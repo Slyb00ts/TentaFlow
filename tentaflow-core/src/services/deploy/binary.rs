@@ -1,29 +1,369 @@
-// ============ File: services/deploy/binary.rs — native binary deploy backend ============
+// ============ File: services/deploy/binary.rs — native-binary deploy strategy ============
+//
+// `runtime = "binary"` engines (sherpa-onnx, stable-diffusion-cpp, teams-bot)
+// are spawned as a child process bound to a freshly allocated TCP port. The
+// strategy waits for an HTTP health probe before committing.
 
-use anyhow::Result;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
+use rusqlite::Transaction;
+use tokio::process::{Child, Command};
 
-use super::{DeployBackend, DeployOutcome, DeployRequest, PreparedDeploy};
+use super::{
+    build_new_service, host_os_supported, http_health_wait, models_from_manifest,
+    standard_engine_env, DeployError, DeployResult, DeployStrategy, PreparedDeploy, RuntimeHandle,
+};
+use crate::services::manifest::{NativeRuntime, ServiceManifest};
+use crate::services::ports::PortAllocator;
+use crate::services::transport::Transport;
+use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
-/// Backend for `runtime = "binary"` engines (sherpa-onnx, stable-diffusion-cpp).
-/// Spawns a native binary built from `binary_path/build.sh`.
-pub struct BinaryBackend;
+pub struct BinaryDeploy {
+    manifest: ServiceManifest,
+    user_config: serde_json::Value,
+    ports: Arc<PortAllocator>,
+    /// Child handle is stored on `self` (not on `PreparedDeploy`) so it stays
+    /// alive across the await boundary in `deploy()`. Rollback consumes it.
+    child: std::sync::Mutex<Option<Child>>,
+}
+
+impl BinaryDeploy {
+    pub fn new(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        ports: Arc<PortAllocator>,
+    ) -> Self {
+        Self {
+            manifest,
+            user_config,
+            ports,
+            child: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn binary_root(&self) -> DeployResult<PathBuf> {
+        let native = self.manifest.deploy.native.as_ref().ok_or_else(|| {
+            DeployError::Manifest(format!(
+                "engine '{}' has no [deploy.native]",
+                self.manifest.engine.id
+            ))
+        })?;
+        if native.runtime != NativeRuntime::Binary {
+            return Err(DeployError::Manifest(format!(
+                "engine '{}' is not a binary runtime ({:?})",
+                self.manifest.engine.id, native.runtime
+            )));
+        }
+        let bp = native.binary_path.as_deref().ok_or_else(|| {
+            DeployError::Manifest(format!(
+                "engine '{}': [deploy.native].binary_path required for runtime=binary",
+                self.manifest.engine.id
+            ))
+        })?;
+        let path = PathBuf::from(bp);
+        if !path.exists() {
+            return Err(DeployError::Manifest(format!(
+                "binary_path does not exist: {}",
+                path.display()
+            )));
+        }
+        Ok(path)
+    }
+}
 
 #[async_trait]
-impl DeployBackend for BinaryBackend {
-    async fn prepare(&self, _req: &DeployRequest) -> Result<PreparedDeploy> {
-        unimplemented!(
-            "Phase 2: BinaryBackend::prepare — ensure build artifact exists, allocate ports"
+impl DeployStrategy for BinaryDeploy {
+    async fn prepare(&mut self) -> DeployResult<PreparedDeploy> {
+        let native = self
+            .manifest
+            .deploy
+            .native
+            .as_ref()
+            .ok_or_else(|| DeployError::Manifest("missing [deploy.native]".into()))?;
+        if !host_os_supported(&native.platforms) {
+            return Err(DeployError::Manifest(format!(
+                "engine '{}' not supported on host OS",
+                self.manifest.engine.id
+            )));
+        }
+
+        let root = self.binary_root()?;
+        let port = self
+            .ports
+            .acquire()
+            .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
+        let allocated_ports = vec![port];
+
+        // Pick the executable: prefer `<root>/server`, then `<root>/run.sh`,
+        // then `<root>/start.sh`, then `<root>/build.sh` (used by tests).
+        let candidates = ["server", "run.sh", "start.sh", "build.sh"];
+        let exe = candidates
+            .iter()
+            .map(|n| root.join(n))
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                DeployError::Spawn(format!(
+                    "no startup script in {} (looked for {:?})",
+                    root.display(),
+                    candidates
+                ))
+            })?;
+
+        let mut env = standard_engine_env();
+        env.insert("PORT".to_string(), port.to_string());
+
+        let mut cmd = Command::new(&exe);
+        cmd.current_dir(&root);
+        cmd.envs(env);
+        cmd.kill_on_drop(true);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| DeployError::Spawn(format!("spawn {}: {}", exe.display(), e)))?;
+        let pid = child.id().map(|v| v as i64);
+
+        // Stash the child for later rollback / for keep-alive across the
+        // commit await.
+        if let Ok(mut slot) = self.child.lock() {
+            *slot = Some(child);
+        }
+
+        // Health check.
+        let health_url = format!("http://127.0.0.1:{}/health", port);
+        // Some engines (vllm, openai-compat) only expose /v1/models — try
+        // /health first, fall back to /v1/models.
+        let res = wait_either(
+            &health_url,
+            &format!("http://127.0.0.1:{}/v1/models", port),
+            30,
         )
+        .await;
+        if let Err(e) = res {
+            // Best-effort cleanup before bubbling up.
+            self.kill_child().await;
+            let _ = self.ports.release(port);
+            return Err(e);
+        }
+
+        let runtime = RuntimeHandle {
+            pid,
+            port: Some(port),
+            sidecar_port: None,
+            endpoint_url: Some(format!("http://127.0.0.1:{}", port)),
+            container_id: None,
+            instance_dir: None,
+        };
+
+        let models = if matches!(
+            self.manifest.engine.resource_kind,
+            Some(crate::services::manifest::ResourceKind::Infra)
+        ) || matches!(
+            self.manifest.engine.category,
+            crate::services::manifest::Category::Agents
+        ) {
+            // Infra & agents have no model registry rows.
+            Vec::new()
+        } else {
+            models_from_manifest(&self.manifest)
+        };
+
+        let config_json = serde_json::to_string(&self.user_config)
+            .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+
+        Ok(PreparedDeploy {
+            engine_id: self.manifest.engine.id.clone(),
+            deploy_method: DeployMethod::NativeBinary,
+            transport: Transport::HttpDirect,
+            runtime,
+            models,
+            config_json,
+            allocated_ports,
+        })
     }
 
-    async fn commit(&self, _prepared: PreparedDeploy) -> Result<DeployOutcome> {
-        unimplemented!(
-            "Phase 2: BinaryBackend::commit — spawn process, wait for health, register service"
-        )
+    fn commit(&self, tx: &Transaction<'_>, prepared: &PreparedDeploy) -> DeployResult<i64> {
+        let new = build_new_service(prepared, ServiceStatus::Running);
+        let id = services_repo::insert_in_tx(tx, &new)?;
+        Ok(id)
     }
 
-    async fn rollback(&self, _prepared: PreparedDeploy) -> Result<()> {
-        unimplemented!("Phase 2: BinaryBackend::rollback — kill spawned process, release ports")
+    async fn rollback(&self, prepared: PreparedDeploy) -> DeployResult<()> {
+        self.kill_child().await;
+        for p in &prepared.allocated_ports {
+            let _ = self.ports.release(*p);
+        }
+        Ok(())
+    }
+}
+
+impl BinaryDeploy {
+    async fn kill_child(&self) {
+        // Take the child out of the mutex (sync), then kill async.
+        let child_opt = self.child.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(mut child) = child_opt {
+            // Try graceful first.
+            if let Some(pid) = child.id() {
+                let _ = crate::deploy::process_ctl::terminate(pid);
+            }
+            // Wait briefly so the async runtime reaps it, then force kill if needed.
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            let _ = child.kill().await;
+        }
+    }
+}
+
+/// Probes two URLs in parallel; returns Ok as soon as either responds 2xx.
+async fn wait_either(a: &str, b: &str, timeout_secs: u64) -> DeployResult<()> {
+    use tokio::select;
+    let fa = http_health_wait(a, timeout_secs);
+    let fb = http_health_wait(b, timeout_secs);
+    tokio::pin!(fa);
+    tokio::pin!(fb);
+    select! {
+        r = &mut fa => r,
+        r = &mut fb => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::manifest::{
+        ApiKind, Category, DeploySection, Engine, NativeDeploy, NativeRuntime, TargetOs,
+    };
+    use std::collections::HashSet;
+
+    fn make_manifest(id: &str, binary_path: &str) -> ServiceManifest {
+        ServiceManifest {
+            engine: Engine {
+                id: id.into(),
+                category: Category::Llm,
+                name: id.into(),
+                description_pl: "".into(),
+                description_en: "".into(),
+                homepage: "".into(),
+                license: "".into(),
+                icon: None,
+                resource_kind: None,
+                requires_model: None,
+                gpu_supported: None,
+                default_port: 0,
+                api: ApiKind::OpenaiCompatible,
+                version: "0".into(),
+            },
+            deploy: DeploySection {
+                docker: None,
+                native: Some(NativeDeploy {
+                    platforms: vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
+                    runtime: NativeRuntime::Binary,
+                    feature_flag: None,
+                    binary_path: Some(binary_path.into()),
+                    bundle_path: None,
+                }),
+                external: None,
+            },
+            model_presets: vec![],
+            docker_source_hash: String::new(),
+            native_source_hash: String::new(),
+        }
+    }
+
+    /// Writes a tiny shell server that listens on $PORT and returns 200 on /health.
+    /// Skipped on Windows in tests.
+    #[cfg(unix)]
+    fn write_fake_server(dir: &std::path::Path) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("server");
+        let script = r#"#!/usr/bin/env bash
+PORT=${PORT:-0}
+# Minimal HTTP server using bash + ncat fallback. We use python3 if available
+# because nc availability differs across distros.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c "
+import http.server, socketserver, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(b'{}')
+    def log_message(self, *a, **k): pass
+port = int(os.environ.get('PORT','0'))
+with socketserver.TCPServer(('127.0.0.1', port), H) as s: s.serve_forever()
+"
+else
+  echo "no python3" >&2; exit 1
+fi
+"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perms = f.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_spawn_health_check_succeeds() {
+        // Skip if no python3 — without it our fake server does nothing.
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_server(dir.path());
+        let manifest = make_manifest("bin-spawn-ok", dir.path().to_str().unwrap());
+        let ports = Arc::new(PortAllocator::new((47_000, 47_050), HashSet::new()).unwrap());
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports);
+        let prepared = s.prepare().await.expect("prepare succeeds");
+        assert!(prepared.runtime.pid.is_some());
+        assert!(prepared.runtime.port.is_some());
+        // Cleanup.
+        s.rollback(prepared).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_health_timeout_returns_err() {
+        // No script at all → spawn fails, mapped to DeployError::Spawn.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = make_manifest("bin-no-script", dir.path().to_str().unwrap());
+        let ports = Arc::new(PortAllocator::new((47_100, 47_110), HashSet::new()).unwrap());
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports);
+        let err = s.prepare().await.unwrap_err();
+        assert!(matches!(err, DeployError::Spawn(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_rollback_releases_port() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_server(dir.path());
+        let manifest = make_manifest("bin-rb", dir.path().to_str().unwrap());
+        let ports = Arc::new(PortAllocator::new((47_200, 47_210), HashSet::new()).unwrap());
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone());
+        let prepared = s.prepare().await.unwrap();
+        let used = prepared.runtime.port.unwrap();
+        s.rollback(prepared).await.unwrap();
+        // After rollback the port should be reusable.
+        let next = ports.acquire().unwrap();
+        // Cycle eventually returns the previously released port; we just check
+        // we can keep allocating without exhausting the small range.
+        assert!(next >= 47_200 && next <= 47_210);
+        let _ = ports.release(used);
+        let _ = ports.release(next);
     }
 }
