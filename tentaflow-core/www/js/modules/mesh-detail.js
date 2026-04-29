@@ -1,14 +1,10 @@
 // =============================================================================
 // Plik: modules/mesh-detail.js
-// Opis: Drill-down view pojedynczego noda mesh — redesign 2026-04-27.
-//       Layout zgodny z Mesh & Network settings: tf-screen shell, breadcrumb,
-//       detail-header (big-ico + meta + actions), section cards z uppercase
-//       tytulami w accent-2. Sekcje: System info, Resource usage (CPU+RAM),
-//       GPUs, Profiling sessions (nsight), Network interfaces (tabela + mobile
-//       cards), Loaded models, Containers. Zero zakladek — wszystko w jednym
-//       scrollu. Auto-refresh przez `createRefresher` (pauza w tle, swiezy
-//       paint po visibility return). Render uzywa `patchInner` (morphdom),
-//       wiec rerender co 2s nie powoduje pelnego reflow ani utraty fokusu.
+// Opis: Drill-down view pojedynczego noda mesh. Layout zgodny z Mesh & Network
+//       settings: tf-screen shell, breadcrumb, detail-header, section cards.
+//       Profilowanie jest jedyna sciezka — multi-source przez ProfilingLaunchModal,
+//       z banerem aktywnej sesji i routingiem do globalnej listy sesji /
+//       szczegolow raportu.
 // =============================================================================
 
 import {
@@ -24,18 +20,7 @@ import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
-import {
-  initNsight,
-  cleanupNsight,
-  loadSessions as loadNsightSessions,
-  topbarHtml as nsightTopbarHtml,
-  gpuProfileButtonHtml as nsightGpuProfileButtonHtml,
-  sessionsSectionHtml as nsightSessionsSectionHtml,
-  nsightInstallHintHtml,
-  bindNsightActions,
-  activeRecLabel,
-  setActiveBannerPokeHook,
-} from '/js/modules/mesh-detail-nsight.js';
+import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
 import { ProfilingActiveBanner } from '/js/modules/profiling-active-banner.js';
 
 let currentNodeId = null;
@@ -45,6 +30,7 @@ let wasDisconnected = false;
 let lastFetchAt = null;
 let backHandler = null;
 let containerHandler = null;
+let profileHandler = null;
 // Banner aktywnej sesji profilingu — montowany pod headerem detail view.
 // Sam polluje backend (`profilingActiveInfo`) co 1s, sam renderuje countdown
 // i przycisk Stop. `bannerNodeId` chroni przed wspoldzieleniem instancji
@@ -71,13 +57,6 @@ const MeshDetailScreen = {
     content.innerHTML = renderSkeleton();
     bindBack(content);
 
-    // Callback z nsight — countdown 1Hz nie powinien rebuildowac calego widoku;
-    // updateRecBadge dotyka tylko jednego elementu chipa.
-    initNsight({ onChange: () => updateRecBadge() });
-    // Hook ktory ProfilingLaunchModal wola po sukcesie startu — wymusza
-    // natychmiastowy poll bannera zamiast czekac do nastepnego tickeru (1s).
-    setActiveBannerPokeHook(() => pokeActiveBanner());
-
     await loadNode();
     renderDetail();
 
@@ -95,8 +74,6 @@ const MeshDetailScreen = {
   },
   cleanup() {
     if (refresher) { refresher.dispose(); refresher = null; }
-    cleanupNsight();
-    setActiveBannerPokeHook(null);
     if (activeBanner) {
       try { activeBanner.unmount(); } catch (_e) { /* ignore */ }
       activeBanner = null;
@@ -106,10 +83,11 @@ const MeshDetailScreen = {
     if (root) {
       if (backHandler) root.removeEventListener('click', backHandler);
       if (containerHandler) root.removeEventListener('click', containerHandler);
-      delete root.__nsightBound;
+      if (profileHandler) root.removeEventListener('click', profileHandler);
     }
     backHandler = null;
     containerHandler = null;
+    profileHandler = null;
     currentNodeId = null;
     nodeData = null;
   },
@@ -129,9 +107,6 @@ async function loadNode() {
   } catch (err) {
     const age = lastFetchAt ? (Date.now() - lastFetchAt) / 1000 : Infinity;
     if (age > 30) wasDisconnected = true;
-  }
-  if (nodeData && nodeData.nsys_available === true) {
-    await loadNsightSessions(currentNodeId);
   }
 }
 
@@ -259,21 +234,6 @@ function renderSkeleton() {
 
 // ---- Render --------------------------------------------------------------
 
-// Tylko zmiana tekstu chipa REC — nsight countdown 1Hz nie moze rebuildowac
-// pelnego widoku, bo wraca to do `innerHTML = ...` na kilkukilobajtowym
-// stringu. F2 fix.
-function updateRecBadge() {
-  const root = document.getElementById('main');
-  if (!root || !nodeData) return;
-  const chip = root.querySelector('[data-nsight-rec-chip]');
-  if (!chip) return;
-  const label = activeRecLabel(nodeData);
-  if (label == null) return;
-  // Chip renderuje children jako label — slot/text. Bezpiecznie podmieniamy
-  // textContent zachowujac dot.
-  chip.textContent = `REC ${label}`;
-}
-
 function renderDetail() {
   const content = document.getElementById('main');
   if (!content) return;
@@ -321,7 +281,7 @@ function renderDetail() {
   // sa rekurencyjnie morphowane (patrz lib/patch.js).
   patchInner(content, html);
   bindContainerActions(content);
-  bindNsightActions(content, n);
+  bindProfileActions(content, n);
   ensureActiveBanner(content, n);
 }
 
@@ -379,8 +339,8 @@ function ensureActiveBanner(root, n) {
   }
 }
 
-// Wolane przez nsight po sukcesie ProfilingLaunchModal — ladniej niz czekac
-// 1s na nastepny tick: REC banner pojawia sie natychmiast.
+// Po sukcesie ProfilingLaunchModal banner sam zalapie sesje przy nastepnym
+// 1s polleru, ale chcemy pokazac REC natychmiast — wymuszamy explicit poll.
 function pokeActiveBanner() {
   if (activeBanner && typeof activeBanner._poll === 'function') {
     activeBanner._poll();
@@ -410,6 +370,9 @@ function renderHead(n, hostname, online) {
     ? `<span class="nd-stat-pill ok dot live">${escapeHtml(I18n.t('mesh.online'))}</span>`
     : `<span class="nd-stat-pill off dot">${escapeHtml(I18n.t('mesh.offline'))}</span>`);
   if (n.is_local) badges.push(`<span class="nd-stat-pill info">${escapeHtml(I18n.t('mesh.local'))}</span>`);
+  // `nsys_available` wraz z `nsys_version` to capability flag z heartbeatu —
+  // backend dalej go raportuje jako wskaznik dostepnosci NVIDIA Nsight Systems
+  // dla collectora `nvidia.nsys.gpu`. Pokazujemy go tylko jako informacyjny pill.
   if (n.nsys_available === true) {
     const ver = n.nsys_version ? ` ${escapeHtml(n.nsys_version)}` : '';
     badges.push(`<span class="nd-stat-pill info">nsys${ver}</span>`);
@@ -441,7 +404,7 @@ function renderHead(n, hostname, online) {
             <div class="d-badges">${badges.join('')}</div>
           </div>
           <div class="d-actions">
-            ${nsightTopbarHtml(n)}
+            ${profileTopbarHtml(n)}
             <tf-button variant="ghost" size="sm" id="btn-back-mesh">
               ← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}
             </tf-button>
@@ -620,7 +583,7 @@ function renderGpus(n) {
       : (g.power_draw_w != null ? `${Math.round(g.power_draw_w)} W` : '—');
     const temp = g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '—';
     const fan = g.fan_speed_percent != null ? `${Math.round(g.fan_speed_percent)}%` : '—';
-    const profileBtn = nsightGpuProfileButtonHtml(n, g, idx);
+    const profileBtn = gpuProfileButtonHtml(n, g, idx);
     const vendor = [g.driver_version ? `driver ${g.driver_version}` : null, g.cuda_version ? `CUDA ${g.cuda_version}` : null]
       .filter(Boolean).join(' · ');
 
@@ -669,11 +632,31 @@ function renderGpus(n) {
   `;
 }
 
+// Sekcja zachecajaca do otwarcia globalnego ekranu Profiling Sessions,
+// gdy node ma jakiekolwiek dostepne kolektory. Pelna lista sesji zyje w
+// `profiling-sessions-screen.js` (z filtrem per-node), tu pokazujemy tylko
+// shortcut + capability badge.
 function renderProfilingWrap(n) {
-  const sessionsHtml = nsightSessionsSectionHtml(n);
-  const installHtml = nsightInstallHintHtml(n);
-  if (!sessionsHtml && !installHtml) return '';
-  return `<div class="nd-section">${sessionsHtml}${installHtml}</div>`;
+  if (!hasProfilingCapability(n)) return '';
+  return `
+    <div class="nd-section">
+      <h3>
+        ${ico('i-trend')}
+        ${escapeHtml(I18n.t('mesh.profiling_section') || 'Profiling')}
+      </h3>
+      <div class="nd-profiling-hint">
+        <p>${escapeHtml(I18n.t('mesh.profiling_hint') || 'Capture multi-source profiling sessions for this node and review reports in the dedicated screen.')}</p>
+        <div class="nd-row-actions">
+          <tf-button size="sm" variant="primary" data-action="profile-node-open">
+            ${escapeHtml(I18n.t('mesh.profile_start') || 'Start profiling…')}
+          </tf-button>
+          <tf-button size="sm" variant="ghost" data-action="profile-view-sessions">
+            ${escapeHtml(I18n.t('mesh.profile_view_sessions') || 'View sessions')}
+          </tf-button>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderNetwork(n) {
@@ -875,6 +858,116 @@ function renderContainers(n) {
       </div>
     </div>
   `;
+}
+
+// ---- Profiling capability + actions --------------------------------------
+
+// Lista id-ow kolektorow rozglaszanych w heartbeacie. Pusta = node nie obsluguje
+// multi-source profilingu (np. brak natywnego daemona z odpowiednimi flagami).
+function profilingCollectors(node) {
+  const list = node?.profiling_collectors_available;
+  return Array.isArray(list) ? list : [];
+}
+
+function hasProfilingCapability(node) {
+  return profilingCollectors(node).length > 0;
+}
+
+function buildLaunchSources(node) {
+  // Heartbeat broadcastuje plaska liste id-ow; modal oczekuje obiektow
+  // `{ id, label, status }`. Status default 'available' — backend dolepi
+  // status `unavailable`/`needs_sudo` przy probie startu sesji.
+  return profilingCollectors(node).map((id) => ({
+    id: String(id),
+    label: String(id),
+    description: '',
+    status: 'available',
+  }));
+}
+
+// HTML do wstrzykniecia w `card-head` GPU. Pokazuje sie gdy node ma
+// jakiekolwiek collectory profilowania — start otwiera modal z preselectGpu.
+function gpuProfileButtonHtml(node, _gpu, idx) {
+  if (!hasProfilingCapability(node)) return '';
+  return `
+    <tf-button size="sm" variant="ghost" data-action="profile-gpu-card" data-gpu-idx="${idx}" title="${escapeAttr(I18n.t('mesh.profile_gpu_btn') || 'Profile this GPU')}">
+      <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-record"/></svg>
+      <span>${escapeHtml(I18n.t('mesh.profile_gpu_btn') || 'Profile')}</span>
+    </tf-button>
+  `;
+}
+
+// HTML topbara: Profile button + Sessions shortcut, gdy node cokolwiek
+// potrafi zaprofilowac. REC banner (countdown + Stop) zyje w
+// ProfilingActiveBanner pod headerem, wiec topbar jest stale niezalezny od
+// stanu sesji.
+function profileTopbarHtml(node) {
+  if (!hasProfilingCapability(node)) return '';
+  return `
+    <tf-button size="sm" variant="ghost" data-action="profile-node-open" title="${escapeAttr(I18n.t('mesh.profile_node_btn') || 'Profile this node')}">
+      <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-record"/></svg>
+      <span>${escapeHtml(I18n.t('mesh.profile_node_btn') || 'Profile')}</span>
+    </tf-button>
+    <tf-button size="sm" variant="ghost" data-action="profile-view-sessions" title="${escapeAttr(I18n.t('mesh.profile_view_sessions') || 'View profiling sessions')}">
+      <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-trend"/></svg>
+      <span>${escapeHtml(I18n.t('mesh.profile_view_sessions') || 'Sessions')}</span>
+    </tf-button>
+  `;
+}
+
+async function openLaunchModal(node, { gpuIndex = null } = {}) {
+  const sources = buildLaunchSources(node);
+  if (sources.length === 0) {
+    toast(I18n.t('mesh.profile_unavailable') || 'Profiling is not available on this node.', 'error');
+    return;
+  }
+  let preselectGpu = null;
+  if (Number.isInteger(gpuIndex)) {
+    const gpu = Array.isArray(node.gpus) ? node.gpus[gpuIndex] : null;
+    preselectGpu = {
+      deviceIndex: gpuIndex,
+      vendor: gpu?.vendor || null,
+    };
+  }
+  try {
+    const result = await ProfilingLaunchModal.open({
+      nodeId: node.node_id,
+      availableSources: sources,
+      preselectGpu,
+    });
+    if (result && result.launched) {
+      toast(I18n.t('mesh.profile_started') || 'Profiling session started', 'success');
+      pokeActiveBanner();
+    }
+  } catch (err) {
+    toast(`${I18n.t('mesh.profile_error') || 'Profiling error'}: ${err.message || err}`, 'error');
+  }
+}
+
+function bindProfileActions(root, node) {
+  if (profileHandler) return;
+  profileHandler = async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'profile-node-open') {
+      await openLaunchModal(node);
+      return;
+    }
+    if (action === 'profile-gpu-card') {
+      const idx = parseInt(btn.dataset.gpuIdx, 10);
+      await openLaunchModal(node, { gpuIndex: Number.isFinite(idx) ? idx : null });
+      return;
+    }
+    if (action === 'profile-view-sessions') {
+      const { Router } = await import('/js/router.js');
+      Router.navigate('profiling-sessions', {
+        nodeId: node.node_id,
+        nodeName: node.hostname || node.node_id,
+      });
+    }
+  };
+  root.addEventListener('click', profileHandler);
 }
 
 function bindContainerActions(root) {
