@@ -1373,6 +1373,61 @@ pub struct ProfilingActiveInfoResponse {
     pub info: Option<ProfilingActiveSessionInfo>,
 }
 
+// =============================================================================
+// ValidateSudo + CollectorsStatus — settings/permissions screen.
+// Migrated from REST (api/profiling/{validate-sudo,collectors/status}) to
+// keep wire format spojny: wszystko binary rkyv przez ApiBinary.
+// =============================================================================
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingValidateSudoRequest {
+    pub node_id: String,
+    /// Used once and zeroized; never logged, never persisted.
+    pub password: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingValidateSudoResponse {
+    pub ok: bool,
+    pub message: String,
+    /// Stable enum-like tag for GUI localisation: ok, bad_password, no_sudo,
+    /// timeout, empty, in_progress, spawn_error.
+    pub reason: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingCollectorsStatusRequest {
+    pub node_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingCollectorStatus {
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub needs_sudo: bool,
+    pub note: Option<String>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingCollectorsStatusResponse {
+    pub collectors: Vec<ProfilingCollectorStatus>,
+    /// Cached snapshot age in seconds; 0 = just recomputed.
+    pub age_seconds: u64,
+}
+
 /// Inner-enum pack (mirrors `NsightPayload`) — keeps every multi-source
 /// profiling message in a single `MessageBody::ProfilingBody` slot to avoid
 /// using up the rkyv 256-variant budget of `MessageBody`.
@@ -1394,6 +1449,10 @@ pub enum ProfilingPayload {
     DownloadResponse(ProfilingDownloadResponse),
     ActiveInfoRequest(ProfilingActiveInfoRequest),
     ActiveInfoResponse(ProfilingActiveInfoResponse),
+    ValidateSudoRequest(ProfilingValidateSudoRequest),
+    ValidateSudoResponse(ProfilingValidateSudoResponse),
+    CollectorsStatusRequest(ProfilingCollectorsStatusRequest),
+    CollectorsStatusResponse(ProfilingCollectorsStatusResponse),
 }
 
 // =============================================================================

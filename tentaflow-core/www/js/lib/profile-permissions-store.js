@@ -60,33 +60,21 @@ export function markSudoValidated() {
   _sudoValidatedAt = Date.now();
 }
 
-// Wywoluje backend `POST /api/profiling/validate-sudo`. Backend może nie
-// istnieć — wtedy zwracamy pseudoreport "not implemented" i zostawiamy decyzję
-// callerowi. NIE udajemy sukcesu.
+// Wywoluje backend przez binary protocol (ProfilingPayload::ValidateSudoRequest).
+// Wczesniej REST `POST /api/profiling/validate-sudo` - usuniete na rzecz binary.
 export async function validateSudo(password) {
   const payload = typeof password === 'string' ? password : _sudoPassword;
   if (!payload) {
     return { ok: false, reason: 'empty', backendAvailable: true };
   }
   try {
-    const resp = await fetch('/api/profiling/validate-sudo', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ password: payload }),
-    });
-    if (resp.status === 404 || resp.status === 405) {
-      console.warn('[profile-permissions] backend nie udostępnia /api/profiling/validate-sudo — walidacja zostanie wykonana dopiero przy starcie sesji');
-      return { ok: false, reason: 'backend_missing', backendAvailable: false };
-    }
-    if (!resp.ok) {
-      return { ok: false, reason: `http_${resp.status}`, backendAvailable: true };
-    }
-    const data = await resp.json().catch(() => ({}));
-    const ok = !!data.ok;
+    const { profilingValidateSudo } = await import('/js/protocol/profiling.js');
+    const resp = await profilingValidateSudo({ nodeId: '', password: payload });
+    const ok = !!resp.ok;
     if (ok) markSudoValidated();
-    return { ok, reason: data.reason || '', backendAvailable: true };
+    return { ok, reason: resp.reason || '', backendAvailable: true };
   } catch (err) {
-    console.warn('[profile-permissions] validateSudo network error:', err?.message || err);
+    console.warn('[profile-permissions] validateSudo error:', err?.message || err);
     return { ok: false, reason: 'network', backendAvailable: false };
   }
 }
