@@ -37,32 +37,38 @@ impl EmbeddedDeploy {
         }
     }
 
-    fn prepare_embedded_vision(&mut self) -> DeployResult<()> {
+    async fn prepare_embedded_vision(&mut self) -> DeployResult<()> {
         if self.manifest.engine.category != Category::Vision {
             return Ok(());
         }
 
-        let kind = crate::vision::VisionEngineKind::from_id(&self.manifest.engine.id)
+        let engine_id = self.manifest.engine.id.clone();
+        let kind = crate::vision::VisionEngineKind::from_id(&engine_id)
             .ok_or_else(|| {
                 DeployError::Manifest(format!(
                     "vision engine '{}' is not registered in runtime",
-                    self.manifest.engine.id
+                    engine_id
                 ))
             })?;
         if let Some(s) = &self.log_sink {
             s.info(&format!(
                 "[vision] preparing embedded model for {}",
-                self.manifest.engine.id
+                engine_id
             ));
         }
-        let model_path = crate::vision::model_path_for(kind).ok_or_else(|| {
-            DeployError::Other(format!(
-                "vision model '{}' is not available after download",
-                self.manifest.engine.id
-            ))
-        })?;
-        let engine = crate::vision::load_engine(kind, &model_path)
-            .map_err(|e| DeployError::Other(format!("load vision model: {:#}", e)))?;
+        let (model_path, engine) = tokio::task::spawn_blocking(move || {
+            let model_path = crate::vision::model_path_for(kind).ok_or_else(|| {
+                DeployError::Other(format!(
+                    "vision model '{}' is not available after download",
+                    engine_id
+                ))
+            })?;
+            let engine = crate::vision::load_engine(kind, &model_path)
+                .map_err(|e| DeployError::Other(format!("load vision model: {:#}", e)))?;
+            Ok::<_, DeployError>((model_path, engine))
+        })
+        .await
+        .map_err(|e| DeployError::Other(format!("vision prepare task: {}", e)))??;
 
         let mut keys = vec![self.manifest.engine.id.clone(), kind.id().to_string()];
         keys.extend(self.manifest.model_presets.iter().map(|p| p.id.clone()));
@@ -114,7 +120,7 @@ impl DeployStrategy for EmbeddedDeploy {
         // gated by `target_os` already passed `host_os_supported`.
         // Future work (Phase 5+): plumb a feature-availability map from build.rs.
 
-        self.prepare_embedded_vision()?;
+        self.prepare_embedded_vision().await?;
 
         let runtime = RuntimeHandle::default();
         let models = models_from_manifest(&self.manifest);

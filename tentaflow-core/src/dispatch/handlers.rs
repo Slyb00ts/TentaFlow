@@ -415,17 +415,45 @@ pub fn model_list_request(
             None => true,
         })
         .map(|m| {
-            let display_name = m.display_name.clone().unwrap_or_else(|| m.model_name.clone());
+            let display_name = m
+                .display_name
+                .clone()
+                .unwrap_or_else(|| m.model_name.clone());
+            let capabilities = parse_capabilities_array(&m.capabilities);
+            let category = capability_to_category(&m.capabilities);
             ModelSummary {
-                id: m.model_name,
+                id: m.model_name.clone(),
+                model_name: m.model_name,
                 display_name,
-                category: capability_to_category(&m.capabilities),
+                category,
                 engine_id: m.engine_id,
+                service_id: m.service_id,
                 availability: m.status,
+                transport: m.transport,
+                endpoint_url: m.endpoint_url,
+                capabilities,
+                context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
+                quantization: m.quantization,
+                is_default: m.is_default,
             }
         })
         .collect();
     Ok(MessageBody::ModelListResponse { models })
+}
+
+/// Parses the JSON-encoded capabilities array from `model_registry.capabilities`.
+/// Defaults to an empty vector on malformed input — never fails.
+fn parse_capabilities_array(capabilities_json: &str) -> Vec<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(capabilities_json).unwrap_or(serde_json::Value::Null);
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Maps the JSON-encoded capabilities array (e.g. `["chat"]`) onto a coarse
@@ -443,7 +471,6 @@ fn capability_to_category(capabilities_json: &str) -> String {
         None => "llm".into(),
     }
 }
-
 
 #[handler(variant = "ModelDetailRequest", since = (1, 0))]
 #[policy(UserSession)]
@@ -475,7 +502,10 @@ pub fn model_detail_request(
         local_path: None,
         size_bytes: 0,
         availability: row.status,
-        description: format!("Hosted by service id={} ({})", row.service_id, row.deploy_method),
+        description: format!(
+            "Hosted by service id={} ({})",
+            row.service_id, row.deploy_method
+        ),
         checksum_sha256: None,
     }))
 }
@@ -4436,3 +4466,372 @@ register_network_variant!(
     "tentaflow_ws_handler_network_relay_status",
     UserSession
 );
+
+// =============================================================================
+// Services (Krok N2) — local-only view powered by the unified `services` +
+// `model_registry` tables. Multi-node aggregation lands in Krok N5; for now the
+// list contains only services owned by this node. Every handler is admin-gated
+// because the sidebar is admin-only and the mutations affect runtime processes.
+// =============================================================================
+
+fn build_service_info(
+    conn: &rusqlite::Connection,
+    svc: crate::services_repo::services::ServiceRow,
+) -> Result<tentaflow_protocol::ServiceInfo, ProtocolError> {
+    let model_rows =
+        crate::services_repo::models::list_for_service(conn, svc.id).map_err(db_err)?;
+    let models: Vec<tentaflow_protocol::ServiceModelEntry> = model_rows
+        .into_iter()
+        .map(|m| tentaflow_protocol::ServiceModelEntry {
+            model_name: m.model_name,
+            display_name: m.display_name,
+            capabilities: parse_capabilities_array(&m.capabilities),
+            context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
+            quantization: m.quantization,
+            is_default: m.is_default,
+        })
+        .collect();
+
+    Ok(tentaflow_protocol::ServiceInfo {
+        id: svc.id,
+        engine_id: svc.engine_id,
+        category: svc.category,
+        display_name: svc.display_name,
+        deploy_method: svc.deploy_method.as_db_tag().to_string(),
+        transport: svc.transport.as_db_tag().to_string(),
+        status: svc.status.as_db_tag().to_string(),
+        pinned: svc.pinned,
+        paused: svc.paused,
+        runtime_pid: svc.runtime_pid,
+        runtime_port: svc.runtime_port,
+        sidecar_quic_port: svc.sidecar_quic_port,
+        endpoint_url: svc.endpoint_url,
+        restart_count: u32::try_from(svc.restart_count).unwrap_or(u32::MAX),
+        health_last_err: svc.health_last_err,
+        models,
+        created_at: svc.created_at,
+        updated_at: svc.updated_at,
+    })
+}
+
+#[handler(variant = "ServiceListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqList(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqList",
+            ))
+        }
+    };
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
+
+    let mut services = Vec::with_capacity(rows.len());
+    for svc in rows {
+        if let Some(filter) = payload.engine_id_filter.as_deref() {
+            if !filter.is_empty() && svc.engine_id != filter {
+                continue;
+            }
+        }
+        if let Some(filter) = payload.category_filter.as_deref() {
+            if !filter.is_empty() && svc.category != filter {
+                continue;
+            }
+        }
+        services.push(build_service_info(&conn, svc)?);
+    }
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResList(tentaflow_protocol::ServiceListResponse {
+            services,
+        }),
+    ))
+}
+
+/// Resolves a service row by id, returning a NotFound protocol error when the
+/// row is gone. Caller drops the lock before doing async work.
+fn fetch_service_row(
+    ctx: &HandlerContext,
+    service_id: i64,
+) -> Result<crate::services_repo::services::ServiceRow, ProtocolError> {
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let row = crate::services_repo::services::get(&conn, service_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found(format!("service id={} not found", service_id)))?;
+    Ok(row)
+}
+
+#[handler(variant = "ServiceStopRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_stop(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqStop(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqStop",
+            ))
+        }
+    };
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    // Stop the runtime side: kill process / remove container, release ports.
+    let (success, error) = match crate::services::deploy::stop(&svc, port_allocator).await {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+
+    if success {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::update_status(
+            &conn,
+            payload.service_id,
+            crate::services_repo::services::ServiceStatus::Stopped,
+        )
+        .map_err(db_err)?;
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.stop",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} success={}",
+            payload.service_id, success
+        )),
+    );
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResStop(tentaflow_protocol::ServiceStopResponse {
+            success,
+            error,
+        }),
+    ))
+}
+
+#[handler(variant = "ServiceDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqDelete(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqDelete",
+            ))
+        }
+    };
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    // Best-effort runtime stop first. Even if it fails (orphaned container,
+    // stale pid) we still drop the row so the GUI does not get stuck on a
+    // zombie entry. Surface the error for the toast but treat overall op as ok.
+    let stop_err = crate::services::deploy::stop(&svc, port_allocator)
+        .await
+        .err()
+        .map(|e| e.to_string());
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
+    drop(conn);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.delete",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} stop_err={}",
+            payload.service_id,
+            stop_err.as_deref().unwrap_or("none")
+        )),
+    );
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResDelete(tentaflow_protocol::ServiceDeleteResponse {
+            success: true,
+            error: stop_err,
+        }),
+    ))
+}
+
+#[handler(variant = "ServicePinRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_pin(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqPin(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqPin",
+            ))
+        }
+    };
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    crate::services_repo::services::set_pinned(&conn, payload.service_id, payload.pinned)
+        .map_err(db_err)?;
+    drop(conn);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.pin",
+        None,
+        Some(&format!(
+            "service_id={} pinned={}",
+            payload.service_id, payload.pinned
+        )),
+    );
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResPin(tentaflow_protocol::ServicePinResponse {
+            success: true,
+            error: None,
+        }),
+    ))
+}
+
+#[handler(variant = "ServicePauseRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_pause(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqPause(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqPause",
+            ))
+        }
+    };
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    crate::services_repo::services::set_paused(&conn, payload.service_id, payload.paused)
+        .map_err(db_err)?;
+    drop(conn);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.pause",
+        None,
+        Some(&format!(
+            "service_id={} paused={}",
+            payload.service_id, payload.paused
+        )),
+    );
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResPause(tentaflow_protocol::ServicePauseResponse {
+            success: true,
+            error: None,
+        }),
+    ))
+}
+
+#[handler(variant = "ServiceRenameRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_rename(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqRename(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqRename",
+            ))
+        }
+    };
+
+    let trimmed = payload.display_name.trim();
+    if trimmed.is_empty() {
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResRename(
+                tentaflow_protocol::ServiceRenameResponse {
+                    success: false,
+                    error: Some("display_name cannot be empty".to_string()),
+                },
+            ),
+        ));
+    }
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    crate::services_repo::services::update_display_name(&conn, payload.service_id, trimmed)
+        .map_err(db_err)?;
+    drop(conn);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.rename",
+        None,
+        Some(&format!(
+            "service_id={} display_name={}",
+            payload.service_id, trimmed
+        )),
+    );
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResRename(tentaflow_protocol::ServiceRenameResponse {
+            success: true,
+            error: None,
+        }),
+    ))
+}

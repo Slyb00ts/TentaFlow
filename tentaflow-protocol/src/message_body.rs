@@ -16,20 +16,174 @@ use rkyv::{Archive, Deserialize, Serialize};
 // Pomocnicze typy (bootstrap — docelowo rozpisane per-archetype)
 // =============================================================================
 
-/// Lekki widok modelu w katalogu.
+/// Wide model view sourced from `model_registry` joined with the parent
+/// `services` row. Returned by `ModelListRequest` so the chat picker can
+/// disambiguate duplicates and the catalog can show transport/endpoint.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ModelSummary {
-    /// Np. "tentaflow-vllm-metal-2izlb" — service name (do dispatchu).
+    /// Stable model identifier used for dispatch (alias key). Equal to the
+    /// row's `model_name` — keeps backward compat with existing call sites
+    /// that match by `id`.
     pub id: String,
-    /// User-friendly etykieta dla GUI: HF repo modelu (np. "Qwen/Qwen3.5-0.8B")
-    /// gdy znany, inaczej service name jako fallback.
+    /// `model_registry.model_name` — the canonical model handle.
+    pub model_name: String,
+    /// User-friendly label (defaults to `model_name` when null in DB).
     pub display_name: String,
-    /// Rodzina: "llm", "tts", "stt", "embedding", itd.
+    /// Coarse bucket derived from `capabilities` ("llm" / "tts" / "stt" /
+    /// "embedding" / ...). Kept for chat-side filtering.
     pub category: String,
-    /// Silnik ktory uruchamia model: "llama-cpp", "mlx", "vllm"...
+    /// `services.engine_id` — engine implementation (vllm / mlx / llama-cpp).
     pub engine_id: String,
-    /// `ready`, `downloading`, `not-installed`.
+    /// `services.id` — disambiguates the same `model_name` across instances.
+    pub service_id: i64,
+    /// Mirrors `services.status` ("running" / "degraded" / ...).
     pub availability: String,
+    /// `services.transport` (embedded / http_direct / sidecar_quic /
+    /// external_http).
+    pub transport: String,
+    /// `services.endpoint_url` when known.
+    pub endpoint_url: Option<String>,
+    /// Capabilities array carried verbatim from the DB JSON column.
+    pub capabilities: Vec<String>,
+    /// Optional context window length advertised by the engine.
+    pub context_length: Option<u32>,
+    /// Optional quantization tag (e.g. "Q4_K_M").
+    pub quantization: Option<String>,
+    /// Whether this row is the default model for its parent service.
+    pub is_default: bool,
+}
+
+// =============================================================================
+// Services — runtime view of deployed services + grouped models. The whole
+// surface is packed into `ServicePayload` to keep the 256-variant rkyv limit
+// on `MessageBody` (same trick as `DeploymentPayload` / `MeetingPayload`).
+// =============================================================================
+
+/// Single model row attached to a `ServiceInfo`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceModelEntry {
+    pub model_name: String,
+    pub display_name: Option<String>,
+    pub capabilities: Vec<String>,
+    pub context_length: Option<u32>,
+    pub quantization: Option<String>,
+    pub is_default: bool,
+}
+
+/// Runtime view of one deployed service. Aggregates the `services` row with
+/// its attached `model_registry` rows.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceInfo {
+    pub id: i64,
+    pub engine_id: String,
+    /// llm / stt / tts / embeddings / image-gen / agents / ...
+    pub category: String,
+    pub display_name: String,
+    /// docker / native_embedded / native_binary / native_python_bundle / external.
+    pub deploy_method: String,
+    /// embedded / http_direct / sidecar_quic / external_http.
+    pub transport: String,
+    /// starting / running / degraded / failed / stopped.
+    pub status: String,
+    pub pinned: bool,
+    pub paused: bool,
+    pub runtime_pid: Option<i64>,
+    pub runtime_port: Option<u16>,
+    pub sidecar_quic_port: Option<u16>,
+    pub endpoint_url: Option<String>,
+    pub restart_count: u32,
+    pub health_last_err: Option<String>,
+    pub models: Vec<ServiceModelEntry>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceListRequest {
+    /// Reserved for future filtering (engine / category). Empty vec = no filter.
+    pub engine_id_filter: Option<String>,
+    pub category_filter: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceListResponse {
+    pub services: Vec<ServiceInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStopRequest {
+    pub service_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStopResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDeleteRequest {
+    pub service_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDeleteResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServicePinRequest {
+    pub service_id: i64,
+    pub pinned: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServicePinResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServicePauseRequest {
+    pub service_id: i64,
+    pub paused: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServicePauseResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRenameRequest {
+    pub service_id: i64,
+    pub display_name: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRenameResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Inner enum bundling every services-screen RPC pair into a single MessageBody
+/// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ServicePayload {
+    ReqList(ServiceListRequest),
+    ResList(ServiceListResponse),
+    ReqStop(ServiceStopRequest),
+    ResStop(ServiceStopResponse),
+    ReqDelete(ServiceDeleteRequest),
+    ResDelete(ServiceDeleteResponse),
+    ReqPin(ServicePinRequest),
+    ResPin(ServicePinResponse),
+    ReqPause(ServicePauseRequest),
+    ResPause(ServicePauseResponse),
+    ReqRename(ServiceRenameRequest),
+    ResRename(ServiceRenameResponse),
 }
 
 // =============================================================================
@@ -499,7 +653,6 @@ pub enum WakeWordOp {
     Delete { id: i64 },
 }
 
-
 // =============================================================================
 // Fast-path patterns — bypass routing for known prompts (migration-map #61-#64)
 // =============================================================================
@@ -937,11 +1090,15 @@ pub struct RelayHealthInfo {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPayload {
     ReqInterfacesList,
-    ResInterfacesList { interfaces: Vec<NetworkInterfaceInfo> },
+    ResInterfacesList {
+        interfaces: Vec<NetworkInterfaceInfo>,
+    },
     ReqConfigGet,
     ResConfigGet(NetworkConfig),
     ReqConfigUpdate(NetworkConfig),
-    ResConfigUpdate { restart_required: bool },
+    ResConfigUpdate {
+        restart_required: bool,
+    },
     ReqRelayStatus,
     ResRelayStatus(RelayHealthInfo),
 }
@@ -2743,9 +2900,15 @@ pub struct PermissionEntry {
 pub enum IamPayload {
     // ---- Users ----
     ReqListUsers,
-    ResListUsers { users: Vec<UserInfo> },
-    ReqGetUser { user_id: i64 },
-    ResGetUser { user: UserInfo },
+    ResListUsers {
+        users: Vec<UserInfo>,
+    },
+    ReqGetUser {
+        user_id: i64,
+    },
+    ResGetUser {
+        user: UserInfo,
+    },
     ReqCreateUser {
         username: String,
         password: String,
@@ -2754,7 +2917,9 @@ pub enum IamPayload {
         role: String,
         group_ids: Vec<i64>,
     },
-    ResCreateUser { user_id: i64 },
+    ResCreateUser {
+        user_id: i64,
+    },
     ReqUpdateUser {
         user_id: i64,
         display_name: String,
@@ -2762,19 +2927,44 @@ pub enum IamPayload {
         is_active: bool,
         role: String,
     },
-    ReqDeleteUser { user_id: i64 },
-    ReqSetUserGroups { user_id: i64, group_ids: Vec<i64> },
-    ReqResetUserPassword { user_id: i64, new_password: String },
+    ReqDeleteUser {
+        user_id: i64,
+    },
+    ReqSetUserGroups {
+        user_id: i64,
+        group_ids: Vec<i64>,
+    },
+    ReqResetUserPassword {
+        user_id: i64,
+        new_password: String,
+    },
 
     // ---- Groups ----
     ReqListGroups,
-    ResListGroups { groups: Vec<GroupInfo> },
-    ReqCreateGroup { name: String, description: String },
-    ResCreateGroup { group_id: i64 },
-    ReqUpdateGroup { group_id: i64, name: String, description: String },
-    ReqDeleteGroup { group_id: i64 },
-    ReqGroupMembers { group_id: i64 },
-    ResGroupMembers { members: Vec<UserInfo> },
+    ResListGroups {
+        groups: Vec<GroupInfo>,
+    },
+    ReqCreateGroup {
+        name: String,
+        description: String,
+    },
+    ResCreateGroup {
+        group_id: i64,
+    },
+    ReqUpdateGroup {
+        group_id: i64,
+        name: String,
+        description: String,
+    },
+    ReqDeleteGroup {
+        group_id: i64,
+    },
+    ReqGroupMembers {
+        group_id: i64,
+    },
+    ResGroupMembers {
+        members: Vec<UserInfo>,
+    },
 
     // ---- Resource permissions (generyczna ACL) ----
     /// resource_type: 'model' | 'flow' | 'addon' | ...
@@ -2793,9 +2983,17 @@ pub enum IamPayload {
         subject_type: String,
         subject_id: i64,
     },
-    ReqListPermsForResource { resource_type: String, resource_id: String },
-    ReqListPermsForSubject { subject_type: String, subject_id: i64 },
-    ResListPermissions { entries: Vec<PermissionEntry> },
+    ReqListPermsForResource {
+        resource_type: String,
+        resource_id: String,
+    },
+    ReqListPermsForSubject {
+        subject_type: String,
+        subject_id: i64,
+    },
+    ResListPermissions {
+        entries: Vec<PermissionEntry>,
+    },
 
     // Generic OK dla mutacji (delete/update/set) bez specyficznego response.
     ResOk,
@@ -2811,11 +3009,18 @@ pub enum IamPayload {
 pub enum MessageBody {
     // ---- Meta (schema/handshake/keepalive) ----
     /// Klient -> serwer: sprawdz wersje protokolu przy handshake.
-    MetaSchemaVersionCheck { client_version: u16 },
+    MetaSchemaVersionCheck {
+        client_version: u16,
+    },
     /// Serwer -> klient: potwierdzenie (accepted=false => disconnect).
-    MetaSchemaVersionAck { server_version: u16, accepted: bool },
+    MetaSchemaVersionAck {
+        server_version: u16,
+        accepted: bool,
+    },
     /// Dwukierunkowy keepalive (WSS ping substitute, liczy RTT).
-    MetaHeartbeat { sent_at_epoch: u64 },
+    MetaHeartbeat {
+        sent_at_epoch: u64,
+    },
     /// Klient -> serwer: anuluj aktywny stream (match po correlation_id w envelope).
     MetaCancelStream,
 
@@ -2823,15 +3028,23 @@ pub enum MessageBody {
     /// Klient -> serwer: lista modeli (publiczne, Anonymous OK).
     ModelListRequest,
     /// Serwer -> klient: odpowiedz.
-    ModelListResponse { models: Vec<ModelSummary> },
+    ModelListResponse {
+        models: Vec<ModelSummary>,
+    },
 
     // ---- API Keys (R-LIST + W-CREATE + W-DELETE) ----
     ApiKeyListRequest,
-    ApiKeyListResponse { keys: Vec<ApiKeySummary> },
+    ApiKeyListResponse {
+        keys: Vec<ApiKeySummary>,
+    },
     ApiKeyCreateRequestBody(ApiKeyCreateRequest),
     ApiKeyCreateResponseBody(ApiKeyCreateResponse),
-    ApiKeyRevokeRequest { key_id: String },
-    ApiKeyRevokeResponse { deleted: bool },
+    ApiKeyRevokeRequest {
+        key_id: String,
+    },
+    ApiKeyRevokeResponse {
+        deleted: bool,
+    },
 
     // ---- Auth (W-ACTION + R-ONE) ----
     AuthLoginRequestBody(AuthLoginRequest),
@@ -2865,7 +3078,9 @@ pub enum MessageBody {
 
     // ---- Mesh peers (R-LIST + W-ACTION) ----
     MeshPeersListRequest,
-    MeshPeersListResponse { peers: Vec<MeshPeerSummary> },
+    MeshPeersListResponse {
+        peers: Vec<MeshPeerSummary>,
+    },
     MeshPairInitRequestBody(MeshPairInitRequest),
     MeshPairInitResponseBody(MeshPairInitResponse),
 
@@ -2904,13 +3119,19 @@ pub enum MessageBody {
 
     // ---- Prompts (R-LIST + R-ONE) ----
     PromptListRequest,
-    PromptListResponse { prompts: Vec<PromptSummary> },
-    PromptDetailRequest { prompt_id: String },
+    PromptListResponse {
+        prompts: Vec<PromptSummary>,
+    },
+    PromptDetailRequest {
+        prompt_id: String,
+    },
     PromptDetailResponse(PromptDetail),
 
     // ---- Registries (R-LIST) ----
     RegistryListRequest,
-    RegistryListResponse { registries: Vec<RegistrySummary> },
+    RegistryListResponse {
+        registries: Vec<RegistrySummary>,
+    },
 
     // ---- Audit (event push — server -> client) ----
     AuditEventBody(AuditEvent),
@@ -2925,61 +3146,114 @@ pub enum MessageBody {
 
     // ---- Portainer (R-LIST + R-STREAM dla logs) ----
     ContainerListRequest,
-    ContainerListResponse { containers: Vec<ContainerSummary> },
-    ContainerStartRequest { container_id: String },
-    ContainerStartResponse { started: bool },
-    ContainerStopRequest { container_id: String },
-    ContainerStopResponse { stopped: bool },
-    ContainerLogStreamRequest { container_id: String, follow: bool },
+    ContainerListResponse {
+        containers: Vec<ContainerSummary>,
+    },
+    ContainerStartRequest {
+        container_id: String,
+    },
+    ContainerStartResponse {
+        started: bool,
+    },
+    ContainerStopRequest {
+        container_id: String,
+    },
+    ContainerStopResponse {
+        stopped: bool,
+    },
+    ContainerLogStreamRequest {
+        container_id: String,
+        follow: bool,
+    },
     ContainerLogChunkBody(ContainerLogChunk),
 
     // ---- Voice profiles (R-LIST) ----
     VoiceProfileListRequest,
-    VoiceProfileListResponse { profiles: Vec<VoiceProfileSummary> },
+    VoiceProfileListResponse {
+        profiles: Vec<VoiceProfileSummary>,
+    },
 
     // ---- TTS rules (R-LIST + W-CREATE/UPDATE/DELETE) ----
     TtsRuleListRequest,
-    TtsRuleListResponse { rules: Vec<TtsRule> },
+    TtsRuleListResponse {
+        rules: Vec<TtsRule>,
+    },
     TtsRuleCreateRequest(TtsRule),
-    TtsRuleCreateResponse { rule_id: String },
-    TtsRuleDeleteRequest { rule_id: String },
-    TtsRuleDeleteResponse { deleted: bool },
+    TtsRuleCreateResponse {
+        rule_id: String,
+    },
+    TtsRuleDeleteRequest {
+        rule_id: String,
+    },
+    TtsRuleDeleteResponse {
+        deleted: bool,
+    },
 
     // ---- PII rules (spakowane w inner enum dla oszczednosci slotu) ----
     // Patrz NsightBody i VisionBody — limit 256 wariantow w MessageBody.
     PiiRuleBody(crate::pii::PiiRulePayload),
 
-
     // ---- Fast-path patterns ----
     FastPathListRequest,
-    FastPathListResponse { patterns: Vec<FastPathPattern> },
+    FastPathListResponse {
+        patterns: Vec<FastPathPattern>,
+    },
 
     // ---- Models (R-ONE + W-ACTION) ----
-    ModelDetailRequest { model_id: String },
+    ModelDetailRequest {
+        model_id: String,
+    },
     ModelDetailResponse(ModelDetail),
     ModelInstallRequestBody(ModelInstallRequest),
-    ModelInstallResponse { model_id: String, accepted: bool },
-    ModelDeleteRequest { model_id: String },
-    ModelDeleteResponse { deleted: bool },
+    ModelInstallResponse {
+        model_id: String,
+        accepted: bool,
+    },
+    ModelDeleteRequest {
+        model_id: String,
+    },
+    ModelDeleteResponse {
+        deleted: bool,
+    },
 
     // ---- Hub (R-LIST + R-STREAM dla download) ----
     HubEngineListRequest,
-    HubEngineListResponse { engines: Vec<HubEngineSummary> },
-    HubModelSearchRequest { query: String },
-    HubModelSearchResponse { results: Vec<HubModelSearchResult> },
+    HubEngineListResponse {
+        engines: Vec<HubEngineSummary>,
+    },
+    HubModelSearchRequest {
+        query: String,
+    },
+    HubModelSearchResponse {
+        results: Vec<HubModelSearchResult>,
+    },
     HubDownloadProgressBody(HubDownloadProgress),
 
     // ---- Flows (R-LIST + R-ONE + W-CREATE/UPDATE/DELETE + executions) ----
     FlowListRequest,
-    FlowListResponse { flows: Vec<FlowSummary> },
-    FlowDetailRequest { flow_id: String },
+    FlowListResponse {
+        flows: Vec<FlowSummary>,
+    },
+    FlowDetailRequest {
+        flow_id: String,
+    },
     FlowDetailResponse(FlowDetail),
     FlowCreateRequestBody(FlowCreateRequest),
-    FlowCreateResponse { flow_id: String },
-    FlowDeleteRequest { flow_id: String },
-    FlowDeleteResponse { deleted: bool },
-    FlowExecutionsListRequest { flow_id: String },
-    FlowExecutionsListResponse { executions: Vec<FlowExecutionSummary> },
+    FlowCreateResponse {
+        flow_id: String,
+    },
+    FlowDeleteRequest {
+        flow_id: String,
+    },
+    FlowDeleteResponse {
+        deleted: bool,
+    },
+    FlowExecutionsListRequest {
+        flow_id: String,
+    },
+    FlowExecutionsListResponse {
+        executions: Vec<FlowExecutionSummary>,
+    },
 
     // ---- Flows phase 3 (partial update, node templates, version history) ----
     FlowUpdateRequestBody(FlowUpdateRequest),
@@ -3008,20 +3282,31 @@ pub enum MessageBody {
     // ---- Subscription resume (client requests replay after reconnect) ----
     /// Klient -> serwer: zaresumuj subscription z tokenem ktory dostal w
     /// SubscribeResumeOffer przy ostatnim disconnect.
-    SubscribeResumeRequest { resume_token: Vec<u8> },
+    SubscribeResumeRequest {
+        resume_token: Vec<u8>,
+    },
     /// Serwer -> klient: ack/reject. Jesli accepted=true, subskrypcja jest
     /// odtworzona pod tym samym correlation_id i serwer zaraz wysle brakujace
     /// chunki z recorder buffer.
-    SubscribeResumeAck { accepted: bool, error: Option<String> },
+    SubscribeResumeAck {
+        accepted: bool,
+        error: Option<String>,
+    },
     /// Serwer -> klient: token ktory pozwoli na resume po disconnect.
     /// Wysylany RAZEM z IS_STREAM_END (envelope flag), opcjonalny.
-    SubscribeResumeOffer { resume_token: Vec<u8> },
+    SubscribeResumeOffer {
+        resume_token: Vec<u8>,
+    },
 
     // ---- Settings (R-LIST + W-UPDATE) ----
     SettingsListRequest,
-    SettingsListResponse { entries: Vec<SettingEntry> },
+    SettingsListResponse {
+        entries: Vec<SettingEntry>,
+    },
     SettingsUpdateRequestBody(SettingsUpdateRequest),
-    SettingsUpdateResponse { applied: u32 },
+    SettingsUpdateResponse {
+        applied: u32,
+    },
 
     // ---- Mesh & Network settings (enumeracja NIC + bind/advertise rules) ----
     // Skonsolidowane w `NetworkPayload` — 1 slot w enum (256-variant limit rkyv).
@@ -3144,6 +3429,11 @@ pub enum MessageBody {
     // ---- Deployments (single-variant, req+res+stream w inner enum) ----
     DeploymentBody(DeploymentPayload),
 
+    // ---- Services view (single-slot, every req+res packed into ServicePayload).
+    // Powers the GUI Services tab + chat model picker. Multi-node aggregation
+    // is handled in a later step (Krok N5) — N2 returns local-only data.
+    ServiceBody(ServicePayload),
+
     // ---- System events (single-variant, push-only unsolicited w inner enum) ----
     // Oszczedza sloty variantowe — dla wszystkich server-push eventow systemowych
     // (service status, mesh peer status, deployment progress summary itd.).
@@ -3184,10 +3474,18 @@ mod tests {
     fn sample_model() -> ModelSummary {
         ModelSummary {
             id: "llama-3.2-1b-instruct".to_string(),
+            model_name: "llama-3.2-1b-instruct".to_string(),
             display_name: "meta-llama/Llama-3.2-1B-Instruct".to_string(),
             category: "llm".to_string(),
             engine_id: "llama-cpp".to_string(),
+            service_id: 1,
             availability: "ready".to_string(),
+            transport: "http_direct".to_string(),
+            endpoint_url: Some("http://127.0.0.1:8080".to_string()),
+            capabilities: vec!["chat".to_string()],
+            context_length: Some(4096),
+            quantization: None,
+            is_default: true,
         }
     }
 
@@ -3507,12 +3805,11 @@ mod tests {
 
     #[test]
     fn consolidated_trust_event_payload_round_trip() {
-        let revoked =
-            MeshTrustEventPayload::Revoked(MeshTrustRevokedEvent {
-                revoked_node_id: [0x11u8; 32],
-                reason: "replay attack".into(),
-                revoked_at_epoch: 1_700_600_000,
-            });
+        let revoked = MeshTrustEventPayload::Revoked(MeshTrustRevokedEvent {
+            revoked_node_id: [0x11u8; 32],
+            reason: "replay attack".into(),
+            revoked_at_epoch: 1_700_600_000,
+        });
         let sync = MeshTrustEventPayload::KeysSync(MeshTrustedKeysSyncEvent {
             trusted_keys: vec![[7u8; 32]],
             epoch: 9,

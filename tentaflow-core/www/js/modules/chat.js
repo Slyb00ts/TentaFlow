@@ -9,7 +9,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, toast, apiGet } from '/js/utils.js';
+import { byId, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { measureItemHeight, getDefaultFont, getDefaultLineHeight } from '/js/lib/text-measure.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
@@ -359,11 +359,11 @@ const ChatScreen = {
     nextMsgId = maxId + 1;
 
     try {
-      // REST /api/models is the unified surface fed by services +
+      // Binary RPC `ModelListRequest` is the unified surface fed by services +
       // model_registry. Chat only routes "chat" capable models; whisper /
       // xtts rows would otherwise crash dispatch with "model not found in
       // configuration".
-      const all = await apiGet('/api/models');
+      const all = await ApiBinary.list('modelListRequest', { arrayKey: 'models' });
       const list = Array.isArray(all) ? all : [];
       const chatOnly = list.filter((m) => {
         const caps = Array.isArray(m.capabilities) ? m.capabilities : [];

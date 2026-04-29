@@ -20,7 +20,6 @@ pub mod api_pii_rules;
 pub mod api_profiling;
 pub mod api_prompts;
 pub mod api_registries;
-pub mod api_services;
 pub mod api_services_manifest;
 pub mod api_tts_rules;
 pub mod auth;

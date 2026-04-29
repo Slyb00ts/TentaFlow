@@ -28,12 +28,11 @@ static MIVOLO_AGE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static MIVOLO_GENDER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static HSEMOTION_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static EMONET_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static YOLOV8N_POSE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static MOVENET_LIGHTNING_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 fn models_root() -> Option<PathBuf> {
-    let base = dirs::data_local_dir()?
-        .join("tentaflow")
-        .join("models")
-        .join("vision");
+    let base = crate::paths::models_root().join("vision");
     std::fs::create_dir_all(&base).ok();
     Some(base)
 }
@@ -64,6 +63,71 @@ fn extract_blob(name: &str, blob: &[u8]) -> Option<PathBuf> {
         path.display()
     );
     Some(path)
+}
+
+fn download_model_file(name: &str, url: &str) -> Option<PathBuf> {
+    let dir = models_root()?;
+    let path = dir.join(name);
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() >= 100 * 1024 {
+            return Some(path);
+        }
+    }
+
+    let tmp = path.with_extension("onnx.download");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .ok()?;
+    let mut response = match client.get(url).send() {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!("vision_models: download {} failed: {}", name, e);
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            "vision_models: download {} returned HTTP {}",
+            name,
+            response.status()
+        );
+        return None;
+    }
+
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("vision_models: create {} failed: {}", tmp.display(), e);
+            return None;
+        }
+    };
+    if let Err(e) = std::io::copy(&mut response, &mut file) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("vision_models: write {} failed: {}", tmp.display(), e);
+        return None;
+    }
+    if let Ok(meta) = std::fs::metadata(&tmp) {
+        if meta.len() < 100 * 1024 {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("vision_models: downloaded {} is too small", name);
+            return None;
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("vision_models: move {} failed: {}", path.display(), e);
+        return None;
+    }
+    tracing::info!("vision_models: downloaded {} -> {}", name, path.display());
+    Some(path)
+}
+
+fn ensure_blob_or_download(name: &str, blob: &[u8], url: &str) -> Option<PathBuf> {
+    match extract_blob(name, blob) {
+        Some(path) => Some(path),
+        None => download_model_file(name, url),
+    }
 }
 
 /// Sciezka do yolov8-face.onnx (faktycznie YOLOv11n-face — patrz setup.sh).
@@ -105,5 +169,29 @@ pub fn hsemotion_path() -> Option<PathBuf> {
 pub fn emonet_path() -> Option<PathBuf> {
     EMONET_PATH
         .get_or_init(|| extract_blob("emonet.onnx", EMONET_ONNX))
+        .clone()
+}
+
+pub fn yolov8n_pose_path() -> Option<PathBuf> {
+    YOLOV8N_POSE_PATH
+        .get_or_init(|| {
+            ensure_blob_or_download(
+                "yolov8n-pose.onnx",
+                YOLOV8N_POSE_ONNX,
+                "https://huggingface.co/Xenova/yolov8n-pose/resolve/main/onnx/model.onnx",
+            )
+        })
+        .clone()
+}
+
+pub fn movenet_lightning_path() -> Option<PathBuf> {
+    MOVENET_LIGHTNING_PATH
+        .get_or_init(|| {
+            ensure_blob_or_download(
+                "movenet-lightning.onnx",
+                MOVENET_LIGHTNING_ONNX,
+                "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/main/onnx/model.onnx",
+            )
+        })
         .clone()
 }

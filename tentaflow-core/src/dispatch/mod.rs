@@ -438,6 +438,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::DeploymentPayload::StreamChunk(_) => "DeploymentStreamChunk",
             tentaflow_protocol::DeploymentPayload::StreamEnd(_) => "DeploymentStreamEnd",
         },
+        MessageBody::ServiceBody(p) => match p {
+            tentaflow_protocol::ServicePayload::ReqList(_) => "ServiceListRequest",
+            tentaflow_protocol::ServicePayload::ResList(_) => "ServiceListResponse",
+            tentaflow_protocol::ServicePayload::ReqStop(_) => "ServiceStopRequest",
+            tentaflow_protocol::ServicePayload::ResStop(_) => "ServiceStopResponse",
+            tentaflow_protocol::ServicePayload::ReqDelete(_) => "ServiceDeleteRequest",
+            tentaflow_protocol::ServicePayload::ResDelete(_) => "ServiceDeleteResponse",
+            tentaflow_protocol::ServicePayload::ReqPin(_) => "ServicePinRequest",
+            tentaflow_protocol::ServicePayload::ResPin(_) => "ServicePinResponse",
+            tentaflow_protocol::ServicePayload::ReqPause(_) => "ServicePauseRequest",
+            tentaflow_protocol::ServicePayload::ResPause(_) => "ServicePauseResponse",
+            tentaflow_protocol::ServicePayload::ReqRename(_) => "ServiceRenameRequest",
+            tentaflow_protocol::ServicePayload::ResRename(_) => "ServiceRenameResponse",
+        },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
                 "ServiceStatusChanged"

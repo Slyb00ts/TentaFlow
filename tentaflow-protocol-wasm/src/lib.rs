@@ -20,31 +20,29 @@ use tentaflow_protocol::{
     envelope::{message_kind, Envelope, EnvelopeFlags, Routing},
     message_body::{
         AddonAdminOnlySetRequest, AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest,
-        AddonShowInCatalogSetRequest,
         AddonInstallRequest, AddonLogsRequest, AddonNetworkRulesGetRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
         AddonOAuthConfigSetRequest, AddonOAuthLinkedAccountsRequest, AddonOAuthReauthorizeRequest,
-        AddonOAuthRevokeRequest, AddonOAuthTestConnectionRequest,
-        AddonPermissionCatalogRequest, AddonPermissionCheckRequest,
-        AddonPermissionDefaultSetRequest, AddonPermissionMatrixRequest, AddonPermissionSetRequest,
-        AddonReloadRequest, AddonResourcesGetRequest, AddonResourcesSetRequest, AddonToggleRequest,
-        AddonToolsRequest, AddonUninstallRequest, AddonVisibilityListRequest,
-        AddonVisibilitySetRequest, ApiKeyCreateRequest,
-        AuthLoginRequest, ChatMessage, ChatStreamRequest, ClusterAddMemberRequest,
-        ClusterCreateRequest, ClusterDeleteRequest, ClusterDetailRequest,
-        ClusterProbeStreamRequest, ClusterRemoveMemberRequest, ClusterUpdateRequest,
-        FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest, FlowVersionListRequest,
-        FlowVersionRestoreRequest, MeshConnectRequest, MeshNodeCommandRequest,
-        MeshNodeNetworkConfigRequest, MeshPairInitRequest, MeshPairingConfirmRequest,
-        MeshPairingRejectRequest, MeshPairingStartRequest, MeshTrustRetrustRequest,
-        MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest, ModelAliasDeleteRequest,
-        ModelAliasUpdateRequest, ModelInstallRequest, MyOAuthAccountsListRequest,
-        NoteCreateRequest, NoteDeleteRequest, NoteDetailRequest, NoteSetPinnedRequest,
-        NoteUpdateRequest, NotesListRequest, NotesRequest, NotesResponse, ProtocolError,
-        ProtocolErrorCode, ServiceCreateRequest, ServiceDeployRequest,
-        ServiceManifestDeployRequest, ServiceUpdateRequest, SettingEntry, SettingsUpdateRequest,
-        SsoProviderCreateRequest, SsoProviderDeleteRequest, TranslateRequest, TtsRule,
+        AddonOAuthRevokeRequest, AddonOAuthTestConnectionRequest, AddonPermissionCatalogRequest,
+        AddonPermissionCheckRequest, AddonPermissionDefaultSetRequest,
+        AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
+        AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
+        AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVisibilityListRequest,
+        AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest, ChatMessage,
+        ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
+        ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
+        ClusterUpdateRequest, FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
+        FlowVersionListRequest, FlowVersionRestoreRequest, MeshConnectRequest,
+        MeshNodeCommandRequest, MeshNodeNetworkConfigRequest, MeshPairInitRequest,
+        MeshPairingConfirmRequest, MeshPairingRejectRequest, MeshPairingStartRequest,
+        MeshTrustRetrustRequest, MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest,
+        ModelAliasDeleteRequest, ModelAliasUpdateRequest, ModelInstallRequest,
+        MyOAuthAccountsListRequest, NoteCreateRequest, NoteDeleteRequest, NoteDetailRequest,
+        NoteSetPinnedRequest, NoteUpdateRequest, NotesListRequest, NotesRequest, NotesResponse,
+        ProtocolError, ProtocolErrorCode, ServiceManifestDeployRequest, SettingEntry,
+        SettingsUpdateRequest, SsoProviderCreateRequest, SsoProviderDeleteRequest,
+        TranslateRequest, TtsRule,
     },
     SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
 };
@@ -266,7 +264,10 @@ pub fn encode_api_key_list_request() -> Result<Vec<u8>, JsError> {
 
 /// MessageBody::ApiKeyCreateRequest { name, scopes }.
 #[wasm_bindgen(js_name = encodeApiKeyCreateRequest)]
-pub fn encode_api_key_create_request(name: String, scopes: Vec<String>) -> Result<Vec<u8>, JsError> {
+pub fn encode_api_key_create_request(
+    name: String,
+    scopes: Vec<String>,
+) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
         name,
         scopes,
@@ -350,16 +351,18 @@ pub fn encode_cluster_update_request(
     health_check_interval_ms: Option<u32>,
     timeout_ms: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ClusterUpdateRequestBody(ClusterUpdateRequest {
-        cluster_id,
-        name,
-        description,
-        strategy,
-        failover_enabled,
-        failover_target,
-        health_check_interval_ms,
-        timeout_ms,
-    }))
+    encode_body_inner(&MessageBody::ClusterUpdateRequestBody(
+        ClusterUpdateRequest {
+            cluster_id,
+            name,
+            description,
+            strategy,
+            failover_enabled,
+            failover_target,
+            health_check_interval_ms,
+            timeout_ms,
+        },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -372,9 +375,9 @@ pub fn encode_cluster_list_request() -> Result<Vec<u8>, JsError> {
 /// MessageBody::ClusterDetailRequest { cluster_id }.
 #[wasm_bindgen(js_name = encodeClusterDetailRequest)]
 pub fn encode_cluster_detail_request(cluster_id: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ClusterDetailRequestBody(ClusterDetailRequest {
-        cluster_id,
-    }))
+    encode_body_inner(&MessageBody::ClusterDetailRequestBody(
+        ClusterDetailRequest { cluster_id },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -389,24 +392,26 @@ pub fn encode_cluster_create_request(
     health_check_interval_ms: u32,
     timeout_ms: u32,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ClusterCreateRequestBody(ClusterCreateRequest {
-        name,
-        description,
-        strategy,
-        failover_enabled,
-        failover_target,
-        health_check_interval_ms,
-        timeout_ms,
-    }))
+    encode_body_inner(&MessageBody::ClusterCreateRequestBody(
+        ClusterCreateRequest {
+            name,
+            description,
+            strategy,
+            failover_enabled,
+            failover_target,
+            health_check_interval_ms,
+            timeout_ms,
+        },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
 /// MessageBody::ClusterDeleteRequest { cluster_id }.
 #[wasm_bindgen(js_name = encodeClusterDeleteRequest)]
 pub fn encode_cluster_delete_request(cluster_id: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ClusterDeleteRequestBody(ClusterDeleteRequest {
-        cluster_id,
-    }))
+    encode_body_inner(&MessageBody::ClusterDeleteRequestBody(
+        ClusterDeleteRequest { cluster_id },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -418,12 +423,14 @@ pub fn encode_cluster_add_member_request(
     interface_type: Option<String>,
     interface_speed_mbps: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ClusterAddMemberRequestBody(ClusterAddMemberRequest {
-        cluster_id,
-        node_id,
-        interface_type,
-        interface_speed_mbps,
-    }))
+    encode_body_inner(&MessageBody::ClusterAddMemberRequestBody(
+        ClusterAddMemberRequest {
+            cluster_id,
+            node_id,
+            interface_type,
+            interface_speed_mbps,
+        },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -434,7 +441,10 @@ pub fn encode_cluster_remove_member_request(
     node_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterRemoveMemberRequestBody(
-        ClusterRemoveMemberRequest { cluster_id, node_id },
+        ClusterRemoveMemberRequest {
+            cluster_id,
+            node_id,
+        },
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -677,13 +687,15 @@ pub fn encode_settings_update_single(
     value: String,
     is_secret: bool,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
-        entries: vec![SettingEntry {
-            key,
-            value,
-            is_secret,
-        }],
-    }))
+    encode_body_inner(&MessageBody::SettingsUpdateRequestBody(
+        SettingsUpdateRequest {
+            entries: vec![SettingEntry {
+                key,
+                value,
+                is_secret,
+            }],
+        },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -812,31 +824,23 @@ pub fn encode_deployment_log_stream_request(
     replay_tail: bool,
 ) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{DeploymentLogStreamRequest, DeploymentPayload};
-    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqLogStream(
-        DeploymentLogStreamRequest {
+    encode_body_inner(&MessageBody::DeploymentBody(
+        DeploymentPayload::ReqLogStream(DeploymentLogStreamRequest {
             deploy_id,
             replay_tail,
-        },
-    )))
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy). Force flag asks
-/// backend to terminate active sessions (agents) rather than returning
-/// `active_sessions`.
-#[wasm_bindgen(js_name = encodeServiceRedeployRequest)]
-pub fn encode_service_redeploy_request(
-    service_id: f64,
-    force_if_active_sessions: bool,
-) -> Result<Vec<u8>, JsError> {
-    use tentaflow_protocol::{DeploymentPayload, ServiceRedeployRequest};
-    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy(
-        ServiceRedeployRequest {
-            service_id: service_id as i64,
-            force_if_active_sessions,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
+// `encodeServiceRedeployRequest` was removed alongside the legacy
+// `DeploymentPayload::ReqRedeploy` variant — Krok N2 keeps deploy as a one-shot
+// request; rerunning a deploy is "delete service + deploy fresh".
+#[allow(dead_code)]
+fn _service_redeploy_request_removed() -> Result<Vec<u8>, JsError> {
+    Err(JsError::new(
+        "encodeServiceRedeployRequest removed in Krok N2",
+    ))
 }
 
 // ---- Meeting VNC tunnel (same-node websockify bridge) ----
@@ -1370,9 +1374,9 @@ pub fn encode_flow_node_templates_list_request() -> Result<Vec<u8>, JsError> {
 /// MessageBody::FlowVersionListRequest { flow_id }.
 #[wasm_bindgen(js_name = encodeFlowVersionListRequest)]
 pub fn encode_flow_version_list_request(flow_id: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::FlowVersionListRequestBody(FlowVersionListRequest {
-        flow_id,
-    }))
+    encode_body_inner(&MessageBody::FlowVersionListRequestBody(
+        FlowVersionListRequest { flow_id },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1382,10 +1386,12 @@ pub fn encode_flow_version_get_request(
     flow_id: String,
     version_id: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::FlowVersionGetRequestBody(FlowVersionGetRequest {
-        flow_id,
-        version_id,
-    }))
+    encode_body_inner(&MessageBody::FlowVersionGetRequestBody(
+        FlowVersionGetRequest {
+            flow_id,
+            version_id,
+        },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1404,119 +1410,93 @@ pub fn encode_flow_version_restore_request(
     .map_err(|e| JsError::new(&e))
 }
 
-// --- Services -------------------------------------------------------------
+// --- Services (Krok N2 — packed in `MessageBody::ServiceBody`) -----------
 
-/// MessageBody::ServiceListRequest (unit).
+/// MessageBody::ServiceBody(ServicePayload::ReqList). Empty filter values are
+/// treated as "no filter".
 #[wasm_bindgen(js_name = encodeServiceListRequest)]
-pub fn encode_service_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ServiceListRequest).map_err(|e| JsError::new(&e))
+pub fn encode_service_list_request(
+    engine_id_filter: Option<String>,
+    category_filter: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceListRequest, ServicePayload};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqList(
+        ServiceListRequest {
+            engine_id_filter: engine_id_filter.filter(|s| !s.is_empty()),
+            category_filter: category_filter.filter(|s| !s.is_empty()),
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceStopRequest { service_id }.
+/// MessageBody::ServiceBody(ServicePayload::ReqStop) — stops the runtime but
+/// keeps the row.
 #[wasm_bindgen(js_name = encodeServiceStopRequest)]
-pub fn encode_service_stop_request(service_id: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ServiceStopRequest { service_id })
-        .map_err(|e| JsError::new(&e))
-}
-
-/// MessageBody::ServiceFlagsUpdateRequest { service_id, pinned, paused }.
-/// pinned/paused jako i32 (-1 = nie zmieniaj, 0 = false, 1 = true).
-#[wasm_bindgen(js_name = encodeServiceFlagsUpdateRequest)]
-pub fn encode_service_flags_update_request(
-    service_id: String,
-    pinned: i32,
-    paused: i32,
-) -> Result<Vec<u8>, JsError> {
-    let pinned_opt = if pinned < 0 { None } else { Some(pinned != 0) };
-    let paused_opt = if paused < 0 { None } else { Some(paused != 0) };
-    encode_body_inner(&MessageBody::ServiceFlagsBody(
-        tentaflow_protocol::ServiceFlagsPayload::Req(
-            tentaflow_protocol::ServiceFlagsUpdateRequest {
-                service_id,
-                pinned: pinned_opt,
-                paused: paused_opt,
-            },
-        ),
-    ))
+pub fn encode_service_stop_request(service_id: f64) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePayload, ServiceStopRequest};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqStop(
+        ServiceStopRequest {
+            service_id: service_id as i64,
+        },
+    )))
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceDeployRequest { engine_id, model_id, deploy_method, node_id }.
-/// node_id MUSI byc 32 bajtami.
-#[wasm_bindgen(js_name = encodeServiceDeployRequest)]
-pub fn encode_service_deploy_request(
-    engine_id: String,
-    model_id: String,
-    deploy_method: String,
-    node_id: &[u8],
-) -> Result<Vec<u8>, JsError> {
-    if node_id.len() != 32 {
-        return Err(JsError::new("node_id must be exactly 32 bytes"));
-    }
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(node_id);
-    encode_body_inner(&MessageBody::ServiceDeployRequestBody(ServiceDeployRequest {
-        engine_id,
-        model_id,
-        deploy_method,
-        node_id: buf,
-    }))
+/// MessageBody::ServiceBody(ServicePayload::ReqDelete) — stop + delete the row
+/// (cascades to `model_registry`).
+#[wasm_bindgen(js_name = encodeServiceDeleteRequest)]
+pub fn encode_service_delete_request(service_id: f64) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceDeleteRequest, ServicePayload};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqDelete(
+        ServiceDeleteRequest {
+            service_id: service_id as i64,
+        },
+    )))
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceCreateRequest { name, service_type, strategy, config_json,
-/// node_id?, cluster_id? }. `node_id` jest hex-enkodowanym ciagiem 64 znakow
-/// (32 bajty), pusty string traktowany jako None.
-#[wasm_bindgen(js_name = encodeServiceCreateRequest)]
-pub fn encode_service_create_request(
-    name: String,
-    service_type: String,
-    strategy: String,
-    config_json: String,
-    node_id: Option<String>,
-    cluster_id: Option<String>,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ServiceCreateRequestBody(ServiceCreateRequest {
-        name,
-        service_type,
-        strategy,
-        config_json,
-        node_id: node_id.filter(|s| !s.is_empty()),
-        cluster_id: cluster_id.filter(|s| !s.is_empty()),
-    }))
+/// MessageBody::ServiceBody(ServicePayload::ReqPin) — toggles the pin flag
+/// used by the supervisor for auto-respawn.
+#[wasm_bindgen(js_name = encodeServicePinRequest)]
+pub fn encode_service_pin_request(service_id: f64, pinned: bool) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePayload, ServicePinRequest};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqPin(
+        ServicePinRequest {
+            service_id: service_id as i64,
+            pinned,
+        },
+    )))
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceUpdateRequest { id, name, service_type, strategy, status,
-/// config_json, node_id?, cluster_id? }.
-#[wasm_bindgen(js_name = encodeServiceUpdateRequest)]
-pub fn encode_service_update_request(
-    id: String,
-    name: String,
-    service_type: String,
-    strategy: String,
-    status: String,
-    config_json: String,
-    node_id: Option<String>,
-    cluster_id: Option<String>,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ServiceUpdateRequestBody(ServiceUpdateRequest {
-        id,
-        name,
-        service_type,
-        strategy,
-        status,
-        config_json,
-        node_id: node_id.filter(|s| !s.is_empty()),
-        cluster_id: cluster_id.filter(|s| !s.is_empty()),
-    }))
+/// MessageBody::ServiceBody(ServicePayload::ReqPause) — supervisor leaves a
+/// paused service untouched.
+#[wasm_bindgen(js_name = encodeServicePauseRequest)]
+pub fn encode_service_pause_request(service_id: f64, paused: bool) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePauseRequest, ServicePayload};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqPause(
+        ServicePauseRequest {
+            service_id: service_id as i64,
+            paused,
+        },
+    )))
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceQuicStatusRequest (unit). Periodyczne polling QUIC.
-#[wasm_bindgen(js_name = encodeServiceQuicStatusRequest)]
-pub fn encode_service_quic_status_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ServiceQuicStatusRequest).map_err(|e| JsError::new(&e))
+/// MessageBody::ServiceBody(ServicePayload::ReqRename) — sets `display_name`.
+#[wasm_bindgen(js_name = encodeServiceRenameRequest)]
+pub fn encode_service_rename_request(
+    service_id: f64,
+    display_name: String,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePayload, ServiceRenameRequest};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqRename(
+        ServiceRenameRequest {
+            service_id: service_id as i64,
+            display_name,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
 }
 
 // --- Prompts --------------------------------------------------------------
@@ -1530,8 +1510,7 @@ pub fn encode_prompt_list_request() -> Result<Vec<u8>, JsError> {
 /// MessageBody::PromptDetailRequest { prompt_id }.
 #[wasm_bindgen(js_name = encodePromptDetailRequest)]
 pub fn encode_prompt_detail_request(prompt_id: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::PromptDetailRequest { prompt_id })
-        .map_err(|e| JsError::new(&e))
+    encode_body_inner(&MessageBody::PromptDetailRequest { prompt_id }).map_err(|e| JsError::new(&e))
 }
 
 // --- Notes ----------------------------------------------------------------
@@ -1612,8 +1591,7 @@ use tentaflow_protocol::{
     MeetingActiveSessionRequest, MeetingPayload, MeetingSessionDetailRequest,
     MeetingSessionLeaveRequest, MeetingSessionListRequest, MeetingSessionStartRequest,
     MeetingSettingKv, MeetingSettingsGetRequest, MeetingSettingsUpdateRequest,
-    MeetingSummariesListRequest, MeetingTranscriptExportRequest,
-    MeetingTranscriptsListRequest,
+    MeetingSummariesListRequest, MeetingTranscriptExportRequest, MeetingTranscriptsListRequest,
 };
 
 #[wasm_bindgen(js_name = encodeMeetingSessionStartRequest)]
@@ -1673,16 +1651,13 @@ pub fn encode_meeting_session_detail(
 }
 
 #[wasm_bindgen(js_name = encodeMeetingTranscriptsListRequest)]
-pub fn encode_meeting_transcripts_list(
-    session_id: f64,
-    since_ms: f64,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqTranscriptsList(
-        MeetingTranscriptsListRequest {
+pub fn encode_meeting_transcripts_list(session_id: f64, since_ms: f64) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(
+        MeetingPayload::ReqTranscriptsList(MeetingTranscriptsListRequest {
             session_id: session_id as i64,
             since_ms: since_ms as i64,
-        },
-    )))
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1724,9 +1699,9 @@ pub fn encode_meeting_settings_update(settings: JsValue) -> Result<Vec<u8>, JsEr
             .ok_or_else(|| JsError::new("value musi byc string"))?;
         kvs.push(MeetingSettingKv { key, value });
     }
-    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSettingsUpdate(
-        MeetingSettingsUpdateRequest { settings: kvs },
-    )))
+    encode_body_inner(&MessageBody::MeetingBody(
+        MeetingPayload::ReqSettingsUpdate(MeetingSettingsUpdateRequest { settings: kvs }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1746,12 +1721,12 @@ pub fn encode_meeting_action_items_list(
     meeting_key: String,
     status_filter: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqActionItemsList(
-        MeetingActionItemsListRequest {
+    encode_body_inner(&MessageBody::MeetingBody(
+        MeetingPayload::ReqActionItemsList(MeetingActionItemsListRequest {
             meeting_key,
             status_filter,
-        },
-    )))
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1771,9 +1746,9 @@ pub fn encode_meeting_action_item_status_update(
 
 #[wasm_bindgen(js_name = encodeMeetingTranscriptExportRequest)]
 pub fn encode_meeting_transcript_export(meeting_key: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqTranscriptExport(
-        MeetingTranscriptExportRequest { meeting_key },
-    )))
+    encode_body_inner(&MessageBody::MeetingBody(
+        MeetingPayload::ReqTranscriptExport(MeetingTranscriptExportRequest { meeting_key }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1813,8 +1788,7 @@ pub fn encode_tts_rule_create_request(
 /// MessageBody::TtsRuleDeleteRequest { rule_id }.
 #[wasm_bindgen(js_name = encodeTtsRuleDeleteRequest)]
 pub fn encode_tts_rule_delete_request(rule_id: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::TtsRuleDeleteRequest { rule_id })
-        .map_err(|e| JsError::new(&e))
+    encode_body_inner(&MessageBody::TtsRuleDeleteRequest { rule_id }).map_err(|e| JsError::new(&e))
 }
 
 // --- PII rules ------------------------------------------------------------
@@ -1889,9 +1863,9 @@ pub fn encode_settings_update_batch(
             is_secret: secret != 0,
         })
         .collect();
-    encode_body_inner(&MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
-        entries,
-    }))
+    encode_body_inner(&MessageBody::SettingsUpdateRequestBody(
+        SettingsUpdateRequest { entries },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1901,6 +1875,163 @@ pub fn encode_settings_update_batch(
 
 fn set(obj: &js_sys::Object, key: &str, value: JsValue) {
     let _ = js_sys::Reflect::set(obj, &key.into(), &value);
+}
+
+/// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
+/// `ServicePayload` enum into per-variant JS objects with snake_case fields
+/// matching the Rust struct names. Both camelCase and snake_case keys are
+/// emitted so the JS side can pick whichever convention it already uses.
+fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::ServicePayload) {
+    use tentaflow_protocol::ServicePayload as SP;
+    match payload {
+        SP::ReqList(r) => {
+            set(obj, "variant", "ServiceListRequest".into());
+            if let Some(f) = r.engine_id_filter {
+                set(obj, "engineIdFilter", f.into());
+            }
+            if let Some(f) = r.category_filter {
+                set(obj, "categoryFilter", f.into());
+            }
+        }
+        SP::ResList(r) => {
+            set(obj, "variant", "ServiceListResponse".into());
+            let arr = js_sys::Array::new();
+            for s in r.services {
+                let item = js_sys::Object::new();
+                set(&item, "id", (s.id as f64).into());
+                set(&item, "engineId", s.engine_id.clone().into());
+                set(&item, "engine_id", s.engine_id.into());
+                set(&item, "category", s.category.into());
+                set(&item, "displayName", s.display_name.clone().into());
+                set(&item, "display_name", s.display_name.into());
+                set(&item, "deployMethod", s.deploy_method.clone().into());
+                set(&item, "deploy_method", s.deploy_method.into());
+                set(&item, "transport", s.transport.into());
+                set(&item, "status", s.status.into());
+                set(&item, "pinned", s.pinned.into());
+                set(&item, "paused", s.paused.into());
+                if let Some(pid) = s.runtime_pid {
+                    set(&item, "runtimePid", (pid as f64).into());
+                    set(&item, "runtime_pid", (pid as f64).into());
+                }
+                if let Some(p) = s.runtime_port {
+                    set(&item, "runtimePort", (p as u32).into());
+                    set(&item, "runtime_port", (p as u32).into());
+                }
+                if let Some(p) = s.sidecar_quic_port {
+                    set(&item, "sidecarQuicPort", (p as u32).into());
+                    set(&item, "sidecar_quic_port", (p as u32).into());
+                }
+                if let Some(url) = s.endpoint_url {
+                    set(&item, "endpointUrl", url.clone().into());
+                    set(&item, "endpoint_url", url.into());
+                }
+                set(&item, "restartCount", s.restart_count.into());
+                set(&item, "restart_count", s.restart_count.into());
+                if let Some(err) = s.health_last_err {
+                    set(&item, "healthLastErr", err.clone().into());
+                    set(&item, "health_last_err", err.into());
+                }
+                set(&item, "createdAt", s.created_at.clone().into());
+                set(&item, "created_at", s.created_at.into());
+                set(&item, "updatedAt", s.updated_at.clone().into());
+                set(&item, "updated_at", s.updated_at.into());
+
+                let models = js_sys::Array::new();
+                for m in s.models {
+                    let m_item = js_sys::Object::new();
+                    set(&m_item, "modelName", m.model_name.clone().into());
+                    set(&m_item, "model_name", m.model_name.into());
+                    if let Some(d) = m.display_name {
+                        set(&m_item, "displayName", d.clone().into());
+                        set(&m_item, "display_name", d.into());
+                    }
+                    let caps = js_sys::Array::new();
+                    for c in m.capabilities {
+                        caps.push(&JsValue::from_str(&c));
+                    }
+                    set(&m_item, "capabilities", caps.into());
+                    if let Some(ctx) = m.context_length {
+                        set(&m_item, "contextLength", ctx.into());
+                        set(&m_item, "context_length", ctx.into());
+                    }
+                    if let Some(q) = m.quantization {
+                        set(&m_item, "quantization", q.into());
+                    }
+                    set(&m_item, "isDefault", m.is_default.into());
+                    set(&m_item, "is_default", m.is_default.into());
+                    models.push(&m_item.into());
+                }
+                set(&item, "models", models.into());
+                arr.push(&item.into());
+            }
+            set(obj, "services", arr.into());
+        }
+        SP::ReqStop(r) => {
+            set(obj, "variant", "ServiceStopRequest".into());
+            set(obj, "serviceId", (r.service_id as f64).into());
+            set(obj, "service_id", (r.service_id as f64).into());
+        }
+        SP::ResStop(r) => {
+            set(obj, "variant", "ServiceStopResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqDelete(r) => {
+            set(obj, "variant", "ServiceDeleteRequest".into());
+            set(obj, "serviceId", (r.service_id as f64).into());
+            set(obj, "service_id", (r.service_id as f64).into());
+        }
+        SP::ResDelete(r) => {
+            set(obj, "variant", "ServiceDeleteResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqPin(r) => {
+            set(obj, "variant", "ServicePinRequest".into());
+            set(obj, "serviceId", (r.service_id as f64).into());
+            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "pinned", r.pinned.into());
+        }
+        SP::ResPin(r) => {
+            set(obj, "variant", "ServicePinResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqPause(r) => {
+            set(obj, "variant", "ServicePauseRequest".into());
+            set(obj, "serviceId", (r.service_id as f64).into());
+            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "paused", r.paused.into());
+        }
+        SP::ResPause(r) => {
+            set(obj, "variant", "ServicePauseResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqRename(r) => {
+            set(obj, "variant", "ServiceRenameRequest".into());
+            set(obj, "serviceId", (r.service_id as f64).into());
+            set(obj, "service_id", (r.service_id as f64).into());
+            set(obj, "displayName", r.display_name.clone().into());
+            set(obj, "display_name", r.display_name.into());
+        }
+        SP::ResRename(r) => {
+            set(obj, "variant", "ServiceRenameResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+    }
 }
 
 /// Dekoduje rkyv-zakodowany MessageBody na JS object.
@@ -1941,12 +2072,35 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             for m in models {
                 let item = js_sys::Object::new();
                 set(&item, "id", m.id.into());
+                set(&item, "modelName", m.model_name.clone().into());
+                set(&item, "model_name", m.model_name.into());
                 set(&item, "displayName", m.display_name.clone().into());
                 set(&item, "display_name", m.display_name.into());
                 set(&item, "category", m.category.into());
                 set(&item, "engineId", m.engine_id.clone().into());
                 set(&item, "engine_id", m.engine_id.into());
+                set(&item, "serviceId", (m.service_id as f64).into());
+                set(&item, "service_id", (m.service_id as f64).into());
                 set(&item, "availability", m.availability.into());
+                set(&item, "transport", m.transport.into());
+                if let Some(url) = m.endpoint_url {
+                    set(&item, "endpointUrl", url.clone().into());
+                    set(&item, "endpoint_url", url.into());
+                }
+                let caps = js_sys::Array::new();
+                for c in m.capabilities {
+                    caps.push(&JsValue::from_str(&c));
+                }
+                set(&item, "capabilities", caps.into());
+                if let Some(ctx) = m.context_length {
+                    set(&item, "contextLength", ctx.into());
+                    set(&item, "context_length", ctx.into());
+                }
+                if let Some(q) = m.quantization {
+                    set(&item, "quantization", q.into());
+                }
+                set(&item, "isDefault", m.is_default.into());
+                set(&item, "is_default", m.is_default.into());
                 arr.push(&item.into());
             }
             set(&obj, "models", arr.into());
@@ -2000,7 +2154,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AuthLoginResponseBody(resp) => {
             set(&obj, "variant", "AuthLoginResponse".into());
             set(&obj, "jwt", resp.jwt.into());
-            set(&obj, "userId", js_sys::Uint8Array::from(&resp.user_id[..]).into());
+            set(
+                &obj,
+                "userId",
+                js_sys::Uint8Array::from(&resp.user_id[..]).into(),
+            );
             set(&obj, "role", resp.role.into());
         }
         MessageBody::AuthMeRequest => {
@@ -2008,7 +2166,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::AuthMeResponseBody(resp) => {
             set(&obj, "variant", "AuthMeResponse".into());
-            set(&obj, "userId", js_sys::Uint8Array::from(&resp.user_id[..]).into());
+            set(
+                &obj,
+                "userId",
+                js_sys::Uint8Array::from(&resp.user_id[..]).into(),
+            );
             set(&obj, "username", resp.username.into());
             set(&obj, "role", resp.role.into());
         }
@@ -2031,32 +2193,54 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ChatStreamEndBody(end) => {
             set(&obj, "variant", "ChatStreamEnd".into());
             set(&obj, "promptTokens", (end.prompt_tokens as u32).into());
-            set(&obj, "completionTokens", (end.completion_tokens as u32).into());
+            set(
+                &obj,
+                "completionTokens",
+                (end.completion_tokens as u32).into(),
+            );
         }
         MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(req)) => {
             set(&obj, "variant", "TranslateRequest".into());
             set(&obj, "sourceText", req.source_text.into());
             set(&obj, "sourceLang", req.source_lang.into());
             set(&obj, "targetLang", req.target_lang.into());
-            if let Some(tone) = req.tone { set(&obj, "tone", tone.into()); }
+            if let Some(tone) = req.tone {
+                set(&obj, "tone", tone.into());
+            }
         }
         MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Res(resp)) => {
             set(&obj, "variant", "TranslateResponse".into());
             set(&obj, "translatedText", resp.translated_text.into());
-            if let Some(d) = resp.detected_source_lang { set(&obj, "detectedSourceLang", d.into()); }
+            if let Some(d) = resp.detected_source_lang {
+                set(&obj, "detectedSourceLang", d.into());
+            }
             set(&obj, "modelUsed", resp.model_used.into());
             set(&obj, "tokensUsed", resp.tokens_used.into());
         }
         MessageBody::ClusterUpdateRequestBody(req) => {
             set(&obj, "variant", "ClusterUpdateRequest".into());
             set(&obj, "clusterId", req.cluster_id.into());
-            if let Some(n) = req.name { set(&obj, "name", n.into()); }
-            if let Some(d) = req.description { set(&obj, "description", d.into()); }
-            if let Some(s) = req.strategy { set(&obj, "strategy", s.into()); }
-            if let Some(b) = req.failover_enabled { set(&obj, "failoverEnabled", b.into()); }
-            if let Some(t) = req.failover_target { set(&obj, "failoverTarget", t.into()); }
-            if let Some(v) = req.health_check_interval_ms { set(&obj, "healthCheckIntervalMs", v.into()); }
-            if let Some(v) = req.timeout_ms { set(&obj, "timeoutMs", v.into()); }
+            if let Some(n) = req.name {
+                set(&obj, "name", n.into());
+            }
+            if let Some(d) = req.description {
+                set(&obj, "description", d.into());
+            }
+            if let Some(s) = req.strategy {
+                set(&obj, "strategy", s.into());
+            }
+            if let Some(b) = req.failover_enabled {
+                set(&obj, "failoverEnabled", b.into());
+            }
+            if let Some(t) = req.failover_target {
+                set(&obj, "failoverTarget", t.into());
+            }
+            if let Some(v) = req.health_check_interval_ms {
+                set(&obj, "healthCheckIntervalMs", v.into());
+            }
+            if let Some(v) = req.timeout_ms {
+                set(&obj, "timeoutMs", v.into());
+            }
         }
         MessageBody::ClusterUpdateResponseBody(resp) => {
             set(&obj, "variant", "ClusterUpdateResponse".into());
@@ -2082,10 +2266,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "trustedKeys", arr.into());
                 set(&obj, "epoch", (evt.epoch as u32).into());
             }
-        }
+        },
         MessageBody::SubscribeResumeRequest { resume_token } => {
             set(&obj, "variant", "SubscribeResumeRequest".into());
-            set(&obj, "resumeToken", js_sys::Uint8Array::from(&resume_token[..]).into());
+            set(
+                &obj,
+                "resumeToken",
+                js_sys::Uint8Array::from(&resume_token[..]).into(),
+            );
         }
         MessageBody::SubscribeResumeAck { accepted, error } => {
             set(&obj, "variant", "SubscribeResumeAck".into());
@@ -2096,7 +2284,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::SubscribeResumeOffer { resume_token } => {
             set(&obj, "variant", "SubscribeResumeOffer".into());
-            set(&obj, "resumeToken", js_sys::Uint8Array::from(&resume_token[..]).into());
+            set(
+                &obj,
+                "resumeToken",
+                js_sys::Uint8Array::from(&resume_token[..]).into(),
+            );
         }
         MessageBody::ModelDetailRequest { model_id } => {
             set(&obj, "variant", "ModelDetailRequest".into());
@@ -2310,7 +2502,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::FlowVersionGetResponseBody(resp) => {
             set(&obj, "variant", "FlowVersionGetResponse".into());
-            set(&obj, "version", flow_version_full_to_js(resp.version).into());
+            set(
+                &obj,
+                "version",
+                flow_version_full_to_js(resp.version).into(),
+            );
         }
         MessageBody::FlowVersionRestoreRequestBody(r) => {
             set(&obj, "variant", "FlowVersionRestoreRequest".into());
@@ -2491,8 +2687,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 }
                 IP::ReqUpdateUser { .. } => set(&obj, "variant", "IamUpdateUserRequest".into()),
                 IP::ReqDeleteUser { .. } => set(&obj, "variant", "IamDeleteUserRequest".into()),
-                IP::ReqSetUserGroups { .. } => set(&obj, "variant", "IamSetUserGroupsRequest".into()),
-                IP::ReqResetUserPassword { .. } => set(&obj, "variant", "IamResetUserPasswordRequest".into()),
+                IP::ReqSetUserGroups { .. } => {
+                    set(&obj, "variant", "IamSetUserGroupsRequest".into())
+                }
+                IP::ReqResetUserPassword { .. } => {
+                    set(&obj, "variant", "IamResetUserPasswordRequest".into())
+                }
                 IP::ReqListGroups => set(&obj, "variant", "IamListGroupsRequest".into()),
                 IP::ResListGroups { groups } => {
                     set(&obj, "variant", "IamListGroupsResponse".into());
@@ -2519,13 +2719,23 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 IP::ResGroupMembers { members } => {
                     set(&obj, "variant", "IamGroupMembersResponse".into());
                     let arr = js_sys::Array::new();
-                    for u in members.iter() { arr.push(&user_info_to_js(u).into()); }
+                    for u in members.iter() {
+                        arr.push(&user_info_to_js(u).into());
+                    }
                     set(&obj, "members", arr.into());
                 }
-                IP::ReqSetPermission { .. } => set(&obj, "variant", "IamSetPermissionRequest".into()),
-                IP::ReqClearPermission { .. } => set(&obj, "variant", "IamClearPermissionRequest".into()),
-                IP::ReqListPermsForResource { .. } => set(&obj, "variant", "IamListPermsForResourceRequest".into()),
-                IP::ReqListPermsForSubject { .. } => set(&obj, "variant", "IamListPermsForSubjectRequest".into()),
+                IP::ReqSetPermission { .. } => {
+                    set(&obj, "variant", "IamSetPermissionRequest".into())
+                }
+                IP::ReqClearPermission { .. } => {
+                    set(&obj, "variant", "IamClearPermissionRequest".into())
+                }
+                IP::ReqListPermsForResource { .. } => {
+                    set(&obj, "variant", "IamListPermsForResourceRequest".into())
+                }
+                IP::ReqListPermsForSubject { .. } => {
+                    set(&obj, "variant", "IamListPermsForSubjectRequest".into())
+                }
                 IP::ResListPermissions { entries } => {
                     set(&obj, "variant", "IamListPermissionsResponse".into());
                     let arr = js_sys::Array::new();
@@ -2600,145 +2810,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "AuditLogCleanupResponse".into());
             set(&obj, "deletedCount", (resp.deleted_count as f64).into());
         }
-        MessageBody::ServiceListRequest => {
-            set(&obj, "variant", "ServiceListRequest".into());
-        }
-        MessageBody::ServiceListResponse { services } => {
-            set(&obj, "variant", "ServiceListResponse".into());
-            let arr = js_sys::Array::new();
-            for s in services {
-                let item = js_sys::Object::new();
-                set(&item, "id", s.id.into());
-                set(&item, "name", s.name.into());
-                set(&item, "serviceType", s.service_type.into());
-                set(&item, "strategy", s.strategy.into());
-                set(&item, "status", s.status.into());
-                set(&item, "configJson", s.config_json.into());
-                set(&item, "createdAt", s.created_at.into());
-                if let Some(nid) = s.node_id {
-                    set(&item, "nodeId", nid.into());
-                }
-                if let Some(host) = s.node_hostname {
-                    set(&item, "nodeHostname", host.into());
-                }
-                if let Some(method) = s.deploy_method {
-                    set(&item, "deployMethod", method.into());
-                }
-                if let Some(url) = s.endpoint_url {
-                    set(&item, "endpointUrl", url.into());
-                }
-                if let Some(t) = s.started_at_epoch {
-                    set(&item, "startedAtEpoch", t.into());
-                }
-                if let Some(eid) = s.engine_id {
-                    set(&item, "engineId", eid.into());
-                }
-                if let Some(mid) = s.model_id {
-                    set(&item, "modelId", mid.into());
-                }
-                set(&item, "pinned", s.pinned.into());
-                set(&item, "paused", s.paused.into());
-                if let Some(h) = s.deployed_source_hash {
-                    set(&item, "deployedSourceHash", h.into());
-                }
-                arr.push(&item.into());
-            }
-            set(&obj, "services", arr.into());
-        }
-        MessageBody::ServiceCreateRequestBody(req) => {
-            set(&obj, "variant", "ServiceCreateRequest".into());
-            set(&obj, "name", req.name.into());
-            set(&obj, "serviceType", req.service_type.into());
-            set(&obj, "strategy", req.strategy.into());
-            set(&obj, "configJson", req.config_json.into());
-            if let Some(nid) = req.node_id {
-                set(&obj, "nodeId", nid.into());
-            }
-            if let Some(cid) = req.cluster_id {
-                set(&obj, "clusterId", cid.into());
-            }
-        }
-        MessageBody::ServiceCreateResponse { id } => {
-            set(&obj, "variant", "ServiceCreateResponse".into());
-            set(&obj, "id", id.into());
-        }
-        MessageBody::ServiceUpdateRequestBody(req) => {
-            set(&obj, "variant", "ServiceUpdateRequest".into());
-            set(&obj, "id", req.id.into());
-            set(&obj, "name", req.name.into());
-            set(&obj, "serviceType", req.service_type.into());
-            set(&obj, "strategy", req.strategy.into());
-            set(&obj, "status", req.status.into());
-            set(&obj, "configJson", req.config_json.into());
-            if let Some(nid) = req.node_id {
-                set(&obj, "nodeId", nid.into());
-            }
-            if let Some(cid) = req.cluster_id {
-                set(&obj, "clusterId", cid.into());
-            }
-        }
-        MessageBody::ServiceUpdateResponse { updated } => {
-            set(&obj, "variant", "ServiceUpdateResponse".into());
-            set(&obj, "updated", updated.into());
-        }
-        MessageBody::ServiceQuicStatusRequest => {
-            set(&obj, "variant", "ServiceQuicStatusRequest".into());
-        }
-        MessageBody::ServiceQuicStatusResponse { statuses } => {
-            set(&obj, "variant", "ServiceQuicStatusResponse".into());
-            let arr = js_sys::Array::new();
-            for st in statuses {
-                let item = js_sys::Object::new();
-                set(&item, "name", st.name.into());
-                set(&item, "status", st.status.into());
-                arr.push(&item.into());
-            }
-            set(&obj, "statuses", arr.into());
-        }
-        MessageBody::ServiceDeployRequestBody(req) => {
-            set(&obj, "variant", "ServiceDeployRequest".into());
-            set(&obj, "engineId", req.engine_id.into());
-            set(&obj, "modelId", req.model_id.into());
-            set(&obj, "deployMethod", req.deploy_method.into());
-            set(&obj, "nodeId", js_sys::Uint8Array::from(&req.node_id[..]).into());
-        }
-        MessageBody::ServiceDeployAccepted { deploy_id } => {
-            set(&obj, "variant", "ServiceDeployAccepted".into());
-            set(&obj, "deployId", deploy_id.into());
-        }
-        MessageBody::ServiceDeployProgressBody(p) => {
-            set(&obj, "variant", "ServiceDeployProgress".into());
-            set(&obj, "deployId", p.deploy_id.into());
-            set(&obj, "stage", p.stage.into());
-            set(&obj, "progressPercent", (p.progress_percent as u32).into());
-            set(&obj, "message", p.message.into());
-        }
-        MessageBody::ServiceStopRequest { service_id } => {
-            set(&obj, "variant", "ServiceStopRequest".into());
-            set(&obj, "serviceId", service_id.into());
-        }
-        MessageBody::ServiceStopResponse { stopped } => {
-            set(&obj, "variant", "ServiceStopResponse".into());
-            set(&obj, "stopped", stopped.into());
-        }
-        MessageBody::ServiceFlagsBody(payload) => match payload {
-            tentaflow_protocol::ServiceFlagsPayload::Req(r) => {
-                set(&obj, "variant", "ServiceFlagsUpdateRequest".into());
-                set(&obj, "serviceId", r.service_id.into());
-                if let Some(p) = r.pinned {
-                    set(&obj, "pinned", p.into());
-                }
-                if let Some(p) = r.paused {
-                    set(&obj, "paused", p.into());
-                }
-            }
-            tentaflow_protocol::ServiceFlagsPayload::Res(r) => {
-                set(&obj, "variant", "ServiceFlagsUpdateResponse".into());
-                set(&obj, "ok", r.ok.into());
-                set(&obj, "pinned", r.pinned.into());
-                set(&obj, "paused", r.paused.into());
-            }
-        },
+        MessageBody::ServiceBody(payload) => decode_service_payload(&obj, payload),
         MessageBody::PromptListRequest => {
             set(&obj, "variant", "PromptListRequest".into());
         }
@@ -2787,9 +2859,17 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "body_preview", n.body_preview.into());
                     set(&item, "pinned", n.pinned.into());
                     set(&item, "createdAtEpoch", (n.created_at_epoch as f64).into());
-                    set(&item, "created_at_epoch", (n.created_at_epoch as f64).into());
+                    set(
+                        &item,
+                        "created_at_epoch",
+                        (n.created_at_epoch as f64).into(),
+                    );
                     set(&item, "updatedAtEpoch", (n.updated_at_epoch as f64).into());
-                    set(&item, "updated_at_epoch", (n.updated_at_epoch as f64).into());
+                    set(
+                        &item,
+                        "updated_at_epoch",
+                        (n.updated_at_epoch as f64).into(),
+                    );
                     arr.push(&item.into());
                 }
                 set(&obj, "notes", arr.into());
@@ -2890,7 +2970,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "ContainerStopResponse".into());
             set(&obj, "stopped", stopped.into());
         }
-        MessageBody::ContainerLogStreamRequest { container_id, follow } => {
+        MessageBody::ContainerLogStreamRequest {
+            container_id,
+            follow,
+        } => {
             set(&obj, "variant", "ContainerLogStreamRequest".into());
             set(&obj, "containerId", container_id.into());
             set(&obj, "follow", follow.into());
@@ -3033,6 +3116,34 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                             set(&obj, "arousal", a.into());
                         }
                     }
+                    tentaflow_protocol::VisionInferResult::Poses(poses) => {
+                        // Pose detection result (added with the vision pose
+                        // models). Surface keypoints and bbox to JS as an
+                        // array; downstream UI does the drawing.
+                        set(&obj, "kind", "poses".into());
+                        let arr = js_sys::Array::new();
+                        for p in poses {
+                            let item = js_sys::Object::new();
+                            set(&item, "x1", p.x1.into());
+                            set(&item, "y1", p.y1.into());
+                            set(&item, "x2", p.x2.into());
+                            set(&item, "y2", p.y2.into());
+                            set(&item, "score", p.score.into());
+                            let kp_arr = js_sys::Array::new();
+                            for kp in p.keypoints {
+                                let kp_item = js_sys::Object::new();
+                                set(&kp_item, "id", (kp.id as u32).into());
+                                set(&kp_item, "name", kp.name.into());
+                                set(&kp_item, "x", kp.x.into());
+                                set(&kp_item, "y", kp.y.into());
+                                set(&kp_item, "score", kp.score.into());
+                                kp_arr.push(&kp_item.into());
+                            }
+                            set(&item, "keypoints", kp_arr.into());
+                            arr.push(&item.into());
+                        }
+                        set(&obj, "poses", arr.into());
+                    }
                 }
             }
         },
@@ -3060,7 +3171,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let arr = js_sys::Array::new();
             for p in peers {
                 let item = js_sys::Object::new();
-                set(&item, "nodeId", js_sys::Uint8Array::from(&p.node_id[..]).into());
+                set(
+                    &item,
+                    "nodeId",
+                    js_sys::Uint8Array::from(&p.node_id[..]).into(),
+                );
                 set(&item, "displayName", p.display_name.into());
                 set(&item, "trustState", p.trust_state.into());
                 if let Some(ep) = p.endpoint {
@@ -3075,7 +3190,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::MeshPairInitRequestBody(req) => {
             set(&obj, "variant", "MeshPairInitRequest".into());
-            set(&obj, "nodeId", js_sys::Uint8Array::from(&req.node_id[..]).into());
+            set(
+                &obj,
+                "nodeId",
+                js_sys::Uint8Array::from(&req.node_id[..]).into(),
+            );
             set(&obj, "pin", req.pin.into());
         }
         MessageBody::MeshPairInitResponseBody(resp) => {
@@ -3159,8 +3278,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "nodeId", m.node_id.into());
                 set(&item, "hostname", m.hostname.into());
                 set(&item, "status", m.status.into());
-                if let Some(t) = m.interface_type { set(&item, "interfaceType", t.into()); }
-                if let Some(s) = m.interface_speed_mbps { set(&item, "interfaceSpeedMbps", s.into()); }
+                if let Some(t) = m.interface_type {
+                    set(&item, "interfaceType", t.into());
+                }
+                if let Some(s) = m.interface_speed_mbps {
+                    set(&item, "interfaceSpeedMbps", s.into());
+                }
                 set(&item, "joinedAt", (m.joined_at as f64).into());
                 arr.push(&item.into());
             }
@@ -3169,11 +3292,19 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ClusterCreateRequestBody(req) => {
             set(&obj, "variant", "ClusterCreateRequest".into());
             set(&obj, "name", req.name.into());
-            if let Some(d) = req.description { set(&obj, "description", d.into()); }
+            if let Some(d) = req.description {
+                set(&obj, "description", d.into());
+            }
             set(&obj, "strategy", req.strategy.into());
             set(&obj, "failoverEnabled", req.failover_enabled.into());
-            if let Some(t) = req.failover_target { set(&obj, "failoverTarget", t.into()); }
-            set(&obj, "healthCheckIntervalMs", req.health_check_interval_ms.into());
+            if let Some(t) = req.failover_target {
+                set(&obj, "failoverTarget", t.into());
+            }
+            set(
+                &obj,
+                "healthCheckIntervalMs",
+                req.health_check_interval_ms.into(),
+            );
             set(&obj, "timeoutMs", req.timeout_ms.into());
         }
         MessageBody::ClusterCreateResponseBody(resp) => {
@@ -3192,8 +3323,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "ClusterAddMemberRequest".into());
             set(&obj, "clusterId", req.cluster_id.into());
             set(&obj, "nodeId", req.node_id.into());
-            if let Some(t) = req.interface_type { set(&obj, "interfaceType", t.into()); }
-            if let Some(s) = req.interface_speed_mbps { set(&obj, "interfaceSpeedMbps", s.into()); }
+            if let Some(t) = req.interface_type {
+                set(&obj, "interfaceType", t.into());
+            }
+            if let Some(s) = req.interface_speed_mbps {
+                set(&obj, "interfaceSpeedMbps", s.into());
+            }
         }
         MessageBody::ClusterAddMemberResponseBody(resp) => {
             set(&obj, "variant", "ClusterAddMemberResponse".into());
@@ -3211,19 +3346,35 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ClusterProbeStreamRequestBody(req) => {
             set(&obj, "variant", "ClusterProbeStreamRequest".into());
             let arr = js_sys::Array::new();
-            for n in req.node_ids { arr.push(&n.into()); }
+            for n in req.node_ids {
+                arr.push(&n.into());
+            }
             set(&obj, "nodeIds", arr.into());
         }
         MessageBody::ClusterProbeStreamChunkBody(c) => {
             set(&obj, "variant", "ClusterProbeStreamChunk".into());
             set(&obj, "eventType", c.event_type.into());
-            if let Some(s) = c.source_node { set(&obj, "sourceNode", s.into()); }
-            if let Some(t) = c.target_node { set(&obj, "targetNode", t.into()); }
-            if let Some(s) = c.success { set(&obj, "success", s.into()); }
-            if let Some(v) = c.latency_ms { set(&obj, "latencyMs", v.into()); }
-            if let Some(v) = c.bandwidth_mbps { set(&obj, "bandwidthMbps", v.into()); }
-            if let Some(t) = c.interface_type { set(&obj, "interfaceType", t.into()); }
-            if let Some(m) = c.message { set(&obj, "message", m.into()); }
+            if let Some(s) = c.source_node {
+                set(&obj, "sourceNode", s.into());
+            }
+            if let Some(t) = c.target_node {
+                set(&obj, "targetNode", t.into());
+            }
+            if let Some(s) = c.success {
+                set(&obj, "success", s.into());
+            }
+            if let Some(v) = c.latency_ms {
+                set(&obj, "latencyMs", v.into());
+            }
+            if let Some(v) = c.bandwidth_mbps {
+                set(&obj, "bandwidthMbps", v.into());
+            }
+            if let Some(t) = c.interface_type {
+                set(&obj, "interfaceType", t.into());
+            }
+            if let Some(m) = c.message {
+                set(&obj, "message", m.into());
+            }
         }
         MessageBody::ClusterProbeStreamEndBody(e) => {
             set(&obj, "variant", "ClusterProbeStreamEnd".into());
@@ -3295,8 +3446,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "version", resp.version.into());
             set(&obj, "invitePin", resp.invite_pin.clone().into());
             set(&obj, "invite_pin", resp.invite_pin.into());
-            set(&obj, "invitePinExpiresSec", (resp.invite_pin_expires_sec as f64).into());
-            set(&obj, "invite_pin_expires_sec", (resp.invite_pin_expires_sec as f64).into());
+            set(
+                &obj,
+                "invitePinExpiresSec",
+                (resp.invite_pin_expires_sec as f64).into(),
+            );
+            set(
+                &obj,
+                "invite_pin_expires_sec",
+                (resp.invite_pin_expires_sec as f64).into(),
+            );
         }
         MessageBody::MeshServicesListRequest => {
             set(&obj, "variant", "MeshServicesListRequest".into());
@@ -3328,7 +3487,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(h) = t.hostname {
                     set(&item, "hostname", h.into());
                 }
-                set(&item, "trustedSinceEpoch", (t.trusted_since_epoch as f64).into());
+                set(
+                    &item,
+                    "trustedSinceEpoch",
+                    (t.trusted_since_epoch as f64).into(),
+                );
                 arr.push(&item.into());
             }
             set(&obj, "trusted", arr.into());
@@ -3480,7 +3643,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "alias", r.alias.into());
             set(&obj, "targetModel", r.target_model.clone().into());
             set(&obj, "target_model", r.target_model.into());
-            if let Some(s) = r.strategy { set(&obj, "strategy", s.into()); }
+            if let Some(s) = r.strategy {
+                set(&obj, "strategy", s.into());
+            }
             if let Some(f) = r.fallback_targets {
                 set(&obj, "fallbackTargets", f.clone().into());
                 set(&obj, "fallback_targets", f.into());
@@ -3500,7 +3665,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "isActive", a.into());
                 set(&obj, "is_active", a.into());
             }
-            if let Some(s) = r.strategy { set(&obj, "strategy", s.into()); }
+            if let Some(s) = r.strategy {
+                set(&obj, "strategy", s.into());
+            }
             if let Some(f) = r.fallback_targets {
                 set(&obj, "fallbackTargets", f.clone().into());
                 set(&obj, "fallback_targets", f.into());
@@ -3552,7 +3719,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "oauth_providers", providers.into());
             set(&obj, "license", resp.license.into());
             set(&obj, "fileSizeBytes", (resp.file_size_bytes as f64).into());
-            set(&obj, "file_size_bytes", (resp.file_size_bytes as f64).into());
+            set(
+                &obj,
+                "file_size_bytes",
+                (resp.file_size_bytes as f64).into(),
+            );
             set(&obj, "runtime", resp.runtime.into());
             match resp.icon {
                 Some(ref v) => set(&obj, "icon", v.clone().into()),
@@ -3568,14 +3739,38 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&obj, "oauth_mode", JsValue::NULL);
                 }
             }
-            set(&obj, "visibilityGroupsVisible", (resp.visibility_groups_visible as f64).into());
-            set(&obj, "visibility_groups_visible", (resp.visibility_groups_visible as f64).into());
-            set(&obj, "visibilityGroupsTotal", (resp.visibility_groups_total as f64).into());
-            set(&obj, "visibility_groups_total", (resp.visibility_groups_total as f64).into());
+            set(
+                &obj,
+                "visibilityGroupsVisible",
+                (resp.visibility_groups_visible as f64).into(),
+            );
+            set(
+                &obj,
+                "visibility_groups_visible",
+                (resp.visibility_groups_visible as f64).into(),
+            );
+            set(
+                &obj,
+                "visibilityGroupsTotal",
+                (resp.visibility_groups_total as f64).into(),
+            );
+            set(
+                &obj,
+                "visibility_groups_total",
+                (resp.visibility_groups_total as f64).into(),
+            );
             set(&obj, "toolsCount", (resp.tools_count as f64).into());
             set(&obj, "tools_count", (resp.tools_count as f64).into());
-            set(&obj, "linkedAccountsCount", (resp.linked_accounts_count as f64).into());
-            set(&obj, "linked_accounts_count", (resp.linked_accounts_count as f64).into());
+            set(
+                &obj,
+                "linkedAccountsCount",
+                (resp.linked_accounts_count as f64).into(),
+            );
+            set(
+                &obj,
+                "linked_accounts_count",
+                (resp.linked_accounts_count as f64).into(),
+            );
             set(&obj, "showInCatalog", resp.show_in_catalog.into());
             set(&obj, "show_in_catalog", resp.show_in_catalog.into());
         }
@@ -3598,7 +3793,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "groupName", r.group_name.clone().into());
                 set(&item, "group_name", r.group_name.into());
                 set(&item, "visible", r.visible.into());
-                set(&item, "groupDescription", r.group_description.clone().into());
+                set(
+                    &item,
+                    "groupDescription",
+                    r.group_description.clone().into(),
+                );
                 set(&item, "group_description", r.group_description.into());
                 set(&item, "userCount", (r.user_count as f64).into());
                 set(&item, "user_count", (r.user_count as f64).into());
@@ -3688,8 +3887,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "defaults", defs.into());
             set(&obj, "lastChangeBy", resp.last_change_by.clone().into());
             set(&obj, "last_change_by", resp.last_change_by.into());
-            set(&obj, "lastChangeAtEpoch", (resp.last_change_at_epoch as f64).into());
-            set(&obj, "last_change_at_epoch", (resp.last_change_at_epoch as f64).into());
+            set(
+                &obj,
+                "lastChangeAtEpoch",
+                (resp.last_change_at_epoch as f64).into(),
+            );
+            set(
+                &obj,
+                "last_change_at_epoch",
+                (resp.last_change_at_epoch as f64).into(),
+            );
         }
         MessageBody::AddonPermissionSetRequestBody(req) => {
             set(&obj, "variant", "AddonPermissionSetRequest".into());
@@ -3805,7 +4012,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "provider_id", req.provider_id.into());
         }
         MessageBody::AddonOAuthConfigClearSecretResponseBody(resp) => {
-            set(&obj, "variant", "AddonOAuthConfigClearSecretResponse".into());
+            set(
+                &obj,
+                "variant",
+                "AddonOAuthConfigClearSecretResponse".into(),
+            );
             set(&obj, "addonId", resp.addon_id.clone().into());
             set(&obj, "addon_id", resp.addon_id.into());
             set(&obj, "providerId", resp.provider_id.clone().into());
@@ -3902,37 +4113,35 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "accounts", arr.into());
         }
-        MessageBody::SystemEventBody(evt) => {
-            match evt {
-                tentaflow_protocol::SystemEventPayload::ServiceStatusChanged {
-                    service_name,
-                    service_type,
-                    status,
-                    message,
-                } => {
-                    set(&obj, "variant", "ServiceStatusChanged".into());
-                    set(&obj, "serviceName", service_name.clone().into());
-                    set(&obj, "service_name", service_name.into());
-                    set(&obj, "serviceType", service_type.clone().into());
-                    set(&obj, "service_type", service_type.into());
-                    set(&obj, "status", status.into());
-                    set(&obj, "message", message.into());
-                }
-                tentaflow_protocol::SystemEventPayload::MeshPeerStatusChanged {
-                    node_id,
-                    hostname,
-                    status,
-                    message,
-                } => {
-                    set(&obj, "variant", "MeshPeerStatusChanged".into());
-                    set(&obj, "nodeId", node_id.clone().into());
-                    set(&obj, "node_id", node_id.into());
-                    set(&obj, "hostname", hostname.into());
-                    set(&obj, "status", status.into());
-                    set(&obj, "message", message.into());
-                }
+        MessageBody::SystemEventBody(evt) => match evt {
+            tentaflow_protocol::SystemEventPayload::ServiceStatusChanged {
+                service_name,
+                service_type,
+                status,
+                message,
+            } => {
+                set(&obj, "variant", "ServiceStatusChanged".into());
+                set(&obj, "serviceName", service_name.clone().into());
+                set(&obj, "service_name", service_name.into());
+                set(&obj, "serviceType", service_type.clone().into());
+                set(&obj, "service_type", service_type.into());
+                set(&obj, "status", status.into());
+                set(&obj, "message", message.into());
             }
-        }
+            tentaflow_protocol::SystemEventPayload::MeshPeerStatusChanged {
+                node_id,
+                hostname,
+                status,
+                message,
+            } => {
+                set(&obj, "variant", "MeshPeerStatusChanged".into());
+                set(&obj, "nodeId", node_id.clone().into());
+                set(&obj, "node_id", node_id.into());
+                set(&obj, "hostname", hostname.into());
+                set(&obj, "status", status.into());
+                set(&obj, "message", message.into());
+            }
+        },
         MessageBody::AddonPermissionChangedEventBody(evt) => {
             set(&obj, "variant", "AddonPermissionChangedEvent".into());
             set(&obj, "addonId", evt.addon_id.clone().into());
@@ -4121,8 +4330,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "cpuLimitPct", (r.cpu_limit_pct as f64).into());
             set(&obj, "ramMb", (r.ram_mb as f64).into());
             set(&obj, "storageMb", (r.storage_mb as f64).into());
-            set(&obj, "httpRequestsPerMin", (r.http_requests_per_min as f64).into());
-            set(&obj, "llmTokensPerMin", (r.llm_tokens_per_min as f64).into());
+            set(
+                &obj,
+                "httpRequestsPerMin",
+                (r.http_requests_per_min as f64).into(),
+            );
+            set(
+                &obj,
+                "llmTokensPerMin",
+                (r.llm_tokens_per_min as f64).into(),
+            );
         }
         MessageBody::AddonResourcesSetResponseBody(r) => {
             set(&obj, "variant", "AddonResourcesSetResponse".into());
@@ -4242,8 +4459,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&obj, "reachable", info.reachable.into());
                     set(&obj, "rttMs", (info.rtt_ms as f64).into());
                     set(&obj, "rtt_ms", (info.rtt_ms as f64).into());
-                    set(&obj, "lastCheckUnixSecs", (info.last_check_unix_secs as f64).into());
-                    set(&obj, "last_check_unix_secs", (info.last_check_unix_secs as f64).into());
+                    set(
+                        &obj,
+                        "lastCheckUnixSecs",
+                        (info.last_check_unix_secs as f64).into(),
+                    );
+                    set(
+                        &obj,
+                        "last_check_unix_secs",
+                        (info.last_check_unix_secs as f64).into(),
+                    );
                     set(
                         &obj,
                         "lastSuccessUnixSecs",
@@ -4256,7 +4481,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     );
                     set(&obj, "status", info.status.clone().into());
                     set(&obj, "bindAddrActual", info.bind_addr_actual.clone().into());
-                    set(&obj, "bind_addr_actual", info.bind_addr_actual.clone().into());
+                    set(
+                        &obj,
+                        "bind_addr_actual",
+                        info.bind_addr_actual.clone().into(),
+                    );
                 }
             }
         }
@@ -4290,7 +4519,9 @@ fn user_info_to_js(u: &tentaflow_protocol::UserInfo) -> js_sys::Object {
     set(&o, "createdAt", u.created_at.clone().into());
     set(&o, "created_at", u.created_at.clone().into());
     let gs = js_sys::Array::new();
-    for gid in &u.group_ids { gs.push(&(*gid as f64).into()); }
+    for gid in &u.group_ids {
+        gs.push(&(*gid as f64).into());
+    }
     set(&o, "groupIds", gs.into());
     o
 }
@@ -4339,7 +4570,11 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
         }
         DP::ResStatus(resp) => {
             set(obj, "variant", "DeploymentStatusResponse".into());
-            set(obj, "deployment", deployment_summary_to_js(resp.deployment).into());
+            set(
+                obj,
+                "deployment",
+                deployment_summary_to_js(resp.deployment).into(),
+            );
         }
         DP::ReqList(req) => {
             set(obj, "variant", "DeploymentListRequest".into());
@@ -4378,20 +4613,8 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
             set(obj, "containerName", e.container_name.into());
             set(obj, "errorMessage", e.error_message.into());
             set(obj, "durationMs", (e.duration_ms as f64).into());
-        }
-        DP::ReqRedeploy(req) => {
-            set(obj, "variant", "ServiceRedeployRequest".into());
-            set(obj, "serviceId", (req.service_id as f64).into());
-            set(obj, "forceIfActiveSessions", req.force_if_active_sessions.into());
-        }
-        DP::ResRedeploy(resp) => {
-            set(obj, "variant", "ServiceRedeployResponse".into());
-            set(obj, "status", resp.status.into());
-            set(obj, "deployId", resp.deploy_id.into());
-            set(obj, "newHash", resp.new_hash.into());
-            set(obj, "error", resp.error.into());
-            set(obj, "activeSessionCount", (resp.active_session_count as f64).into());
-        }
+        } // ReqRedeploy/ResRedeploy were removed when DeploymentPayload was
+          // trimmed; kept as a comment so future searches find the change.
     }
 }
 
@@ -4494,12 +4717,20 @@ fn vnc_tunnel_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::VncTunn
         VP::Chunk(c) => {
             set(obj, "variant", "VncTunnelChunk".into());
             set(obj, "tunnelId", c.tunnel_id.into());
-            set(obj, "bytes", js_sys::Uint8Array::from(c.bytes.as_slice()).into());
+            set(
+                obj,
+                "bytes",
+                js_sys::Uint8Array::from(c.bytes.as_slice()).into(),
+            );
         }
         VP::ReqSend(r) => {
             set(obj, "variant", "VncTunnelSendRequest".into());
             set(obj, "tunnelId", r.tunnel_id.into());
-            set(obj, "bytes", js_sys::Uint8Array::from(r.bytes.as_slice()).into());
+            set(
+                obj,
+                "bytes",
+                js_sys::Uint8Array::from(r.bytes.as_slice()).into(),
+            );
         }
         VP::ResSend(r) => {
             set(obj, "variant", "VncTunnelSendResponse".into());
@@ -4604,16 +4835,20 @@ fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPay
             }
             set(obj, "items", arr.into());
         }
-        MP::ReqActionItemStatusUpdate(_) => {
-            set(obj, "variant", "MeetingActionItemStatusUpdateRequest".into())
-        }
+        MP::ReqActionItemStatusUpdate(_) => set(
+            obj,
+            "variant",
+            "MeetingActionItemStatusUpdateRequest".into(),
+        ),
         MP::ResActionItemStatusUpdate(r) => {
-            set(obj, "variant", "MeetingActionItemStatusUpdateResponse".into());
+            set(
+                obj,
+                "variant",
+                "MeetingActionItemStatusUpdateResponse".into(),
+            );
             set(obj, "success", r.success.into());
         }
-        MP::ReqTranscriptExport(_) => {
-            set(obj, "variant", "MeetingTranscriptExportRequest".into())
-        }
+        MP::ReqTranscriptExport(_) => set(obj, "variant", "MeetingTranscriptExportRequest".into()),
         MP::ResTranscriptExport(r) => {
             set(obj, "variant", "MeetingTranscriptExportResponse".into());
             set(obj, "content", r.content.into());
@@ -4692,10 +4927,7 @@ fn meeting_action_item_to_js(a: tentaflow_protocol::MeetingActionItemItem) -> js
 
 /// Tlumaczy `MeetingEventPayload` na JS object. Pole `type` zawiera nazwe
 /// wariantu ("SummaryUpdate" itd.), `data` zawiera splaszczone pola danych.
-fn meeting_event_payload_to_js(
-    obj: &js_sys::Object,
-    p: tentaflow_protocol::MeetingEventPayload,
-) {
+fn meeting_event_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingEventPayload) {
     use tentaflow_protocol::MeetingEventPayload as EP;
     let data = js_sys::Object::new();
     match p {
@@ -4849,7 +5081,9 @@ fn meeting_event_payload_to_js(
     set(obj, "data", data.into());
 }
 
-fn flow_node_template_to_js(t: tentaflow_protocol::message_body::FlowNodeTemplate) -> js_sys::Object {
+fn flow_node_template_to_js(
+    t: tentaflow_protocol::message_body::FlowNodeTemplate,
+) -> js_sys::Object {
     let obj = js_sys::Object::new();
     // Emitujemy rownoczesnie camelCase (nowy kod) i snake_case (istniejaca paleta).
     set(&obj, "id", (t.id as f64).into());
@@ -4905,9 +5139,7 @@ fn flow_version_summary_to_js(
     obj
 }
 
-fn flow_version_full_to_js(
-    v: tentaflow_protocol::message_body::FlowVersionFull,
-) -> js_sys::Object {
+fn flow_version_full_to_js(v: tentaflow_protocol::message_body::FlowVersionFull) -> js_sys::Object {
     let obj = js_sys::Object::new();
     set(&obj, "id", v.id.into());
     set(&obj, "flowId", v.flow_id.clone().into());
@@ -4944,7 +5176,9 @@ fn model_alias_entry_to_js(a: tentaflow_protocol::ModelAliasEntry) -> js_sys::Ob
         set(&obj, "fallbackTargets", f.clone().into());
         set(&obj, "fallback_targets", f.into());
     }
-    if let Some(s) = a.strategy { set(&obj, "strategy", s.into()); }
+    if let Some(s) = a.strategy {
+        set(&obj, "strategy", s.into());
+    }
     obj
 }
 
@@ -4955,7 +5189,9 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "nodeId", n.node_id.clone().into());
     set(&obj, "node_id", n.node_id.into());
     set(&obj, "hostname", n.hostname.into());
-    if let Some(ref ip) = n.ip { set(&obj, "ip", ip.clone().into()); }
+    if let Some(ref ip) = n.ip {
+        set(&obj, "ip", ip.clone().into());
+    }
     set(&obj, "status", n.status.into());
     set(&obj, "source", n.source.clone().into());
     set(&obj, "trust", n.source.into());
@@ -5044,7 +5280,11 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     }
     if let Some(connection) = &n.connection {
         let connection_obj = js_sys::Object::new();
-        set(&connection_obj, "transport", connection.transport.clone().into());
+        set(
+            &connection_obj,
+            "transport",
+            connection.transport.clone().into(),
+        );
         if let Some(scope) = &connection.scope {
             set(&connection_obj, "scope", scope.clone().into());
         }
@@ -5108,8 +5348,12 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     for m in n.models {
         let item = js_sys::Object::new();
         set(&item, "alias", m.alias.into());
-        if let Some(v) = m.kind { set(&item, "kind", v.into()); }
-        if let Some(v) = m.backend { set(&item, "backend", v.into()); }
+        if let Some(v) = m.kind {
+            set(&item, "kind", v.into());
+        }
+        if let Some(v) = m.backend {
+            set(&item, "backend", v.into());
+        }
         if let Some(v) = m.size_mb {
             set(&item, "sizeMb", (v as f64).into());
             set(&item, "size_mb", (v as f64).into());
@@ -5183,7 +5427,9 @@ fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
     let obj = js_sys::Object::new();
     set(&obj, "id", c.id.into());
     set(&obj, "name", c.name.into());
-    if let Some(d) = c.description { set(&obj, "description", d.into()); }
+    if let Some(d) = c.description {
+        set(&obj, "description", d.into());
+    }
     set(&obj, "strategy", c.strategy.into());
     set(&obj, "status", c.status.into());
     set(&obj, "membersCount", c.members_count.into());
@@ -5191,8 +5437,14 @@ fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
     set(&obj, "createdAt", (c.created_at as f64).into());
     set(&obj, "updatedAt", (c.updated_at as f64).into());
     set(&obj, "failoverEnabled", c.failover_enabled.into());
-    if let Some(t) = c.failover_target { set(&obj, "failoverTarget", t.into()); }
-    set(&obj, "healthCheckIntervalMs", c.health_check_interval_ms.into());
+    if let Some(t) = c.failover_target {
+        set(&obj, "failoverTarget", t.into());
+    }
+    set(
+        &obj,
+        "healthCheckIntervalMs",
+        c.health_check_interval_ms.into(),
+    );
     set(&obj, "timeoutMs", c.timeout_ms.into());
     obj
 }
@@ -5333,7 +5585,11 @@ fn user_oauth_account_row_to_js(
     set(&obj, "addon_id", a.addon_id.into());
     set(&obj, "providerId", a.provider_id.clone().into());
     set(&obj, "provider_id", a.provider_id.into());
-    set(&obj, "externalAccountId", a.external_account_id.clone().into());
+    set(
+        &obj,
+        "externalAccountId",
+        a.external_account_id.clone().into(),
+    );
     set(&obj, "external_account_id", a.external_account_id.into());
     set(&obj, "displayName", a.display_name.clone().into());
     set(&obj, "display_name", a.display_name.into());
@@ -5359,9 +5615,7 @@ fn user_oauth_account_row_to_js(
 }
 
 /// Konwertuje `MyOAuthEntry` (wiersz widoku "Moje polaczone konta").
-fn my_oauth_entry_to_js(
-    e: tentaflow_protocol::message_body::MyOAuthEntry,
-) -> js_sys::Object {
+fn my_oauth_entry_to_js(e: tentaflow_protocol::message_body::MyOAuthEntry) -> js_sys::Object {
     let obj = js_sys::Object::new();
     set(&obj, "addonId", e.addon_id.clone().into());
     set(&obj, "addon_id", e.addon_id.into());
@@ -5380,8 +5634,16 @@ fn my_oauth_entry_to_js(
     set(&obj, "addon_version", e.addon_version.into());
     set(&obj, "providerId", e.provider_id.clone().into());
     set(&obj, "provider_id", e.provider_id.into());
-    set(&obj, "providerDisplayName", e.provider_display_name.clone().into());
-    set(&obj, "provider_display_name", e.provider_display_name.into());
+    set(
+        &obj,
+        "providerDisplayName",
+        e.provider_display_name.clone().into(),
+    );
+    set(
+        &obj,
+        "provider_display_name",
+        e.provider_display_name.into(),
+    );
     set(&obj, "status", e.status.into());
     if let Some(aid) = e.account_id {
         set(&obj, "accountId", (aid as f64).into());
@@ -5392,17 +5654,37 @@ fn my_oauth_entry_to_js(
     }
     set(&obj, "accountEmail", e.account_email.clone().into());
     set(&obj, "account_email", e.account_email.into());
-    set(&obj, "accountDisplayName", e.account_display_name.clone().into());
+    set(
+        &obj,
+        "accountDisplayName",
+        e.account_display_name.clone().into(),
+    );
     set(&obj, "account_display_name", e.account_display_name.into());
     let scopes = js_sys::Array::new();
     for s in e.scopes {
         scopes.push(&JsValue::from_str(&s));
     }
     set(&obj, "scopes", scopes.into());
-    set(&obj, "connectedAtEpoch", (e.connected_at_epoch as f64).into());
-    set(&obj, "connected_at_epoch", (e.connected_at_epoch as f64).into());
-    set(&obj, "lastUsedAtEpoch", (e.last_used_at_epoch as f64).into());
-    set(&obj, "last_used_at_epoch", (e.last_used_at_epoch as f64).into());
+    set(
+        &obj,
+        "connectedAtEpoch",
+        (e.connected_at_epoch as f64).into(),
+    );
+    set(
+        &obj,
+        "connected_at_epoch",
+        (e.connected_at_epoch as f64).into(),
+    );
+    set(
+        &obj,
+        "lastUsedAtEpoch",
+        (e.last_used_at_epoch as f64).into(),
+    );
+    set(
+        &obj,
+        "last_used_at_epoch",
+        (e.last_used_at_epoch as f64).into(),
+    );
     set(&obj, "expiresAtEpoch", (e.expires_at_epoch as f64).into());
     set(&obj, "expires_at_epoch", (e.expires_at_epoch as f64).into());
     obj
@@ -5607,9 +5889,8 @@ mod tests {
     #[test]
     fn roundtrip_envelope_with_model_list_request() {
         let body = encode_body_inner(&MessageBody::ModelListRequest).unwrap();
-        let frame =
-            encode_envelope_direct_inner(42, 1, message_kind::META_HEARTBEAT, body.clone())
-                .unwrap();
+        let frame = encode_envelope_direct_inner(42, 1, message_kind::META_HEARTBEAT, body.clone())
+            .unwrap();
         let env = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&frame).unwrap();
         assert_eq!(env.correlation_id, 42);
         assert_eq!(env.sequence, 1);
@@ -5678,7 +5959,9 @@ pub fn encode_iam_list_users() -> Result<Vec<u8>, JsError> {
 
 #[wasm_bindgen(js_name = encodeIamGetUserRequest)]
 pub fn encode_iam_get_user(user_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqGetUser { user_id: user_id as i64 })
+    encode_iam(IamPayload::ReqGetUser {
+        user_id: user_id as i64,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamCreateUserRequest)]
@@ -5695,7 +5978,12 @@ pub fn encode_iam_create_user(
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
     encode_iam(IamPayload::ReqCreateUser {
-        username, password, display_name, email, role, group_ids,
+        username,
+        password,
+        display_name,
+        email,
+        role,
+        group_ids,
     })
 }
 
@@ -5708,13 +5996,19 @@ pub fn encode_iam_update_user(
     role: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqUpdateUser {
-        user_id: user_id as i64, display_name, email, is_active, role,
+        user_id: user_id as i64,
+        display_name,
+        email,
+        is_active,
+        role,
     })
 }
 
 #[wasm_bindgen(js_name = encodeIamDeleteUserRequest)]
 pub fn encode_iam_delete_user(user_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqDeleteUser { user_id: user_id as i64 })
+    encode_iam(IamPayload::ReqDeleteUser {
+        user_id: user_id as i64,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamSetUserGroupsRequest)]
@@ -5723,12 +6017,18 @@ pub fn encode_iam_set_user_groups(user_id: f64, group_ids_csv: String) -> Result
         .split(',')
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
-    encode_iam(IamPayload::ReqSetUserGroups { user_id: user_id as i64, group_ids })
+    encode_iam(IamPayload::ReqSetUserGroups {
+        user_id: user_id as i64,
+        group_ids,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamResetUserPasswordRequest)]
 pub fn encode_iam_reset_password(user_id: f64, new_password: String) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqResetUserPassword { user_id: user_id as i64, new_password })
+    encode_iam(IamPayload::ReqResetUserPassword {
+        user_id: user_id as i64,
+        new_password,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamListGroupsRequest)]
@@ -5742,18 +6042,30 @@ pub fn encode_iam_create_group(name: String, description: String) -> Result<Vec<
 }
 
 #[wasm_bindgen(js_name = encodeIamUpdateGroupRequest)]
-pub fn encode_iam_update_group(group_id: f64, name: String, description: String) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqUpdateGroup { group_id: group_id as i64, name, description })
+pub fn encode_iam_update_group(
+    group_id: f64,
+    name: String,
+    description: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqUpdateGroup {
+        group_id: group_id as i64,
+        name,
+        description,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamDeleteGroupRequest)]
 pub fn encode_iam_delete_group(group_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqDeleteGroup { group_id: group_id as i64 })
+    encode_iam(IamPayload::ReqDeleteGroup {
+        group_id: group_id as i64,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamGroupMembersRequest)]
 pub fn encode_iam_group_members(group_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqGroupMembers { group_id: group_id as i64 })
+    encode_iam(IamPayload::ReqGroupMembers {
+        group_id: group_id as i64,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamSetPermissionRequest)]
@@ -5765,8 +6077,11 @@ pub fn encode_iam_set_permission(
     access_level: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqSetPermission {
-        resource_type, resource_id, subject_type,
-        subject_id: subject_id as i64, access_level,
+        resource_type,
+        resource_id,
+        subject_type,
+        subject_id: subject_id as i64,
+        access_level,
     })
 }
 
@@ -5778,18 +6093,33 @@ pub fn encode_iam_clear_permission(
     subject_id: f64,
 ) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqClearPermission {
-        resource_type, resource_id, subject_type, subject_id: subject_id as i64,
+        resource_type,
+        resource_id,
+        subject_type,
+        subject_id: subject_id as i64,
     })
 }
 
 #[wasm_bindgen(js_name = encodeIamListPermsForResourceRequest)]
-pub fn encode_iam_list_perms_resource(resource_type: String, resource_id: String) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqListPermsForResource { resource_type, resource_id })
+pub fn encode_iam_list_perms_resource(
+    resource_type: String,
+    resource_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListPermsForResource {
+        resource_type,
+        resource_id,
+    })
 }
 
 #[wasm_bindgen(js_name = encodeIamListPermsForSubjectRequest)]
-pub fn encode_iam_list_perms_subject(subject_type: String, subject_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_iam(IamPayload::ReqListPermsForSubject { subject_type, subject_id: subject_id as i64 })
+pub fn encode_iam_list_perms_subject(
+    subject_type: String,
+    subject_id: f64,
+) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListPermsForSubject {
+        subject_type,
+        subject_id: subject_id as i64,
+    })
 }
 
 // =============================================================================
@@ -5916,11 +6246,13 @@ fn nsight_scope_from_js(value: &JsValue) -> Result<tentaflow_protocol::NsightSco
         let obj: &js_sys::Object = value.unchecked_ref();
         let kind_js = js_sys::Reflect::get(obj, &"kind".into())
             .map_err(|_| JsError::new("nsight scope: brak pola 'kind'"))?;
-        let kind = kind_js.as_string()
+        let kind = kind_js
+            .as_string()
             .ok_or_else(|| JsError::new("nsight scope: pole 'kind' musi byc stringiem"))?;
         let idx_js = js_sys::Reflect::get(obj, &"idx".into())
             .map_err(|_| JsError::new("nsight scope: brak pola 'idx'"))?;
-        let idx = idx_js.as_f64()
+        let idx = idx_js
+            .as_f64()
             .ok_or_else(|| JsError::new("nsight scope: pole 'idx' musi byc liczba"))?;
         if !(0.0..=255.0).contains(&idx) || idx.fract() != 0.0 {
             return Err(JsError::new("nsight scope: 'idx' poza zakresem u8"));
@@ -5935,7 +6267,9 @@ fn nsight_scope_from_js(value: &JsValue) -> Result<tentaflow_protocol::NsightSco
         };
     }
 
-    Err(JsError::new("nsight scope: oczekiwany string lub obiekt {kind, idx}"))
+    Err(JsError::new(
+        "nsight scope: oczekiwany string lub obiekt {kind, idx}",
+    ))
 }
 
 /// Mapuje `NsightScope` na JsValue w tagged formie:
@@ -6052,7 +6386,11 @@ fn profile_report_to_js(r: &tentaflow_protocol::ProfileReport) -> js_sys::Object
     set(&kpi, "kernelCount", (r.kpi.kernel_count as f64).into());
     set(&kpi, "cudaApiCount", (r.kpi.cuda_api_count as f64).into());
     set(&kpi, "peakVramMb", (r.kpi.peak_vram_mb as f64).into());
-    set(&kpi, "samplesCollected", (r.kpi.samples_collected as f64).into());
+    set(
+        &kpi,
+        "samplesCollected",
+        (r.kpi.samples_collected as f64).into(),
+    );
     set(&o, "kpi", kpi.into());
 
     let push_rows = |rows: &[tentaflow_protocol::ProfileTopRow]| -> JsValue {
@@ -6181,7 +6519,10 @@ pub fn encode_nsight_start_request(
 #[wasm_bindgen(js_name = encodeNsightStopRequest)]
 pub fn encode_nsight_stop_request(node_id: String, session_id: String) -> Result<Vec<u8>, JsError> {
     encode_nsight(tentaflow_protocol::NsightPayload::StopRequest(
-        tentaflow_protocol::NsightStopRequest { node_id, session_id },
+        tentaflow_protocol::NsightStopRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -6200,7 +6541,10 @@ pub fn encode_nsight_report_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_nsight(tentaflow_protocol::NsightPayload::ReportRequest(
-        tentaflow_protocol::NsightReportRequest { node_id, session_id },
+        tentaflow_protocol::NsightReportRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -6211,7 +6555,10 @@ pub fn encode_nsight_delete_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_nsight(tentaflow_protocol::NsightPayload::DeleteRequest(
-        tentaflow_protocol::NsightDeleteRequest { node_id, session_id },
+        tentaflow_protocol::NsightDeleteRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -6222,7 +6569,10 @@ pub fn encode_nsight_download_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_nsight(tentaflow_protocol::NsightPayload::DownloadRequest(
-        tentaflow_protocol::NsightDownloadRequest { node_id, session_id },
+        tentaflow_protocol::NsightDownloadRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -6402,7 +6752,9 @@ fn profile_scope_from_js(value: &JsValue) -> Result<tentaflow_protocol::ProfileS
         .as_f64()
         .ok_or_else(|| JsError::new("scope.cpuSamplingHz: oczekiwana liczba"))?;
     if !(0.0..=u32::MAX as f64).contains(&hz) || hz.fract() != 0.0 {
-        return Err(JsError::new("scope.cpuSamplingHz: niecalkowita lub poza u32"));
+        return Err(JsError::new(
+            "scope.cpuSamplingHz: niecalkowita lub poza u32",
+        ));
     }
     let cpu_sampling_hz = hz as u32;
 
@@ -6548,7 +6900,11 @@ fn collector_run_info_to_js(c: &tentaflow_protocol::CollectorRunInfo) -> JsValue
     set(&o, "status", collector_status_to_js(&c.status));
     set(&o, "samplesCollected", (c.samples_collected as f64).into());
     set(&o, "rawSizeBytes", (c.raw_size_bytes as f64).into());
-    set(&o, "primaryCategory", event_category_to_js(c.primary_category));
+    set(
+        &o,
+        "primaryCategory",
+        event_category_to_js(c.primary_category),
+    );
     set(&o, "durationNs", (c.duration_ns as f64).into());
     o.into()
 }
@@ -6599,7 +6955,11 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             set(&o, "counter", counter_kind_to_js(kind));
             set(&o, "value", (*value).into());
         }
-        P::CpuUtil { core, util_pct, freq_mhz } => {
+        P::CpuUtil {
+            core,
+            util_pct,
+            freq_mhz,
+        } => {
             set(&o, "kind", "cpu_util".into());
             set(&o, "core", (*core as f64).into());
             set(&o, "utilPct", (*util_pct as f64).into());
@@ -6615,7 +6975,10 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             set(&o, "availableBytes", (*available_bytes as f64).into());
             set(&o, "pageFaultsPerS", (*page_faults_per_s as f64).into());
         }
-        P::RamBandwidth { read_bps, write_bps } => {
+        P::RamBandwidth {
+            read_bps,
+            write_bps,
+        } => {
             set(&o, "kind", "ram_bandwidth".into());
             set(&o, "readBps", (*read_bps as f64).into());
             set(&o, "writeBps", (*write_bps as f64).into());
@@ -6767,7 +7130,11 @@ fn drift_report_to_js(d: &tentaflow_protocol::DriftReport) -> JsValue {
         arr.push(&clock_samples_to_js(s));
     }
     set(&o, "perCollector", arr.into());
-    set(&o, "maxObservedDriftNs", (d.max_observed_drift_ns as f64).into());
+    set(
+        &o,
+        "maxObservedDriftNs",
+        (d.max_observed_drift_ns as f64).into(),
+    );
     set(&o, "exceededTolerance", d.exceeded_tolerance.into());
     set(&o, "toleranceNs", (d.tolerance_ns as f64).into());
     o.into()
@@ -6780,7 +7147,11 @@ fn profile_report_v2_to_js(r: &tentaflow_protocol::ProfileReportV2) -> JsValue {
     set(&o, "nodeId", r.node_id.clone().into());
     set(&o, "scope", profile_scope_to_js(&r.scope));
     set(&o, "t0MonotonicNs", (r.t0_monotonic_ns as f64).into());
-    set(&o, "t0WallclockUnixNs", (r.t0_wallclock_unix_ns as f64).into());
+    set(
+        &o,
+        "t0WallclockUnixNs",
+        (r.t0_wallclock_unix_ns as f64).into(),
+    );
     set(&o, "durationNs", (r.duration_ns as f64).into());
 
     let collectors = js_sys::Array::new();
@@ -6840,9 +7211,7 @@ fn profile_report_envelope_to_js(env: &tentaflow_protocol::ProfileReportEnvelope
     o.into()
 }
 
-fn profiling_skipped_collector_to_js(
-    s: &tentaflow_protocol::ProfilingSkippedCollector,
-) -> JsValue {
+fn profiling_skipped_collector_to_js(s: &tentaflow_protocol::ProfilingSkippedCollector) -> JsValue {
     let o = js_sys::Object::new();
     set(&o, "id", s.id.clone().into());
     set(&o, "reason", s.reason.clone().into());
@@ -6872,8 +7241,16 @@ fn profiling_active_session_info_to_js(
     set(&o, "sessionId", info.session_id.clone().into());
     set(&o, "nodeId", info.node_id.clone().into());
     set(&o, "label", info.label.clone().into());
-    set(&o, "startedAtUnixNs", (info.started_at_unix_ns as f64).into());
-    set(&o, "plannedDurationNs", (info.planned_duration_ns as f64).into());
+    set(
+        &o,
+        "startedAtUnixNs",
+        (info.started_at_unix_ns as f64).into(),
+    );
+    set(
+        &o,
+        "plannedDurationNs",
+        (info.planned_duration_ns as f64).into(),
+    );
     set(&o, "elapsedNs", (info.elapsed_ns as f64).into());
     let running = js_sys::Array::new();
     for c in &info.collectors_running {
@@ -6889,7 +7266,10 @@ fn profiling_active_session_info_to_js(
 }
 
 /// Wypelnia `obj` polami pojedynczego wariantu `ProfilingPayload`.
-fn profiling_payload_fill_obj(obj: &js_sys::Object, payload: &tentaflow_protocol::ProfilingPayload) {
+fn profiling_payload_fill_obj(
+    obj: &js_sys::Object,
+    payload: &tentaflow_protocol::ProfilingPayload,
+) {
     use tentaflow_protocol::ProfilingPayload as P;
     match payload {
         P::StartRequest(r) => {
@@ -6898,7 +7278,11 @@ fn profiling_payload_fill_obj(obj: &js_sys::Object, payload: &tentaflow_protocol
             set(obj, "scope", profile_scope_to_js(&r.scope));
             set(obj, "label", r.label.clone().into());
             // Hasla nie eksponujemy w decode (bezpieczenstwo); JS dostaje tylko fakt obecnosci.
-            set(obj, "hasElevationPassword", (!r.elevation_password.is_empty()).into());
+            set(
+                obj,
+                "hasElevationPassword",
+                (!r.elevation_password.is_empty()).into(),
+            );
         }
         P::StartResponse(r) => {
             set(obj, "variant", "ProfilingStartResponse".into());
@@ -7019,7 +7403,10 @@ pub fn encode_profiling_stop_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_profiling(tentaflow_protocol::ProfilingPayload::StopRequest(
-        tentaflow_protocol::ProfilingStopRequest { node_id, session_id },
+        tentaflow_protocol::ProfilingStopRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -7038,7 +7425,10 @@ pub fn encode_profiling_report_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_profiling(tentaflow_protocol::ProfilingPayload::ReportRequest(
-        tentaflow_protocol::ProfilingReportRequest { node_id, session_id },
+        tentaflow_protocol::ProfilingReportRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -7049,7 +7439,10 @@ pub fn encode_profiling_delete_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_profiling(tentaflow_protocol::ProfilingPayload::DeleteRequest(
-        tentaflow_protocol::ProfilingDeleteRequest { node_id, session_id },
+        tentaflow_protocol::ProfilingDeleteRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -7060,7 +7453,10 @@ pub fn encode_profiling_download_request(
     session_id: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_profiling(tentaflow_protocol::ProfilingPayload::DownloadRequest(
-        tentaflow_protocol::ProfilingDownloadRequest { node_id, session_id },
+        tentaflow_protocol::ProfilingDownloadRequest {
+            node_id,
+            session_id,
+        },
     ))
 }
 
@@ -7125,7 +7521,9 @@ mod nsight_tests {
                 session_id: "s1".into(),
                 status: tentaflow_protocol::NsightSessionStatus::Stopping,
             }),
-            NsightPayload::SessionsRequest(NsightSessionsRequest { node_id: "n".into() }),
+            NsightPayload::SessionsRequest(NsightSessionsRequest {
+                node_id: "n".into(),
+            }),
             NsightPayload::SessionsResponse(NsightSessionsResponse {
                 node_id: "n".into(),
                 sessions: vec![],
