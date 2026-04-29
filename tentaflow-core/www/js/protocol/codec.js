@@ -1596,6 +1596,33 @@ export const encode = {
     );
   },
 
+  /** ProfilingPayload::ValidateSudoRequest — sudo password (used once, never logged). */
+  profilingValidateSudoRequest(correlationId, { nodeId, password }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProfilingValidateSudoRequest(
+      String(nodeId ?? ''),
+      String(password ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** ProfilingPayload::CollectorsStatusRequest — list collectors + binary paths. */
+  profilingCollectorsStatusRequest(correlationId, { nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProfilingCollectorsStatusRequest(String(nodeId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // SSO / TLS / NGC (FAZA 4)
   // -------------------------------------------------------------------------

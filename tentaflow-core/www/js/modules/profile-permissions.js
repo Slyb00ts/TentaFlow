@@ -198,7 +198,7 @@ function bind(container) {
         fb.textContent = 'Sudo password accepted by backend.';
       } else if (!res.backendAvailable) {
         fb.className = 'pp-feedback warn';
-        fb.textContent = 'Backend does not implement /api/profiling/validate-sudo — password is cached but unverified.';
+        fb.textContent = 'Backend nieosiagalny przez binary ValidateSudoRequest — haslo cached lokalnie, walidacja przy starcie sesji.';
       } else if (res.reason === 'empty') {
         fb.className = 'pp-feedback warn';
         fb.textContent = 'Empty password — nothing to validate.';

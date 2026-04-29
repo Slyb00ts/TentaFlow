@@ -16,7 +16,6 @@ pub mod api_mesh;
 pub mod api_models;
 pub mod api_nim;
 pub mod api_pii_rules;
-pub mod api_profiling;
 pub mod api_prompts;
 pub mod api_registries;
 pub mod api_services;

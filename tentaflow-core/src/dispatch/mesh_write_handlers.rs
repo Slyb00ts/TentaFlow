@@ -1278,6 +1278,33 @@ async fn handle_profiling_local(
             });
             Ok(PP::ActiveInfoResponse(ProfilingActiveInfoResponse { info }))
         }
+        PP::ValidateSudoRequest(req) => {
+            let response = crate::profiling::permissions::validate_sudo(req.password).await;
+            let _ = repository::log_audit(
+                &ctx.state.db,
+                None,
+                None,
+                "profiling.validate_sudo",
+                None,
+                Some(&format!(
+                    "success={}, reason={}",
+                    response.ok, response.reason
+                )),
+                None,
+                Some(ctx.state.local_node_id.as_ref()),
+            );
+            Ok(PP::ValidateSudoResponse(response))
+        }
+        PP::CollectorsStatusRequest(_req) => {
+            let (collectors, age_seconds) =
+                crate::profiling::permissions::collectors_status_snapshot();
+            Ok(PP::CollectorsStatusResponse(
+                tentaflow_protocol::ProfilingCollectorsStatusResponse {
+                    collectors,
+                    age_seconds,
+                },
+            ))
+        }
         // Response variants must not arrive as requests.
         PP::StartResponse(_)
         | PP::StopResponse(_)
@@ -1285,7 +1312,9 @@ async fn handle_profiling_local(
         | PP::ReportResponse(_)
         | PP::DeleteResponse(_)
         | PP::DownloadResponse(_)
-        | PP::ActiveInfoResponse(_) => Err(ProtocolError::bad_request(
+        | PP::ActiveInfoResponse(_)
+        | PP::ValidateSudoResponse(_)
+        | PP::CollectorsStatusResponse(_) => Err(ProtocolError::bad_request(
             "expected ProfilingPayload request variant",
         )),
     }
@@ -1307,6 +1336,12 @@ async fn profiling_route(
         PP::DeleteRequest(r) => r.node_id.clone(),
         PP::DownloadRequest(r) => r.node_id.clone(),
         PP::ActiveInfoRequest(r) => r.node_id.clone(),
+        // ValidateSudo i CollectorsStatus to per-process state — sudo dziala
+        // tylko w kontekscie tego procesu, kolektory probowane lokalnie.
+        // Nie forward'ujemy do peera - obsluga wprost lokalna.
+        PP::ValidateSudoRequest(_) | PP::CollectorsStatusRequest(_) => {
+            return handle_profiling_local(ctx, payload).await;
+        }
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ProfilingPayload request variant",
@@ -1387,6 +1422,14 @@ register_profiling_variant!(
 register_profiling_variant!(
     "ProfilingActiveInfoRequest",
     "tentaflow_ws_handler_profiling_active_info"
+);
+register_profiling_variant!(
+    "ProfilingValidateSudoRequest",
+    "tentaflow_ws_handler_profiling_validate_sudo"
+);
+register_profiling_variant!(
+    "ProfilingCollectorsStatusRequest",
+    "tentaflow_ws_handler_profiling_collectors_status"
 );
 
 #[cfg(test)]
