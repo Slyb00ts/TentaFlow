@@ -18,3 +18,4 @@ pub mod redeploy;
 pub mod runner;
 
 pub use bundle::extract_to;
+pub mod vram_calculator;

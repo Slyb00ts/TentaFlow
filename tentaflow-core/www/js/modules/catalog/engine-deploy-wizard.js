@@ -46,8 +46,14 @@ const STEPS = [
   { id: 'method' },
   { id: 'model', skip: shouldSkipModelStep },
   { id: 'gpu', skip: shouldSkipGpuStep },
+  { id: 'advanced', skip: shouldSkipAdvancedStep },
   { id: 'runtime' },
 ];
+
+// Cache ostatniego wyniku /api/deploy/vllm/recommend (key: model+gpu_ids hash).
+// Pozwala przeliczyc VRAM lokalnie przy zmianie suwaka bez ponownego HF fetch.
+let advancedRecommendation = null;
+let advancedRecommendDebounceTimer = null;
 
 /// Publiczne API: otwiera wizard dla `engineId`. `opts` opcjonalnie zawiera
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
@@ -65,7 +71,18 @@ export async function openDeployWizard(engineId, opts = {}) {
     containerName: null,
     gpuSelectMode: 'all',
     gpuIds: [],
+    // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args
+    advanced: {
+      mode: 'auto',  // 'auto' = use recommended, 'manual' = override
+      tensor_parallel: null,       // null = auto-pick
+      pipeline_parallel: null,
+      max_model_len: null,
+      max_num_seqs: null,
+      kv_cache_dtype: 'auto',
+      gpu_memory_utilization: 0.9,
+    },
   };
+  advancedRecommendation = null;
   gpuListByNode.clear();
 
   renderShell(`<div class="form-hint">${escapeHtml(I18n.t('common.loading'))}</div>`);
@@ -233,12 +250,27 @@ function renderStepIndicator() {
 
 function renderStepBody() {
   switch (currentStepId()) {
-    case 'method':  return renderStepMethod();
-    case 'model':   return renderStepModel();
-    case 'gpu':     return renderStepGpu();
-    case 'runtime': return renderStepRuntime();
+    case 'method':   return renderStepMethod();
+    case 'model':    return renderStepModel();
+    case 'gpu':      return renderStepGpu();
+    case 'advanced': return renderStepAdvanced();
+    case 'runtime':  return renderStepRuntime();
     default: return '';
   }
+}
+
+// Step Advanced wyswietlamy TYLKO dla LLM silnikow ktore akceptuja
+// VLLM_ARGS-style override (vllm/sglang/llama-cpp). Inne silniki (TTS/STT/
+// vision/image-gen) maja stalsze konfiguracje i nie maja kalkulatora VRAM.
+function shouldSkipAdvancedStep() {
+  const eng = engineEntry?.engine || {};
+  const id = String(eng.id || '').toLowerCase();
+  if (!['vllm', 'sglang', 'llama-cpp', 'tensorrt-llm'].includes(id)) return true;
+  // Bez wybranego modelu nie ma jak liczyc VRAM
+  if (!selection.modelRepo && !selection.modelPresetId) return true;
+  // Bez wybranych GPU tez nie - kalkulator wymaga at least 1 GPU
+  if (selection.gpuSelectMode === 'none') return true;
+  return false;
 }
 
 function renderFooter() {
@@ -407,6 +439,284 @@ function formatCount(n) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+// ---- Step Advanced: vLLM Auto-tuned -------------------------------------
+// Inteligentny kalkulator VRAM. Czyta config.json modelu z HF, smart-pick
+// TP/PP zgodne z liczba attention heads i hidden layers, suwaki ctx_len /
+// max_seqs / kv_dtype / gpu_mem_util z hard limits ile VRAM zostaje (suwak
+// nie pozwoli ustawic czegos co nie miesci sie w VRAM).
+
+function getAdvancedModelName() {
+  if (selection.modelRepo) return selection.modelRepo;
+  if (selection.modelPresetId) {
+    const presets = Manifest.modelPresets(engineEntry);
+    const preset = presets.find((p) => p?.id === selection.modelPresetId);
+    return preset?.repo || null;
+  }
+  return null;
+}
+
+function getAdvancedGpus() {
+  const node = nodes.find((n) => (n.node_id || n.id) === selection.nodeId);
+  if (!node) return [];
+  const allGpus = (node.gpus || []).map((g, i) => ({
+    index: g.index ?? i,
+    name: g.name || 'GPU',
+    memory_gb: Math.round(((g.vram_total_mb || g.memory_mb || 0) / 1024) * 10) / 10,
+  }));
+  if (selection.gpuSelectMode === 'specific') {
+    const ids = new Set((selection.gpuIds || []).map(String));
+    return allGpus.filter((g) => ids.has(String(g.index)));
+  }
+  return allGpus; // 'all'
+}
+
+async function fetchVllmRecommendation(overrides = {}) {
+  const model = getAdvancedModelName();
+  const gpus = getAdvancedGpus();
+  if (!model || gpus.length === 0) return null;
+  const body = {
+    model,
+    gpus,
+    ...overrides,
+  };
+  try {
+    const resp = await fetch('/api/deploy/vllm/recommend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errBody = await resp.text();
+      return { error: `HTTP ${resp.status}: ${errBody}` };
+    }
+    return await resp.json();
+  } catch (err) {
+    return { error: err.message || String(err) };
+  }
+}
+
+function renderStepAdvanced() {
+  const model = getAdvancedModelName() || '?';
+  const gpus = getAdvancedGpus();
+  const totalVramGb = gpus.reduce((acc, g) => acc + g.memory_gb, 0);
+
+  const adv = selection.advanced;
+  const summaryHtml = advancedRecommendation && !advancedRecommendation.error
+    ? renderRecommendationSummary(advancedRecommendation)
+    : `<div class="form-hint" id="edw-adv-loading">Pobieram config modelu z HuggingFace i kalkuluje VRAM...</div>`;
+
+  return `
+    <h4 class="wizard-step-title">Zaawansowane: vLLM Auto-tuned</h4>
+    <div class="form-group">
+      <label>Model</label>
+      <div><code>${escapeHtml(model)}</code></div>
+    </div>
+    <div class="form-group">
+      <label>Wybrane GPU (${gpus.length} × ${totalVramGb.toFixed(1)} GB total)</label>
+      <div class="form-hint">${gpus.map((g) => `GPU ${g.index} (${g.memory_gb} GB)`).join(', ') || '—'}</div>
+    </div>
+
+    <div id="edw-adv-summary">${summaryHtml}</div>
+
+    <div class="form-group" style="margin-top: 16px;">
+      <label>Tryb konfiguracji</label>
+      <div style="display:flex; gap:8px;">
+        <tf-button size="sm" variant="${adv.mode === 'auto' ? 'primary' : 'secondary'}" data-adv-mode="auto">Auto-tuned</tf-button>
+        <tf-button size="sm" variant="${adv.mode === 'manual' ? 'primary' : 'secondary'}" data-adv-mode="manual">Ręczna</tf-button>
+      </div>
+    </div>
+
+    ${adv.mode === 'manual' ? renderAdvancedManualControls(adv) : `
+      <div class="form-hint">
+        Auto-tuned używa rekomendowanej konfiguracji (TP/PP zgodne z heads/layers, kv-cache fp8 dla wiekszych modeli, max_model_len ograniczone do tego co fits w VRAM).
+        Przelacz na "Ręczna" aby skonfigurowac suwakami.
+      </div>
+    `}
+  `;
+}
+
+function renderRecommendationSummary(rec) {
+  if (rec.error) {
+    return `<div class="form-hint" style="color:var(--color-error,#c00)">${escapeHtml(rec.error)}</div>`;
+  }
+  const m = rec.model_spec || {};
+  const v = rec.vram_estimate || {};
+  const r = rec.recommended || {};
+  const totalGpus = (getAdvancedGpus() || []).length || 1;
+  const totalVram = (getAdvancedGpus() || []).reduce((a, g) => a + g.memory_gb, 0);
+  const usedTotal = (v.per_gpu_gb || 0) * (r.tensor_parallel || 1) * (r.pipeline_parallel || 1);
+  const fillPct = Math.min(100, Math.round((v.per_gpu_gb || 0) / Math.max(1, totalVram / totalGpus) * 100));
+  const fillColor = v.fits_per_gpu ? '#4caf50' : '#f44336';
+
+  const warningsHtml = (rec.warnings || []).length > 0
+    ? `<ul style="margin: 8px 0; padding-left: 20px; color: var(--color-warn, #b87100); font-size: 12px;">
+         ${rec.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}
+       </ul>`
+    : '';
+
+  return `
+    <div style="background: var(--color-surface-alt, #f5f5f5); padding: 12px; border-radius: 6px;">
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; font-size: 13px;">
+        <div><strong>Architektura:</strong> ${escapeHtml(m.model_type || '?')} (${escapeHtml((m.architectures || []).join(', ') || '?')})</div>
+        <div><strong>Parametry:</strong> ${(m.estimated_params_billions || 0).toFixed(1)}B (${escapeHtml(m.dtype || '?')}${m.quantization ? `, ${escapeHtml(m.quantization)}` : ''})</div>
+        <div><strong>Layers / Heads:</strong> ${m.num_hidden_layers || 0} / ${m.num_attention_heads || 0} (KV: ${m.num_key_value_heads || 0})</div>
+        <div><strong>Max ctx (model):</strong> ${(m.max_position_embeddings || 0).toLocaleString()}</div>
+      </div>
+      <div style="margin-top: 12px;">
+        <strong>Konfiguracja rekomendowana:</strong> TP=${r.tensor_parallel} × PP=${r.pipeline_parallel}, ctx=${(r.max_model_len || 0).toLocaleString()}, max_seqs=${r.max_num_seqs}, kv=${escapeHtml(r.kv_cache_dtype || 'auto')}
+      </div>
+      <div style="margin-top: 8px;">
+        <div style="display:flex; justify-content: space-between; font-size:12px; margin-bottom: 4px;">
+          <span>VRAM per GPU: ${(v.per_gpu_gb || 0).toFixed(1)} / ${(totalVram / totalGpus).toFixed(1)} GB (${fillPct}%)</span>
+          <span>Total: ${(usedTotal).toFixed(1)} / ${totalVram.toFixed(1)} GB</span>
+        </div>
+        <div style="height:8px; background: #ddd; border-radius:4px; overflow: hidden;">
+          <div style="width: ${fillPct}%; height:100%; background: ${fillColor}; transition: width 0.3s;"></div>
+        </div>
+        <div style="font-size:12px; margin-top:4px; color: var(--color-text-muted, #666);">
+          Weights: ${(v.model_weights_gb || 0).toFixed(1)} GB · KV cache: ${(v.kv_cache_gb || 0).toFixed(1)} GB · Activations: ${(v.activations_gb || 0).toFixed(1)} GB
+        </div>
+      </div>
+      ${warningsHtml}
+      <details style="margin-top: 8px; font-size: 12px;">
+        <summary style="cursor: pointer;">VLLM_ARGS (rozwijany)</summary>
+        <pre style="background: #eee; padding: 6px; border-radius: 4px; overflow-x: auto; margin-top: 4px;">${escapeHtml(rec.recommended_vllm_args || '')}</pre>
+      </details>
+    </div>
+  `;
+}
+
+function renderAdvancedManualControls(adv) {
+  const rec = advancedRecommendation || {};
+  const recCfg = rec.recommended || {};
+  const maxCtx = rec.max_supported_model_len || 32768;
+  const maxSeqs = rec.max_supported_num_seqs || 256;
+  const tp = adv.tensor_parallel ?? recCfg.tensor_parallel ?? 1;
+  const pp = adv.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
+  const ctx = adv.max_model_len ?? recCfg.max_model_len ?? 8192;
+  const seqs = adv.max_num_seqs ?? recCfg.max_num_seqs ?? 16;
+  const kv = adv.kv_cache_dtype || recCfg.kv_cache_dtype || 'auto';
+  const memUtil = adv.gpu_memory_utilization ?? recCfg.gpu_memory_utilization ?? 0.9;
+  const totalGpus = (getAdvancedGpus() || []).length || 1;
+
+  return `
+    <div class="form-group">
+      <label>Tensor Parallel (1..${totalGpus})</label>
+      <input type="number" id="edw-adv-tp" min="1" max="${totalGpus}" step="1" value="${tp}"
+        style="width: 80px;">
+      <span class="form-hint inline">musi dzielic num_attention_heads modelu</span>
+    </div>
+    <div class="form-group">
+      <label>Pipeline Parallel (1..${totalGpus})</label>
+      <input type="number" id="edw-adv-pp" min="1" max="${totalGpus}" step="1" value="${pp}"
+        style="width: 80px;">
+      <span class="form-hint inline">TP × PP musi byc <= liczba GPU; PP dzieli num_hidden_layers</span>
+    </div>
+    <div class="form-group">
+      <label>Max model length (kontekst): <span id="edw-adv-ctx-val">${ctx.toLocaleString()}</span></label>
+      <input type="range" id="edw-adv-ctx" min="512" max="${maxCtx}" step="512" value="${ctx}" style="width: 100%;">
+      <span class="form-hint">Max wspierane: ${maxCtx.toLocaleString()} (limit z VRAM dla aktualnej konfiguracji)</span>
+    </div>
+    <div class="form-group">
+      <label>Max równoległych zapytań: <span id="edw-adv-seqs-val">${seqs}</span></label>
+      <input type="range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}" style="width: 100%;">
+      <span class="form-hint">Max wspierane: ${maxSeqs}</span>
+    </div>
+    <div class="form-group">
+      <label>KV Cache Dtype</label>
+      <select id="edw-adv-kv" style="padding: 4px;">
+        <option value="auto" ${kv === 'auto' ? 'selected' : ''}>auto (fp16, default)</option>
+        <option value="fp16" ${kv === 'fp16' ? 'selected' : ''}>fp16 (2 bytes/elem)</option>
+        <option value="bfloat16" ${kv === 'bfloat16' ? 'selected' : ''}>bfloat16 (2 bytes/elem)</option>
+        <option value="fp8" ${kv === 'fp8' ? 'selected' : ''}>fp8 (1 byte/elem - 2× wiecej kontekstu)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>GPU memory utilization: <span id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
+      <input type="range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}" style="width: 100%;">
+      <span class="form-hint">Ile VRAM mozna uzyc (0.5 = 50%, 0.95 = 95%; rezerwuje miejsce dla CUDA workspace)</span>
+    </div>
+    <div class="form-hint" style="margin-top: 8px;">
+      Wartosci sa zapisywane jako VLLM_ARGS w deploy. Suwaki maja hard limits z aktualnej konfiguracji - jezeli ustawisz wieksze, deploy moze sie OOM-owac.
+    </div>
+  `;
+}
+
+function bindAdvancedHandlers() {
+  document.querySelectorAll('[data-adv-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      selection.advanced.mode = btn.getAttribute('data-adv-mode');
+      rerenderStepBody();
+    });
+  });
+
+  const debounceRecompute = (overrides) => {
+    if (advancedRecommendDebounceTimer) clearTimeout(advancedRecommendDebounceTimer);
+    advancedRecommendDebounceTimer = setTimeout(async () => {
+      advancedRecommendation = await fetchVllmRecommendation(overrides);
+      const summaryDiv = document.getElementById('edw-adv-summary');
+      if (summaryDiv && advancedRecommendation) {
+        summaryDiv.innerHTML = renderRecommendationSummary(advancedRecommendation);
+      }
+    }, 300);
+  };
+
+  const buildOverrides = () => {
+    const a = selection.advanced;
+    return {
+      tensor_parallel: a.tensor_parallel || undefined,
+      pipeline_parallel: a.pipeline_parallel || undefined,
+      max_model_len: a.max_model_len || undefined,
+      max_num_seqs: a.max_num_seqs || undefined,
+      kv_cache_dtype: a.kv_cache_dtype !== 'auto' ? a.kv_cache_dtype : undefined,
+      gpu_memory_utilization: a.gpu_memory_utilization || undefined,
+    };
+  };
+
+  const bindRange = (id, valSpanId, key, transform = (v) => v, displayFn = null) => {
+    const el = document.getElementById(id);
+    const valSpan = document.getElementById(valSpanId);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      const v = transform(el.value);
+      selection.advanced[key] = v;
+      if (valSpan) valSpan.textContent = displayFn ? displayFn(v) : v.toLocaleString();
+      debounceRecompute(buildOverrides());
+    });
+  };
+
+  bindRange('edw-adv-ctx', 'edw-adv-ctx-val', 'max_model_len', (v) => parseInt(v));
+  bindRange('edw-adv-seqs', 'edw-adv-seqs-val', 'max_num_seqs', (v) => parseInt(v));
+  bindRange('edw-adv-mem', 'edw-adv-mem-val', 'gpu_memory_utilization',
+    (v) => parseFloat(v),
+    (v) => `${(v * 100).toFixed(0)}%`);
+
+  ['edw-adv-tp', 'edw-adv-pp'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', () => {
+      const key = id === 'edw-adv-tp' ? 'tensor_parallel' : 'pipeline_parallel';
+      selection.advanced[key] = parseInt(el.value);
+      debounceRecompute(buildOverrides());
+    });
+  });
+
+  const kvSelect = document.getElementById('edw-adv-kv');
+  if (kvSelect) {
+    kvSelect.addEventListener('change', () => {
+      selection.advanced.kv_cache_dtype = kvSelect.value;
+      debounceRecompute(buildOverrides());
+    });
+  }
+
+  // Wyzwalaj initial fetch jezeli jeszcze nie ma rekomendacji (np. user
+  // wszedl w step pierwszy raz bez auto-trigger).
+  if (!advancedRecommendation) {
+    debounceRecompute({});
+  }
 }
 
 // ---- Step 3: runtime ------------------------------------------------------
@@ -649,11 +959,20 @@ function bindStepGpuInputs() {
 
 function bindStepInputs() {
   switch (currentStepId()) {
-    case 'method':  bindStepMethodInputs(); break;
-    case 'model':   bindStepModelInputs(); break;
-    case 'gpu':     bindStepGpuInputs(); break;
-    case 'runtime': bindStepRuntimeInputs(); break;
+    case 'method':   bindStepMethodInputs(); break;
+    case 'model':    bindStepModelInputs(); break;
+    case 'gpu':      bindStepGpuInputs(); break;
+    case 'advanced': bindAdvancedHandlers(); break;
+    case 'runtime':  bindStepRuntimeInputs(); break;
   }
+}
+
+// Re-render zachowuje pozycje step ale przerysowuje body (np. po zmianie
+// trybu auto/manual w Advanced step). renderShell powtarza wszystkie nagłówki
+// + footer + bindings - tanie operacje (no DOM diff).
+function rerenderStepBody() {
+  renderShell(renderStepBody());
+  bindStepInputs();
 }
 
 function bindStepMethodInputs() {
@@ -832,6 +1151,34 @@ async function startDeploy() {
   if (btn) btn.setAttribute('disabled', '');
 
   const eng = engineEntry.engine || {};
+  // Build vllm_args z Advanced step (jezeli aktywny dla tego silnika).
+  // Auto-tuned -> uzywa recommended_vllm_args z kalkulatora.
+  // Manual -> sklada CLI string z user-set wartosci suwakow.
+  let vllmArgs = null;
+  if (!shouldSkipAdvancedStep() && advancedRecommendation && !advancedRecommendation.error) {
+    if (selection.advanced.mode === 'auto') {
+      vllmArgs = advancedRecommendation.recommended_vllm_args || null;
+    } else {
+      const a = selection.advanced;
+      const r = advancedRecommendation.recommended || {};
+      const parts = [
+        '--dtype', 'auto',
+        '--gpu-memory-utilization', String(a.gpu_memory_utilization ?? r.gpu_memory_utilization ?? 0.9),
+        '--max-model-len', String(a.max_model_len ?? r.max_model_len ?? 8192),
+        '--max-num-seqs', String(a.max_num_seqs ?? r.max_num_seqs ?? 16),
+        '--max-num-batched-tokens', String(Math.max(a.max_model_len ?? 8192, 8192)),
+        '--enable-chunked-prefill',
+      ];
+      const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
+      const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
+      if (tp > 1) parts.push('--tensor-parallel-size', String(tp));
+      if (pp > 1) parts.push('--pipeline-parallel-size', String(pp));
+      const kv = a.kv_cache_dtype || r.kv_cache_dtype || 'auto';
+      if (kv !== 'auto') parts.push('--kv-cache-dtype', kv);
+      vllmArgs = parts.join(' ');
+    }
+  }
+
   const configJson = JSON.stringify({
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
@@ -839,6 +1186,7 @@ async function startDeploy() {
     container_name: selection.containerName || null,
     gpu_select_mode: selection.gpuSelectMode,
     gpu_ids: selection.gpuSelectMode === 'specific' ? selection.gpuIds : null,
+    vllm_args: vllmArgs,
   });
 
   try {
