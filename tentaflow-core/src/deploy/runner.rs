@@ -497,6 +497,11 @@ async fn do_docker_deploy(
         // jest osiagalny tylko przez QUIC sidecar.
         service_manager.register_model_mapping(model_name, &service_name);
     }
+    // Alias service_name -> service_name w model_pool. GUI dispatchuje
+    // chat completion z model=service_name (np. "tentaflow-vllm-ec7sj"),
+    // nie z HF repo. Bez tego routera 'Model X nie znaleziony w konfiguracji'.
+    // Parytet z python-bundle (runner.rs:1750+).
+    service_manager.register_model_mapping(&service_name, &service_name);
     persist_source_hash(db, &engine.engine_id, "docker", &service_name);
     log_line(db, deploy_id, tx, "log", "serwis zarejestrowany w routerze");
 
