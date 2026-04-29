@@ -202,7 +202,8 @@ export class ProfilingLaunchModal {
     // state
     this.selected = new Set(); // ids
     this.label = '';
-    this.durationSec = 60;
+    // Domyślny czas sesji 5 min (zgodne z mockupem #01).
+    this.durationSec = 300;
     this.manualStop = false;
     this.targetMode = 'system_wide';
     this.targetPid = '';
@@ -227,15 +228,30 @@ export class ProfilingLaunchModal {
     });
   }
 
+  // Buduje podtytuł nagłówka modalu w formacie:
+  // "<nodeId> · <CPU + N GPU + RAM + Disk + Power + Network>".
+  // Liczy GPU per-vendor jako jednorazową kategorię.
+  _buildSubtitle() {
+    const has = (predicate) => this.sources.some(predicate);
+    const gpuCount = this.sources.filter((s) => sourceVendor(s) !== null).length;
+    const parts = [];
+    if (has((s) => categorizeSource(s) === 'CPU')) parts.push('CPU');
+    if (gpuCount > 0) parts.push(`${gpuCount} GPU`);
+    if (has((s) => categorizeSource(s) === 'RAM')) parts.push('RAM');
+    if (has((s) => categorizeSource(s) === 'Disk')) parts.push('Disk');
+    if (has((s) => categorizeSource(s) === 'Power')) parts.push('Power');
+    if (has((s) => categorizeSource(s) === 'Network')) parts.push('Network');
+    const components = parts.join(' + ');
+    return `${this.nodeId}${components ? ' · ' + components : ''}`;
+  }
+
   _launchWindow() {
     const bodyEl = document.createElement('div');
     bodyEl.className = 'profiling-launch';
 
-    const footEl = document.createElement('div');
-    footEl.style.display = 'contents';
-
     const winPromise = TfWindow.open({
       title: 'Start profiling session',
+      subtitle: this._buildSubtitle(),
       icon: 'activity',
       body: bodyEl,
       footer: this._buildFooter(),
@@ -293,7 +309,7 @@ export class ProfilingLaunchModal {
     wrap.style.width = '100%';
 
     const est = document.createElement('div');
-    est.className = 'estimate-foot';
+    est.className = 'est estimate-foot';
     est.id = 'profiling-estimate-foot';
     est.style.flex = '1';
     est.textContent = 'Estimated storage: — · overhead: —';
@@ -306,7 +322,7 @@ export class ProfilingLaunchModal {
     const start = document.createElement('tf-button');
     start.setAttribute('variant', 'primary');
     start.setAttribute('data-action', 'start');
-    start.setAttribute('icon', 'record');
+    start.setAttribute('icon', 'record-dot');
     start.id = 'profiling-launch-start-btn';
     start.textContent = 'Start Profiling';
 
@@ -349,15 +365,17 @@ export class ProfilingLaunchModal {
     const wrap = document.createElement('div');
     wrap.className = 'field';
     const sliderDisabled = this.manualStop ? 'disabled' : '';
+    // Mockup #01 wymaga sufiksu " s" w polu duration (np. "300 s"). Używamy
+    // type="text" z parsowaniem w handlerze, żeby uniknąć ograniczeń
+    // type="number" (które nie zezwala na nie-cyfrowe znaki).
     wrap.innerHTML = `
       <div class="field-label"><span>Duration</span></div>
       <div class="field-row">
         <input type="range" class="tf-slider" id="pl-duration-slider"
                min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
                value="${this.durationSec}" ${sliderDisabled} />
-        <input type="number" class="field-input duration-num" id="pl-duration-num"
-               min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
-               value="${this.durationSec}" ${sliderDisabled} />
+        <input type="text" inputmode="numeric" class="field-input duration-num" id="pl-duration-num"
+               value="${this.durationSec} s" ${sliderDisabled} />
         <label class="tf-check">
           <input type="checkbox" id="pl-manual-stop" ${this.manualStop ? 'checked' : ''} />
           <span>Manual stop</span>
@@ -416,6 +434,18 @@ export class ProfilingLaunchModal {
       ? `<span class="vendor-badge ${vendor.cls}">${vendor.label}</span>`
       : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="${sourceIconPath(src)}"/></svg>`;
 
+    // Info-tip "(?)" pojawia się przy źródłach gdy backend dostarczył pole
+    // tooltip (np. "perf record / dtrace, 99 Hz default" dla CPU sampling).
+    const tooltip = src.tooltip || src.hint;
+    const infoTipHtml = tooltip
+      ? `<span class="info-tip" title="${escapeAttr(tooltip)}">
+           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+             <circle cx="12" cy="12" r="10"/>
+             <path d="M12 16v-4M12 8h.01"/>
+           </svg>
+         </span>`
+      : '';
+
     card.innerHTML = `
       <span class="src-check">
         <input type="checkbox"
@@ -427,6 +457,7 @@ export class ProfilingLaunchModal {
       <span class="src-meta">
         <span class="src-name">
           <span>${escapeHtml(src.label || src.id)}</span>
+          ${infoTipHtml}
           ${statusBadge}
         </span>
         <span class="src-desc">${escapeHtml(src.description || '')}</span>
@@ -446,41 +477,58 @@ export class ProfilingLaunchModal {
     wrap.className = 'field';
     wrap.id = 'pl-elevation-field';
     const inputType = this.elevationVisible ? 'text' : 'password';
+
+    // Liczba źródeł wymagających elevacji — pokazujemy w treści alertu, żeby
+    // user wiedział czego konkretnie dotyczy żądanie hasła.
+    const elevSources = this.sources.filter((s) =>
+      this.selected.has(s.id) && (s.status === 'needs_sudo' || s.status === 'needs_admin')
+    );
+    const elevCount = elevSources.length;
+    const elevNames = elevSources.map((s) => s.label || s.id).join(', ');
+
     wrap.innerHTML = `
       <div class="alert-box">
+        <div class="a-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 22h20L12 2z"/>
+            <path d="M12 9v6M12 18h.01"/>
+          </svg>
+        </div>
         <div class="a-body">
-          <strong>Elevated permissions required.</strong>
-          Some selected sources need <code>sudo</code>/admin access. Provide your password and click <strong>Test</strong> to verify.
+          <strong>${elevCount} source${elevCount === 1 ? '' : 's'} require elevation</strong> — ${escapeHtml(elevNames)}.
+          Provide your sudo password once. It is used to spawn collectors and is <strong>never stored on disk or in DB</strong>.
         </div>
       </div>
-      <div class="field-label"><span>Elevation password</span></div>
-      <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}">
-        <svg class="lock-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="4" y="11" width="16" height="10" rx="2"/>
-          <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
-        </svg>
-        <input type="${inputType}" id="pl-elevation-input"
-               autocomplete="current-password"
-               value="${escapeAttr(this.elevationPassword)}"
-               placeholder="••••••••" />
-        <button type="button" class="pw-eye" id="pl-elevation-eye"
-                title="Toggle visibility">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
-            <circle cx="12" cy="12" r="3"/>
+      <div class="field-label">
+        <span>Sudo password</span>
+        <span class="counter">used once · not stored</span>
+      </div>
+      <div class="field-row">
+        <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}" style="flex:1;">
+          <svg class="lock-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="11" width="16" height="10" rx="2"/>
+            <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
           </svg>
-        </button>
-      </div>
-      <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+          <input type="${inputType}" id="pl-elevation-input"
+                 autocomplete="current-password"
+                 value="${escapeAttr(this.elevationPassword)}"
+                 placeholder="••••••••" />
+          <button type="button" class="pw-eye" id="pl-elevation-eye" title="Toggle visibility">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+        </div>
         <tf-button variant="outline" size="sm" id="pl-elevation-test">Test</tf-button>
-        <span class="pw-test-result ${this.elevationStatus === 'ok' ? 'ok' : ''} ${this.elevationStatus === 'bad' ? 'bad' : ''}"
-              id="pl-elevation-result">
-          ${this.elevationStatus === 'ok' ? '✓ Authenticated'
-            : this.elevationStatus === 'bad' ? '✗ Invalid password'
-            : this.elevationStatus === 'testing' ? 'Testing…'
-            : ''}
-        </span>
       </div>
+      <span class="pw-test-result ${this.elevationStatus === 'ok' ? 'ok' : ''} ${this.elevationStatus === 'bad' ? 'bad' : ''}"
+            id="pl-elevation-result">
+        ${this.elevationStatus === 'ok' ? '✓ Authenticated'
+          : this.elevationStatus === 'bad' ? '✗ Invalid password'
+          : this.elevationStatus === 'testing' ? 'Testing…'
+          : ''}
+      </span>
     `;
     return wrap;
   }
@@ -488,8 +536,11 @@ export class ProfilingLaunchModal {
   _renderTargetField() {
     const wrap = document.createElement('div');
     wrap.className = 'field';
+    // PID input renderujemy zawsze w środku radio-row (120px wide jak w mockupie),
+    // ukrywając go gdy nie wybrano "Specific PID".
+    const pidStyle = this.targetMode === 'specific_pid' ? 'width:120px;' : 'width:120px; display:none;';
     wrap.innerHTML = `
-      <div class="field-label"><span>Target</span></div>
+      <div class="field-label"><span>Profile target</span></div>
       <div class="radio-row">
         <label class="tf-check">
           <input type="radio" name="pl-target" value="system_wide"
@@ -499,18 +550,18 @@ export class ProfilingLaunchModal {
         <label class="tf-check">
           <input type="radio" name="pl-target" value="own_process"
                  ${this.targetMode === 'own_process' ? 'checked' : ''} />
-          <span>TentaFlow process only</span>
+          <span>Own process (tentaflow)</span>
         </label>
         <label class="tf-check">
           <input type="radio" name="pl-target" value="specific_pid"
                  ${this.targetMode === 'specific_pid' ? 'checked' : ''} />
           <span>Specific PID</span>
         </label>
+        <input type="number" class="field-input" id="pl-target-pid"
+               placeholder="e.g. 14872" min="1" step="1"
+               value="${escapeAttr(this.targetPid)}"
+               style="${pidStyle}" />
       </div>
-      <input type="number" class="field-input" id="pl-target-pid"
-             placeholder="PID" min="1" step="1"
-             value="${escapeAttr(this.targetPid)}"
-             style="${this.targetMode === 'specific_pid' ? '' : 'display:none;'}" />
     `;
     return wrap;
   }
@@ -533,18 +584,24 @@ export class ProfilingLaunchModal {
     if (slider) {
       slider.addEventListener('input', () => {
         this.durationSec = parseInt(slider.value, 10);
-        if (durNum) durNum.value = String(this.durationSec);
+        if (durNum) durNum.value = `${this.durationSec} s`;
         this._updateEstimate();
       });
     }
     if (durNum) {
+      // Wycinamy wszystko poza cyframi (sufiks " s" jest ozdobny).
       durNum.addEventListener('input', () => {
-        let v = parseInt(durNum.value, 10);
+        const digits = String(durNum.value).replace(/[^0-9]/g, '');
+        let v = parseInt(digits, 10);
         if (Number.isNaN(v)) v = MIN_DURATION_SEC;
         v = Math.max(MIN_DURATION_SEC, Math.min(MAX_DURATION_SEC, v));
         this.durationSec = v;
         if (slider) slider.value = String(v);
         this._updateEstimate();
+      });
+      // Przy blur dopisujemy z powrotem sufiks (gdyby user go skasował).
+      durNum.addEventListener('blur', () => {
+        durNum.value = `${this.durationSec} s`;
       });
     }
     if (manualStop) {
@@ -588,7 +645,11 @@ export class ProfilingLaunchModal {
         if (!rb.checked) return;
         this.targetMode = rb.value;
         const pidInput = root.querySelector('#pl-target-pid');
-        if (pidInput) pidInput.style.display = (this.targetMode === 'specific_pid') ? '' : 'none';
+        if (pidInput) {
+          // Width 120px per mockup; toggle tylko display.
+          pidInput.style.width = '120px';
+          pidInput.style.display = (this.targetMode === 'specific_pid') ? '' : 'none';
+        }
       });
     });
     const pidInput = root.querySelector('#pl-target-pid');
