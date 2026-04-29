@@ -3379,6 +3379,8 @@ pub fn service_manifest_deploy(
     let manifest_task = manifest.clone();
     let user_config_task = user_config.clone();
     let log_sender_task = log_sender.clone();
+    let local_node_id_task = ctx.state.local_node_id.to_string();
+    let quic_mesh_task = ctx.state.quic_mesh.clone();
 
     tokio::spawn(async move {
         let start_ms = crate::deploy::log_bus::now_ms();
@@ -3404,6 +3406,43 @@ pub fn service_manifest_deploy(
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 crate::deploy::log_bus::close(&slug_task);
+
+                // Push delta — peers' MeshServicesRegistry pick up the freshly
+                // deployed service immediately instead of waiting for the
+                // 5-min anti-drift announce.
+                if let Some(qm) = quic_mesh_task {
+                    let service_id = outcome.endpoint.handle.id;
+                    match crate::services::snapshot_builder::build_one(
+                        &db_clone,
+                        service_id,
+                        &local_node_id_task,
+                    ) {
+                        Ok(Some(info)) => {
+                            let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                from_node_id: local_node_id_task.clone(),
+                                change: tentaflow_protocol::ServiceChange::Added(info),
+                            };
+                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                                let _ = qm
+                                    .broadcast_to_trusted(
+                                        tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                        &bytes,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                service_id,
+                                "MeshServicesUpdate (Added): row missing right after deploy"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, service_id, "MeshServicesUpdate (Added): build_one failed");
+                        }
+                    }
+                }
             }
             Err(err) => {
                 let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
@@ -4477,41 +4516,59 @@ register_network_variant!(
 fn build_service_info(
     conn: &rusqlite::Connection,
     svc: crate::services_repo::services::ServiceRow,
+    local_node_id: &str,
 ) -> Result<tentaflow_protocol::ServiceInfo, ProtocolError> {
-    let model_rows =
-        crate::services_repo::models::list_for_service(conn, svc.id).map_err(db_err)?;
-    let models: Vec<tentaflow_protocol::ServiceModelEntry> = model_rows
-        .into_iter()
-        .map(|m| tentaflow_protocol::ServiceModelEntry {
-            model_name: m.model_name,
-            display_name: m.display_name,
-            capabilities: parse_capabilities_array(&m.capabilities),
-            context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
-            quantization: m.quantization,
-            is_default: m.is_default,
-        })
-        .collect();
+    crate::services::snapshot_builder::project_service_row(conn, svc, local_node_id).map_err(db_err)
+}
 
-    Ok(tentaflow_protocol::ServiceInfo {
-        id: svc.id,
-        engine_id: svc.engine_id,
-        category: svc.category,
-        display_name: svc.display_name,
-        deploy_method: svc.deploy_method.as_db_tag().to_string(),
-        transport: svc.transport.as_db_tag().to_string(),
-        status: svc.status.as_db_tag().to_string(),
-        pinned: svc.pinned,
-        paused: svc.paused,
-        runtime_pid: svc.runtime_pid,
-        runtime_port: svc.runtime_port,
-        sidecar_quic_port: svc.sidecar_quic_port,
-        endpoint_url: svc.endpoint_url,
-        restart_count: u32::try_from(svc.restart_count).unwrap_or(u32::MAX),
-        health_last_err: svc.health_last_err,
-        models,
-        created_at: svc.created_at,
-        updated_at: svc.updated_at,
-    })
+/// Push a `ServiceChange` to every trusted mesh peer. Fires after every
+/// successful local mutation (deploy / stop / pin / pause / rename / delete)
+/// so peers' `MeshServicesRegistry` view converges in real time instead of
+/// waiting for the 5-min anti-drift announce. No-op when the mesh manager is
+/// not initialised (single-node mode, tests).
+fn broadcast_service_change(ctx: &HandlerContext, change: tentaflow_protocol::ServiceChange) {
+    let qm = match ctx.state.quic_mesh.as_ref() {
+        Some(q) => q.clone(),
+        None => return,
+    };
+    let from = ctx.state.local_node_id.to_string();
+    let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+        from_node_id: from,
+        change,
+    };
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            tracing::warn!(error = %e, "MeshServicesUpdate: rkyv encode failed");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let _ = qm
+            .broadcast_to_trusted(
+                tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                &bytes,
+                None,
+            )
+            .await;
+    });
+}
+
+/// Build a `ServiceInfo` for `service_id` (current DB state) and push it as
+/// `ServiceChange::Updated`. Used by mutating handlers that left the row in
+/// place but changed its fields (stop, pin, pause, rename, redeploy).
+fn push_service_updated(ctx: &HandlerContext, service_id: i64) {
+    let local = ctx.state.local_node_id.to_string();
+    let info = match crate::services::snapshot_builder::build_one(&ctx.state.db, service_id, &local)
+    {
+        Ok(Some(info)) => info,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, service_id, "push_service_updated: build_one failed");
+            return;
+        }
+    };
+    broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Updated(info));
 }
 
 #[handler(variant = "ServiceListRequest", since = (1, 0))]
@@ -4533,6 +4590,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         .lock()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
+    let local_node_id = ctx.state.local_node_id.as_ref();
 
     let mut services = Vec::with_capacity(rows.len());
     for svc in rows {
@@ -4546,7 +4604,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 continue;
             }
         }
-        services.push(build_service_info(&conn, svc)?);
+        services.push(build_service_info(&conn, svc, local_node_id)?);
     }
 
     Ok(MessageBody::ServiceBody(
@@ -4626,6 +4684,10 @@ pub async fn service_stop(
         )),
     );
 
+    if success {
+        push_service_updated(ctx, payload.service_id);
+    }
+
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResStop(tentaflow_protocol::ServiceStopResponse {
             success,
@@ -4684,6 +4746,13 @@ pub async fn service_delete(
         )),
     );
 
+    broadcast_service_change(
+        ctx,
+        tentaflow_protocol::ServiceChange::Removed {
+            service_id: payload.service_id,
+        },
+    );
+
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResDelete(tentaflow_protocol::ServiceDeleteResponse {
             success: true,
@@ -4725,6 +4794,8 @@ pub fn service_pin(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
             payload.service_id, payload.pinned
         )),
     );
+
+    push_service_updated(ctx, payload.service_id);
 
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResPin(tentaflow_protocol::ServicePinResponse {
@@ -4770,6 +4841,8 @@ pub fn service_pause(
             payload.service_id, payload.paused
         )),
     );
+
+    push_service_updated(ctx, payload.service_id);
 
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResPause(tentaflow_protocol::ServicePauseResponse {
@@ -4827,6 +4900,8 @@ pub fn service_rename(
             payload.service_id, trimmed
         )),
     );
+
+    push_service_updated(ctx, payload.service_id);
 
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResRename(tentaflow_protocol::ServiceRenameResponse {

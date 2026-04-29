@@ -14,8 +14,10 @@ pub mod tts;
 // Unified services refactor (Phase 1 — additive, runs alongside legacy code).
 pub mod deploy;
 pub mod lifecycle;
+pub mod mesh_registry;
 pub mod ports;
 pub mod registry;
+pub mod snapshot_builder;
 pub mod supervisor;
 pub mod transport;
 

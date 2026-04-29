@@ -48,6 +48,7 @@ pub struct DashboardServer {
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 }
 
 impl DashboardServer {
@@ -77,6 +78,9 @@ impl DashboardServer {
             license: Arc::new(StaticLicenseChecker::free()),
             mesh_relay_health: None,
             port_allocator: None,
+            mesh_services_registry: Arc::new(
+                crate::services::mesh_registry::MeshServicesRegistry::new(),
+            ),
         }
     }
 
@@ -152,6 +156,7 @@ impl DashboardServer {
         let license = self.license.clone();
         let mesh_relay_health = self.mesh_relay_health.clone();
         let port_allocator = self.port_allocator.clone();
+        let mesh_services_registry = self.mesh_services_registry.clone();
 
         loop {
             let (stream, remote_addr) = match listener.accept().await {
@@ -178,6 +183,7 @@ impl DashboardServer {
             let lic_clone = license.clone();
             let mrh_clone = mesh_relay_health.clone();
             let pa_clone = port_allocator.clone();
+            let msr_clone = mesh_services_registry.clone();
             // VULN-035: Przekaz remote_addr do handle_request (dual rate limiting)
             let remote_addr_str = remote_addr.to_string();
 
@@ -199,11 +205,12 @@ impl DashboardServer {
                     let lic = lic_clone.clone();
                     let mrh = mrh_clone.clone();
                     let pa = pa_clone.clone();
+                    let msr = msr_clone.clone();
                     let ra = remote_addr_str.clone();
                     async move {
                         handle_request(
                             req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic,
-                            mrh, pa, ra,
+                            mrh, pa, ra, msr,
                         )
                         .await
                     }
@@ -320,6 +327,7 @@ pub async fn handle_request(
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     remote_addr: String,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -481,6 +489,7 @@ pub async fn handle_request(
             vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
             mesh_relay_health: mesh_relay_health.clone(),
             port_allocator: port_allocator.clone(),
+            mesh_services_registry: mesh_services_registry.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);

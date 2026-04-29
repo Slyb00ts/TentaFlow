@@ -299,6 +299,7 @@ pub use message_body::{
     ProtocolErrorCode,
     RegistrySummary,
     RelayHealthInfo,
+    ServiceChange,
     ServiceDeleteRequest,
     ServiceDeleteResponse,
     ServiceInfo,
