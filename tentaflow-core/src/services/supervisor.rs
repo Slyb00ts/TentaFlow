@@ -1,6 +1,6 @@
-// ============ File: services/supervisor.rs — health probe + restart loop for services_v2 ============
+// ============ File: services/supervisor.rs — health probe + restart loop for services ============
 //
-// The supervisor watches every row in `services_v2` whose status is one of
+// The supervisor watches every row in `services` whose status is one of
 // {running, degraded, starting} and applies a per-transport health probe at a
 // configurable cadence. On `Failed`, exponential backoff is applied before
 // `services::deploy::respawn` is invoked to bring the runtime back; on
@@ -92,16 +92,20 @@ impl ServicesSnapshot {
 pub struct ServiceEntry {
     pub id: i64,
     pub engine_id: String,
+    pub category: String,
+    pub display_name: String,
     pub deploy_method: crate::services_repo::services::DeployMethod,
     pub transport: Transport,
     pub status: ServiceStatus,
+    pub pinned: bool,
+    pub paused: bool,
     pub endpoint_url: Option<String>,
     pub runtime_pid: Option<i32>,
     pub runtime_port: Option<u16>,
     pub sidecar_quic_port: Option<u16>,
     pub models: Vec<ModelEntry>,
     /// Backend timeout for this service (defaults to 30000 if `config_json`
-    /// does not specify it). Materialised from `services_v2.config_json` at
+    /// does not specify it). Materialised from `services.config_json` at
     /// snapshot build time so the routing path never re-parses TOML.
     pub timeout_ms: u64,
     /// Maximum concurrent requests the load balancer will dispatch to this
@@ -112,7 +116,7 @@ pub struct ServiceEntry {
     /// Optional alias the engine prefers for this model (e.g. ollama maps
     /// `llama3.1` → `llama3.1:8b-instruct-q4_0`).
     pub model_name_override: Option<String>,
-    /// Verbatim string-typed entries from `services_v2.config_json`. The
+    /// Verbatim string-typed entries from `services.config_json`. The
     /// transport client glue reads `api_key`, `api_key_env`, `request_format`,
     /// `custom_endpoint`, `custom_headers_json`, plus any other string-valued
     /// top-level keys, when materialising a legacy `ServiceBackend` for
@@ -232,6 +236,9 @@ impl Supervisor {
         let services = self.read_supervised().await?;
 
         for svc in &services {
+            if svc.paused {
+                continue;
+            }
             // PID-reuse defence runs only for transports that actually own a process.
             if let Some(pid) = svc.runtime_pid {
                 let needs_pid_check = matches!(
@@ -285,6 +292,12 @@ impl Supervisor {
             };
 
             for svc in &services {
+                // Paused services are observation-frozen: skip the probe entirely
+                // so we neither flip status nor count restart attempts. The user
+                // controls the runtime state directly through the pin/pause API.
+                if svc.paused {
+                    continue;
+                }
                 let health = self
                     .check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
                     .await;
@@ -292,6 +305,8 @@ impl Supervisor {
                     .await;
             }
 
+            // pinned-respawn handled by Krok N4 — list_pinned() is already
+            // available in services_repo for the consumer there.
             match self.build_snapshot().await {
                 Ok(snap) => {
                     let _ = self.snapshot_tx.send(Arc::new(snap));
@@ -410,9 +425,13 @@ impl Supervisor {
                 services.push(ServiceEntry {
                     id: row.id,
                     engine_id: row.engine_id,
+                    category: row.category,
+                    display_name: row.display_name,
                     deploy_method: row.deploy_method,
                     transport: row.transport,
                     status: row.status,
+                    pinned: row.pinned,
+                    paused: row.paused,
                     endpoint_url: row.endpoint_url,
                     runtime_pid: row.runtime_pid.map(|p| p as i32),
                     runtime_port: row.runtime_port,
@@ -617,7 +636,7 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
 
 // ----- config_json materialisation ------------------------------------------
 
-/// Materialised form of `services_v2.config_json` consumed by the snapshot
+/// Materialised form of `services.config_json` consumed by the snapshot
 /// builder. Numeric scalars are extracted into typed fields; every remaining
 /// string-valued top-level entry is preserved in `extra_config` for the
 /// transport-client glue (api keys, custom endpoints, request format, etc.).
@@ -631,7 +650,7 @@ pub(crate) struct BackendMeta {
 }
 
 /// Parses optional `timeout_ms` / `max_concurrent` / `weight` /
-/// `model_name_override` from `services_v2.config_json` (a JSON object).
+/// `model_name_override` from `services.config_json` (a JSON object).
 /// Missing or malformed fields fall back to documented defaults so the
 /// routing path can rely on these values being populated unconditionally.
 /// All string-valued top-level entries are also collected into
@@ -783,9 +802,13 @@ mod tests {
                 &conn,
                 &NewService {
                     engine_id: "supervisor-bogus".into(),
+                    category: "llm".into(),
+                    display_name: "supervisor-bogus".into(),
                     deploy_method: DeployMethod::Docker,
                     transport: Transport::HttpDirect,
                     status: ServiceStatus::Running,
+                    pinned: false,
+                    paused: false,
                     runtime_pid: None,
                     runtime_port: Some(1),
                     sidecar_quic_port: None,
@@ -835,9 +858,13 @@ mod tests {
                 &conn,
                 &NewService {
                     engine_id: "alive".into(),
+                    category: "llm".into(),
+                    display_name: "alive".into(),
                     deploy_method: DeployMethod::NativeEmbedded,
                     transport: Transport::Embedded,
                     status: ServiceStatus::Running,
+                    pinned: false,
+                    paused: false,
                     runtime_pid: None,
                     runtime_port: None,
                     sidecar_quic_port: None,
@@ -874,9 +901,13 @@ mod tests {
                 &conn,
                 &NewService {
                     engine_id: "recover".into(),
+                    category: "llm".into(),
+                    display_name: "recover".into(),
                     deploy_method: DeployMethod::NativeEmbedded,
                     transport: Transport::Embedded,
                     status: ServiceStatus::Running,
+                    pinned: false,
+                    paused: false,
                     runtime_pid: None,
                     runtime_port: None,
                     sidecar_quic_port: None,
@@ -978,9 +1009,13 @@ mod tests {
                 &conn,
                 &NewService {
                     engine_id: "llama-cpp".into(),
+                    category: "llm".into(),
+                    display_name: "llama-cpp".into(),
                     deploy_method: DeployMethod::NativeEmbedded,
                     transport: Transport::Embedded,
                     status: ServiceStatus::Running,
+                    pinned: false,
+                    paused: false,
                     runtime_pid: None,
                     runtime_port: None,
                     sidecar_quic_port: None,

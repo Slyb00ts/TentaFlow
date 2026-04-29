@@ -9,24 +9,76 @@ use async_trait::async_trait;
 use rusqlite::Transaction;
 
 use super::{
-    build_new_service, host_os_supported, models_from_manifest, DeployError, DeployResult,
-    DeployStrategy, PreparedDeploy, RuntimeHandle,
+    build_new_service, category_tag, host_os_supported, models_from_manifest, resolve_display_name,
+    DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
 };
-use crate::services::manifest::{NativeRuntime, ServiceManifest};
+use crate::services::manifest::{Category, NativeRuntime, ServiceManifest};
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
 pub struct EmbeddedDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
+    log_sink: Option<LogSink>,
+    registered_vision_keys: Vec<String>,
 }
 
 impl EmbeddedDeploy {
-    pub fn new(manifest: ServiceManifest, user_config: serde_json::Value) -> Self {
+    pub fn new(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        log_sink: Option<LogSink>,
+    ) -> Self {
         Self {
             manifest,
             user_config,
+            log_sink,
+            registered_vision_keys: Vec::new(),
         }
+    }
+
+    fn prepare_embedded_vision(&mut self) -> DeployResult<()> {
+        if self.manifest.engine.category != Category::Vision {
+            return Ok(());
+        }
+
+        let kind = crate::vision::VisionEngineKind::from_id(&self.manifest.engine.id)
+            .ok_or_else(|| {
+                DeployError::Manifest(format!(
+                    "vision engine '{}' is not registered in runtime",
+                    self.manifest.engine.id
+                ))
+            })?;
+        if let Some(s) = &self.log_sink {
+            s.info(&format!(
+                "[vision] preparing embedded model for {}",
+                self.manifest.engine.id
+            ));
+        }
+        let model_path = crate::vision::model_path_for(kind).ok_or_else(|| {
+            DeployError::Other(format!(
+                "vision model '{}' is not available after download",
+                self.manifest.engine.id
+            ))
+        })?;
+        let engine = crate::vision::load_engine(kind, &model_path)
+            .map_err(|e| DeployError::Other(format!("load vision model: {:#}", e)))?;
+
+        let mut keys = vec![self.manifest.engine.id.clone(), kind.id().to_string()];
+        keys.extend(self.manifest.model_presets.iter().map(|p| p.id.clone()));
+        keys.sort();
+        keys.dedup();
+        for key in &keys {
+            crate::vision::register_engine(key.clone(), engine.clone());
+        }
+        self.registered_vision_keys = keys;
+        if let Some(s) = &self.log_sink {
+            s.info(&format!(
+                "[vision] model loaded from {}",
+                model_path.display()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -62,6 +114,8 @@ impl DeployStrategy for EmbeddedDeploy {
         // gated by `target_os` already passed `host_os_supported`.
         // Future work (Phase 5+): plumb a feature-availability map from build.rs.
 
+        self.prepare_embedded_vision()?;
+
         let runtime = RuntimeHandle::default();
         let models = models_from_manifest(&self.manifest);
         let config_json = serde_json::to_string(&self.user_config)
@@ -69,6 +123,8 @@ impl DeployStrategy for EmbeddedDeploy {
 
         Ok(PreparedDeploy {
             engine_id: self.manifest.engine.id.clone(),
+            category: category_tag(&self.manifest).to_string(),
+            display_name: resolve_display_name(&self.manifest),
             deploy_method: DeployMethod::NativeEmbedded,
             transport: Transport::Embedded,
             runtime,
@@ -85,7 +141,9 @@ impl DeployStrategy for EmbeddedDeploy {
     }
 
     async fn rollback(&self, _prepared: PreparedDeploy) -> DeployResult<()> {
-        // Embedded prepare allocates no external resources; nothing to undo.
+        for key in &self.registered_vision_keys {
+            crate::vision::unregister_engine(key);
+        }
         Ok(())
     }
 }
@@ -145,7 +203,7 @@ mod tests {
             NativeRuntime::Binary,
             vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
         );
-        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}));
+        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Manifest(_)));
     }
@@ -161,7 +219,7 @@ mod tests {
             vec![TargetOs::Linux, TargetOs::Macos]
         };
         let m = manifest("emb-foreign", NativeRuntime::Embedded, host_excl);
-        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}));
+        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Manifest(_)));
     }
@@ -173,7 +231,7 @@ mod tests {
             NativeRuntime::Embedded,
             vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
         );
-        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}));
+        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None);
         let prepared = s.prepare().await.unwrap();
         assert_eq!(prepared.transport, Transport::Embedded);
         assert_eq!(prepared.models.len(), 1);

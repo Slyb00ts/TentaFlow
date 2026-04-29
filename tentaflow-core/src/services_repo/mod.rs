@@ -1,4 +1,4 @@
-// ============ File: services_repo/mod.rs — repository over services_v2 / model_registry_v2 / deployments_v2 ============
+// ============ File: services_repo/mod.rs — repository over services / model_registry / deployments ============
 
 pub mod deployments;
 pub mod models;

@@ -751,9 +751,13 @@ mod middleware_tests {
         ServiceEntry {
             id,
             engine_id: engine_id.into(),
+            category: "llm".into(),
+            display_name: engine_id.into(),
             deploy_method: DeployMethod::NativePythonBundle,
             transport,
             status: ServiceStatus::Running,
+            pinned: false,
+            paused: false,
             endpoint_url: Some("http://127.0.0.1:5099".into()),
             runtime_pid: None,
             runtime_port: Some(5099),

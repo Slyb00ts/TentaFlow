@@ -1,230 +1,212 @@
-// =============================================================================
-// Plik: api/dashboard/api_services.rs
-// Opis: CRUD serwisow AI - lista, tworzenie, edycja, usuwanie, statystyki.
-// =============================================================================
+// ============ File: api/dashboard/api_services.rs — REST view over services + model_registry ============
+//
+// Thin GUI surface for the unified services pipeline. The REST shape is
+// intentionally minimal: a flat list of supervised services plus their
+// attached model rows. Heavier mutations (deploy, delete) flow through the
+// binary RPC handlers; this module is read + DELETE only.
 
-use crate::db::{self, DbPool};
+use std::sync::Arc;
+
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Deserialize)]
-pub struct CreateServiceRequest {
-    pub name: String,
-    pub service_type: String,
-    pub strategy: String,
-    pub model_category: Option<String>,
-    pub config_json: Option<String>,
-}
+use crate::db::DbPool;
+use crate::services::deploy as deploy_pipeline;
+use crate::services::ports::PortAllocator;
+use crate::services_repo::services::{DeployMethod, ServiceStatus};
+use crate::services_repo::{models as models_repo, services as services_repo};
 
-#[derive(Deserialize)]
-pub struct UpdateServiceRequest {
-    pub name: String,
-    pub service_type: String,
-    pub strategy: String,
-    pub model_category: Option<String>,
-    pub status: String,
-    pub config_json: Option<String>,
+#[derive(Serialize)]
+pub struct ServiceModelItem {
+    pub model_name: String,
+    pub display_name: Option<String>,
+    pub capabilities: serde_json::Value,
 }
 
 #[derive(Serialize)]
-pub struct ServiceWithBackends {
-    #[serde(flatten)]
-    pub service: db::models::DbService,
-    pub backends: Vec<db::models::DbServiceBackend>,
+pub struct ServiceListItem {
+    pub id: i64,
+    pub engine_id: String,
+    pub category: String,
+    pub display_name: String,
+    pub deploy_method: &'static str,
+    pub transport: &'static str,
+    pub status: &'static str,
+    pub pinned: bool,
+    pub paused: bool,
+    pub endpoint_url: Option<String>,
+    pub runtime_pid: Option<i64>,
+    pub runtime_port: Option<u16>,
+    pub sidecar_quic_port: Option<u16>,
+    pub restart_count: i64,
+    pub models: Vec<ServiceModelItem>,
 }
 
-#[derive(Serialize)]
-pub struct ServiceStats {
-    pub service_id: i64,
-    pub total_requests: u64,
-    pub avg_latency_ms: f64,
-    pub error_rate: f64,
+fn model_to_item(row: crate::services_repo::models::ModelRow) -> ServiceModelItem {
+    let caps = serde_json::from_str::<serde_json::Value>(&row.capabilities)
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    ServiceModelItem {
+        model_name: row.model_name,
+        display_name: row.display_name,
+        capabilities: caps,
+    }
 }
 
-/// GET /api/services - lista serwisow z backendami (jeden JOIN zamiast N+1)
-pub fn handle_list(pool: &DbPool) -> Result<(u16, String)> {
-    let pairs = db::repository::list_services_with_backends(pool)?;
-
-    let result: Vec<ServiceWithBackends> = pairs
+fn build_item(
+    db: &DbPool,
+    svc: crate::services_repo::services::ServiceRow,
+) -> Result<ServiceListItem> {
+    let conn = db
+        .lock()
+        .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+    let models = models_repo::list_for_service(&conn, svc.id)?
         .into_iter()
-        .map(|(service, backends)| ServiceWithBackends { service, backends })
+        .map(model_to_item)
         .collect();
-
-    Ok((200, serde_json::to_string(&result)?))
+    Ok(ServiceListItem {
+        id: svc.id,
+        engine_id: svc.engine_id,
+        category: svc.category,
+        display_name: svc.display_name,
+        deploy_method: svc.deploy_method.as_db_tag(),
+        transport: svc.transport.as_db_tag(),
+        status: svc.status.as_db_tag(),
+        pinned: svc.pinned,
+        paused: svc.paused,
+        endpoint_url: svc.endpoint_url,
+        runtime_pid: svc.runtime_pid,
+        runtime_port: svc.runtime_port,
+        sidecar_quic_port: svc.sidecar_quic_port,
+        restart_count: svc.restart_count,
+        models,
+    })
 }
 
-/// POST /api/services - utworz nowy serwis
-pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateServiceRequest =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+/// GET /api/services — supervised services (running / starting / degraded).
+pub fn handle_list(db: &DbPool) -> Result<(u16, String)> {
+    let conn = db
+        .lock()
+        .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+    let services = services_repo::list_supervised(&conn)?;
+    drop(conn);
 
-    let config = req.config_json.as_deref().unwrap_or("{}");
-
-    let id = db::repository::create_service(
-        pool,
-        &req.name,
-        &req.service_type,
-        &req.strategy,
-        req.model_category.as_deref(),
-        config,
-    )?;
-
-    let service = db::repository::get_service(pool, id)?;
-    Ok((201, serde_json::to_string(&service)?))
+    let mut out: Vec<ServiceListItem> = Vec::with_capacity(services.len());
+    for svc in services {
+        out.push(build_item(db, svc)?);
+    }
+    Ok((200, serde_json::to_string(&out)?))
 }
 
-/// PUT /api/services/:id - aktualizuj serwis
-pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
-    let existing = db::repository::get_service(pool, id)?;
-    if existing.is_none() {
-        return Ok((
-            404,
-            format!(r#"{{"error":"Serwis o id {} nie istnieje"}}"#, id),
-        ));
+/// DELETE /api/services/:id — stops the runtime and removes the row, cascading
+/// to `model_registry` via FK ON DELETE CASCADE.
+pub async fn handle_delete(
+    db: &DbPool,
+    ports: Option<Arc<PortAllocator>>,
+    id: i64,
+) -> Result<(u16, String)> {
+    let svc = {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+        services_repo::get(&conn, id)?
+    };
+    let Some(svc) = svc else {
+        return Ok((404, format!(r#"{{"error":"Service id {} not found"}}"#, id)));
+    };
+
+    if let Some(ports) = ports {
+        if let Err(e) = deploy_pipeline::stop(&svc, ports).await {
+            tracing::warn!("services::deploy::stop({}): {}", id, e);
+        }
     }
 
-    let req: UpdateServiceRequest =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
-
-    let config = req.config_json.as_deref().unwrap_or("{}");
-
-    db::repository::update_service(
-        pool,
-        id,
-        &req.name,
-        &req.service_type,
-        &req.strategy,
-        req.model_category.as_deref(),
-        &req.status,
-        config,
-    )?;
-
-    let service = db::repository::get_service(pool, id)?;
-    Ok((200, serde_json::to_string(&service)?))
-}
-
-/// DELETE /api/services/:id - usun serwis (kasuje rowniez powiazane wpisy
-/// `model_registry`, zeby model nie zostal w panelu Modele jako sierota).
-pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
-    let existing = db::repository::get_service(pool, id)?;
-    if existing.is_none() {
-        return Ok((
-            404,
-            format!(r#"{{"error":"Serwis o id {} nie istnieje"}}"#, id),
-        ));
-    }
-
-    if let Err(e) = db::repository::delete_model_entries_by_service(pool, id) {
-        tracing::warn!(service_id = id, "delete_model_entries_by_service: {}", e);
-    }
-    db::repository::delete_service(pool, id)?;
+    let conn = db
+        .lock()
+        .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+    services_repo::delete(&conn, id)?;
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
 
-/// GET /api/services/:id/stats - statystyki serwisu (placeholder)
-pub fn handle_stats(_pool: &DbPool, id: i64) -> Result<(u16, String)> {
-    let stats = ServiceStats {
-        service_id: id,
-        total_requests: 0,
-        avg_latency_ms: 0.0,
-        error_rate: 0.0,
-    };
-
-    Ok((200, serde_json::to_string(&stats)?))
+#[allow(dead_code)] // referenced by tests / future binary RPC.
+pub fn status_label(status: ServiceStatus) -> &'static str {
+    status.as_db_tag()
 }
 
-// --- Backendy serwisow ---
-
-#[derive(Deserialize)]
-pub struct CreateBackendRequest {
-    pub service_id: i64,
-    pub connection_type: String,
-    pub config_json: Option<String>,
-    pub max_concurrent: Option<i64>,
-    pub timeout_ms: Option<i64>,
-    pub weight: Option<i64>,
-    pub model_name_override: Option<String>,
-    pub health_check_path: Option<String>,
+#[allow(dead_code)]
+pub fn method_label(method: DeployMethod) -> &'static str {
+    method.as_db_tag()
 }
 
-#[derive(Deserialize)]
-pub struct UpdateBackendRequest {
-    pub connection_type: String,
-    pub config_json: Option<String>,
-    pub max_concurrent: Option<i64>,
-    pub timeout_ms: Option<i64>,
-    pub weight: Option<i64>,
-    pub model_name_override: Option<String>,
-    pub health_check_path: Option<String>,
-    pub is_active: Option<bool>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::transport::Transport;
+    use crate::services_repo::models::NewModel;
+    use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
 
-/// GET /api/services/:id/backends - lista backendow serwisu
-pub fn handle_list_backends(pool: &DbPool, service_id: i64) -> Result<(u16, String)> {
-    let backends = db::repository::list_backends_for_service(pool, service_id)?;
-    Ok((200, serde_json::to_string(&backends)?))
-}
-
-/// POST /api/services/:id/backends - utworz nowy backend
-pub fn handle_create_backend(pool: &DbPool, service_id: i64, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateBackendRequest =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
-
-    let config = req.config_json.as_deref().unwrap_or("{}");
-    let backend = db::models::NewBackend {
-        service_id,
-        connection_type: &req.connection_type,
-        config_json: config,
-        max_concurrent: req.max_concurrent.unwrap_or(50),
-        timeout_ms: req.timeout_ms.unwrap_or(120000),
-        weight: req.weight.unwrap_or(1),
-        model_name_override: req.model_name_override.as_deref(),
-        health_check_path: req.health_check_path.as_deref(),
-    };
-
-    let id = db::repository::create_backend(pool, &backend)?;
-    let item = db::repository::get_backend(pool, id)?;
-    Ok((201, serde_json::to_string(&item)?))
-}
-
-/// PUT /api/backends/:id - aktualizuj backend
-pub fn handle_update_backend(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
-    if db::repository::get_backend(pool, id)?.is_none() {
-        return Ok((
-            404,
-            format!(r#"{{"error":"Backend o id {} nie istnieje"}}"#, id),
-        ));
+    fn open_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        Arc::new(std::sync::Mutex::new(conn))
     }
 
-    let req: UpdateBackendRequest =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
-
-    let config = req.config_json.as_deref().unwrap_or("{}");
-    db::repository::update_backend(
-        pool,
-        id,
-        &req.connection_type,
-        config,
-        req.max_concurrent.unwrap_or(50),
-        req.timeout_ms.unwrap_or(120000),
-        req.weight.unwrap_or(1),
-        req.model_name_override.as_deref(),
-        req.health_check_path.as_deref(),
-        req.is_active.unwrap_or(true),
-    )?;
-
-    let item = db::repository::get_backend(pool, id)?;
-    Ok((200, serde_json::to_string(&item)?))
-}
-
-/// DELETE /api/backends/:id - usun backend
-pub fn handle_delete_backend(pool: &DbPool, id: i64) -> Result<(u16, String)> {
-    if db::repository::get_backend(pool, id)?.is_none() {
-        return Ok((
-            404,
-            format!(r#"{{"error":"Backend o id {} nie istnieje"}}"#, id),
-        ));
+    fn seed_running_service(db: &DbPool, engine: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        let mut new = NewService::minimal(engine, DeployMethod::Docker, Transport::HttpDirect);
+        new.status = ServiceStatus::Running;
+        let id = services_repo::insert(&conn, &new).unwrap();
+        services_repo::update_status(&conn, id, ServiceStatus::Running).unwrap();
+        models_repo::insert(
+            &conn,
+            &NewModel {
+                service_id: id,
+                model_name: format!("{}-default", engine),
+                display_name: Some("Default".into()),
+                capabilities: r#"["chat"]"#.into(),
+                context_length: Some(4096),
+                quantization: None,
+                is_default: true,
+            },
+        )
+        .unwrap();
+        id
     }
-    db::repository::delete_backend(pool, id)?;
-    Ok((200, r#"{"ok":true}"#.to_string()))
+
+    #[test]
+    fn handle_list_returns_alive_with_models() {
+        let db = open_db();
+        let _id = seed_running_service(&db, "vllm");
+
+        let (status, body) = handle_list(&db).unwrap();
+        assert_eq!(status, 200);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["engine_id"], "vllm");
+        assert_eq!(parsed[0]["status"], "running");
+        assert_eq!(parsed[0]["models"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["models"][0]["model_name"], "vllm-default");
+    }
+
+    #[tokio::test]
+    async fn handle_delete_removes_service_and_models() {
+        let db = open_db();
+        let id = seed_running_service(&db, "vllm");
+
+        let (status, _) = handle_delete(&db, None, id).await.unwrap();
+        assert_eq!(status, 200);
+
+        let conn = db.lock().unwrap();
+        let row = services_repo::get(&conn, id).unwrap();
+        assert!(row.is_none(), "service row was deleted");
+        let models = models_repo::list_for_service(&conn, id).unwrap();
+        assert!(models.is_empty(), "FK CASCADE removed model rows");
+    }
+
+    #[tokio::test]
+    async fn handle_delete_404_for_unknown_id() {
+        let db = open_db();
+        let (status, _) = handle_delete(&db, None, 9999).await.unwrap();
+        assert_eq!(status, 404);
+    }
 }

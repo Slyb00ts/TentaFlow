@@ -1,4 +1,4 @@
-// ============ File: services/registry.rs — in-memory cache of deployed services backed by services_v2 ============
+// ============ File: services/registry.rs — in-memory cache of deployed services backed by services ============
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use crate::db::DbPool;
 use crate::services::lifecycle::{ServiceEndpoint, ServiceHandle};
 use crate::services_repo::services::{self, ServiceRow, ServiceStatus};
 
-/// In-memory registry of running services. Backed by `services_v2`; rebuilt
+/// In-memory registry of running services. Backed by `services`; rebuilt
 /// from the DB at startup and updated on every lifecycle transition.
 pub struct ServiceRegistry {
     by_id: RwLock<HashMap<i64, ServiceEndpoint>>,
@@ -21,7 +21,7 @@ impl ServiceRegistry {
         }
     }
 
-    /// Loads every row from `services_v2` (regardless of status) into memory.
+    /// Loads every row from `services` (regardless of status) into memory.
     pub fn load_from_db(&self, pool: &DbPool) -> Result<usize> {
         let conn = pool
             .lock()
