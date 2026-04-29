@@ -1493,10 +1493,40 @@ async fn do_python_bundle_native_deploy(
 
     // VLLM_ARGS z deploy wizard Advanced (kalkulator VRAM) - dla bundle
     // python jest podawane jako env do bundle.toml ${VLLM_ARGS:-...}.
+    let mut vllm_args_explicit = false;
     if let Some(args) = config.vllm_args.as_deref() {
         let trimmed = args.trim();
         if !trimmed.is_empty() {
             env.insert("VLLM_ARGS".to_string(), trimmed.to_string());
+            vllm_args_explicit = true;
+        }
+    }
+
+    // AUTO-DEFAULTS dla bundle vllm gdy user NIE ustawil Advanced wizard:
+    // wykryj liczbe GPU + VRAM, pobierz HF config modelu, smart-pick TP/PP/
+    // ctx/seqs/kv_dtype zgodnie z heads/layers + VRAM. Bez tego user pisze
+    // model + GPU = 'all' i dostaje OOM (np. 31B na 1 GPU bez TP) lub
+    // multimodal crash (--max-num-batched-tokens default 2048).
+    if !vllm_args_explicit && engine.engine_id == "vllm" && !model_repo.is_empty() {
+        match build_auto_vllm_args(&model_repo, config.gpu_ids.as_deref(), db, settings_cipher).await {
+            Ok(Some(auto_args)) => {
+                log_line(
+                    db,
+                    deploy_id,
+                    tx,
+                    "log",
+                    &format!("auto-tuned VLLM_ARGS (kalkulator VRAM): {}", auto_args),
+                );
+                env.insert("VLLM_ARGS".to_string(), auto_args);
+            }
+            Ok(None) => {
+                log_line(db, deploy_id, tx, "log",
+                    "auto-tune skip: brak GPU lub HF config niedostepny - uzywam default args z bundle.toml");
+            }
+            Err(e) => {
+                log_line(db, deploy_id, tx, "log",
+                    &format!("auto-tune fail: {} - uzywam default args z bundle.toml", e));
+            }
         }
     }
 
@@ -2756,4 +2786,123 @@ async fn fail(
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     log_bus::close(deploy_id);
+}
+
+/// Auto-detect liczby GPU + VRAM, fetch HF config dla modelu, smart-pick
+/// TP/PP/ctx/seqs/kv_dtype zgodnie z architektura modelu i dostepnym sprzetem.
+/// Wynik: gotowy VLLM_ARGS string do wstrzykniecia w env bundle/docker.
+/// Zwraca None gdy brak GPU lub HF config niedostepny (caller uzyje
+/// bundle.toml defaultow).
+pub(crate) async fn build_auto_vllm_args(
+    model_repo: &str,
+    gpu_ids_filter: Option<&[String]>,
+    db: &DbPool,
+    settings_cipher: &Arc<crate::crypto::SettingsCipher>,
+) -> Result<Option<String>> {
+    use crate::deploy::vram_calculator::{
+        build_vllm_args_string, estimate_vllm_vram, fetch_hf_config, max_concurrent_seqs_for_budget,
+        max_context_for_budget, parse_hf_config, recommend_parallelism, VramEstimateInput,
+    };
+
+    // Wykryj GPU lokalne. detect_gpus_cached() jest cached 60s wiec nie
+    // robi nvidia-smi przy kazdym deploy.
+    let all_gpus = crate::mesh::node_info_collector::detect_gpus_cached();
+    let nvidia: Vec<&crate::mesh::peer_store::PeerGpuInfo> = all_gpus
+        .iter()
+        .filter(|g| g.vram_total_mb > 0)
+        .collect();
+    if nvidia.is_empty() {
+        return Ok(None);
+    }
+
+    // Filter po wybranych GPU_IDS gdy user wybral konkretne (gpu_select_mode=specific).
+    let selected: Vec<&crate::mesh::peer_store::PeerGpuInfo> = match gpu_ids_filter {
+        Some(ids) if !ids.is_empty() => {
+            let id_set: std::collections::HashSet<u32> = ids
+                .iter()
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect();
+            nvidia.iter().enumerate()
+                .filter(|(idx, _)| id_set.contains(&(*idx as u32)))
+                .map(|(_, g)| *g)
+                .collect()
+        }
+        _ => nvidia,
+    };
+    if selected.is_empty() {
+        return Ok(None);
+    }
+
+    let gpu_count = selected.len() as u32;
+    let gpu_memory_gb_each = selected
+        .iter()
+        .map(|g| g.vram_total_mb as f64 / 1024.0)
+        .fold(f64::INFINITY, f64::min);
+
+    // HF token dla gated modeli (Llama, Gemma niektore wersje).
+    let hf_token = repository::get_setting_secure(db, "hf_token", settings_cipher)
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let token_opt = if hf_token.is_empty() { None } else { Some(hf_token.as_str()) };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok();
+    let client = match client {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let cfg_json = fetch_hf_config(&client, model_repo, token_opt).await?;
+    let spec = parse_hf_config(&cfg_json, model_repo)?;
+
+    let (tp, pp) = recommend_parallelism(&spec, gpu_count);
+
+    // Defaulty dla initial deploy: ctx 8192 (lub model max jesli mniej),
+    // batch 16, fp8 KV jesli model duzy (>20B param), gpu_mem_util 0.9.
+    let initial_ctx = spec
+        .max_position_embeddings
+        .min(8192)
+        .max(2048);
+    let estimated_b = spec.estimated_params() as f64 / 1_000_000_000.0;
+    let kv_dtype = if estimated_b > 20.0 { "fp8" } else { "auto" };
+
+    let mut input = VramEstimateInput {
+        gpu_count,
+        gpu_memory_gb_each,
+        tensor_parallel: tp,
+        pipeline_parallel: pp,
+        max_model_len: initial_ctx,
+        max_num_seqs: 16,
+        kv_cache_dtype: kv_dtype.into(),
+        gpu_memory_utilization: 0.9,
+        activation_overhead_pct: 10.0,
+    };
+
+    // Sprawdz czy fits. Jesli nie - obetnij ctx+seqs do max ktore fits.
+    let est = estimate_vllm_vram(&spec, &input);
+    if !est.fits_per_gpu {
+        // Spróbuj zmniejszyć batch do 4
+        input.max_num_seqs = 4;
+        let est2 = estimate_vllm_vram(&spec, &input);
+        if !est2.fits_per_gpu {
+            // Ogranicz ctx do max ktore fits
+            let max_ctx = max_context_for_budget(&spec, &input);
+            if max_ctx >= 1024 {
+                input.max_model_len = max_ctx;
+            } else {
+                // Nawet 1k ctx nie fits - return None, zostaw bundle defaults
+                return Ok(None);
+            }
+        }
+    }
+
+    // Final adjust: max_num_seqs do limitu fits (na wypadek gdy ctx zmalal).
+    let max_seqs = max_concurrent_seqs_for_budget(&spec, &input);
+    if max_seqs < input.max_num_seqs {
+        input.max_num_seqs = max_seqs.max(1);
+    }
+
+    Ok(Some(build_vllm_args_string(&spec, &input)))
 }

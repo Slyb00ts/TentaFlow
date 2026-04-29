@@ -446,7 +446,7 @@ pub struct GpuMemSnapshot {
     pub free_mb: u64,
 }
 
-fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
+pub fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
     {
         let cache = GPU_CACHE.lock();
         if cache.0.elapsed() < Duration::from_secs(2) {

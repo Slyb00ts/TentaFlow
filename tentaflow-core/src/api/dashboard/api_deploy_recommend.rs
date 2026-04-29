@@ -10,8 +10,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::deploy::vram_calculator::{
-    estimate_vllm_vram, fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
-    parse_hf_config, recommend_parallelism, ModelSpec, VramEstimate, VramEstimateInput,
+    build_vllm_args_string, estimate_vllm_vram, fetch_hf_config, max_concurrent_seqs_for_budget,
+    max_context_for_budget, parse_hf_config, recommend_parallelism, ModelSpec, VramEstimate,
+    VramEstimateInput,
 };
 
 #[derive(Debug, Deserialize)]
@@ -199,59 +200,5 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
     Ok((200, serde_json::to_string(&response)?))
 }
 
-/// Buduje string `--key val --key val ...` do wpisania w VLLM_ARGS env.
-/// Zalacza tylko parametry rozne od vllm defaults zeby nie zasmiecac.
-fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    parts.push("--dtype".into());
-    parts.push("auto".into());
-    parts.push("--gpu-memory-utilization".into());
-    parts.push(format!("{:.2}", input.gpu_memory_utilization));
-    parts.push("--max-model-len".into());
-    parts.push(input.max_model_len.to_string());
-    parts.push("--max-num-seqs".into());
-    parts.push(input.max_num_seqs.to_string());
-    parts.push("--max-num-batched-tokens".into());
-    parts.push(input.max_model_len.max(8192).to_string());
-    parts.push("--enable-chunked-prefill".into());
-
-    if input.tensor_parallel > 1 {
-        parts.push("--tensor-parallel-size".into());
-        parts.push(input.tensor_parallel.to_string());
-    }
-    if input.pipeline_parallel > 1 {
-        parts.push("--pipeline-parallel-size".into());
-        parts.push(input.pipeline_parallel.to_string());
-    }
-    if input.kv_cache_dtype != "auto" {
-        parts.push("--kv-cache-dtype".into());
-        parts.push(input.kv_cache_dtype.clone());
-    }
-
-    // Quantization auto-detect (vllm rozpozna z config.json modelu, ale
-    // dla autoround/awq/gptq lepiej jawnie podac flag).
-    if let Some(q) = &spec.quantization {
-        match q.as_str() {
-            "awq" => {
-                parts.push("--quantization".into());
-                parts.push("awq".into());
-            }
-            "gptq" => {
-                parts.push("--quantization".into());
-                parts.push("gptq".into());
-            }
-            "fp8" => {
-                parts.push("--quantization".into());
-                parts.push("fp8".into());
-            }
-            "int4" | "int4_autoround" | "auto_round" => {
-                parts.push("--quantization".into());
-                parts.push("auto_round".into());
-            }
-            _ => {}
-        }
-    }
-
-    parts.join(" ")
-}
+// build_vllm_args_string przeniesione do crate::deploy::vram_calculator
+// zeby moglo byc reuse'owane przez runner.rs (auto-defaults dla bundle).
