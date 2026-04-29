@@ -15,6 +15,7 @@ const TILES = [
   { id: 'images',       route: 'images',       icon: 'image',        soon: true },
   { id: 'notes',        route: 'notes',        icon: 'mic',          soon: true },
   { id: 'meeting',      route: 'meeting',      icon: 'meeting',      soon: true },
+  { id: 'pose',         route: 'pose',         icon: 'image' },
   { id: 'translate',    route: 'translate',    icon: 'globe',        soon: true },
 ];
 
