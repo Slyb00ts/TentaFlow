@@ -1340,6 +1340,34 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     for arg in &spec.launch.args {
         cmd.arg(substitute_vars_full(arg, &req.env, &bundle_dir, venv));
     }
+    // VLLM_ARGS / SGLANG_ARGS / itd. z deploy wizard (Advanced section) -
+    // appendowane PO arguments z bundle.toml. shlex split honoruje cudzyslowy
+    // (np. --extra-config '{"key": "val"}'). Pozwala uzytkownikowi nadpisac
+    // tensor-parallel-size, max-model-len, kv-cache-dtype itp. dla bundle
+    // python tak samo jak dla docker (gdzie VLLM_ARGS jest expanded w
+    // entrypoint.sh przez shell).
+    let extra_args_env_keys = ["VLLM_ARGS", "SGLANG_ARGS", "TRTLLM_ARGS", "EXTRA_ARGS"];
+    for key in extra_args_env_keys {
+        if let Some(extra) = req.env.get(key) {
+            let trimmed = extra.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match shlex::split(trimmed) {
+                Some(parts) => {
+                    for part in parts {
+                        cmd.arg(substitute_vars_full(&part, &req.env, &bundle_dir, venv));
+                    }
+                }
+                None => {
+                    // Quotes mismatch - fallback do prostego whitespace split.
+                    for part in trimmed.split_whitespace() {
+                        cmd.arg(substitute_vars_full(part, &req.env, &bundle_dir, venv));
+                    }
+                }
+            }
+        }
+    }
     for (k, v) in &req.env {
         cmd.env(k, v);
     }
