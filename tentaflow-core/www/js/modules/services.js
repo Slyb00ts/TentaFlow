@@ -105,8 +105,15 @@ async function loadAll() {
 async function loadForCurrentTab() {
   try {
     if (currentTab === 'list') {
-      const svc = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
+      // meshNodes is needed for hostname resolution in the Node column. Both
+      // requests run in parallel — peer_store updates land lazily so the local
+      // node is always present even when remotes are offline.
+      const [svc, nodes] = await Promise.all([
+        ApiBinary.list('serviceListRequest', { arrayKey: 'services' }),
+        ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => meshNodes),
+      ]);
       services = Array.isArray(svc) ? svc : [];
+      meshNodes = Array.isArray(nodes) ? nodes : meshNodes;
       patchListTab();
     } else if (currentTab === 'aliases') {
       aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
@@ -195,11 +202,28 @@ function bindTabEvents() {
   const body = byId('svc-tab-body');
   if (!body) return;
 
-  // List tab
+  // List tab — N5 row actions: Pause/Play toggle, Pin toggle, Delete.
   body.querySelectorAll('[data-svc-delete]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      stopService(b.dataset.svcDelete, b.dataset.svcName, b.dataset.svcNode);
+      stopService(
+        b.dataset.svcDelete,
+        b.dataset.svcName,
+        b.dataset.svcNode,
+        b.dataset.svcNodeLabel,
+      );
+    };
+  });
+  body.querySelectorAll('[data-svc-pause-play]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      togglePauseStart(b);
+    };
+  });
+  body.querySelectorAll('[data-svc-pin-toggle]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      togglePin(b);
     };
   });
   body.querySelectorAll('[data-empty-cta]').forEach((b) => {
@@ -238,9 +262,10 @@ function renderListTab() {
     <table class="data-table">
       <thead>
         <tr>
+          <th>${escapeHtml(I18n.t('services.col_node'))}</th>
           <th>${escapeHtml(I18n.t('services.col_engine'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_method'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_transport'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_display_name'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_category'))}</th>
           <th>${escapeHtml(I18n.t('services.col_status'))}</th>
           <th>${escapeHtml(I18n.t('services.col_endpoint'))}</th>
           <th>${escapeHtml(I18n.t('services.col_models'))}</th>
@@ -255,48 +280,56 @@ function renderListTab() {
   `;
 }
 
-// Maps services.status (running|degraded|failed|starting|stopped) onto the
-// tf-chip status palette. degraded → pending (yellow), failed → err (red).
-function mapStatusToChip(status) {
-  switch ((status || '').toLowerCase()) {
-    case 'running': return { variant: 'online', dot: true };
-    case 'degraded': return { variant: 'pending', dot: true };
-    case 'failed': return { variant: 'err', dot: true };
-    case 'starting': return { variant: 'info', dot: true };
-    case 'stopped': return { variant: 'offline', dot: false };
-    default: return { variant: 'info', dot: false };
+// Resolve a friendly label for a service.node_id by joining against the cached
+// meshNodes list. Falls back to a 12-char short hex when hostname is missing.
+function nodeLabelFor(nodeId) {
+  if (!nodeId) return { label: '?', isLocal: false, hostname: null, full: '' };
+  const node = meshNodes.find((n) => (n.node_id || n.id) === nodeId);
+  const hostname = node?.hostname || null;
+  const label = hostname || nodeId.slice(0, 12);
+  return { label, isLocal: !!node?.is_local, hostname, full: nodeId };
+}
+
+// Maps services.status × paused flag onto the tf-chip palette. The paused flag
+// wins over the underlying status because a paused row has no live process.
+function mapStatusToChip(status, paused) {
+  if (paused) return { variant: 'info', dot: false, key: 'paused' };
+  const key = (status || '').toLowerCase();
+  switch (key) {
+    case 'running': return { variant: 'online', dot: true, key };
+    case 'degraded': return { variant: 'pending', dot: true, key };
+    case 'failed': return { variant: 'err', dot: true, key };
+    case 'starting': return { variant: 'info', dot: true, key };
+    case 'stopped': return { variant: 'offline', dot: false, key };
+    default: return { variant: 'info', dot: false, key };
   }
 }
 
-// Translates the deploy_method db tag (docker|native_python_bundle|native_binary|
-// embedded|external) to a short human label. Falls back to raw value.
-function deployMethodLabel(method) {
-  const raw = (method || '').toLowerCase();
-  switch (raw) {
-    case 'docker': return I18n.t('wizard.method.docker') || 'Docker';
-    case 'native_python_bundle': return 'Native (Python)';
-    case 'native_binary': return 'Native (binary)';
-    case 'embedded': return I18n.t('wizard.method.embedded') || 'Embedded';
-    case 'external': return I18n.t('wizard.method.external') || 'External';
-    default: return raw || '—';
+// Color chip class for a category — reuses existing scope-chip palette so the
+// list looks visually consistent with the catalog tiles.
+function categoryChipClass(category) {
+  switch ((category || '').toLowerCase()) {
+    case 'llm': return 'chat';
+    case 'embeddings':
+    case 'embedding': return 'mesh-read';
+    case 'stt':
+    case 'tts': return 'deploy';
+    case 'image-gen':
+    case 'video-gen':
+    case 'music-gen': return 'mesh-admin';
+    case 'agents':
+    case 'tools': return 'license';
+    default: return 'mesh-read';
   }
-}
-
-// Transport tag (http_direct | quic_sidecar | embedded_inproc) → short label.
-function transportLabel(transport) {
-  const raw = (transport || '').toLowerCase();
-  if (raw === 'http_direct') return 'HTTP';
-  if (raw === 'quic_sidecar') return 'QUIC';
-  if (raw === 'embedded_inproc') return 'inproc';
-  return raw || '—';
 }
 
 function renderRow(s) {
-  const statusInfo = mapStatusToChip(s.status);
-  const statusLabel = I18n.t(`services.status.${(s.status || '').toLowerCase()}`)
+  const paused = !!s.paused;
+  const statusInfo = mapStatusToChip(s.status, paused);
+  const statusLabel = I18n.t(`services.status.${statusInfo.key}`)
     || s.status || '—';
   const endpoint = s.endpoint_url
-    ? `<code style="font-size:11px;">${escapeHtml(s.endpoint_url)}</code>`
+    ? `<code style="font-size:11px;" title="${escapeAttr(s.endpoint_url)}">${escapeHtml(truncateMiddle(s.endpoint_url, 36))}</code>`
     : '<span style="color:var(--text-3);">—</span>';
   const models = Array.isArray(s.models) ? s.models : [];
   const modelChips = models.length === 0
@@ -308,20 +341,56 @@ function renderRow(s) {
         })
         .join(' ');
   const restartCount = Number.isFinite(s.restart_count) ? s.restart_count : 0;
+  const restartTitle = s.health_last_err
+    ? `title="${escapeAttr(s.health_last_err)}"`
+    : '';
   const restartCell = restartCount > 0
-    ? `<tf-chip status="warn">${restartCount}</tf-chip>`
+    ? `<tf-chip status="warn" ${restartTitle}>${restartCount}</tf-chip>`
     : '<span style="color:var(--text-3);">0</span>';
-  const displayName = s.engine_id || '';
+
+  const displayName = s.display_name || s.engine_id || '';
+  const engineLabel = s.engine_id || '';
+  const category = s.category || '';
+  const nodeInfo = nodeLabelFor(s.node_id);
+  const nodeBadge = nodeInfo.isLocal
+    ? `<span class="svc-node-local">${escapeHtml(I18n.t('services.node_local_badge'))}</span>`
+    : '';
+  const nodeCell = `
+    <span class="svc-node-cell" title="${escapeAttr(nodeInfo.full)}">
+      ${escapeHtml(nodeInfo.label)}${nodeBadge}
+    </span>`;
+
+  // Pause/Play toggle — paused row OR not-running ⇒ Play (start). Running ⇒ Pause.
+  const isStarting = (s.status || '').toLowerCase() === 'starting';
+  const isRunning = ['running', 'degraded'].includes((s.status || '').toLowerCase()) && !paused;
+  const showPlay = paused || !isRunning;
+  const ppIcon = isStarting ? 'rotate' : (showPlay ? 'play' : 'pause');
+  const ppAction = showPlay ? 'start' : 'pause';
+  const ppTooltip = showPlay
+    ? I18n.t('services.btn_play')
+    : I18n.t('services.btn_pause');
+
+  // Pin toggle — outline by default, filled accent when pinned.
+  const pinned = !!s.pinned;
+  const pinTooltip = pinned
+    ? I18n.t('services.tooltip_pin_on')
+    : I18n.t('services.tooltip_pin_off');
+
+  const svcId = escapeAttr(s.id);
+  const svcNodeId = escapeAttr(s.node_id || '');
+  const svcNodeLabel = escapeAttr(nodeInfo.label);
+
   return `
-    <tr data-key="svc-${escapeAttr(s.id)}">
+    <tr data-key="svc-${svcId}">
+      <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
-        <strong style="color: var(--accent-2);">${escapeHtml(displayName)}</strong>
+        <strong style="color: var(--accent-2);">${escapeHtml(engineLabel)}</strong>
       </td>
-      <td data-label="${escapeAttr(I18n.t('services.col_method'))}">
-        <span class="scope-chip mesh-admin">${escapeHtml(deployMethodLabel(s.deploy_method))}</span>
+      <td data-label="${escapeAttr(I18n.t('services.col_display_name'))}">
+        ${escapeHtml(displayName)}
       </td>
-      <td data-label="${escapeAttr(I18n.t('services.col_transport'))}">
-        <span class="scope-chip mesh-read">${escapeHtml(transportLabel(s.transport))}</span>
+      <td data-label="${escapeAttr(I18n.t('services.col_category'))}">
+        <span class="scope-chip ${categoryChipClass(category)}">${escapeHtml(category.toUpperCase() || '—')}</span>
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
         <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
@@ -332,14 +401,35 @@ function renderRow(s) {
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
+        <tf-button variant="ghost" size="sm" icon="${ppIcon}"
+          data-svc-pause-play="${svcId}"
+          data-svc-action="${ppAction}"
+          data-svc-node="${svcNodeId}"
+          ${isStarting ? 'disabled' : ''}
+          title="${escapeAttr(ppTooltip)}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="pin"
+          class="svc-pin-toggle${pinned ? ' pinned' : ''}"
+          data-svc-pin-toggle="${svcId}"
+          data-svc-pinned="${pinned ? 'true' : 'false'}"
+          data-svc-node="${svcNodeId}"
+          title="${escapeAttr(pinTooltip)}"></tf-button>
         <tf-button variant="danger" size="sm" icon="trash"
-          data-svc-delete="${escapeAttr(s.id)}"
+          data-svc-delete="${svcId}"
           data-svc-name="${escapeAttr(displayName)}"
-          data-svc-node="${escapeAttr(s.node_id || '')}"
-          title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
+          data-svc-node="${svcNodeId}"
+          data-svc-node-label="${svcNodeLabel}"
+          title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>
+        <span class="svc-row-error" data-svc-error="${svcId}" hidden></span>
       </td>
     </tr>
   `;
+}
+
+// Truncate a long string in the middle so both prefix and suffix remain visible.
+function truncateMiddle(value, max) {
+  if (!value || value.length <= max) return value || '';
+  const half = Math.floor((max - 1) / 2);
+  return value.slice(0, half) + '…' + value.slice(value.length - half);
 }
 
 // ---- Aliases tab ----------------------------------------------------------
@@ -770,20 +860,22 @@ async function deleteAlias(id, name) {
 
 // ---- Helpers --------------------------------------------------------------
 
-async function stopService(id, name, nodeId) {
+async function stopService(id, name, nodeId, nodeLabel) {
   const ok = await TfWindow.confirm({
-    title: I18n.t('common.delete'),
-    message: I18n.t('services.delete_confirm', { name }),
-    confirmLabel: I18n.t('common.delete'),
+    title: I18n.t('services.confirm_delete_title'),
+    message: I18n.t('services.confirm_delete_body', {
+      name: name || id,
+      node: nodeLabel || nodeId || '—',
+    }),
+    confirmLabel: I18n.t('services.btn_delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,
   });
   if (!ok) return;
   try {
-    // Binary RPC `ServiceDeleteRequest` stops the runtime AND removes the row,
-    // cascading to model_registry via FK ON DELETE CASCADE. `nodeId` is the
-    // owning mesh node — when it differs from the local node the dispatcher
-    // forwards the request as `MeshCommandType::ServiceDeleteRemote`.
+    // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
+    // wipes attached model_registry rows. When nodeId points at a remote peer
+    // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.
     const resp = await ApiBinary.action('serviceDeleteRequest', {
       serviceId: id,
       nodeId: nodeId || undefined,
@@ -791,16 +883,95 @@ async function stopService(id, name, nodeId) {
     if (resp && resp.success === false) {
       throw new Error(resp.error || 'Unknown error');
     }
-    toast(I18n.t('services.delete_success', { name }), 'success');
-    const fresh = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' })
-      .catch(() => services);
-    services = Array.isArray(fresh) ? fresh : [];
-    patchListTab();
-    updateSubtitle();
-    updateTabCounts();
+    await refreshServiceList();
   } catch (err) {
-    toast(I18n.t('services.delete_error', { error: err.message }), 'error');
+    showRowError(id, err.message);
   }
+}
+
+// Pause/Play toggle handler. Reads action from data-svc-action set by renderer
+// and posts the matching binary RPC. The button's icon is updated inline (rotate
+// = pending) until the refresh swaps the row in.
+async function togglePauseStart(button) {
+  const id = button.dataset.svcPausePlay;
+  const action = button.dataset.svcAction;
+  const nodeId = button.dataset.svcNode;
+  if (!id || !action) return;
+  button.setAttribute('disabled', '');
+  button.setAttribute('icon', 'rotate');
+  try {
+    if (action === 'pause') {
+      await ApiBinary.action('servicePauseRequest', {
+        serviceId: id,
+        nodeId: nodeId || undefined,
+        paused: true,
+      });
+    } else {
+      await ApiBinary.action('serviceStartRequest', {
+        serviceId: id,
+        nodeId: nodeId || undefined,
+      });
+    }
+    await refreshServiceList();
+  } catch (err) {
+    showRowError(id, err.message);
+    button.removeAttribute('disabled');
+    button.setAttribute('icon', action === 'pause' ? 'pause' : 'play');
+  }
+}
+
+// Pin toggle handler — flips data-svc-pinned, posts servicePinRequest with the
+// new state, and refreshes the list. The .pinned class is rebuilt by render.
+async function togglePin(button) {
+  const id = button.dataset.svcPinToggle;
+  const nodeId = button.dataset.svcNode;
+  const current = button.dataset.svcPinned === 'true';
+  if (!id) return;
+  const next = !current;
+  button.setAttribute('disabled', '');
+  // Optimistic flip — keeps the icon state consistent during the round-trip.
+  button.classList.toggle('pinned', next);
+  button.dataset.svcPinned = next ? 'true' : 'false';
+  try {
+    await ApiBinary.action('servicePinRequest', {
+      serviceId: id,
+      nodeId: nodeId || undefined,
+      pinned: next,
+    });
+    await refreshServiceList();
+  } catch (err) {
+    // Rollback optimistic flip.
+    button.classList.toggle('pinned', current);
+    button.dataset.svcPinned = current ? 'true' : 'false';
+    button.removeAttribute('disabled');
+    showRowError(id, err.message);
+  }
+}
+
+// Pull a fresh service list and patch the table without flicker.
+async function refreshServiceList() {
+  const fresh = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' })
+    .catch(() => services);
+  services = Array.isArray(fresh) ? fresh : [];
+  patchListTab();
+  updateSubtitle();
+  updateTabCounts();
+}
+
+// Render a per-row error string under the action cell. Auto-hides via CSS
+// animation (5s). Replaces any prior message so the user sees the latest.
+function showRowError(serviceId, message) {
+  const el = document.querySelector(`[data-svc-error="${CSS.escape(String(serviceId))}"]`);
+  if (!el) return;
+  el.textContent = message || I18n.t('common.error');
+  el.hidden = false;
+  // Restart CSS animation by reflow + class toggle.
+  el.classList.remove('svc-row-error');
+  void el.offsetWidth; // force reflow
+  el.classList.add('svc-row-error');
+  setTimeout(() => {
+    if (el.isConnected) el.hidden = true;
+  }, 5000);
 }
 
 function typeChipClass(t) {
