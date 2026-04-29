@@ -234,8 +234,19 @@ class TfWindow extends HTMLElement {
 
     const w = this.getAttribute('width');
     const h = this.getAttribute('height');
-    if (w) this._win.style.width = `${parseInt(w, 10)}px`;
-    if (h) this._win.style.height = `${parseInt(h, 10)}px`;
+    if (w) {
+      // Clamp do viewport - mniejsze z requested i (window.innerWidth - 24).
+      // CSS max-width tez to chroni, ale ustawiamy explicit zeby JS layout
+      // (drag, resize) operowal na realnej wartosci.
+      const reqW = parseInt(w, 10);
+      const maxW = Math.max(320, window.innerWidth - 24);
+      this._win.style.width = `${Math.min(reqW, maxW)}px`;
+    }
+    if (h) {
+      const reqH = parseInt(h, 10);
+      const maxH = Math.max(200, window.innerHeight - 24);
+      this._win.style.height = `${Math.min(reqH, maxH)}px`;
+    }
   }
 
   _renderControls(actions) {
@@ -318,6 +329,17 @@ class TfWindow extends HTMLElement {
   }
 
   _onViewportResize() {
+    // Re-clamp height/width gdy viewport sie zmniejszyl (np. mobile rotate,
+    // window resize) - bez tego content moze wystawac poza ekran. CSS
+    // max-height to lapie ale explicit JS height nadpisuje, wiec aktualizujemy.
+    if (this._win && !this._win.classList.contains('maximized')) {
+      const curH = parseInt(this._win.style.height || '0', 10);
+      const curW = parseInt(this._win.style.width || '0', 10);
+      const maxH = Math.max(200, window.innerHeight - 24);
+      const maxW = Math.max(320, window.innerWidth - 24);
+      if (curH > maxH) this._win.style.height = `${maxH}px`;
+      if (curW > maxW) this._win.style.width = `${maxW}px`;
+    }
     this._recenterIfNeeded();
   }
 

@@ -1147,6 +1147,13 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   flex-direction: column;
   min-width: 320px;
   min-height: 200px;
+  /* Hard cap na wysokosc - bez tego window z duza zawartoscia (np. wizard
+     z dlugą lista GPU/modeli) rosnie pod ekranem i footer z przyciskami
+     znika. Body ma `overflow: auto` wiec content scrolluje wewnatrz, header
+     i footer zostaja widoczne (`flex-shrink: 0`). dvh = dynamic viewport
+     height (mobile uwzglednia paski URL/nav). 24px = 12px margines gora+dol. */
+  max-height: calc(100dvh - 24px);
+  max-width: calc(100vw - 24px);
   z-index: 1000;
   will-change: transform, width, height, filter;
   overflow: hidden;
