@@ -731,6 +731,14 @@ impl IrohMeshManager {
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         self.connections.clear();
+        // Bez tego iroh przy dropie tokio runtime cancellowal wszystkie
+        // ActiveRelayActor sequencyjnie generujac setki linii spamu
+        // "JoinError::Cancelled" i "Home relay not set". `close()` dorzuca
+        // CONNECTION_CLOSE peerom i czeka az relay actorzy zamkna kanaly
+        // czysto. Awaitujemy z timeout 3s zeby shutdown nie wisial gdy
+        // relay nie odpowiada.
+        let close_fut = self.endpoint.inner().close();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), close_fut).await;
     }
 
     /// Laczy sie z peerem po hex-enkodowanym EndpointId. Gdy caller poda
