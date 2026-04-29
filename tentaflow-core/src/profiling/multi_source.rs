@@ -446,14 +446,25 @@ impl MultiSourceSession {
             }
         };
 
-        // Cancel watchdog if pending. Awaiting the JoinHandle is best-effort.
+        // Cancel watchdog if pending. Sygnal przez oneshot jest wystarczajacy:
+        //   - jezeli watchdog jeszcze spi w sleep -> cancel_rx.recv wybudza go,
+        //     wybiera cancel branch, exit czysto (NIE wywoluje stop()).
+        //   - jezeli watchdog wlasnie odpala stop() -> oneshot.send() failuje
+        //     (channel zamkniety przy drop'ie cancel_rx) ale to OK - jestesmy
+        //     juz w stop() tej samej sesji, robimy reszte work'u.
+        //
+        // CRITICAL: NIE wywolujemy wd.handle.abort()! Gdy stop() jest wywolane
+        // przez watchdog (auto-stop), wd.handle to JoinHandle TEGO task'u.
+        // abort() killuje biezacy task przy najblizszym .await -> reszta stop()
+        // (collector merge + write_session) NIGDY nie sie wykona -> summary.bin
+        // nie zapisany -> sesja "Failed to load report: NotFound summary.bin".
+        // Drop'owanie WatchdogControl bez abort detacha task; on dokonczy swoj
+        // select branch i exit'uje czysto.
         if let Some(mut wd) = state.watchdog {
             if let Some(tx) = wd.cancel_tx.take() {
                 let _ = tx.send(());
             }
-            // If the watchdog is the caller (auto-stop), the join is on the same task —
-            // we cannot await ourselves. Detach instead.
-            wd.handle.abort();
+            drop(wd);
         }
 
         let duration_ns = state.t0_instant.elapsed().as_nanos() as u64;
