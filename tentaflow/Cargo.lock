@@ -7671,6 +7671,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "sherpa-rs",
+ "shlex",
  "symphonia",
  "sysinfo",
  "tar",

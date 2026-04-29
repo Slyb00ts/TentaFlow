@@ -55,6 +55,29 @@ const STEPS = [
 let advancedRecommendation = null;
 let advancedRecommendDebounceTimer = null;
 
+// Cache `model_spec` (num_layers, num_kv_heads, head_dim, dtype) z pierwszego
+// fetchu — uzywamy go w `estimateKvGb` zeby pokazac szybki podglad VRAM
+// natychmiast po ruchu suwaka, zanim backend potwierdzi przez /recommend.
+let cachedModelSpec = null;
+
+// Poprzedni stan "at_limit" — gdy zmienia sie z false->true, dodajemy
+// klase pulse na adv-pill zeby user zauwazyl ze jest na granicy.
+let prevAtLimit = false;
+
+// Estymator KV cache po stronie klienta. Wzor:
+//   2 (K + V) * layers * kv_heads * head_dim * seq_len * batch * bytes_per_elem
+// Wartosci modelu czytamy z `cachedModelSpec`. Wynik w GB.
+function estimateKvGb({ num_layers, num_kv_heads, head_dim, max_model_len, max_num_seqs, kv_dtype_bytes = 2 }) {
+  if (!num_layers || !num_kv_heads || !head_dim || !max_model_len || !max_num_seqs) return null;
+  const bytes = 2 * num_layers * num_kv_heads * head_dim * max_model_len * max_num_seqs * kv_dtype_bytes;
+  return bytes / (1024 ** 3);
+}
+
+function kvDtypeBytes(kv) {
+  if (kv === 'fp8') return 1;
+  return 2; // auto/fp16/bfloat16
+}
+
 /// Publiczne API: otwiera wizard dla `engineId`. `opts` opcjonalnie zawiera
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
 export async function openDeployWizard(engineId, opts = {}) {
@@ -71,7 +94,10 @@ export async function openDeployWizard(engineId, opts = {}) {
     containerName: null,
     gpuSelectMode: 'all',
     gpuIds: [],
-    // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args
+    // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args.
+    // `lockedParam` = ostatnio dotkniety przez usera slider/chip — backend
+    // dostaje `lock_<param>: true` tylko dla niego, reszte parametrow
+    // dopasowuje sam (auto-fit).
     advanced: {
       mode: 'auto',  // 'auto' = use recommended, 'manual' = override
       tensor_parallel: null,       // null = auto-pick
@@ -80,9 +106,12 @@ export async function openDeployWizard(engineId, opts = {}) {
       max_num_seqs: null,
       kv_cache_dtype: 'auto',
       gpu_memory_utilization: 0.9,
+      lockedParam: null,           // 'max_model_len' | 'max_num_seqs' | 'tensor_parallel' | 'gpu_memory_utilization' | null
     },
   };
   advancedRecommendation = null;
+  cachedModelSpec = null;
+  prevAtLimit = false;
   gpuListByNode.clear();
 
   renderShell(`<div class="form-hint">${escapeHtml(I18n.t('common.loading'))}</div>`);
@@ -482,7 +511,20 @@ async function fetchVllmRecommendation(overrides = {}) {
     ...overrides,
   };
   try {
-    return await apiPost('/api/deploy/vllm/recommend', body);
+    const resp = await apiPost('/api/deploy/vllm/recommend', body);
+    if (resp && resp.model_spec && !cachedModelSpec) {
+      // Cache field set wystarczajacy dla estimateKvGb. Backendy moga
+      // raportowac kv_heads pod alternatywnymi nazwami — bierzemy pierwszy
+      // niepusty.
+      const ms = resp.model_spec;
+      cachedModelSpec = {
+        num_layers: ms.num_hidden_layers || ms.num_layers || 0,
+        num_kv_heads: ms.num_key_value_heads || ms.num_kv_heads || ms.num_attention_heads || 0,
+        head_dim: ms.head_dim || (ms.hidden_size && ms.num_attention_heads ? Math.round(ms.hidden_size / ms.num_attention_heads) : 0),
+        dtype: ms.dtype || 'fp16',
+      };
+    }
+    return resp;
   } catch (err) {
     return { error: err.message || String(err) };
   }
@@ -530,12 +572,17 @@ function renderStepAdvanced() {
       ? `<div class="adv-section"><div class="adv-error">${escapeHtml(rec.error)}</div></div>`
       : renderVramCard(rec, totalVramGb, gpus.length);
 
-  // Sekcja: tryb auto/manual
+  // Sekcja: tryb auto/manual + reset locka (tylko w manual gdy cos jest locked)
+  const showReset = adv.mode === 'manual' && adv.lockedParam;
+  const resetBtn = showReset
+    ? `<button type="button" class="adv-reset-lock" id="edw-adv-reset-lock" title="Odblokuj wszystkie parametry — niech backend dobierze auto-fit">🔄 Reset to auto</button>`
+    : '';
   const modeCard = `
     <div class="adv-section">
       <div class="adv-sec-title">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/></svg>
         Tryb konfiguracji
+        <div class="adv-sec-actions">${resetBtn}</div>
       </div>
       <tf-segmented id="edw-adv-mode" value="${escapeAttr(adv.mode)}" size="sm">
         <option value="auto" variant="neutral">Auto-tuned</option>
@@ -566,8 +613,13 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   const pctUsed = totalVramGb > 0 ? Math.min(200, Math.round((totalUsed / totalVramGb) * 100)) : 0;
   const fits = v.fits_per_gpu !== false && pctUsed <= 95;
 
+  // Backend (po ukonczeniu refactoru rust) raportuje `at_limit: true` gdy
+  // konfiguracja jest na granicy — wtedy pokazujemy zolty pill nawet jezeli
+  // pctUsed jeszcze nie przekroczylo progu (np. backend juz auto_adjusted
+  // parametry, fits, ale dalej recznie nie ma sie gdzie ruszyc).
+  const backendAtLimit = rec && rec.at_limit === true;
   let pillCls = 'adv-pill ok';
-  let pillTxt = 'FITS';
+  let pillTxt = backendAtLimit ? `${pctUsed}% — AT LIMIT` : 'FITS';
   let barCls = 'ok';
   let kvCls = '';
   let leftCls = 'success';
@@ -575,10 +627,16 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   if (pctUsed > 95) {
     pillCls = 'adv-pill danger'; pillTxt = `${pctUsed}% — OUT OF VRAM`;
     barCls = 'danger'; kvCls = 'danger'; leftCls = 'danger'; totalCls = 'danger';
-  } else if (pctUsed > 80) {
-    pillCls = 'adv-pill warn'; pillTxt = `${pctUsed}% — uważaj`;
+  } else if (pctUsed > 80 || backendAtLimit) {
+    pillCls = 'adv-pill warn';
+    if (!backendAtLimit) pillTxt = `${pctUsed}% — uważaj`;
     barCls = 'warn'; kvCls = 'warn'; leftCls = 'warn';
   }
+  // Pulse 1x na przejsciu na "at limit" zeby user zauwazyl. Klasa
+  // jest dodawana tylko gdy stan zmienil sie z false -> true.
+  const becameAtLimit = backendAtLimit && !prevAtLimit;
+  prevAtLimit = backendAtLimit;
+  if (becameAtLimit) pillCls += ' pulse';
 
   const weightsGb = v.model_weights_gb || 0;
   const kvGb = v.kv_cache_gb || 0;
@@ -682,24 +740,64 @@ const CTX_PRESETS = [
 ];
 
 function renderAdvancedManualControls(adv, rec) {
+  // `applied` jest aktualnym stanem auto-fit po overrides (backend zwraca
+  // realne wartosci jakie zaproponowal po lockach usera). `recommended` zostaje
+  // jako fallback gdy backend nie zwraca jeszcze `applied` (graceful degradation).
+  const applied = rec?.applied || rec?.recommended || {};
   const recCfg = rec?.recommended || {};
-  // Maksymalny kontekst: bierzemy z config.json modelu (max_position_embeddings),
-  // albo z `max_supported_model_len` (limit z VRAM), wybieramy większą wartość żeby
-  // user mógł próbować ekstremalnych ustawień nawet gdy auto-tuned ograniczył do mniej.
-  // Hard ceiling 1M (1_048_576) — modele typu Llama 3.1 mają 1M, więcej w praktyce nikt nie używa.
+  const autoAdjusted = new Set(Array.isArray(rec?.auto_adjusted) ? rec.auto_adjusted : []);
+  const lockedParam = adv.lockedParam || null;
+
+  // Limity per-param. Backend (po refaktorze rust) udostepnia
+  // `max_supported_<param>` indywidualnie liczone pod aktualne overrides
+  // — dzieki temu po zalockowaniu np. ctx, max num_seqs natychmiast spada.
   const modelMaxCtx = rec?.model_spec?.max_position_embeddings || 0;
   const vramMaxCtx = rec?.max_supported_model_len || 0;
   const ABSOLUTE_MAX = 1_048_576;
   const maxCtx = Math.min(ABSOLUTE_MAX, Math.max(modelMaxCtx, vramMaxCtx, 32768));
   const maxSeqs = rec?.max_supported_num_seqs || 256;
 
-  const tp = adv.tensor_parallel ?? recCfg.tensor_parallel ?? 1;
-  const pp = adv.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
-  const ctx = adv.max_model_len ?? recCfg.max_model_len ?? 8192;
-  const seqs = adv.max_num_seqs ?? recCfg.max_num_seqs ?? 16;
-  const kv = adv.kv_cache_dtype || recCfg.kv_cache_dtype || 'auto';
-  const memUtil = adv.gpu_memory_utilization ?? recCfg.gpu_memory_utilization ?? 0.9;
+  // Wartosci pokazywane na sliderach: dla locked param bierzemy z `adv`
+  // (user-set), dla pozostalych z `applied` (auto-fit przez backend).
+  const valueFor = (key, fallback) => {
+    if (lockedParam === key) return adv[key] ?? applied[key] ?? recCfg[key] ?? fallback;
+    return applied[key] ?? adv[key] ?? recCfg[key] ?? fallback;
+  };
+
+  const tp = valueFor('tensor_parallel', 1);
+  const pp = adv.pipeline_parallel ?? applied.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
+  const ctx = valueFor('max_model_len', 8192);
+  const seqs = valueFor('max_num_seqs', 16);
+  const kv = adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || 'auto';
+  const memUtil = valueFor('gpu_memory_utilization', 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
+
+  // Helper: render hintu auto-adjust pod sliderem.
+  const adjustHint = (key, prevVal, newVal) => {
+    if (lockedParam === key) return ''; // locked = wartosc usera, nic nie autotunujemy
+    if (!autoAdjusted.has(key)) return '';
+    const fmt = (v) => typeof v === 'number' ? (v >= 1 ? v.toLocaleString() : v.toFixed(2)) : String(v ?? '?');
+    return `<div class="adv-hint adjust-warn">⚙ Auto-zmniejszono z ${fmt(prevVal)} do ${fmt(newVal)} (limit VRAM)</div>`;
+  };
+
+  // Helper: marker locka obok labelki slidera.
+  const lockMark = (key) => lockedParam === key
+    ? `<span class="adv-lock-tag" title="Ten parametr jest zablokowany — pozostale slidery dostosowuja sie automatycznie">🔒 locked</span>`
+    : '';
+
+  // Live JS estimator KV — natychmiastowy podglad VRAM (przed backendem).
+  let liveKvHint = '';
+  if (cachedModelSpec) {
+    const liveGb = estimateKvGb({
+      ...cachedModelSpec,
+      max_model_len: ctx,
+      max_num_seqs: seqs,
+      kv_dtype_bytes: kvDtypeBytes(kv),
+    });
+    if (liveGb != null) {
+      liveKvHint = `<div class="adv-hint">Estymowany KV cache (live): <strong>${liveGb.toFixed(1)} GB</strong> · backend potwierdzi za chwile…</div>`;
+    }
+  }
 
   // Chipy presetów — disabled gdy przekraczają max modelu.
   const chips = CTX_PRESETS.map((p) => {
@@ -712,22 +810,33 @@ function renderAdvancedManualControls(adv, rec) {
     return `<button type="button" class="${cls.join(' ')}" data-ctx="${p.value}" title="${escapeAttr(title)}" ${exceeds ? 'disabled' : ''}>${escapeHtml(p.label)}</button>`;
   }).join('');
 
+  // Hinty auto-adjust — porownujemy applied z recommended zeby pokazac
+  // delty. Backend powinien zwracac obie wartosci, ale dzialamy defensive
+  // (graceful degradation): jezeli `auto_adjusted` puste, hint sie nie
+  // pojawi, a porownanie applied vs recommended jest tylko podpowiedzia.
+  const ctxAdjust = adjustHint('max_model_len', recCfg.max_model_len, applied.max_model_len);
+  const seqsAdjust = adjustHint('max_num_seqs', recCfg.max_num_seqs, applied.max_num_seqs);
+  const tpAdjust = adjustHint('tensor_parallel', recCfg.tensor_parallel, applied.tensor_parallel);
+  const memAdjust = adjustHint('gpu_memory_utilization', recCfg.gpu_memory_utilization, applied.gpu_memory_utilization);
+
   return `
     <div class="adv-form-row">
       <label>
-        <span>Długość kontekstu (max_model_len)</span>
+        <span>Długość kontekstu (max_model_len) ${lockMark('max_model_len')}</span>
         <span class="v" id="edw-adv-ctx-val">${ctx.toLocaleString()}</span>
       </label>
       <input type="range" class="adv-range" id="edw-adv-ctx" min="512" max="${maxCtx}" step="512" value="${ctx}">
       <div class="adv-ctx-presets">${chips}</div>
       <div class="adv-hint">Max z konfiguracji modelu: <strong>${modelMaxCtx ? modelMaxCtx.toLocaleString() : '?'}</strong>${vramMaxCtx ? ` · z VRAM: <strong>${vramMaxCtx.toLocaleString()}</strong>` : ''}.</div>
+      ${ctxAdjust}
     </div>
 
     <div class="adv-row-2">
       <div class="adv-form-row">
-        <label><span>Tensor Parallel</span><span class="v">${tp}</span></label>
+        <label><span>Tensor Parallel ${lockMark('tensor_parallel')}</span><span class="v">${tp}</span></label>
         <tf-input type="number" id="edw-adv-tp" min="1" max="${totalGpus}" value="${tp}"></tf-input>
         <div class="adv-hint">Musi dzielić num_attention_heads. Limit ${totalGpus} GPU.</div>
+        ${tpAdjust}
       </div>
       <div class="adv-form-row">
         <label><span>Pipeline Parallel</span><span class="v">${pp}</span></label>
@@ -738,16 +847,20 @@ function renderAdvancedManualControls(adv, rec) {
 
     <div class="adv-row-2">
       <div class="adv-form-row">
-        <label><span>Max num seqs</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
+        <label><span>Max num seqs ${lockMark('max_num_seqs')}</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
         <input type="range" class="adv-range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}">
         <div class="adv-hint">Liczba równoległych zapytań w batch (max ${maxSeqs}).</div>
+        ${seqsAdjust}
       </div>
       <div class="adv-form-row">
-        <label><span>GPU memory utilization</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
+        <label><span>GPU memory utilization ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
         <input type="range" class="adv-range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}">
         <div class="adv-hint">Procent VRAM dla vLLM, reszta na CUDA workspace.</div>
+        ${memAdjust}
       </div>
     </div>
+
+    ${liveKvHint}
 
     <div class="adv-form-row">
       <label>KV Cache dtype</label>

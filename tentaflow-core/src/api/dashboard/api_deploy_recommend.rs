@@ -10,9 +10,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::deploy::vram_calculator::{
-    analyze_gpu_compatibility, build_vllm_args_string, estimate_vllm_vram, fetch_hf_config,
-    max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config,
-    recommend_parallelism, GpuCompatibilityReport, ModelSpec, VramEstimate, VramEstimateInput,
+    analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
+    fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config,
+    AutoFitOutcome, AutoFitRequest, GpuCompatibilityReport, VramEstimate, VramEstimateInput,
 };
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +31,14 @@ pub struct RecommendRequest {
     pub max_num_seqs: Option<u64>,
     pub kv_cache_dtype: Option<String>,
     pub gpu_memory_utilization: Option<f64>,
+
+    // Lock flags - gdy true, backend traktuje odpowiadajacy parametr jako fixed
+    // (uzytkownik wybral go swiadomie) i auto-zmniejsza POZOSTALE parametry zeby
+    // calosc miescila sie w VRAM. Gdy false albo pominiete - parametr moze byc
+    // auto-cap'owany przez auto_fit.
+    pub lock_max_model_len: Option<bool>,
+    pub lock_max_num_seqs: Option<bool>,
+    pub lock_tensor_parallel: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -59,6 +67,28 @@ pub struct RecommendResponse {
     /// Analiza zgodnosci liczby GPU z modelem - lepsze wartosci do wyboru
     /// gdy aktualny setup jest nieoptymalny (np. 5 GPU dla Gemma -> rekomendacja 4 lub 6).
     pub gpu_compatibility: GpuCompatibilityReport,
+    /// Konfiguracja faktycznie zastosowana po auto-fit. Moze sie roznic od
+    /// `recommended` gdy backend musial obciac parametry zeby fits w VRAM.
+    pub applied: AppliedConfig,
+    /// Lista nazw parametrow ktore auto-fit zmniejszyl wzgledem tego co user
+    /// przyslal (np. `["max_num_seqs", "max_model_len"]`). Pusta gdy zadne
+    /// auto-cap nie wystapil.
+    pub auto_adjusted: Vec<String>,
+    /// True gdy headroom < 5% albo cokolwiek bylo auto-cap'owane. GUI uzywa
+    /// tego do pokazania ostrzezenia "konfiguracja na granicy VRAM".
+    pub at_limit: bool,
+}
+
+/// Wartosci uzyte do faktycznej estymacji (po auto-fit). Jak `RecommendedConfig`
+/// ale moze byc po obcieciu.
+#[derive(Debug, Serialize)]
+pub struct AppliedConfig {
+    pub tensor_parallel: u32,
+    pub pipeline_parallel: u32,
+    pub max_model_len: u64,
+    pub max_num_seqs: u64,
+    pub kv_cache_dtype: String,
+    pub gpu_memory_utilization: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,43 +154,55 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
     let gpu_count = req.gpus.len() as u32;
     let gpu_memory_gb = req.gpus.iter().map(|g| g.memory_gb).fold(f64::INFINITY, f64::min);
 
-    // Smart-pick TP/PP gdy user nie wymusil - wybiera kombinacje zgodna
-    // z liczba attention heads i hidden layers modelu.
-    let (rec_tp, rec_pp) = recommend_parallelism(&spec, gpu_count);
-    let tp = req.tensor_parallel.unwrap_or(rec_tp);
-    let pp = req.pipeline_parallel.unwrap_or(rec_pp);
-
-    // Defaulty dla pozostalych pol (uzywane gdy user nie nadpisuje).
     let kv_dtype = req
         .kv_cache_dtype
         .clone()
         .unwrap_or_else(|| "auto".to_string());
     let gpu_mem_util = req.gpu_memory_utilization.unwrap_or(0.9);
-    let max_ctx_default = req
-        .max_model_len
-        .unwrap_or_else(|| spec.max_position_embeddings.min(8192).max(2048));
-    let max_seqs_default = req.max_num_seqs.unwrap_or(16);
 
-    let input = VramEstimateInput {
-        gpu_count,
-        gpu_memory_gb_each: gpu_memory_gb,
-        tensor_parallel: tp,
-        pipeline_parallel: pp,
-        max_model_len: max_ctx_default,
-        max_num_seqs: max_seqs_default,
-        kv_cache_dtype: kv_dtype.clone(),
-        gpu_memory_utilization: gpu_mem_util,
-        activation_overhead_pct: 10.0,
-    };
+    // Wartosci ktore user JAWNIE wyslal w body sa traktowane jako fixed gdy
+    // odpowiadajacy lock_* = true. Gdy user lockuje param ktorego nie wyslal,
+    // bierzemy wartosc z heurystyki dla auto-fit i tak nie pozwalamy obniżać.
+    let lock_ctx = req.lock_max_model_len.unwrap_or(false);
+    let lock_seqs = req.lock_max_num_seqs.unwrap_or(false);
+    let lock_tp = req.lock_tensor_parallel.unwrap_or(false);
 
-    let estimate = estimate_vllm_vram(&spec, &input);
+    let fit = auto_fit_config(
+        &spec,
+        &AutoFitRequest {
+            gpu_count,
+            gpu_memory_gb_each: gpu_memory_gb,
+            kv_cache_dtype: kv_dtype.clone(),
+            gpu_memory_utilization: gpu_mem_util,
+            requested_max_model_len: req.max_model_len,
+            requested_max_num_seqs: req.max_num_seqs,
+            requested_tensor_parallel: req.tensor_parallel,
+            requested_pipeline_parallel: req.pipeline_parallel,
+            lock_max_model_len: lock_ctx,
+            lock_max_num_seqs: lock_seqs,
+            lock_tensor_parallel: lock_tp,
+        },
+    );
+
+    let AutoFitOutcome {
+        applied: applied_input,
+        auto_adjusted,
+        at_limit,
+        error: fit_error,
+    } = fit;
+
+    if let Some(err) = fit_error {
+        return Ok((409, serde_json::json!({"error": err}).to_string()));
+    }
+
+    let estimate = estimate_vllm_vram(&spec, &applied_input);
 
     // Max limits dla GUI suwakow - obliczone niezaleznie zeby user wiedzial
-    // do jakiej wartosci moze podkrecic.
-    let max_supported_model_len = max_context_for_budget(&spec, &input);
-    let max_supported_num_seqs = max_concurrent_seqs_for_budget(&spec, &input);
+    // do jakiej wartosci moze podkrecic. Liczone wzgledem applied (po fit).
+    let max_supported_model_len = max_context_for_budget(&spec, &applied_input);
+    let max_supported_num_seqs = max_concurrent_seqs_for_budget(&spec, &applied_input);
 
-    let recommended_vllm_args = build_vllm_args_string(&spec, &input);
+    let recommended_vllm_args = build_vllm_args_string(&spec, &applied_input);
 
     let estimated_params = spec.estimated_params() as f64 / 1_000_000_000.0;
     let bytes_per_param = spec.bytes_per_param();
@@ -191,21 +233,233 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
         model_spec: summary,
         vram_estimate: estimate,
         recommended: RecommendedConfig {
-            tensor_parallel: tp,
-            pipeline_parallel: pp,
-            max_model_len: max_ctx_default,
-            max_num_seqs: max_seqs_default,
-            kv_cache_dtype: kv_dtype,
-            gpu_memory_utilization: gpu_mem_util,
+            tensor_parallel: applied_input.tensor_parallel,
+            pipeline_parallel: applied_input.pipeline_parallel,
+            max_model_len: applied_input.max_model_len,
+            max_num_seqs: applied_input.max_num_seqs,
+            kv_cache_dtype: applied_input.kv_cache_dtype.clone(),
+            gpu_memory_utilization: applied_input.gpu_memory_utilization,
         },
         max_supported_model_len,
         max_supported_num_seqs,
         recommended_vllm_args,
         warnings,
         gpu_compatibility: gpu_compat,
+        applied: AppliedConfig {
+            tensor_parallel: applied_input.tensor_parallel,
+            pipeline_parallel: applied_input.pipeline_parallel,
+            max_model_len: applied_input.max_model_len,
+            max_num_seqs: applied_input.max_num_seqs,
+            kv_cache_dtype: applied_input.kv_cache_dtype,
+            gpu_memory_utilization: applied_input.gpu_memory_utilization,
+        },
+        auto_adjusted,
+        at_limit,
     };
 
     Ok((200, serde_json::to_string(&response)?))
+}
+
+#[derive(Debug, Serialize)]
+pub struct LimitsResponse {
+    pub max_model_len: u64,
+    pub max_num_seqs: u64,
+    pub max_tensor_parallel: u32,
+    pub available_kv_budget_gb: f64,
+    /// TP wybrane jako baseline (smart-pick lub user lock) - GUI uzywa do
+    /// wyswietlenia "przy TP=4 mozesz miec ctx do X".
+    pub tensor_parallel: u32,
+    pub pipeline_parallel: u32,
+}
+
+/// Handler GET `/api/deploy/vllm/limits`. Query params (URL-encoded):
+///   `model` - HF repo id (required)
+///   `gpus` - csv `<idx>:<mem_gb>,...` lub jen csv `<mem_gb>` (np. `24,24,24,24`)
+///   `lock_max_model_len`, `max_model_len` - opcjonalny lock + wartosc
+///   `lock_max_num_seqs`, `max_num_seqs`
+///   `lock_tensor_parallel`, `tensor_parallel`
+///   `kv_cache_dtype`, `gpu_memory_utilization`, `hf_token`
+pub async fn handle_limits(query: &str) -> Result<(u16, String)> {
+    let params = parse_query(query);
+
+    let model = params
+        .get("model")
+        .cloned()
+        .unwrap_or_default();
+    if model.trim().is_empty() {
+        return Ok((400, r#"{"error":"model wymagany"}"#.to_string()));
+    }
+
+    let gpus_csv = params.get("gpus").cloned().unwrap_or_default();
+    let gpus: Vec<f64> = gpus_csv
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            // akceptujemy zarowno "24" jak i "0:24"
+            let last = s.rsplit(':').next().unwrap_or(s);
+            last.parse::<f64>().ok()
+        })
+        .collect();
+    if gpus.is_empty() {
+        return Ok((400, r#"{"error":"gpus wymagane (csv mem_gb)"}"#.to_string()));
+    }
+
+    let hf_token = params.get("hf_token").cloned();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| anyhow::anyhow!("reqwest client: {e}"))?;
+    let config_json = match fetch_hf_config(&client, &model, hf_token.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok((
+                404,
+                serde_json::json!({"error": format!("HF config fetch: {e}")}).to_string(),
+            ));
+        }
+    };
+    let spec = parse_hf_config(&config_json, &model)
+        .map_err(|e| anyhow::anyhow!("parse HF: {e}"))?;
+
+    let gpu_count = gpus.len() as u32;
+    let gpu_memory_gb = gpus.iter().copied().fold(f64::INFINITY, f64::min);
+    let kv_dtype = params
+        .get("kv_cache_dtype")
+        .cloned()
+        .unwrap_or_else(|| "auto".to_string());
+    let gpu_mem_util: f64 = params
+        .get("gpu_memory_utilization")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.9);
+    let lock_ctx = parse_bool(params.get("lock_max_model_len"));
+    let lock_seqs = parse_bool(params.get("lock_max_num_seqs"));
+    let lock_tp = parse_bool(params.get("lock_tensor_parallel"));
+    let req_ctx = params.get("max_model_len").and_then(|s| s.parse().ok());
+    let req_seqs = params.get("max_num_seqs").and_then(|s| s.parse().ok());
+    let req_tp = params
+        .get("tensor_parallel")
+        .and_then(|s| s.parse().ok());
+
+    let fit = auto_fit_config(
+        &spec,
+        &AutoFitRequest {
+            gpu_count,
+            gpu_memory_gb_each: gpu_memory_gb,
+            kv_cache_dtype: kv_dtype,
+            gpu_memory_utilization: gpu_mem_util,
+            requested_max_model_len: req_ctx,
+            requested_max_num_seqs: req_seqs,
+            requested_tensor_parallel: req_tp,
+            requested_pipeline_parallel: None,
+            lock_max_model_len: lock_ctx,
+            lock_max_num_seqs: lock_seqs,
+            lock_tensor_parallel: lock_tp,
+        },
+    );
+
+    if let Some(err) = fit.error {
+        return Ok((409, serde_json::json!({"error": err}).to_string()));
+    }
+
+    let applied = fit.applied;
+    let max_model_len = max_context_for_budget(&spec, &applied);
+    let max_num_seqs = max_concurrent_seqs_for_budget(&spec, &applied);
+
+    // KV budget: capacity*util - weights/parallel - activations
+    let parallel = (applied.tensor_parallel * applied.pipeline_parallel).max(1) as f64;
+    let weights_gb = (spec.estimated_params() as f64 * spec.bytes_per_param())
+        / (1024.0 * 1024.0 * 1024.0);
+    let weights_per_gpu = weights_gb / parallel;
+    let activations_per_gpu = 5.0 + weights_per_gpu * 0.10;
+    let usable_per_gpu = applied.gpu_memory_gb_each * applied.gpu_memory_utilization;
+    let kv_budget = (usable_per_gpu - weights_per_gpu - activations_per_gpu).max(0.0);
+
+    // max_tensor_parallel: najwieksze TP dla ktorego model+min KV miesci sie
+    // na pojedynczym GPU (przy danej PP=1) i dzieli heads. Iteruj malejaco.
+    let heads = spec.num_attention_heads.max(1);
+    let kv_heads = spec.num_key_value_heads.max(1);
+    let mut max_tp = 1u32;
+    for tp in 1..=gpu_count {
+        if gpu_count % tp != 0 {
+            continue;
+        }
+        if heads % (tp as u64) != 0 || kv_heads % (tp as u64) != 0 {
+            continue;
+        }
+        let probe = VramEstimateInput {
+            gpu_count,
+            gpu_memory_gb_each: gpu_memory_gb,
+            tensor_parallel: tp,
+            pipeline_parallel: 1,
+            max_model_len: 1024,
+            max_num_seqs: 1,
+            kv_cache_dtype: applied.kv_cache_dtype.clone(),
+            gpu_memory_utilization: gpu_mem_util,
+            activation_overhead_pct: 10.0,
+        };
+        if estimate_vllm_vram(&spec, &probe).fits_per_gpu {
+            max_tp = tp;
+        }
+    }
+
+    let resp = LimitsResponse {
+        max_model_len,
+        max_num_seqs,
+        max_tensor_parallel: max_tp,
+        available_kv_budget_gb: kv_budget,
+        tensor_parallel: applied.tensor_parallel,
+        pipeline_parallel: applied.pipeline_parallel,
+    };
+    Ok((200, serde_json::to_string(&resp)?))
+}
+
+/// Prosty parser query stringu (`a=1&b=hello+world`). URL-decode tylko `+` -> ` `
+/// i `%XX`. Zwraca map klucz -> wartosc; ostatnie wystapienie wygrywa.
+fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for pair in q.split('&').filter(|p| !p.is_empty()) {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        out.insert(url_decode(k), url_decode(v));
+    }
+    out
+}
+
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn parse_bool(v: Option<&String>) -> bool {
+    matches!(
+        v.map(|s| s.as_str()),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 // build_vllm_args_string przeniesione do crate::deploy::vram_calculator

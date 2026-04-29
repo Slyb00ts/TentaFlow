@@ -1035,6 +1035,32 @@ pub async fn handle_request(
     // Body: {model, gpus[], hf_token?, optional overrides}.
     // Wolane przez engine-deploy-wizard dla live recompute przy zmianie
     // modelu lub suwakow advanced settings. Endpoint async bo robi HF fetch.
+    // Deploy: live limits dla suwakow GUI (max ctx, max seqs, max TP) na
+    // podstawie wybranego modelu i listy GPU. GET zeby moc cache'owac, params
+    // w query string.
+    if method == Method::GET && path == "/api/deploy/vllm/limits" {
+        if require_admin(&claims, &db).is_some() {
+            return Ok(json_error_cors(
+                403,
+                "Brak uprawnien administratora",
+                cors_origin.as_deref(),
+            ));
+        }
+        let (status, response_body) = match api_deploy_recommend::handle_limits(&query_string).await
+        {
+            Ok(p) => p,
+            Err(e) => (
+                500,
+                format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
+            ),
+        };
+        return Ok(json_response_cors(
+            status,
+            response_body,
+            cors_origin.as_deref(),
+        ));
+    }
+
     if method == Method::POST && path == "/api/deploy/vllm/recommend" {
         if require_admin(&claims, &db).is_some() {
             return Ok(json_error_cors(
