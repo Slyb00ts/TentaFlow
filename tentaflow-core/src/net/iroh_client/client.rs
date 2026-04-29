@@ -150,6 +150,25 @@ impl IrohServiceClient {
         &self,
         request: ModelRequest,
     ) -> Result<impl Stream<Item = Result<ModelStreamChunk, CoreError>> + Send, CoreError> {
+        // Paranoid check: bidi handler po drugiej stronie decyduje na podstawie
+        // request.stream czy zwrocic ModelResponse czy strumien ModelStreamChunk.
+        // Wywolanie send_request_stream z stream=false skutkowalo cichym
+        // "subtree pointer overran range" (bajty ModelResponse parsowane jako
+        // ModelStreamChunk). Wymuszamy true zamiast bledu, zeby istniejacy
+        // caller-bug naprawic z miejsca.
+        let request = if request.stream {
+            request
+        } else {
+            tracing::warn!(
+                request_id = %request.request_id,
+                "send_request_stream wywolany z stream=false; wymuszam true"
+            );
+            ModelRequest {
+                stream: true,
+                ..request
+            }
+        };
+
         let (_send, mut recv) = self
             .inner
             .open_bi(request)
@@ -162,6 +181,12 @@ impl IrohServiceClient {
                     Ok(Some(chunk)) => yield chunk,
                     Ok(None) => break,
                     Err(e) => {
+                        // Czytelny log zamiast cichego pointer-overrun.
+                        tracing::error!(
+                            error = %e,
+                            "read_frame::<ModelStreamChunk> fail — sprawdz czy peer \
+                             rzeczywiscie wysyla strumien (stream=true) zamiast ModelResponse"
+                        );
                         Err(map_transport_err(e))?;
                         break;
                     }
