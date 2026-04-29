@@ -1232,6 +1232,7 @@ impl Router {
         &self,
         rx: tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>,
     ) {
+        self.service_manager.set_snapshot_rx(rx.clone());
         *self.services_snapshot_rx.write() = Some(rx);
     }
 

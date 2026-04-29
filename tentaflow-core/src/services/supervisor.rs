@@ -112,6 +112,12 @@ pub struct ServiceEntry {
     /// Optional alias the engine prefers for this model (e.g. ollama maps
     /// `llama3.1` → `llama3.1:8b-instruct-q4_0`).
     pub model_name_override: Option<String>,
+    /// Verbatim string-typed entries from `services_v2.config_json`. The
+    /// transport client glue reads `api_key`, `api_key_env`, `request_format`,
+    /// `custom_endpoint`, `custom_headers_json`, plus any other string-valued
+    /// top-level keys, when materialising a legacy `ServiceBackend` for
+    /// `BackendClient::new`. Numeric / object / array values are excluded.
+    pub extra_config: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -398,8 +404,7 @@ impl Supervisor {
                         }
                     })
                     .collect();
-                let (timeout_ms, max_concurrent, weight, model_name_override) =
-                    parse_backend_meta(&row.config_json);
+                let meta = parse_backend_meta(&row.config_json);
                 let idx = services.len();
                 services_by_id.insert(row.id, idx);
                 services.push(ServiceEntry {
@@ -413,10 +418,11 @@ impl Supervisor {
                     runtime_port: row.runtime_port,
                     sidecar_quic_port: row.sidecar_quic_port,
                     models: model_entries,
-                    timeout_ms,
-                    max_concurrent,
-                    weight,
-                    model_name_override,
+                    timeout_ms: meta.timeout_ms,
+                    max_concurrent: meta.max_concurrent,
+                    weight: meta.weight,
+                    model_name_override: meta.model_name_override,
+                    extra_config: meta.extra_config,
                 });
             }
 
@@ -611,11 +617,26 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
 
 // ----- config_json materialisation ------------------------------------------
 
+/// Materialised form of `services_v2.config_json` consumed by the snapshot
+/// builder. Numeric scalars are extracted into typed fields; every remaining
+/// string-valued top-level entry is preserved in `extra_config` for the
+/// transport-client glue (api keys, custom endpoints, request format, etc.).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BackendMeta {
+    pub timeout_ms: u64,
+    pub max_concurrent: u32,
+    pub weight: u32,
+    pub model_name_override: Option<String>,
+    pub extra_config: HashMap<String, String>,
+}
+
 /// Parses optional `timeout_ms` / `max_concurrent` / `weight` /
 /// `model_name_override` from `services_v2.config_json` (a JSON object).
 /// Missing or malformed fields fall back to documented defaults so the
 /// routing path can rely on these values being populated unconditionally.
-fn parse_backend_meta(config_json: &str) -> (u64, u32, u32, Option<String>) {
+/// All string-valued top-level entries are also collected into
+/// `extra_config` for transport-client materialisation.
+fn parse_backend_meta(config_json: &str) -> BackendMeta {
     let parsed: serde_json::Value =
         serde_json::from_str(config_json).unwrap_or(serde_json::Value::Null);
     let obj = parsed.as_object();
@@ -637,7 +658,29 @@ fn parse_backend_meta(config_json: &str) -> (u64, u32, u32, Option<String>) {
         .and_then(|m| m.get("model_name_override"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    (timeout_ms, max_concurrent, weight, model_name_override)
+
+    let mut extra_config = HashMap::new();
+    if let Some(map) = obj {
+        for (k, v) in map {
+            if let Some(s) = v.as_str() {
+                // model_name_override is already typed above; keep extra_config
+                // strictly for transport-client knobs to avoid double-write
+                // confusion at consumer side.
+                if k == "model_name_override" {
+                    continue;
+                }
+                extra_config.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    BackendMeta {
+        timeout_ms,
+        max_concurrent,
+        weight,
+        model_name_override,
+        extra_config,
+    }
 }
 
 // ----- Tests ----------------------------------------------------------------
@@ -862,30 +905,64 @@ mod tests {
 
     #[test]
     fn parse_backend_meta_returns_defaults_for_empty_object() {
-        let (timeout, max_conc, weight, alias) = parse_backend_meta("{}");
-        assert_eq!(timeout, 30_000);
-        assert_eq!(max_conc, 16);
-        assert_eq!(weight, 100);
-        assert!(alias.is_none());
+        let meta = parse_backend_meta("{}");
+        assert_eq!(meta.timeout_ms, 30_000);
+        assert_eq!(meta.max_concurrent, 16);
+        assert_eq!(meta.weight, 100);
+        assert!(meta.model_name_override.is_none());
+        assert!(meta.extra_config.is_empty());
     }
 
     #[test]
     fn parse_backend_meta_reads_overrides() {
         let json = r#"{"timeout_ms":60000,"max_concurrent":4,"weight":50,"model_name_override":"alias-x"}"#;
-        let (timeout, max_conc, weight, alias) = parse_backend_meta(json);
-        assert_eq!(timeout, 60_000);
-        assert_eq!(max_conc, 4);
-        assert_eq!(weight, 50);
-        assert_eq!(alias.as_deref(), Some("alias-x"));
+        let meta = parse_backend_meta(json);
+        assert_eq!(meta.timeout_ms, 60_000);
+        assert_eq!(meta.max_concurrent, 4);
+        assert_eq!(meta.weight, 50);
+        assert_eq!(meta.model_name_override.as_deref(), Some("alias-x"));
+        // model_name_override is consumed into the typed field; it must not
+        // also leak into extra_config.
+        assert!(!meta.extra_config.contains_key("model_name_override"));
     }
 
     #[test]
     fn parse_backend_meta_tolerates_invalid_json() {
-        let (timeout, max_conc, weight, alias) = parse_backend_meta("not-json");
-        assert_eq!(timeout, 30_000);
-        assert_eq!(max_conc, 16);
-        assert_eq!(weight, 100);
-        assert!(alias.is_none());
+        let meta = parse_backend_meta("not-json");
+        assert_eq!(meta.timeout_ms, 30_000);
+        assert_eq!(meta.max_concurrent, 16);
+        assert_eq!(meta.weight, 100);
+        assert!(meta.model_name_override.is_none());
+        assert!(meta.extra_config.is_empty());
+    }
+
+    #[test]
+    fn parse_backend_meta_extracts_string_values() {
+        let json = r#"{
+            "api_key": "sk-xxx",
+            "custom_endpoint": "/v1",
+            "request_format": "openai",
+            "timeout_ms": 5000,
+            "max_concurrent": 8
+        }"#;
+        let meta = parse_backend_meta(json);
+        assert_eq!(meta.timeout_ms, 5_000);
+        assert_eq!(meta.max_concurrent, 8);
+        assert_eq!(
+            meta.extra_config.get("api_key").map(String::as_str),
+            Some("sk-xxx")
+        );
+        assert_eq!(
+            meta.extra_config.get("custom_endpoint").map(String::as_str),
+            Some("/v1")
+        );
+        assert_eq!(
+            meta.extra_config.get("request_format").map(String::as_str),
+            Some("openai")
+        );
+        // Numeric fields must not appear in extra_config.
+        assert!(!meta.extra_config.contains_key("timeout_ms"));
+        assert!(!meta.extra_config.contains_key("max_concurrent"));
     }
 
     #[tokio::test]
