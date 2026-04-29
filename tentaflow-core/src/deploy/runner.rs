@@ -480,6 +480,12 @@ async fn do_docker_deploy(
         host_port,
     );
     let _ = node_id;
+
+    // Spawn `docker logs --follow` w tle - linie kontenera (sidecar + engine)
+    // streamowane do deploy_log z prefixem [docker]. Bez tego user widzi tylko
+    // 'kontener uruchomiony' i potem cisze az QUIC peer się polaczy. Dla 31B
+    // multimodal vllm load + warmup zajmuje 3-5min - bez logow wyglada jak hang.
+    spawn_docker_log_tailer(db.clone(), deploy_id.to_string(), tx.clone(), created_name.clone());
     // Symetria z native LLM/STT/TTS/Embeddings: po register_service wpinamy
     // model do tabeli `models` i mappingu routera. Bez tego zakladka Models
     // jest pusta po docker deploy, a /v1/chat/completions z model="Qwen/..."
@@ -1682,6 +1688,8 @@ async fn do_python_bundle_native_deploy(
     // Bez tego wyglada jakby tentaflow stal w miejscu chociaz vllm pracuje.
     let log_path = running.venv_dir.join("engine.log");
     let mut last_log_offset: u64 = 0;
+    let mut last_engine_activity_at = std::time::Instant::now();
+    let mut last_heartbeat_at = std::time::Instant::now();
     for attempt in 0..max_attempts {
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
         // Najpierw: czy proces vllm zyje? Jesli padl (np. ImportError, OOM,
@@ -1722,11 +1730,36 @@ async fn do_python_bundle_native_deploy(
                                     }
                                 }
                                 last_log_offset += n as u64;
+                                last_engine_activity_at = std::time::Instant::now();
                             }
                         }
                     }
                 }
             }
+        }
+        // Heartbeat: gdy engine.log jest cichy >30s ale proces zyje, pokaz
+        // metryki (RSS, GPU util) zeby user wiedzial ze cos sie dzieje.
+        // Vllm w fazie torch.compile + load shards potrafi przez 3-5min
+        // nie pisac na stdout - bez tego wyglada jak zawieszenie.
+        let cichy_sec = last_engine_activity_at.elapsed().as_secs();
+        let od_heartbeat = last_heartbeat_at.elapsed().as_secs();
+        if cichy_sec >= 30 && od_heartbeat >= 30 {
+            last_heartbeat_at = std::time::Instant::now();
+            let metrics = read_proc_metrics(pid);
+            let gpu_snap = nvidia_smi_snapshot();
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!(
+                    "[heartbeat] engine cichy {}s, ale dziala: PID={} RSS={} | {}",
+                    cichy_sec,
+                    pid,
+                    metrics.unwrap_or_else(|| "unknown".into()),
+                    gpu_snap.unwrap_or_else(|| "(no nvidia-smi)".into()),
+                ),
+            );
         }
         // Progress bar 85..92 w trakcie czekania, co 30s aktualizuj wiadomosc
         if attempt > 0 && attempt % 10 == 0 {
@@ -2905,4 +2938,135 @@ pub(crate) async fn build_auto_vllm_args(
     }
 
     Ok(Some(build_vllm_args_string(&spec, &input)))
+}
+
+/// Czyta /proc/<pid>/status -> VmRSS dla heartbeat. Linux only; macOS i
+/// inne os zwracaja None i heartbeat pokazuje tylko PID.
+fn read_proc_metrics(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{}/status", pid);
+        let content = std::fs::read_to_string(&path).ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let trimmed = rest.trim();
+                let kb: u64 = trimmed.split_whitespace().next()?.parse().ok()?;
+                let mb = kb / 1024;
+                return Some(format!("{} MB ({:.1} GB)", mb, mb as f64 / 1024.0));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Snapshot nvidia-smi do heartbeat - GPU index, util%, memory used. Cached
+/// 5s zeby nie spawnowac procesu co petle. Zwraca None gdy nvidia-smi brak
+/// (macOS, AMD-only).
+fn nvidia_smi_snapshot() -> Option<String> {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use std::sync::Mutex;
+    static CACHE: std::sync::OnceLock<Mutex<(Instant, Option<String>)>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(60), None)));
+    {
+        let guard = cache.lock().ok()?;
+        if guard.0.elapsed() < Duration::from_secs(5) {
+            return guard.1.clone();
+        }
+    }
+    let output = Command::new("nvidia-smi")
+        .args(&[
+            "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let cells: Vec<&str> = l.split(',').map(str::trim).collect();
+            if cells.len() == 4 {
+                format!("GPU{}:{}%{}/{}MB", cells[0], cells[1], cells[2], cells[3])
+            } else {
+                l.trim().to_string()
+            }
+        })
+        .collect();
+    let snap = if parts.is_empty() { None } else { Some(parts.join(" ")) };
+    if let Ok(mut guard) = cache.lock() {
+        *guard = (Instant::now(), snap.clone());
+    }
+    snap
+}
+
+/// Spawn `docker logs --follow <container>` w tle, kazda linia trafia do
+/// deploy_log z prefixem [docker]. Task konczy sie automatycznie gdy kontener
+/// stops (docker logs --follow zamyka stdout). Bez fail handling - log
+/// streaming jest best-effort, deploy nie zalezy od tego.
+fn spawn_docker_log_tailer(
+    db: DbPool,
+    deploy_id: String,
+    tx: broadcast::Sender<BusMessage>,
+    container: String,
+) {
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+        let mut cmd = Command::new("docker");
+        cmd.arg("logs")
+            .arg("--follow")
+            .arg("--tail")
+            .arg("0")
+            .arg(&container)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                log_line(&db, &deploy_id, &tx, "log",
+                    &format!("[docker-log] spawn fail: {e}"));
+                return;
+            }
+        };
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let db_o = db.clone();
+        let dep_o = deploy_id.clone();
+        let tx_o = tx.clone();
+        let stdout_task = tokio::spawn(async move {
+            if let Some(out) = stdout {
+                let mut lines = BufReader::new(out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        log_line(&db_o, &dep_o, &tx_o, "log",
+                            &format!("[docker] {}", trimmed));
+                    }
+                }
+            }
+        });
+        let stderr_task = tokio::spawn(async move {
+            if let Some(err) = stderr {
+                let mut lines = BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        log_line(&db, &deploy_id, &tx, "log",
+                            &format!("[docker] {}", trimmed));
+                    }
+                }
+            }
+        });
+        let _ = tokio::join!(stdout_task, stderr_task, async { let _ = child.wait().await; });
+    });
 }
