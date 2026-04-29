@@ -15,6 +15,7 @@ import {
 } from '/js/lib/profile-permissions-store.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
+import { I18n } from '/js/i18n.js';
 
 // ProfileSourceFlags bity (zgodnie z tentaflow-protocol/src/profiling.rs).
 const SOURCE_FLAGS = {
@@ -283,7 +284,7 @@ export class ProfilingLaunchModal {
     bodyEl.className = 'profiling-launch';
 
     const winPromise = TfWindow.open({
-      title: 'Start profiling session',
+      title: I18n.t('profiling.launch.title') || 'Start profiling session',
       subtitle: this._buildSubtitle(),
       icon: 'activity',
       body: bodyEl,
@@ -345,19 +346,19 @@ export class ProfilingLaunchModal {
     est.className = 'est estimate-foot';
     est.id = 'profiling-estimate-foot';
     est.style.flex = '1';
-    est.textContent = 'Estimated storage: — · overhead: —';
+    est.textContent = I18n.t('profiling.launch.estimated_unknown') || 'Estimated storage: — · overhead: —';
 
     const cancel = document.createElement('tf-button');
     cancel.setAttribute('variant', 'ghost');
     cancel.setAttribute('data-action', 'cancel');
-    cancel.textContent = 'Cancel';
+    cancel.textContent = I18n.t('profiling.launch.cancel_button') || 'Cancel';
 
     const start = document.createElement('tf-button');
     start.setAttribute('variant', 'primary');
     start.setAttribute('data-action', 'start');
     start.setAttribute('icon', 'record-dot');
     start.id = 'profiling-launch-start-btn';
-    start.textContent = 'Start Profiling';
+    start.textContent = I18n.t('profiling.launch.start_button') || 'Start Profiling';
 
     wrap.appendChild(est);
     wrap.appendChild(cancel);
@@ -381,14 +382,16 @@ export class ProfilingLaunchModal {
   _renderLabelField() {
     const wrap = document.createElement('div');
     wrap.className = 'field';
+    const labelTxt = I18n.t('profiling.launch.label_field') || 'Label';
+    const labelPh = I18n.t('profiling.launch.label_placeholder') || 'qwen-7b inference benchmark';
     wrap.innerHTML = `
       <div class="field-label">
-        <span>Label</span>
+        <span>${escapeHtml(labelTxt)}</span>
         <span class="counter" id="pl-label-counter">${this.label.length} / ${MAX_LABEL_LEN}</span>
       </div>
       <input class="field-input" id="pl-label-input" type="text"
              maxlength="${MAX_LABEL_LEN}"
-             placeholder="qwen-7b inference benchmark"
+             placeholder="${escapeAttr(labelPh)}"
              value="${escapeAttr(this.label)}" />
     `;
     return wrap;
@@ -401,8 +404,10 @@ export class ProfilingLaunchModal {
     // Mockup #01 wymaga sufiksu " s" w polu duration (np. "300 s"). Używamy
     // type="text" z parsowaniem w handlerze, żeby uniknąć ograniczeń
     // type="number" (które nie zezwala na nie-cyfrowe znaki).
+    const durTxt = I18n.t('profiling.launch.duration') || 'Duration';
+    const manualTxt = I18n.t('profiling.launch.manual_stop') || 'Manual stop';
     wrap.innerHTML = `
-      <div class="field-label"><span>Duration</span></div>
+      <div class="field-label"><span>${escapeHtml(durTxt)}</span></div>
       <div class="field-row">
         <input type="range" class="tf-slider" id="pl-duration-slider"
                min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
@@ -411,7 +416,7 @@ export class ProfilingLaunchModal {
                value="${this.durationSec} s" ${sliderDisabled} />
         <label class="tf-check">
           <input type="checkbox" id="pl-manual-stop" ${this.manualStop ? 'checked' : ''} />
-          <span>Manual stop</span>
+          <span>${escapeHtml(manualTxt)}</span>
         </label>
       </div>
     `;
@@ -423,10 +428,13 @@ export class ProfilingLaunchModal {
     wrap.className = 'field';
     const total = this.sources.length;
     const sel = this.sources.filter((s) => this.selected.has(s.id)).length;
+    const sourcesTxt = I18n.t('profiling.launch.data_sources') || 'Data sources';
+    const counterTmpl = I18n.t('profiling.launch.sources_selected') || '{sel} of {total} selected';
+    const counterTxt = counterTmpl.replace('{sel}', String(sel)).replace('{total}', String(total));
     wrap.innerHTML = `
       <div class="field-label">
-        <span>Data sources</span>
-        <span class="counter" id="pl-source-counter">${sel} of ${total} selected</span>
+        <span>${escapeHtml(sourcesTxt)}</span>
+        <span class="counter" id="pl-source-counter">${escapeHtml(counterTxt)}</span>
       </div>
       <div class="source-grid" id="pl-source-grid"></div>
     `;
@@ -453,11 +461,11 @@ export class ProfilingLaunchModal {
 
     // Status pill 1:1 wg mockupu: Available / Needs sudo / Limited / Unavailable.
     const statusBadge = (() => {
-      if (src.status === 'available') return '<span class="src-status ok">Available</span>';
-      if (src.status === 'needs_sudo') return '<span class="src-status warn">Needs sudo</span>';
-      if (src.status === 'needs_admin') return '<span class="src-status warn">Needs admin</span>';
-      if (src.status === 'limited') return '<span class="src-status lim">Limited</span>';
-      if (src.status === 'unavailable') return '<span class="src-status bad">Unavailable</span>';
+      if (src.status === 'available') return `<span class="src-status ok">${escapeHtml(I18n.t('profiling.launch.status_available') || 'Available')}</span>`;
+      if (src.status === 'needs_sudo') return `<span class="src-status warn">${escapeHtml(I18n.t('profiling.launch.status_needs_sudo') || 'Needs sudo')}</span>`;
+      if (src.status === 'needs_admin') return `<span class="src-status warn">${escapeHtml(I18n.t('profiling.launch.status_needs_admin') || 'Needs admin')}</span>`;
+      if (src.status === 'limited') return `<span class="src-status lim">${escapeHtml(I18n.t('profiling.launch.status_limited') || 'Limited')}</span>`;
+      if (src.status === 'unavailable') return `<span class="src-status bad">${escapeHtml(I18n.t('profiling.launch.status_unavailable') || 'Unavailable')}</span>`;
       return '';
     })();
 
@@ -519,6 +527,26 @@ export class ProfilingLaunchModal {
     const elevCount = elevSources.length;
     const elevNames = elevSources.map((s) => s.label || s.id).join(', ');
 
+    const countTmpl = elevCount === 1
+      ? (I18n.t('profiling.launch.elevation_count') || '{count} source requires elevation')
+      : (I18n.t('profiling.launch.elevation_count_plural') || '{count} sources require elevation');
+    const countLine = countTmpl.replace('{count}', String(elevCount));
+    const explainTmpl = I18n.t('profiling.launch.elevation_explain')
+      || 'Provide your sudo password once. It is used to spawn collectors and is {strong_never_stored}.';
+    const neverStored = I18n.t('profiling.launch.elevation_never_stored') || 'never stored on disk or in DB';
+    const explainHtml = escapeHtml(explainTmpl).replace(
+      escapeHtml('{strong_never_stored}'),
+      `<strong>${escapeHtml(neverStored)}</strong>`,
+    );
+    const sudoLabel = I18n.t('profiling.launch.sudo_password_label') || 'Sudo password';
+    const sudoHint = I18n.t('profiling.launch.sudo_used_once') || 'used once · not stored';
+    const sudoPh = I18n.t('profiling.launch.sudo_placeholder') || '••••••••';
+    const testTxt = I18n.t('profiling.launch.test_button') || 'Test';
+    const togglePwTitle = I18n.t('profiling.launch.toggle_password_visibility') || 'Toggle visibility';
+    const okMsg = I18n.t('profiling.launch.elevation_authenticated') || '✓ Authenticated';
+    const badMsg = I18n.t('profiling.launch.elevation_invalid') || '✗ Invalid password';
+    const testingMsg = I18n.t('profiling.launch.elevation_testing') || 'Testing…';
+
     wrap.innerHTML = `
       <div class="alert-box">
         <div class="a-ico">
@@ -528,13 +556,13 @@ export class ProfilingLaunchModal {
           </svg>
         </div>
         <div class="a-body">
-          <strong>${elevCount} source${elevCount === 1 ? '' : 's'} require elevation</strong> — ${escapeHtml(elevNames)}.
-          Provide your sudo password once. It is used to spawn collectors and is <strong>never stored on disk or in DB</strong>.
+          <strong>${escapeHtml(countLine)}</strong> — ${escapeHtml(elevNames)}.
+          ${explainHtml}
         </div>
       </div>
       <div class="field-label">
-        <span>Sudo password</span>
-        <span class="counter">used once · not stored</span>
+        <span>${escapeHtml(sudoLabel)}</span>
+        <span class="counter">${escapeHtml(sudoHint)}</span>
       </div>
       <div class="field-row">
         <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}" style="flex:1;">
@@ -545,21 +573,21 @@ export class ProfilingLaunchModal {
           <input type="${inputType}" id="pl-elevation-input"
                  autocomplete="current-password"
                  value="${escapeAttr(this.elevationPassword)}"
-                 placeholder="••••••••" />
-          <button type="button" class="pw-eye" id="pl-elevation-eye" title="Toggle visibility">
+                 placeholder="${escapeAttr(sudoPh)}" />
+          <button type="button" class="pw-eye" id="pl-elevation-eye" title="${escapeAttr(togglePwTitle)}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
               <circle cx="12" cy="12" r="3"/>
             </svg>
           </button>
         </div>
-        <tf-button variant="outline" size="sm" id="pl-elevation-test">Test</tf-button>
+        <tf-button variant="outline" size="sm" id="pl-elevation-test">${escapeHtml(testTxt)}</tf-button>
       </div>
       <span class="pw-test-result ${this.elevationStatus === 'ok' ? 'ok' : ''} ${this.elevationStatus === 'bad' ? 'bad' : ''}"
             id="pl-elevation-result">
-        ${this.elevationStatus === 'ok' ? '✓ Authenticated'
-          : this.elevationStatus === 'bad' ? '✗ Invalid password'
-          : this.elevationStatus === 'testing' ? 'Testing…'
+        ${this.elevationStatus === 'ok' ? escapeHtml(okMsg)
+          : this.elevationStatus === 'bad' ? escapeHtml(badMsg)
+          : this.elevationStatus === 'testing' ? escapeHtml(testingMsg)
           : ''}
       </span>
     `;
@@ -572,26 +600,31 @@ export class ProfilingLaunchModal {
     // PID input renderujemy zawsze w środku radio-row (120px wide jak w mockupie),
     // ukrywając go gdy nie wybrano "Specific PID".
     const pidStyle = this.targetMode === 'specific_pid' ? 'width:120px;' : 'width:120px; display:none;';
+    const targetTxt = I18n.t('profiling.launch.target_field') || 'Profile target';
+    const sysWide = I18n.t('profiling.launch.target_system_wide') || 'System-wide';
+    const ownProc = I18n.t('profiling.launch.target_own_process') || 'Own process (tentaflow)';
+    const specPid = I18n.t('profiling.launch.target_specific_pid') || 'Specific PID';
+    const pidPh = I18n.t('profiling.launch.target_pid_placeholder') || 'e.g. 14872';
     wrap.innerHTML = `
-      <div class="field-label"><span>Profile target</span></div>
+      <div class="field-label"><span>${escapeHtml(targetTxt)}</span></div>
       <div class="radio-row">
         <label class="tf-check">
           <input type="radio" name="pl-target" value="system_wide"
                  ${this.targetMode === 'system_wide' ? 'checked' : ''} />
-          <span>System-wide</span>
+          <span>${escapeHtml(sysWide)}</span>
         </label>
         <label class="tf-check">
           <input type="radio" name="pl-target" value="own_process"
                  ${this.targetMode === 'own_process' ? 'checked' : ''} />
-          <span>Own process (tentaflow)</span>
+          <span>${escapeHtml(ownProc)}</span>
         </label>
         <label class="tf-check">
           <input type="radio" name="pl-target" value="specific_pid"
                  ${this.targetMode === 'specific_pid' ? 'checked' : ''} />
-          <span>Specific PID</span>
+          <span>${escapeHtml(specPid)}</span>
         </label>
         <input type="number" class="field-input" id="pl-target-pid"
-               placeholder="e.g. 14872" min="1" step="1"
+               placeholder="${escapeAttr(pidPh)}" min="1" step="1"
                value="${escapeAttr(this.targetPid)}"
                style="${pidStyle}" />
       </div>
@@ -661,7 +694,10 @@ export class ProfilingLaunchModal {
         // Live counter "N of M selected" w field-label.
         const counterEl = root.querySelector('#pl-source-counter');
         if (counterEl) {
-          counterEl.textContent = `${this.selected.size} of ${this.sources.length} selected`;
+          const tmpl = I18n.t('profiling.launch.sources_selected') || '{sel} of {total} selected';
+          counterEl.textContent = tmpl
+            .replace('{sel}', String(this.selected.size))
+            .replace('{total}', String(this.sources.length));
         }
         // Re-render elevation block: appears/disappears depending on selection.
         this._refreshElevation(root);

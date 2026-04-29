@@ -23,6 +23,7 @@ import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
 import { ProfilingActiveBanner } from '/js/modules/profiling-active-banner.js';
+import { ProfileRecPill } from '/js/modules/profile-rec-pill.js';
 
 let currentNodeId = null;
 let nodeData = null;
@@ -38,6 +39,10 @@ let profileHandler = null;
 // miedzy nodami przy nawigacji bez full cleanup.
 let activeBanner = null;
 let bannerNodeId = null;
+// Topbar REC pill — kompaktowa wersja banneru, montowana w `[data-rec-pill-host]`
+// w sekcji d-actions. Sticky widocznosc nawet po scrolu.
+let recPill = null;
+let recPillNodeId = null;
 
 // Inline SVG przez <use href="#i-..."> — sprite definiuje symbole raz w
 // index.html. Nie parsujemy zadnego SVG przy kazdym renderDetail.
@@ -282,6 +287,26 @@ function renderDetail() {
   bindContainerActions(content);
   bindProfileActions(content, n);
   ensureActiveBanner(content, n);
+  ensureRecPill(content, n);
+}
+
+// Idempotentnie montuje ProfileRecPill do `[data-rec-pill-host]` w topbarze.
+// Pill polluje backend i sam pokazuje sie tylko gdy istnieje aktywna sesja.
+function ensureRecPill(root, n) {
+  const host = root.querySelector('[data-rec-pill-host]');
+  if (!host) return;
+  if (recPill && recPillNodeId !== n.node_id) {
+    try { recPill.unmount(); } catch (_e) { /* ignore */ }
+    recPill = null;
+    recPillNodeId = null;
+  }
+  if (!recPill) {
+    recPill = new ProfileRecPill({ nodeId: n.node_id });
+    recPill.mount(host);
+    recPillNodeId = n.node_id;
+  } else if (recPill.root && recPill.root.parentNode !== host) {
+    host.appendChild(recPill.root);
+  }
 }
 
 // Idempotentnie montuje ProfilingActiveBanner do `[data-banner-host]`. Banner
@@ -307,11 +332,11 @@ function ensureActiveBanner(root, n) {
       onSessionEnded: (sessionId) => {
         const t = document.createElement('div');
         t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--tf-bg-2,#0a0d24);color:var(--tf-text,#e8ebf5);border:1px solid var(--tf-border,#1f2548);border-radius:8px;padding:10px 14px;font-size:13px;z-index:9999;display:flex;gap:10px;align-items:center;box-shadow:0 12px 32px rgba(0,0,0,0.5);';
-        t.innerHTML = `<span>Profiling session finished</span>`;
+        t.innerHTML = `<span>${escapeHtml(I18n.t('profiling.banner.session_finished') || 'Profiling session finished')}</span>`;
         const reportBtn = document.createElement('tf-button');
         reportBtn.setAttribute('size', 'sm');
         reportBtn.setAttribute('variant', 'primary');
-        reportBtn.textContent = 'View report';
+        reportBtn.textContent = I18n.t('profiling.banner.view_report') || 'View report';
         reportBtn.addEventListener('click', () => {
           if (window.Router) window.Router.navigate('profile-report', { nodeId, sessionId });
           t.remove();
@@ -319,7 +344,7 @@ function ensureActiveBanner(root, n) {
         const listBtn = document.createElement('tf-button');
         listBtn.setAttribute('size', 'sm');
         listBtn.setAttribute('variant', 'ghost');
-        listBtn.textContent = 'All sessions';
+        listBtn.textContent = I18n.t('profiling.banner.all_sessions') || 'All sessions';
         listBtn.addEventListener('click', () => {
           if (window.Router) window.Router.navigate('profiling-sessions', { nodeId, nodeName: bannerNodeId ? null : null });
           t.remove();
@@ -343,6 +368,9 @@ function ensureActiveBanner(root, n) {
 function pokeActiveBanner() {
   if (activeBanner && typeof activeBanner._poll === 'function') {
     activeBanner._poll();
+  }
+  if (recPill && typeof recPill._poll === 'function') {
+    recPill._poll();
   }
 }
 
@@ -903,6 +931,7 @@ function gpuProfileButtonHtml(node, _gpu, idx) {
 function profileTopbarHtml(node) {
   if (!hasProfilingCapability(node)) return '';
   return `
+    <span class="rec-pill-host" data-rec-pill-host></span>
     <tf-button size="sm" variant="ghost" data-action="profile-node-open" title="${escapeAttr(I18n.t('mesh.profile_node_btn') || 'Profile this node')}">
       <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-record"/></svg>
       <span>${escapeHtml(I18n.t('mesh.profile_node_btn') || 'Profile')}</span>

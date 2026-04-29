@@ -10,6 +10,7 @@ import {
   profilingActiveInfo,
   profilingStop,
 } from '/js/protocol/profiling.js';
+import { I18n } from '/js/i18n.js';
 
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
@@ -187,7 +188,16 @@ export class ProfilingActiveBanner {
       const remaining = Math.max(0, plannedSec - elapsedSec);
       return `${formatMS(remaining)} <span class="of">/ ${formatMS(plannedSec)}</span>`;
     }
-    return `${formatMS(elapsedSec)} <span class="of">elapsed (manual stop)</span>`;
+    const tmpl = I18n.t('profiling.banner.elapsed_manual') || '{elapsed} elapsed (manual stop)';
+    const elapsedStr = formatMS(elapsedSec);
+    // Wstawiamy markup ozdobnego span'a wokół czesci po liczniku — szukamy
+    // separatora po pierwszym tokenie {elapsed}, zeby zachowac styl ".of".
+    const rendered = tmpl.replace('{elapsed}', elapsedStr);
+    const idx = rendered.indexOf(elapsedStr) + elapsedStr.length;
+    if (idx > elapsedStr.length && idx < rendered.length) {
+      return `${rendered.slice(0, idx)} <span class="of">${escapeHtml(rendered.slice(idx).trim())}</span>`;
+    }
+    return rendered;
   }
 
   _render() {
@@ -204,18 +214,29 @@ export class ProfilingActiveBanner {
       ? new Date(startedMs).toLocaleTimeString('en-GB', { hour12: false })
       : '—';
     const colCount = collectors.length;
-    const meta = `session ${sidShort} · started ${startedHHMMSS} · ${colCount} collector${colCount === 1 ? '' : 's'}`;
+    const metaTmpl = colCount === 1
+      ? (I18n.t('profiling.banner.session_label') || 'session {sid} · started {time} · {count} collector')
+      : (I18n.t('profiling.banner.session_label_plural') || 'session {sid} · started {time} · {count} collectors');
+    const meta = metaTmpl
+      .replace('{sid}', sidShort)
+      .replace('{time}', startedHHMMSS)
+      .replace('{count}', String(colCount));
+
+    const recLabel = I18n.t('profiling.banner.rec') || 'REC';
+    const defaultLabel = I18n.t('profiling.banner.default_label') || 'profiling session';
+    const openWhenDone = I18n.t('profiling.banner.open_report_when_done') || 'Open report when done';
+    const stopNow = I18n.t('profiling.banner.stop_now') || 'Stop now';
 
     this.root.innerHTML = `
-      <span class="rec">REC</span>
+      <span class="rec">${escapeHtml(recLabel)}</span>
       <div class="session-title">
-        <div class="s-label">${escapeHtml(sess.label || 'profiling session')}</div>
+        <div class="s-label">${escapeHtml(sess.label || defaultLabel)}</div>
         <div class="s-meta">${escapeHtml(meta)}</div>
       </div>
       <div class="countdown">${this._countdownHtml()}</div>
       <div class="banner-actions">
-        <tf-button variant="outline" size="sm" icon="chart-line" data-action="open-when-done" disabled>Open report when done</tf-button>
-        <tf-button variant="danger-outline" size="sm" icon="stop" data-action="stop">Stop now</tf-button>
+        <tf-button variant="outline" size="sm" icon="chart-line" data-action="open-when-done" disabled>${escapeHtml(openWhenDone)}</tf-button>
+        <tf-button variant="danger-outline" size="sm" icon="stop" data-action="stop">${escapeHtml(stopNow)}</tf-button>
       </div>
       <div class="collectors">${chips}</div>
     `;

@@ -5,6 +5,14 @@
 //          KPI math, downsampling, formatters, and SVG chart primitives.
 // =============================================================================
 
+import { I18n } from '/js/i18n.js';
+
+// Krotki helper i18n z fallbackiem.
+function ti(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
+
 // ---- Compact-series expander ------------------------------------------------
 //
 // The fixture (and the future API) ships a compact representation under
@@ -694,8 +702,8 @@ export function buildQuickFindings(events, devices, durationNs, names) {
       const cpuTop = computeKpiCpu(events, names);
       findings.push({
         kind: 'warn',
-        title: `GPU ${d.device_id} idle ${pct.toFixed(0)}% of session — possible CPU bottleneck`,
-        detail: `${cpuTop.topSymbol} (${cpuTop.topPct.toFixed(1)}%) saturates host while GPU stream waits. Consider pipelining or moving hot path to GPU.`,
+        title: ti('profiling.report.finding_gpu_idle_title', { id: d.device_id, pct: pct.toFixed(0) }, `GPU ${d.device_id} idle ${pct.toFixed(0)}% of session — possible CPU bottleneck`),
+        detail: ti('profiling.report.finding_gpu_idle_detail', { sym: cpuTop.topSymbol, pct: cpuTop.topPct.toFixed(1) }, `${cpuTop.topSymbol} (${cpuTop.topPct.toFixed(1)}%) saturates host while GPU stream waits. Consider pipelining or moving hot path to GPU.`),
       });
       break;
     }
@@ -715,10 +723,11 @@ export function buildQuickFindings(events, devices, durationNs, names) {
       const mins = Math.floor(t / 60);
       const secs = Math.floor(t % 60);
       const deviceLabel = (max.p.deviceNameId !== undefined && names[max.p.deviceNameId]) || `disk${max.e.lane_hint ?? ''}`;
+      const time = `${mins}:${String(secs).padStart(2, '0')}`;
       findings.push({
         kind: 'info',
-        title: `Disk write spike at ${mins}:${String(secs).padStart(2, '0')} on ${deviceLabel}`,
-        detail: `${formatBytesPerSec(max.p.write_bps)} burst — likely correlates with checkpoint save NVTX range.`,
+        title: ti('profiling.report.finding_disk_spike_title', { time, device: deviceLabel }, `Disk write spike at ${time} on ${deviceLabel}`),
+        detail: ti('profiling.report.finding_disk_spike_detail', { val: formatBytesPerSec(max.p.write_bps) }, `${formatBytesPerSec(max.p.write_bps)} burst — likely correlates with checkpoint save NVTX range.`),
       });
     }
   }
@@ -734,8 +743,8 @@ export function buildQuickFindings(events, devices, durationNs, names) {
       const pct = (saturated / bw.length) * 100;
       findings.push({
         kind: 'warn',
-        title: `RAM bandwidth saturated ${pct.toFixed(0)}% of time`,
-        detail: `Read+write peaked above 85% of the DDR5-6000 ceiling. Memory-bound kernels likely.`,
+        title: ti('profiling.report.finding_ram_bw_title', { pct: pct.toFixed(0) }, `RAM bandwidth saturated ${pct.toFixed(0)}% of time`),
+        detail: ti('profiling.report.finding_ram_bw_detail', null, 'Read+write peaked above 85% of the DDR5-6000 ceiling. Memory-bound kernels likely.'),
       });
     }
   }
@@ -744,8 +753,8 @@ export function buildQuickFindings(events, devices, durationNs, names) {
   if (devices.length >= 2) {
     findings.push({
       kind: 'bad',
-      title: 'Cross-vendor dispatch is sequential, not concurrent',
-      detail: `GPU 0 (${devices[0].vendor}) and GPU 1 (${devices[1].vendor}) appear to alternate rather than overlap. Parallelize via separate streams for potential speedup.`,
+      title: ti('profiling.report.finding_cross_vendor_title', null, 'Cross-vendor dispatch is sequential, not concurrent'),
+      detail: ti('profiling.report.finding_cross_vendor_detail', { va: devices[0].vendor, vb: devices[1].vendor }, `GPU 0 (${devices[0].vendor}) and GPU 1 (${devices[1].vendor}) appear to alternate rather than overlap. Parallelize via separate streams for potential speedup.`),
     });
   }
 
