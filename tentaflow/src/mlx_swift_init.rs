@@ -58,8 +58,9 @@ fn locate_dylib() -> Option<PathBuf> {
 /// Laduje bridge dylib i rejestruje callbacki w tentaflow-core. Wolane przy
 /// starcie main(). Bledy logowane jako warn — fallback na inne backendy.
 pub fn init() -> Result<()> {
-    let dylib_path = locate_dylib()
-        .context("Nie znaleziono libMLXBridge.dylib (build.rs powinien go skopiowac do target/release/)")?;
+    let dylib_path = locate_dylib().context(
+        "Nie znaleziono libMLXBridge.dylib (build.rs powinien go skopiowac do target/release/)",
+    )?;
 
     info!("[mlx-swift] Ladowanie {}", dylib_path.display());
 

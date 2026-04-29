@@ -16,7 +16,7 @@ use rusqlite::Transaction;
 
 use super::{
     build_new_service, models_from_manifest, transport_hint, DeployError, DeployResult,
-    DeployStrategy, PreparedDeploy, RuntimeHandle,
+    DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -27,6 +27,7 @@ pub struct DockerDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    log_sink: Option<LogSink>,
     container_id: std::sync::Mutex<Option<String>>,
 }
 
@@ -35,11 +36,13 @@ impl DockerDeploy {
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
     ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
+            log_sink,
             container_id: std::sync::Mutex::new(None),
         }
     }
@@ -261,6 +264,12 @@ impl DeployStrategy for DockerDeploy {
         }
 
         let container_name = format!("tentaflow-{}-{}", self.manifest.engine.id, host_http);
+        if let Some(s) = &self.log_sink {
+            s.info(&format!(
+                "[docker] starting container '{}' image={} host_port={}",
+                container_name, image_tag, host_http
+            ));
+        }
         let id = backend::run(
             &docker,
             &image_tag,
@@ -275,6 +284,13 @@ impl DeployStrategy for DockerDeploy {
         // Save id for rollback.
         if let Ok(mut slot) = self.container_id.lock() {
             *slot = Some(id.clone());
+        }
+        if let Some(s) = &self.log_sink {
+            s.info(&format!(
+                "[docker] container '{}' started (id={})",
+                container_name,
+                &id[..id.len().min(12)]
+            ));
         }
 
         // Health check on the host-mapped HTTP port.
@@ -421,7 +437,7 @@ mod tests {
     async fn prepare_errors_without_docker_feature() {
         let m = skeleton_manifest("no-docker");
         let ports = Arc::new(PortAllocator::new((48_500, 48_510), HashSet::new()).unwrap());
-        let mut s = DockerDeploy::new(m, serde_json::json!({}), ports);
+        let mut s = DockerDeploy::new(m, serde_json::json!({}), ports, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Docker(_)));
     }
@@ -430,7 +446,7 @@ mod tests {
     fn pick_transport_default_is_sidecar_quic() {
         let m = skeleton_manifest("def");
         let ports = Arc::new(PortAllocator::new((48_600, 48_610), HashSet::new()).unwrap());
-        let s = DockerDeploy::new(m, serde_json::json!({}), ports);
+        let s = DockerDeploy::new(m, serde_json::json!({}), ports, None);
         assert_eq!(s.pick_transport(), Transport::SidecarQuic);
     }
 
@@ -442,6 +458,7 @@ mod tests {
             m,
             serde_json::json!({"transport_explicit": "direct_http"}),
             ports,
+            None,
         );
         assert_eq!(s.pick_transport(), Transport::HttpDirect);
     }

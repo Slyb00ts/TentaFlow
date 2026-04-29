@@ -19,15 +19,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusqlite::Transaction;
+use tokio::sync::broadcast;
 
 use crate::db::DbPool;
+use crate::deploy::log_bus::{now_ms, BusMessage, LogLine};
 use crate::services::lifecycle::ServiceEndpoint;
 use crate::services::manifest::ServiceManifest;
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
-use crate::services_repo::deployments::{
-    self as deployments_repo, DeploymentStatus, NewDeployment,
-};
+use crate::services_repo::deployments::{self as deployments_repo, DeploymentStatus};
 use crate::services_repo::models::{self as models_repo, NewModel};
 use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
 
@@ -69,6 +69,39 @@ impl From<rusqlite::Error> for DeployError {
 }
 
 pub type DeployResult<T> = std::result::Result<T, DeployError>;
+
+// ----- Log streaming --------------------------------------------------------
+
+/// Live feed of build/run output for a single deploy job. Keyed by `slug`,
+/// the broadcaster fans out to dashboard subscribers and also persists each
+/// line to `deployments_v2.log_tail` for replay.
+#[derive(Clone)]
+pub struct LogSink {
+    pub slug: String,
+    pub sender: broadcast::Sender<BusMessage>,
+    pub db: DbPool,
+}
+
+impl LogSink {
+    /// Persists `line` to log_tail and broadcasts it as a `BusMessage::Line`
+    /// with `kind` (e.g. "log", "phase", "info"). Errors are best-effort —
+    /// a failed DB write must not abort the deploy.
+    pub fn emit(&self, kind: &str, line: &str) {
+        let _ = deployments_repo::append_log_line(&self.db, &self.slug, line);
+        let _ = self.sender.send(BusMessage::Line(LogLine {
+            deploy_id: self.slug.clone(),
+            kind: kind.to_string(),
+            line: line.to_string(),
+            phase: String::new(),
+            progress_pct: 0,
+            ts_ms: now_ms(),
+        }));
+    }
+
+    pub fn info(&self, line: &str) {
+        self.emit("info", line);
+    }
+}
 
 // ----- Public types ---------------------------------------------------------
 
@@ -127,26 +160,41 @@ pub trait DeployStrategy: Send + Sync {
 /// Deploys an engine atomically. On any failure the system state is rolled
 /// back: spawned processes killed, containers removed, ports released, and
 /// the deployments_v2 row marked `failed` with the error text.
+///
+/// `log_sink` (when provided) receives every build/run line as a
+/// `BusMessage::Line` keyed by `slug`. `existing_slug` lets the caller pin a
+/// pre-generated slug (e.g. so the WebSocket subscription URL is known
+/// before the audit row is written); when `None` a fresh UUID is used.
 pub async fn deploy(
     method: DeployMethod,
     manifest: &ServiceManifest,
     user_config: &serde_json::Value,
-    ports: Arc<PortAllocator>,
-    db: DbPool,
+    ports: &Arc<PortAllocator>,
+    db: &DbPool,
+    log_sink: Option<broadcast::Sender<BusMessage>>,
+    existing_slug: Option<String>,
 ) -> DeployResult<DeployOutcome> {
+    let slug = existing_slug.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let sink = log_sink.map(|sender| LogSink {
+        slug: slug.clone(),
+        sender,
+        db: db.clone(),
+    });
+
     // 1. Audit row first so we always have a paper trail, even on prepare failure.
-    let deployment_id = with_tx(&db, |tx| {
-        let id = deployments_repo::insert(
-            tx,
-            &NewDeployment {
-                engine_id: manifest.engine.id.clone(),
-                deploy_method: method.as_db_tag().to_string(),
-                status: DeploymentStatus::Running,
-                config_json: serde_json::to_string(user_config).ok(),
-            },
-        )?;
+    let deployment_id = with_tx(db, |tx| {
+        let id =
+            deployments_repo::create_with_slug(tx, &manifest.engine.id, method.as_db_tag(), &slug)?;
         Ok(id)
     })?;
+
+    if let Some(s) = &sink {
+        s.info(&format!(
+            "[prepare] engine={} method={}",
+            manifest.engine.id,
+            method.as_db_tag()
+        ));
+    }
 
     // 2. Pick strategy.
     let mut strategy: Box<dyn DeployStrategy> = match method {
@@ -158,22 +206,23 @@ pub async fn deploy(
             manifest.clone(),
             user_config.clone(),
             ports.clone(),
+            sink.clone(),
         )),
         DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
             manifest.clone(),
             user_config.clone(),
             ports.clone(),
+            sink.clone(),
         )),
         DeployMethod::Docker => Box::new(docker::DockerDeploy::new(
             manifest.clone(),
             user_config.clone(),
             ports.clone(),
+            sink.clone(),
         )),
         DeployMethod::External => {
-            // External engines are detected, not deployed; closing the audit row
-            // immediately keeps the table consistent.
             mark_finished(
-                &db,
+                db,
                 deployment_id,
                 DeploymentStatus::Failed,
                 Some("external method has no deploy step"),
@@ -188,8 +237,11 @@ pub async fn deploy(
     let prepared = match strategy.prepare().await {
         Ok(p) => p,
         Err(e) => {
+            if let Some(s) = &sink {
+                s.emit("error", &format!("[prepare-failed] {}", e));
+            }
             mark_finished(
-                &db,
+                db,
                 deployment_id,
                 DeploymentStatus::Failed,
                 Some(&e.to_string()),
@@ -198,9 +250,13 @@ pub async fn deploy(
         }
     };
 
+    if let Some(s) = &sink {
+        s.info("[commit] writing services_v2 + model_registry_v2");
+    }
+
     // 4. COMMIT — single transaction over services_v2 + model_registry_v2 +
     //    deployments_v2.finish. Any failure triggers rollback of side effects.
-    let commit_result: DeployResult<i64> = with_tx(&db, |tx| {
+    let commit_result: DeployResult<i64> = with_tx(db, |tx| {
         let sid = strategy.commit(tx, &prepared)?;
         for m in &prepared.models {
             // service_id is filled by commit; the strategy returns NewModel with
@@ -224,7 +280,10 @@ pub async fn deploy(
                     commit_err, rb
                 ),
             };
-            mark_finished(&db, deployment_id, DeploymentStatus::Failed, Some(&rb_msg));
+            if let Some(s) = &sink {
+                s.emit("error", &rb_msg);
+            }
+            mark_finished(db, deployment_id, DeploymentStatus::Failed, Some(&rb_msg));
             return Err(commit_err);
         }
     };
@@ -288,16 +347,19 @@ pub async fn respawn(
             manifest,
             user_config,
             ports.clone(),
+            None,
         )),
         DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
             manifest,
             user_config,
             ports.clone(),
+            None,
         )),
         DeployMethod::Docker => Box::new(docker::DockerDeploy::new(
             manifest,
             user_config,
             ports.clone(),
+            None,
         )),
         DeployMethod::External => {
             return Err(DeployError::Manifest(
@@ -316,7 +378,10 @@ pub async fn respawn(
 /// or `DELETE` it (cascade removes `model_registry_v2`). Errors are merged
 /// into a single `DeployError::Other` so callers can surface them as a single
 /// "stop failed" message.
-pub async fn stop(svc: &crate::services_repo::services::ServiceRow, ports: Arc<PortAllocator>) -> DeployResult<()> {
+pub async fn stop(
+    svc: &crate::services_repo::services::ServiceRow,
+    ports: Arc<PortAllocator>,
+) -> DeployResult<()> {
     use crate::services_repo::services::DeployMethod as DM;
 
     // Container shutdown: only docker deploys own a container at runtime.
@@ -576,8 +641,10 @@ mod tests {
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
-            ports,
-            db.clone(),
+            &ports,
+            &db,
+            None,
+            None,
         )
         .await
         .expect("embedded deploy succeeds");
@@ -608,8 +675,10 @@ mod tests {
             DeployMethod::NativeEmbedded,
             &manifest,
             &cfg,
-            ports.clone(),
-            db.clone(),
+            &ports,
+            &db,
+            None,
+            None,
         )
         .await
         .expect("seed deploy succeeds");
@@ -661,8 +730,10 @@ mod tests {
             DeployMethod::NativeBinary,
             &manifest,
             &cfg,
-            ports,
-            db.clone(),
+            &ports,
+            &db,
+            None,
+            None,
         )
         .await;
         assert!(res.is_err(), "deploy should fail when binary path invalid");
@@ -678,5 +749,83 @@ mod tests {
             .unwrap();
         assert_eq!(status, "failed");
         assert!(err.is_some());
+    }
+
+    /// Mirrors the dispatch handler's contract: each deploy persists a
+    /// `deployments_v2` row whose `slug` matches the value the handler
+    /// returns to the caller. The dashboard subscribes to logs by slug, so
+    /// drift between handler-returned slug and DB slug breaks live tail.
+    #[tokio::test]
+    async fn service_manifest_deploy_writes_to_v2_with_slug() {
+        let db = open_db();
+        let ports = Arc::new(PortAllocator::new((45_650, 45_699), Default::default()).unwrap());
+        let manifest = dummy_manifest("emb-slug-handler", NativeRuntime::Embedded);
+        let cfg = serde_json::json!({});
+
+        let slug = "handler-slug-cccc".to_string();
+        deploy(
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            &ports,
+            &db,
+            None,
+            Some(slug.clone()),
+        )
+        .await
+        .unwrap();
+
+        let row = crate::services_repo::deployments::get_by_slug(&db, &slug)
+            .unwrap()
+            .expect("v2 row exists for handler slug");
+        assert_eq!(row.engine_id, "emb-slug-handler");
+        assert_eq!(row.deploy_method, "native_embedded");
+        assert_eq!(
+            row.status,
+            crate::services_repo::deployments::DeploymentStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_with_log_sink_pipes_lines() {
+        // Embedded deploy never spawns a process, so the lines we observe come
+        // from `deploy()` itself: the [prepare] info and the [commit] info.
+        // We verify they reach a subscriber AND get appended to log_tail.
+        let db = open_db();
+        let ports = Arc::new(PortAllocator::new((45_700, 45_799), Default::default()).unwrap());
+        let manifest = dummy_manifest("emb-with-sink", NativeRuntime::Embedded);
+        let cfg = serde_json::json!({});
+
+        let slug = "test-slug-aaaa".to_string();
+        let (tx, mut rx) =
+            tokio::sync::broadcast::channel::<crate::deploy::log_bus::BusMessage>(64);
+
+        let outcome = deploy(
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            &ports,
+            &db,
+            Some(tx.clone()),
+            Some(slug.clone()),
+        )
+        .await
+        .expect("embedded deploy succeeds");
+        assert!(outcome.endpoint.handle.id > 0);
+
+        // Drain at least 2 lines (prepare + commit) without blocking forever.
+        let mut received = 0usize;
+        while received < 2 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(crate::deploy::log_bus::BusMessage::Line(_))) => received += 1,
+                _ => break,
+            }
+        }
+        assert!(received >= 2, "expected at least prepare + commit lines");
+
+        let row = crate::services_repo::deployments::get_by_slug(&db, &slug)
+            .unwrap()
+            .expect("deployment row by slug");
+        assert!(!row.log_tail.is_empty(), "log_tail was persisted");
     }
 }

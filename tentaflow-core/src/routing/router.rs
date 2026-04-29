@@ -77,7 +77,9 @@ pub struct Router {
     /// misses; Phase 8 cleanup will make it the only source of truth.
     pub(crate) services_snapshot_rx: Arc<
         parking_lot::RwLock<
-            Option<tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>>,
+            Option<
+                tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>,
+            >,
         >,
     >,
 }

@@ -220,11 +220,14 @@ async fn run_server(args: Args) -> Result<()> {
     // Runs alongside legacy router restore paths until Phase 5 swaps call sites.
     // Phase 5: `snapshot_rx` is wired into the router below so resolve_model
     // can consult the supervisor's view as a fallback.
-    let services_snapshot_rx_for_router: Option<
-        tokio::sync::watch::Receiver<
-            Arc<tentaflow_core::services::supervisor::ServicesSnapshot>,
+    let (services_snapshot_rx_for_router, services_port_allocator): (
+        Option<
+            tokio::sync::watch::Receiver<
+                Arc<tentaflow_core::services::supervisor::ServicesSnapshot>,
+            >,
         >,
-    > = {
+        Option<Arc<tentaflow_core::services::ports::PortAllocator>>,
+    ) = {
         use std::collections::HashSet;
         use tentaflow_core::services::ports::PortAllocator;
         use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
@@ -255,8 +258,7 @@ async fn run_server(args: Args) -> Result<()> {
                 // local inference manager exposes a per-engine health hook.
                 let (supervisor, snapshot_rx) =
                     Supervisor::new(&services_runtime_cfg, db.clone(), port_allocator.clone());
-                let supervisor =
-                    supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
+                let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
 
                 // First tick is synchronous so the initial snapshot is non-empty
                 // before the router goes online. Failures are logged but not fatal.
@@ -267,14 +269,13 @@ async fn run_server(args: Args) -> Result<()> {
                 let supervisor_handle = supervisor.spawn();
                 info!(
                     "Services supervisor started (interval={}ms, port_range={:?})",
-                    services_runtime_cfg.health_check_interval_ms,
-                    services_runtime_cfg.port_range
+                    services_runtime_cfg.health_check_interval_ms, services_runtime_cfg.port_range
                 );
-                // Hand the receiver to the router below; keep allocator + handle
-                // alive for the lifetime of the process.
+                // Keep the supervisor task alive for the lifetime of the
+                // process; the port allocator escapes the block so deploy
+                // handlers can share the same instance.
                 let _supervisor_handle = supervisor_handle;
-                let _supervisor_port_allocator = port_allocator;
-                Some(snapshot_rx)
+                (Some(snapshot_rx), Some(port_allocator))
             }
             Err(e) => {
                 tracing::warn!(
@@ -282,7 +283,7 @@ async fn run_server(args: Args) -> Result<()> {
                     services_runtime_cfg.port_range,
                     e
                 );
-                None
+                (None, None)
             }
         }
     };
@@ -487,6 +488,7 @@ async fn run_server(args: Args) -> Result<()> {
         local_node_id_for_server,
         mesh_security_for_server,
         mesh_relay_health_for_server,
+        services_port_allocator.clone(),
     )?;
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");

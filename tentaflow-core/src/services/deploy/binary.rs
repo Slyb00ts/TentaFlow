@@ -10,11 +10,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rusqlite::Transaction;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::{
     build_new_service, host_os_supported, http_health_wait, models_from_manifest,
-    standard_engine_env, DeployError, DeployResult, DeployStrategy, PreparedDeploy, RuntimeHandle,
+    standard_engine_env, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
+    RuntimeHandle,
 };
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -25,6 +27,7 @@ pub struct BinaryDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    log_sink: Option<LogSink>,
     /// Child handle is stored on `self` (not on `PreparedDeploy`) so it stays
     /// alive across the await boundary in `deploy()`. Rollback consumes it.
     child: std::sync::Mutex<Option<Child>>,
@@ -35,11 +38,13 @@ impl BinaryDeploy {
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
     ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
+            log_sink,
             child: std::sync::Mutex::new(None),
         }
     }
@@ -122,10 +127,37 @@ impl DeployStrategy for BinaryDeploy {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd
+        if let Some(s) = &self.log_sink {
+            s.info(&format!("[binary] spawn {} (PORT={})", exe.display(), port));
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| DeployError::Spawn(format!("spawn {}: {}", exe.display(), e)))?;
         let pid = child.id().map(|v| v as i64);
+
+        // Pipe stdout / stderr into the log sink line-by-line so the dashboard
+        // sees engine startup output in real time. Both pipes are owned tasks;
+        // they end when the child closes its descriptors.
+        if let Some(sink) = self.log_sink.clone() {
+            if let Some(stdout) = child.stdout.take() {
+                let s = sink.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        s.emit("log", &line);
+                    }
+                });
+            }
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        sink.emit("log", &line);
+                    }
+                });
+            }
+        }
 
         // Stash the child for later rollback / for keep-alive across the
         // commit await.
@@ -321,7 +353,7 @@ fi
         write_fake_server(dir.path());
         let manifest = make_manifest("bin-spawn-ok", dir.path().to_str().unwrap());
         let ports = Arc::new(PortAllocator::new((47_000, 47_050), HashSet::new()).unwrap());
-        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports);
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports, None);
         let prepared = s.prepare().await.expect("prepare succeeds");
         assert!(prepared.runtime.pid.is_some());
         assert!(prepared.runtime.port.is_some());
@@ -335,7 +367,7 @@ fi
         let dir = tempfile::tempdir().unwrap();
         let manifest = make_manifest("bin-no-script", dir.path().to_str().unwrap());
         let ports = Arc::new(PortAllocator::new((47_100, 47_110), HashSet::new()).unwrap());
-        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports);
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Spawn(_)));
     }
@@ -354,7 +386,7 @@ fi
         write_fake_server(dir.path());
         let manifest = make_manifest("bin-rb", dir.path().to_str().unwrap());
         let ports = Arc::new(PortAllocator::new((47_200, 47_210), HashSet::new()).unwrap());
-        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone());
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone(), None);
         let prepared = s.prepare().await.unwrap();
         let used = prepared.runtime.port.unwrap();
         s.rollback(prepared).await.unwrap();

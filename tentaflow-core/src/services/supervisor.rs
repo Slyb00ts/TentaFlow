@@ -244,7 +244,8 @@ impl Supervisor {
                 let health = self
                     .check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
                     .await;
-                self.apply_health(svc, health, /*allow_restart=*/ true).await;
+                self.apply_health(svc, health, /*allow_restart=*/ true)
+                    .await;
             }
 
             match self.build_snapshot().await {
@@ -300,11 +301,7 @@ impl Supervisor {
         .await;
     }
 
-    async fn write_runtime(
-        &self,
-        id: i64,
-        runtime: &RuntimeHandle,
-    ) -> Result<(), SupervisorError> {
+    async fn write_runtime(&self, id: i64, runtime: &RuntimeHandle) -> Result<(), SupervisorError> {
         let db = self.db.clone();
         let pid = runtime.pid;
         let port = runtime.port;
@@ -346,10 +343,7 @@ impl Supervisor {
             let mut services_by_id = HashMap::new();
 
             for row in rows {
-                if !matches!(
-                    row.status,
-                    ServiceStatus::Running | ServiceStatus::Degraded
-                ) {
+                if !matches!(row.status, ServiceStatus::Running | ServiceStatus::Degraded) {
                     continue;
                 }
                 let models = crate::services_repo::models::list_for_service(&conn, row.id)
@@ -465,8 +459,7 @@ impl Supervisor {
                     .or_insert_with(|| RestartState::new(self.initial_backoff));
 
                 if state.attempts >= self.max_restart_attempts {
-                    let msg =
-                        format!("permanent failure after {} attempts", state.attempts);
+                    let msg = format!("permanent failure after {} attempts", state.attempts);
                     drop(states);
                     self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                         .await;
@@ -480,7 +473,8 @@ impl Supervisor {
                 let attempt = state.attempts;
                 drop(states);
 
-                self.mark_status(svc.id, ServiceStatus::Starting, None).await;
+                self.mark_status(svc.id, ServiceStatus::Starting, None)
+                    .await;
                 self.increment_restart(svc.id).await;
 
                 match deploy::respawn(
@@ -588,7 +582,11 @@ mod tests {
         Arc::new(PortAllocator::new((lo, hi), Default::default()).unwrap())
     }
 
-    fn cfg(interval_ms: u64, max_restart: u32, backoff_max_ms: u64) -> crate::config::ServicesRuntimeConfig {
+    fn cfg(
+        interval_ms: u64,
+        max_restart: u32,
+        backoff_max_ms: u64,
+    ) -> crate::config::ServicesRuntimeConfig {
         crate::config::ServicesRuntimeConfig {
             port_range: (50_000, 50_100),
             health_check_interval_ms: interval_ms,
@@ -730,11 +728,7 @@ mod tests {
             .unwrap();
             let s = services_repo::insert(
                 &conn,
-                &NewService::minimal(
-                    "stopped",
-                    DeployMethod::NativeEmbedded,
-                    Transport::Embedded,
-                ),
+                &NewService::minimal("stopped", DeployMethod::NativeEmbedded, Transport::Embedded),
             )
             .unwrap();
             services_repo::update_status(&conn, s, ServiceStatus::Stopped).unwrap();

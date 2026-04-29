@@ -94,14 +94,13 @@ fn build_mlx_bridge() {
         .current_dir(&package_dir)
         .status();
     if !matches!(xcode_status, Ok(s) if s.success()) {
-        println!(
-            "cargo:warning=tentaflow: xcodebuild nieudane — Swift MLX bridge nie zbudowany"
-        );
+        println!("cargo:warning=tentaflow: xcodebuild nieudane — Swift MLX bridge nie zbudowany");
         return;
     }
 
     let products = xcode_build_dir.join("Build/Products/Release");
-    let framework_binary = products.join("PackageFrameworks/MLXBridge.framework/Versions/A/MLXBridge");
+    let framework_binary =
+        products.join("PackageFrameworks/MLXBridge.framework/Versions/A/MLXBridge");
     let metallib_bundle = products.join("mlx-swift_Cmlx.bundle");
 
     if !framework_binary.exists() {
@@ -147,10 +146,7 @@ fn build_mlx_bridge() {
     );
 
     println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
-    println!(
-        "cargo:rustc-link-arg=-Wl,-rpath,{}",
-        target_dir.display()
-    );
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", target_dir.display());
 }
 
 // ----- Kokoro Swift bridge (macOS only) --------------------------------------
@@ -171,10 +167,16 @@ fn build_kokoro_bridge() {
         .join("tentaflow-desktop/macos/swift/KokoroBridge");
     let package_swift = package_dir.join("Package.swift");
     if !package_swift.exists() {
-        println!("cargo:warning=tentaflow: brak {}, omijam KokoroBridge", package_swift.display());
+        println!(
+            "cargo:warning=tentaflow: brak {}, omijam KokoroBridge",
+            package_swift.display()
+        );
         return;
     }
-    println!("cargo:rerun-if-changed={}/Package.swift", package_dir.display());
+    println!(
+        "cargo:rerun-if-changed={}/Package.swift",
+        package_dir.display()
+    );
     println!("cargo:rerun-if-changed={}/Sources", package_dir.display());
 
     let cargo_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -185,9 +187,12 @@ fn build_kokoro_bridge() {
     let xcode_build_dir = package_dir.join("build-xcode");
     let xcode_status = Command::new("xcodebuild")
         .args([
-            "-scheme", "KokoroBridge",
-            "-destination", &format!("platform=macOS,arch={}", xcode_arch),
-            "-configuration", "Release",
+            "-scheme",
+            "KokoroBridge",
+            "-destination",
+            &format!("platform=macOS,arch={}", xcode_arch),
+            "-configuration",
+            "Release",
             "-derivedDataPath",
         ])
         .arg(&xcode_build_dir)
@@ -202,7 +207,10 @@ fn build_kokoro_bridge() {
     let framework_binary =
         products.join("PackageFrameworks/KokoroBridge.framework/Versions/A/KokoroBridge");
     if !framework_binary.exists() {
-        println!("cargo:warning=tentaflow: brak {}", framework_binary.display());
+        println!(
+            "cargo:warning=tentaflow: brak {}",
+            framework_binary.display()
+        );
         return;
     }
     let target_dir = cargo_target_dir();
@@ -215,7 +223,10 @@ fn build_kokoro_bridge() {
         .args(["-id", "@rpath/libKokoroBridge.dylib"])
         .arg(&dylib_dest)
         .status();
-    println!("cargo:warning=tentaflow: KokoroBridge gotowy ({})", dylib_dest.display());
+    println!(
+        "cargo:warning=tentaflow: KokoroBridge gotowy ({})",
+        dylib_dest.display()
+    );
 }
 
 // ----- Meeting bot (all platforms) -------------------------------------------
@@ -340,10 +351,7 @@ fn cargo_target_dir() -> PathBuf {
         .to_path_buf()
 }
 
-fn copy_dir_recursive(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> std::io::Result<()> {
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

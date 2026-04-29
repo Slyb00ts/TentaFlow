@@ -6,7 +6,7 @@
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_deploy_recommend,
     api_fast_path, api_flows, api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts,
-    api_registries, api_services, api_tts_rules, auth, static_files,
+    api_registries, api_services, api_services_v2, api_tts_rules, auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -47,6 +47,7 @@ pub struct DashboardServer {
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
 }
 
 impl DashboardServer {
@@ -75,7 +76,17 @@ impl DashboardServer {
             permission_checker: None,
             license: Arc::new(StaticLicenseChecker::free()),
             mesh_relay_health: None,
+            port_allocator: None,
         }
+    }
+
+    /// Wstrzykuje shared `PortAllocator` (wlasnosciowo nalezy do supervisor).
+    pub fn with_port_allocator(
+        mut self,
+        allocator: Option<Arc<crate::services::ports::PortAllocator>>,
+    ) -> Self {
+        self.port_allocator = allocator;
+        self
     }
 
     /// Ustawia snapshot zdrowia relay aktualizowany w tle przez mesh pipeline.
@@ -140,6 +151,7 @@ impl DashboardServer {
         let permission_checker = self.permission_checker.clone();
         let license = self.license.clone();
         let mesh_relay_health = self.mesh_relay_health.clone();
+        let port_allocator = self.port_allocator.clone();
 
         loop {
             let (stream, remote_addr) = match listener.accept().await {
@@ -165,6 +177,7 @@ impl DashboardServer {
             let pc_clone = permission_checker.clone();
             let lic_clone = license.clone();
             let mrh_clone = mesh_relay_health.clone();
+            let pa_clone = port_allocator.clone();
             // VULN-035: Przekaz remote_addr do handle_request (dual rate limiting)
             let remote_addr_str = remote_addr.to_string();
 
@@ -185,11 +198,12 @@ impl DashboardServer {
                     let pc = pc_clone.clone();
                     let lic = lic_clone.clone();
                     let mrh = mrh_clone.clone();
+                    let pa = pa_clone.clone();
                     let ra = remote_addr_str.clone();
                     async move {
                         handle_request(
                             req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic,
-                            mrh, ra,
+                            mrh, pa, ra,
                         )
                         .await
                     }
@@ -311,6 +325,7 @@ pub async fn handle_request(
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     remote_addr: String,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
@@ -523,6 +538,7 @@ pub async fn handle_request(
             meeting_manager,
             vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
             mesh_relay_health: mesh_relay_health.clone(),
+            port_allocator: port_allocator.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
@@ -1210,8 +1226,16 @@ pub async fn handle_request(
         ));
     }
 
-    let (status, response_body) =
-        route_api(&method, &path, &query_string, &db, &claims, &body_bytes);
+    let (status, response_body) = route_api(
+        &method,
+        &path,
+        &query_string,
+        &db,
+        &claims,
+        &body_bytes,
+        port_allocator.clone(),
+    )
+    .await;
 
     Ok(json_response_cors(
         status,
@@ -1255,13 +1279,14 @@ fn require_admin(claims: &auth::Claims, db: &DbPool) -> Option<(u16, String)> {
 }
 
 /// Routuje endpointy /api/* do odpowiednich handlerow
-fn route_api(
+async fn route_api(
     method: &Method,
     path: &str,
     query: &str,
     db: &DbPool,
     claims: &auth::Claims,
     body: &[u8],
+    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
 ) -> (u16, String) {
     match (method, path) {
         // Auth
@@ -1281,8 +1306,8 @@ fn route_api(
         // Dashboard
         (&Method::GET, "/api/dashboard") => handle_result(api_dashboard::handle_overview(db), 500),
 
-        // Services
-        (&Method::GET, "/api/services") => handle_result(api_services::handle_list(db), 500),
+        // Services — Phase 5: REST GET serves the unified services_v2 view.
+        (&Method::GET, "/api/services") => handle_result(api_services_v2::handle_list(db), 500),
         (&Method::POST, "/api/services") => {
             if let Some(err) = require_admin(claims, db) {
                 return err;
@@ -1460,7 +1485,11 @@ fn route_api(
                             if require_admin(claims, db).is_some() {
                                 return admin_err();
                             }
-                            handle_result(api_services::handle_delete(db, id), 500)
+                            // Phase 5: flip to unified services_v2 stop+delete.
+                            let res =
+                                api_services_v2::handle_delete(db, port_allocator.clone(), id)
+                                    .await;
+                            handle_result(res, 500)
                         }
                         _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
                     };

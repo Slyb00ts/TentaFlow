@@ -1816,5 +1816,19 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             );
         ",
     ),
+    (
+        63,
+        "deployments_v2_slug_and_log_tail",
+        "
+            -- Slug = stable client-facing identifier (UUID v4) used by the
+            -- deploy log stream subscription and the WebSocket fan-out so
+            -- callers can subscribe BEFORE the auto-increment id is known.
+            -- log_tail accumulates the live stdout/stderr feed for replay
+            -- when the dashboard mounts the modal after deploy began.
+            ALTER TABLE deployments_v2 ADD COLUMN slug TEXT;
+            ALTER TABLE deployments_v2 ADD COLUMN log_tail TEXT NOT NULL DEFAULT '';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_v2_slug ON deployments_v2(slug);
+        ",
+    ),
 ]
 }

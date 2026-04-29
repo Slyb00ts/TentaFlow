@@ -537,9 +537,58 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
 
     let db = ctx.state.db.clone();
     tokio::spawn(async move {
-        // Replay historycznych linii z DB.
+        // Replay historycznych linii — najpierw z deployments_v2 po slug,
+        // fallback do legacy `deployments` jesli rekord nie istnieje w v2.
         if replay_tail {
-            if let Ok(Some(row)) = crate::db::repository::deployments::get(&db, &deploy_id) {
+            if let Ok(Some(v2)) = crate::services_repo::deployments::get_by_slug(&db, &deploy_id) {
+                for (idx, line) in v2.log_tail.split('\n').enumerate() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let chunk = DeploymentStreamChunk {
+                        deploy_id: deploy_id.clone(),
+                        kind: "log".to_string(),
+                        line: line.to_string(),
+                        phase: String::new(),
+                        progress_pct: 0,
+                        ts_ms: idx as i64,
+                    };
+                    if push_chunk(
+                        &sub,
+                        MessageBody::DeploymentBody(DeploymentPayload::StreamChunk(chunk)),
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                let final_status = match v2.status {
+                    crate::services_repo::deployments::DeploymentStatus::Success => "success",
+                    crate::services_repo::deployments::DeploymentStatus::Failed => "failure",
+                    _ => "",
+                };
+                if !final_status.is_empty() {
+                    let end = DeploymentStreamEnd {
+                        deploy_id: deploy_id.clone(),
+                        final_status: final_status.to_string(),
+                        image_tag: String::new(),
+                        container_name: String::new(),
+                        error_message: v2.error_text.unwrap_or_default(),
+                        duration_ms: 0,
+                    };
+                    let _ = push_end(
+                        &sub,
+                        Some(MessageBody::DeploymentBody(DeploymentPayload::StreamEnd(
+                            end,
+                        ))),
+                    );
+                    return;
+                }
+            } else if let Ok(Some(row)) =
+                // FAZA-8: legacy `deployments` table is read-only fallback for
+                // deploys started under the pre-unification path. Drop in cleanup.
+                crate::db::repository::deployments::get(&db, &deploy_id)
+            {
                 for (idx, line) in row.log_tail.split('\n').enumerate() {
                     if line.is_empty() {
                         continue;
@@ -561,7 +610,6 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         return;
                     }
                 }
-                // Jeśli deployment już zakończony → emit End od razu i koniec.
                 if matches!(row.status.as_str(), "success" | "failure" | "cancelled") {
                     let end = DeploymentStreamEnd {
                         deploy_id: deploy_id.clone(),

@@ -121,3 +121,57 @@ pub fn delete_for_service(conn: &Connection, service_id: i64) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Aggregate row joining `model_registry_v2` with the parent `services_v2`.
+/// Used by the dashboard `GET /api/models` to surface which engine each
+/// model is served by + the runtime transport / status.
+#[derive(Debug, Clone)]
+pub struct ModelWithService {
+    pub id: i64,
+    pub service_id: i64,
+    pub model_name: String,
+    pub display_name: Option<String>,
+    pub capabilities: String,
+    pub context_length: Option<i64>,
+    pub quantization: Option<String>,
+    pub is_default: bool,
+    pub engine_id: String,
+    pub status: String,
+    pub transport: String,
+    pub deploy_method: String,
+    pub endpoint_url: Option<String>,
+}
+
+/// Lists all models attached to services in `running` or `degraded` state.
+/// Models on `starting`/`failed`/`stopped` services are filtered so callers
+/// only see usable engines.
+pub fn list_alive(conn: &Connection) -> Result<Vec<ModelWithService>> {
+    let sql = "SELECT m.id, m.service_id, m.model_name, m.display_name, m.capabilities, \
+        m.context_length, m.quantization, m.is_default, \
+        s.engine_id, s.status, s.transport, s.deploy_method, s.endpoint_url \
+        FROM model_registry_v2 m \
+        INNER JOIN services_v2 s ON s.id = m.service_id \
+        WHERE s.status IN ('running','degraded') \
+        ORDER BY m.id ASC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ModelWithService {
+                id: row.get(0)?,
+                service_id: row.get(1)?,
+                model_name: row.get(2)?,
+                display_name: row.get(3)?,
+                capabilities: row.get(4)?,
+                context_length: row.get(5)?,
+                quantization: row.get(6)?,
+                is_default: row.get::<_, i64>(7)? != 0,
+                engine_id: row.get(8)?,
+                status: row.get(9)?,
+                transport: row.get(10)?,
+                deploy_method: row.get(11)?,
+                endpoint_url: row.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
