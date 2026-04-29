@@ -7,9 +7,11 @@
 use crate::error::Result;
 use crate::routing::router::Router;
 use crate::routing::service_manager::PoolStrategy;
+use crate::routing::transport_client::entry_to_backend_client;
+use crate::services::transport::Transport;
 
 use std::sync::atomic::Ordering;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maksymalna liczba hopow mesh (zapobiega petlom)
 const MAX_HOPS: u32 = 3;
@@ -92,6 +94,22 @@ impl Router {
     /// 4. Model pool (round-robin pula serwisow)
     /// 5. Oryginalna nazwa
     pub(crate) fn resolve_route(&self, model: &str) -> ResolvedRoute {
+        // Snapshot-first lookup: when the supervisor snapshot already maps the
+        // requested model name, skip the legacy fallback chain entirely. Phase 5+
+        // deploy commits register the service into the snapshot, so this is the
+        // authoritative path on fresh installs.
+        let snap = self.service_manager.current_snapshot();
+        if snap.models_by_name.contains_key(model)
+            || snap.services.iter().any(|s| s.engine_id == model)
+        {
+            debug!("resolve_route: snapshot hit for {}", model);
+            return ResolvedRoute {
+                targets: vec![model.to_string()],
+                strategy: PoolStrategy::FirstAvailable,
+            };
+        }
+
+        // FAZA-8c: drop legacy fallback chain after old paths cleaned.
         // 1. Config aliasy
         for alias in &self.config.service_aliases {
             if alias.alias == model {
@@ -170,6 +188,69 @@ impl Router {
     pub(crate) fn get_backends(&self, target: &str) -> Vec<BackendHandle> {
         let mut backends = Vec::new();
 
+        // Snapshot-first path: derive handles from the supervisor snapshot.
+        // Embedded LLM services are dispatched through `LocalInferenceManager`
+        // (BackendHandle::LocalLlm). HttpDirect / ExternalHttp / SidecarQuic
+        // services map to existing handle variants and are looked up by service
+        // name from the legacy DashMaps in `ServiceManager` (populated at deploy
+        // commit time). The snapshot determines *whether* we route, the legacy
+        // stores carry the connection state.
+        let snap = self.service_manager.current_snapshot();
+        let candidates = snap.find_services_for_model(target);
+        if !candidates.is_empty() {
+            for entry in &candidates {
+                match entry.transport {
+                    Transport::Embedded => {
+                        let model_name = entry
+                            .models
+                            .iter()
+                            .find(|m| m.model_name == target)
+                            .map(|m| m.model_name.clone())
+                            .unwrap_or_else(|| target.to_string());
+                        if self
+                            .service_manager
+                            .has_local_inference_service(&model_name)
+                        {
+                            backends.push(BackendHandle::LocalLlm);
+                        } else if let Ok(guard) = crate::tts::shared_tts_manager().try_read() {
+                            if guard.has(&model_name) {
+                                backends.push(BackendHandle::LocalTts(model_name));
+                            }
+                        }
+                    }
+                    Transport::HttpDirect | Transport::ExternalHttp => {
+                        // Validate the snapshot entry can materialise a
+                        // BackendClient (catches misconfigured endpoints /
+                        // headers early). The legacy DashMap, populated at
+                        // deploy commit time, is what `select_http_backend`
+                        // actually queries during dispatch — Phase 8c collapses
+                        // both paths.
+                        if let Err(e) = entry_to_backend_client(entry) {
+                            warn!(
+                                "snapshot path: entry_to_backend_client for svc-{} failed: {}",
+                                entry.id, e
+                            );
+                            continue;
+                        }
+                        if self.service_manager.has_http_backends(target) {
+                            backends.push(BackendHandle::Http(target.to_string()));
+                        }
+                    }
+                    Transport::SidecarQuic => {
+                        if self.service_manager.has_quic_llm_service(target) {
+                            backends.push(BackendHandle::QuicLlm(target.to_string()));
+                        }
+                    }
+                }
+            }
+            if !backends.is_empty() {
+                return backends;
+            }
+        }
+
+        // FAZA-8c: drop legacy backend probing once snapshot covers all
+        // transports (TTS/STT/embedding/RAG) and `LocalInferenceManager`
+        // registration is wired through the snapshot path.
         if self.service_manager.has_local_inference_service(target) {
             backends.push(BackendHandle::LocalLlm);
         }
@@ -635,5 +716,150 @@ mod middleware_tests {
 
         // Assert
         assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // FAZA-8b-2: snapshot-first resolve_route / get_backends
+    // ========================================================================
+
+    use crate::config::RouterConfig;
+    use crate::routing::router::Router;
+    use crate::services::supervisor::{ModelEntry, ServiceEntry, ServicesSnapshot};
+    use crate::services::transport::Transport;
+    use crate::services_repo::services::{DeployMethod, ServiceStatus};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    fn make_router_with_snapshot(snap: ServicesSnapshot) -> Arc<Router> {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile for test DB");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = crate::db::init(&path).expect("test DB init");
+        let router = Arc::new(Router::new(RouterConfig::default(), Some(db)).expect("test router"));
+        let (_tx, rx) = watch::channel(Arc::new(snap));
+        router.service_manager().set_snapshot_rx(rx);
+        router
+    }
+
+    fn fixture_entry(
+        id: i64,
+        engine_id: &str,
+        transport: Transport,
+        models: Vec<&str>,
+    ) -> ServiceEntry {
+        ServiceEntry {
+            id,
+            engine_id: engine_id.into(),
+            deploy_method: DeployMethod::NativePythonBundle,
+            transport,
+            status: ServiceStatus::Running,
+            endpoint_url: Some("http://127.0.0.1:5099".into()),
+            runtime_pid: None,
+            runtime_port: Some(5099),
+            sidecar_quic_port: Some(5100),
+            models: models
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ModelEntry {
+                    id: (id * 100) + i as i64,
+                    model_name: name.into(),
+                    display_name: None,
+                    is_default: i == 0,
+                })
+                .collect(),
+            timeout_ms: 30_000,
+            max_concurrent: 16,
+            weight: 100,
+            model_name_override: None,
+            extra_config: HashMap::new(),
+        }
+    }
+
+    fn build_snapshot(services: Vec<ServiceEntry>) -> ServicesSnapshot {
+        let mut models_by_name = HashMap::new();
+        let mut services_by_id = HashMap::new();
+        for (idx, svc) in services.iter().enumerate() {
+            services_by_id.insert(svc.id, idx);
+            for m in &svc.models {
+                models_by_name.insert(m.model_name.clone(), svc.id);
+            }
+        }
+        ServicesSnapshot {
+            services,
+            models_by_name,
+            services_by_id,
+            generated_at_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_route_uses_snapshot_first() {
+        // Arrange — snapshot zna model X. Ani config aliasy, ani legacy stores
+        // nie znaja modelu — gdyby snapshot path nie dzialal, weszlibysmy w
+        // krok 5 (oryginalna nazwa).
+        let svc = fixture_entry(1, "vllm", Transport::HttpDirect, vec!["llama-x"]);
+        let router = make_router_with_snapshot(build_snapshot(vec![svc]));
+
+        // Act
+        let route = router.resolve_route("llama-x");
+
+        // Assert
+        assert_eq!(route.targets, vec!["llama-x".to_string()]);
+        assert!(matches!(route.strategy, PoolStrategy::FirstAvailable));
+    }
+
+    #[test]
+    fn resolve_route_falls_back_when_snapshot_empty() {
+        // Arrange — pusty snapshot, brak aliasow, brak serwisow legacy.
+        // Powinien zlapac sie krok 5: oryginalna nazwa.
+        let router = make_router_with_snapshot(ServicesSnapshot::default());
+
+        // Act
+        let route = router.resolve_route("unknown-model");
+
+        // Assert — krok 5 zwraca oryginalna nazwe ze strategia FirstAvailable.
+        assert_eq!(route.targets, vec!["unknown-model".to_string()]);
+        assert!(matches!(route.strategy, PoolStrategy::FirstAvailable));
+    }
+
+    #[test]
+    fn resolve_route_snapshot_matches_engine_id() {
+        // Arrange — niektore deploy'e (ollama, vllm) lapia request po engine_id
+        // a nie po nazwie modelu. find_services_for_model wspiera oba klucze;
+        // resolve_route podpiera te sama heurystyke.
+        let svc = fixture_entry(2, "ollama", Transport::ExternalHttp, vec!["llama3.1:8b"]);
+        let router = make_router_with_snapshot(build_snapshot(vec![svc]));
+
+        // Act
+        let route = router.resolve_route("ollama");
+
+        // Assert
+        assert_eq!(route.targets, vec!["ollama".to_string()]);
+    }
+
+    #[test]
+    fn get_backends_snapshot_embedded_yields_local_llm() {
+        // Arrange — snapshot ma embedded service; legacy local_inference_models
+        // tez musi byc populated (tak robi register_local_inference_model przy
+        // deploy commit), bo BackendHandle::LocalLlm idzie przez
+        // LocalInferenceManager.
+        let svc = fixture_entry(3, "llama-cpp", Transport::Embedded, vec!["qwen-mini"]);
+        let router = make_router_with_snapshot(build_snapshot(vec![svc]));
+        router
+            .service_manager()
+            .register_local_inference_model("qwen-mini");
+
+        // Act
+        let backends = router.get_backends("qwen-mini");
+
+        // Assert — snapshot path zwraca LocalLlm.
+        assert!(
+            backends
+                .iter()
+                .any(|b| matches!(b, BackendHandle::LocalLlm)),
+            "expected LocalLlm in {:?}",
+            backends.iter().map(|b| b.type_name()).collect::<Vec<_>>()
+        );
     }
 }
