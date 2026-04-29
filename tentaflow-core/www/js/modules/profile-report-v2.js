@@ -1648,10 +1648,23 @@ function renderPowerTab(ctx) {
   const { events, report } = ctx;
   const samples = eventsForCategory(events, 'PowerSample');
   if (samples.length === 0) {
-    return noDataCard('No power samples collected. RAPL likely unavailable; re-run with sudo.');
+    // Pełen brak PowerSample — żaden kolektor nie zwrócił danych.
+    return `
+      <section class="pr2-card">
+        <div class="pr2-banner-degraded">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <div>
+            <strong>No power samples collected.</strong>
+            Power telemetry requires <code class="mono">RAPL</code> (sudo / CAP_SYS_RAWIO on Linux),
+            <code class="mono">nvidia-smi</code>, <code class="mono">rocm-smi</code>,
+            or <code class="mono">powermetrics</code> (macOS, sudo). Re-run the session with elevated privileges.
+          </div>
+        </div>
+      </section>
+    `;
   }
 
-  // Group by domain → time series.
+  // Grupowanie po domenie → seria czasowa watów.
   const byDomain = new Map();
   for (const e of samples) {
     const p = unwrapPayload(e.payload);
@@ -1661,36 +1674,63 @@ function renderPowerTab(ctx) {
     arr.push([e.t_start_ns, p.watts]);
     byDomain.set(key, arr);
   }
-  // Align all series on the same x-axis (use the longest one as reference).
-  const reference = Array.from(byDomain.values()).reduce((longest, s) => (s.length > longest.length ? s : longest), []);
-  reference.sort((a, b) => a[0] - b[0]);
+
+  const palette = { CpuPkg: '#a78bfa', CpuCore: '#7c3aed', Dram: '#60a5fa', Ane: '#22c55e', Soc: '#fbbf24', Other: '#71717a' };
+  const gpuColors = ['#76b900', '#ed1c24', '#0071c5', '#d4d4d8'];
+  const humanLabel = (key) => {
+    if (key === 'CpuPkg') return 'CPU pkg';
+    if (key === 'CpuCore') return 'CPU core';
+    if (key === 'Dram') return 'DRAM';
+    if (key === 'Ane') return 'ANE';
+    if (key === 'Soc') return 'SoC';
+    if (key.startsWith('Gpu(')) {
+      const idx = parseInt(key.match(/\d+/)?.[0] || '0', 10);
+      return `GPU${idx}`;
+    }
+    return key;
+  };
+  const colorForKey = (key) => {
+    if (key.startsWith('Gpu(')) {
+      const idx = parseInt(key.match(/\d+/)?.[0] || '0', 10);
+      return gpuColors[idx % gpuColors.length];
+    }
+    return palette[key] || '#a78bfa';
+  };
+
+  const sortedKeys = Array.from(byDomain.keys()).sort((a, b) => domainOrder(a) - domainOrder(b));
   const seriesList = [];
   const colors = [];
   const labels = [];
-  const palette = { CpuPkg: '#a78bfa', CpuCore: '#7c3aed', Dram: '#60a5fa', Ane: '#22c55e', Soc: '#fbbf24', Other: '#71717a' };
-  const gpuColors = ['#76b900', '#ed1c24', '#0071c5', '#d4d4d8'];
-
-  // Order: CPU pkg, DRAM, Gpu0..N, Ane, Soc, Other.
-  const sortedKeys = Array.from(byDomain.keys()).sort((a, b) => domainOrder(a) - domainOrder(b));
+  const avgs = [];
   for (const key of sortedKeys) {
     const points = byDomain.get(key).slice().sort((a, b) => a[0] - b[0]);
     seriesList.push(points);
-    if (key.startsWith('Gpu(')) {
-      const idx = parseInt(key.match(/\d+/)?.[0] || '0', 10);
-      colors.push(gpuColors[idx % gpuColors.length]);
-      labels.push(`GPU ${idx}`);
-    } else {
-      colors.push(palette[key] || '#a78bfa');
-      labels.push(key);
-    }
+    colors.push(colorForKey(key));
+    labels.push(humanLabel(key));
+    const avgW = points.length ? points.reduce((s, [, v]) => s + v, 0) / points.length : 0;
+    avgs.push(avgW);
   }
 
   const power = ctx.kpis.power;
   const kWh = power.totalKj / 3600;
   const cost = kWh * 0.15;
 
-  const legend = labels.map((l, i) => `<span class="lg"><span class="sw" style="background:${colors[i]};"></span>${escape(l)}</span>`).join('') +
+  // Legenda w formacie mockupu: "CPU pkg (84W avg)".
+  const legend = labels.map((l, i) =>
+    `<span class="lg"><span class="sw" style="background:${colors[i]};"></span>${escape(l)} (${avgs[i].toFixed(0)}W avg)</span>`
+  ).join('') +
     `<span class="lg"><span class="sw" style="background:#f59e0b;height:2px;"></span>Total (peak ${formatPower(power.peakW)})</span>`;
+
+  // Mockup wymaga osobnego kafelka ANE; jeśli brak danych — placeholder.
+  const hasAne = byDomain.has('Ane');
+  const anePlaceholder = !hasAne ? `
+    <div class="pr2-mini-chart">
+      <div class="mc-title"><span>ANE W</span><span class="v">— not detected</span></div>
+      <svg viewBox="0 0 200 60" preserveAspectRatio="none" aria-label="ANE not detected">
+        <path d="M0 56 L200 56" stroke="#71717a" stroke-width="1" stroke-dasharray="2 3" fill="none"/>
+      </svg>
+    </div>
+  ` : '';
 
   // Per-domain mini charts.
   const miniCharts = labels.map((l, i) => {
@@ -1702,11 +1742,26 @@ function renderPowerTab(ctx) {
         ${renderLineChart(pts, { color: colors[i], height: 60 })}
       </div>
     `;
-  }).join('');
+  }).join('') + anePlaceholder;
+
+  // Banner gdy RAPL/CPU pkg niedostępne — pokazujemy częściowe dane (np. tylko GPU).
+  const raplSkipped = (report.collectors || []).some((c) => {
+    const id = (c.id || '').toLowerCase();
+    if (!id.includes('rapl') && !id.includes('power')) return false;
+    const status = normalizeCollectorStatus(c.status);
+    return status.kind === 'skipped' || status.kind === 'failed';
+  });
+  const partialBanner = (raplSkipped && !byDomain.has('CpuPkg') && !byDomain.has('Dram')) ? `
+    <div class="pr2-banner-degraded inline" style="margin-bottom:10px;">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+      <div><strong>RAPL unavailable</strong> — CPU pkg / DRAM power missing. Showing GPU-only domains. Re-run with sudo for full breakdown.</div>
+    </div>
+  ` : '';
 
   return `
     <section class="pr2-card">
       <h2 class="pr2-card-title">Total power broken down per domain</h2>
+      ${partialBanner}
       <div class="pr2-stacked-chart-wrap">
         ${renderStackedArea(seriesList, { width: 920, height: 220, colors })}
         <div class="pr2-stacked-legend">${legend}</div>
@@ -1724,7 +1779,7 @@ function renderPowerTab(ctx) {
     </section>
 
     <section class="pr2-card">
-      <h2 class="pr2-card-title">Per-domain breakdown</h2>
+      <h2 class="pr2-card-title">Per-domain mini charts</h2>
       <div class="pr2-charts-row pr2-charts-row-flexible">${miniCharts}</div>
     </section>
   `;
