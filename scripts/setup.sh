@@ -880,9 +880,21 @@ download_vision_models() {
     )
     local _ok=0
     local _miss=0
+    # stat ma rozne flagi per OS:
+    #   GNU (Linux):  stat -c %s <file>      (--format=%s)
+    #   BSD (macOS):  stat -f %z <file>      (--format wbudowane w -f)
+    # Mieszanie ich daje smieci - na Linuxie 'stat -f %z' to '--file-system'
+    # i wypluwa multi-line output z lokalizowanym 'Plik:' / 'File:' /etc.
+    # ktore set -u wykrywa jako undefined variable.
+    local _stat_size
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        _stat_size() { stat -f %z "$1" 2>/dev/null || echo 0; }
+    else
+        _stat_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+    fi
     for f in "${_expected[@]}"; do
         local p="${vision_dir}/${f}"
-        if [[ -f "$p" ]] && [[ $(stat -f %z "$p" 2>/dev/null || stat -c %s "$p" 2>/dev/null || echo 0) -gt 100000 ]]; then
+        if [[ -f "$p" ]] && [[ $(_stat_size "$p") -gt 100000 ]]; then
             _ok=$((_ok + 1))
         else
             log_warn "BRAK po pobieraniu: $p"
