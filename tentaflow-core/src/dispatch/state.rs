@@ -17,6 +17,7 @@ use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;
 use crate::routing::service_manager::ServiceManager;
+use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;
 
 /// Wszystkie shared resources serwera. Handlery uzywaja przez `ctx.state`.
@@ -48,6 +49,11 @@ pub struct AppState {
     /// unified service deploy pipeline (`services::deploy::deploy`). `None`
     /// only in tests / when the supervisor failed to initialise.
     pub port_allocator: Option<Arc<PortAllocator>>,
+    /// In-memory aggregator of services advertised by every reachable remote
+    /// mesh node. The local node is read directly from the `services` SQLite
+    /// table; remote snapshots arrive via `MeshServicesGet`/`Announce`/`Update`
+    /// messages handled in `mesh::pipeline`.
+    pub mesh_services_registry: Arc<MeshServicesRegistry>,
 }
 
 impl AppState {
@@ -93,6 +99,7 @@ impl AppState {
             vnc_tunnels: Arc::new(dashmap::DashMap::new()),
             mesh_relay_health: None,
             port_allocator: None,
+            mesh_services_registry: Arc::new(MeshServicesRegistry::new()),
         })
     }
 }

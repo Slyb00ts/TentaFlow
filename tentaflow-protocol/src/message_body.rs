@@ -61,6 +61,7 @@ pub struct ModelSummary {
 
 /// Single model row attached to a `ServiceInfo`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[rkyv(derive(Debug))]
 pub struct ServiceModelEntry {
     pub model_name: String,
     pub display_name: Option<String>,
@@ -73,8 +74,13 @@ pub struct ServiceModelEntry {
 /// Runtime view of one deployed service. Aggregates the `services` row with
 /// its attached `model_registry` rows.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[rkyv(derive(Debug))]
 pub struct ServiceInfo {
     pub id: i64,
+    /// Owning mesh node — endpoint-id hex. Same as the local node when the row
+    /// originates from this process; populated from the announcement payload
+    /// for snapshots received over mesh sync (see `MeshServicesRegistry`).
+    pub node_id: String,
     pub engine_id: String,
     /// llm / stt / tts / embeddings / image-gen / agents / ...
     pub category: String,
@@ -96,6 +102,17 @@ pub struct ServiceInfo {
     pub models: Vec<ServiceModelEntry>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Incremental change applied to one entry in the mesh services registry. Used
+/// by `MeshServicesUpdate` push messages so peers do not have to re-broadcast
+/// the full snapshot on every deploy / stop / pin / pause / rename / delete.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[rkyv(derive(Debug))]
+pub enum ServiceChange {
+    Added(ServiceInfo),
+    Updated(ServiceInfo),
+    Removed { service_id: i64 },
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]

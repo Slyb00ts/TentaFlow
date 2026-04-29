@@ -116,6 +116,7 @@ pub async fn start_mesh_pipeline(
     db_pool: Option<crate::db::DbPool>,
     _settings_cipher: std::sync::Arc<crate::crypto::SettingsCipher>,
     mesh_security: Arc<MeshSecurity>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Result<MeshPipelineHandles> {
     let app_node_id = &config.node_id;
     let mesh_config = &config.mesh_config;
@@ -442,6 +443,7 @@ pub async fn start_mesh_pipeline(
                 Some(mesh_security.clone()),
                 local_node_id.clone(),
                 db_pool.clone(),
+                mesh_services_registry.clone(),
             );
 
             let docker_cache = spawn_docker_cache();
@@ -450,6 +452,7 @@ pub async fn start_mesh_pipeline(
                 mesh_peer_store.clone(),
                 local_node_id.clone(),
                 docker_cache,
+                db_pool.clone(),
             );
             spawn_slow_refresh(
                 mesh_peer_store.clone(),
@@ -710,6 +713,26 @@ async fn handle_peer_connected(
                 last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
             }
         }
+
+        // Pull-on-connect: poprosic peera o pelny snapshot jego serwisow.
+        // Wynik trafia do `MeshServicesRegistry` w handlerze
+        // `ServicesGetResponseReceived`. Wysylamy tylko dla zaufanych — peer
+        // i tak odrzuci request od niezaufanego (defense in depth).
+        let pull = tentaflow_protocol::mesh::MeshServicesGetPayload {
+            from_node_id: local_node_id.clone(),
+        };
+        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&pull) {
+            if let Err(e) = qm_events
+                .send_to_peer(
+                    &node_id,
+                    tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET,
+                    &bytes,
+                )
+                .await
+            {
+                debug!(peer = %node_id, "MeshServicesGet send failed: {}", e);
+            }
+        }
     } else {
         debug!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
     }
@@ -869,6 +892,7 @@ fn spawn_quic_event_handler(
     mesh_security: Option<Arc<MeshSecurity>>,
     local_node_id: String,
     db_pool: Option<crate::db::DbPool>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) {
     let qm_events = quic_mesh.clone();
     let mut event_rx = quic_mesh.subscribe();
@@ -1376,6 +1400,11 @@ fn spawn_quic_event_handler(
                         debug!(peer_id = %node_id, "QUIC peer — duplicate disconnect event");
                         continue;
                     }
+
+                    // Mesh services registry — wyrzuc snapshot zerwanego peera.
+                    // Bez tego GUI aggregate (krok N3b) widzialby duchowe serwisy
+                    // niedostepnego nodu az do nastepnego anti-drift broadcastu.
+                    mesh_services_registry.remove_node(&node_id);
 
                     // [SCALE] Debounce + reszta przeniesione do spawnowanego
                     // taska z per-peer lockiem (wspolny z PeerConnected).
@@ -1907,6 +1936,141 @@ fn spawn_quic_event_handler(
                     peer_store.set_status(&node_id, "discovered");
                     debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
                 }
+                Ok(IrohMeshEvent::ServicesGetReceived { from_node_id, .. }) => {
+                    // Peer prosi o pelny snapshot lokalnych serwisow. Tylko
+                    // trusted — defense in depth, send_to_peer wymagal trustu
+                    // po stronie inicjatora ale ktos moze otworzyc surowy stream.
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesGet od niezaufanego peera — ignoruje");
+                        continue;
+                    }
+                    let pool = match &db_pool {
+                        Some(p) => p.clone(),
+                        None => {
+                            debug!("MeshServicesGet: brak db_pool, pomijam odpowiedz");
+                            continue;
+                        }
+                    };
+                    let qm = qm_events.clone();
+                    let local = local_node_id.clone();
+                    let peer = from_node_id.clone();
+                    tokio::spawn(async move {
+                        let services = match crate::services::snapshot_builder::build_local_snapshot(
+                            &pool, &local,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(error = %e, "MeshServicesGet: build_local_snapshot failed");
+                                return;
+                            }
+                        };
+                        let payload = tentaflow_protocol::mesh::MeshServicesGetResponsePayload {
+                            from_node_id: local,
+                            services,
+                        };
+                        let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "MeshServicesGetResponse: rkyv encode failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = qm
+                            .send_to_peer(
+                                &peer,
+                                tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET_RESPONSE,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            debug!(peer = %peer, "MeshServicesGetResponse send failed: {}", e);
+                        }
+                    });
+                }
+                Ok(IrohMeshEvent::ServicesGetResponseReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesGetResponse od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshServicesGetResponsePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            debug!(
+                                peer = %from_node_id,
+                                count = payload.services.len(),
+                                "MeshServicesGetResponse: replace_node"
+                            );
+                            mesh_services_registry
+                                .replace_node(payload.from_node_id, payload.services);
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "MeshServicesGetResponse decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::ServicesAnnounceReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesAnnounce od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshServicesAnnouncePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            debug!(
+                                peer = %from_node_id,
+                                count = payload.services.len(),
+                                "MeshServicesAnnounce: replace_node"
+                            );
+                            mesh_services_registry
+                                .replace_node(payload.from_node_id, payload.services);
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "MeshServicesAnnounce decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::ServicesUpdateReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesUpdate od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshServicesUpdatePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            debug!(peer = %from_node_id, "MeshServicesUpdate: apply_change");
+                            mesh_services_registry
+                                .apply_change(payload.from_node_id, payload.change);
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "MeshServicesUpdate decode error: {}", e);
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Event receiver opuscil {} wiadomosci", n);
@@ -1947,6 +2111,7 @@ fn spawn_heartbeat_sender(
     peer_store: MeshPeerStore,
     local_node_id: String,
     docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>,
+    db_pool: Option<crate::db::DbPool>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -2039,6 +2204,39 @@ fn spawn_heartbeat_sender(
                 heartbeat_count += 1;
                 if heartbeat_count % 10 == 0 {
                     peer_store.maybe_recalculate_routes(&local_node_id);
+                }
+
+                // Mesh services registry — anti-drift snapshot broadcast co 600
+                // heartbeatow (~5 min). Naprawia rozjazd rejestru po nieudanych
+                // push delta'ach (`MeshServicesUpdate`) lub gdy peer dolaczyl
+                // bez pull-on-connect (np. po zmianie sieci, hardlinkowy reuse).
+                if heartbeat_count % 600 == 0 {
+                    if let Some(ref pool) = db_pool {
+                        match crate::services::snapshot_builder::build_local_snapshot(
+                            pool,
+                            &local_node_id,
+                        ) {
+                            Ok(services) => {
+                                let payload =
+                                    tentaflow_protocol::mesh::MeshServicesAnnouncePayload {
+                                        from_node_id: local_node_id.clone(),
+                                        services,
+                                    };
+                                if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                                    let _ = quic_mesh
+                                        .broadcast_to_trusted(
+                                            tentaflow_protocol::mesh::MESH_MSG_SERVICES_ANNOUNCE,
+                                            &bytes,
+                                            None,
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "MeshServicesAnnounce: build_local_snapshot failed");
+                            }
+                        }
+                    }
                 }
 
                 // ModelsSync broadcast co 60 heartbeatow (~30s). Serwer-side

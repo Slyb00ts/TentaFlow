@@ -187,6 +187,12 @@ async fn run_server(args: Args) -> Result<()> {
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
 
+    // Mesh services registry — agregator widokow `services` ze wszystkich
+    // zaufanych peerow. Pisze do niego pipeline mesh (handlery
+    // `MeshServicesGet/Announce/Update`); czyta GUI/forwarding (krok N3b).
+    let mesh_services_registry =
+        Arc::new(tentaflow_core::services::mesh_registry::MeshServicesRegistry::new());
+
     // Seed lokalnego noda w peer_store — synchronicznie, przed startupem mesh.
     // Dzieki temu catalog/services/mesh GUI zawsze ma target "local" do dyspozycji.
     {
@@ -338,6 +344,7 @@ async fn run_server(args: Args) -> Result<()> {
                 Some(db.clone()),
                 settings_cipher.clone(),
                 mesh_security.clone(),
+                mesh_services_registry.clone(),
             )
             .await
             {
@@ -477,6 +484,7 @@ async fn run_server(args: Args) -> Result<()> {
         mesh_security_for_server,
         mesh_relay_health_for_server,
         services_port_allocator.clone(),
+        mesh_services_registry.clone(),
     )?;
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");

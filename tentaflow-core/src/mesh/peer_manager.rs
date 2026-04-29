@@ -714,7 +714,11 @@ impl PeerManager {
             | IrohMeshEvent::PeerDiscovered { .. }
             | IrohMeshEvent::HelloReceived { .. }
             | IrohMeshEvent::TopologyAnnounceReceived { .. }
-            | IrohMeshEvent::KnownPeersReceived { .. } => {
+            | IrohMeshEvent::KnownPeersReceived { .. }
+            | IrohMeshEvent::ServicesGetReceived { .. }
+            | IrohMeshEvent::ServicesGetResponseReceived { .. }
+            | IrohMeshEvent::ServicesAnnounceReceived { .. }
+            | IrohMeshEvent::ServicesUpdateReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }

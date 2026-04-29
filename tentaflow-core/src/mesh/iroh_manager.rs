@@ -211,6 +211,27 @@ pub enum IrohMeshEvent {
         node_id: String,
         addresses: Vec<std::net::SocketAddr>,
     },
+    /// Pull request: peer prosi nas o pelny snapshot lokalnych serwisow
+    /// (`MESH_MSG_SERVICES_GET`).
+    ServicesGetReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    /// Odpowiedz peera na nasz pull (`MESH_MSG_SERVICES_GET_RESPONSE`).
+    ServicesGetResponseReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    /// Periodyczny anti-drift broadcast peera (`MESH_MSG_SERVICES_ANNOUNCE`).
+    ServicesAnnounceReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    /// Push delta peera (`MESH_MSG_SERVICES_UPDATE`).
+    ServicesUpdateReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
 }
 
 /// Kierunek polaczenia QUIC z perspektywy lokalnego noda. Uzywany przez
@@ -1615,6 +1636,24 @@ impl IrohMeshManagerRef {
                 data: payload,
             },
             x if x == MESH_MSG_LOG_CHUNK => IrohMeshEvent::MeshLogChunkReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SERVICES_GET => IrohMeshEvent::ServicesGetReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SERVICES_GET_RESPONSE => {
+                IrohMeshEvent::ServicesGetResponseReceived {
+                    from_node_id: remote_hex,
+                    data: payload,
+                }
+            }
+            x if x == MESH_MSG_SERVICES_ANNOUNCE => IrohMeshEvent::ServicesAnnounceReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SERVICES_UPDATE => IrohMeshEvent::ServicesUpdateReceived {
                 from_node_id: remote_hex,
                 data: payload,
             },
