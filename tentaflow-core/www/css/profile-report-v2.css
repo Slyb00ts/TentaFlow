@@ -623,3 +623,58 @@
   .pr2-card { padding: 14px; }
   .pr2-title { font-size: 16px; }
 }
+
+/* =============================================================================
+   CPU Detail tab (mockup #07): per-core grid + PMU chart + degraded banners
+   ============================================================================= */
+.pr2-cores-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+@media (max-width: 1100px) { .pr2-cores-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 540px)  { .pr2-cores-grid { grid-template-columns: 1fr; } }
+.pr2-core-mini {
+  background: var(--tf-bg-3, #111535);
+  border: 1px solid var(--tf-border, #1f2548);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.pr2-core-mini .cm-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.pr2-core-mini .cm-name {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  color: var(--tf-text-2, #a0a8c8); font-weight: 700;
+}
+.pr2-core-mini .cm-val {
+  font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  font-weight: 800; color: var(--tf-text, #e8ebf5);
+}
+.pr2-core-mini svg { width: 100%; height: 28px; display: block; }
+
+.pr2-pmu-chart {
+  background: var(--tf-bg-input, #0b0e22);
+  border: 1px solid var(--tf-border, #1f2548);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+/* Banner gdy zrodlo niedostepne (PMU/sampling/intel kernels itp.) */
+.pr2-banner-degraded {
+  display: flex; gap: 10px; align-items: center;
+  padding: 10px 14px; border-radius: 6px;
+  background: rgba(96, 165, 250, 0.06);
+  border: 1px dashed rgba(96, 165, 250, 0.35);
+  color: var(--tf-text-2, #a0a8c8); font-size: 12px;
+}
+.pr2-banner-degraded svg {
+  width: 16px; height: 16px; stroke: var(--tf-info, #60a5fa);
+  fill: none; stroke-width: 2; flex-shrink: 0;
+}
+.pr2-banner-degraded strong { color: var(--tf-text, #e8ebf5); font-weight: 700; }
+.pr2-banner-degraded code {
+  font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+  color: var(--tf-accent-2, #a78bfa);
+}
