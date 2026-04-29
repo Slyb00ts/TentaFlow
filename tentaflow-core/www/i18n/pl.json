@@ -1492,7 +1492,17 @@
     "qr_scan_denied": "Dostęp do kamery odrzucony. Sprawdź uprawnienia w ustawieniach przeglądarki.",
     "qr_scan_no_camera": "Nie znaleziono kamery na tym urządzeniu.",
     "qr_scan_busy": "Kamera jest używana przez inną aplikację.",
-    "qr_scan_insecure": "Skanowanie wymaga HTTPS. Otwórz aplikację przez https://"
+    "qr_scan_insecure": "Skanowanie wymaga HTTPS. Otwórz aplikację przez https://",
+    "profile_node_btn": "Profiluj noda",
+    "profile_gpu_btn": "Profiluj tę kartę",
+    "profile_view_sessions": "Sesje",
+    "profile_started": "Sesja profilowania uruchomiona",
+    "profile_unavailable": "Profilowanie niedostępne na tym nodzie",
+    "profile_error": "Błąd profilowania",
+    "profile_rec_badge": "REC",
+    "profile_rec_session_label": "Sesja: {label}",
+    "profile_rec_stop": "Zatrzymaj",
+    "profile_rec_view_report": "Otwórz raport"
   },
   "nsight": {
     "profile_btn": "Profil",
@@ -1628,6 +1638,67 @@
         "delete": "Nie udało się usunąć sesji",
         "download": "Nie udało się pobrać pliku"
       }
+    }
+  },
+  "profiling": {
+    "launch": {
+      "title": "Uruchom sesję profilowania",
+      "label_field": "Etykieta",
+      "label_placeholder": "np. inference qwen-7b",
+      "duration": "Czas trwania",
+      "manual_stop": "Stop manualny",
+      "data_sources": "Źródła danych",
+      "sources_selected": "{sel} z {total} wybranych",
+      "estimated_storage": "Przewidywany rozmiar: {size} · narzut: {overhead}",
+      "estimated_unknown": "Przewidywany rozmiar: — · narzut: —",
+      "start_button": "Uruchom profilowanie",
+      "cancel_button": "Anuluj",
+      "test_button": "Sprawdź",
+      "sudo_password_label": "Hasło sudo",
+      "sudo_used_once": "używane raz · niezapisywane",
+      "sudo_placeholder": "••••••••",
+      "elevation_count": "{count} źródło wymaga uprawnień",
+      "elevation_count_plural": "{count} źródeł wymaga uprawnień",
+      "elevation_explain": "Podaj hasło sudo jeden raz. Jest używane wyłącznie do uruchomienia kolektorów i {strong_never_stored}.",
+      "elevation_never_stored": "nigdy nie jest zapisywane na dysku ani w bazie",
+      "elevation_authenticated": "✓ Zweryfikowano",
+      "elevation_invalid": "✗ Błędne hasło",
+      "elevation_testing": "Sprawdzanie...",
+      "toggle_password_visibility": "Pokaż/ukryj hasło",
+      "target_field": "Cel profilowania",
+      "target_system_wide": "Cały system",
+      "target_own_process": "Własny proces (tentaflow)",
+      "target_specific_pid": "Konkretny PID",
+      "target_pid_placeholder": "np. 14872",
+      "status_available": "Dostępne",
+      "status_needs_sudo": "Wymaga sudo",
+      "status_needs_admin": "Wymaga admina",
+      "status_limited": "Ograniczone",
+      "status_unavailable": "Niedostępne"
+    },
+    "banner": {
+      "rec": "REC",
+      "stop_now": "Zatrzymaj teraz",
+      "open_report_when_done": "Otwórz raport po zakończeniu",
+      "session_label": "sesja {sid} · start {time} · {count} kolektor",
+      "session_label_plural": "sesja {sid} · start {time} · {count} kolektorów",
+      "elapsed_manual": "{elapsed} upłynęło (stop manualny)",
+      "default_label": "sesja profilowania",
+      "stop_error": "Nie udało się zatrzymać sesji",
+      "session_finished": "Sesja profilowania zakończona",
+      "view_report": "Otwórz raport",
+      "all_sessions": "Wszystkie sesje"
+    },
+    "sessions": {
+      "title": "Sesje profilowania",
+      "empty_no_sessions": "Brak sesji",
+      "empty_launch_first": "Uruchom pierwszą sesję, by zobaczyć wyniki tutaj.",
+      "no_sessions_match": "Żadna sesja nie pasuje do filtrów"
+    },
+    "errors": {
+      "active_busy": "Inna sesja profilowania jest już aktywna",
+      "session_not_found": "Sesja nie znaleziona",
+      "invalid_request": "Nieprawidłowe żądanie"
     }
   },
   "clusters": {
