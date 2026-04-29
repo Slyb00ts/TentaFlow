@@ -11,6 +11,9 @@ bin/
 *.dll
 *.exe
 *.wasm
+# wyjątek: glue wasm dla protocol codec — komitujemy żeby production deploy
+# nie wymagał lokalnego cargo build do wygenerowania bindings
+!tentaflow-core/www/js/protocol/wasm_glue_bg.wasm
 
 # Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
 .build/
