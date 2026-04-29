@@ -49,6 +49,24 @@ import '/js/components/tf-window.js';
 
 const FIXTURE_PATH = '/js/modules/__fixtures__/profile-report.json';
 
+// wasm-bindgen / decode helpery zwracaja klucze w camelCase (schemaVersion,
+// sessionId, ...), a reszta tego pliku byla pisana pod snake_case zgodny z
+// rust polami. Konwertujemy raz przy boundary, zeby nie przepisywac 39 odwolan.
+function camelToSnake(name) {
+  return name.replace(/[A-Z]/g, (m) => '_' + m.toLowerCase());
+}
+function deepSnakeKeys(value) {
+  if (Array.isArray(value)) return value.map(deepSnakeKeys);
+  if (value && typeof value === 'object' && value.constructor === Object) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[camelToSnake(k)] = deepSnakeKeys(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
 }
@@ -136,6 +154,7 @@ export class ProfileReportV2View {
       bindBackHandler(container);
       return;
     }
+    report = deepSnakeKeys(report);
     if (report.schema_version !== 2) {
       const msg = envelopeIsV2
         ? `Backend zwrocil V2 envelope ze schema_version=${report.schema_version} ktorego dashboard nie obsluguje. Zaktualizuj klienta WWW.`
