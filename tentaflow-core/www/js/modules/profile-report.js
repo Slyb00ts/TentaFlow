@@ -1784,16 +1784,30 @@ function domainOrder(key) {
 function renderSourcesTab(ctx) {
   const { report } = ctx;
   const collectors = report.collectors || [];
+
+  // Heurystyka: kolektor w kategorii wymagajacej elewacji + status Used ⇒ sudo
+  // dostarczone w czasie sesji. Pozwala uzupelnic kolumne "Reason" dla wierszy
+  // USED, zgodnie z mockupem (#12 — sudo provided przy linux.uncore.imc, rapl).
+  const elevationHintCategories = new Set(['ram bw', 'power', 'memory bandwidth']);
+  const elevationHintIdPatterns = /(rapl|uncore|imc|powermetrics|ebpf|perf\.pmu|perf\.kernel)/i;
+
   const rows = collectors.map((c) => {
     const s = normalizeCollectorStatus(c.status);
     const statusCls = s.kind === 'used' ? 'ok' : s.kind === 'skipped' ? 'warn' : s.kind === 'failed' ? 'bad' : 'lim';
     const statusLabel = s.kind.toUpperCase();
     const dim = s.kind === 'skipped' || s.kind === 'failed' ? ' class="dim"' : '';
+    let reason = s.reason || '';
+    if (!reason && s.kind === 'used') {
+      const cat = String(c.primary_category || '').toLowerCase();
+      if (elevationHintCategories.has(cat) || elevationHintIdPatterns.test(c.id || '')) {
+        reason = 'sudo provided';
+      }
+    }
     return `<tr${dim}>
       <td class="mono">${escape(c.id)}</td>
       <td>${escape(c.primary_category || '—')}</td>
       <td><span class="pr-src-status ${statusCls}">${escape(statusLabel)}</span></td>
-      <td>${escape(s.reason || '—')}</td>
+      <td>${escape(reason || '—')}</td>
       <td class="num mono">${c.samples_collected ? formatInt(c.samples_collected) : '—'}</td>
       <td class="num mono">${c.raw_size_bytes ? formatBytes(c.raw_size_bytes) : '—'}</td>
     </tr>`;
@@ -1803,17 +1817,59 @@ function renderSourcesTab(ctx) {
   const driftMs = (drift.max_observed_drift_ns || 0) / 1e6;
   const tolMs = (drift.tolerance_ns || 5_000_000) / 1e6;
   const driftOk = !drift.exceeded_tolerance;
-  const skippedCount = collectors.filter((c) => normalizeCollectorStatus(c.status).kind === 'skipped').length;
+  const perCollectorClocks = Array.isArray(drift.per_collector) ? drift.per_collector.length : 0;
+  // NTP "yes" tylko gdy mamy wiele zrodel czasu i drift jest dobrze wewnatrz tolerancji.
+  // W przeciwnym razie nie wiemy — pokazujemy "unknown" aby nie klamac.
+  const ntpKnownOk = perCollectorClocks >= 2 && drift.max_observed_drift_ns < (drift.tolerance_ns || 5_000_000) / 2;
 
-  const hasElevationCollectors = collectors.some((c) => normalizeCollectorStatus(c.status).kind === 'used' && /sudo|admin|elev/i.test(JSON.stringify(c)));
+  // Klasyfikacja kolektorow wedlug rodzaju powodu pominiecia. Bierzemy reason
+  // z normalizeCollectorStatus oraz oryginalny status enum (SkippedRequiresElevation).
+  let skippedElevation = 0;
+  let skippedUnavailable = 0;
+  let failed = 0;
+  let used = 0;
+  for (const c of collectors) {
+    const s = normalizeCollectorStatus(c.status);
+    if (s.kind === 'used') { used += 1; continue; }
+    if (s.kind === 'failed') { failed += 1; continue; }
+    if (s.kind !== 'skipped') continue;
+    const reason = (s.reason || '').toLowerCase();
+    if (reason === 'requires elevation' || reason.includes('cap_') || reason.includes('sudo') || reason.includes('admin')) {
+      skippedElevation += 1;
+    } else {
+      skippedUnavailable += 1;
+    }
+  }
+  const totalSkipped = skippedElevation + skippedUnavailable;
 
-  const rerunBtn = skippedCount > 0
-    ? `<tf-button variant="ghost" size="sm" data-action="rerun" aria-label="Re-run with elevation">Re-run with elevated permissions</tf-button>`
+  const sudoUsed = used > 0 && collectors.some((c) => {
+    if (normalizeCollectorStatus(c.status).kind !== 'used') return false;
+    const cat = String(c.primary_category || '').toLowerCase();
+    return elevationHintCategories.has(cat) || elevationHintIdPatterns.test(c.id || '');
+  });
+
+  const capPerfmonCls = skippedElevation > 0 ? 'warn' : 'muted';
+  const capPerfmonText = skippedElevation > 0 ? 'not set' : 'unknown';
+  const capBpfCls = skippedElevation > 0 ? 'warn' : 'muted';
+  const capBpfText = skippedElevation > 0 ? 'not set' : 'unknown';
+
+  const rerunBtn = totalSkipped > 0 || failed > 0
+    ? `<tf-button variant="ghost" size="sm" icon="refresh" data-action="rerun" aria-label="Re-run with elevation">Re-run with elevated permissions</tf-button>`
     : '';
+
+  // Drift summary alert: kontener .pr-alert ma teraz strukture .pr-alert-icon
+  // + .pr-alert-body, identyczna jak .alert-box w mockupie #12.
+  const alertCls = driftOk ? 'ok' : 'bad';
+  const alertIcon = driftOk
+    ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>`
+    : `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>`;
+  const alertBody = driftOk
+    ? `<strong>Within tolerance</strong> — cross-source correlation reliable.`
+    : `<strong>Exceeded tolerance</strong> — cross-source correlation unreliable; re-collect with NTP-synced clocks.`;
 
   return `
     <section class="pr-card">
-      <h2 class="pr-card-title">Collectors</h2>
+      <h2 class="pr-card-title">Collectors used</h2>
       <table class="pr-table">
         <thead><tr><th>ID</th><th>Category</th><th>Status</th><th>Reason</th><th class="num">Samples</th><th class="num">Raw size</th></tr></thead>
         <tbody>${rows}</tbody>
@@ -1824,10 +1880,10 @@ function renderSourcesTab(ctx) {
       <section class="pr-card">
         <h2 class="pr-card-title">Privilege summary</h2>
         <div class="pr-sp-list">
-          <div class="sp-item"><span class="sym">Sudo provided</span><span class="pct ${hasElevationCollectors ? 'ok' : 'warn'}">${hasElevationCollectors ? 'yes' : 'no / not tested'}</span></div>
+          <div class="sp-item"><span class="sym">Sudo provided</span><span class="pct ${sudoUsed ? 'ok' : 'warn'}">${sudoUsed ? 'yes (test passed)' : 'no / not tested'}</span></div>
           <div class="sp-item"><span class="sym">Admin (Windows)</span><span class="pct muted">n/a</span></div>
-          <div class="sp-item"><span class="sym">cap_perfmon</span><span class="pct warn">${skippedCount > 0 ? 'not set' : 'as needed'}</span></div>
-          <div class="sp-item"><span class="sym">cap_bpf</span><span class="pct warn">${skippedCount > 0 ? 'not set' : 'as needed'}</span></div>
+          <div class="sp-item"><span class="sym">cap_perfmon</span><span class="pct ${capPerfmonCls}">${capPerfmonText}</span></div>
+          <div class="sp-item"><span class="sym">cap_bpf</span><span class="pct ${capBpfCls}">${capBpfText}</span></div>
         </div>
         ${rerunBtn}
       </section>
@@ -1838,9 +1894,11 @@ function renderSourcesTab(ctx) {
           <div class="sp-item"><span class="sym">Max clock drift</span><span class="pct">${driftMs.toFixed(2)} ms</span></div>
           <div class="sp-item"><span class="sym">Tolerance</span><span class="pct">${tolMs.toFixed(1)} ms</span></div>
           <div class="sp-item"><span class="sym">Reference</span><span class="pct">CLOCK_MONOTONIC_RAW</span></div>
+          <div class="sp-item"><span class="sym">NTP-synced</span><span class="pct ${ntpKnownOk ? 'ok' : 'muted'}">${ntpKnownOk ? 'yes' : 'unknown'}</span></div>
         </div>
-        <div class="pr-alert ${driftOk ? 'ok' : 'bad'}">
-          <strong>${driftOk ? 'Within tolerance' : 'Exceeded tolerance'}</strong> — cross-source correlation ${driftOk ? 'reliable' : 'unreliable; re-collect with NTP-synced clocks'}.
+        <div class="pr-alert ${alertCls}">
+          <span class="pr-alert-icon">${alertIcon}</span>
+          <span class="pr-alert-body">${alertBody}</span>
         </div>
       </section>
     </div>
