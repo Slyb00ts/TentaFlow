@@ -303,6 +303,15 @@ impl MeshPeerStore {
         }
     }
 
+    /// Public entry point for callers that want to make a peer visible to GUI
+    /// as `TrustState::Discovered` without driving the connection state machine.
+    /// Used when an untrusted peer dials in over the mesh ALPN: their frames
+    /// are rejected by the gate, but they should still appear as a pairing
+    /// candidate in the dashboard.
+    pub fn ensure_in_registry(&self, node_id: &str) {
+        self.shadow_ensure(node_id);
+    }
+
     /// Ensure the registry has an entry for `node_id`. Used as a prelude to
     /// state-machine triggers that require the entry to already exist.
     fn shadow_ensure(&self, node_id: &str) {
