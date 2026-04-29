@@ -38,7 +38,9 @@ rdma-probe = []
 # Jedna flaga GPU per backend — wlacza akceleracje dla LLM (llama.cpp) i STT
 # (whisper). Duplicate ggml_* symbols rozwiazane przez
 # `-Wl,--allow-multiple-definition` w `.cargo/config.toml`.
-gpu-cuda = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/cuda", "whisper-rs/cuda"]
+# `dynamic-link` na CUDA: NVIDIA wycofala libcublas_static.a w CUDA 13, wiec
+# bez niego linker pada na "could not find native static library cublas_static".
+gpu-cuda = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/cuda", "llama-cpp-2/dynamic-link", "whisper-rs/cuda"]
 gpu-vulkan = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/vulkan", "whisper-rs/vulkan"]
 gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/hipblas"]
 gpu-metal = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/metal", "whisper-rs/metal"]
@@ -131,6 +133,8 @@ serde_yaml = "0.9.33"
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
 arc-swap = "1.7.1"
+smallvec = "1.13"
+rustc-hash = "2"
 
 # Utils
 uuid = { version = "1.23.1", features = ["v4"] }
@@ -198,6 +202,7 @@ hf-hub = "0.5.0"
 urlencoding = "2"
 url = "2"
 dirs = "6.0.0"
+subtle = "2"
 
 # Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
 netdev = "0.31"

@@ -96,6 +96,8 @@ impl MeshSecurity {
         }
 
         info!(
+            target: "mesh::identity",
+            ed25519_hex = %security.ed25519_public_key_hex(),
             public_key = %security.public_key_hex(),
             trusted_count = security.trusted_keys.len(),
             "MeshSecurity zainicjalizowany"

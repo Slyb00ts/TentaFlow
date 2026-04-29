@@ -5,6 +5,14 @@
 //          KPI math, downsampling, formatters, and SVG chart primitives.
 // =============================================================================
 
+import { I18n } from '/js/i18n.js';
+
+// Krotki helper i18n z fallbackiem.
+function ti(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
+
 // ---- Compact-series expander ------------------------------------------------
 //
 // The fixture (and the future API) ships a compact representation under
@@ -15,8 +23,26 @@
 // For real reports the API is expected to ship `events[]` directly; in that
 // case we just pass through.
 
+// Wasm-glue eksponuje event.category jako snake_case (np. "ram_sample"), ale
+// caly downstream code (profile-report.js, profile-timeline.js, profile-range)
+// porownuje przeciwko PascalCase ("RamSample"). Normalizujemy raz na wejsciu.
+function snakeToPascal(s) {
+  if (!s || typeof s !== 'string') return s;
+  if (/[A-Z]/.test(s)) return s; // juz PascalCase
+  return s.split('_').map((p) => p ? (p[0].toUpperCase() + p.slice(1)) : '').join('');
+}
+
+function normalizeEventCategories(events) {
+  if (!Array.isArray(events)) return events;
+  for (const e of events) {
+    if (e && typeof e.category === 'string') e.category = snakeToPascal(e.category);
+  }
+  return events;
+}
+
 export function expandCompactSeries(report) {
   if (Array.isArray(report.events) && report.events.length > 0) {
+    normalizeEventCategories(report.events);
     return report;
   }
   const cs = report._compact_series;
@@ -694,8 +720,8 @@ export function buildQuickFindings(events, devices, durationNs, names) {
       const cpuTop = computeKpiCpu(events, names);
       findings.push({
         kind: 'warn',
-        title: `GPU ${d.device_id} idle ${pct.toFixed(0)}% of session — possible CPU bottleneck`,
-        detail: `${cpuTop.topSymbol} (${cpuTop.topPct.toFixed(1)}%) saturates host while GPU stream waits. Consider pipelining or moving hot path to GPU.`,
+        title: ti('profiling.report.finding_gpu_idle_title', { id: d.device_id, pct: pct.toFixed(0) }, `GPU ${d.device_id} idle ${pct.toFixed(0)}% of session — possible CPU bottleneck`),
+        detail: ti('profiling.report.finding_gpu_idle_detail', { sym: cpuTop.topSymbol, pct: cpuTop.topPct.toFixed(1) }, `${cpuTop.topSymbol} (${cpuTop.topPct.toFixed(1)}%) saturates host while GPU stream waits. Consider pipelining or moving hot path to GPU.`),
       });
       break;
     }
@@ -715,10 +741,11 @@ export function buildQuickFindings(events, devices, durationNs, names) {
       const mins = Math.floor(t / 60);
       const secs = Math.floor(t % 60);
       const deviceLabel = (max.p.deviceNameId !== undefined && names[max.p.deviceNameId]) || `disk${max.e.lane_hint ?? ''}`;
+      const time = `${mins}:${String(secs).padStart(2, '0')}`;
       findings.push({
         kind: 'info',
-        title: `Disk write spike at ${mins}:${String(secs).padStart(2, '0')} on ${deviceLabel}`,
-        detail: `${formatBytesPerSec(max.p.write_bps)} burst — likely correlates with checkpoint save NVTX range.`,
+        title: ti('profiling.report.finding_disk_spike_title', { time, device: deviceLabel }, `Disk write spike at ${time} on ${deviceLabel}`),
+        detail: ti('profiling.report.finding_disk_spike_detail', { val: formatBytesPerSec(max.p.write_bps) }, `${formatBytesPerSec(max.p.write_bps)} burst — likely correlates with checkpoint save NVTX range.`),
       });
     }
   }
@@ -734,8 +761,8 @@ export function buildQuickFindings(events, devices, durationNs, names) {
       const pct = (saturated / bw.length) * 100;
       findings.push({
         kind: 'warn',
-        title: `RAM bandwidth saturated ${pct.toFixed(0)}% of time`,
-        detail: `Read+write peaked above 85% of the DDR5-6000 ceiling. Memory-bound kernels likely.`,
+        title: ti('profiling.report.finding_ram_bw_title', { pct: pct.toFixed(0) }, `RAM bandwidth saturated ${pct.toFixed(0)}% of time`),
+        detail: ti('profiling.report.finding_ram_bw_detail', null, 'Read+write peaked above 85% of the DDR5-6000 ceiling. Memory-bound kernels likely.'),
       });
     }
   }
@@ -744,8 +771,8 @@ export function buildQuickFindings(events, devices, durationNs, names) {
   if (devices.length >= 2) {
     findings.push({
       kind: 'bad',
-      title: 'Cross-vendor dispatch is sequential, not concurrent',
-      detail: `GPU 0 (${devices[0].vendor}) and GPU 1 (${devices[1].vendor}) appear to alternate rather than overlap. Parallelize via separate streams for potential speedup.`,
+      title: ti('profiling.report.finding_cross_vendor_title', null, 'Cross-vendor dispatch is sequential, not concurrent'),
+      detail: ti('profiling.report.finding_cross_vendor_detail', { va: devices[0].vendor, vb: devices[1].vendor }, `GPU 0 (${devices[0].vendor}) and GPU 1 (${devices[1].vendor}) appear to alternate rather than overlap. Parallelize via separate streams for potential speedup.`),
     });
   }
 
@@ -1015,20 +1042,31 @@ export function vendorBadge(vendor) {
 
 // ---- Collector status helpers -----------------------------------------------
 
-// Status enum is rkyv-tagged. We normalize to { kind, reason }.
+// Wasm-glue emituje status jako `{ kind: 'used'|'skipped_requires_elevation'|
+// 'skipped_unavailable'|'failed', reason?: string }`. Backward-compat:
+// dopuszczamy tez stary PascalCase rkyv-tagged kszt­alt `{ Used: ... }`.
 export function normalizeCollectorStatus(status) {
   if (!status) return { kind: 'unknown', reason: '' };
   if (typeof status === 'string') return { kind: status.toLowerCase(), reason: '' };
-  if (typeof status === 'object') {
-    const keys = Object.keys(status);
-    if (keys.length === 0) return { kind: 'unknown', reason: '' };
-    const k = keys[0];
-    const v = status[k];
-    if (k === 'Used') return { kind: 'used', reason: '' };
-    if (k === 'SkippedUnavailable') return { kind: 'skipped', reason: typeof v === 'string' ? v : 'unavailable' };
-    if (k === 'SkippedRequiresElevation') return { kind: 'skipped', reason: 'requires elevation' };
-    if (k === 'Failed') return { kind: 'failed', reason: typeof v === 'string' ? v : 'failed' };
+  if (typeof status !== 'object') return { kind: 'unknown', reason: '' };
+  // Nowy ksztalt z wasm-glue.
+  if (typeof status.kind === 'string') {
+    const k = status.kind.toLowerCase();
+    if (k === 'used') return { kind: 'used', reason: '' };
+    if (k === 'skipped_requires_elevation') return { kind: 'skipped', reason: 'requires elevation' };
+    if (k === 'skipped_unavailable') return { kind: 'skipped', reason: status.reason || 'unavailable' };
+    if (k === 'failed') return { kind: 'failed', reason: status.reason || 'failed' };
+    return { kind: k, reason: status.reason || '' };
   }
+  // Legacy PascalCase fallback.
+  const keys = Object.keys(status);
+  if (keys.length === 0) return { kind: 'unknown', reason: '' };
+  const k = keys[0];
+  const v = status[k];
+  if (k === 'Used') return { kind: 'used', reason: '' };
+  if (k === 'SkippedUnavailable') return { kind: 'skipped', reason: typeof v === 'string' ? v : 'unavailable' };
+  if (k === 'SkippedRequiresElevation') return { kind: 'skipped', reason: 'requires elevation' };
+  if (k === 'Failed') return { kind: 'failed', reason: typeof v === 'string' ? v : 'failed' };
   return { kind: 'unknown', reason: '' };
 }
 

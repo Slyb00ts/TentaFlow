@@ -3,7 +3,7 @@
 // Opis: Typy protokolu dla inference vision (face detection / age+gender /
 //       emotion). Spakowane jako jeden `VisionInferPayload` enum z 2 parami
 //       request/response — zeby zaoszczedzic sloty w MessageBody (rkyv 0.8
-//       ma twardy limit 256 wariantow w enumie). Patrn `NsightPayload`.
+//       ma twardy limit 256 wariantow w enumie). Patrn `ProfilingPayload`.
 // =============================================================================
 
 use rkyv::{Archive, Deserialize, Serialize};
@@ -98,7 +98,7 @@ pub struct VisionInferResponse {
     pub latency_ms: u64,
 }
 
-/// Inner-enum pack — jeden slot w MessageBody. Patrz NsightPayload jako wzor.
+/// Inner-enum pack — jeden slot w MessageBody. Patrz ProfilingPayload jako wzor.
 #[derive(
     Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]

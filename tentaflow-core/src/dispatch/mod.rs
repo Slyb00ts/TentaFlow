@@ -337,51 +337,37 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MeshTrustEventPayload::Revoked(_) => "MeshTrustRevoked",
             tentaflow_protocol::MeshTrustEventPayload::KeysSync(_) => "MeshTrustedKeysSync",
         },
-        MessageBody::NsightBody(p) => match p {
-            tentaflow_protocol::NsightPayload::StartRequest(_) => "NsightStartRequest",
-            tentaflow_protocol::NsightPayload::StartResponse(_) => "NsightStartResponse",
-            tentaflow_protocol::NsightPayload::StopRequest(_) => "NsightStopRequest",
-            tentaflow_protocol::NsightPayload::StopResponse(_) => "NsightStopResponse",
-            tentaflow_protocol::NsightPayload::SessionsRequest(_) => "NsightSessionsRequest",
-            tentaflow_protocol::NsightPayload::SessionsResponse(_) => "NsightSessionsResponse",
-            tentaflow_protocol::NsightPayload::ReportRequest(_) => "NsightReportRequest",
-            tentaflow_protocol::NsightPayload::ReportResponse(_) => "NsightReportResponse",
-            tentaflow_protocol::NsightPayload::DeleteRequest(_) => "NsightDeleteRequest",
-            tentaflow_protocol::NsightPayload::DeleteResponse(_) => "NsightDeleteResponse",
-            tentaflow_protocol::NsightPayload::DownloadRequest(_) => "NsightDownloadRequest",
-            tentaflow_protocol::NsightPayload::DownloadResponse(_) => "NsightDownloadResponse",
-            tentaflow_protocol::NsightPayload::Profiling(p) => match p {
-                tentaflow_protocol::ProfilingPayload::StartRequest(_) => "ProfilingStartRequest",
-                tentaflow_protocol::ProfilingPayload::StartResponse(_) => "ProfilingStartResponse",
-                tentaflow_protocol::ProfilingPayload::StopRequest(_) => "ProfilingStopRequest",
-                tentaflow_protocol::ProfilingPayload::StopResponse(_) => "ProfilingStopResponse",
-                tentaflow_protocol::ProfilingPayload::SessionsRequest(_) => {
-                    "ProfilingSessionsRequest"
-                }
-                tentaflow_protocol::ProfilingPayload::SessionsResponse(_) => {
-                    "ProfilingSessionsResponse"
-                }
-                tentaflow_protocol::ProfilingPayload::ReportRequest(_) => "ProfilingReportRequest",
-                tentaflow_protocol::ProfilingPayload::ReportResponse(_) => {
-                    "ProfilingReportResponse"
-                }
-                tentaflow_protocol::ProfilingPayload::DeleteRequest(_) => "ProfilingDeleteRequest",
-                tentaflow_protocol::ProfilingPayload::DeleteResponse(_) => {
-                    "ProfilingDeleteResponse"
-                }
-                tentaflow_protocol::ProfilingPayload::DownloadRequest(_) => {
-                    "ProfilingDownloadRequest"
-                }
-                tentaflow_protocol::ProfilingPayload::DownloadResponse(_) => {
-                    "ProfilingDownloadResponse"
-                }
-                tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(_) => {
-                    "ProfilingActiveInfoRequest"
-                }
-                tentaflow_protocol::ProfilingPayload::ActiveInfoResponse(_) => {
-                    "ProfilingActiveInfoResponse"
-                }
-            },
+        MessageBody::ProfilingBody(p) => match p {
+            tentaflow_protocol::ProfilingPayload::StartRequest(_) => "ProfilingStartRequest",
+            tentaflow_protocol::ProfilingPayload::StartResponse(_) => "ProfilingStartResponse",
+            tentaflow_protocol::ProfilingPayload::StopRequest(_) => "ProfilingStopRequest",
+            tentaflow_protocol::ProfilingPayload::StopResponse(_) => "ProfilingStopResponse",
+            tentaflow_protocol::ProfilingPayload::SessionsRequest(_) => "ProfilingSessionsRequest",
+            tentaflow_protocol::ProfilingPayload::SessionsResponse(_) => "ProfilingSessionsResponse",
+            tentaflow_protocol::ProfilingPayload::ReportRequest(_) => "ProfilingReportRequest",
+            tentaflow_protocol::ProfilingPayload::ReportResponse(_) => "ProfilingReportResponse",
+            tentaflow_protocol::ProfilingPayload::DeleteRequest(_) => "ProfilingDeleteRequest",
+            tentaflow_protocol::ProfilingPayload::DeleteResponse(_) => "ProfilingDeleteResponse",
+            tentaflow_protocol::ProfilingPayload::DownloadRequest(_) => "ProfilingDownloadRequest",
+            tentaflow_protocol::ProfilingPayload::DownloadResponse(_) => "ProfilingDownloadResponse",
+            tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(_) => {
+                "ProfilingActiveInfoRequest"
+            }
+            tentaflow_protocol::ProfilingPayload::ActiveInfoResponse(_) => {
+                "ProfilingActiveInfoResponse"
+            }
+            tentaflow_protocol::ProfilingPayload::ValidateSudoRequest(_) => {
+                "ProfilingValidateSudoRequest"
+            }
+            tentaflow_protocol::ProfilingPayload::ValidateSudoResponse(_) => {
+                "ProfilingValidateSudoResponse"
+            }
+            tentaflow_protocol::ProfilingPayload::CollectorsStatusRequest(_) => {
+                "ProfilingCollectorsStatusRequest"
+            }
+            tentaflow_protocol::ProfilingPayload::CollectorsStatusResponse(_) => {
+                "ProfilingCollectorsStatusResponse"
+            }
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",

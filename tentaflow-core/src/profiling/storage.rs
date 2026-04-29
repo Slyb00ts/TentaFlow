@@ -1,367 +1,742 @@
 // =============================================================================
-// Plik: profiling/storage.rs
-// Opis: FIFO storage sesji Nsight per nod — alokacja katalogu sesji, zapis
-//       summary.bin (rkyv ProfileReport), listing, rotacja MAX 20 sesji,
-//       walidacja path traversal po session_id.
+// Plik: profiling/storage.rs — multi-source profiling session storage.
+// Opis: Layout per sesja:
+//   <TENTAFLOW_HOME>/profiling/<node_id>/<session_id>/
+//   ├── manifest.json     (serde JSON, operator-readable)
+//   ├── summary.bin       (rkyv ProfileReportV2)
+//   ├── flamegraph.bin    (optional, side-data — owned by CPU sampling parser)
+//   └── raw/<collector_id>/<artifact files...>
+//
+// Path traversal jest odrzucana w kazdym entry-poincie: node_id, session_id i
+// collector_id sa walidowane regexami przed jakakolwiek operacja FS.
+// Rekurencyjne liczenie rozmiaru sluzy do egzekwowania per-session size cap
+// (1 GiB) oraz FIFO 20 sesji per node.
 // =============================================================================
 
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use regex::Regex;
-use std::sync::LazyLock;
-use tentaflow_protocol::profiling::{
-    NsightScope, NsightSessionEntry, NsightSessionStatus, ProfileReport,
-};
+use tentaflow_protocol::profiling::{validate_collector_id, ProfileReportV2};
+use tokio::fs;
 
-use super::nsys::ProfilingError;
+// -----------------------------------------------------------------------------
+// Constants & validators
+// -----------------------------------------------------------------------------
 
-/// Maksymalna liczba sesji trzymana per nod — najstarsze usuwane przez `rotate()`.
-pub const MAX_SESSIONS_PER_NODE: usize = 20;
+/// FIFO retention per node — newest N sessions are kept, the rest deleted.
+pub const DEFAULT_FIFO_LIMIT: usize = 20;
 
-/// Regex dla session_id — UUIDv4 simple (32 hex), z minimum 16 dla testow.
-/// Tylko lowercase hex, blokuje "..", "/" i wszystko poza alfabetem hex.
+/// Per-session disk budget: 1 GiB. Enforced after `write_session` plus on demand.
+pub const DEFAULT_PER_SESSION_SIZE_CAP: u64 = 1u64 << 30;
+
+/// Schema version embedded in `SessionManifest`.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+
 static SESSION_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-f0-9]{16,32}$").expect("valid session id regex"));
 
-fn validate_session_id(s: &str) -> Result<(), ProfilingError> {
+static NODE_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").expect("valid node id regex"));
+
+fn check_session_id(s: &str) -> Result<(), StorageError> {
     if SESSION_ID_RE.is_match(s) {
         Ok(())
     } else {
-        Err(ProfilingError::InvalidSessionId)
+        Err(StorageError::InvalidSessionId(s.to_string()))
     }
 }
 
-/// Storage sesji — root layout: `<root>/<node_id>/<session_id>/{report.nsys-rep, summary.bin}`.
-#[derive(Clone)]
+fn check_node_id(s: &str) -> Result<(), StorageError> {
+    if NODE_ID_RE.is_match(s) {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidNodeId(s.to_string()))
+    }
+}
+
+fn check_collector_id(s: &str) -> Result<(), StorageError> {
+    validate_collector_id(s).map_err(|_| StorageError::InvalidCollectorId(s.to_string()))
+}
+
+// -----------------------------------------------------------------------------
+// Error type
+// -----------------------------------------------------------------------------
+
+#[derive(thiserror::Error, Debug)]
+pub enum StorageError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid session id: {0}")]
+    InvalidSessionId(String),
+    #[error("invalid node id: {0}")]
+    InvalidNodeId(String),
+    #[error("invalid collector id: {0}")]
+    InvalidCollectorId(String),
+    #[error("manifest parse: {0}")]
+    ManifestParse(String),
+    #[error("rkyv: {0}")]
+    Rkyv(String),
+    #[error("session size cap exceeded: {actual} > {cap}")]
+    SizeCapExceeded { actual: u64, cap: u64 },
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("path traversal attempt: {0}")]
+    PathTraversal(String),
+}
+
+// -----------------------------------------------------------------------------
+// Manifest types (serde JSON, NOT rkyv)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    MultiSource,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkippedCollector {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionManifest {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub label: String,
+    pub node_id: String,
+    pub kind: SessionKind,
+    /// RFC3339 (UTC).
+    pub started_at: String,
+    pub duration_ns: u64,
+    /// Free-form serialization of `ProfileScope` to keep manifest forward-compatible.
+    pub scope: serde_json::Value,
+    pub collectors_used: Vec<String>,
+    pub collectors_skipped: Vec<SkippedCollector>,
+    pub size_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+/// Slim entry returned from `list_sessions`.
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    pub session_id: String,
+    pub label: String,
+    pub started_at: String,
+    pub duration_ns: u64,
+    pub kind: SessionKind,
+    pub collectors_used: Vec<String>,
+    pub size_bytes: u64,
+}
+
+// -----------------------------------------------------------------------------
+// Storage
+// -----------------------------------------------------------------------------
+
 pub struct ProfileStorage {
     root: PathBuf,
-    node_id: String,
+    fifo_limit: usize,
+    per_session_size_cap: u64,
 }
 
 impl ProfileStorage {
-    /// `data_dir` to katalog danych aplikacji (np. `tentaflow_home`); pod nim
-    /// powstaje `nsight/<node_id>/`.
-    pub fn new(data_dir: &Path, node_id: &str) -> Self {
+    pub fn new(tentaflow_home: &Path) -> Self {
+        Self::new_with_limits(
+            tentaflow_home,
+            DEFAULT_FIFO_LIMIT,
+            DEFAULT_PER_SESSION_SIZE_CAP,
+        )
+    }
+
+    pub fn new_with_limits(
+        tentaflow_home: &Path,
+        fifo_limit: usize,
+        per_session_size_cap: u64,
+    ) -> Self {
         Self {
-            root: data_dir.join("nsight"),
-            node_id: node_id.to_string(),
+            root: tentaflow_home.join("profiling"),
+            fifo_limit,
+            per_session_size_cap,
         }
     }
 
-    fn node_dir(&self) -> PathBuf {
-        self.root.join(&self.node_id)
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn fifo_limit(&self) -> usize {
+        self.fifo_limit
+    }
+    pub fn per_session_size_cap(&self) -> u64 {
+        self.per_session_size_cap
     }
 
-    fn session_dir(&self, session_id: &str) -> Result<PathBuf, ProfilingError> {
-        validate_session_id(session_id)?;
-        Ok(self.node_dir().join(session_id))
+    fn node_dir(&self, node_id: &str) -> Result<PathBuf, StorageError> {
+        check_node_id(node_id)?;
+        Ok(self.root.join(node_id))
     }
 
-    /// Alokuje nowy katalog sesji i zwraca `(session_id, scieżka do .nsys-rep)`.
-    /// `.nsys-rep` jeszcze nie istnieje — zostanie utworzony przez `nsys profile`.
-    pub fn allocate(
+    fn session_dir_path(&self, node_id: &str, session_id: &str) -> Result<PathBuf, StorageError> {
+        check_session_id(session_id)?;
+        Ok(self.node_dir(node_id)?.join(session_id))
+    }
+
+    /// Returns directory for a session, creating it on demand.
+    pub async fn session_dir(
         &self,
-        _label: &str,
-        _scope: &NsightScope,
-    ) -> Result<(String, PathBuf), ProfilingError> {
-        // UUIDv4 simple: 32 lowercase hex bez kresek — zgodny z naszym regexem.
-        let session_id = uuid::Uuid::new_v4().simple().to_string();
-        let dir = self.session_dir(&session_id)?;
-        fs::create_dir_all(&dir)?;
-        let rep_path = dir.join("report.nsys-rep");
-        Ok((session_id, rep_path))
-    }
-
-    /// Pelna sciezka do pliku `.nsys-rep` po walidacji session_id.
-    pub fn raw_report_path(&self, session_id: &str) -> Result<PathBuf, ProfilingError> {
-        let dir = self.session_dir(session_id)?;
-        Ok(dir.join("report.nsys-rep"))
-    }
-
-    /// Zapis raportu rkyv do `<session>/summary.bin`.
-    pub fn write_summary(
-        &self,
+        node_id: &str,
         session_id: &str,
-        report: &ProfileReport,
-    ) -> Result<(), ProfilingError> {
-        let dir = self.session_dir(session_id)?;
-        fs::create_dir_all(&dir)?;
+    ) -> Result<PathBuf, StorageError> {
+        let dir = self.session_dir_path(node_id, session_id)?;
+        fs::create_dir_all(&dir).await?;
+        Ok(dir)
+    }
+
+    /// Returns `raw/<collector_id>/` inside the session directory, creating it.
+    pub async fn collector_raw_dir(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        collector_id: &str,
+    ) -> Result<PathBuf, StorageError> {
+        check_collector_id(collector_id)?;
+        let session_dir = self.session_dir(node_id, session_id).await?;
+        let raw = session_dir.join("raw").join(collector_id);
+        fs::create_dir_all(&raw).await?;
+        // Anti-traversal: resolved path must stay under the session dir.
+        ensure_under(&session_dir, &raw).await?;
+        Ok(raw)
+    }
+
+    /// Path to optional flamegraph side-table; not created on call.
+    pub fn flamegraph_path(&self, node_id: &str, session_id: &str) -> PathBuf {
+        // Validation deferred to actual fs operations; this method is a pure path builder.
+        self.root
+            .join(node_id)
+            .join(session_id)
+            .join("flamegraph.bin")
+    }
+
+    /// Persist manifest + summary, then compute total size and rewrite manifest.
+    pub async fn write_session(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        manifest: &SessionManifest,
+        report: &ProfileReportV2,
+    ) -> Result<(), StorageError> {
+        let dir = self.session_dir(node_id, session_id).await?;
+
+        // 1) Write summary first; manifest size_bytes will include it.
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(report)
-            .map_err(|e| ProfilingError::Parse(format!("rkyv encode: {e}")))?;
-        fs::write(dir.join("summary.bin"), bytes.as_ref())?;
+            .map_err(|e| StorageError::Rkyv(format!("encode: {e}")))?;
+        fs::write(dir.join("summary.bin"), bytes.as_ref()).await?;
+
+        // 2) Write manifest with placeholder size, then update.
+        let mut manifest = manifest.clone();
+        manifest.schema_version = MANIFEST_SCHEMA_VERSION;
+        manifest.session_id = session_id.to_string();
+        manifest.node_id = node_id.to_string();
+        let json = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| StorageError::ManifestParse(format!("encode: {e}")))?;
+        fs::write(dir.join("manifest.json"), &json).await?;
+
+        let total = compute_dir_size(&dir).await?;
+        manifest.size_bytes = total;
+        let json = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| StorageError::ManifestParse(format!("encode: {e}")))?;
+        fs::write(dir.join("manifest.json"), &json).await?;
+
         Ok(())
     }
 
-    /// Odczyt raportu rkyv z `<session>/summary.bin`. Gdy plik nie istnieje
-    /// (sesja na liscie, ale parser .nsys-rep -> summary.bin nie zakonczyl
-    /// sie sukcesem, albo sesja zostala czesciowo skasowana po rotacji),
-    /// zwracamy NotFound z konkretna informacja jaki plik brakuje, zamiast
-    /// generycznego IO error 2 ktore w GUI widac jako 'Internal' bez kontekstu.
-    pub fn read_summary(&self, session_id: &str) -> Result<ProfileReport, ProfilingError> {
-        let dir = self.session_dir(session_id)?;
-        let summary_path = dir.join("summary.bin");
-        if !summary_path.exists() {
-            // Sprawdz czy mamy raw .nsys-rep — to znaczy ze nagranie sie udalo
-            // ale parser/eksport padl. Daj user'owi konkretny feedback.
-            let raw_path = dir.join("report.nsys-rep");
-            let hint = if raw_path.exists() {
-                format!(
-                    "sesja {} ma raw report.nsys-rep ale brak summary.bin - parser nsys export prawdopodobnie padl. \
-                     Pobierz raw przez NsightDownload (przycisk 'Pobierz' w GUI) i otworz lokalnie w Nsight Systems",
-                    session_id
-                )
-            } else {
-                format!(
-                    "sesja {} nie ma summary.bin ani report.nsys-rep - prawdopodobnie skasowana przez rotacje (FIFO 20 sesji per nod) \
-                     albo sesja byla przerwana przed write. Odswiez liste sesji.",
-                    session_id
-                )
-            };
-            return Err(ProfilingError::NotFound(hint));
-        }
-        let bytes = fs::read(&summary_path)?;
-        rkyv::from_bytes::<ProfileReport, rkyv::rancor::Error>(&bytes)
-            .map_err(|e| ProfilingError::Parse(format!("rkyv decode: {e}")))
-    }
-
-    /// Lista sesji posortowana desc po `started_at_ms`. Sesje bez `summary.bin`
-    /// (np. w trakcie nagrywania albo przerwane) sa pominiete w listingu.
-    pub fn list(&self) -> Result<Vec<NsightSessionEntry>, ProfilingError> {
-        let dir = self.node_dir();
+    /// List sessions sorted by `started_at` desc.
+    pub async fn list_sessions(&self, node_id: &str) -> Result<Vec<SessionEntry>, StorageError> {
+        let dir = self.node_dir(node_id)?;
         if !dir.exists() {
             return Ok(Vec::new());
         }
-
-        let mut entries: Vec<NsightSessionEntry> = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        let mut out: Vec<SessionEntry> = Vec::new();
+        let mut rd = fs::read_dir(&dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if validate_session_id(&name).is_err() {
+            if check_session_id(&name).is_err() {
                 continue;
             }
-            let session_dir = entry.path();
-            let summary_path = session_dir.join("summary.bin");
-            if !summary_path.exists() {
+            // Skip sessions without manifest (in-progress / crashed).
+            let mp = entry.path().join("manifest.json");
+            if !mp.exists() {
                 continue;
             }
-            let report = match self.read_summary(&name) {
-                Ok(r) => r,
+            // Skip sessions bez summary.bin - to oznacza ze stop() nie ukonczyl
+            // zapisu (proces tentaflow zabity, panic, OOM itp.). Pokazywanie ich
+            // w liscie powoduje "Failed to load report: NotFound" gdy user kliknie.
+            // Active session jest pokazywana w banner'ze (osobny code path),
+            // nie przez list_sessions.
+            let sp = entry.path().join("summary.bin");
+            if !sp.exists() {
+                continue;
+            }
+            match self.read_manifest(node_id, &name).await {
+                Ok(m) => out.push(SessionEntry {
+                    session_id: m.session_id.clone(),
+                    label: m.label.clone(),
+                    started_at: m.started_at.clone(),
+                    duration_ns: m.duration_ns,
+                    kind: m.kind.clone(),
+                    collectors_used: m.collectors_used.clone(),
+                    size_bytes: m.size_bytes,
+                }),
                 Err(_) => continue,
-            };
-            let rep_size = fs::metadata(session_dir.join("report.nsys-rep"))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            entries.push(NsightSessionEntry {
-                session_id: name,
-                label: report.meta.label,
-                scope: report.meta.scope,
-                status: NsightSessionStatus::Done,
-                started_at_ms: report.meta.started_at_ms,
-                duration_ms: report.meta.duration_ms,
-                size_bytes: rep_size,
-                error: None,
-            });
-        }
-
-        entries.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
-        Ok(entries)
-    }
-
-    /// Usuwa katalog konkretnej sesji. Wykonuje canonicalize i sprawdza, ze
-    /// rozwiazana sciezka nadal jest pod `<root>/<node_id>/` (ochrona przed
-    /// ewentualnym path traversal jezeli regex sie kiedys popsuje).
-    pub fn delete(&self, session_id: &str) -> Result<(), ProfilingError> {
-        let dir = self.session_dir(session_id)?;
-        if !dir.exists() {
-            return Err(ProfilingError::NotFound(session_id.to_string()));
-        }
-        let canon = fs::canonicalize(&dir)?;
-        let node_canon = fs::canonicalize(self.node_dir())?;
-        if !canon.starts_with(&node_canon) {
-            return Err(ProfilingError::InvalidSessionId);
-        }
-        fs::remove_dir_all(&canon)?;
-        Ok(())
-    }
-
-    /// Usuwa najstarsze sesje powyzej limitu `MAX_SESSIONS_PER_NODE`. Jako
-    /// kryterium wieku uzywa `started_at_ms` zapisanego w summary.bin.
-    /// Drugi pass sprzata "osierocone" katalogi sesji (alokowane, ale `nsys`
-    /// padl przed zapisem `summary.bin`) starsze niz 1h, zeby disk nie rosl
-    /// w nieskonczonosc po crashach.
-    pub fn rotate(&self) -> Result<(), ProfilingError> {
-        let entries = self.list()?;
-        if entries.len() > MAX_SESSIONS_PER_NODE {
-            for old in entries.iter().skip(MAX_SESSIONS_PER_NODE) {
-                let _ = self.delete(&old.session_id);
             }
         }
-        self.rotate_orphans()?;
-        Ok(())
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(out)
     }
 
-    fn rotate_orphans(&self) -> Result<(), ProfilingError> {
-        let dir = self.node_dir();
+    pub async fn read_manifest(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<SessionManifest, StorageError> {
+        let dir = self.session_dir_path(node_id, session_id)?;
+        let p = dir.join("manifest.json");
+        if !p.exists() {
+            return Err(StorageError::NotFound(format!(
+                "manifest.json for {session_id}"
+            )));
+        }
+        let bytes = fs::read(&p).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StorageError::ManifestParse(format!("decode: {e}")))
+    }
+
+    pub async fn read_report(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<ProfileReportV2, StorageError> {
+        let dir = self.session_dir_path(node_id, session_id)?;
+        let p = dir.join("summary.bin");
+        if !p.exists() {
+            return Err(StorageError::NotFound(format!(
+                "summary.bin for {session_id}"
+            )));
+        }
+        let bytes = fs::read(&p).await?;
+        rkyv::from_bytes::<ProfileReportV2, rkyv::rancor::Error>(&bytes)
+            .map_err(|e| StorageError::Rkyv(format!("decode: {e}")))
+    }
+
+    /// Idempotent: delete a session directory if it exists.
+    pub async fn delete_session(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<(), StorageError> {
+        let dir = self.session_dir_path(node_id, session_id)?;
         if !dir.exists() {
             return Ok(());
         }
-        let now = std::time::SystemTime::now();
-        let stale_threshold = std::time::Duration::from_secs(3600);
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if validate_session_id(&name).is_err() {
-                continue;
-            }
-            let session_dir = entry.path();
-            if session_dir.join("summary.bin").exists() {
-                continue;
-            }
-            let mtime = match fs::metadata(&session_dir).and_then(|m| m.modified()) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let age = now.duration_since(mtime).unwrap_or_default();
-            if age >= stale_threshold {
-                let _ = fs::remove_dir_all(&session_dir);
-            }
-        }
+        // Resolve and ensure the path stays under the node dir.
+        let node_dir = self.node_dir(node_id)?;
+        ensure_under(&node_dir, &dir).await?;
+        fs::remove_dir_all(&dir).await?;
         Ok(())
     }
+
+    /// Keep newest `fifo_limit` sessions per node; delete older ones.
+    /// Returns count of deleted sessions.
+    pub async fn enforce_fifo(&self, node_id: &str) -> Result<usize, StorageError> {
+        let entries = self.list_sessions(node_id).await?;
+        if entries.len() <= self.fifo_limit {
+            return Ok(0);
+        }
+        let mut deleted = 0usize;
+        for old in entries.iter().skip(self.fifo_limit) {
+            if self.delete_session(node_id, &old.session_id).await.is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    pub async fn compute_session_size(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<u64, StorageError> {
+        let dir = self.session_dir_path(node_id, session_id)?;
+        if !dir.exists() {
+            return Err(StorageError::NotFound(session_id.to_string()));
+        }
+        compute_dir_size(&dir).await
+    }
+
+    /// Drops largest `raw/<collector>/` subdirectories until the session fits the cap.
+    /// Whole subdirs are removed (raw artifacts cannot be safely truncated mid-file).
+    pub async fn enforce_size_cap(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<u64, StorageError> {
+        let dir = self.session_dir_path(node_id, session_id)?;
+        let cap = self.per_session_size_cap;
+        let mut total = compute_dir_size(&dir).await?;
+        if total <= cap {
+            return Ok(total);
+        }
+
+        let raw_root = dir.join("raw");
+        if raw_root.exists() {
+            // Collect (size, path) for each collector subdir.
+            let mut subdirs: Vec<(u64, PathBuf)> = Vec::new();
+            let mut rd = fs::read_dir(&raw_root).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                if entry.file_type().await?.is_dir() {
+                    let p = entry.path();
+                    let s = compute_dir_size(&p).await?;
+                    subdirs.push((s, p));
+                }
+            }
+            // Largest first.
+            subdirs.sort_by_key(|(sz, _)| std::cmp::Reverse(*sz));
+            for (sz, p) in subdirs {
+                if total <= cap {
+                    break;
+                }
+                if fs::remove_dir_all(&p).await.is_ok() {
+                    total = total.saturating_sub(sz);
+                }
+            }
+        }
+
+        if total > cap {
+            return Err(StorageError::SizeCapExceeded { actual: total, cap });
+        }
+        // Recompute exactly post-removal so the manifest can be refreshed by the caller.
+        let exact = compute_dir_size(&dir).await?;
+        Ok(exact)
+    }
 }
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+async fn compute_dir_size(dir: &Path) -> Result<u64, StorageError> {
+    // Whole walk runs on the blocking pool: sessions with thousands of raw
+    // files would otherwise issue thousands of `tokio::fs` calls (each
+    // `spawn_blocking` round-trip) and stall the runtime worker.
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || compute_dir_size_sync(&dir))
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("join: {e}"))))?
+}
+
+fn compute_dir_size_sync(dir: &Path) -> Result<u64, StorageError> {
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    let mut total: u64 = 0;
+    while let Some(d) = stack.pop() {
+        let rd = match std::fs::read_dir(&d) {
+            Ok(r) => r,
+            // A symlink or vanished entry should not abort accounting.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let md = std::fs::symlink_metadata(entry.path())?;
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                // Skip symlinks — anti-traversal guard, also prevents double counting.
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Ensure that `child` resolves to a path strictly under `parent` (anti path-traversal).
+async fn ensure_under(parent: &Path, child: &Path) -> Result<(), StorageError> {
+    let parent_canon = fs::canonicalize(parent).await.map_err(StorageError::Io)?;
+    let child_canon = fs::canonicalize(child).await.map_err(StorageError::Io)?;
+    if !child_canon.starts_with(&parent_canon) {
+        return Err(StorageError::PathTraversal(
+            child.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tentaflow_protocol::profiling::{NsightScope, ProfileKpi, ProfileMeta, ProfileReport};
+    use tempfile::TempDir;
+    use tentaflow_protocol::profiling::{
+        CollectorRunInfo, CollectorStatus, DriftReport, EventCategory, EventPayload, GpuTargets,
+        ProfileScope, ProfileSourceFlags, ProfileTarget, TimelineEvent,
+        PROFILE_REPORT_V2_SCHEMA_VERSION,
+    };
 
-    fn dummy_report(session_id: &str, started_at_ms: u64) -> ProfileReport {
-        ProfileReport {
-            meta: ProfileMeta {
-                session_id: session_id.to_string(),
-                label: "t".to_string(),
-                scope: NsightScope::Cpu,
-                hostname: "h".to_string(),
-                started_at_ms,
-                duration_ms: 100,
-                nsys_version: "0".to_string(),
-                gpu_targets: Vec::new(),
-            },
-            kpi: ProfileKpi::default(),
-            gpu_kernels_top: Vec::new(),
-            cuda_api_top: Vec::new(),
-            gpu_mem_ops: Vec::new(),
-            cpu_samples_top: Vec::new(),
-            nvtx_ranges_top: Vec::new(),
-            gpu_util_timeline: Vec::new(),
-        }
-    }
-
-    fn make_storage() -> (tempfile::TempDir, ProfileStorage) {
+    fn make_storage() -> (TempDir, ProfileStorage) {
         let tmp = tempfile::tempdir().unwrap();
-        let st = ProfileStorage::new(tmp.path(), "node-test");
+        let st = ProfileStorage::new(tmp.path());
         (tmp, st)
     }
 
-    #[test]
-    fn storage_session_id_traversal() {
-        let (_tmp, st) = make_storage();
-        let err = st.delete("../../../etc/passwd").unwrap_err();
-        assert!(matches!(err, ProfilingError::InvalidSessionId));
-    }
-
-    #[test]
-    fn storage_session_id_dotdot() {
-        let (_tmp, st) = make_storage();
-        let err = st.read_summary("..").unwrap_err();
-        assert!(matches!(err, ProfilingError::InvalidSessionId));
-    }
-
-    #[test]
-    fn storage_session_id_valid_uuid() {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        assert!(validate_session_id(&id).is_ok());
-    }
-
-    #[test]
-    fn storage_session_id_too_short() {
-        let err = validate_session_id("abc12345").unwrap_err();
-        assert!(matches!(err, ProfilingError::InvalidSessionId));
-    }
-
-    #[test]
-    fn storage_session_id_uppercase() {
-        let err = validate_session_id("ABCDEF0123456789abcdef0123456789").unwrap_err();
-        assert!(matches!(err, ProfilingError::InvalidSessionId));
-    }
-
-    #[test]
-    fn storage_write_read_summary_round_trip() {
-        let (_tmp, st) = make_storage();
-        let (sid, _path) = st.allocate("lbl", &NsightScope::Cpu).unwrap();
-        let rep = dummy_report(&sid, 1234);
-        st.write_summary(&sid, &rep).unwrap();
-        let read = st.read_summary(&sid).unwrap();
-        assert_eq!(read, rep);
-    }
-
-    #[test]
-    fn storage_rotate_removes_old_orphans() {
-        // Osierocony katalog (bez summary.bin) starszy niz 1h ma byc usuniety
-        // przez rotate(); mlodszy musi pozostac.
-        let (tmp, st) = make_storage();
-        // Symuluj alokacje: 2 katalogi sesji bez summary.bin.
-        let (sid_old, rep_old) = st.allocate("x", &NsightScope::Cpu).unwrap();
-        let (sid_new, rep_new) = st.allocate("x", &NsightScope::Cpu).unwrap();
-        // Zapisz dummy report.nsys-rep w obu (1MB nie jest wymagany, byle plik istnial).
-        std::fs::write(&rep_old, b"dummy").unwrap();
-        std::fs::write(&rep_new, b"dummy").unwrap();
-
-        // Cofnij mtime starszego katalogu o 2h.
-        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-        let ft = filetime::FileTime::from_system_time(two_hours_ago);
-        let old_dir = tmp.path().join("nsight").join("node-test").join(&sid_old);
-        filetime::set_file_mtime(&old_dir, ft).unwrap();
-
-        st.rotate().unwrap();
-
-        let new_dir = tmp.path().join("nsight").join("node-test").join(&sid_new);
-        assert!(
-            !old_dir.exists(),
-            "stary osierocony katalog powinien byc usuniety"
-        );
-        assert!(new_dir.exists(), "swiezy osierocony katalog ma pozostac");
-    }
-
-    #[test]
-    fn storage_fifo_rotation() {
-        let (_tmp, st) = make_storage();
-        // Tworz 25 sesji z rosnacym started_at_ms zeby kolejnosc desc byla deterministyczna.
-        let mut ids = Vec::new();
-        for i in 0..25 {
-            let (sid, _p) = st.allocate("x", &NsightScope::Cpu).unwrap();
-            let rep = dummy_report(&sid, 1_000 + i as u64);
-            st.write_summary(&sid, &rep).unwrap();
-            ids.push(sid);
+    fn sample_scope() -> ProfileScope {
+        ProfileScope {
+            sources: ProfileSourceFlags(ProfileSourceFlags::GPU),
+            gpu_targets: GpuTargets::All,
+            cpu_sampling_hz: 99,
+            target: ProfileTarget::SystemWide,
+            duration_seconds: 0,
+            label: "lbl".into(),
         }
+    }
 
-        let listing = st.list().unwrap();
-        assert_eq!(listing.len(), 25);
-
-        st.rotate().unwrap();
-        let after = st.list().unwrap();
-        assert_eq!(after.len(), MAX_SESSIONS_PER_NODE);
-
-        // 5 najstarszych (i=0..5, started_at_ms=1000..1005) powinno byc usunietych.
-        for sid in &ids[0..5] {
-            assert!(st.read_summary(sid).is_err());
+    fn sample_report_v2(session: &str, node: &str) -> ProfileReportV2 {
+        ProfileReportV2 {
+            schema_version: PROFILE_REPORT_V2_SCHEMA_VERSION,
+            session_id: session.into(),
+            node_id: node.into(),
+            scope: sample_scope(),
+            t0_monotonic_ns: 0,
+            t0_wallclock_unix_ns: 0,
+            duration_ns: 1_000_000,
+            collectors: vec![CollectorRunInfo {
+                id: "nvidia.nsys.gpu".into(),
+                status: CollectorStatus::Used,
+                samples_collected: 1,
+                raw_size_bytes: 0,
+                primary_category: EventCategory::GpuKernel,
+                duration_ns: 1_000_000,
+            }],
+            events: vec![TimelineEvent {
+                source_idx: 0,
+                t_start_ns: 0,
+                t_end_ns: 100,
+                category: EventCategory::GpuKernel,
+                lane_hint: 0,
+                payload: EventPayload::GpuKernel {
+                    device_id: 0,
+                    name_id: 0,
+                    grid: [1, 1, 1],
+                    block: [1, 1, 1],
+                    shared_mem_bytes: 0,
+                },
+            }],
+            frames: Vec::new(),
+            stacks: Vec::new(),
+            names: vec!["k".into()],
+            drift_report: DriftReport::empty(),
+            warnings: Vec::new(),
         }
+    }
+
+    fn sample_manifest(
+        session: &str,
+        node: &str,
+        started_at: &str,
+        kind: SessionKind,
+    ) -> SessionManifest {
+        SessionManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            session_id: session.into(),
+            label: "label".into(),
+            node_id: node.into(),
+            kind,
+            started_at: started_at.into(),
+            duration_ns: 1_000_000,
+            scope: serde_json::to_value(sample_scope()).unwrap(),
+            collectors_used: vec!["nvidia.nsys.gpu".into()],
+            collectors_skipped: Vec::new(),
+            size_bytes: 0,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_dir_creates_validated() {
+        let (_tmp, st) = make_storage();
+        let p = st.session_dir("node-1", "deadbeefdeadbeef").await.unwrap();
+        assert!(p.exists());
+        assert!(p.ends_with("profiling/node-1/deadbeefdeadbeef"));
+    }
+
+    #[tokio::test]
+    async fn session_dir_rejects_bad_session_id() {
+        let (_tmp, st) = make_storage();
+        let err = st.session_dir("node-1", "bad-id").await.unwrap_err();
+        assert!(matches!(err, StorageError::InvalidSessionId(_)));
+    }
+
+    #[tokio::test]
+    async fn session_dir_rejects_path_traversal_node() {
+        let (_tmp, st) = make_storage();
+        let err = st
+            .session_dir("../../../etc", "deadbeefdeadbeef")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidNodeId(_)));
+    }
+
+    #[tokio::test]
+    async fn collector_raw_dir_creates_subdir() {
+        let (_tmp, st) = make_storage();
+        let p = st
+            .collector_raw_dir("node-1", "deadbeefdeadbeef", "nvidia.nsys.gpu")
+            .await
+            .unwrap();
+        assert!(p.exists());
+        assert!(p.ends_with("raw/nvidia.nsys.gpu"));
+    }
+
+    #[tokio::test]
+    async fn write_and_read_session_round_trip() {
+        let (_tmp, st) = make_storage();
+        let sid = "deadbeefdeadbeef";
+        let node = "node-1";
+        let report = sample_report_v2(sid, node);
+        let manifest = sample_manifest(sid, node, "2026-04-28T10:00:00Z", SessionKind::MultiSource);
+        st.write_session(node, sid, &manifest, &report)
+            .await
+            .unwrap();
+        let m = st.read_manifest(node, sid).await.unwrap();
+        assert_eq!(m.session_id, sid);
+        assert_eq!(m.kind, SessionKind::MultiSource);
+        assert!(m.size_bytes > 0);
+        let r = st.read_report(node, sid).await.unwrap();
+        assert_eq!(r.session_id, sid);
+        assert_eq!(r.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_sorted_desc() {
+        let (_tmp, st) = make_storage();
+        let node = "node-1";
+        let triples = [
+            ("aaaaaaaaaaaaaaaa", "2026-04-28T10:00:00Z"),
+            ("bbbbbbbbbbbbbbbb", "2026-04-28T12:00:00Z"),
+            ("cccccccccccccccc", "2026-04-28T11:00:00Z"),
+        ];
+        for (sid, ts) in &triples {
+            let r = sample_report_v2(sid, node);
+            let m = sample_manifest(sid, node, ts, SessionKind::MultiSource);
+            st.write_session(node, sid, &m, &r).await.unwrap();
+        }
+        let list = st.list_sessions(node).await.unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].session_id, "bbbbbbbbbbbbbbbb");
+        assert_eq!(list[1].session_id, "cccccccccccccccc");
+        assert_eq!(list[2].session_id, "aaaaaaaaaaaaaaaa");
+    }
+
+    #[tokio::test]
+    async fn delete_session_idempotent() {
+        let (_tmp, st) = make_storage();
+        let sid = "deadbeefdeadbeef";
+        let node = "node-1";
+        st.session_dir(node, sid).await.unwrap();
+        st.delete_session(node, sid).await.unwrap();
+        st.delete_session(node, sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enforce_fifo_keeps_newest_n() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = ProfileStorage::new_with_limits(tmp.path(), 20, DEFAULT_PER_SESSION_SIZE_CAP);
+        let node = "node-1";
+        for i in 0..25u32 {
+            // 16 hex chars; encode i in last 4 to keep them unique.
+            let sid = format!("{:0>12x}{:0>4x}", i, i);
+            let ts = format!("2026-04-28T10:{:02}:00Z", i);
+            let r = sample_report_v2(&sid, node);
+            let m = sample_manifest(&sid, node, &ts, SessionKind::MultiSource);
+            st.write_session(node, &sid, &m, &r).await.unwrap();
+        }
+        assert_eq!(st.list_sessions(node).await.unwrap().len(), 25);
+        let deleted = st.enforce_fifo(node).await.unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(st.list_sessions(node).await.unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn compute_session_size_recursive() {
+        let (_tmp, st) = make_storage();
+        let node = "node-1";
+        let sid = "deadbeefdeadbeef";
+        let raw_a = st
+            .collector_raw_dir(node, sid, "nvidia.nsys.gpu")
+            .await
+            .unwrap();
+        let raw_b = st
+            .collector_raw_dir(node, sid, "linux.proc.cpu_util")
+            .await
+            .unwrap();
+        fs::write(raw_a.join("file1"), vec![0u8; 1000])
+            .await
+            .unwrap();
+        fs::write(raw_b.join("file2"), vec![0u8; 500])
+            .await
+            .unwrap();
+        let total = st.compute_session_size(node, sid).await.unwrap();
+        assert_eq!(total, 1500);
+    }
+
+    #[tokio::test]
+    async fn enforce_size_cap_removes_largest_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Cap chosen so that 6 KiB + 5 KiB exceeds cap, but 5 KiB alone fits.
+        let st = ProfileStorage::new_with_limits(tmp.path(), 20, 8 * 1024);
+        let node = "node-1";
+        let sid = "deadbeefdeadbeef";
+        let big = st
+            .collector_raw_dir(node, sid, "linux.rapl.power")
+            .await
+            .unwrap();
+        let small = st
+            .collector_raw_dir(node, sid, "nvidia.nsys.gpu")
+            .await
+            .unwrap();
+        fs::write(big.join("big.bin"), vec![0u8; 6 * 1024])
+            .await
+            .unwrap();
+        fs::write(small.join("small.bin"), vec![0u8; 5 * 1024])
+            .await
+            .unwrap();
+        let new_total = st.enforce_size_cap(node, sid).await.unwrap();
+        assert!(new_total <= 8 * 1024);
+        assert!(!big.exists(), "largest raw subdir must be removed");
+        assert!(small.exists(), "smaller raw subdir must remain");
+    }
+
+    #[tokio::test]
+    async fn enforce_size_cap_returns_err_if_still_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = ProfileStorage::new_with_limits(tmp.path(), 20, 1024);
+        let node = "node-1";
+        let sid = "deadbeefdeadbeef";
+        // Place a huge file directly inside session dir (NOT in raw/), so size cap cannot be reduced.
+        let dir = st.session_dir(node, sid).await.unwrap();
+        fs::write(dir.join("summary.bin"), vec![0u8; 4096])
+            .await
+            .unwrap();
+        let err = st.enforce_size_cap(node, sid).await.unwrap_err();
+        assert!(matches!(err, StorageError::SizeCapExceeded { .. }));
     }
 }

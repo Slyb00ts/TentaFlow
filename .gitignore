@@ -11,6 +11,9 @@ bin/
 *.dll
 *.exe
 *.wasm
+# wyjątek: glue wasm dla protocol codec — komitujemy żeby production deploy
+# nie wymagał lokalnego cargo build do wygenerowania bindings
+!tentaflow-core/www/js/protocol/wasm_glue_bg.wasm
 
 # Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
 .build/
@@ -22,12 +25,6 @@ DerivedData/
 # Wygenerowany manifest serwisow dla GUI (build.rs produkuje przy kompilacji)
 tentaflow-core/www/js/generated/
 tentaflow-core/wwwroot/js/generated/
-
-# Wygenerowany wasm-bindgen glue dla protocol codec (build.rs produkuje)
-tentaflow-core/www/js/protocol/wasm_glue.js
-tentaflow-core/www/js/protocol/wasm_glue_bg.wasm
-tentaflow-core/wwwroot/js/protocol/wasm_glue.js
-tentaflow-core/wwwroot/js/protocol/wasm_glue_bg.wasm
 
 # Wygenerowany cbindgen header dla .NET P/Invoke
 tentaflow-client/native/include/

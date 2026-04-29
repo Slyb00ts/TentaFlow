@@ -1,7 +1,7 @@
 // =============================================================================
 // File: multi_source.rs — Orchestrator that runs multiple ProfileCollectors in
 // parallel, merges their TimelineEvents into a single ProfileReportV2, and
-// persists via ProfileStorageV2.
+// persists via ProfileStorage.
 // =============================================================================
 
 use std::collections::HashMap;
@@ -24,8 +24,8 @@ use crate::profiling::collectors::{
     CollectorParser, CollectorRegistry, ElevationKind, ElevationToken, FrameInterner, FrameKey,
     NameInterner, ProbeResult, ProfileCollector, RunningCollector, SessionCtx,
 };
-use crate::profiling::storage_v2::{
-    ProfileStorageV2, SessionKind, SessionManifest, SkippedCollector, StorageError,
+use crate::profiling::storage::{
+    ProfileStorage, SessionKind, SessionManifest, SkippedCollector, StorageError,
 };
 
 // -----------------------------------------------------------------------------
@@ -104,73 +104,30 @@ impl ParserRegistry {
         // NVIDIA Nsight Systems SQLite parser.
         r.register("nvidia.nsys.gpu".to_string(), Arc::new(c::NvidiaNsysParser));
         // Linux no-priv parsers.
-        r.register(
-            "linux.proc.cpu_util".to_string(),
-            Arc::new(c::linux::cpu_util::LinuxProcCpuUtilParser),
-        );
-        r.register(
-            "linux.proc.ram".to_string(),
-            Arc::new(c::linux::ram::LinuxProcRamParser),
-        );
-        r.register(
-            "linux.iostat.disk".to_string(),
-            Arc::new(c::linux::disk::LinuxIostatDiskParser),
-        );
-        r.register(
-            "linux.rapl.power".to_string(),
-            Arc::new(c::linux::rapl_power::LinuxRaplPowerParser),
-        );
-        r.register(
-            "linux.nvsmi.gpu_util".to_string(),
-            Arc::new(c::linux::nvsmi_gpu::LinuxNvsmiGpuParser),
-        );
+        r.register("linux.proc.cpu_util".to_string(), Arc::new(c::linux::cpu_util::LinuxProcCpuUtilParser));
+        r.register("linux.perf.cpu_sampling".to_string(), Arc::new(c::linux::perf_sampling::LinuxPerfSamplingParser));
+        r.register("linux.perf.pmu_counters".to_string(), Arc::new(c::linux::perf_counters::LinuxPerfCountersParser));
+        r.register("linux.proc.ram".to_string(), Arc::new(c::linux::ram::LinuxProcRamParser));
+        r.register("linux.iostat.disk".to_string(), Arc::new(c::linux::disk::LinuxIostatDiskParser));
+        r.register("linux.rapl.power".to_string(), Arc::new(c::linux::rapl_power::LinuxRaplPowerParser));
+        r.register("linux.nvsmi.gpu_util".to_string(), Arc::new(c::linux::nvsmi_gpu::LinuxNvsmiGpuParser));
+        r.register("linux.netdev".to_string(), Arc::new(c::linux::netdev::LinuxNetdevParser));
+        r.register("linux.proc.top_processes".to_string(), Arc::new(c::linux::top_processes::LinuxTopProcessesParser));
+        r.register("linux.uncore.imc".to_string(), Arc::new(c::linux::uncore_imc::LinuxUncoreImcParser));
         // Linux GPU vendor parsers.
-        r.register(
-            "linux.rocsmi.gpu_util".to_string(),
-            Arc::new(c::linux_gpu::rocsmi_util::LinuxRocmSmiGpuParser),
-        );
-        r.register(
-            "linux.rocprof.gpu_kernels".to_string(),
-            Arc::new(c::linux_gpu::rocprof_kernels::LinuxRocprofKernelsParser),
-        );
-        r.register(
-            "linux.intel_gpu_top.gpu".to_string(),
-            Arc::new(c::linux_gpu::intel_gpu_top::LinuxIntelGpuTopParser),
-        );
+        r.register("linux.rocsmi.gpu_util".to_string(), Arc::new(c::linux_gpu::rocsmi_util::LinuxRocmSmiGpuParser));
+        r.register("linux.rocprof.gpu_kernels".to_string(), Arc::new(c::linux_gpu::rocprof_kernels::LinuxRocprofKernelsParser));
+        r.register("linux.intel_gpu_top.gpu".to_string(), Arc::new(c::linux_gpu::intel_gpu_top::LinuxIntelGpuTopParser));
         // macOS parsers.
-        r.register(
-            "macos.vm_stat.ram".to_string(),
-            Arc::new(c::macos::vm_stat_ram::MacosVmStatRamParser),
-        );
-        r.register(
-            "macos.iostat.disk".to_string(),
-            Arc::new(c::macos::iostat_disk::MacosIostatDiskParser),
-        );
-        r.register(
-            "macos.powermetrics.power".to_string(),
-            Arc::new(c::macos::powermetrics_power::MacosPowermetricsPowerParser),
-        );
-        r.register(
-            "macos.powermetrics.gpu".to_string(),
-            Arc::new(c::macos::powermetrics_gpu::MacosPowermetricsGpuParser),
-        );
+        r.register("macos.vm_stat.ram".to_string(), Arc::new(c::macos::vm_stat_ram::MacosVmStatRamParser));
+        r.register("macos.iostat.disk".to_string(), Arc::new(c::macos::iostat_disk::MacosIostatDiskParser));
+        r.register("macos.powermetrics.power".to_string(), Arc::new(c::macos::powermetrics_power::MacosPowermetricsPowerParser));
+        r.register("macos.powermetrics.gpu".to_string(), Arc::new(c::macos::powermetrics_gpu::MacosPowermetricsGpuParser));
         // Windows PDH parsers.
-        r.register(
-            "windows.pdh.cpu_util".to_string(),
-            Arc::new(c::windows::pdh_cpu_util::WindowsPdhCpuUtilParser),
-        );
-        r.register(
-            "windows.pdh.ram".to_string(),
-            Arc::new(c::windows::pdh_ram::WindowsPdhRamParser),
-        );
-        r.register(
-            "windows.pdh.disk".to_string(),
-            Arc::new(c::windows::pdh_disk::WindowsPdhDiskParser),
-        );
-        r.register(
-            "windows.pdh.gpu".to_string(),
-            Arc::new(c::windows::pdh_gpu::WindowsPdhGpuParser),
-        );
+        r.register("windows.pdh.cpu_util".to_string(), Arc::new(c::windows::pdh_cpu_util::WindowsPdhCpuUtilParser));
+        r.register("windows.pdh.ram".to_string(), Arc::new(c::windows::pdh_ram::WindowsPdhRamParser));
+        r.register("windows.pdh.disk".to_string(), Arc::new(c::windows::pdh_disk::WindowsPdhDiskParser));
+        r.register("windows.pdh.gpu".to_string(), Arc::new(c::windows::pdh_gpu::WindowsPdhGpuParser));
         r
     }
 }
@@ -216,14 +173,14 @@ struct ActiveSessionState {
 // -----------------------------------------------------------------------------
 
 pub struct MultiSourceSession {
-    storage: Arc<ProfileStorageV2>,
+    storage: Arc<ProfileStorage>,
     registry: Arc<CollectorRegistry>,
     active: Mutex<Option<ActiveSessionState>>,
     epoch_counter: AtomicU64,
 }
 
 impl MultiSourceSession {
-    pub fn new(storage: Arc<ProfileStorageV2>, registry: Arc<CollectorRegistry>) -> Arc<Self> {
+    pub fn new(storage: Arc<ProfileStorage>, registry: Arc<CollectorRegistry>) -> Arc<Self> {
         Arc::new(Self {
             storage,
             registry,
@@ -489,14 +446,25 @@ impl MultiSourceSession {
             }
         };
 
-        // Cancel watchdog if pending. Awaiting the JoinHandle is best-effort.
+        // Cancel watchdog if pending. Sygnal przez oneshot jest wystarczajacy:
+        //   - jezeli watchdog jeszcze spi w sleep -> cancel_rx.recv wybudza go,
+        //     wybiera cancel branch, exit czysto (NIE wywoluje stop()).
+        //   - jezeli watchdog wlasnie odpala stop() -> oneshot.send() failuje
+        //     (channel zamkniety przy drop'ie cancel_rx) ale to OK - jestesmy
+        //     juz w stop() tej samej sesji, robimy reszte work'u.
+        //
+        // CRITICAL: NIE wywolujemy wd.handle.abort()! Gdy stop() jest wywolane
+        // przez watchdog (auto-stop), wd.handle to JoinHandle TEGO task'u.
+        // abort() killuje biezacy task przy najblizszym .await -> reszta stop()
+        // (collector merge + write_session) NIGDY nie sie wykona -> summary.bin
+        // nie zapisany -> sesja "Failed to load report: NotFound summary.bin".
+        // Drop'owanie WatchdogControl bez abort detacha task; on dokonczy swoj
+        // select branch i exit'uje czysto.
         if let Some(mut wd) = state.watchdog {
             if let Some(tx) = wd.cancel_tx.take() {
                 let _ = tx.send(());
             }
-            // If the watchdog is the caller (auto-stop), the join is on the same task —
-            // we cannot await ourselves. Detach instead.
-            wd.handle.abort();
+            drop(wd);
         }
 
         let duration_ns = state.t0_instant.elapsed().as_nanos() as u64;
@@ -508,10 +476,8 @@ impl MultiSourceSession {
         // Phase 1: stop every collector concurrently on the blocking pool.
         // For 17 collectors with 50–500 ms shutdown cost each this turns a
         // sequential ~8 s tail into the time of the slowest single stop.
-        let mut stop_set: JoinSet<(
-            String,
-            Result<crate::profiling::collectors::RawCapture, String>,
-        )> = JoinSet::new();
+        let mut stop_set: JoinSet<(String, Result<crate::profiling::collectors::RawCapture, String>)> =
+            JoinSet::new();
         for (id, handle) in state.running {
             stop_set.spawn_blocking(move || {
                 let res = match handle.stop() {
@@ -728,8 +694,10 @@ impl MultiSourceSession {
                         local_stacks,
                     } = fragment;
 
-                    let name_remap: Vec<u32> =
-                        local_names.iter().map(|s| final_names.intern(s)).collect();
+                    let name_remap: Vec<u32> = local_names
+                        .iter()
+                        .map(|s| final_names.intern(s))
+                        .collect();
                     let frame_remap: Vec<u32> = local_frames
                         .into_iter()
                         .map(|f| final_frames.intern_frame(FrameKey::from(f)))
@@ -737,8 +705,10 @@ impl MultiSourceSession {
                     let stack_remap: Vec<u32> = local_stacks
                         .into_iter()
                         .map(|s| {
-                            let translated: Vec<u32> =
-                                s.into_iter().map(|fid| frame_remap[fid as usize]).collect();
+                            let translated: Vec<u32> = s
+                                .into_iter()
+                                .map(|fid| frame_remap[fid as usize])
+                                .collect();
                             final_frames.intern_stack(translated)
                         })
                         .collect();
@@ -1221,7 +1191,7 @@ mod tests {
         Arc<ParserRegistry>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let registry = Arc::new(CollectorRegistry::new());
         let parsers = Arc::new(ParserRegistry::new());
         let orch = MultiSourceSession::new(storage, Arc::clone(&registry));
@@ -1289,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn start_already_active_returns_already_active() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_cpu("mock.cpu"));
         let registry = Arc::new(reg);
@@ -1343,7 +1313,7 @@ mod tests {
     #[tokio::test]
     async fn start_filters_unavailable_collectors_to_none_available() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(
             MockCollector::new_cpu("mock.cpu").with_probe(ProbeResult::Unavailable {
@@ -1371,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn start_skips_needs_elevation_when_no_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_cpu("mock.cpu_a"));
         reg.register(MockCollector::new_cpu("mock.cpu_b").with_probe(
@@ -1404,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn start_uses_elevation_when_token_provided() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(
             MockCollector::new_cpu("mock.cpu").with_probe(ProbeResult::NeedsElevation {
@@ -1436,7 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn start_all_collectors_fail_returns_all_failed() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         let failing = Arc::new(
             (*MockCollector::new_cpu("mock.cpu_fail"))
@@ -1486,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn stop_returns_assembled_report_with_merged_events() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu_a"));
         reg.register(MockCollector::new_gpu("mock.gpu_b"));
@@ -1543,7 +1513,7 @@ mod tests {
     #[tokio::test]
     async fn stop_persists_via_storage() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1577,7 +1547,7 @@ mod tests {
     #[tokio::test]
     async fn abort_removes_session_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1605,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn stale_handle_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1637,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn watchdog_auto_stops_after_duration() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1715,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn merge_dedupes_names_and_remaps_event_ids() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.a"));
         reg.register(MockCollector::new_gpu("mock.b"));
@@ -1771,7 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn merge_preserves_event_categories() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1814,7 +1784,7 @@ mod tests {
     #[tokio::test]
     async fn is_active_and_info_during_session() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);

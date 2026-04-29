@@ -85,6 +85,39 @@ pub struct RouteResult<T> {
 // ============================================================================
 
 impl Router {
+    /// Czy `name` jest znanym serwisem (po service_name) w jakimkolwiek
+    /// rejestrze backendow.
+    fn is_known_service(&self, name: &str) -> bool {
+        self.service_manager.has_quic_llm_service(name)
+            || self.service_manager.has_http_backends(name)
+            || self.service_manager.has_rag_service(name)
+            || self.service_manager.has_local_inference_service(name)
+            || self.service_manager.has_quic_stt_service(name)
+            || self.service_manager.has_quic_tts_service(name)
+            || self.service_manager.has_quic_embedding_service(name)
+    }
+
+    /// Probuje rozwinac target aliasu na service_name'y. Gdy target jest
+    /// nazwa modelu HF (z dropdown w GUI), `model_pool` zna mapping
+    /// model->service. Pusty target ani nieznane nazwy nie sa rozwijane —
+    /// wraca lista jednoelementowa zeby kolejne kroki dispatch_with_fallback
+    /// mogly zachowac sie tak jak przed fixem.
+    fn expand_alias_target(&self, target: String) -> Vec<String> {
+        if target.is_empty() || self.is_known_service(&target) {
+            return vec![target];
+        }
+        if let Some(svcs) = self.service_manager.resolve_model_services(&target) {
+            if !svcs.is_empty() {
+                debug!(
+                    "resolve_route: alias target '{}' rozwiniety przez model_pool -> {:?}",
+                    target, svcs
+                );
+                return svcs;
+            }
+        }
+        vec![target]
+    }
+
     /// Rozwiazuje nazwe modelu na liste targetow i strategie.
     ///
     /// Kolejnosc:
@@ -110,14 +143,7 @@ impl Router {
         }
 
         // 2. Znany serwis
-        if self.service_manager.has_quic_llm_service(model)
-            || self.service_manager.has_http_backends(model)
-            || self.service_manager.has_rag_service(model)
-            || self.service_manager.has_local_inference_service(model)
-            || self.service_manager.has_quic_stt_service(model)
-            || self.service_manager.has_quic_tts_service(model)
-            || self.service_manager.has_quic_embedding_service(model)
-        {
+        if self.is_known_service(model) {
             return ResolvedRoute {
                 targets: vec![model.to_string()],
                 strategy: PoolStrategy::FirstAvailable,
@@ -128,15 +154,28 @@ impl Router {
         {
             let cache = self.alias_cache.read();
             if let Some(db_alias) = cache.get(model) {
-                let mut targets = vec![db_alias.target_model.clone()];
+                let mut raw_targets = vec![db_alias.target_model.clone()];
                 if let Some(ref fallbacks) = db_alias.fallback_targets {
                     for fb in fallbacks.split(',') {
                         let fb = fb.trim();
                         if !fb.is_empty() {
-                            targets.push(fb.to_string());
+                            raw_targets.push(fb.to_string());
                         }
                     }
                 }
+                // GUI w modalu aliasu wypelnia dropdown nazwami modeli HF
+                // (z `collect_local_models`/mesh services), nie service_name'ami.
+                // Backendy HTTP/QUIC sa rejestrowane pod service_name (patrz
+                // `register_dynamic_http_backend`), a mapping HF->service zyje
+                // w `model_pool`. Bez ekspansji `get_backends(<model HF>)`
+                // zwraca pustke i caller dostaje ModelNotFound. Rozwijamy
+                // tylko gdy target nie jest ani znanym serwisem ani pusty —
+                // jesli cos rozwinelo sie przez model_pool, podstawiamy
+                // service_name'y.
+                let targets: Vec<String> = raw_targets
+                    .into_iter()
+                    .flat_map(|t| self.expand_alias_target(t))
+                    .collect();
                 let strategy = db_alias
                     .strategy
                     .as_deref()

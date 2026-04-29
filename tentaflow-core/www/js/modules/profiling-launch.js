@@ -15,6 +15,7 @@ import {
 } from '/js/lib/profile-permissions-store.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
+import { I18n } from '/js/i18n.js';
 
 // ProfileSourceFlags bity (zgodnie z tentaflow-protocol/src/profiling.rs).
 const SOURCE_FLAGS = {
@@ -76,6 +77,33 @@ function escapeHtml(s) {
 }
 
 function escapeAttr(s) { return escapeHtml(s); }
+
+// Mapowanie GPU source -> vendor badge wedlug mockup (kolory akcentu).
+// nvidia.* -> NV (zielony NV), amd.*/rocm.*/rocprof.* -> A (czerwony AMD),
+// intel.* -> I (niebieski Intel), apple.*/macos.powermetrics.gpu -> M3.
+function sourceVendor(src) {
+  const id = String(src.id || '').toLowerCase();
+  if (id.includes('nvidia') || id.includes('nsys') || id.includes('nvsmi')) return { cls: 'nv', label: 'NV' };
+  if (id.includes('amd') || id.includes('rocm') || id.includes('rocprof') || id.includes('rocsmi')) return { cls: 'amd', label: 'A' };
+  if (id.includes('intel') || id.includes('xpu')) return { cls: 'intel', label: 'I' };
+  if (id.includes('apple') || id.includes('macos.powermetrics.gpu')) return { cls: 'apple', label: 'M3' };
+  return null;
+}
+
+// Niewielka ikonka SVG dla source bez vendor-badge. Wybor scieżki path zalezy
+// od kategorii (CPU=quad, RAM=stick, Disk=cylinder, Power=lightning,
+// Network=nodes, Other=lista).
+function sourceIconPath(src) {
+  const cat = categorizeSource(src);
+  switch (cat) {
+    case 'CPU': return 'M6 6h12v12H6z M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3';
+    case 'RAM': return 'M3 6h18v12H3z M7 6V4M11 6V4M15 6V4M19 6V4';
+    case 'Disk': return 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3v12c0 1.7-3.6 3-8 3s-8-1.3-8-3z';
+    case 'Power': return 'M12 2L4 7v10l8 5 8-5V7z';
+    case 'Network': return 'M12 9a3 3 0 0 1 3 3 3 3 0 0 1-3 3 3 3 0 0 1-3-3 3 3 0 0 1 3-3z';
+    default: return 'M3 6h18M3 12h18M3 18h18';
+  }
+}
 
 // Heuristic estymaty storage + overhead na podstawie wybranych sources.
 function estimateImpact(selectedSources, durationSec) {
@@ -153,17 +181,21 @@ export class ProfilingLaunchModal {
    * @param {object} opts
    * @param {string} opts.nodeId
    * @param {Array} opts.availableSources [{ id, label, description, status, vendor?, deviceIndex?, requiresElevation }]
+   * @param {object=} opts.preselectGpu { deviceIndex, vendor? } — gdy podane,
+   *        modal startuje z zaznaczonym tylko jednym source'em GPU (tym
+   *        dotyczacym `deviceIndex`). User moze nadal odznaczyc/zaznaczyc
+   *        cokolwiek przed startem.
    * @param {Function=} opts.onLaunched callback wolany po sukcesie
    */
-  static async open({ nodeId, availableSources, onLaunched }) {
+  static async open({ nodeId, availableSources, preselectGpu, onLaunched }) {
     if (!Array.isArray(availableSources) || availableSources.length === 0) {
       throw new Error('availableSources must be a non-empty array');
     }
-    const ctrl = new ProfilingLaunchModal(nodeId, availableSources, onLaunched);
+    const ctrl = new ProfilingLaunchModal(nodeId, availableSources, onLaunched, preselectGpu);
     return ctrl._run();
   }
 
-  constructor(nodeId, availableSources, onLaunched) {
+  constructor(nodeId, availableSources, onLaunched, preselectGpu = null) {
     this.nodeId = nodeId;
     // Filter out sources globalnie wylaczone w Profile Permissions (per browser).
     // Unavailable po stronie backendu zostawiamy zeby user widzial dlaczego cos
@@ -171,11 +203,15 @@ export class ProfilingLaunchModal {
     const disabled = new Set(getDisabledSources());
     this.sources = availableSources.filter((s) => !disabled.has(s.id));
     this.onLaunched = typeof onLaunched === 'function' ? onLaunched : null;
+    this.preselectGpu = preselectGpu && Number.isInteger(preselectGpu.deviceIndex)
+      ? preselectGpu
+      : null;
 
     // state
     this.selected = new Set(); // ids
     this.label = '';
-    this.durationSec = 60;
+    // Domyślny czas sesji 5 min (zgodne z mockupem #01).
+    this.durationSec = 300;
     this.manualStop = false;
     this.targetMode = 'system_wide';
     this.targetPid = '';
@@ -184,9 +220,35 @@ export class ProfilingLaunchModal {
     this.elevationVisible = false;
     this.elevationStatus = 'untested'; // 'untested' | 'ok' | 'bad' | 'testing'
 
+    // GPU pre-select z per-card "Profile" buttona: pin device index na kazdym
+    // GPU source, zeby _buildScope() wybral konkretny indeks zamiast "all".
+    if (this.preselectGpu) {
+      for (const s of this.sources) {
+        if (sourceToFlag(s) === SOURCE_FLAGS.GPU) {
+          s.deviceIndex = this.preselectGpu.deviceIndex;
+        }
+      }
+    }
+
     // Domyslnie zaznacz wszystkie 'available' (bez 'unavailable').
+    // Wyjatek: gdy preselectGpu, GPU sources sa odznaczone poza tym pasujacym
+    // do device-indeksu — user moze i tak je domyslnie wlaczyc po reviewie.
     for (const s of this.sources) {
-      if (s.status !== 'unavailable') this.selected.add(s.id);
+      if (s.status === 'unavailable') continue;
+      if (this.preselectGpu && sourceToFlag(s) === SOURCE_FLAGS.GPU) {
+        // Wszystkie GPU sources maja juz ten sam deviceIndex, wiec rozroznienie
+        // po vendor: gdy preselectGpu.vendor podany, zaznacz tylko match.
+        if (this.preselectGpu.vendor) {
+          const v = sourceVendor(s);
+          if (v && String(this.preselectGpu.vendor).toLowerCase().startsWith(v.cls)) {
+            this.selected.add(s.id);
+          }
+        } else {
+          this.selected.add(s.id);
+        }
+        continue;
+      }
+      this.selected.add(s.id);
     }
 
     this._winRef = null;
@@ -200,15 +262,30 @@ export class ProfilingLaunchModal {
     });
   }
 
+  // Buduje podtytuł nagłówka modalu w formacie:
+  // "<nodeId> · <CPU + N GPU + RAM + Disk + Power + Network>".
+  // Liczy GPU per-vendor jako jednorazową kategorię.
+  _buildSubtitle() {
+    const has = (predicate) => this.sources.some(predicate);
+    const gpuCount = this.sources.filter((s) => sourceVendor(s) !== null).length;
+    const parts = [];
+    if (has((s) => categorizeSource(s) === 'CPU')) parts.push('CPU');
+    if (gpuCount > 0) parts.push(`${gpuCount} GPU`);
+    if (has((s) => categorizeSource(s) === 'RAM')) parts.push('RAM');
+    if (has((s) => categorizeSource(s) === 'Disk')) parts.push('Disk');
+    if (has((s) => categorizeSource(s) === 'Power')) parts.push('Power');
+    if (has((s) => categorizeSource(s) === 'Network')) parts.push('Network');
+    const components = parts.join(' + ');
+    return `${this.nodeId}${components ? ' · ' + components : ''}`;
+  }
+
   _launchWindow() {
     const bodyEl = document.createElement('div');
     bodyEl.className = 'profiling-launch';
 
-    const footEl = document.createElement('div');
-    footEl.style.display = 'contents';
-
     const winPromise = TfWindow.open({
-      title: 'Start profiling session',
+      title: I18n.t('profiling.launch.title') || 'Start profiling session',
+      subtitle: this._buildSubtitle(),
       icon: 'activity',
       body: bodyEl,
       footer: this._buildFooter(),
@@ -266,22 +343,22 @@ export class ProfilingLaunchModal {
     wrap.style.width = '100%';
 
     const est = document.createElement('div');
-    est.className = 'estimate-foot';
+    est.className = 'est estimate-foot';
     est.id = 'profiling-estimate-foot';
     est.style.flex = '1';
-    est.textContent = 'Estimated storage: — · overhead: —';
+    est.textContent = I18n.t('profiling.launch.estimated_unknown') || 'Estimated storage: — · overhead: —';
 
     const cancel = document.createElement('tf-button');
     cancel.setAttribute('variant', 'ghost');
     cancel.setAttribute('data-action', 'cancel');
-    cancel.textContent = 'Cancel';
+    cancel.textContent = I18n.t('profiling.launch.cancel_button') || 'Cancel';
 
     const start = document.createElement('tf-button');
     start.setAttribute('variant', 'primary');
     start.setAttribute('data-action', 'start');
-    start.setAttribute('icon', 'record');
+    start.setAttribute('icon', 'record-dot');
     start.id = 'profiling-launch-start-btn';
-    start.textContent = 'Start Profiling';
+    start.textContent = I18n.t('profiling.launch.start_button') || 'Start Profiling';
 
     wrap.appendChild(est);
     wrap.appendChild(cancel);
@@ -305,14 +382,16 @@ export class ProfilingLaunchModal {
   _renderLabelField() {
     const wrap = document.createElement('div');
     wrap.className = 'field';
+    const labelTxt = I18n.t('profiling.launch.label_field') || 'Label';
+    const labelPh = I18n.t('profiling.launch.label_placeholder') || 'qwen-7b inference benchmark';
     wrap.innerHTML = `
       <div class="field-label">
-        <span>Label</span>
+        <span>${escapeHtml(labelTxt)}</span>
         <span class="counter" id="pl-label-counter">${this.label.length} / ${MAX_LABEL_LEN}</span>
       </div>
       <input class="field-input" id="pl-label-input" type="text"
              maxlength="${MAX_LABEL_LEN}"
-             placeholder="qwen-7b inference benchmark"
+             placeholder="${escapeAttr(labelPh)}"
              value="${escapeAttr(this.label)}" />
     `;
     return wrap;
@@ -322,18 +401,22 @@ export class ProfilingLaunchModal {
     const wrap = document.createElement('div');
     wrap.className = 'field';
     const sliderDisabled = this.manualStop ? 'disabled' : '';
+    // Mockup #01 wymaga sufiksu " s" w polu duration (np. "300 s"). Używamy
+    // type="text" z parsowaniem w handlerze, żeby uniknąć ograniczeń
+    // type="number" (które nie zezwala na nie-cyfrowe znaki).
+    const durTxt = I18n.t('profiling.launch.duration') || 'Duration';
+    const manualTxt = I18n.t('profiling.launch.manual_stop') || 'Manual stop';
     wrap.innerHTML = `
-      <div class="field-label"><span>Duration</span></div>
+      <div class="field-label"><span>${escapeHtml(durTxt)}</span></div>
       <div class="field-row">
         <input type="range" class="tf-slider" id="pl-duration-slider"
                min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
                value="${this.durationSec}" ${sliderDisabled} />
-        <input type="number" class="field-input duration-num" id="pl-duration-num"
-               min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
-               value="${this.durationSec}" ${sliderDisabled} />
+        <input type="text" inputmode="numeric" class="field-input duration-num" id="pl-duration-num"
+               value="${this.durationSec} s" ${sliderDisabled} />
         <label class="tf-check">
           <input type="checkbox" id="pl-manual-stop" ${this.manualStop ? 'checked' : ''} />
-          <span>Manual stop</span>
+          <span>${escapeHtml(manualTxt)}</span>
         </label>
       </div>
     `;
@@ -343,66 +426,83 @@ export class ProfilingLaunchModal {
   _renderSourceGrid() {
     const wrap = document.createElement('div');
     wrap.className = 'field';
+    const total = this.sources.length;
+    const sel = this.sources.filter((s) => this.selected.has(s.id)).length;
+    const sourcesTxt = I18n.t('profiling.launch.data_sources') || 'Data sources';
+    const counterTmpl = I18n.t('profiling.launch.sources_selected') || '{sel} of {total} selected';
+    const counterTxt = counterTmpl.replace('{sel}', String(sel)).replace('{total}', String(total));
     wrap.innerHTML = `
-      <div class="field-label"><span>Sources</span></div>
+      <div class="field-label">
+        <span>${escapeHtml(sourcesTxt)}</span>
+        <span class="counter" id="pl-source-counter">${escapeHtml(counterTxt)}</span>
+      </div>
       <div class="source-grid" id="pl-source-grid"></div>
     `;
     const grid = wrap.querySelector('#pl-source-grid');
-
-    // Group by category, in stable order.
-    const byCat = new Map();
+    // Mockup #01 uzywa plaskiej 2-kolumnowej siatki bez nagłówków kategorii -
+    // user widzi pełną listę naraz, kategoryzacja przez prefix w nazwie ID
+    // jest wystarczająca jako wizualny grupator.
     for (const src of this.sources) {
-      const cat = categorizeSource(src);
-      if (!byCat.has(cat)) byCat.set(cat, []);
-      byCat.get(cat).push(src);
-    }
-
-    for (const cat of CATEGORY_ORDER) {
-      const list = byCat.get(cat);
-      if (!list || list.length === 0) continue;
-      const label = document.createElement('div');
-      label.className = 'source-category-label';
-      label.textContent = cat;
-      grid.appendChild(label);
-      for (const src of list) {
-        grid.appendChild(this._renderSourceCard(src));
-      }
+      grid.appendChild(this._renderSourceCard(src));
     }
     return wrap;
   }
 
   _renderSourceCard(src) {
-    const card = document.createElement('div');
+    const card = document.createElement('label');
     const isDisabled = src.status === 'unavailable';
     const isChecked = this.selected.has(src.id);
     card.className = 'source-card';
     card.setAttribute('data-source-id', src.id);
+    if (isChecked) card.setAttribute('checked', '');
     card.setAttribute('data-checked', String(isChecked));
     card.setAttribute('data-disabled', String(isDisabled));
     card.setAttribute('title', src.description || '');
 
+    // Status pill 1:1 wg mockupu: Available / Needs sudo / Limited / Unavailable.
     const statusBadge = (() => {
-      if (src.status === 'available') return '<span class="src-status ok">ready</span>';
-      if (src.status === 'needs_sudo') return '<span class="src-status warn">sudo</span>';
-      if (src.status === 'needs_admin') return '<span class="src-status warn">admin</span>';
-      if (src.status === 'unavailable') return '<span class="src-status bad">n/a</span>';
+      if (src.status === 'available') return `<span class="src-status ok">${escapeHtml(I18n.t('profiling.launch.status_available') || 'Available')}</span>`;
+      if (src.status === 'needs_sudo') return `<span class="src-status warn">${escapeHtml(I18n.t('profiling.launch.status_needs_sudo') || 'Needs sudo')}</span>`;
+      if (src.status === 'needs_admin') return `<span class="src-status warn">${escapeHtml(I18n.t('profiling.launch.status_needs_admin') || 'Needs admin')}</span>`;
+      if (src.status === 'limited') return `<span class="src-status lim">${escapeHtml(I18n.t('profiling.launch.status_limited') || 'Limited')}</span>`;
+      if (src.status === 'unavailable') return `<span class="src-status bad">${escapeHtml(I18n.t('profiling.launch.status_unavailable') || 'Unavailable')}</span>`;
       return '';
     })();
 
+    // Vendor-badge w ikonce kafelka (NV/A/I/M3) gdy źródło to GPU per-vendor.
+    const vendor = sourceVendor(src);
+    const iconHtml = vendor
+      ? `<span class="vendor-badge ${vendor.cls}">${vendor.label}</span>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="${sourceIconPath(src)}"/></svg>`;
+
+    // Info-tip "(?)" pojawia się przy źródłach gdy backend dostarczył pole
+    // tooltip (np. "perf record / dtrace, 99 Hz default" dla CPU sampling).
+    const tooltip = src.tooltip || src.hint;
+    const infoTipHtml = tooltip
+      ? `<span class="info-tip" title="${escapeAttr(tooltip)}">
+           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+             <circle cx="12" cy="12" r="10"/>
+             <path d="M12 16v-4M12 8h.01"/>
+           </svg>
+         </span>`
+      : '';
+
     card.innerHTML = `
-      <label class="src-check">
+      <span class="src-check">
         <input type="checkbox"
                ${isChecked ? 'checked' : ''}
                ${isDisabled ? 'disabled' : ''}
                data-source-checkbox="${escapeAttr(src.id)}" />
-      </label>
-      <div class="src-meta">
-        <div class="src-name">
+      </span>
+      <span class="src-ico">${iconHtml}</span>
+      <span class="src-meta">
+        <span class="src-name">
           <span>${escapeHtml(src.label || src.id)}</span>
+          ${infoTipHtml}
           ${statusBadge}
-        </div>
-        <div class="src-desc">${escapeHtml(src.description || '')}</div>
-      </div>
+        </span>
+        <span class="src-desc">${escapeHtml(src.description || '')}</span>
+      </span>
     `;
     return card;
   }
@@ -418,32 +518,78 @@ export class ProfilingLaunchModal {
     wrap.className = 'field';
     wrap.id = 'pl-elevation-field';
     const inputType = this.elevationVisible ? 'text' : 'password';
+
+    // Liczba źródeł wymagających elevacji — pokazujemy w treści alertu, żeby
+    // user wiedział czego konkretnie dotyczy żądanie hasła.
+    const elevSources = this.sources.filter((s) =>
+      this.selected.has(s.id) && (s.status === 'needs_sudo' || s.status === 'needs_admin')
+    );
+    const elevCount = elevSources.length;
+    const elevNames = elevSources.map((s) => s.label || s.id).join(', ');
+
+    const countTmpl = elevCount === 1
+      ? (I18n.t('profiling.launch.elevation_count') || '{count} source requires elevation')
+      : (I18n.t('profiling.launch.elevation_count_plural') || '{count} sources require elevation');
+    const countLine = countTmpl.replace('{count}', String(elevCount));
+    const explainTmpl = I18n.t('profiling.launch.elevation_explain')
+      || 'Provide your sudo password once. It is used to spawn collectors and is {strong_never_stored}.';
+    const neverStored = I18n.t('profiling.launch.elevation_never_stored') || 'never stored on disk or in DB';
+    const explainHtml = escapeHtml(explainTmpl).replace(
+      escapeHtml('{strong_never_stored}'),
+      `<strong>${escapeHtml(neverStored)}</strong>`,
+    );
+    const sudoLabel = I18n.t('profiling.launch.sudo_password_label') || 'Sudo password';
+    const sudoHint = I18n.t('profiling.launch.sudo_used_once') || 'used once · not stored';
+    const sudoPh = I18n.t('profiling.launch.sudo_placeholder') || '••••••••';
+    const testTxt = I18n.t('profiling.launch.test_button') || 'Test';
+    const togglePwTitle = I18n.t('profiling.launch.toggle_password_visibility') || 'Toggle visibility';
+    const okMsg = I18n.t('profiling.launch.elevation_authenticated') || '✓ Authenticated';
+    const badMsg = I18n.t('profiling.launch.elevation_invalid') || '✗ Invalid password';
+    const testingMsg = I18n.t('profiling.launch.elevation_testing') || 'Testing…';
+
     wrap.innerHTML = `
       <div class="alert-box">
+        <div class="a-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 22h20L12 2z"/>
+            <path d="M12 9v6M12 18h.01"/>
+          </svg>
+        </div>
         <div class="a-body">
-          <strong>Elevated permissions required.</strong>
-          Some selected sources need <code>sudo</code>/admin access. Provide your password and click <strong>Test</strong> to verify.
+          <strong>${escapeHtml(countLine)}</strong> — ${escapeHtml(elevNames)}.
+          ${explainHtml}
         </div>
       </div>
-      <div class="field-label"><span>Elevation password</span></div>
-      <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}">
-        <input type="${inputType}" id="pl-elevation-input"
-               autocomplete="current-password"
-               value="${escapeAttr(this.elevationPassword)}"
-               placeholder="••••••••" />
-        <button type="button" class="pw-eye" id="pl-elevation-eye"
-                title="Toggle visibility">${this.elevationVisible ? 'hide' : 'show'}</button>
+      <div class="field-label">
+        <span>${escapeHtml(sudoLabel)}</span>
+        <span class="counter">${escapeHtml(sudoHint)}</span>
       </div>
-      <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
-        <tf-button variant="outline" size="sm" id="pl-elevation-test">Test</tf-button>
-        <span class="pw-test-result ${this.elevationStatus === 'ok' ? 'ok' : ''} ${this.elevationStatus === 'bad' ? 'bad' : ''}"
-              id="pl-elevation-result">
-          ${this.elevationStatus === 'ok' ? '✓ Authenticated'
-            : this.elevationStatus === 'bad' ? '✗ Invalid password'
-            : this.elevationStatus === 'testing' ? 'Testing…'
-            : ''}
-        </span>
+      <div class="field-row">
+        <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}" style="flex:1;">
+          <svg class="lock-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="11" width="16" height="10" rx="2"/>
+            <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+          </svg>
+          <input type="${inputType}" id="pl-elevation-input"
+                 autocomplete="current-password"
+                 value="${escapeAttr(this.elevationPassword)}"
+                 placeholder="${escapeAttr(sudoPh)}" />
+          <button type="button" class="pw-eye" id="pl-elevation-eye" title="${escapeAttr(togglePwTitle)}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+        </div>
+        <tf-button variant="outline" size="sm" id="pl-elevation-test">${escapeHtml(testTxt)}</tf-button>
       </div>
+      <span class="pw-test-result ${this.elevationStatus === 'ok' ? 'ok' : ''} ${this.elevationStatus === 'bad' ? 'bad' : ''}"
+            id="pl-elevation-result">
+        ${this.elevationStatus === 'ok' ? escapeHtml(okMsg)
+          : this.elevationStatus === 'bad' ? escapeHtml(badMsg)
+          : this.elevationStatus === 'testing' ? escapeHtml(testingMsg)
+          : ''}
+      </span>
     `;
     return wrap;
   }
@@ -451,29 +597,37 @@ export class ProfilingLaunchModal {
   _renderTargetField() {
     const wrap = document.createElement('div');
     wrap.className = 'field';
+    // PID input renderujemy zawsze w środku radio-row (120px wide jak w mockupie),
+    // ukrywając go gdy nie wybrano "Specific PID".
+    const pidStyle = this.targetMode === 'specific_pid' ? 'width:120px;' : 'width:120px; display:none;';
+    const targetTxt = I18n.t('profiling.launch.target_field') || 'Profile target';
+    const sysWide = I18n.t('profiling.launch.target_system_wide') || 'System-wide';
+    const ownProc = I18n.t('profiling.launch.target_own_process') || 'Own process (tentaflow)';
+    const specPid = I18n.t('profiling.launch.target_specific_pid') || 'Specific PID';
+    const pidPh = I18n.t('profiling.launch.target_pid_placeholder') || 'e.g. 14872';
     wrap.innerHTML = `
-      <div class="field-label"><span>Target</span></div>
+      <div class="field-label"><span>${escapeHtml(targetTxt)}</span></div>
       <div class="radio-row">
         <label class="tf-check">
           <input type="radio" name="pl-target" value="system_wide"
                  ${this.targetMode === 'system_wide' ? 'checked' : ''} />
-          <span>System-wide</span>
+          <span>${escapeHtml(sysWide)}</span>
         </label>
         <label class="tf-check">
           <input type="radio" name="pl-target" value="own_process"
                  ${this.targetMode === 'own_process' ? 'checked' : ''} />
-          <span>TentaFlow process only</span>
+          <span>${escapeHtml(ownProc)}</span>
         </label>
         <label class="tf-check">
           <input type="radio" name="pl-target" value="specific_pid"
                  ${this.targetMode === 'specific_pid' ? 'checked' : ''} />
-          <span>Specific PID</span>
+          <span>${escapeHtml(specPid)}</span>
         </label>
+        <input type="number" class="field-input" id="pl-target-pid"
+               placeholder="${escapeAttr(pidPh)}" min="1" step="1"
+               value="${escapeAttr(this.targetPid)}"
+               style="${pidStyle}" />
       </div>
-      <input type="number" class="field-input" id="pl-target-pid"
-             placeholder="PID" min="1" step="1"
-             value="${escapeAttr(this.targetPid)}"
-             style="${this.targetMode === 'specific_pid' ? '' : 'display:none;'}" />
     `;
     return wrap;
   }
@@ -496,18 +650,24 @@ export class ProfilingLaunchModal {
     if (slider) {
       slider.addEventListener('input', () => {
         this.durationSec = parseInt(slider.value, 10);
-        if (durNum) durNum.value = String(this.durationSec);
+        if (durNum) durNum.value = `${this.durationSec} s`;
         this._updateEstimate();
       });
     }
     if (durNum) {
+      // Wycinamy wszystko poza cyframi (sufiks " s" jest ozdobny).
       durNum.addEventListener('input', () => {
-        let v = parseInt(durNum.value, 10);
+        const digits = String(durNum.value).replace(/[^0-9]/g, '');
+        let v = parseInt(digits, 10);
         if (Number.isNaN(v)) v = MIN_DURATION_SEC;
         v = Math.max(MIN_DURATION_SEC, Math.min(MAX_DURATION_SEC, v));
         this.durationSec = v;
         if (slider) slider.value = String(v);
         this._updateEstimate();
+      });
+      // Przy blur dopisujemy z powrotem sufiks (gdyby user go skasował).
+      durNum.addEventListener('blur', () => {
+        durNum.value = `${this.durationSec} s`;
       });
     }
     if (manualStop) {
@@ -526,7 +686,19 @@ export class ProfilingLaunchModal {
         if (cb.checked) this.selected.add(id);
         else this.selected.delete(id);
         const card = cb.closest('.source-card');
-        if (card) card.setAttribute('data-checked', String(cb.checked));
+        if (card) {
+          card.setAttribute('data-checked', String(cb.checked));
+          if (cb.checked) card.setAttribute('checked', '');
+          else card.removeAttribute('checked');
+        }
+        // Live counter "N of M selected" w field-label.
+        const counterEl = root.querySelector('#pl-source-counter');
+        if (counterEl) {
+          const tmpl = I18n.t('profiling.launch.sources_selected') || '{sel} of {total} selected';
+          counterEl.textContent = tmpl
+            .replace('{sel}', String(this.selected.size))
+            .replace('{total}', String(this.sources.length));
+        }
         // Re-render elevation block: appears/disappears depending on selection.
         this._refreshElevation(root);
         this._updateEstimate();
@@ -542,7 +714,11 @@ export class ProfilingLaunchModal {
         if (!rb.checked) return;
         this.targetMode = rb.value;
         const pidInput = root.querySelector('#pl-target-pid');
-        if (pidInput) pidInput.style.display = (this.targetMode === 'specific_pid') ? '' : 'none';
+        if (pidInput) {
+          // Width 120px per mockup; toggle tylko display.
+          pidInput.style.width = '120px';
+          pidInput.style.display = (this.targetMode === 'specific_pid') ? '' : 'none';
+        }
       });
     });
     const pidInput = root.querySelector('#pl-target-pid');
@@ -619,13 +795,19 @@ export class ProfilingLaunchModal {
     const { bytes, overheadPct } = estimateImpact(selectedSources, dur);
     const foot = document.getElementById('profiling-estimate-foot');
     if (foot) {
-      foot.textContent = `Estimated storage: ~${formatBytes(bytes)} · overhead: ~${overheadPct}% CPU`;
+      const n = selectedSources.length;
+      foot.textContent = `Estimated storage: ~${formatBytes(bytes)} · overhead: ~${overheadPct}% CPU · ${n} collector${n === 1 ? '' : 's'}`;
     }
   }
 
   _validate() {
+    // Auto-fill label gdy puste — nie blokujemy startu z powodu braku etykiety,
+    // user pisze ja opcjonalnie. `session-YYYYMMDD-HHMMSS` jest deterministyczny
+    // i czytelny w liscie sesji.
     if (!this.label || !this.label.trim()) {
-      return 'Label is required.';
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      this.label = `session-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
     }
     if (this.label.length > MAX_LABEL_LEN) {
       return `Label too long (max ${MAX_LABEL_LEN}).`;
@@ -697,6 +879,7 @@ export class ProfilingLaunchModal {
   }
 
   async _handleStart() {
+    this._clearError();
     const err = this._validate();
     const startBtn = document.getElementById('profiling-launch-start-btn');
     if (err) {
@@ -706,6 +889,7 @@ export class ProfilingLaunchModal {
     if (startBtn) startBtn.setAttribute('disabled', '');
     try {
       const scope = this._buildScope();
+      console.log('[profiling-launch] starting session:', { nodeId: this.nodeId, scope });
       const elevationPassword = this.elevationPassword || undefined;
       // Zapisz do permissions store (in-memory, per-tab) — kolejna sesja
       // uniknie pytania o haslo dopoki uzytkownik nie zamknie zakladki.
@@ -733,10 +917,30 @@ export class ProfilingLaunchModal {
     if (foot) {
       foot.textContent = `⚠ ${msg}`;
       foot.style.color = 'var(--tf-danger, #ef4444)';
-      setTimeout(() => {
-        foot.style.color = '';
-        this._updateEstimate();
-      }, 3500);
+      foot.style.fontWeight = '600';
+    }
+    // Globalny banner u gory modala — persistent dopoki user nie kliknie zamkniecia
+    // ani nie wystartuje sesji ponownie. Mockup-friendly (czerwone tlo, biala czcionka).
+    let banner = document.getElementById('pl-error-banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'pl-error-banner';
+      banner.style.cssText = 'background:rgba(239,68,68,0.16);border:1px solid var(--tf-danger,#ef4444);color:#fecaca;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-size:13px;display:flex;align-items:center;gap:8px;';
+      const body = document.querySelector('#tf-launch-body') || document.querySelector('.tf-window-body');
+      if (body && body.firstChild) body.insertBefore(banner, body.firstChild);
+      else if (body) body.appendChild(banner);
+    }
+    banner.innerHTML = `<span>⚠</span><span>${escapeHtml(msg)}</span>`;
+  }
+
+  _clearError() {
+    const banner = document.getElementById('pl-error-banner');
+    if (banner) banner.remove();
+    const foot = document.getElementById('profiling-estimate-foot');
+    if (foot) {
+      foot.style.color = '';
+      foot.style.fontWeight = '';
+      this._updateEstimate();
     }
   }
 }

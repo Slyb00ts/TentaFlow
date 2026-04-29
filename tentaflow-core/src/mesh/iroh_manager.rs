@@ -311,6 +311,13 @@ impl IrohMeshManager {
             .map_err(|e: IrohEndpointError| anyhow::anyhow!("iroh endpoint bind: {e:?}"))?;
 
         let local_id_hex = hex::encode(endpoint.id().as_bytes());
+        info!(
+            target: "mesh::identity",
+            iroh_node_id = %endpoint.id().to_string(),
+            iroh_node_id_bytes_hex = %local_id_hex,
+            ed25519_hex = %security.ed25519_public_key_hex(),
+            "local iroh identity"
+        );
         // Duzy buffer — przy discovery burst (nowa siec, wiele peerow na raz)
         // subscriber pipeline moze chwilowo byc wolniejszy niz producent
         // eventow. 1024 bylo za malo, przy 100+ peerach Lagged sie zdarzal.
@@ -548,6 +555,7 @@ impl IrohMeshManager {
         IrohMeshManagerRef {
             connections: Arc::clone(&self.connections),
             event_tx: self.event_tx.clone(),
+            security: Arc::clone(&self.security),
         }
     }
 
@@ -735,6 +743,14 @@ impl IrohMeshManager {
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         self.connections.clear();
+        // Bez tego iroh przy dropie tokio runtime cancellowal wszystkie
+        // ActiveRelayActor sequencyjnie generujac setki linii spamu
+        // "JoinError::Cancelled" i "Home relay not set". `close()` dorzuca
+        // CONNECTION_CLOSE peerom i czeka az relay actorzy zamkna kanaly
+        // czysto. Awaitujemy z timeout 3s zeby shutdown nie wisial gdy
+        // relay nie odpowiada.
+        let close_fut = self.endpoint.inner().close();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), close_fut).await;
     }
 
     /// Laczy sie z peerem po hex-enkodowanym EndpointId. Gdy caller poda
@@ -1459,6 +1475,7 @@ impl IrohMeshManager {
 struct IrohMeshManagerRef {
     connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
+    security: Arc<MeshSecurity>,
 }
 
 impl IrohMeshManagerRef {
@@ -1485,18 +1502,32 @@ impl IrohMeshManagerRef {
                 }
             });
         }
-        let is_current = self
-            .connections
-            .get(&remote_hex)
-            .map(|active| active.id == connection_id)
-            .unwrap_or(false);
-        if is_current {
-            self.connections.remove(&remote_hex);
-            let reason = close_reason.as_deref().unwrap_or("stream closed");
+        // Connection wymarl. Mapowanie usuwamy WYLACZNIE jesli nadal
+        // wskazuje na nasz connection_id — gdy nowsze polaczenie
+        // (tie-break / reconnect) juz przebilo nasz wpis, zostawiamy
+        // jego stan w spokoju. Nie wysylamy wtedy PeerDisconnected, zeby
+        // pipeline nie zerowal heartbeat livenessu zywego polaczenia.
+        let was_current = match self.connections.get(&remote_hex) {
+            Some(active) if active.id == connection_id => {
+                drop(active);
+                self.connections.remove(&remote_hex);
+                true
+            }
+            _ => false,
+        };
+        let reason = close_reason.as_deref().unwrap_or("stream closed");
+        if was_current {
             info!(peer = %remote_hex, reason, "iroh_mesh: polaczenie zamkniete");
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
                 node_id: remote_hex,
             });
+        } else {
+            debug!(
+                peer = %remote_hex,
+                reason,
+                connection_id,
+                "iroh_mesh: stary handler zakonczony — aktywne jest nowsze polaczenie, PeerDisconnected pominiety"
+            );
         }
     }
 
@@ -1516,6 +1547,42 @@ impl IrohMeshManagerRef {
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
         if payload.len() > MAX_MSG_BYTES {
             return Err(IrohStreamError::FrameTooLarge(payload.len()));
+        }
+
+        // Pre-trust whitelist: untrusted peers may only send pairing handshake
+        // frames. Every other mesh frame is dropped before any application
+        // state (peer_store, registry, command executor, ...) is touched.
+        let frame_type = disc[0];
+        let trusted_now = self.security.is_trusted(&remote_hex);
+        tracing::debug!(
+            target: "mesh::gate",
+            remote_hex = %remote_hex,
+            frame_type = format!("0x{:02X}", frame_type),
+            is_trusted = trusted_now,
+            "frame received, gate check"
+        );
+        if !crate::mesh::frame_policy::is_pre_trust_frame(frame_type) && !trusted_now {
+            tracing::debug!(
+                target: "mesh::gate",
+                peer = %remote_hex,
+                frame_type = format!("0x{:02X}", frame_type),
+                "iroh_mesh: rejected mesh frame from untrusted peer"
+            );
+            let details = format!(
+                "{{\"peer\":\"{}\",\"frame_type\":\"0x{:02X}\"}}",
+                remote_hex, frame_type
+            );
+            let _ = crate::db::repository::log_audit(
+                &self.security.db,
+                None,
+                None,
+                "mesh.frame_rejected",
+                None,
+                Some(&details),
+                None,
+                Some(&remote_hex),
+            );
+            return Ok(());
         }
 
         use tentaflow_protocol::mesh::*;

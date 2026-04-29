@@ -13,7 +13,6 @@ use zeroize::Zeroize;
 
 use crate::db::DbPool;
 use crate::mesh::security::MeshSecurity;
-use crate::profiling::{ProfileStorage, ProfilingError, NSYS_RUNNER};
 use crate::services::ports::PortAllocator;
 use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 
@@ -57,11 +56,13 @@ impl CommandResponse {
 
 /// Executor komend mesh — weryfikuje trust i wykonuje komendy od zdalnych nodow.
 ///
-/// `local_node_id` i `data_dir` sa potrzebne do uruchamiania `ProfileStorage`
-/// dla komend Nsight (storage ma layout `<data_dir>/nsight/<node_id>/...`).
+/// `local_node_id` jest uzywane przez handlery profilowania do lokalizacji
+/// sesji w storage (`<HOME>/profiling/<local_node_id>/<session>/`).
 pub struct MeshCommandExecutor {
     security: Arc<MeshSecurity>,
     local_node_id: String,
+    /// Trzymane do walidacji `validate_target_dir` (cert provisioning).
+    #[allow(dead_code)]
     data_dir: PathBuf,
     /// Service-action context wired in after AppState initialisation. `None`
     /// disables ServiceDeleteRemote / ServicePinRemote / ... handlers.
@@ -89,9 +90,6 @@ impl MeshCommandExecutor {
         self.service_actions.read().await.clone()
     }
 
-    fn profile_storage(&self) -> ProfileStorage {
-        ProfileStorage::new(&self.data_dir, &self.local_node_id)
-    }
 
     /// Wykonaj komende od zdalnego noda. Sprawdza trust przed wykonaniem.
     pub async fn execute(&self, from_node_id: &str, command: MeshCommandType) -> CommandResponse {
@@ -320,13 +318,6 @@ impl MeshCommandExecutor {
             MeshCommandType::BandwidthProbeCancel => {
                 CommandResponse::ok(MeshCommandResponsePayload::Empty)
             }
-
-            MeshCommandType::NsightStart(req) => self.handle_nsight_start(req).await,
-            MeshCommandType::NsightStop(req) => self.handle_nsight_stop(req).await,
-            MeshCommandType::NsightSessions(req) => self.handle_nsight_sessions(req).await,
-            MeshCommandType::NsightReport(req) => self.handle_nsight_report(req).await,
-            MeshCommandType::NsightDelete(req) => self.handle_nsight_delete(req).await,
-            MeshCommandType::NsightDownload(req) => self.handle_nsight_download(req).await,
 
             MeshCommandType::ProfilingStart(req) => self.handle_profiling_start(req).await,
             MeshCommandType::ProfilingStop(req) => self.handle_profiling_stop(req).await,
@@ -817,136 +808,7 @@ impl MeshCommandExecutor {
     }
 
     // -------------------------------------------------------------------------
-    // Nsight handlery — wykonywane na nodzie odbierajacym komende mesh.
-    // Dla local node ten sam kod jest wolany bezposrednio z dispatch handlera.
-    // -------------------------------------------------------------------------
-
-    async fn handle_nsight_start(
-        &self,
-        req: tentaflow_protocol::profiling::NsightStartRequest,
-    ) -> CommandResponse {
-        let storage = self.profile_storage();
-        match NSYS_RUNNER
-            .start(req.scope, req.duration_secs, req.label, &storage)
-            .await
-        {
-            Ok((session_id, started_at_ms)) => {
-                CommandResponse::ok(MeshCommandResponsePayload::NsightStart(
-                    tentaflow_protocol::profiling::NsightStartResponse {
-                        session_id,
-                        started_at_ms,
-                    },
-                ))
-            }
-            Err(e) => CommandResponse::fail(format!("nsight start: {}", e)),
-        }
-    }
-
-    async fn handle_nsight_stop(
-        &self,
-        req: tentaflow_protocol::profiling::NsightStopRequest,
-    ) -> CommandResponse {
-        let storage = self.profile_storage();
-        match NSYS_RUNNER.stop(&req.session_id, &storage).await {
-            Ok(status) => CommandResponse::ok(MeshCommandResponsePayload::NsightStop(
-                tentaflow_protocol::profiling::NsightStopResponse {
-                    session_id: req.session_id,
-                    status,
-                },
-            )),
-            Err(e) => CommandResponse::fail(format!("nsight stop: {}", e)),
-        }
-    }
-
-    async fn handle_nsight_sessions(
-        &self,
-        req: tentaflow_protocol::profiling::NsightSessionsRequest,
-    ) -> CommandResponse {
-        let storage = self.profile_storage();
-        match storage.list() {
-            Ok(sessions) => CommandResponse::ok(MeshCommandResponsePayload::NsightSessions(
-                tentaflow_protocol::profiling::NsightSessionsResponse {
-                    node_id: req.node_id,
-                    sessions,
-                },
-            )),
-            Err(e) => CommandResponse::fail(format!("nsight sessions: {}", e)),
-        }
-    }
-
-    async fn handle_nsight_report(
-        &self,
-        req: tentaflow_protocol::profiling::NsightReportRequest,
-    ) -> CommandResponse {
-        let storage = self.profile_storage();
-        match storage.read_summary(&req.session_id) {
-            Ok(report) => CommandResponse::ok(MeshCommandResponsePayload::NsightReport(
-                tentaflow_protocol::profiling::NsightReportResponse { report },
-            )),
-            Err(ProfilingError::InvalidSessionId) => {
-                CommandResponse::fail("invalid session id".to_string())
-            }
-            Err(ProfilingError::NotFound(s)) => {
-                CommandResponse::fail(format!("session not found: {}", s))
-            }
-            Err(e) => CommandResponse::fail(format!("nsight report: {}", e)),
-        }
-    }
-
-    async fn handle_nsight_delete(
-        &self,
-        req: tentaflow_protocol::profiling::NsightDeleteRequest,
-    ) -> CommandResponse {
-        let storage = self.profile_storage();
-        match storage.delete(&req.session_id) {
-            Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::NsightDelete(
-                tentaflow_protocol::profiling::NsightDeleteResponse {
-                    session_id: req.session_id,
-                    ok: true,
-                },
-            )),
-            Err(ProfilingError::InvalidSessionId) => {
-                CommandResponse::fail("invalid session id".to_string())
-            }
-            Err(ProfilingError::NotFound(s)) => {
-                CommandResponse::fail(format!("session not found: {}", s))
-            }
-            Err(e) => CommandResponse::fail(format!("nsight delete: {}", e)),
-        }
-    }
-
-    async fn handle_nsight_download(
-        &self,
-        req: tentaflow_protocol::profiling::NsightDownloadRequest,
-    ) -> CommandResponse {
-        let storage = self.profile_storage();
-        let path = match storage.raw_report_path(&req.session_id) {
-            Ok(p) => p,
-            Err(ProfilingError::InvalidSessionId) => {
-                return CommandResponse::fail("invalid session id".to_string());
-            }
-            Err(e) => return CommandResponse::fail(format!("nsight download: {}", e)),
-        };
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                let filename = format!("nsight-{}.nsys-rep", req.session_id);
-                CommandResponse::ok(MeshCommandResponsePayload::NsightDownload(
-                    tentaflow_protocol::profiling::NsightDownloadResponse {
-                        session_id: req.session_id,
-                        filename,
-                        bytes,
-                    },
-                ))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                CommandResponse::fail(format!("session not found: {}", req.session_id))
-            }
-            Err(e) => CommandResponse::fail(format!("nsight download: {}", e)),
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Multi-source profiling V2 handlery — wykonywane na nodzie odbierajacym
+    // Multi-source profiling handlery — wykonywane na nodzie odbierajacym
     // komende mesh. Lokalny dispatch w `mesh_write_handlers.rs::handle_profiling_local`
     // zawiera te sama logike (z dodatkowym audit log + auth) wolana przy local
     // node_id. Tu obslugujemy peer-side, gdzie auth juz przeszlo przez `is_trusted`.
@@ -968,7 +830,6 @@ impl MeshCommandExecutor {
     ) -> tentaflow_protocol::ProfilingSessionEntry {
         let kind = match e.kind {
             crate::profiling::SessionKind::MultiSource => "multi_source".to_string(),
-            crate::profiling::SessionKind::LegacyNsight => "legacy_nsight".to_string(),
         };
         tentaflow_protocol::ProfilingSessionEntry {
             session_id: e.session_id,
@@ -1053,8 +914,8 @@ impl MeshCommandExecutor {
         &self,
         req: tentaflow_protocol::ProfilingSessionsRequest,
     ) -> CommandResponse {
-        use crate::profiling::PROFILE_STORAGE_V2;
-        match PROFILE_STORAGE_V2.list_sessions(&self.local_node_id).await {
+        use crate::profiling::PROFILE_STORAGE;
+        match PROFILE_STORAGE.list_sessions(&self.local_node_id).await {
             Ok(entries) => {
                 let entries = entries
                     .into_iter()
@@ -1075,13 +936,13 @@ impl MeshCommandExecutor {
         &self,
         req: tentaflow_protocol::ProfilingReportRequest,
     ) -> CommandResponse {
-        use crate::profiling::PROFILE_STORAGE_V2;
-        match PROFILE_STORAGE_V2
+        use crate::profiling::PROFILE_STORAGE;
+        match PROFILE_STORAGE
             .read_report(&self.local_node_id, &req.session_id)
             .await
         {
-            Ok(envelope) => CommandResponse::ok(MeshCommandResponsePayload::ProfilingReport(
-                tentaflow_protocol::ProfilingReportResponse { envelope },
+            Ok(report) => CommandResponse::ok(MeshCommandResponsePayload::ProfilingReport(
+                tentaflow_protocol::ProfilingReportResponse { report },
             )),
             Err(e) => CommandResponse::fail(format!("profiling report: {}", e)),
         }
@@ -1091,8 +952,8 @@ impl MeshCommandExecutor {
         &self,
         req: tentaflow_protocol::ProfilingDeleteRequest,
     ) -> CommandResponse {
-        use crate::profiling::PROFILE_STORAGE_V2;
-        match PROFILE_STORAGE_V2
+        use crate::profiling::PROFILE_STORAGE;
+        match PROFILE_STORAGE
             .delete_session(&self.local_node_id, &req.session_id)
             .await
         {
@@ -1110,9 +971,9 @@ impl MeshCommandExecutor {
         &self,
         req: tentaflow_protocol::ProfilingDownloadRequest,
     ) -> CommandResponse {
-        use crate::profiling::PROFILE_STORAGE_V2;
+        use crate::profiling::PROFILE_STORAGE;
         use std::io::Write;
-        let storage = std::sync::Arc::clone(&PROFILE_STORAGE_V2);
+        let storage = std::sync::Arc::clone(&PROFILE_STORAGE);
         let node_id = self.local_node_id.clone();
         let sid = req.session_id.clone();
         let bytes_res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
@@ -1472,19 +1333,16 @@ mod tests {
     }
 
     /// Niezaufany peer dostaje `ok=false` z opisem bledu — wszystkie komendy
-    /// (lacznie z Nsight) sa odrzucane na samym wejsciu, niezaleznie od ich
+    /// (lacznie z profiling) sa odrzucane na samym wejsciu, niezaleznie od ich
     /// payloadu.
     #[tokio::test]
     async fn executor_rejects_untrusted_peer() {
         let executor = create_test_executor();
-        let req = tentaflow_protocol::profiling::NsightStartRequest {
+        let req = tentaflow_protocol::ProfilingSessionsRequest {
             node_id: "untrusted-peer".to_string(),
-            scope: tentaflow_protocol::profiling::NsightScope::Cpu,
-            duration_secs: 5,
-            label: String::new(),
         };
         let resp = executor
-            .execute("untrusted-peer", MeshCommandType::NsightStart(req))
+            .execute("untrusted-peer", MeshCommandType::ProfilingSessions(req))
             .await;
         assert!(!resp.ok);
         let err = resp.error.unwrap_or_default();
@@ -1493,39 +1351,6 @@ mod tests {
             "spodziewano sie komunikatu o trust, mam: {}",
             err
         );
-    }
-
-    /// Sessions list dla zaufanego peera dziala bez nsys w PATH (storage
-    /// inicjalizuje sie ad-hoc, lista pusta przy nowym data_dir).
-    #[tokio::test]
-    async fn executor_dispatches_nsight_sessions_for_trusted_peer() {
-        let executor = create_test_executor();
-        let trusted_id = "0123456789abcdef0123456789abcdef";
-        // Generujemy realny klucz publiczny przez druga instancje MeshSecurity —
-        // unikamy duplikowania logiki konkatenacji Ed25519+X25519, ktora siedzi
-        // w `MeshSecurity::public_key_hex`.
-        let other_db = create_test_db();
-        let other_cipher = Arc::new(crate::crypto::SettingsCipher::new(&[1u8; 32]));
-        let other = MeshSecurity::new(other_db, other_cipher).unwrap();
-        let pk_hex = other.public_key_hex();
-        executor
-            .security
-            .add_trusted_key(trusted_id, &pk_hex, "test-host")
-            .expect("add trusted");
-
-        let req = tentaflow_protocol::profiling::NsightSessionsRequest {
-            node_id: trusted_id.to_string(),
-        };
-        let resp = executor
-            .execute(trusted_id, MeshCommandType::NsightSessions(req))
-            .await;
-        assert!(resp.ok, "expected ok, got error: {:?}", resp.error);
-        match resp.payload {
-            tentaflow_protocol::mesh::MeshCommandResponsePayload::NsightSessions(p) => {
-                assert!(p.sessions.is_empty(), "swieze data_dir powinno byc puste");
-            }
-            other => panic!("nieoczekiwany payload: {:?}", other),
-        }
     }
 
     fn create_test_executor() -> MeshCommandExecutor {
