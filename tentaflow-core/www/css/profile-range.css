@@ -1,0 +1,286 @@
+/* =============================================================================
+   File: profile-range.css — styles for Range Select fullscreen view (mockup #14).
+   Selectors are scoped under .profile-range to avoid collisions with
+   profile-compare/profile-timeline which define visually different
+   .compare-card / .sp-list variants.
+   ============================================================================= */
+
+.profile-range {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 2px;
+}
+
+/* Header row: time range + duration pill + actions. */
+.profile-range .range-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.profile-range .range-time {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  color: var(--accent-2);
+  font-weight: 700;
+}
+
+.profile-range .range-duration {
+  background: var(--accent-glow);
+  color: var(--accent-2);
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.profile-range .range-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* Mini timeline showing whole session with the selection highlighted. */
+.profile-range .range-mini-timeline {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.profile-range .range-mini-timeline svg {
+  width: 100%;
+  height: 80px;
+  display: block;
+}
+
+.profile-range .range-mini-timeline .range-overlay {
+  fill: rgba(167, 139, 250, 0.16);
+  stroke: var(--accent-2);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.profile-range .range-mini-timeline .range-baseline {
+  stroke: #1f2548;
+  stroke-width: 1;
+}
+
+.profile-range .range-mini-timeline .range-power-line {
+  stroke: #a78bfa;
+  stroke-width: 1.4;
+  fill: none;
+}
+
+.profile-range .range-mini-timeline .range-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  fill: var(--accent-2);
+}
+
+/* Two-column main grid: left stats column + right kernels grid. */
+.profile-range .range-grid {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 14px;
+}
+
+@media (max-width: 980px) {
+  .profile-range .range-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Left column stack. */
+.profile-range .range-left {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Card style — local to the range view (kept independent from
+   .profile-compare .compare-card so we control padding and font scale). */
+.profile-range .range-section {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.profile-range .range-section h3 {
+  font-size: 11px;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-2);
+  font-weight: 700;
+}
+
+/* Symbol/list rows, shared by CPU/IO/power summary lists. */
+.profile-range .range-symbol-row,
+.profile-range .range-kernel-row,
+.profile-range .range-io-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11.5px;
+  align-items: center;
+}
+
+.profile-range .range-symbol-row .sym,
+.profile-range .range-kernel-row .sym,
+.profile-range .range-io-row .sym {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.profile-range .range-symbol-row .pct,
+.profile-range .range-kernel-row .pct,
+.profile-range .range-io-row .pct {
+  color: var(--text-2);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+}
+
+.profile-range .range-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Power summary footer: small per-range power timeline. */
+.profile-range .range-power-summary .range-power-mini {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(99, 102, 241, 0.18);
+}
+
+.profile-range .range-power-summary .range-power-mini-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-3);
+  margin-bottom: 6px;
+}
+
+.profile-range .range-power-summary .range-power-mini svg {
+  width: 100%;
+  height: 50px;
+  display: block;
+}
+
+.profile-range .range-power-summary .range-power-mini path {
+  stroke: #f59e0b;
+  stroke-width: 1.5;
+  fill: none;
+}
+
+/* Right column: 3-vendor kernels grid + NVTX table. */
+.profile-range .range-vendor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 760px) {
+  .profile-range .range-vendor-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.profile-range .range-vendor-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  margin-bottom: 8px;
+}
+
+.profile-range .range-vendor-name.nv { color: #76b900; }
+.profile-range .range-vendor-name.amd { color: #ed1c24; }
+.profile-range .range-vendor-name.intel { color: #4ba3e0; }
+.profile-range .range-vendor-name.apple { color: #d4d4d8; }
+
+.profile-range .range-vendor-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 800;
+  color: white;
+}
+
+.profile-range .range-vendor-badge.nv { background: #76b900; color: #000; }
+.profile-range .range-vendor-badge.amd { background: #ed1c24; }
+.profile-range .range-vendor-badge.intel { background: #0071c5; }
+.profile-range .range-vendor-badge.apple { background: #d4d4d8; color: #000; }
+
+.profile-range .range-banner-degraded {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(96, 165, 250, 0.08);
+  border: 1px solid rgba(96, 165, 250, 0.25);
+  border-radius: var(--radius);
+  color: var(--text-2);
+}
+
+.profile-range .range-banner-degraded svg {
+  width: 16px;
+  height: 16px;
+  stroke: var(--info);
+  fill: none;
+  stroke-width: 2;
+  flex-shrink: 0;
+}
+
+.profile-range .range-nvtx-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.profile-range .range-nvtx-table th,
+.profile-range .range-nvtx-table td {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.profile-range .range-nvtx-table th {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  font-weight: 700;
+}
+
+.profile-range .range-nvtx-table td.num,
+.profile-range .range-nvtx-table th.num {
+  text-align: right;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.profile-range .range-nvtx-table td.mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.profile-range .range-empty {
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-style: italic;
+}
