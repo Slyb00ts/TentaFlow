@@ -89,12 +89,12 @@ fn locate_meeting_binary() -> Result<std::path::PathBuf> {
 /// odinstalowany od deployu), wolamy provisioner przed spawnem. Blad jest
 /// logowany ale nie blokuje spawn — bot wtedy sam zwroci czytelny error
 /// 'Nie znaleziono Chromium/Chrome'.
-fn ensure_chromium_for_spawn() -> Option<String> {
+async fn ensure_chromium_for_spawn() -> Option<String> {
     use std::sync::Arc;
     let log: crate::deploy::python_venv::LogSink = Arc::new(|line: &str| {
         info!(target = "chromium", "{}", line);
     });
-    match crate::deploy::chromium_provisioner::ensure_chromium(&log) {
+    match crate::deploy::chromium_provisioner::ensure_chromium(&log).await {
         Ok(path) => Some(path.to_string_lossy().into_owned()),
         Err(e) => {
             warn!(
@@ -129,7 +129,7 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
     // powodu nie zostawil systemowego/cached Chrome, wykryjmy to TUTAJ i
     // pobierzmy go zanim spawnujemy bota — meeting nie wystartuje bez
     // przegladarki, a bot nie potrafi pobierac sam.
-    let chromium_env = ensure_chromium_for_spawn();
+    let chromium_env = ensure_chromium_for_spawn().await;
 
     // Bez `--config` — bot uzyje default `meeting.toml` ktory nie istnieje w
     // cwd subprocesu, wiec zalanduje w `from_env()`. Wszystkie potrzebne

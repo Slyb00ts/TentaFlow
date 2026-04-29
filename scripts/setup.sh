@@ -203,10 +203,12 @@ install_base() {
                 linux-tools-common
                 linux-tools-generic
                 sysstat
+                libclang-dev
+                patchelf
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev" "perf" "sysstat")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
