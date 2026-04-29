@@ -1563,7 +1563,8 @@ impl IrohMeshManagerRef {
             "frame received, gate check"
         );
         if !crate::mesh::frame_policy::is_pre_trust_frame(frame_type) && !trusted_now {
-            warn!(
+            tracing::debug!(
+                target: "mesh::gate",
                 peer = %remote_hex,
                 frame_type = format!("0x{:02X}", frame_type),
                 "iroh_mesh: rejected mesh frame from untrusted peer"
