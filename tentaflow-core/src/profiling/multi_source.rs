@@ -113,6 +113,7 @@ impl ParserRegistry {
         r.register("linux.nvsmi.gpu_util".to_string(), Arc::new(c::linux::nvsmi_gpu::LinuxNvsmiGpuParser));
         r.register("linux.netdev".to_string(), Arc::new(c::linux::netdev::LinuxNetdevParser));
         r.register("linux.proc.top_processes".to_string(), Arc::new(c::linux::top_processes::LinuxTopProcessesParser));
+        r.register("linux.uncore.imc".to_string(), Arc::new(c::linux::uncore_imc::LinuxUncoreImcParser));
         // Linux GPU vendor parsers.
         r.register("linux.rocsmi.gpu_util".to_string(), Arc::new(c::linux_gpu::rocsmi_util::LinuxRocmSmiGpuParser));
         r.register("linux.rocprof.gpu_kernels".to_string(), Arc::new(c::linux_gpu::rocprof_kernels::LinuxRocprofKernelsParser));
