@@ -9,6 +9,11 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { codecReady } from '/js/protocol/codec.js';
 import { Router } from '/js/router.js';
+// Expose router globally for modules ladowane dynamicznie (profile-report,
+// profile-compare, profile-permissions, profiling-sessions) ktore robia
+// `window.Router.navigate(...)` zamiast staleego importu — to celowe
+// "weak coupling" zeby uniknac cyklicznych importow w drill-down widokach.
+if (typeof window !== 'undefined') window.Router = Router;
 import { byId, escapeHtml } from '/js/utils.js';
 import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
@@ -45,6 +50,7 @@ import MeetingLiveScreen from '/js/modules/meeting-live.js';
 import ProfileReportV2View from '/js/modules/profile-report-v2.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
+import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 
 // Adapter: V2 view eksponuje statyczne `render(container, params)`, podczas
 // gdy Router oczekuje `show(params)` lub `render()/mount()`. Owijamy V2 w
@@ -125,6 +131,7 @@ const ADMIN_NAV = [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
+      { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
   },
 ];
@@ -423,6 +430,7 @@ async function renderApp() {
   Router.register('profile-report', ProfileReportScreen);
   Router.register('profile-compare', ProfileCompareScreen);
   Router.register('profile-permissions', ProfilePermissionsScreen);
+  Router.register('profiling-sessions', ProfilingSessionsScreen);
 
   paint();
 
