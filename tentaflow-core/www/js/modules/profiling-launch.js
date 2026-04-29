@@ -455,12 +455,21 @@ export class ProfilingLaunchModal {
       </div>
       <div class="field-label"><span>Elevation password</span></div>
       <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}">
+        <svg class="lock-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="11" width="16" height="10" rx="2"/>
+          <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+        </svg>
         <input type="${inputType}" id="pl-elevation-input"
                autocomplete="current-password"
                value="${escapeAttr(this.elevationPassword)}"
                placeholder="••••••••" />
         <button type="button" class="pw-eye" id="pl-elevation-eye"
-                title="Toggle visibility">${this.elevationVisible ? 'hide' : 'show'}</button>
+                title="Toggle visibility">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
       </div>
       <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
         <tf-button variant="outline" size="sm" id="pl-elevation-test">Test</tf-button>
@@ -656,7 +665,8 @@ export class ProfilingLaunchModal {
     const { bytes, overheadPct } = estimateImpact(selectedSources, dur);
     const foot = document.getElementById('profiling-estimate-foot');
     if (foot) {
-      foot.textContent = `Estimated storage: ~${formatBytes(bytes)} · overhead: ~${overheadPct}% CPU`;
+      const n = selectedSources.length;
+      foot.textContent = `Estimated storage: ~${formatBytes(bytes)} · overhead: ~${overheadPct}% CPU · ${n} collector${n === 1 ? '' : 's'}`;
     }
   }
 
