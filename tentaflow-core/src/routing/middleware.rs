@@ -109,18 +109,6 @@ impl Router {
             };
         }
 
-        // FAZA-8c: drop legacy fallback chain after old paths cleaned.
-        // 1. Config aliasy
-        for alias in &self.config.service_aliases {
-            if alias.alias == model {
-                debug!("resolve_route: config alias {} -> {}", model, alias.target);
-                return ResolvedRoute {
-                    targets: vec![alias.target.clone()],
-                    strategy: PoolStrategy::FirstAvailable,
-                };
-            }
-        }
-
         // 2. Znany serwis
         if self.service_manager.has_quic_llm_service(model)
             || self.service_manager.has_http_backends(model)
@@ -248,9 +236,6 @@ impl Router {
             }
         }
 
-        // FAZA-8c: drop legacy backend probing once snapshot covers all
-        // transports (TTS/STT/embedding/RAG) and `LocalInferenceManager`
-        // registration is wired through the snapshot path.
         if self.service_manager.has_local_inference_service(target) {
             backends.push(BackendHandle::LocalLlm);
         }
@@ -302,17 +287,22 @@ impl Router {
         // probuje MeshForward przez QUIC do siebie samego, dostaje
         // 'Mesh STT serwis nie polaczony' bo nie ma quic clienta na
         // wlasnym embedded silniku.
-        let registry = self.service_manager.mesh_registry.read();
-        if let Some(ref reg) = *registry {
-            let local_node = reg.local_node_id().to_string();
+        // Mesh forward — only remote nodes (filter local owner). Uses the V2
+        // services registry: local services live in `local()`, remote ones in
+        // `all_remote()`.
+        if let Some(reg) = self.service_manager.mesh_services_registry.read().as_ref() {
+            let local_owner = reg.local().node_id.clone();
             for svc in reg.visible_services() {
-                if svc.node_id == local_node {
+                if svc.node_id == local_owner {
                     continue;
                 }
-                if svc.models.iter().any(|m| m == target) && svc.status == "running" {
+                if svc.status != "running" {
+                    continue;
+                }
+                if svc.models.iter().any(|m| m.model_name == target) {
                     backends.push(BackendHandle::MeshForward(
                         svc.node_id.clone(),
-                        svc.service_name.clone(),
+                        svc.display_name.clone(),
                     ));
                 }
             }
@@ -719,7 +709,7 @@ mod middleware_tests {
     }
 
     // ========================================================================
-    // FAZA-8b-2: snapshot-first resolve_route / get_backends
+    // Snapshot-first resolve_route / get_backends
     // ========================================================================
 
     use crate::config::RouterConfig;

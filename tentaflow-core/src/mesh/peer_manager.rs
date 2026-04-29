@@ -701,9 +701,6 @@ impl PeerManager {
             | IrohMeshEvent::MeshCommandResponseReceived { .. }
             | IrohMeshEvent::MeshDeployProgressReceived { .. }
             | IrohMeshEvent::MeshLogChunkReceived { .. }
-            | IrohMeshEvent::ServiceAnnounceReceived { .. }
-            | IrohMeshEvent::ServiceQueryAllReceived { .. }
-            | IrohMeshEvent::ServiceResponseAllReceived { .. }
             | IrohMeshEvent::TrustRevokedReceived { .. }
             | IrohMeshEvent::KeyRotationReceived { .. }
             | IrohMeshEvent::KeyRotationResponseReceived { .. }

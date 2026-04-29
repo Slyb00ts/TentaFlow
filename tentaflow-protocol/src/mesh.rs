@@ -18,10 +18,6 @@ use crate::profiling::{
     ProfilingStopResponse,
 };
 
-fn default_service_status() -> String {
-    "running".to_string()
-}
-
 // =============================================================================
 // Typ operacji CRDT
 // =============================================================================
@@ -53,44 +49,6 @@ pub struct CrdtSyncOp {
     pub key: String,
     /// Typ operacji CRDT
     pub op_type: CrdtOpType,
-}
-
-// =============================================================================
-// Informacja o serwisie AI
-// =============================================================================
-
-/// Opis serwisu AI dostepnego na nodzie mesh.
-/// Uzywany w service discovery i load balancingu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct MeshServiceInfo {
-    /// Identyfikator serwisu (UUID)
-    #[serde(default)]
-    pub service_id: String,
-    /// Nazwa serwisu
-    pub service_name: String,
-    /// Typ serwisu: "llm", "tts", "embedding" itp.
-    pub service_type: String,
-    /// Identyfikator noda na ktorym dziala serwis
-    pub node_id: String,
-    /// Port QUIC na ktorym serwis nasluchuje
-    pub quic_port: u16,
-    /// Adres QUIC serwisu (z perspektywy owner node)
-    #[serde(default)]
-    pub quic_url: String,
-    /// Status serwisu: "running", "stopped", "error"
-    #[serde(default = "default_service_status")]
-    pub status: String,
-    /// Lista modeli dostepnych w serwisie
-    pub models: Vec<String>,
-    /// Obciazenie noda w procentach (0-100)
-    pub load_percent: u8,
-    /// Engine serving these models (e.g. "llama-cpp", "vllm", "mlx", "whisper-rs").
-    #[serde(default)]
-    pub engine_id: Option<String>,
-    /// Parallel array to `models`: weights size in MB per entry (0 when unknown).
-    /// Empty when no size metadata is available.
-    #[serde(default)]
-    pub model_sizes_mb: Vec<u64>,
 }
 
 // =============================================================================
@@ -136,22 +94,6 @@ pub enum MeshMessage {
 
     /// Zadanie synchronizacji stanu od podanego czasu
     StateSyncRequest { from: String, since_time: u64 },
-
-    // -- Service discovery --
-    /// Ogloszenie dostepnych serwisow na nodzie
-    ServiceAnnounce {
-        node_id: String,
-        services: Vec<MeshServiceInfo>,
-    },
-
-    /// Zapytanie o serwisy danego typu
-    ServiceQuery { service_type: String, from: String },
-
-    /// Odpowiedz z lista serwisow
-    ServiceResponse {
-        services: Vec<MeshServiceInfo>,
-        from: String,
-    },
 
     // -- Forwarding --
     /// Przekazanie requestu do innego noda
@@ -273,19 +215,6 @@ pub enum MeshMessage {
         strategy: String,
     },
 
-    // -- Service discovery rozszerzony --
-    /// Zapytanie o wszystkie widoczne serwisy w mesh
-    ServiceQueryAll {
-        from_node_id: String,
-        request_id: String,
-    },
-
-    /// Odpowiedz z pelna lista serwisow (z dedup)
-    ServiceResponseAll {
-        from_node_id: String,
-        request_id: String,
-        services: Vec<MeshServiceInfo>,
-    },
 }
 
 // =============================================================================
@@ -407,8 +336,6 @@ pub struct MeshFullState {
     pub models: Vec<MeshModelInfo>,
     /// Dzialajace kontenery Docker
     pub containers: Vec<MeshContainerInfo>,
-    /// Dostepne serwisy AI
-    pub services: Vec<MeshServiceInfo>,
     /// Operacje CRDT do synchronizacji
     pub crdt_operations: Vec<CrdtSyncOp>,
     /// Wektor wersji: pary (hash_noda, czas_logiczny)
@@ -779,7 +706,6 @@ pub const MESH_MSG_FORWARD_REQ: u8 = 0x13;
 pub const MESH_MSG_FORWARD_RES: u8 = 0x14;
 pub const MESH_MSG_MODEL_LIST: u8 = 0x15;
 pub const MESH_MSG_CONTAINER_LIST: u8 = 0x16;
-pub const MESH_MSG_SERVICE_ANNOUNCE: u8 = 0x17;
 pub const MESH_MSG_NODE_INFO: u8 = 0x18;
 /// Minimal hello — hostname + platform. Wysylany przy kazdym PeerConnected
 /// (trusted LUB discovered), zeby GUI mogl pokazac ludzka nazwe (spark-002)
@@ -805,8 +731,6 @@ pub const MESH_MSG_COMMAND: u8 = 0x30;
 pub const MESH_MSG_COMMAND_RESPONSE: u8 = 0x31;
 pub const MESH_MSG_DEPLOY_PROGRESS: u8 = 0x32;
 pub const MESH_MSG_LOG_CHUNK: u8 = 0x33;
-pub const MESH_MSG_SERVICE_QUERY_ALL: u8 = 0x34;
-pub const MESH_MSG_SERVICE_RESPONSE_ALL: u8 = 0x35;
 pub const MESH_MSG_CLUSTER_INFO: u8 = 0x36;
 pub const MESH_MSG_KEY_ROTATION: u8 = 0x25;
 pub const MESH_MSG_KEY_ROTATION_RESPONSE: u8 = 0x26;
@@ -1168,43 +1092,6 @@ mod tests {
                 assert_eq!(operations.len(), 2);
             }
             _ => panic!("Oczekiwano wariantu StateSync"),
-        }
-    }
-
-    #[test]
-    fn test_service_info_roundtrip() {
-        let msg = MeshMessage::ServiceAnnounce {
-            node_id: "node-4".to_string(),
-            services: vec![MeshServiceInfo {
-                service_id: String::new(),
-                service_name: "llm-server".to_string(),
-                service_type: "llm".to_string(),
-                node_id: "node-4".to_string(),
-                quic_port: 4433,
-                quic_url: String::new(),
-                status: "running".to_string(),
-                models: vec!["llama3-8b".to_string(), "mistral-7b".to_string()],
-                load_percent: 35,
-                engine_id: None,
-                model_sizes_mb: Vec::new(),
-            }],
-        };
-
-        let bytes = msg
-            .serialize_rkyv()
-            .expect("Serializacja service announce powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja service announce powinna sie udac");
-
-        match archived {
-            ArchivedMeshMessage::ServiceAnnounce { node_id, services } => {
-                assert_eq!(node_id.as_str(), "node-4");
-                assert_eq!(services.len(), 1);
-                assert_eq!(services[0].quic_port, 4433);
-                assert_eq!(services[0].load_percent, 35);
-                assert_eq!(services[0].models.len(), 2);
-            }
-            _ => panic!("Oczekiwano wariantu ServiceAnnounce"),
         }
     }
 
@@ -1664,19 +1551,6 @@ mod tests {
                 cpu_percent: 55.0,
                 memory_mb: 4096,
             }],
-            services: vec![MeshServiceInfo {
-                service_id: String::new(),
-                service_name: "llm-vllm".to_string(),
-                service_type: "llm".to_string(),
-                node_id: "node-20".to_string(),
-                quic_port: 4433,
-                quic_url: String::new(),
-                status: "running".to_string(),
-                models: vec!["llama3-70b".to_string()],
-                load_percent: 55,
-                engine_id: None,
-                model_sizes_mb: Vec::new(),
-            }],
             crdt_operations: vec![CrdtSyncOp {
                 clock_time: 200,
                 clock_node_hash: 0xCAFE,
@@ -1707,7 +1581,6 @@ mod tests {
                 assert_eq!(state.models[0].max_context, 8192);
                 assert_eq!(state.containers.len(), 1);
                 assert_eq!(state.containers[0].name.as_str(), "vllm-server");
-                assert_eq!(state.services.len(), 1);
                 assert_eq!(state.crdt_operations.len(), 1);
                 assert_eq!(state.version_vector.len(), 2);
             }

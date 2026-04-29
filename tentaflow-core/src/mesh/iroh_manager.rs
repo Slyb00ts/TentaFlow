@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::mesh::security::MeshSecurity;
-use crate::mesh::service_registry::MeshServiceRegistry;
 use crate::net::iroh::{
     handler::IrohStreamError,
     pairing::{
@@ -126,10 +125,6 @@ pub enum IrohMeshEvent {
         peer_id: String,
         data: Vec<u8>,
     },
-    ServiceAnnounceReceived {
-        node_id: String,
-        data: Vec<u8>,
-    },
     AliasSyncReceived {
         from_node_id: String,
         data: Vec<u8>,
@@ -195,14 +190,6 @@ pub enum IrohMeshEvent {
     RelayFrameReceived {
         from_node_id: String,
         frame: tentaflow_protocol::mesh::MeshRelayFrame,
-    },
-    ServiceQueryAllReceived {
-        from_node_id: String,
-        data: Vec<u8>,
-    },
-    ServiceResponseAllReceived {
-        from_node_id: String,
-        data: Vec<u8>,
     },
     /// Odkryty nowy peer przez mDNS/DHT — wypala zanim zaczniemy dial.
     /// Pipeline pisze do peer_store z source=discovered zeby UI widzial peera
@@ -287,7 +274,6 @@ pub struct IrohMeshManager {
     next_connection_id: AtomicU64,
     forward_handler: AsyncRwLock<Option<ForwardHandler>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
-    service_reg: Arc<MeshServiceRegistry>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
     /// DashMap — upsert/read lock-free per-shard.
@@ -329,7 +315,6 @@ impl IrohMeshManager {
         // subscriber pipeline moze chwilowo byc wolniejszy niz producent
         // eventow. 1024 bylo za malo, przy 100+ peerach Lagged sie zdarzal.
         let (event_tx, _rx) = broadcast::channel(16_384);
-        let service_reg = Arc::new(MeshServiceRegistry::new(local_id_hex.clone()));
 
         Ok(Arc::new(Self {
             endpoint: Arc::new(endpoint),
@@ -342,7 +327,6 @@ impl IrohMeshManager {
             next_connection_id: AtomicU64::new(1),
             forward_handler: AsyncRwLock::new(None),
             command_waiters: DashMap::new(),
-            service_reg,
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
             command_executor: AsyncRwLock::new(None),
@@ -1197,11 +1181,6 @@ impl IrohMeshManager {
         self.connected_peers().await
     }
 
-    /// Zwraca referencje do rejestru serwisow mesh.
-    pub fn service_registry(&self) -> &Arc<MeshServiceRegistry> {
-        &self.service_reg
-    }
-
     /// Ustawia callback dla incoming forward requestow.
     pub async fn set_forward_handler(&self, handler: ForwardHandler) {
         *self.forward_handler.write().await = Some(handler);
@@ -1575,10 +1554,6 @@ impl IrohMeshManagerRef {
             },
             x if x == MESH_MSG_PAIRING_REJECT => IrohMeshEvent::PairingRejectReceived {
                 peer_id: remote_hex,
-                data: payload,
-            },
-            x if x == MESH_MSG_SERVICE_ANNOUNCE => IrohMeshEvent::ServiceAnnounceReceived {
-                node_id: remote_hex,
                 data: payload,
             },
             x if x == MESH_MSG_ALIAS_SYNC => IrohMeshEvent::AliasSyncReceived {

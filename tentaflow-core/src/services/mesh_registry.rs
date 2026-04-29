@@ -1,15 +1,15 @@
 // ============ File: mesh_registry.rs — In-memory aggregator of services from all known mesh nodes ============
 
-// Cross-node `services` projection. The local node persists its rows in the
-// SQLite `services` table; remote nodes' snapshots arrive via
-// `MeshServicesGet`/`Announce`/`Update` messages and end up here. The local
-// node is intentionally NOT inserted — readers (GUI aggregate, forwarding
-// lookup) merge `services_repo::list_all` with `all_remote()` to get a global
-// view.
+// Cross-node `services` projection. Local node snapshot zywie obok zdalnych —
+// supervisor odswiezza go (krok N7.2) z `services_repo::list_all`, zdalne
+// snapshoty docieraja przez `MeshServicesGet`/`Announce`/`Update` (krok N3a).
+// Czytelnicy uzywaja `visible_services` / `unique_models` dostac globalny
+// widok bez jawnego mergeowania DB-list w call sites.
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tentaflow_protocol::{ServiceChange, ServiceInfo};
 
@@ -24,10 +24,45 @@ pub struct RemoteNodeSnapshot {
     pub last_seen_at: Instant,
 }
 
-/// In-memory aggregator of services advertised by every reachable remote
-/// mesh node. The local node is NOT here; readers union with the local
-/// `services` table to produce a full mesh view.
+/// Local node snapshot — populated by the supervisor (krok N7.2) every tick
+/// from `services_repo::list_all`. Default is an empty vector with an empty
+/// `node_id` so cross-node lookups during boot (before supervisor first tick)
+/// return nothing rather than crashing.
+#[derive(Debug, Clone, Default)]
+pub struct LocalNodeSnapshot {
+    pub node_id: String,
+    pub services: Vec<ServiceInfo>,
+}
+
+/// Unified entry zwracany przez `unique_models`. Sklejony z `ServiceInfo` +
+/// `ServiceModelEntry` z konkretnego serwisu, ktory go eksponuje. Kolejnosc
+/// pol odpowiada szybkiemu lookup'owi po `model_name`; wlasciciel widoczny
+/// w `node_id`/`service_id`.
+#[derive(Debug, Clone)]
+pub struct UnifiedModelEntry {
+    pub model_name: String,
+    pub display_name: Option<String>,
+    pub service_id: i64,
+    pub node_id: String,
+    pub engine_id: String,
+    pub category: String,
+    pub status: String,
+    pub transport: String,
+    pub endpoint_url: Option<String>,
+    pub capabilities: Vec<String>,
+    pub context_length: Option<u32>,
+    pub quantization: Option<String>,
+    pub is_default: bool,
+}
+
+/// In-memory aggregator of services advertised by every reachable mesh node
+/// plus the local node. Readers (routing, GUI aggregate) operate purely on
+/// this struct and never touch the SQLite `services` table directly anymore.
 pub struct MeshServicesRegistry {
+    /// Local node snapshot. ArcSwap zeby readers byli lock-free; supervisor
+    /// publikuje pelen vector na kazdym tick przez `replace_local`.
+    local: ArcSwap<LocalNodeSnapshot>,
+    /// Per-peer snapshots adwertyzowane przez zaufane nody.
     remote: Arc<DashMap<String, RemoteNodeSnapshot>>,
 }
 
@@ -40,9 +75,58 @@ impl Default for MeshServicesRegistry {
 impl MeshServicesRegistry {
     pub fn new() -> Self {
         Self {
+            local: ArcSwap::from_pointee(LocalNodeSnapshot::default()),
             remote: Arc::new(DashMap::new()),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Local node
+    // -------------------------------------------------------------------------
+
+    /// Replace lokalnego node'a snapshot. Wolany przez supervisor po kazdym
+    /// tick'u (full repo dump) oraz przez nawiezujacy snapshot publisher na
+    /// startup.
+    pub fn replace_local(&self, node_id: String, services: Vec<ServiceInfo>) {
+        self.local
+            .store(Arc::new(LocalNodeSnapshot { node_id, services }));
+    }
+
+    /// Inkrementalna zmiana lokalnego snapshotu (po deploy, pause, delete itp.).
+    /// `node_id` musi pasowac do aktualnego `local.node_id` — w przeciwnym
+    /// wypadku zmiana jest ignorowana (dispatcher kierowal do remote).
+    pub fn apply_local_change(&self, node_id: &str, change: ServiceChange) {
+        let current = self.local.load();
+        if current.node_id != node_id {
+            return;
+        }
+        let mut services = current.services.clone();
+        match change {
+            ServiceChange::Added(svc) | ServiceChange::Updated(svc) => {
+                if let Some(slot) = services.iter_mut().find(|s| s.id == svc.id) {
+                    *slot = svc;
+                } else {
+                    services.push(svc);
+                }
+            }
+            ServiceChange::Removed { service_id } => {
+                services.retain(|s| s.id != service_id);
+            }
+        }
+        self.local.store(Arc::new(LocalNodeSnapshot {
+            node_id: current.node_id.clone(),
+            services,
+        }));
+    }
+
+    /// Snapshot lokalnego node'a. Read-only; lock-free dzieki ArcSwap.
+    pub fn local(&self) -> Arc<LocalNodeSnapshot> {
+        self.local.load_full()
+    }
+
+    // -------------------------------------------------------------------------
+    // Remote nodes
+    // -------------------------------------------------------------------------
 
     /// Replace the snapshot stored for `node_id`. Used for full-state messages
     /// (`MeshServicesGetResponse`, `MeshServicesAnnounce`). Bumps `last_seen_at`.
@@ -56,11 +140,16 @@ impl MeshServicesRegistry {
         );
     }
 
-    /// Apply an incremental change to `node_id`'s snapshot. If the node is not
-    /// known yet (no prior `replace_node`), `Added`/`Updated` create a new
-    /// entry; `Removed` is a no-op. `last_seen_at` is bumped in every case
-    /// where the entry actually changes.
+    /// Apply an incremental change to `node_id`'s snapshot. If `node_id`
+    /// is the local node, deleguje na `apply_local_change`. Dla zdalnych
+    /// nodow gdy entry nie istnieje (no prior `replace_node`), `Added`/
+    /// `Updated` tworzy nowy entry; `Removed` jest no-op. `last_seen_at`
+    /// jest bumpowany za kazdym razem kiedy entry sie zmienia.
     pub fn apply_change(&self, node_id: String, change: ServiceChange) {
+        if self.local.load().node_id == node_id {
+            self.apply_local_change(&node_id, change);
+            return;
+        }
         match change {
             ServiceChange::Added(svc) => {
                 let mut entry = self
@@ -143,6 +232,85 @@ impl MeshServicesRegistry {
     /// Number of remote nodes currently in the registry. Diagnostics only.
     pub fn remote_node_count(&self) -> usize {
         self.remote.len()
+    }
+
+    // -------------------------------------------------------------------------
+    // Aggregated views (local + remote)
+    // -------------------------------------------------------------------------
+
+    /// Wszystkie services widoczne w mesh — local snapshot + kazdy remote
+    /// snapshot — zdedupowane po `(node_id, service_id)`. Kolejnosc:
+    /// najpierw local, potem remote w kolejnosci iteratora DashMap.
+    pub fn visible_services(&self) -> Vec<ServiceInfo> {
+        let mut out: Vec<ServiceInfo> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+        for svc in &self.local.load().services {
+            if seen.insert((svc.node_id.clone(), svc.id)) {
+                out.push(svc.clone());
+            }
+        }
+        for entry in self.remote.iter() {
+            for svc in &entry.value().services {
+                if seen.insert((svc.node_id.clone(), svc.id)) {
+                    out.push(svc.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Lista unikalnych modeli dostepnych w mesh, zgrupowana po `model_name`.
+    /// Pierwszy znaleziony serwis (local-first) wygrywa kiedy dwa nody
+    /// publikuja ten sam `model_name`. Uzywane przez routing (krok N7.3) i
+    /// GUI catalog do wystawienia spojnej listy modeli.
+    pub fn unique_models(&self) -> Vec<UnifiedModelEntry> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<UnifiedModelEntry> = Vec::new();
+        for svc in self.visible_services() {
+            for model in &svc.models {
+                if seen.insert(model.model_name.clone()) {
+                    out.push(UnifiedModelEntry {
+                        model_name: model.model_name.clone(),
+                        display_name: model.display_name.clone(),
+                        service_id: svc.id,
+                        node_id: svc.node_id.clone(),
+                        engine_id: svc.engine_id.clone(),
+                        category: svc.category.clone(),
+                        status: svc.status.clone(),
+                        transport: svc.transport.clone(),
+                        endpoint_url: svc.endpoint_url.clone(),
+                        capabilities: model.capabilities.clone(),
+                        context_length: model.context_length,
+                        quantization: model.quantization.clone(),
+                        is_default: model.is_default,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Znajdz wlasciciela serwisu eksponujacego `model_name`. Zwraca pierwszy
+    /// dopasowany `node_id` (local-first przez `visible_services` ordering).
+    pub fn find_node_for_model(&self, model_name: &str) -> Option<String> {
+        self.visible_services()
+            .into_iter()
+            .find(|s| s.models.iter().any(|m| m.model_name == model_name))
+            .map(|s| s.node_id)
+    }
+
+    /// Konkretny `ServiceInfo` po `(node_id, service_id)`. Local probowany
+    /// jako pierwszy, potem zdalne snapshoty. Zwraca `None` kiedy nic nie
+    /// pasuje.
+    pub fn find_service(&self, node_id: &str, service_id: i64) -> Option<ServiceInfo> {
+        let local = self.local.load();
+        if local.node_id == node_id {
+            if let Some(s) = local.services.iter().find(|s| s.id == service_id) {
+                return Some(s.clone());
+            }
+        }
+        let remote = self.remote.get(node_id)?;
+        remote.services.iter().find(|s| s.id == service_id).cloned()
     }
 }
 
@@ -285,5 +453,124 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0, "nodeA");
         assert_eq!(all[1].0, "nodeB");
+    }
+
+    // -------------------------------------------------------------------------
+    // Local + aggregated (krok N7.1b)
+    // -------------------------------------------------------------------------
+
+    fn svc_with_model(id: i64, node: &str, name: &str, model: &str) -> ServiceInfo {
+        let mut s = svc(id, node, name);
+        s.models.push(tentaflow_protocol::ServiceModelEntry {
+            model_name: model.to_string(),
+            display_name: None,
+            capabilities: Vec::new(),
+            context_length: None,
+            quantization: None,
+            is_default: false,
+        });
+        s
+    }
+
+    #[test]
+    fn replace_local_replaces_local_snapshot() {
+        let reg = MeshServicesRegistry::new();
+        assert!(reg.local().services.is_empty());
+        reg.replace_local("local".into(), vec![svc(1, "local", "first")]);
+        let snap = reg.local();
+        assert_eq!(snap.node_id, "local");
+        assert_eq!(snap.services.len(), 1);
+        assert_eq!(snap.services[0].id, 1);
+
+        reg.replace_local(
+            "local".into(),
+            vec![svc(2, "local", "second"), svc(3, "local", "third")],
+        );
+        assert_eq!(reg.local().services.len(), 2);
+    }
+
+    #[test]
+    fn apply_local_change_routes_through_local_when_node_matches() {
+        let reg = MeshServicesRegistry::new();
+        reg.replace_local("local".into(), vec![svc(1, "local", "old")]);
+        // Updated z apply_change powinno trafic do local, nie remote.
+        let mut updated = svc(1, "local", "renamed");
+        updated.status = "stopped".into();
+        reg.apply_change("local".into(), ServiceChange::Updated(updated));
+        let snap = reg.local();
+        assert_eq!(snap.services[0].display_name, "renamed");
+        assert_eq!(snap.services[0].status, "stopped");
+        assert_eq!(reg.remote_node_count(), 0);
+    }
+
+    #[test]
+    fn visible_services_includes_local_and_remote() {
+        let reg = MeshServicesRegistry::new();
+        reg.replace_local("local".into(), vec![svc(1, "local", "L1")]);
+        reg.replace_node("peerA".into(), vec![svc(2, "peerA", "A1")]);
+        let v = reg.visible_services();
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().any(|s| s.node_id == "local" && s.id == 1));
+        assert!(v.iter().any(|s| s.node_id == "peerA" && s.id == 2));
+    }
+
+    #[test]
+    fn visible_services_dedups_by_node_id_service_id() {
+        let reg = MeshServicesRegistry::new();
+        // Wstawiamy ten sam (node_id, id) lokalnie i zdalnie — local wygrywa.
+        reg.replace_local("nodeX".into(), vec![svc(7, "nodeX", "from-local")]);
+        reg.replace_node("nodeX".into(), vec![svc(7, "nodeX", "from-remote")]);
+        let v = reg.visible_services();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].display_name, "from-local");
+    }
+
+    #[test]
+    fn unique_models_first_service_wins_for_duplicates() {
+        let reg = MeshServicesRegistry::new();
+        reg.replace_local(
+            "local".into(),
+            vec![svc_with_model(1, "local", "L1", "qwen-tiny")],
+        );
+        // Drugi node oferuje ten sam model — powinien byc pominiety.
+        reg.replace_node(
+            "peerA".into(),
+            vec![svc_with_model(2, "peerA", "A1", "qwen-tiny")],
+        );
+        let models = reg.unique_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_name, "qwen-tiny");
+        assert_eq!(models[0].node_id, "local");
+        assert_eq!(models[0].service_id, 1);
+    }
+
+    #[test]
+    fn find_node_for_model_returns_correct_owner() {
+        let reg = MeshServicesRegistry::new();
+        reg.replace_local(
+            "local".into(),
+            vec![svc_with_model(1, "local", "L1", "model-a")],
+        );
+        reg.replace_node(
+            "peerA".into(),
+            vec![svc_with_model(11, "peerA", "A1", "model-b")],
+        );
+        assert_eq!(reg.find_node_for_model("model-a").as_deref(), Some("local"));
+        assert_eq!(reg.find_node_for_model("model-b").as_deref(), Some("peerA"));
+        assert!(reg.find_node_for_model("nope").is_none());
+    }
+
+    #[test]
+    fn find_service_returns_correct_entry() {
+        let reg = MeshServicesRegistry::new();
+        reg.replace_local("local".into(), vec![svc(5, "local", "loc-5")]);
+        reg.replace_node("peerA".into(), vec![svc(6, "peerA", "rem-6")]);
+
+        let s_local = reg.find_service("local", 5).expect("local present");
+        assert_eq!(s_local.display_name, "loc-5");
+        let s_remote = reg.find_service("peerA", 6).expect("remote present");
+        assert_eq!(s_remote.display_name, "rem-6");
+        assert!(reg.find_service("local", 999).is_none());
+        assert!(reg.find_service("ghost", 1).is_none());
     }
 }

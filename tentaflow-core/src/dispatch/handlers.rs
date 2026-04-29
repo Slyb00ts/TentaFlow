@@ -599,10 +599,7 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         (row.service_id, row.engine_id)
     };
 
-    let mesh_service_id = format!("native-{}-{}", engine_id, model_id);
-    ctx.state
-        .router
-        .unregister_native_service_from_mesh(&mesh_service_id);
+    let _ = engine_id; // mesh dereg now driven by supervisor + services_repo delete
 
     {
         let conn = ctx
@@ -2834,24 +2831,18 @@ pub fn mesh_services_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let services: Vec<tentaflow_protocol::MeshServicesEntry> = match &ctx.state.quic_mesh {
-        Some(qm) => qm
-            .service_registry()
-            .visible_services()
-            .into_iter()
-            .map(|s| tentaflow_protocol::MeshServicesEntry {
-                service_name: s.service_name,
-                node_id: s.node_id,
-                status: s.status,
-                endpoint: if s.quic_url.is_empty() {
-                    None
-                } else {
-                    Some(s.quic_url)
-                },
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let services: Vec<tentaflow_protocol::MeshServicesEntry> = ctx
+        .state
+        .mesh_services_registry
+        .visible_services()
+        .into_iter()
+        .map(|s| tentaflow_protocol::MeshServicesEntry {
+            service_name: s.display_name,
+            node_id: s.node_id,
+            status: s.status,
+            endpoint: s.endpoint_url,
+        })
+        .collect();
     Ok(MessageBody::MeshServicesListResponseBody(
         tentaflow_protocol::MeshServicesListResponse { services },
     ))
@@ -2905,7 +2896,7 @@ pub fn models_unified_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let mut models = unified_from_service_registry(&ctx.state.quic_mesh);
+    let mut models = unified_from_service_registry(&ctx.state.mesh_services_registry);
     merge_peer_store_models(
         &mut models,
         &ctx.state.mesh_peer_store,
@@ -2923,9 +2914,9 @@ pub fn models_unified_list(
 }
 
 fn unified_from_service_registry(
-    quic_mesh: &Option<std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
+    registry: &std::sync::Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Vec<tentaflow_protocol::UnifiedModel> {
-    crate::api::dashboard::api_models::collect_unified(quic_mesh)
+    crate::api::dashboard::api_models::collect_unified(registry)
         .into_iter()
         .map(|m| tentaflow_protocol::UnifiedModel {
             model_name: m.model_name,
@@ -5191,4 +5182,3 @@ pub async fn service_start(
         }),
     ))
 }
-
