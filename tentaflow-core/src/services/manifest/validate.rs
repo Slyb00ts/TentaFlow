@@ -41,6 +41,12 @@ pub enum ValidationError {
     DockerRequiresSingleSource { engine_id: String },
 
     #[error(
+        "Engine '{engine_id}': [deploy.docker] is missing required `transport` field — \
+         set it to \"sidecar-quic\" or \"direct-http\""
+    )]
+    DockerRequiresTransport { engine_id: String },
+
+    #[error(
         "Engine '{engine_id}': deploy.native.runtime = embedded must not define \
          binary_path or bundle_path (feature_flag is optional — silniki gated \
          tylko przez target_os, jak apple-tts czy tract-onnx vision, mogą go pominąć)"
@@ -103,6 +109,12 @@ pub fn validate_engine(
             .is_some_and(|s| !s.is_empty());
         if has_context == has_compose {
             errors.push(ValidationError::DockerRequiresSingleSource {
+                engine_id: eid.clone(),
+            });
+        }
+        // Phase 6: every docker manifest must declare a runtime transport.
+        if docker.transport.is_none() {
+            errors.push(ValidationError::DockerRequiresTransport {
                 engine_id: eid.clone(),
             });
         }

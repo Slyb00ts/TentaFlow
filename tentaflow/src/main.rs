@@ -218,10 +218,16 @@ async fn run_server(args: Args) -> Result<()> {
 
     // === Phase 4: services supervisor over services_v2 ===
     // Runs alongside legacy router restore paths until Phase 5 swaps call sites.
-    {
+    // Phase 5: `snapshot_rx` is wired into the router below so resolve_model
+    // can consult the supervisor's view as a fallback.
+    let services_snapshot_rx_for_router: Option<
+        tokio::sync::watch::Receiver<
+            Arc<tentaflow_core::services::supervisor::ServicesSnapshot>,
+        >,
+    > = {
         use std::collections::HashSet;
         use tentaflow_core::services::ports::PortAllocator;
-        use tentaflow_core::services::supervisor::Supervisor;
+        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
         use tentaflow_core::services_repo::services as services_v2_repo;
 
         let services_runtime_cfg = config.services_runtime.clone();
@@ -245,8 +251,12 @@ async fn run_server(args: Args) -> Result<()> {
         match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
             Ok(allocator) => {
                 let port_allocator = Arc::new(allocator);
+                // Phase 5: AlwaysOkEmbeddedProbe is a placeholder until the
+                // local inference manager exposes a per-engine health hook.
                 let (supervisor, snapshot_rx) =
                     Supervisor::new(&services_runtime_cfg, db.clone(), port_allocator.clone());
+                let supervisor =
+                    supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
 
                 // First tick is synchronous so the initial snapshot is non-empty
                 // before the router goes online. Failures are logged but not fatal.
@@ -260,11 +270,11 @@ async fn run_server(args: Args) -> Result<()> {
                     services_runtime_cfg.health_check_interval_ms,
                     services_runtime_cfg.port_range
                 );
-                // The receiver / handle are not yet consumed by anyone; Phase 5
-                // will plumb the snapshot into the router. Keep them alive.
-                let _supervisor_snapshot_rx = snapshot_rx;
+                // Hand the receiver to the router below; keep allocator + handle
+                // alive for the lifetime of the process.
                 let _supervisor_handle = supervisor_handle;
                 let _supervisor_port_allocator = port_allocator;
+                Some(snapshot_rx)
             }
             Err(e) => {
                 tracing::warn!(
@@ -272,13 +282,17 @@ async fn run_server(args: Args) -> Result<()> {
                     services_runtime_cfg.port_range,
                     e
                 );
+                None
             }
         }
-    }
+    };
 
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
+    if let Some(rx) = services_snapshot_rx_for_router {
+        router.set_services_snapshot_rx(rx);
+    }
     router.start();
 
     // Zaladuj serwisy QUIC z bazy danych (metoda w Core)

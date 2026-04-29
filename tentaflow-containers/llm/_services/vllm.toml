@@ -19,6 +19,7 @@ version = "0.6.3"
 [deploy.docker]
 context_path = "llm/docker/vllm"
 platforms = ["linux", "windows"]
+transport = "sidecar-quic"
 
 [deploy.native]
 platforms = ["linux", "windows"]

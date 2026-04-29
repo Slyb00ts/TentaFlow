@@ -16,6 +16,7 @@ version = "1.7.4"
 [deploy.docker]
 context_path = "stt/docker/whisper"
 platforms = ["linux", "windows"]
+transport = "sidecar-quic"
 
 [deploy.native]
 platforms = ["linux", "macos", "windows", "ios", "android"]

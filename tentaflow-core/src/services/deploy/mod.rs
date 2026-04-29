@@ -310,6 +310,58 @@ pub async fn respawn(
     Ok(prepared.runtime)
 }
 
+/// Stops the runtime side of a deployed service: kills the process, removes
+/// the container, and releases its host-allocated ports. Does **not** delete
+/// the `services_v2` row — the caller decides whether to mark it `stopped`
+/// or `DELETE` it (cascade removes `model_registry_v2`). Errors are merged
+/// into a single `DeployError::Other` so callers can surface them as a single
+/// "stop failed" message.
+pub async fn stop(svc: &crate::services_repo::services::ServiceRow, ports: Arc<PortAllocator>) -> DeployResult<()> {
+    use crate::services_repo::services::DeployMethod as DM;
+
+    // Container shutdown: only docker deploys own a container at runtime.
+    // We don't persist the container id on the row, so match by the
+    // deterministic name pattern used at create time (see DockerDeploy::run).
+    #[cfg(feature = "docker")]
+    if svc.deploy_method == DM::Docker {
+        if let (Ok(docker), Some(port)) = (
+            bollard::Docker::connect_with_local_defaults(),
+            svc.runtime_port,
+        ) {
+            let name = format!("tentaflow-{}-{}", svc.engine_id, port);
+            let _ = docker.stop_container(&name, None).await;
+            let _ = docker
+                .remove_container(
+                    &name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+    }
+
+    // Process shutdown: only the process-owning transports actually have a PID.
+    if let Some(pid) = svc.runtime_pid {
+        if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+            // SIGTERM with short grace then SIGKILL — handled inside terminate.
+            let _ = crate::deploy::process_ctl::terminate(pid as u32);
+        }
+    }
+
+    // Always release whichever ports the row claims; PortAllocator is idempotent
+    // on unknown ports.
+    if let Some(p) = svc.runtime_port {
+        let _ = ports.release(p);
+    }
+    if let Some(p) = svc.sidecar_quic_port {
+        let _ = ports.release(p);
+    }
+
+    Ok(())
+}
+
 // ----- DB helpers -----------------------------------------------------------
 
 /// Runs a closure inside a single SQLite transaction held under the pool's

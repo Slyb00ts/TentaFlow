@@ -67,6 +67,7 @@ version = "0.6.3"                          # REQUIRED: wersja referencyjna
 [deploy.docker]
 context_path = "llm/docker/vllm"           # REQUIRED: ścieżka pod tentaflow-containers/
 platforms = ["linux", "windows"]           # REQUIRED: array OS-ów
+transport = "sidecar-quic"                 # REQUIRED: sidecar-quic | direct-http
 download_image = "ghcr.io/.../vllm:latest" # OPTIONAL (Pro feature)
 download_size_mb = 8500                    # OPTIONAL
 
@@ -138,10 +139,28 @@ Manifest **musi mieć przynajmniej jedną** sekcję deploy: `[deploy.docker]`, `
 | `context_path` | string | warunkowo | Ścieżka kontekstu Dockerfile, względem `tentaflow-containers/`. Wymagane gdy deploy uruchamia pojedynczy kontener budowany z `Dockerfile`. |
 | `compose_path` | string | warunkowo | Ścieżka do pliku Compose/stack, względem `tentaflow-containers/`. Wymagane gdy jeden kafelek ma uruchamiać wiele kontenerów. |
 | `platforms` | array enum OS | tak | Systemy, na których ten obraz może być zbudowany / uruchomiony. |
+| `transport` | enum `sidecar-quic` / `direct-http` | tak | Jak TentaFlow rozmawia z kontenerem w runtime. |
 | `download_image` | string | nie | Referencja OCI prebuilt image (Pro feature). |
 | `download_size_mb` | u64 | nie | Rozmiar do pobrania (informacyjnie). |
 
 Dokładnie jedno z pól `context_path` albo `compose_path` musi być ustawione.
+
+#### `transport` — wybór ścieżki runtime
+
+Każdy `[deploy.docker]` musi zadeklarować, jak TentaFlow dociera do uruchomionego kontenera.
+Pole jest **wymagane** od Fazy 6 (build.rs odrzuca manifest bez niego).
+
+- **`sidecar-quic`** — TentaFlow odpala obok kontenera Rust-owy QUIC sidecar, który
+  opakowuje HTTP API silnika w QUIC. Domyślny wybór dla silników mesh-routowanych
+  (LLM-y typu `vllm` / `sglang` / `llama-cpp`, STT, TTS, embeddings). Mesh peer rozmawia
+  z TentaFlow przez QUIC, TentaFlow → sidecar → kontener po HTTP.
+- **`direct-http`** — TentaFlow rozmawia HTTP-em bezpośrednio z portem zmapowanym do hosta,
+  bez sidecara. Stosowane dla silników z własnym dashboard UI (np. `comfyui`), zewnętrznych
+  daemonów we własnym formacie (np. `ollama`), webhook-botów (`teams-bot`) i stosów
+  infra (`iroh-relay`).
+
+Wybór `transport` to decyzja architektoniczna na poziomie manifestu — runtime nie zmienia
+ścieżki dynamicznie. Migracja w drugą stronę = bump wersji silnika.
 
 ### 4.2. `[deploy.native]`
 
@@ -187,7 +206,7 @@ Lista rekomendowanych modeli dla silnika. Zero lub więcej bloków na plik.
 
 ---
 
-## 6. Reguły walidacji semantycznej (4 reguły)
+## 6. Reguły walidacji semantycznej (5 reguł)
 
 Build.rs sprawdza poniższe reguły dla każdego manifestu. Naruszenie = błąd kompilacji
 z komunikatem wskazującym plik, sekcję i pole.
@@ -198,6 +217,7 @@ z komunikatem wskazującym plik, sekcję i pole.
 | 2 | Manifest MUSI mieć przynajmniej jedną sekcję deploy (`[deploy.docker]`, `[deploy.native]` lub `[deploy.external]`). |
 | 3 | `deploy.native.runtime` musi być spójny z polami: `embedded` MOŻE mieć `feature_flag` (gating przez Cargo feature) ale nie musi (gdy gating jest przez `target_os` lub stałą zależność typu `tract-onnx`) — NIE MOŻE mieć `binary_path` ani `bundle_path`; `binary` ⇒ `binary_path` (i brak `feature_flag`/`bundle_path`); `python-bundle` ⇒ `bundle_path` (i brak `feature_flag`/`binary_path`). Tylko jedno z trzech pól. |
 | 4 | Ścieżki muszą istnieć na dysku — `deploy.docker.context_path`, `deploy.native.binary_path`, `deploy.native.bundle_path` (sprawdzane build-time, runtime nie ma dostępu do FS). |
+| 5 | Każda sekcja `[deploy.docker]` MUSI deklarować `transport` z wartością `"sidecar-quic"` albo `"direct-http"`. Brak pola = błąd kompilacji z linkiem do manifestu i wskazówką jak go uzupełnić. |
 
 Dodatkowo build.rs egzekwuje **globalną unikalność `engine.id`** w obrębie całego repo.
 

@@ -41,6 +41,18 @@ pub trait EmbeddedHealthProbe: Send + Sync {
     async fn probe(&self, engine_id: &str) -> HealthStatus;
 }
 
+/// Phase 5 placeholder: until `LocalInferenceManager` exposes a real probe,
+/// embedded engines are reported `Ok` unconditionally. Replace the binding in
+/// `main.rs` once the manager grows a `health_for(engine_id)` accessor.
+pub struct AlwaysOkEmbeddedProbe;
+
+#[async_trait::async_trait]
+impl EmbeddedHealthProbe for AlwaysOkEmbeddedProbe {
+    async fn probe(&self, _engine_id: &str) -> HealthStatus {
+        HealthStatus::Ok
+    }
+}
+
 /// Snapshot of the supervised fleet, refreshed once per loop iteration. Wired
 /// into the watch channel so consumers (router in Phase 5) can subscribe
 /// without polling the DB.
