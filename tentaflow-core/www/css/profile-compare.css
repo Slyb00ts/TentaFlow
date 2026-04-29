@@ -1,8 +1,8 @@
 /* =============================================================================
    File: profile-compare.css
    Purpose: Style dla widoku Compare Sessions (modules/profile-compare.js).
-            Kolorystyka i naming bazuje na profile-report-v2.css; extends
-            zmienne pr2-* zeby trzymac spojny look-and-feel.
+            Kolorystyka i naming bazuje na profile-report.css; uzywa
+            zmiennych pr-* zeby trzymac spojny look-and-feel.
    ============================================================================= */
 
 .profile-compare {
@@ -22,7 +22,7 @@
   color: var(--pc-text);
 }
 
-.profile-compare .pr2-breadcrumb {
+.profile-compare .pr-breadcrumb {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -30,9 +30,9 @@
   color: var(--pc-text-2);
   margin-bottom: 12px;
 }
-.profile-compare .pr2-breadcrumb a { color: var(--pc-text-2); text-decoration: none; }
-.profile-compare .pr2-breadcrumb a:hover { color: var(--pc-text); }
-.profile-compare .pr2-breadcrumb .sep { color: var(--pc-text-3); }
+.profile-compare .pr-breadcrumb a { color: var(--pc-text-2); text-decoration: none; }
+.profile-compare .pr-breadcrumb a:hover { color: var(--pc-text); }
+.profile-compare .pr-breadcrumb .sep { color: var(--pc-text-3); }
 
 .pc-header {
   display: flex;
