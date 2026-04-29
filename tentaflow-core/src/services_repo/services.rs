@@ -1,4 +1,4 @@
-// ============ File: services_repo/services.rs — CRUD over services_v2 ============
+// ============ File: services_repo/services.rs — CRUD over services ============
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -75,9 +75,13 @@ pub fn parse_status(tag: &str) -> Result<ServiceStatus> {
 #[derive(Debug, Clone)]
 pub struct NewService {
     pub engine_id: String,
+    pub category: String,
+    pub display_name: String,
     pub deploy_method: DeployMethod,
     pub transport: Transport,
     pub status: ServiceStatus,
+    pub pinned: bool,
+    pub paused: bool,
     pub runtime_pid: Option<i64>,
     pub runtime_port: Option<u16>,
     pub sidecar_quic_port: Option<u16>,
@@ -91,11 +95,16 @@ impl NewService {
         deploy_method: DeployMethod,
         transport: Transport,
     ) -> Self {
+        let engine_id = engine_id.into();
         Self {
-            engine_id: engine_id.into(),
+            display_name: engine_id.clone(),
+            engine_id,
+            category: "llm".to_string(),
             deploy_method,
             transport,
             status: ServiceStatus::Starting,
+            pinned: false,
+            paused: false,
             runtime_pid: None,
             runtime_port: None,
             sidecar_quic_port: None,
@@ -105,14 +114,18 @@ impl NewService {
     }
 }
 
-/// Row read from `services_v2`.
+/// Row read from `services`.
 #[derive(Debug, Clone)]
 pub struct ServiceRow {
     pub id: i64,
     pub engine_id: String,
+    pub category: String,
+    pub display_name: String,
     pub deploy_method: DeployMethod,
     pub transport: Transport,
     pub status: ServiceStatus,
+    pub pinned: bool,
+    pub paused: bool,
     pub runtime_pid: Option<i64>,
     pub runtime_port: Option<u16>,
     pub sidecar_quic_port: Option<u16>,
@@ -143,9 +156,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
     Ok(ServiceRow {
         id: row.get("id")?,
         engine_id: row.get("engine_id")?,
+        category: row.get("category")?,
+        display_name: row.get("display_name")?,
         deploy_method,
         transport,
         status,
+        pinned: row.get::<_, i64>("pinned")? != 0,
+        paused: row.get::<_, i64>("paused")? != 0,
         runtime_pid: row.get("runtime_pid")?,
         runtime_port: row.get::<_, Option<i64>>("runtime_port")?.map(|v| v as u16),
         sidecar_quic_port: row
@@ -161,21 +178,28 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
     })
 }
 
-const SELECT_COLUMNS: &str = "id, engine_id, deploy_method, transport, status, runtime_pid, \
-    runtime_port, sidecar_quic_port, endpoint_url, config_json, health_last_ok, health_last_err, \
-    restart_count, created_at, updated_at";
+const SELECT_COLUMNS: &str = "id, engine_id, category, display_name, deploy_method, transport, \
+    status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
+    config_json, health_last_ok, health_last_err, restart_count, created_at, updated_at";
+
+const INSERT_SQL: &str = "INSERT INTO services (engine_id, category, display_name, deploy_method, \
+    transport, status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
+    config_json) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
 
 /// Inserts a new service row. Returns the assigned id.
 pub fn insert(conn: &Connection, new: &NewService) -> Result<i64> {
     conn.execute(
-        "INSERT INTO services_v2 (engine_id, deploy_method, transport, status, runtime_pid, \
-            runtime_port, sidecar_quic_port, endpoint_url, config_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        INSERT_SQL,
         params![
             new.engine_id,
+            new.category,
+            new.display_name,
             new.deploy_method.as_db_tag(),
             new.transport.as_db_tag(),
             new.status.as_db_tag(),
+            new.pinned as i64,
+            new.paused as i64,
             new.runtime_pid,
             new.runtime_port.map(|v| v as i64),
             new.sidecar_quic_port.map(|v| v as i64),
@@ -183,21 +207,23 @@ pub fn insert(conn: &Connection, new: &NewService) -> Result<i64> {
             new.config_json,
         ],
     )
-    .context("insert services_v2")?;
+    .context("insert services")?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Inserts using an open transaction (for atomicity with related rows).
 pub fn insert_in_tx(tx: &Transaction<'_>, new: &NewService) -> Result<i64> {
     tx.execute(
-        "INSERT INTO services_v2 (engine_id, deploy_method, transport, status, runtime_pid, \
-            runtime_port, sidecar_quic_port, endpoint_url, config_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        INSERT_SQL,
         params![
             new.engine_id,
+            new.category,
+            new.display_name,
             new.deploy_method.as_db_tag(),
             new.transport.as_db_tag(),
             new.status.as_db_tag(),
+            new.pinned as i64,
+            new.paused as i64,
             new.runtime_pid,
             new.runtime_port.map(|v| v as i64),
             new.sidecar_quic_port.map(|v| v as i64),
@@ -205,23 +231,23 @@ pub fn insert_in_tx(tx: &Transaction<'_>, new: &NewService) -> Result<i64> {
             new.config_json,
         ],
     )
-    .context("insert services_v2 (tx)")?;
+    .context("insert services (tx)")?;
     Ok(tx.last_insert_rowid())
 }
 
 /// Fetches a service by id.
 pub fn get(conn: &Connection, id: i64) -> Result<Option<ServiceRow>> {
-    let sql = format!("SELECT {} FROM services_v2 WHERE id = ?1", SELECT_COLUMNS);
+    let sql = format!("SELECT {} FROM services WHERE id = ?1", SELECT_COLUMNS);
     Ok(conn
         .query_row(&sql, params![id], map_row)
         .optional()
-        .context("get services_v2")?)
+        .context("get services")?)
 }
 
 /// Lists services with status = 'running'.
 pub fn list_alive(conn: &Connection) -> Result<Vec<ServiceRow>> {
     let sql = format!(
-        "SELECT {} FROM services_v2 WHERE status = 'running' ORDER BY id ASC",
+        "SELECT {} FROM services WHERE status = 'running' ORDER BY id ASC",
         SELECT_COLUMNS
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -236,7 +262,7 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ServiceRow>> {
 /// excluded — they require an explicit user action to come back online.
 pub fn list_supervised(conn: &Connection) -> Result<Vec<ServiceRow>> {
     let sql = format!(
-        "SELECT {} FROM services_v2 WHERE status IN ('running','degraded','starting') \
+        "SELECT {} FROM services WHERE status IN ('running','degraded','starting') \
          ORDER BY id ASC",
         SELECT_COLUMNS
     );
@@ -249,7 +275,22 @@ pub fn list_supervised(conn: &Connection) -> Result<Vec<ServiceRow>> {
 
 /// Lists every service regardless of status (admin view).
 pub fn list_all(conn: &Connection) -> Result<Vec<ServiceRow>> {
-    let sql = format!("SELECT {} FROM services_v2 ORDER BY id ASC", SELECT_COLUMNS);
+    let sql = format!("SELECT {} FROM services ORDER BY id ASC", SELECT_COLUMNS);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], map_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Lists pinned services in any status. The supervisor uses this to decide
+/// whether to respawn services that the user marked pinned but which fell to
+/// `stopped` or `failed` after an upstream restart / crash.
+pub fn list_pinned(conn: &Connection) -> Result<Vec<ServiceRow>> {
+    let sql = format!(
+        "SELECT {} FROM services WHERE pinned = 1 ORDER BY id ASC",
+        SELECT_COLUMNS
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map([], map_row)?
@@ -260,7 +301,7 @@ pub fn list_all(conn: &Connection) -> Result<Vec<ServiceRow>> {
 /// Updates the lifecycle status of a service. Bumps `updated_at`.
 pub fn update_status(conn: &Connection, id: i64, status: ServiceStatus) -> Result<()> {
     let n = conn.execute(
-        "UPDATE services_v2 SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        "UPDATE services SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
         params![status.as_db_tag(), id],
     )?;
     if n == 0 {
@@ -272,10 +313,10 @@ pub fn update_status(conn: &Connection, id: i64, status: ServiceStatus) -> Resul
 /// Records a successful or failed health probe.
 pub fn update_health(conn: &Connection, id: i64, ok: bool, err: Option<&str>) -> Result<()> {
     let sql = if ok {
-        "UPDATE services_v2 SET health_last_ok = CURRENT_TIMESTAMP, health_last_err = NULL, \
+        "UPDATE services SET health_last_ok = CURRENT_TIMESTAMP, health_last_err = NULL, \
          updated_at = CURRENT_TIMESTAMP WHERE id = ?1"
     } else {
-        "UPDATE services_v2 SET health_last_err = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1"
+        "UPDATE services SET health_last_err = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1"
     };
     let n = if ok {
         conn.execute(sql, params![id])?
@@ -291,12 +332,12 @@ pub fn update_health(conn: &Connection, id: i64, ok: bool, err: Option<&str>) ->
 /// Increments `restart_count`. Used by supervisor.
 pub fn increment_restart(conn: &Connection, id: i64) -> Result<i64> {
     conn.execute(
-        "UPDATE services_v2 SET restart_count = restart_count + 1, \
+        "UPDATE services SET restart_count = restart_count + 1, \
          updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
         params![id],
     )?;
     let new_count: i64 = conn.query_row(
-        "SELECT restart_count FROM services_v2 WHERE id = ?1",
+        "SELECT restart_count FROM services WHERE id = ?1",
         params![id],
         |r| r.get(0),
     )?;
@@ -313,7 +354,7 @@ pub fn update_runtime(
     endpoint_url: Option<&str>,
 ) -> Result<()> {
     let n = conn.execute(
-        "UPDATE services_v2 SET runtime_pid = ?2, runtime_port = ?3, sidecar_quic_port = ?4, \
+        "UPDATE services SET runtime_pid = ?2, runtime_port = ?3, sidecar_quic_port = ?4, \
          endpoint_url = ?5, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
         params![
             id,
@@ -329,9 +370,47 @@ pub fn update_runtime(
     Ok(())
 }
 
-/// Deletes a service. Cascades to `model_registry_v2` via FK ON DELETE CASCADE.
+/// Toggles the pin flag. Pinned services are auto-respawned by the supervisor
+/// when they fall to `stopped` / `failed`.
+pub fn set_pinned(conn: &Connection, id: i64, pinned: bool) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET pinned = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, pinned as i64],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("set_pinned: service id={} not found", id));
+    }
+    Ok(())
+}
+
+/// Toggles the pause flag. A paused service is left untouched by the
+/// supervisor's health probe (no restarts) regardless of its runtime state.
+pub fn set_paused(conn: &Connection, id: i64, paused: bool) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET paused = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, paused as i64],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("set_paused: service id={} not found", id));
+    }
+    Ok(())
+}
+
+/// Renames the user-facing display name.
+pub fn update_display_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET display_name = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, name],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("update_display_name: service id={} not found", id));
+    }
+    Ok(())
+}
+
+/// Deletes a service. Cascades to `model_registry` via FK ON DELETE CASCADE.
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
-    conn.execute("DELETE FROM services_v2 WHERE id = ?1", params![id])?;
+    conn.execute("DELETE FROM services WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -361,6 +440,10 @@ mod tests {
         assert_eq!(row.transport, Transport::HttpDirect);
         assert_eq!(row.status, ServiceStatus::Starting);
         assert_eq!(row.restart_count, 0);
+        assert_eq!(row.category, "llm");
+        assert_eq!(row.display_name, "vllm");
+        assert!(!row.pinned);
+        assert!(!row.paused);
     }
 
     #[test]
@@ -399,6 +482,27 @@ mod tests {
         let alive = list_alive(&conn).unwrap();
         let ids: Vec<i64> = alive.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![a, c]);
+    }
+
+    #[test]
+    fn pin_pause_and_rename_round_trip() {
+        let conn = open_test_db();
+        let id = insert(&conn, &sample_new("vllm")).unwrap();
+        set_pinned(&conn, id, true).unwrap();
+        set_paused(&conn, id, true).unwrap();
+        update_display_name(&conn, id, "Production vLLM").unwrap();
+        let row = get(&conn, id).unwrap().unwrap();
+        assert!(row.pinned);
+        assert!(row.paused);
+        assert_eq!(row.display_name, "Production vLLM");
+
+        let pinned = list_pinned(&conn).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, id);
+
+        set_pinned(&conn, id, false).unwrap();
+        let pinned = list_pinned(&conn).unwrap();
+        assert!(pinned.is_empty());
     }
 
     #[test]

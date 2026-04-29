@@ -2808,9 +2808,13 @@ mod snapshot_helpers_tests {
         ServiceEntry {
             id,
             engine_id: engine_id.into(),
+            category: "llm".into(),
+            display_name: engine_id.into(),
             deploy_method: DeployMethod::NativePythonBundle,
             transport,
             status: ServiceStatus::Running,
+            pinned: false,
+            paused: false,
             endpoint_url: Some(format!("http://127.0.0.1:50{:02}", id % 100)),
             runtime_pid: None,
             runtime_port: Some(5050 + id as u16),

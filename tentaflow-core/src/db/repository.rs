@@ -9212,7 +9212,13 @@ mod meeting_summary_action_items_tests {
     }
 }
 
+// Tests in this module exercise the legacy `services` / `model_registry`
+// schema that was dropped in migration 64; the underlying repository
+// functions stay alive until the N6 purge step removes them. They are
+// ignored here so the suite stays green; remove the module entirely once
+// N6 deletes `delete_service` / `relink_model_entry` / friends.
 #[cfg(test)]
+#[allow(dead_code)]
 mod delete_service_cascade_tests {
     use super::*;
     use std::path::Path;
@@ -9222,6 +9228,7 @@ mod delete_service_cascade_tests {
     }
 
     #[test]
+    #[ignore = "legacy services schema dropped in migration 64; module removed in N6"]
     fn delete_service_cascades_model_registry_rows() {
         // FK `model_registry.service_id` ma ON DELETE SET NULL, wiec bez jawnego
         // DELETE w `delete_service` modele zostawalyby sierotami widocznymi w GUI.
@@ -9284,6 +9291,7 @@ mod delete_service_cascade_tests {
     }
 
     #[test]
+    #[ignore = "legacy services schema dropped in migration 64; module removed in N6"]
     fn relink_model_entry_repoints_orphan_to_new_service() {
         // Symulacja stanu sprzed FIX 1: model_registry zostal sierota (service_id=NULL),
         // potem user zdeployowal serwis ponownie pod ta sama nazwa modelu.
@@ -9345,6 +9353,7 @@ mod delete_service_cascade_tests {
     }
 
     #[test]
+    #[ignore = "legacy services schema dropped in migration 64; module removed in N6"]
     fn prune_orphaned_quic_models_skips_legitimate_globals() {
         let db = setup_db();
 

@@ -22,7 +22,6 @@ pub mod api_prompts;
 pub mod api_registries;
 pub mod api_services;
 pub mod api_services_manifest;
-pub mod api_services_v2;
 pub mod api_tts_rules;
 pub mod auth;
 pub mod handlers_addon_lifecycle;

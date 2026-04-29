@@ -537,7 +537,7 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
 
     let db = ctx.state.db.clone();
     tokio::spawn(async move {
-        // Replay historycznych linii — najpierw z deployments_v2 po slug,
+        // Replay historycznych linii — najpierw z deployments po slug,
         // fallback do legacy `deployments` jesli rekord nie istnieje w v2.
         if replay_tail {
             if let Ok(Some(v2)) = crate::services_repo::deployments::get_by_slug(&db, &deploy_id) {

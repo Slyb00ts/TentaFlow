@@ -19,7 +19,7 @@ pub enum Transport {
 }
 
 impl Transport {
-    /// Stable string used in the `services_v2.transport` column.
+    /// Stable string used in the `services.transport` column.
     pub fn as_db_tag(self) -> &'static str {
         match self {
             Transport::Embedded => "embedded",

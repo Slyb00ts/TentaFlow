@@ -6,7 +6,7 @@
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_deploy_recommend,
     api_fast_path, api_flows, api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts,
-    api_registries, api_services, api_services_v2, api_tts_rules, auth, static_files,
+    api_registries, api_services, api_tts_rules, auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -300,13 +300,6 @@ fn extract_bearer_token(req: &Request<Incoming>) -> Option<&str> {
 fn extract_id_from_path(path: &str, prefix: &str) -> Option<i64> {
     path.strip_prefix(prefix)
         .and_then(|rest| rest.trim_matches('/').parse().ok())
-}
-
-/// Wyciaga id serwisu ze sciezki /api/services/:id/backends
-fn extract_service_id_for_backends(path: &str) -> Option<i64> {
-    let stripped = path.strip_prefix("/api/services/")?;
-    let id_str = stripped.strip_suffix("/backends")?;
-    id_str.parse().ok()
 }
 
 /// Glowny handler routingu
@@ -1255,14 +1248,10 @@ async fn route_api(
         // Dashboard
         (&Method::GET, "/api/dashboard") => handle_result(api_dashboard::handle_overview(db), 500),
 
-        // Services — Phase 5: REST GET serves the unified services_v2 view.
-        (&Method::GET, "/api/services") => handle_result(api_services_v2::handle_list(db), 500),
-        (&Method::POST, "/api/services") => {
-            if let Some(err) = require_admin(claims, db) {
-                return err;
-            }
-            handle_result(api_services::handle_create(db, body), 400)
-        }
+        // Services — REST GET serves the unified services view. Mutations
+        // (deploy / pin / pause / delete) go through binary RPC; the only
+        // REST mutation kept is DELETE /api/services/:id below.
+        (&Method::GET, "/api/services") => handle_result(api_services::handle_list(db), 500),
 
         // API Keys
         (&Method::GET, "/api/apikeys") => handle_result(api_apikeys::handle_list(db), 500),
@@ -1383,66 +1372,18 @@ async fn route_api(
                 )
             };
 
-            // Backendy serwisow: /api/services/:id/backends
-            if let Some(sid) = extract_service_id_for_backends(path) {
-                return match method {
-                    &Method::GET => handle_result(api_services::handle_list_backends(db, sid), 500),
-                    &Method::POST => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_services::handle_create_backend(db, sid, body), 400)
-                    }
-                    _ => (405, r#"{"error":"Metoda niedozwolona"}"#.to_string()),
-                };
-            }
-
-            // Backendy: /api/backends/:id
-            if let Some(id) = extract_id_from_path(path, "/api/backends/") {
-                return match method {
-                    &Method::PUT => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_services::handle_update_backend(db, id, body), 400)
-                    }
-                    &Method::DELETE => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_services::handle_delete_backend(db, id), 500)
-                    }
-                    _ => (405, r#"{"error":"Metoda niedozwolona"}"#.to_string()),
-                };
-            }
-
-            // Sciezki z :id - services/:id, services/:id/stats, apikeys/:id
+            // /api/services/:id — DELETE stops the runtime and removes the row.
+            // POST/PUT/stats/backends went away with the legacy services table.
             if let Some(id) = extract_id_from_path(path, "/api/services/") {
-                if path.ends_with("/stats") {
-                    if *method == Method::GET {
-                        return handle_result(api_services::handle_stats(db, id), 500);
+                if *method == Method::DELETE {
+                    if require_admin(claims, db).is_some() {
+                        return admin_err();
                     }
-                } else {
-                    return match *method {
-                        Method::PUT => {
-                            if require_admin(claims, db).is_some() {
-                                return admin_err();
-                            }
-                            handle_result(api_services::handle_update(db, id, body), 400)
-                        }
-                        Method::DELETE => {
-                            if require_admin(claims, db).is_some() {
-                                return admin_err();
-                            }
-                            // Phase 5: flip to unified services_v2 stop+delete.
-                            let res =
-                                api_services_v2::handle_delete(db, port_allocator.clone(), id)
-                                    .await;
-                            handle_result(res, 500)
-                        }
-                        _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
-                    };
+                    let res =
+                        api_services::handle_delete(db, port_allocator.clone(), id).await;
+                    return handle_result(res, 500);
                 }
+                return (405, r#"{"error":"Method not allowed"}"#.to_string());
             }
 
             if let Some(id) = extract_id_from_path(path, "/api/apikeys/") {

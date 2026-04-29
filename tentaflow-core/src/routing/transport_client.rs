@@ -173,9 +173,13 @@ mod tests {
         ServiceEntry {
             id: 1,
             engine_id: "test".into(),
+            category: "llm".into(),
+            display_name: "test".into(),
             deploy_method: DeployMethod::NativePythonBundle,
             transport,
             status: ServiceStatus::Running,
+            pinned: false,
+            paused: false,
             endpoint_url: Some("http://127.0.0.1:5012".into()),
             runtime_pid: None,
             runtime_port: Some(5012),

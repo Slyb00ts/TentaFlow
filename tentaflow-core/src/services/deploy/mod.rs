@@ -1,12 +1,9 @@
-// ============ File: services/deploy/mod.rs — unified atomic deploy entry point (Phase 2) ============
+// ============ File: services/deploy/mod.rs — unified atomic deploy entry point ============
 //
 // Two-phase atomic deploy:
 //   1. PREPARE — side effects (port alloc, image build, process spawn, health check).
-//   2. COMMIT  — single DB transaction across services_v2 + model_registry_v2 +
-//                deployments_v2. If it fails, ROLLBACK is invoked to undo prepare.
-//
-// The legacy `crate::deploy::runner` path is left untouched; this module writes only
-// to the *_v2 tables and is wired to call sites in Phase 5.
+//   2. COMMIT  — single DB transaction across services + model_registry +
+//                deployments. If it fails, ROLLBACK is invoked to undo prepare.
 
 pub mod binary;
 pub mod docker;
@@ -74,7 +71,7 @@ pub type DeployResult<T> = std::result::Result<T, DeployError>;
 
 /// Live feed of build/run output for a single deploy job. Keyed by `slug`,
 /// the broadcaster fans out to dashboard subscribers and also persists each
-/// line to `deployments_v2.log_tail` for replay.
+/// line to `deployments.log_tail` for replay.
 #[derive(Clone)]
 pub struct LogSink {
     pub slug: String,
@@ -106,7 +103,7 @@ impl LogSink {
 // ----- Public types ---------------------------------------------------------
 
 /// Outcome of a successful deploy: a runnable, registered endpoint plus the
-/// deployments_v2 audit-row id.
+/// deployments audit-row id.
 #[derive(Debug, Clone)]
 pub struct DeployOutcome {
     pub deployment_id: i64,
@@ -133,6 +130,13 @@ pub struct RuntimeHandle {
 #[derive(Debug)]
 pub struct PreparedDeploy {
     pub engine_id: String,
+    /// Stable kebab-case category tag (e.g. `llm`, `tts`). Mirrors
+    /// `manifest.engine.category` so the row reflects what the catalog UI
+    /// indexes by.
+    pub category: String,
+    /// User-facing display name; falls back to `engine_id` when the manifest's
+    /// `engine.name` is empty.
+    pub display_name: String,
     pub deploy_method: DeployMethod,
     pub transport: Transport,
     pub runtime: RuntimeHandle,
@@ -159,7 +163,7 @@ pub trait DeployStrategy: Send + Sync {
 
 /// Deploys an engine atomically. On any failure the system state is rolled
 /// back: spawned processes killed, containers removed, ports released, and
-/// the deployments_v2 row marked `failed` with the error text.
+/// the deployments row marked `failed` with the error text.
 ///
 /// `log_sink` (when provided) receives every build/run line as a
 /// `BusMessage::Line` keyed by `slug`. `existing_slug` lets the caller pin a
@@ -201,6 +205,7 @@ pub async fn deploy(
         DeployMethod::NativeEmbedded => Box::new(embedded::EmbeddedDeploy::new(
             manifest.clone(),
             user_config.clone(),
+            sink.clone(),
         )),
         DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
             manifest.clone(),
@@ -251,11 +256,11 @@ pub async fn deploy(
     };
 
     if let Some(s) = &sink {
-        s.info("[commit] writing services_v2 + model_registry_v2");
+        s.info("[commit] writing services + model_registry");
     }
 
-    // 4. COMMIT — single transaction over services_v2 + model_registry_v2 +
-    //    deployments_v2.finish. Any failure triggers rollback of side effects.
+    // 4. COMMIT — single transaction over services + model_registry +
+    //    deployments.finish. Any failure triggers rollback of side effects.
     let commit_result: DeployResult<i64> = with_tx(db, |tx| {
         let sid = strategy.commit(tx, &prepared)?;
         for m in &prepared.models {
@@ -310,7 +315,7 @@ pub async fn deploy(
 }
 
 /// Re-spawns the runtime side of an existing service (process / container)
-/// without touching `services_v2`. Used by the supervisor's restart loop —
+/// without touching `services`. Used by the supervisor's restart loop —
 /// the caller is expected to update `runtime_pid/port/...` on the existing row
 /// after this returns.
 ///
@@ -341,7 +346,7 @@ pub async fn respawn(
 
     let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
         DeployMethod::NativeEmbedded => {
-            Box::new(embedded::EmbeddedDeploy::new(manifest, user_config))
+            Box::new(embedded::EmbeddedDeploy::new(manifest, user_config, None))
         }
         DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
             manifest,
@@ -374,8 +379,8 @@ pub async fn respawn(
 
 /// Stops the runtime side of a deployed service: kills the process, removes
 /// the container, and releases its host-allocated ports. Does **not** delete
-/// the `services_v2` row — the caller decides whether to mark it `stopped`
-/// or `DELETE` it (cascade removes `model_registry_v2`). Errors are merged
+/// the `services` row — the caller decides whether to mark it `stopped`
+/// or `DELETE` it (cascade removes `model_registry`). Errors are merged
 /// into a single `DeployError::Other` so callers can surface them as a single
 /// "stop failed" message.
 pub async fn stop(
@@ -460,14 +465,29 @@ fn mark_finished(db: &DbPool, id: i64, status: DeploymentStatus, err: Option<&st
 pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus) -> NewService {
     NewService {
         engine_id: prepared.engine_id.clone(),
+        category: prepared.category.clone(),
+        display_name: prepared.display_name.clone(),
         deploy_method: prepared.deploy_method,
         transport: prepared.transport,
         status,
+        pinned: false,
+        paused: false,
         runtime_pid: prepared.runtime.pid,
         runtime_port: prepared.runtime.port,
         sidecar_quic_port: prepared.runtime.sidecar_port,
         endpoint_url: prepared.runtime.endpoint_url.clone(),
         config_json: prepared.config_json.clone(),
+    }
+}
+
+/// Resolves a manifest's user-facing display name. Falls back to the engine
+/// id when the manifest left `engine.name` empty.
+pub(crate) fn resolve_display_name(manifest: &ServiceManifest) -> String {
+    let trimmed = manifest.engine.name.trim();
+    if trimmed.is_empty() {
+        manifest.engine.id.clone()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -501,7 +521,7 @@ pub(crate) fn models_from_manifest(manifest: &ServiceManifest) -> Vec<NewModel> 
             service_id: 0,
             model_name: p.id.clone(),
             display_name: Some(p.display_name.clone()),
-            capabilities: format!("[\"{}\"]", manifest.engine.category_str()),
+            capabilities: format!("[\"{}\"]", manifest.engine.capability_tag()),
             context_length: None,
             quantization: p.quantization.clone(),
             // First preset becomes default if none is marked recommended.
@@ -551,11 +571,17 @@ pub(crate) fn standard_engine_env() -> HashMap<String, String> {
 // ----- Tiny extension on Category to get string capability tag --------------
 
 trait CategoryStr {
-    fn category_str(&self) -> &'static str;
+    /// Capability tag used inside the embedded JSON list on `model_registry`
+    /// rows (e.g. "chat" for an LLM, "tts" for a TTS engine). Distinct from
+    /// the kebab-case category id stored in `services.category` because the
+    /// capability surfaces to routing while the category surfaces to the UI.
+    fn capability_tag(&self) -> &'static str;
+    /// Stable kebab-case category id matching `tentaflow-containers/<id>/`.
+    fn category_tag(&self) -> &'static str;
 }
 
 impl CategoryStr for crate::services::manifest::Engine {
-    fn category_str(&self) -> &'static str {
+    fn capability_tag(&self) -> &'static str {
         use crate::services::manifest::Category::*;
         match self.category {
             Llm => "chat",
@@ -572,6 +598,28 @@ impl CategoryStr for crate::services::manifest::Engine {
             Tools => "tool",
         }
     }
+
+    fn category_tag(&self) -> &'static str {
+        use crate::services::manifest::Category::*;
+        match self.category {
+            Llm => "llm",
+            Stt => "stt",
+            Tts => "tts",
+            Embeddings => "embeddings",
+            Reranker => "reranker",
+            Vision => "vision",
+            ImageGen => "image-gen",
+            VideoGen => "video-gen",
+            MusicGen => "music-gen",
+            Model3dGen => "model-3d-gen",
+            Agents => "agents",
+            Tools => "tools",
+        }
+    }
+}
+
+pub(crate) fn category_tag(manifest: &ServiceManifest) -> &'static str {
+    manifest.engine.category_tag()
 }
 
 #[cfg(test)]
@@ -655,7 +703,7 @@ mod tests {
         let conn = db.lock().unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM model_registry_v2 WHERE service_id = ?1",
+                "SELECT COUNT(*) FROM model_registry WHERE service_id = ?1",
                 rusqlite::params![outcome.endpoint.handle.id],
                 |r| r.get(0),
             )
@@ -685,7 +733,7 @@ mod tests {
 
         let count_before: i64 = {
             let conn = db.lock().unwrap();
-            conn.query_row("SELECT COUNT(*) FROM services_v2", [], |r| r.get(0))
+            conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
                 .unwrap()
         };
 
@@ -707,7 +755,7 @@ mod tests {
 
         let count_after: i64 = {
             let conn = db.lock().unwrap();
-            conn.query_row("SELECT COUNT(*) FROM services_v2", [], |r| r.get(0))
+            conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
                 .unwrap()
         };
         assert_eq!(count_before, count_after, "respawn must not touch the DB");
@@ -738,11 +786,11 @@ mod tests {
         .await;
         assert!(res.is_err(), "deploy should fail when binary path invalid");
 
-        // deployments_v2 row exists with status=failed.
+        // deployments row exists with status=failed.
         let conn = db.lock().unwrap();
         let (status, err): (String, Option<String>) = conn
             .query_row(
-                "SELECT status, error_text FROM deployments_v2 WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",
+                "SELECT status, error_text FROM deployments WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -752,11 +800,11 @@ mod tests {
     }
 
     /// Mirrors the dispatch handler's contract: each deploy persists a
-    /// `deployments_v2` row whose `slug` matches the value the handler
+    /// `deployments` row whose `slug` matches the value the handler
     /// returns to the caller. The dashboard subscribes to logs by slug, so
     /// drift between handler-returned slug and DB slug breaks live tail.
     #[tokio::test]
-    async fn service_manifest_deploy_writes_to_v2_with_slug() {
+    async fn service_manifest_deploy_writes_with_slug() {
         let db = open_db();
         let ports = Arc::new(PortAllocator::new((45_650, 45_699), Default::default()).unwrap());
         let manifest = dummy_manifest("emb-slug-handler", NativeRuntime::Embedded);
@@ -777,7 +825,7 @@ mod tests {
 
         let row = crate::services_repo::deployments::get_by_slug(&db, &slug)
             .unwrap()
-            .expect("v2 row exists for handler slug");
+            .expect("deployments row exists for handler slug");
         assert_eq!(row.engine_id, "emb-slug-handler");
         assert_eq!(row.deploy_method, "native_embedded");
         assert_eq!(

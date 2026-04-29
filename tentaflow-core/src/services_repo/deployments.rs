@@ -1,4 +1,4 @@
-// ============ File: services_repo/deployments.rs — CRUD over deployments_v2 (audit trail) ============
+// ============ File: services_repo/deployments.rs — CRUD over deployments (audit trail) ============
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -84,7 +84,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
 
 pub fn insert(conn: &Connection, new: &NewDeployment) -> Result<i64> {
     conn.execute(
-        "INSERT INTO deployments_v2 (engine_id, deploy_method, status, config_json) \
+        "INSERT INTO deployments (engine_id, deploy_method, status, config_json) \
          VALUES (?1, ?2, ?3, ?4)",
         params![
             new.engine_id,
@@ -93,7 +93,7 @@ pub fn insert(conn: &Connection, new: &NewDeployment) -> Result<i64> {
             new.config_json,
         ],
     )
-    .context("insert deployments_v2")?;
+    .context("insert deployments")?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -107,11 +107,11 @@ pub fn create_with_slug(
     slug: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO deployments_v2 (engine_id, deploy_method, status, slug) \
+        "INSERT INTO deployments (engine_id, deploy_method, status, slug) \
          VALUES (?1, ?2, 'running', ?3)",
         params![engine_id, deploy_method, slug],
     )
-    .context("insert deployments_v2 with slug")?;
+    .context("insert deployments with slug")?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -123,7 +123,7 @@ pub fn append_log_line(db: &DbPool, slug: &str, line: &str) -> Result<()> {
         .map_err(|e| anyhow!("pool lock poisoned: {}", e))?;
     let current: Option<String> = conn
         .query_row(
-            "SELECT log_tail FROM deployments_v2 WHERE slug = ?1",
+            "SELECT log_tail FROM deployments WHERE slug = ?1",
             params![slug],
             |r| r.get(0),
         )
@@ -146,7 +146,7 @@ pub fn append_log_line(db: &DbPool, slug: &str, line: &str) -> Result<()> {
     };
 
     conn.execute(
-        "UPDATE deployments_v2 SET log_tail = ?2 WHERE slug = ?1",
+        "UPDATE deployments SET log_tail = ?2 WHERE slug = ?1",
         params![slug, new_tail],
     )?;
     Ok(())
@@ -159,11 +159,11 @@ pub fn get_by_slug(db: &DbPool, slug: &str) -> Result<Option<DeploymentRow>> {
     let conn = db
         .lock()
         .map_err(|e| anyhow!("pool lock poisoned: {}", e))?;
-    let sql = format!("SELECT {} FROM deployments_v2 WHERE slug = ?1", COLS);
+    let sql = format!("SELECT {} FROM deployments WHERE slug = ?1", COLS);
     Ok(conn
         .query_row(&sql, params![slug], map_row)
         .optional()
-        .context("get_by_slug deployments_v2")?)
+        .context("get_by_slug deployments")?)
 }
 
 pub fn mark_finished(
@@ -173,7 +173,7 @@ pub fn mark_finished(
     error_text: Option<&str>,
 ) -> Result<()> {
     let n = conn.execute(
-        "UPDATE deployments_v2 SET status = ?2, finished_at = CURRENT_TIMESTAMP, \
+        "UPDATE deployments SET status = ?2, finished_at = CURRENT_TIMESTAMP, \
          error_text = ?3 WHERE id = ?1",
         params![id, status.as_db_tag(), error_text],
     )?;
@@ -184,16 +184,16 @@ pub fn mark_finished(
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<DeploymentRow>> {
-    let sql = format!("SELECT {} FROM deployments_v2 WHERE id = ?1", COLS);
+    let sql = format!("SELECT {} FROM deployments WHERE id = ?1", COLS);
     Ok(conn
         .query_row(&sql, params![id], map_row)
         .optional()
-        .context("get deployments_v2")?)
+        .context("get deployments")?)
 }
 
 pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<DeploymentRow>> {
     let sql = format!(
-        "SELECT {} FROM deployments_v2 ORDER BY id DESC LIMIT ?1",
+        "SELECT {} FROM deployments ORDER BY id DESC LIMIT ?1",
         COLS
     );
     let mut stmt = conn.prepare(&sql)?;

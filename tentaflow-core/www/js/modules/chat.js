@@ -359,8 +359,8 @@ const ChatScreen = {
     nextMsgId = maxId + 1;
 
     try {
-      // Phase 7: REST /api/models is the v2 surface fed by services_v2 +
-      // model_registry_v2. Chat only routes "chat" capable models; whisper /
+      // REST /api/models is the unified surface fed by services +
+      // model_registry. Chat only routes "chat" capable models; whisper /
       // xtts rows would otherwise crash dispatch with "model not found in
       // configuration".
       const all = await apiGet('/api/models');

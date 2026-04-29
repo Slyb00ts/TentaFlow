@@ -1,4 +1,4 @@
-// ============ File: services_repo/models.rs — CRUD over model_registry_v2 ============
+// ============ File: services_repo/models.rs — CRUD over model_registry ============
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -46,7 +46,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
 
 pub fn insert(conn: &Connection, new: &NewModel) -> Result<i64> {
     conn.execute(
-        "INSERT INTO model_registry_v2 (service_id, model_name, display_name, capabilities, \
+        "INSERT INTO model_registry (service_id, model_name, display_name, capabilities, \
             context_length, quantization, is_default) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -59,13 +59,13 @@ pub fn insert(conn: &Connection, new: &NewModel) -> Result<i64> {
             new.is_default as i64,
         ],
     )
-    .context("insert model_registry_v2")?;
+    .context("insert model_registry")?;
     Ok(conn.last_insert_rowid())
 }
 
 pub fn insert_in_tx(tx: &Transaction<'_>, new: &NewModel) -> Result<i64> {
     tx.execute(
-        "INSERT INTO model_registry_v2 (service_id, model_name, display_name, capabilities, \
+        "INSERT INTO model_registry (service_id, model_name, display_name, capabilities, \
             context_length, quantization, is_default) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -78,24 +78,24 @@ pub fn insert_in_tx(tx: &Transaction<'_>, new: &NewModel) -> Result<i64> {
             new.is_default as i64,
         ],
     )
-    .context("insert model_registry_v2 (tx)")?;
+    .context("insert model_registry (tx)")?;
     Ok(tx.last_insert_rowid())
 }
 
 pub fn get_by_name(conn: &Connection, model_name: &str) -> Result<Option<ModelRow>> {
     let sql = format!(
-        "SELECT {} FROM model_registry_v2 WHERE model_name = ?1 LIMIT 1",
+        "SELECT {} FROM model_registry WHERE model_name = ?1 LIMIT 1",
         COLS
     );
     Ok(conn
         .query_row(&sql, params![model_name], map_row)
         .optional()
-        .context("get_by_name model_registry_v2")?)
+        .context("get_by_name model_registry")?)
 }
 
 pub fn list_for_service(conn: &Connection, service_id: i64) -> Result<Vec<ModelRow>> {
     let sql = format!(
-        "SELECT {} FROM model_registry_v2 WHERE service_id = ?1 ORDER BY id ASC",
+        "SELECT {} FROM model_registry WHERE service_id = ?1 ORDER BY id ASC",
         COLS
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -106,7 +106,7 @@ pub fn list_for_service(conn: &Connection, service_id: i64) -> Result<Vec<ModelR
 }
 
 pub fn list_all(conn: &Connection) -> Result<Vec<ModelRow>> {
-    let sql = format!("SELECT {} FROM model_registry_v2 ORDER BY id ASC", COLS);
+    let sql = format!("SELECT {} FROM model_registry ORDER BY id ASC", COLS);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map([], map_row)?
@@ -116,13 +116,13 @@ pub fn list_all(conn: &Connection) -> Result<Vec<ModelRow>> {
 
 pub fn delete_for_service(conn: &Connection, service_id: i64) -> Result<()> {
     conn.execute(
-        "DELETE FROM model_registry_v2 WHERE service_id = ?1",
+        "DELETE FROM model_registry WHERE service_id = ?1",
         params![service_id],
     )?;
     Ok(())
 }
 
-/// Aggregate row joining `model_registry_v2` with the parent `services_v2`.
+/// Aggregate row joining `model_registry` with the parent `services`.
 /// Used by the dashboard `GET /api/models` to surface which engine each
 /// model is served by + the runtime transport / status.
 #[derive(Debug, Clone)]
@@ -149,8 +149,8 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ModelWithService>> {
     let sql = "SELECT m.id, m.service_id, m.model_name, m.display_name, m.capabilities, \
         m.context_length, m.quantization, m.is_default, \
         s.engine_id, s.status, s.transport, s.deploy_method, s.endpoint_url \
-        FROM model_registry_v2 m \
-        INNER JOIN services_v2 s ON s.id = m.service_id \
+        FROM model_registry m \
+        INNER JOIN services s ON s.id = m.service_id \
         WHERE s.status IN ('running','degraded') \
         ORDER BY m.id ASC";
     let mut stmt = conn.prepare(sql)?;

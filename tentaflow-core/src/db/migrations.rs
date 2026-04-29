@@ -1830,5 +1830,87 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_v2_slug ON deployments_v2(slug);
         ",
     ),
+    (
+        64,
+        "services_schema_final",
+        "
+            -- Final services schema: drop both legacy (`services`,
+            -- `model_registry`, `deployments`) and the additive `_v2` mirrors
+            -- introduced in migration 62/63, then recreate the unified tables
+            -- under bare names with the columns the supervisor and GUI need
+            -- (category / display_name / pinned / paused). Schema reset is
+            -- intentional — these tables are non-production and rebuilt by the
+            -- deploy pipeline at runtime; the legacy `service_backends` /
+            -- `model_pool` stragglers are purged in the same step so no
+            -- orphaned rows survive.
+            DROP INDEX IF EXISTS idx_services_v2_status;
+            DROP INDEX IF EXISTS idx_services_v2_engine;
+            DROP INDEX IF EXISTS idx_models_v2_service;
+            DROP INDEX IF EXISTS idx_models_v2_name;
+            DROP INDEX IF EXISTS idx_deployments_v2_slug;
+            DROP TABLE IF EXISTS services_v2;
+            DROP TABLE IF EXISTS model_registry_v2;
+            DROP TABLE IF EXISTS deployments_v2;
+            DROP TABLE IF EXISTS services;
+            DROP TABLE IF EXISTS model_registry;
+            DROP TABLE IF EXISTS deployments;
+            DROP TABLE IF EXISTS service_backends;
+            DROP TABLE IF EXISTS model_pool;
+
+            CREATE TABLE services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                engine_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                deploy_method TEXT NOT NULL CHECK(deploy_method IN ('docker','native_embedded','native_binary','native_python_bundle','external')),
+                transport TEXT NOT NULL CHECK(transport IN ('embedded','http_direct','sidecar_quic','external_http')),
+                status TEXT NOT NULL CHECK(status IN ('starting','running','degraded','failed','stopped')) DEFAULT 'starting',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                paused INTEGER NOT NULL DEFAULT 0,
+                runtime_pid INTEGER,
+                runtime_port INTEGER,
+                sidecar_quic_port INTEGER,
+                endpoint_url TEXT,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                health_last_ok TIMESTAMP,
+                health_last_err TEXT,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_services_status ON services(status);
+            CREATE INDEX idx_services_engine ON services(engine_id);
+            CREATE INDEX idx_services_category ON services(category);
+
+            CREATE TABLE model_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+                model_name TEXT NOT NULL,
+                display_name TEXT,
+                capabilities TEXT NOT NULL DEFAULT '[]',
+                context_length INTEGER,
+                quantization TEXT,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(service_id, model_name)
+            );
+            CREATE INDEX idx_models_service ON model_registry(service_id);
+            CREATE INDEX idx_models_name ON model_registry(model_name);
+
+            CREATE TABLE deployments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                engine_id TEXT NOT NULL,
+                deploy_method TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending','running','success','failed')),
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                error_text TEXT,
+                config_json TEXT,
+                slug TEXT,
+                log_tail TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX idx_deployments_slug ON deployments(slug);
+        ",
+    ),
 ]
 }
