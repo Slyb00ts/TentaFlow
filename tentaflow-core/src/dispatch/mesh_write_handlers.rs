@@ -714,8 +714,41 @@ async fn handle_nsight_local(
             }))
         }
         NsightPayload::SessionsRequest(req) => {
+            // V1 storage (legacy nsys-only).
             let storage = local_profile_storage(ctx);
-            let sessions = storage.list().map_err(profiling_err_to_proto)?;
+            let mut sessions = storage.list().map_err(profiling_err_to_proto)?;
+            // PLUS v2 storage (multi-source). Backend list_sessions_v2 zwraca
+            // SessionEntry rozne od NsightSessionEntry - mapujemy do v1 shape
+            // zeby legacy GUI mesh-detail-nsight.js (ktory uzywa nsightSessions
+            // ale potem navigatuje do V2 view dla otwarcia raportu) widzial obie.
+            let storage_v2 = std::sync::Arc::clone(&crate::profiling::PROFILE_STORAGE_V2);
+            let local_node_id = ctx.state.local_node_id.as_ref().to_string();
+            if let Ok(v2_sessions) = storage_v2.list_sessions(&local_node_id).await {
+                for s in v2_sessions {
+                    if sessions.iter().any(|e| e.session_id == s.session_id) {
+                        continue;
+                    }
+                    // Parsuj started_at jako RFC3339 -> unix ms. Fallback 0
+                    // gdy parse fail (sesja bez timestampu).
+                    let started_at_ms = chrono::DateTime::parse_from_rfc3339(&s.started_at)
+                        .ok()
+                        .map(|dt| dt.timestamp_millis() as u64)
+                        .unwrap_or(0);
+                    let duration_ms = s.duration_ns / 1_000_000;
+                    sessions.push(tentaflow_protocol::NsightSessionEntry {
+                        session_id: s.session_id.clone(),
+                        label: s.label.clone(),
+                        scope: tentaflow_protocol::NsightScope::Cpu,
+                        status: tentaflow_protocol::NsightSessionStatus::Done,
+                        started_at_ms,
+                        duration_ms,
+                        size_bytes: s.size_bytes,
+                        error: None,
+                    });
+                }
+            }
+            // Sortuj malejaco po started_at_ms (najnowsze pierwsze).
+            sessions.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
             Ok(NsightPayload::SessionsResponse(NsightSessionsResponse {
                 node_id: req.node_id,
                 sessions,
