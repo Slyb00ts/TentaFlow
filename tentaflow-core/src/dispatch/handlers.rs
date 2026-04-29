@@ -388,6 +388,8 @@ pub fn model_list_request(
     let rows = crate::services_repo::models::list_alive(&conn).map_err(db_err)?;
     drop(conn);
 
+    let local_node_id = ctx.state.local_node_id.as_ref().to_string();
+
     let user_acl = match &ctx.session {
         crate::dispatch::SessionAuth::UserSession { user_id, role, .. } => {
             let role_str = role.clone().unwrap_or_else(|| "user".to_string());
@@ -402,7 +404,7 @@ pub fn model_list_request(
         _ => None,
     };
 
-    let models: Vec<ModelSummary> = rows
+    let mut models: Vec<ModelSummary> = rows
         .into_iter()
         .filter(|m| match &user_acl {
             Some((uid, role)) => crate::routing::acl::check_access_safe(
@@ -428,6 +430,7 @@ pub fn model_list_request(
                 category,
                 engine_id: m.engine_id,
                 service_id: m.service_id,
+                node_id: local_node_id.clone(),
                 availability: m.status,
                 transport: m.transport,
                 endpoint_url: m.endpoint_url,
@@ -438,6 +441,43 @@ pub fn model_list_request(
             }
         })
         .collect();
+
+    // Merge model entries advertised by other mesh nodes (krok N3b). Each
+    // peer's `ServiceInfo` rolls up its own model rows; we flatten back into
+    // the legacy `ModelSummary` view the GUI expects, tagging every row with
+    // the owning node so the GUI can group / filter by host.
+    for (_peer_node_id, snapshot) in ctx.state.mesh_services_registry.all_remote() {
+        for svc in snapshot {
+            for entry in &svc.models {
+                let display_name = entry
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| entry.model_name.clone());
+                let category = match entry.capabilities.first().map(String::as_str) {
+                    Some("chat") => "llm".to_string(),
+                    Some(other) => other.to_string(),
+                    None => "llm".to_string(),
+                };
+                models.push(ModelSummary {
+                    id: entry.model_name.clone(),
+                    model_name: entry.model_name.clone(),
+                    display_name,
+                    category,
+                    engine_id: svc.engine_id.clone(),
+                    service_id: svc.id,
+                    node_id: svc.node_id.clone(),
+                    availability: svc.status.clone(),
+                    transport: svc.transport.clone(),
+                    endpoint_url: svc.endpoint_url.clone(),
+                    capabilities: entry.capabilities.clone(),
+                    context_length: entry.context_length,
+                    quantization: entry.quantization.clone(),
+                    is_default: entry.is_default,
+                });
+            }
+        }
+    }
+
     Ok(MessageBody::ModelListResponse { models })
 }
 
@@ -3297,7 +3337,7 @@ pub async fn nim_catalog_list(
 #[handler(variant = "ServiceManifestDeployRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_manifest_deploy(
+pub async fn service_manifest_deploy(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -3312,6 +3352,64 @@ pub fn service_manifest_deploy(
 
     if payload.engine_id.is_empty() || payload.node_id.is_empty() {
         return Err(ProtocolError::bad_request("engine_id i node_id wymagane"));
+    }
+
+    // Cross-node deploy forwarding (krok N3b). When the request targets a
+    // different mesh node, forward it as `ServiceDeployRemote` and return the
+    // slug allocated on the receiver. The deploy log websocket lives on the
+    // receiver side — cross-node log streaming is intentionally out of scope.
+    let local_node_id = ctx.state.local_node_id.as_ref();
+    if !payload.node_id.is_empty() && payload.node_id != local_node_id {
+        let target = payload.node_id.clone();
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {
+            engine_id: payload.engine_id.clone(),
+            deploy_method: payload.deploy_method.clone(),
+            config_json: payload.config_json.clone(),
+        };
+        let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+            ProtocolError::internal("mesh transport not available on this node")
+        })?;
+        if let Some(security) = ctx.state.mesh_security.as_ref() {
+            if !security.is_trusted(&target) {
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
+            }
+        }
+        let resp = iroh
+            .send_command_and_wait(&target, cmd, 30)
+            .await
+            .map_err(|e| ProtocolError::internal(e.to_string()))?;
+        if !resp.ok {
+            return Err(ProtocolError::internal(
+                resp.error.unwrap_or_else(|| "remote deploy failed".to_string()),
+            ));
+        }
+        let (deploy_id, engine_id_resp, deploy_method_resp) = match resp.payload {
+            tentaflow_protocol::mesh::MeshCommandResponsePayload::ServiceDeployResult {
+                deploy_id,
+                engine_id,
+                deploy_method,
+            } => (deploy_id, engine_id, deploy_method),
+            _ => (
+                String::new(),
+                payload.engine_id.clone(),
+                payload.deploy_method.clone(),
+            ),
+        };
+        return Ok(MessageBody::DeploymentBody(
+            tentaflow_protocol::DeploymentPayload::ResStart(
+                tentaflow_protocol::ServiceManifestDeployResponse {
+                    status: "forwarded".to_string(),
+                    deploy_id: deploy_id.clone(),
+                    engine_id: engine_id_resp,
+                    deploy_method: deploy_method_resp,
+                    node_id: target,
+                    websocket_url: format!("/ws/deploy?id={}", deploy_id),
+                },
+            ),
+        ));
     }
 
     use crate::api::dashboard::api_services_manifest::{
@@ -4592,6 +4690,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
     let local_node_id = ctx.state.local_node_id.as_ref();
 
+    // Local rows first.
     let mut services = Vec::with_capacity(rows.len());
     for svc in rows {
         if let Some(filter) = payload.engine_id_filter.as_deref() {
@@ -4606,12 +4705,79 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         }
         services.push(build_service_info(&conn, svc, local_node_id)?);
     }
+    drop(conn);
+
+    // Then merge in every peer's snapshot (krok N3b — single-flat list, GUI
+    // groups by `service.node_id`). Same filter semantics applied client-side
+    // here so the wire response stays consistent across local and remote rows.
+    for (_node_id, snapshot) in ctx.state.mesh_services_registry.all_remote() {
+        for svc in snapshot {
+            if let Some(filter) = payload.engine_id_filter.as_deref() {
+                if !filter.is_empty() && svc.engine_id != filter {
+                    continue;
+                }
+            }
+            if let Some(filter) = payload.category_filter.as_deref() {
+                if !filter.is_empty() && svc.category != filter {
+                    continue;
+                }
+            }
+            services.push(svc);
+        }
+    }
 
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResList(tentaflow_protocol::ServiceListResponse {
             services,
         }),
     ))
+}
+
+/// True when the request's `node_id` refers to another mesh node and the
+/// action must be forwarded over `MeshCommandType::Service*Remote`. `None`
+/// or the local node id falls through to local execution.
+fn forward_target_node<'a>(
+    ctx: &'a HandlerContext,
+    target: &'a Option<String>,
+) -> Option<&'a str> {
+    let target = target.as_deref()?;
+    if target.is_empty() || target == ctx.state.local_node_id.as_ref() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// Forward a service-action `MeshCommandType::*Remote` over iroh and convert
+/// the typed `MeshCommandResponse` envelope into the boolean ok/error pair the
+/// dispatch-side `Service*Response` expects. Errors from the transport
+/// itself surface as `success=false, error=Some(...)`.
+async fn forward_service_action(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> (bool, Option<String>) {
+    let iroh = match ctx.state.quic_mesh.as_ref() {
+        Some(m) => m.clone(),
+        None => {
+            return (
+                false,
+                Some("mesh transport not available on this node".to_string()),
+            )
+        }
+    };
+    if let Some(security) = ctx.state.mesh_security.as_ref() {
+        if !security.is_trusted(target_node_id) {
+            return (
+                false,
+                Some(format!("peer {} is not trusted", target_node_id)),
+            );
+        }
+    }
+    match iroh.send_command_and_wait(target_node_id, cmd, 10).await {
+        Ok(resp) => (resp.ok, resp.error),
+        Err(e) => (false, Some(e.to_string())),
+    }
 }
 
 /// Resolves a service row by id, returning a NotFound protocol error when the
@@ -4646,6 +4812,19 @@ pub async fn service_stop(
             ))
         }
     };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceStopRemote {
+            service_id: payload.service_id,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResStop(tentaflow_protocol::ServiceStopResponse {
+                success,
+                error,
+            }),
+        ));
+    }
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -4712,6 +4891,18 @@ pub async fn service_delete(
         }
     };
 
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeleteRemote {
+            service_id: payload.service_id,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResDelete(
+                tentaflow_protocol::ServiceDeleteResponse { success, error },
+            ),
+        ));
+    }
+
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
@@ -4764,7 +4955,10 @@ pub async fn service_delete(
 #[handler(variant = "ServicePinRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_pin(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+pub async fn service_pin(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqPin(p)) => p.clone(),
         _ => {
@@ -4773,6 +4967,20 @@ pub fn service_pin(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
             ))
         }
     };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServicePinRemote {
+            service_id: payload.service_id,
+            pinned: payload.pinned,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResPin(tentaflow_protocol::ServicePinResponse {
+                success,
+                error,
+            }),
+        ));
+    }
 
     let conn = ctx
         .state
@@ -4808,7 +5016,7 @@ pub fn service_pin(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 #[handler(variant = "ServicePauseRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_pause(
+pub async fn service_pause(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -4820,6 +5028,20 @@ pub fn service_pause(
             ))
         }
     };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServicePauseRemote {
+            service_id: payload.service_id,
+            paused: payload.paused,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResPause(tentaflow_protocol::ServicePauseResponse {
+                success,
+                error,
+            }),
+        ));
+    }
 
     let conn = ctx
         .state
@@ -4855,7 +5077,7 @@ pub fn service_pause(
 #[handler(variant = "ServiceRenameRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_rename(
+pub async fn service_rename(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -4867,6 +5089,19 @@ pub fn service_rename(
             ))
         }
     };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceRenameRemote {
+            service_id: payload.service_id,
+            display_name: payload.display_name.clone(),
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResRename(
+                tentaflow_protocol::ServiceRenameResponse { success, error },
+            ),
+        ));
+    }
 
     let trimmed = payload.display_name.trim();
     if trimmed.is_empty() {

@@ -43,13 +43,12 @@ impl EmbeddedDeploy {
         }
 
         let engine_id = self.manifest.engine.id.clone();
-        let kind = crate::vision::VisionEngineKind::from_id(&engine_id)
-            .ok_or_else(|| {
-                DeployError::Manifest(format!(
-                    "vision engine '{}' is not registered in runtime",
-                    engine_id
-                ))
-            })?;
+        let kind = crate::vision::VisionEngineKind::from_id(&engine_id).ok_or_else(|| {
+            DeployError::Manifest(format!(
+                "vision engine '{}' is not registered in runtime",
+                engine_id
+            ))
+        })?;
         if let Some(s) = &self.log_sink {
             s.info(&format!(
                 "[vision] preparing embedded model for {}",

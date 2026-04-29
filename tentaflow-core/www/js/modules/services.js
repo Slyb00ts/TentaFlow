@@ -199,7 +199,7 @@ function bindTabEvents() {
   body.querySelectorAll('[data-svc-delete]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      stopService(b.dataset.svcDelete, b.dataset.svcName);
+      stopService(b.dataset.svcDelete, b.dataset.svcName, b.dataset.svcNode);
     };
   });
   body.querySelectorAll('[data-empty-cta]').forEach((b) => {
@@ -335,6 +335,7 @@ function renderRow(s) {
         <tf-button variant="danger" size="sm" icon="trash"
           data-svc-delete="${escapeAttr(s.id)}"
           data-svc-name="${escapeAttr(displayName)}"
+          data-svc-node="${escapeAttr(s.node_id || '')}"
           title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
@@ -769,7 +770,7 @@ async function deleteAlias(id, name) {
 
 // ---- Helpers --------------------------------------------------------------
 
-async function stopService(id, name) {
+async function stopService(id, name, nodeId) {
   const ok = await TfWindow.confirm({
     title: I18n.t('common.delete'),
     message: I18n.t('services.delete_confirm', { name }),
@@ -780,8 +781,13 @@ async function stopService(id, name) {
   if (!ok) return;
   try {
     // Binary RPC `ServiceDeleteRequest` stops the runtime AND removes the row,
-    // cascading to model_registry via FK ON DELETE CASCADE.
-    const resp = await ApiBinary.action('serviceDeleteRequest', { serviceId: id });
+    // cascading to model_registry via FK ON DELETE CASCADE. `nodeId` is the
+    // owning mesh node — when it differs from the local node the dispatcher
+    // forwards the request as `MeshCommandType::ServiceDeleteRemote`.
+    const resp = await ApiBinary.action('serviceDeleteRequest', {
+      serviceId: id,
+      nodeId: nodeId || undefined,
+    });
     if (resp && resp.success === false) {
       throw new Error(resp.error || 'Unknown error');
     }

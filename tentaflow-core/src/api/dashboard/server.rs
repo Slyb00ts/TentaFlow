@@ -158,6 +158,26 @@ impl DashboardServer {
         let port_allocator = self.port_allocator.clone();
         let mesh_services_registry = self.mesh_services_registry.clone();
 
+        // Wire up cross-node service action handlers (krok N3b). The mesh
+        // command executor is created by `start_mesh_pipeline` long before
+        // AppState (db_pool + port_allocator + iroh) is fully assembled, so
+        // we inject the action context here once everything exists. Without
+        // this the receiver of `ServiceStopRemote` / `ServiceDeleteRemote` /
+        // ... returns "service action context not configured".
+        if let (Some(qm), Some(pa)) = (quic_mesh.clone(), port_allocator.clone()) {
+            if let Some(executor) = qm.command_executor().await {
+                executor
+                    .set_service_action_context(
+                        crate::mesh::command_executor::ServiceActionContext {
+                            db: db.clone(),
+                            port_allocator: pa,
+                            iroh: qm.clone(),
+                        },
+                    )
+                    .await;
+            }
+        }
+
         loop {
             let (stream, remote_addr) = match listener.accept().await {
                 Ok(conn) => conn,

@@ -1432,11 +1432,15 @@ pub fn encode_service_list_request(
 /// MessageBody::ServiceBody(ServicePayload::ReqStop) — stops the runtime but
 /// keeps the row.
 #[wasm_bindgen(js_name = encodeServiceStopRequest)]
-pub fn encode_service_stop_request(service_id: f64) -> Result<Vec<u8>, JsError> {
+pub fn encode_service_stop_request(
+    service_id: f64,
+    node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{ServicePayload, ServiceStopRequest};
     encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqStop(
         ServiceStopRequest {
             service_id: service_id as i64,
+            node_id,
         },
     )))
     .map_err(|e| JsError::new(&e))
@@ -1445,11 +1449,15 @@ pub fn encode_service_stop_request(service_id: f64) -> Result<Vec<u8>, JsError> 
 /// MessageBody::ServiceBody(ServicePayload::ReqDelete) — stop + delete the row
 /// (cascades to `model_registry`).
 #[wasm_bindgen(js_name = encodeServiceDeleteRequest)]
-pub fn encode_service_delete_request(service_id: f64) -> Result<Vec<u8>, JsError> {
+pub fn encode_service_delete_request(
+    service_id: f64,
+    node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{ServiceDeleteRequest, ServicePayload};
     encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqDelete(
         ServiceDeleteRequest {
             service_id: service_id as i64,
+            node_id,
         },
     )))
     .map_err(|e| JsError::new(&e))
@@ -1458,12 +1466,17 @@ pub fn encode_service_delete_request(service_id: f64) -> Result<Vec<u8>, JsError
 /// MessageBody::ServiceBody(ServicePayload::ReqPin) — toggles the pin flag
 /// used by the supervisor for auto-respawn.
 #[wasm_bindgen(js_name = encodeServicePinRequest)]
-pub fn encode_service_pin_request(service_id: f64, pinned: bool) -> Result<Vec<u8>, JsError> {
+pub fn encode_service_pin_request(
+    service_id: f64,
+    pinned: bool,
+    node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{ServicePayload, ServicePinRequest};
     encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqPin(
         ServicePinRequest {
             service_id: service_id as i64,
             pinned,
+            node_id,
         },
     )))
     .map_err(|e| JsError::new(&e))
@@ -1472,12 +1485,17 @@ pub fn encode_service_pin_request(service_id: f64, pinned: bool) -> Result<Vec<u
 /// MessageBody::ServiceBody(ServicePayload::ReqPause) — supervisor leaves a
 /// paused service untouched.
 #[wasm_bindgen(js_name = encodeServicePauseRequest)]
-pub fn encode_service_pause_request(service_id: f64, paused: bool) -> Result<Vec<u8>, JsError> {
+pub fn encode_service_pause_request(
+    service_id: f64,
+    paused: bool,
+    node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{ServicePauseRequest, ServicePayload};
     encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqPause(
         ServicePauseRequest {
             service_id: service_id as i64,
             paused,
+            node_id,
         },
     )))
     .map_err(|e| JsError::new(&e))
@@ -1488,12 +1506,14 @@ pub fn encode_service_pause_request(service_id: f64, paused: bool) -> Result<Vec
 pub fn encode_service_rename_request(
     service_id: f64,
     display_name: String,
+    node_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{ServicePayload, ServiceRenameRequest};
     encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqRename(
         ServiceRenameRequest {
             service_id: service_id as i64,
             display_name,
+            node_id,
         },
     )))
     .map_err(|e| JsError::new(&e))
