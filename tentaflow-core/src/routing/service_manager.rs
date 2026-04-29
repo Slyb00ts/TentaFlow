@@ -966,6 +966,11 @@ impl ServiceManager {
     /// Wires the supervisor's services snapshot receiver. Called by
     /// `Router::set_services_snapshot_rx` so the manager can resolve models
     /// against the V2 snapshot without re-borrowing through the router.
+    ///
+    /// Spawning a background task that re-runs `hydrate_from_snapshot` on every
+    /// snapshot update is left to the caller (`Router::set_services_snapshot_rx`)
+    /// so unit tests that wire a snapshot directly do not pull in a Tokio
+    /// runtime requirement.
     pub fn set_snapshot_rx(
         &self,
         rx: tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>,
@@ -2083,6 +2088,108 @@ impl ServiceManager {
         );
     }
 
+    /// Snapshot-first resolution of HTTP backends for a given model. Walks the
+    /// supervisor snapshot, materialises a `BackendClient` for every HTTP /
+    /// ExternalHTTP entry that hosts `model_name`, and returns the freshly built
+    /// list. Returns `None` when the snapshot has no candidates so the caller
+    /// can fall back to the legacy DashMap path.
+    ///
+    /// FAZA-8c: this becomes the only path; legacy fallback in chat.rs /
+    /// adapters disappears.
+    pub fn resolve_http_backends_via_snapshot(
+        &self,
+        model_name: &str,
+    ) -> Option<Vec<Arc<BackendClient>>> {
+        use crate::routing::transport_client::entry_to_backend_client;
+        use crate::services::transport::Transport;
+
+        let snap = self.current_snapshot();
+        let entries = snap.find_services_for_model(model_name);
+        if entries.is_empty() {
+            return None;
+        }
+
+        let mut clients: Vec<Arc<BackendClient>> = Vec::new();
+        for entry in entries {
+            match entry.transport {
+                Transport::HttpDirect | Transport::ExternalHttp => {
+                    match entry_to_backend_client(entry) {
+                        Ok(client) => clients.push(Arc::new(client)),
+                        Err(e) => {
+                            warn!(
+                                "snapshot path: backend client init for svc-{} failed: {}",
+                                entry.id, e
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if clients.is_empty() {
+            None
+        } else {
+            Some(clients)
+        }
+    }
+
+    /// Reconciles legacy DashMap stores (`local_inference_models`,
+    /// `dynamic_backends`) with the current supervisor snapshot. Called after
+    /// every successful deploy commit so callers that still depend on the
+    /// legacy stores observe the new service immediately, without waiting for
+    /// the next supervisor tick to push the snapshot.
+    ///
+    /// Embedded entries register their model names into `local_inference_models`.
+    /// HTTP entries materialise a `BackendClient` and push it into
+    /// `dynamic_backends` keyed by every model name the entry hosts. SidecarQuic
+    /// entries are owned by `register_quic_service` and are not touched here.
+    pub fn hydrate_from_snapshot(&self) {
+        use crate::routing::transport_client::entry_to_backend_client;
+        use crate::services::transport::Transport;
+
+        let snap = self.current_snapshot();
+        for entry in &snap.services {
+            match entry.transport {
+                Transport::Embedded => {
+                    for m in &entry.models {
+                        if !self.local_inference_models.contains_key(&m.model_name) {
+                            self.register_local_inference_model(&m.model_name);
+                        }
+                    }
+                }
+                Transport::HttpDirect | Transport::ExternalHttp => {
+                    let client = match entry_to_backend_client(entry) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            warn!(
+                                "hydrate: backend client init for svc-{} failed: {}",
+                                entry.id, e
+                            );
+                            continue;
+                        }
+                    };
+                    for m in &entry.models {
+                        if !self.dynamic_backends.contains_key(&m.model_name)
+                            && !self.service_backends.contains_key(&m.model_name)
+                        {
+                            self.register_dynamic_http_backend(&m.model_name, client.clone());
+                        }
+                    }
+                    if !entry.engine_id.is_empty()
+                        && !self.dynamic_backends.contains_key(&entry.engine_id)
+                        && !self.service_backends.contains_key(&entry.engine_id)
+                    {
+                        self.register_dynamic_http_backend(&entry.engine_id, client.clone());
+                    }
+                }
+                Transport::SidecarQuic => {
+                    // Owned by register_quic_service / spawn_connection_tasks.
+                }
+            }
+        }
+    }
+
     /// Sprawdz czy serwis QUIC STT istnieje
     pub fn has_quic_stt_service(&self, service_name: &str) -> bool {
         self.quic_stt_services.contains_key(service_name)
@@ -2769,5 +2876,166 @@ mod strategy_tests {
                 s
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_helpers_tests {
+    //! FAZA-8b-3: tests for `resolve_http_backends_via_snapshot` and
+    //! `hydrate_from_snapshot`. The legacy ad-hoc DashMap stores must be
+    //! reconciled from a fresh snapshot so chat.rs callbacks and adapters
+    //! observe newly-deployed services.
+
+    use super::*;
+    use crate::config::RouterConfig;
+    use crate::services::supervisor::{ModelEntry, ServiceEntry, ServicesSnapshot};
+    use crate::services::transport::Transport;
+    use crate::services_repo::services::{DeployMethod, ServiceStatus};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    fn fixture_entry(
+        id: i64,
+        engine_id: &str,
+        transport: Transport,
+        models: Vec<&str>,
+    ) -> ServiceEntry {
+        // BackendClient::new requires an API key (direct or via env). The
+        // unified deploy pipeline always populates one of those fields for
+        // HTTP services; the fixture mirrors that contract so the helper
+        // can materialise the client without env wiring.
+        let mut extra_config = HashMap::new();
+        extra_config.insert("api_key".into(), "test-key".into());
+        ServiceEntry {
+            id,
+            engine_id: engine_id.into(),
+            deploy_method: DeployMethod::NativePythonBundle,
+            transport,
+            status: ServiceStatus::Running,
+            endpoint_url: Some(format!("http://127.0.0.1:50{:02}", id % 100)),
+            runtime_pid: None,
+            runtime_port: Some(5050 + id as u16),
+            sidecar_quic_port: Some(5060 + id as u16),
+            models: models
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ModelEntry {
+                    id: (id * 100) + i as i64,
+                    model_name: name.into(),
+                    display_name: None,
+                    is_default: i == 0,
+                })
+                .collect(),
+            timeout_ms: 30_000,
+            max_concurrent: 16,
+            weight: 100,
+            model_name_override: None,
+            extra_config,
+        }
+    }
+
+    fn build_snapshot(services: Vec<ServiceEntry>) -> ServicesSnapshot {
+        let mut models_by_name = HashMap::new();
+        let mut services_by_id = HashMap::new();
+        for (idx, svc) in services.iter().enumerate() {
+            services_by_id.insert(svc.id, idx);
+            for m in &svc.models {
+                models_by_name.insert(m.model_name.clone(), svc.id);
+            }
+        }
+        ServicesSnapshot {
+            services,
+            models_by_name,
+            services_by_id,
+            generated_at_unix_ms: 0,
+        }
+    }
+
+    fn make_manager_with_snapshot(snap: ServicesSnapshot) -> Arc<ServiceManager> {
+        let mgr = Arc::new(
+            ServiceManager::new(Arc::new(RouterConfig::default()), None)
+                .expect("ServiceManager construction"),
+        );
+        let (_tx, rx) = watch::channel(Arc::new(snap));
+        mgr.set_snapshot_rx(rx);
+        mgr
+    }
+
+    #[test]
+    fn resolve_http_backends_via_snapshot_returns_clients_for_http() {
+        let svc = fixture_entry(1, "vllm", Transport::HttpDirect, vec!["llama-x"]);
+        let mgr = make_manager_with_snapshot(build_snapshot(vec![svc]));
+
+        let backends = mgr
+            .resolve_http_backends_via_snapshot("llama-x")
+            .expect("snapshot HTTP backends");
+        assert_eq!(backends.len(), 1);
+    }
+
+    #[test]
+    fn resolve_http_backends_via_snapshot_skips_quic_and_embedded() {
+        let q = fixture_entry(2, "vllm-q", Transport::SidecarQuic, vec!["llama-q"]);
+        let e = fixture_entry(3, "llama-cpp", Transport::Embedded, vec!["llama-emb"]);
+        let mgr = make_manager_with_snapshot(build_snapshot(vec![q, e]));
+
+        // SidecarQuic and Embedded must yield None — they are not HTTP.
+        assert!(mgr.resolve_http_backends_via_snapshot("llama-q").is_none());
+        assert!(mgr
+            .resolve_http_backends_via_snapshot("llama-emb")
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_http_backends_via_snapshot_unknown_model_returns_none() {
+        let mgr = make_manager_with_snapshot(ServicesSnapshot::default());
+        assert!(mgr
+            .resolve_http_backends_via_snapshot("nope-not-here")
+            .is_none());
+    }
+
+    #[test]
+    fn hydrate_from_snapshot_registers_local_inference_for_embedded() {
+        let svc = fixture_entry(4, "llama-cpp", Transport::Embedded, vec!["qwen-mini"]);
+        let mgr = make_manager_with_snapshot(build_snapshot(vec![svc]));
+
+        assert!(!mgr.has_local_inference_service("qwen-mini"));
+        mgr.hydrate_from_snapshot();
+        assert!(mgr.has_local_inference_service("qwen-mini"));
+    }
+
+    #[test]
+    fn hydrate_from_snapshot_registers_dynamic_http_backend() {
+        let svc = fixture_entry(5, "vllm", Transport::HttpDirect, vec!["llama-y"]);
+        let mgr = make_manager_with_snapshot(build_snapshot(vec![svc]));
+
+        assert!(!mgr.has_http_backends("llama-y"));
+        mgr.hydrate_from_snapshot();
+        assert!(mgr.has_http_backends("llama-y"));
+        // Engine id is also registered so requests addressed by engine name route.
+        assert!(mgr.has_http_backends("vllm"));
+    }
+
+    #[test]
+    fn hydrate_from_snapshot_is_idempotent() {
+        let svc = fixture_entry(6, "vllm", Transport::HttpDirect, vec!["llama-z"]);
+        let mgr = make_manager_with_snapshot(build_snapshot(vec![svc]));
+
+        mgr.hydrate_from_snapshot();
+        let count_after_first = mgr
+            .dynamic_backends
+            .get("llama-z")
+            .map(|r| r.value().0.len())
+            .unwrap_or(0);
+        mgr.hydrate_from_snapshot();
+        let count_after_second = mgr
+            .dynamic_backends
+            .get("llama-z")
+            .map(|r| r.value().0.len())
+            .unwrap_or(0);
+        assert_eq!(
+            count_after_first, count_after_second,
+            "hydrate_from_snapshot should not duplicate backends across calls"
+        );
     }
 }

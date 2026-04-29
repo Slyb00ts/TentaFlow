@@ -165,33 +165,36 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             }
         }
 
-        // HTTP backend jako fallback
-        let backends = self
+        // HTTP backend (snapshot-first; legacy fallback removed in FAZA-8c).
+        let backend_opt = self
             .service_manager
-            .get_service_backends_cloned(&model_name);
-        if let Some(ref backends) = backends {
-            if !backends.is_empty() {
-                let backend = &backends[0];
+            .resolve_http_backends_via_snapshot(&model_name)
+            .and_then(|v| v.into_iter().next())
+            .or_else(|| {
+                self.service_manager
+                    .get_service_backends_cloned(&model_name)
+                    .and_then(|v| v.into_iter().next())
+            });
 
-                debug!("Embeddings adapter: uzywam HTTP backend: {}", backend.url());
+        if let Some(backend) = backend_opt {
+            debug!("Embeddings adapter: uzywam HTTP backend: {}", backend.url());
 
-                let request = crate::api::openai::types::EmbeddingRequest {
-                    model: model_name.clone(),
-                    input: crate::api::openai::types::EmbeddingInput::Single(input_text),
-                    encoding_format: None,
-                    dimensions: None,
-                    user: None,
-                };
+            let request = crate::api::openai::types::EmbeddingRequest {
+                model: model_name.clone(),
+                input: crate::api::openai::types::EmbeddingInput::Single(input_text),
+                encoding_format: None,
+                dimensions: None,
+                user: None,
+            };
 
-                let response = backend.embeddings_request(request).await?;
+            let response = backend.embeddings_request(request).await?;
 
-                if let Some(first) = response.data.first() {
-                    let dimensions = first.embedding.len();
-                    return Ok(serde_json::json!({
-                        "embedding": first.embedding,
-                        "dimensions": dimensions,
-                    }));
-                }
+            if let Some(first) = response.data.first() {
+                let dimensions = first.embedding.len();
+                return Ok(serde_json::json!({
+                    "embedding": first.embedding,
+                    "dimensions": dimensions,
+                }));
             }
         }
 
