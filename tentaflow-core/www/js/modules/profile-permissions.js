@@ -18,6 +18,7 @@ import {
   setCollectorPath,
   resetCollectorPaths,
 } from '/js/lib/profile-permissions-store.js';
+import { profilingCollectorsStatus } from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-input.js';
@@ -75,6 +76,9 @@ export class ProfilePermissionsView {
     if (!container) throw new Error('container is required');
     container.innerHTML = renderShell();
     bind(container);
+    // Background — discovery binarek przez binary protocol. Jesli odpowie,
+    // FOUND/N/A pills i wersje ustawiane sa async (no-op gdy backend brak).
+    refreshCollectorStatus(container).catch(() => {});
   }
 }
 
@@ -169,8 +173,79 @@ function renderShell() {
         <div class="pp-sub">Disabled sources are hidden from the launch modal on this browser. Backend capability detection still applies.</div>
         ${sourcesHtml}
       </section>
+
+      <section class="pp-card">
+        <h3 class="pp-h3">Storage limits</h3>
+        <div class="pp-sub">Mockup #15 — limity zapisu sesji. Wartosci sa lokalne (per browser); zmiana realnej polityki backend wymaga settings.toml.</div>
+
+        <div class="pp-row">
+          <div class="pp-row-meta">
+            <div class="pp-row-name">Storage cap per session</div>
+            <div class="pp-row-desc">Maksymalny rozmiar pojedynczej sesji. Sesje przekraczajace cap sa zatrzymane i oznaczone jako truncated.</div>
+          </div>
+          <input class="pp-path-input" id="pp-cap-session" type="text" value="1 GB" style="width:120px;" />
+        </div>
+
+        <div class="pp-row">
+          <div class="pp-row-meta">
+            <div class="pp-row-name">FIFO size (sessions per node)</div>
+            <div class="pp-row-desc">Liczba sesji trzymanych na dysku. Najstarsza jest rotowana gdy limit osiagniety.</div>
+          </div>
+          <input class="pp-path-input" id="pp-fifo-size" type="number" value="20" style="width:120px;" />
+        </div>
+
+        <div class="pp-row">
+          <div class="pp-row-meta">
+            <div class="pp-row-name">Auto-delete failed sessions after</div>
+            <div class="pp-row-desc">Sesje zakonczone bledem sa usuwane po tylu dniach.</div>
+          </div>
+          <input class="pp-path-input" id="pp-autodelete-days" type="text" value="7 days" style="width:120px;" />
+        </div>
+      </section>
     </div>
   `;
+}
+
+// Auto-discovery sciezek kolektorow przez binary protocol. Po renderze wola
+// profilingCollectorsStatus() i aktualizuje pp-path-status badges (FOUND/N/A
+// + wersja) oraz placeholder w inputach.
+async function refreshCollectorStatus(container) {
+  let resp;
+  try {
+    resp = await profilingCollectorsStatus({ nodeId: '' });
+  } catch (err) {
+    console.warn('[profile-permissions] collectors-status binary call failed:', err?.message || err);
+    return;
+  }
+  const arr = Array.isArray(resp.collectors) ? resp.collectors : [];
+  // Map collector backend id -> path/version. Klucze sa pelne id (np.
+  // 'nvidia.nsys.gpu') a UI mappuje binarki przez prefiksy.
+  const idMap = {
+    nsys: arr.find((c) => c.id === 'nvidia.nsys.gpu'),
+    rocprof: arr.find((c) => c.id === 'linux.rocprof.gpu_kernels'),
+    perf: arr.find((c) => c.id === 'linux.perf.cpu_sampling'),
+    intel_gpu_top: arr.find((c) => c.id === 'linux.intel_gpu_top.gpu'),
+    powermetrics: arr.find((c) => c.id === 'macos.powermetrics.power'),
+  };
+  for (const [uiId, status] of Object.entries(idMap)) {
+    if (!status) continue;
+    const badge = container.querySelector(`[data-collector-status="${uiId}"]`);
+    const input = container.querySelector(`[data-collector-id="${uiId}"]`);
+    if (badge) {
+      if (status.available && status.path) {
+        badge.textContent = `FOUND${status.version ? ' · ' + status.version.split('\n')[0].slice(0, 24) : ''}`;
+        badge.style.background = 'rgba(34,197,94,0.14)';
+        badge.style.color = 'var(--tf-success, #22c55e)';
+      } else {
+        badge.textContent = 'N/A';
+        badge.style.background = 'rgba(245,158,11,0.14)';
+        badge.style.color = 'var(--tf-warning, #f59e0b)';
+      }
+    }
+    if (input && status.path && !input.value) {
+      input.placeholder = status.path;
+    }
+  }
 }
 
 function bind(container) {
