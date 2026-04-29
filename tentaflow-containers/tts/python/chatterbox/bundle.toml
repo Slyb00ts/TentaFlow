@@ -3,8 +3,7 @@ engine = "chatterbox"
 description = "Chatterbox Multilingual TTS (Resemble AI, 23 jezyki + PL)"
 python_version = "3.11"
 source = "pypi"
-package = "chatterbox-tts"
-package_version = "0.1.7"
+pypi_package = "chatterbox-tts==0.1.7"
 
 [launch]
 command = "uvicorn"

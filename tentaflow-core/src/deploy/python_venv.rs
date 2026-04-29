@@ -914,11 +914,19 @@ fn install_deps(
 
     match spec.bundle.source.as_str() {
         "pypi" => {
-            let pkg = spec
-                .bundle
-                .pypi_package
-                .as_deref()
-                .unwrap_or(&spec.bundle.engine);
+            // Fallback do engine.id zostal usuniety: dawal mylacy blad
+            // "No versions of <engine_id>" gdy bundle.toml mial literowke
+            // (np. `package = "x"` zamiast `pypi_package = "x"`). Wymuszamy
+            // explicit pypi_package zeby walic z czytelnym bledem przy
+            // deploy zamiast 5 min po fakcie.
+            let pkg = spec.bundle.pypi_package.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "bundle.toml dla '{}': source=\"pypi\" wymaga pola \
+                     `pypi_package = \"<nazwa-na-pypi>\"`. Pole `package` \
+                     nie jest rozpoznawane (literowka).",
+                    spec.bundle.engine
+                )
+            })?;
             installer
                 .install_package(pkg)
                 .with_context(|| format!("install {}", pkg))?;
