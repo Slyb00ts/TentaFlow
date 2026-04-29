@@ -344,6 +344,15 @@
 /* =========================================================================
    ACTIVE SESSION BANNER
    ========================================================================= */
+/* Slot na bannera w mesh-detail; gdy pusty zachowuje sie jak `display:none`
+   przez :empty zeby nie wprowadzac extra marginesu nad sekcjami nizej. */
+.nd-active-banner-host {
+  margin: 12px 0 0 0;
+}
+.nd-active-banner-host:empty {
+  display: none;
+}
+
 .session-banner {
   position: relative;
   background: var(--tf-bg-2, #0a0d24);

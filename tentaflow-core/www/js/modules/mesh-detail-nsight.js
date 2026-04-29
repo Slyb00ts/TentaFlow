@@ -32,11 +32,18 @@ let lastSessionsNodeId = null;  // dla ktorego noda cachedSessions zostalo pobra
 let onChangeCallback = null;     // wywolanie do mesh-detail.js po start/stop/delete
 let boundActionsRoot = null;     // root na ktorym wisi nasz click listener
 let boundActionsHandler = null;  // referencja handlera do removeEventListener
+// Hook ustawiany przez mesh-detail.js — wolany po sukcesie launchu by banner
+// aktywnej sesji od razu zrobil poll zamiast czekac na swoj 1s tick.
+let activeBannerPokeHook = null;
 
 // ---- Public API ------------------------------------------------------------
 
 export function initNsight({ onChange } = {}) {
   onChangeCallback = typeof onChange === 'function' ? onChange : null;
+}
+
+export function setActiveBannerPokeHook(fn) {
+  activeBannerPokeHook = typeof fn === 'function' ? fn : null;
 }
 
 export function cleanupNsight() {
@@ -51,6 +58,7 @@ export function cleanupNsight() {
   activeNodeId = null;
   cachedSessions = [];
   lastSessionsNodeId = null;
+  activeBannerPokeHook = null;
 }
 
 // Pobiera liste sesji z backendu i cache'uje. Wolane z mesh-detail przy loadNode.
@@ -470,6 +478,10 @@ async function openProfilingLaunch(node, { gpuCardIndex = null } = {}) {
       toast(I18n.t('nsight.session.started'), 'success');
       await loadSessions(node.node_id);
       notifyChange();
+      // Banner sam polluje 1Hz; ten poke pokazuje go natychmiast.
+      if (activeBannerPokeHook) {
+        try { activeBannerPokeHook(); } catch (_e) { /* ignore */ }
+      }
     }
   } catch (err) {
     toast(`${I18n.t('nsight.session.error')}: ${err.message || err}`, 'error');

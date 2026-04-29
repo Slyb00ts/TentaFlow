@@ -34,7 +34,9 @@ import {
   nsightInstallHintHtml,
   bindNsightActions,
   activeRecLabel,
+  setActiveBannerPokeHook,
 } from '/js/modules/mesh-detail-nsight.js';
+import { ProfilingActiveBanner } from '/js/modules/profiling-active-banner.js';
 
 let currentNodeId = null;
 let nodeData = null;
@@ -43,6 +45,12 @@ let wasDisconnected = false;
 let lastFetchAt = null;
 let backHandler = null;
 let containerHandler = null;
+// Banner aktywnej sesji profilingu — montowany pod headerem detail view.
+// Sam polluje backend (`profilingActiveInfo`) co 1s, sam renderuje countdown
+// i przycisk Stop. `bannerNodeId` chroni przed wspoldzieleniem instancji
+// miedzy nodami przy nawigacji bez full cleanup.
+let activeBanner = null;
+let bannerNodeId = null;
 
 // Inline SVG przez <use href="#i-..."> — sprite definiuje symbole raz w
 // index.html. Nie parsujemy zadnego SVG przy kazdym renderDetail.
@@ -66,6 +74,9 @@ const MeshDetailScreen = {
     // Callback z nsight — countdown 1Hz nie powinien rebuildowac calego widoku;
     // updateRecBadge dotyka tylko jednego elementu chipa.
     initNsight({ onChange: () => updateRecBadge() });
+    // Hook ktory ProfilingLaunchModal wola po sukcesie startu — wymusza
+    // natychmiastowy poll bannera zamiast czekac do nastepnego tickeru (1s).
+    setActiveBannerPokeHook(() => pokeActiveBanner());
 
     await loadNode();
     renderDetail();
@@ -85,6 +96,12 @@ const MeshDetailScreen = {
   cleanup() {
     if (refresher) { refresher.dispose(); refresher = null; }
     cleanupNsight();
+    setActiveBannerPokeHook(null);
+    if (activeBanner) {
+      try { activeBanner.unmount(); } catch (_e) { /* ignore */ }
+      activeBanner = null;
+      bannerNodeId = null;
+    }
     const root = document.getElementById('main');
     if (root) {
       if (backHandler) root.removeEventListener('click', backHandler);
@@ -287,6 +304,7 @@ function renderDetail() {
   const html = `
     <div class="nd-shell${freshnessClass()}">
       ${renderHead(n, hostname, online)}
+      <div class="nd-active-banner-host" data-banner-host></div>
       <div class="nd-body">
         ${renderSystemInfo(n)}
         ${renderResources(n)}
@@ -304,6 +322,37 @@ function renderDetail() {
   patchInner(content, html);
   bindContainerActions(content);
   bindNsightActions(content, n);
+  ensureActiveBanner(content, n);
+}
+
+// Idempotentnie montuje ProfilingActiveBanner do `[data-banner-host]`. Banner
+// sam polluje `profilingActiveInfo` co 1s i sam dba o show/hide oraz
+// countdown. Wymontowujemy gdy zmienia sie node id (nawigacja A->B bez
+// pelnego cleanup).
+function ensureActiveBanner(root, n) {
+  const host = root.querySelector('[data-banner-host]');
+  if (!host) return;
+  if (activeBanner && bannerNodeId !== n.node_id) {
+    try { activeBanner.unmount(); } catch (_e) { /* ignore */ }
+    activeBanner = null;
+    bannerNodeId = null;
+  }
+  if (!activeBanner) {
+    activeBanner = new ProfilingActiveBanner({ nodeId: n.node_id });
+    activeBanner.mount(host);
+    bannerNodeId = n.node_id;
+  } else if (activeBanner.root && activeBanner.root.parentNode !== host) {
+    // Po patchInner host moze byc nowym elementem DOM — przepnij banner.
+    host.appendChild(activeBanner.root);
+  }
+}
+
+// Wolane przez nsight po sukcesie ProfilingLaunchModal — ladniej niz czekac
+// 1s na nastepny tick: REC banner pojawia sie natychmiast.
+function pokeActiveBanner() {
+  if (activeBanner && typeof activeBanner._poll === 'function') {
+    activeBanner._poll();
+  }
 }
 
 function renderHead(n, hostname, online) {
