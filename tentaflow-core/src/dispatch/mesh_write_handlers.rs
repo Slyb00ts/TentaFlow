@@ -1,8 +1,9 @@
 // =============================================================================
 // Plik: dispatch/mesh_write_handlers.rs
 // Opis: Async handlery operacji zapisu mesh: pairing/trust/connect/command/
-//       network-config oraz Nsight profiling dispatch. Reuzywaja domenowe
-//       helpery z api/dashboard/api_mesh.rs i mapuja rezultaty na MessageBody.
+//       network-config oraz Nsight profiling dispatch. Domena pairing/trust
+//       zyje w mesh::admin_ops; tu robimy tylko walidacje wariantu i mapowanie
+//       AdminError -> ProtocolError.
 // =============================================================================
 
 use std::net::{IpAddr, SocketAddr};
@@ -20,8 +21,8 @@ use tentaflow_protocol::{
 use tracing::warn;
 
 use super::HandlerContext;
-use crate::api::dashboard::api_mesh;
 use crate::db::repository;
+use crate::mesh::admin_ops::{self, AdminError, AdminErrorKind};
 use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::security::MeshSecurity;
 
@@ -43,27 +44,28 @@ fn require_mesh_security(ctx: &HandlerContext) -> Result<Arc<MeshSecurity>, Prot
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::Internal, "MeshSecurity niedostepny"))
 }
 
-/// Mapuje HTTP-style status code z api_mesh::handle_* na ProtocolError.
-fn http_status_to_proto_err(status: u16, json_body: &str) -> ProtocolError {
-    // Wyekstrahuj "error" pole jesli to JSON object.
-    let msg = serde_json::from_str::<serde_json::Value>(json_body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| json_body.to_string());
-
-    let code = match status {
-        400 => ProtocolErrorCode::BadRequest,
-        403 => ProtocolErrorCode::PolicyDenied,
-        404 => ProtocolErrorCode::NotFound,
-        413 | 429 => ProtocolErrorCode::BadRequest,
-        502 | 503 => ProtocolErrorCode::Internal,
-        _ => ProtocolErrorCode::Internal,
-    };
-    ProtocolError::new(code, msg)
+impl From<AdminError> for ProtocolError {
+    fn from(e: AdminError) -> Self {
+        let code = match e.kind {
+            AdminErrorKind::BadRequest => ProtocolErrorCode::BadRequest,
+            AdminErrorKind::AlreadyPending => ProtocolErrorCode::Conflict,
+            AdminErrorKind::RateLimited => ProtocolErrorCode::RateLimited,
+            AdminErrorKind::BadPin => ProtocolErrorCode::AuthRequired,
+            AdminErrorKind::DeliveryFailed => ProtocolErrorCode::NodeUnreachable,
+            AdminErrorKind::MeshUnavailable => ProtocolErrorCode::NotAvailable,
+            AdminErrorKind::Internal => ProtocolErrorCode::Internal,
+        };
+        // CR-004: never let raw internal error text reach the wire — caller
+        // already logged details via tracing::error! at the AdminError site.
+        let message = match e.kind {
+            AdminErrorKind::Internal => {
+                tracing::error!("AdminError::Internal: {}", e.message);
+                "internal mesh error".to_string()
+            }
+            _ => e.message,
+        };
+        ProtocolError::new(code, message)
+    }
 }
 
 // =============================================================================
@@ -99,7 +101,7 @@ pub async fn mesh_pairing_start(
     // Uwaga: REST handler uzywal "remote_address" jako node_id (legacy shape).
     // Zachowujemy te sama semantyke — dla binary protocol to jest faktycznie
     // identyfikator zdalnego noda (lub jego publicznego aliasu).
-    let (status, json_body) = api_mesh::handle_initiate_pairing(
+    let outcome = admin_ops::initiate_pairing(
         &ctx.state.db,
         &security,
         remote_address,
@@ -112,34 +114,13 @@ pub async fn mesh_pairing_start(
         &ctx.state.mesh_peer_store,
         pin_hint,
     )
-    .await
-    .map_err(|e| ProtocolError::internal(format!("pairing start failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
-
-    // JSON body: {"pin": ..., "node_id": ..., "expires_in_seconds": ...}
-    let parsed: serde_json::Value = serde_json::from_str(&json_body)
-        .map_err(|e| ProtocolError::internal(format!("pairing response parse: {}", e)))?;
-    let pin = parsed
-        .get("pin")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let completed = parsed
-        .get("completed")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // Pair_id = node_id (mapowanie proste — pairing jednoznaczny per node).
-    let pair_id = remote_address.clone();
+    .await?;
 
     Ok(MessageBody::MeshPairingStartResponseBody(
         MeshPairingStartResponse {
-            pair_id,
-            pin,
-            completed,
+            pair_id: remote_address.clone(),
+            pin: outcome.pin,
+            completed: outcome.completed,
         },
     ))
 }
@@ -168,29 +149,19 @@ pub async fn mesh_pairing_confirm(
     let security = require_mesh_security(ctx)?;
 
     // pair_id mapuje na node_id (patrz mesh_pairing_start).
-    let body_json = serde_json::json!({
-        "pin": pin,
-        "hostname": "",
-    })
-    .to_string();
-
-    let (status, json_body) = api_mesh::handle_confirm_pairing(
+    let outcome = admin_ops::confirm_pairing(
         &security,
         pair_id,
-        body_json.as_bytes(),
+        Some(pin.as_str()),
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
-    )
-    .map_err(|e| ProtocolError::internal(format!("pairing confirm failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+        &ctx.state.mesh_peer_store,
+    )?;
 
     Ok(MessageBody::MeshPairingConfirmResponseBody(
         MeshPairingConfirmResponse {
             ok: true,
-            trusted_node_id: pair_id.clone(),
+            trusted_node_id: outcome.trusted_node_id,
         },
     ))
 }
@@ -218,17 +189,7 @@ pub async fn mesh_pairing_reject(
 
     let security = require_mesh_security(ctx)?;
 
-    let (status, json_body) = api_mesh::handle_reject_pairing(
-        &security,
-        pair_id,
-        &ctx.state.quic_mesh,
-        ctx.state.local_node_id.as_ref(),
-    )
-    .map_err(|e| ProtocolError::internal(format!("pairing reject failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+    admin_ops::reject_pairing(&security, pair_id, &ctx.state.quic_mesh)?;
 
     Ok(MessageBody::MeshPairingRejectResponseBody(
         MeshPairingRejectResponse { ok: true },
@@ -258,17 +219,12 @@ pub async fn mesh_trust_revoke(
 
     let security = require_mesh_security(ctx)?;
 
-    let (status, json_body) = api_mesh::handle_revoke_trust(
+    admin_ops::revoke_trust(
         &security,
         node_id,
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
-    )
-    .map_err(|e| ProtocolError::internal(format!("trust revoke failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+    )?;
 
     Ok(MessageBody::MeshTrustRevokeResponseBody(
         MeshTrustRevokeResponse { ok: true },
@@ -298,12 +254,7 @@ pub async fn mesh_trust_retrust(
 
     let security = require_mesh_security(ctx)?;
 
-    let (status, json_body) = api_mesh::handle_retrust(&security, node_id)
-        .map_err(|e| ProtocolError::internal(format!("retrust failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+    admin_ops::retrust(&security, node_id)?;
 
     Ok(MessageBody::MeshTrustRetrustResponseBody(
         MeshTrustRetrustResponse { ok: true },

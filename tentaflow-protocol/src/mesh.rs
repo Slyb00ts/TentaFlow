@@ -820,6 +820,35 @@ pub struct TrustedKeysSyncPayload {
     pub keys: Vec<TrustedKeyEntry>,
 }
 
+/// Wire payload dla `MESH_MSG_PAIRING_REQUEST` — wysylany przez istniejacy mesh
+/// stream przez inicjatora parowania. `from_node_id` to Ed25519 pubkey hex
+/// (= iroh endpoint id). `public_key` to X25519 pubkey hex uzywany do KEX.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshPairingRequestPayload {
+    pub from_node_id: String,
+    pub public_key: String,
+    pub pin: String,
+}
+
+/// Wire payload dla `MESH_MSG_PAIRING_CONFIRM` — wysylany w odpowiedzi przez
+/// receivera po walidacji PIN-u przez admina.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshPairingConfirmPayload {
+    pub from_node_id: String,
+    pub public_key: String,
+    pub hostname: String,
+    pub pin: String,
+}
+
+/// Wire payload dla `MESH_MSG_PAIRING_REJECT` — wysylany gdy admin odrzuca prosbe.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshPairingRejectPayload {
+    pub from_node_id: String,
+}
+
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
 #[rkyv(derive(Debug))]
 pub struct NodeLeavingPayload {

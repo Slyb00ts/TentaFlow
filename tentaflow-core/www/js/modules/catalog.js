@@ -13,6 +13,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
+import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
 import { render as renderIcon, categoryIconKey } from '/js/modules/catalog/catalog-icons.js';
 import { openDeployWizard } from '/js/modules/catalog/engine-deploy-wizard.js';
 import { openNimDeployModal } from '/js/modules/catalog/nim-deploy.js';
@@ -266,9 +267,7 @@ function bindTargetPicker() {
 }
 
 function isOnline(node) {
-  if (node.is_local) return true;
-  const s = String(node.status || '').toLowerCase();
-  return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
+  return isOnlineHelper(node);
 }
 
 // ---- Tabs -----------------------------------------------------------------

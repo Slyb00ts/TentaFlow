@@ -737,12 +737,27 @@ pub struct MeshConnectionPathInfo {
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum MeshConnState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Degraded,
+    Reconnecting,
+    Offline,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeshConnectionInfo {
+    pub state: MeshConnState,
     pub transport: String,
     pub scope: Option<String>,
     pub address: Option<String>,
     pub relay_url: Option<String>,
     pub paths: Vec<MeshConnectionPathInfo>,
+    /// Unix epoch ms — moment ostatniej zmiany stanu (`state`).
+    pub since_ms: i64,
+    /// Unix epoch ms — ostatni heartbeat aplikacyjny od peera. 0 gdy brak.
+    pub last_app_heartbeat_ms: i64,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -750,7 +765,6 @@ pub struct MeshNodeInfo {
     pub node_id: String,
     pub hostname: String,
     pub ip: Option<String>,
-    pub status: String,
     pub source: String,
     pub is_local: bool,
     pub uptime_secs: Option<u64>,

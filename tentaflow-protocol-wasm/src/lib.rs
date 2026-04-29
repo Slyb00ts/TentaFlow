@@ -4956,7 +4956,6 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "node_id", n.node_id.into());
     set(&obj, "hostname", n.hostname.into());
     if let Some(ref ip) = n.ip { set(&obj, "ip", ip.clone().into()); }
-    set(&obj, "status", n.status.into());
     set(&obj, "source", n.source.clone().into());
     set(&obj, "trust", n.source.into());
     set(&obj, "isLocal", n.is_local.into());
@@ -5044,6 +5043,19 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     }
     if let Some(connection) = &n.connection {
         let connection_obj = js_sys::Object::new();
+        let state_str = match connection.state {
+            tentaflow_protocol::MeshConnState::Disconnected => "disconnected",
+            tentaflow_protocol::MeshConnState::Connecting => "connecting",
+            tentaflow_protocol::MeshConnState::Connected => "connected",
+            tentaflow_protocol::MeshConnState::Degraded => "degraded",
+            tentaflow_protocol::MeshConnState::Reconnecting => "reconnecting",
+            tentaflow_protocol::MeshConnState::Offline => "offline",
+        };
+        set(&connection_obj, "state", state_str.into());
+        set(&connection_obj, "sinceMs", (connection.since_ms as f64).into());
+        set(&connection_obj, "since_ms", (connection.since_ms as f64).into());
+        set(&connection_obj, "lastAppHeartbeatMs", (connection.last_app_heartbeat_ms as f64).into());
+        set(&connection_obj, "last_app_heartbeat_ms", (connection.last_app_heartbeat_ms as f64).into());
         set(&connection_obj, "transport", connection.transport.clone().into());
         if let Some(scope) = &connection.scope {
             set(&connection_obj, "scope", scope.clone().into());
@@ -5054,6 +5066,41 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         if let Some(relay_url) = &connection.relay_url {
             set(&connection_obj, "relayUrl", relay_url.clone().into());
             set(&connection_obj, "relay_url", relay_url.clone().into());
+        }
+        // Aggregated `path` view for GUI helpers — kind = "direct"|"relay" with
+        // the matching addr/url fields. Picks the selected path; falls back to
+        // the first path when nothing is marked selected.
+        let path_view = js_sys::Object::new();
+        let chosen = connection
+            .paths
+            .iter()
+            .find(|p| p.selected)
+            .or_else(|| connection.paths.first());
+        if let Some(p) = chosen {
+            let kind = if p.transport == "relay" { "relay" } else { "direct" };
+            set(&path_view, "kind", kind.into());
+            if kind == "relay" {
+                if let Some(url) = &connection.relay_url {
+                    set(&path_view, "url", url.clone().into());
+                } else {
+                    set(&path_view, "url", p.address.clone().into());
+                }
+            } else {
+                set(&path_view, "addr", p.address.clone().into());
+            }
+            set(&connection_obj, "path", path_view.into());
+        } else if connection.transport == "p2p" || connection.transport == "relay" {
+            // No paths list — synth from top-level transport/address.
+            let kind = if connection.transport == "relay" { "relay" } else { "direct" };
+            set(&path_view, "kind", kind.into());
+            if kind == "relay" {
+                if let Some(url) = &connection.relay_url {
+                    set(&path_view, "url", url.clone().into());
+                }
+            } else if let Some(addr) = &connection.address {
+                set(&path_view, "addr", addr.clone().into());
+            }
+            set(&connection_obj, "path", path_view.into());
         }
         let paths = js_sys::Array::new();
         for path in &connection.paths {

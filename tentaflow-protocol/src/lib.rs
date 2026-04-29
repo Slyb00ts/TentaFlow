@@ -74,7 +74,7 @@ pub use message_body::{
     FlowVersionListRequest, FlowVersionListResponse, FlowVersionRestoreRequest,
     FlowVersionRestoreResponse, FlowVersionSummary,
     HubDownloadProgress, HubEngineSummary, HubModelSearchResult, MeshConnectRequest,
-    MeshConnectResponse, MeshConnectionInfo, MeshConnectionPathInfo, MeshIdentityResponse,
+    MeshConnectResponse, MeshConnState, MeshConnectionInfo, MeshConnectionPathInfo, MeshIdentityResponse,
     MeshNodeCommandRequest, MeshNodeCommandResponse, MeshNodeContainer, MeshNodeDetailRequest,
     MeshNodeDetailResponse, MeshNodeGpuInfo, MeshNodeInfo, MeshNodeListResponse, MeshNodeModel,
     MeshNodeNetworkConfigRequest,
