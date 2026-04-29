@@ -23,6 +23,7 @@ import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
 import { ProfilingActiveBanner } from '/js/modules/profiling-active-banner.js';
+import { profilingCollectorsStatus } from '/js/protocol/profiling.js';
 import { ProfileRecPill } from '/js/modules/profile-rec-pill.js';
 
 let currentNodeId = null;
@@ -944,7 +945,23 @@ function profileTopbarHtml(node) {
 }
 
 async function openLaunchModal(node, { gpuIndex = null } = {}) {
-  const sources = buildLaunchSources(node);
+  // Pelne info per-collector (needsSudo, available, note) idzie przez
+  // profilingCollectorsStatus, nie przez plaska liste w heartbeat — modal musi
+  // wiedziec ktore source wymagaja sudo zeby zapytac o haslo PRZED startem.
+  let sources = [];
+  try {
+    const resp = await profilingCollectorsStatus({ nodeId: node.node_id });
+    const collectors = Array.isArray(resp?.collectors) ? resp.collectors : [];
+    sources = collectors.map((c) => ({
+      id: String(c.id),
+      label: String(c.name || c.id),
+      description: String(c.note || ''),
+      status: !c.available ? 'unavailable' : (c.needsSudo ? 'needs_sudo' : 'available'),
+    }));
+  } catch (err) {
+    console.warn('[mesh-detail] profilingCollectorsStatus failed, fallback to heartbeat:', err?.message);
+    sources = buildLaunchSources(node);
+  }
   if (sources.length === 0) {
     toast(I18n.t('mesh.profile_unavailable') || 'Profiling is not available on this node.', 'error');
     return;
