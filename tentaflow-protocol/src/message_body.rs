@@ -3119,7 +3119,7 @@ pub enum MessageBody {
     TtsRuleDeleteResponse { deleted: bool },
 
     // ---- PII rules (spakowane w inner enum dla oszczednosci slotu) ----
-    // Patrz NsightBody i VisionBody — limit 256 wariantow w MessageBody.
+    // Patrz ProfilingBody i VisionBody — limit 256 wariantow w MessageBody.
     PiiRuleBody(crate::pii::PiiRulePayload),
 
 
@@ -3329,16 +3329,15 @@ pub enum MessageBody {
     // UsersList* consolidated into IamBody (below) jako ReqListUsers/ResListUsers.
     IamBody(IamPayload),
 
-    // ---- Nsight profiling (single-variant, req+res w inner enum) ----
-    // 10 par request/response w jednym slocie — rkyv 0.8 ma twardy limit 256.
-    // Nowe pary multi-source profiling (7 par) tez sa pakowane w NsightPayload
-    // (`NsightPayload::Profiling(ProfilingPayload)`) zeby nie zjadac kolejnych
-    // slotow — limit 256 wariantow MessageBody jest twardy.
-    NsightBody(crate::profiling::NsightPayload),
+    // ---- Multi-source profiling (single-variant, req+res w inner enum) ----
+    // 9 par request/response w jednym slocie — rkyv 0.8 ma twardy limit 256
+    // wariantow MessageBody, wiec wszystkie wiadomosci profiling pakujemy do
+    // jednego `ProfilingPayload`.
+    ProfilingBody(crate::profiling::ProfilingPayload),
 
     // ---- Vision inference (single-slot, req+res w inner enum) ----
     // Slot odzyskany przez konsolidacje PiiRuleListRequest/Response do
-    // PiiRuleBody. Patrz NsightBody jako wzor inner-enum pack.
+    // PiiRuleBody. Patrz ProfilingBody jako wzor inner-enum pack.
     VisionBody(crate::vision::VisionInferPayload),
 
     // ---- Error ----
@@ -3667,14 +3666,28 @@ mod tests {
     }
 
     #[test]
-    fn nsight_body_round_trip() {
-        use crate::profiling::{NsightPayload, NsightScope, NsightStartRequest};
-        let body = MessageBody::NsightBody(NsightPayload::StartRequest(NsightStartRequest {
-            node_id: "node-x".into(),
-            scope: NsightScope::BothAll,
-            duration_secs: 30,
-            label: "deep-profile".into(),
-        }));
+    fn profiling_body_round_trip() {
+        use crate::profiling::{
+            GpuTargets, ProfileScope, ProfileSourceFlags, ProfileTarget, ProfilingPayload,
+            ProfilingStartRequest,
+        };
+        let body = MessageBody::ProfilingBody(ProfilingPayload::StartRequest(
+            ProfilingStartRequest {
+                node_id: "node-x".into(),
+                scope: ProfileScope {
+                    sources: ProfileSourceFlags(
+                        ProfileSourceFlags::CPU_SAMPLING | ProfileSourceFlags::GPU,
+                    ),
+                    gpu_targets: GpuTargets::All,
+                    cpu_sampling_hz: 99,
+                    target: ProfileTarget::SystemWide,
+                    duration_seconds: 30,
+                    label: "deep-profile".into(),
+                },
+                label: "deep-profile".into(),
+                elevation_password: String::new(),
+            },
+        ));
         assert_eq!(round_trip(body.clone()), body);
     }
 
