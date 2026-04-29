@@ -492,98 +492,175 @@ function renderStepAdvanced() {
   const model = getAdvancedModelName() || '?';
   const gpus = getAdvancedGpus();
   const totalVramGb = gpus.reduce((acc, g) => acc + g.memory_gb, 0);
+  const gpuLabel = gpus.length > 0
+    ? `${gpus.length} × ${gpus[0].name} · ${totalVramGb.toFixed(1)} GB VRAM`
+    : '—';
 
   const adv = selection.advanced;
-  const summaryHtml = advancedRecommendation && !advancedRecommendation.error
-    ? renderRecommendationSummary(advancedRecommendation)
-    : `<div class="form-hint" id="edw-adv-loading">Pobieram config modelu z HuggingFace i kalkuluje VRAM...</div>`;
+  const rec = advancedRecommendation;
+  const isLoading = !rec;
+  const hasError = rec && rec.error;
+
+  // Sekcja: podsumowanie z poprzednich kroków
+  const summaryCard = `
+    <div class="adv-section">
+      <div class="adv-sec-title">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3 8-8"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        Wybór z poprzednich kroków
+      </div>
+      <div class="adv-summary-grid">
+        <div class="adv-summary-cell">
+          <div class="adv-cell-label">Model</div>
+          <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
+          ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(rec.model_spec.dtype || '?')} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
+        </div>
+        <div class="adv-summary-cell">
+          <div class="adv-cell-label">GPU</div>
+          <div class="adv-cell-value">${escapeHtml(gpuLabel)}</div>
+          <div class="adv-cell-sub">${gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'}</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Sekcja: kalkulator VRAM
+  const vramCard = isLoading
+    ? `<div class="adv-section"><div class="adv-loading">Pobieram <code>config.json</code> modelu z HuggingFace i kalkuluję VRAM…</div></div>`
+    : hasError
+      ? `<div class="adv-section"><div class="adv-error">${escapeHtml(rec.error)}</div></div>`
+      : renderVramCard(rec, totalVramGb, gpus.length);
+
+  // Sekcja: tryb auto/manual
+  const modeCard = `
+    <div class="adv-section">
+      <div class="adv-sec-title">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/></svg>
+        Tryb konfiguracji
+      </div>
+      <tf-segmented id="edw-adv-mode" value="${escapeAttr(adv.mode)}" size="sm">
+        <option value="auto" variant="neutral">Auto-tuned</option>
+        <option value="manual" variant="neutral">Ręczna</option>
+      </tf-segmented>
+      ${adv.mode === 'auto'
+        ? renderAutoAlert(rec)
+        : `<div class="adv-manual">${renderAdvancedManualControls(adv, rec)}</div>`}
+    </div>
+  `;
 
   return `
-    <h4 class="wizard-step-title">Zaawansowane: vLLM Auto-tuned</h4>
-    <div class="form-group">
-      <label>Model</label>
-      <div><code>${escapeHtml(model)}</code></div>
-    </div>
-    <div class="form-group">
-      <label>Wybrane GPU (${gpus.length} × ${totalVramGb.toFixed(1)} GB total)</label>
-      <div class="form-hint">${gpus.map((g) => `GPU ${g.index} (${g.memory_gb} GB)`).join(', ') || '—'}</div>
-    </div>
-
-    <div id="edw-adv-summary">${summaryHtml}</div>
-
-    <div class="form-group" style="margin-top: 16px;">
-      <label>Tryb konfiguracji</label>
-      <div style="display:flex; gap:8px;">
-        <tf-button size="sm" variant="${adv.mode === 'auto' ? 'primary' : 'secondary'}" data-adv-mode="auto">Auto-tuned</tf-button>
-        <tf-button size="sm" variant="${adv.mode === 'manual' ? 'primary' : 'secondary'}" data-adv-mode="manual">Ręczna</tf-button>
-      </div>
-    </div>
-
-    ${adv.mode === 'manual' ? renderAdvancedManualControls(adv) : `
-      <div class="form-hint">
-        Auto-tuned używa rekomendowanej konfiguracji (TP/PP zgodne z heads/layers, kv-cache fp8 dla wiekszych modeli, max_model_len ograniczone do tego co fits w VRAM).
-        Przelacz na "Ręczna" aby skonfigurowac suwakami.
-      </div>
-    `}
+    <h4 class="wizard-step-title">Konfiguracja zaawansowana</h4>
+    <p class="form-hint" style="margin-bottom:14px;">Inteligentny kalkulator VRAM dobiera tensor parallel, kontekst i KV cache pod twoje GPU. Możesz zostawić auto-tuned albo przełączyć na ręczne.</p>
+    ${summaryCard}
+    ${vramCard}
+    ${modeCard}
   `;
 }
 
-function renderRecommendationSummary(rec) {
-  if (rec.error) {
-    return `<div class="form-hint" style="color:var(--color-error,#c00)">${escapeHtml(rec.error)}</div>`;
-  }
-  const m = rec.model_spec || {};
+function renderVramCard(rec, totalVramGb, gpuCount) {
   const v = rec.vram_estimate || {};
   const r = rec.recommended || {};
-  const totalGpus = (getAdvancedGpus() || []).length || 1;
-  const totalVram = (getAdvancedGpus() || []).reduce((a, g) => a + g.memory_gb, 0);
-  const usedTotal = (v.per_gpu_gb || 0) * (r.tensor_parallel || 1) * (r.pipeline_parallel || 1);
-  const fillPct = Math.min(100, Math.round((v.per_gpu_gb || 0) / Math.max(1, totalVram / totalGpus) * 100));
-  const fillColor = v.fits_per_gpu ? '#4caf50' : '#f44336';
+  const perGpu = v.per_gpu_gb || 0;
+  const tpPp = (r.tensor_parallel || 1) * (r.pipeline_parallel || 1);
+  const totalUsed = perGpu * tpPp;
+  const headroomGb = totalVramGb - totalUsed;
+  const pctUsed = totalVramGb > 0 ? Math.min(200, Math.round((totalUsed / totalVramGb) * 100)) : 0;
+  const fits = v.fits_per_gpu !== false && pctUsed <= 95;
 
-  const warningsHtml = (rec.warnings || []).length > 0
-    ? `<ul style="margin: 8px 0; padding-left: 20px; color: var(--color-warn, #b87100); font-size: 12px;">
-         ${rec.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}
-       </ul>`
-    : '';
+  let pillCls = 'adv-pill ok';
+  let pillTxt = 'FITS';
+  let barCls = 'ok';
+  let kvCls = '';
+  let leftCls = 'success';
+  let totalCls = 'accent';
+  if (pctUsed > 95) {
+    pillCls = 'adv-pill danger'; pillTxt = `${pctUsed}% — OUT OF VRAM`;
+    barCls = 'danger'; kvCls = 'danger'; leftCls = 'danger'; totalCls = 'danger';
+  } else if (pctUsed > 80) {
+    pillCls = 'adv-pill warn'; pillTxt = `${pctUsed}% — uważaj`;
+    barCls = 'warn'; kvCls = 'warn'; leftCls = 'warn';
+  }
+
+  const weightsGb = v.model_weights_gb || 0;
+  const kvGb = v.kv_cache_gb || 0;
+  const actGb = v.activations_gb || 0;
+  const w = (n) => totalVramGb > 0 ? Math.min(100, (n / totalVramGb) * 100) : 0;
 
   return `
-    <div style="background: var(--color-surface-alt, #f5f5f5); padding: 12px; border-radius: 6px;">
-      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; font-size: 13px;">
-        <div><strong>Architektura:</strong> ${escapeHtml(m.model_type || '?')} (${escapeHtml((m.architectures || []).join(', ') || '?')})</div>
-        <div><strong>Parametry:</strong> ${(m.estimated_params_billions || 0).toFixed(1)}B (${escapeHtml(m.dtype || '?')}${m.quantization ? `, ${escapeHtml(m.quantization)}` : ''})</div>
-        <div><strong>Layers / Heads:</strong> ${m.num_hidden_layers || 0} / ${m.num_attention_heads || 0} (KV: ${m.num_key_value_heads || 0})</div>
-        <div><strong>Max ctx (model):</strong> ${(m.max_position_embeddings || 0).toLocaleString()}</div>
+    <div class="adv-section">
+      <div class="adv-sec-title">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h20v18H2z"/><path d="M2 9h20"/></svg>
+        Kalkulator VRAM
+        <div class="adv-sec-actions"><span class="${pillCls}">${escapeHtml(pillTxt)}</span></div>
       </div>
-      <div style="margin-top: 12px;">
-        <strong>Konfiguracja rekomendowana:</strong> TP=${r.tensor_parallel} × PP=${r.pipeline_parallel}, ctx=${(r.max_model_len || 0).toLocaleString()}, max_seqs=${r.max_num_seqs}, kv=${escapeHtml(r.kv_cache_dtype || 'auto')}
+      <div class="adv-kpi-grid" id="edw-adv-kpi">
+        <div class="adv-kpi"><div class="k-label">Wagi modelu</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
+        <div class="adv-kpi ${kvCls}"><div class="k-label">KV cache</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${(r.max_model_len || 0).toLocaleString()} ctx · ${escapeHtml(r.kv_cache_dtype || 'auto')}</div></div>
+        <div class="adv-kpi"><div class="k-label">Aktywacje</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">workspace</div></div>
+        <div class="adv-kpi ${leftCls}"><div class="k-label">Zostaje</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${Math.max(0, 100 - pctUsed)}% headroom</div></div>
+        <div class="adv-kpi ${totalCls}"><div class="k-label">Total / Avail</div><div class="k-value">${totalUsed.toFixed(1)} / ${totalVramGb.toFixed(0)}</div><div class="k-sub">${pctUsed}% z ${gpuCount} GPU</div></div>
       </div>
-      <div style="margin-top: 8px;">
-        <div style="display:flex; justify-content: space-between; font-size:12px; margin-bottom: 4px;">
-          <span>VRAM per GPU: ${(v.per_gpu_gb || 0).toFixed(1)} / ${(totalVram / totalGpus).toFixed(1)} GB (${fillPct}%)</span>
-          <span>Total: ${(usedTotal).toFixed(1)} / ${totalVram.toFixed(1)} GB</span>
-        </div>
-        <div style="height:8px; background: #ddd; border-radius:4px; overflow: hidden;">
-          <div style="width: ${fillPct}%; height:100%; background: ${fillColor}; transition: width 0.3s;"></div>
-        </div>
-        <div style="font-size:12px; margin-top:4px; color: var(--color-text-muted, #666);">
-          Weights: ${(v.model_weights_gb || 0).toFixed(1)} GB · KV cache: ${(v.kv_cache_gb || 0).toFixed(1)} GB · Activations: ${(v.activations_gb || 0).toFixed(1)} GB
+      <div class="adv-vram-bar-wrap">
+        <div class="adv-vram-head"><span>Wykorzystanie VRAM</span><span class="pct">${pctUsed}%</span></div>
+        <div class="adv-vram-bar"><div class="fill ${barCls}" style="width:${Math.min(100, pctUsed)}%"></div></div>
+        <div class="adv-vram-legend">
+          <span class="lg-w">Wagi ${w(weightsGb).toFixed(0)}%</span>
+          <span class="lg-kv">KV ${w(kvGb).toFixed(0)}%</span>
+          <span class="lg-act">Aktywacje ${w(actGb).toFixed(0)}%</span>
+          <span class="lg-free">Wolne ${Math.max(0, 100 - pctUsed)}%</span>
         </div>
       </div>
-      ${warningsHtml}
-      <details style="margin-top: 8px; font-size: 12px;">
-        <summary style="cursor: pointer;">VLLM_ARGS (rozwijany)</summary>
-        <pre style="background: #eee; padding: 6px; border-radius: 4px; overflow-x: auto; margin-top: 4px;">${escapeHtml(rec.recommended_vllm_args || '')}</pre>
-      </details>
     </div>
   `;
 }
 
-function renderAdvancedManualControls(adv) {
-  const rec = advancedRecommendation || {};
-  const recCfg = rec.recommended || {};
-  const maxCtx = rec.max_supported_model_len || 32768;
-  const maxSeqs = rec.max_supported_num_seqs || 256;
+function renderAutoAlert(rec) {
+  if (!rec || rec.error) {
+    return `<div class="form-hint" style="margin-top:10px;">Auto-tuned użyje domyślnej konfiguracji vLLM po pobraniu rekomendacji.</div>`;
+  }
+  const r = rec.recommended || {};
+  const args = rec.recommended_vllm_args || '';
+  const warnings = rec.warnings || [];
+  return `
+    <div class="adv-alert info">
+      <div class="adv-alert-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></div>
+      <div class="adv-alert-body">
+        <strong>Rekomendacja na podstawie hardware'u:</strong>
+        TP=${r.tensor_parallel || 1} × PP=${r.pipeline_parallel || 1}, kontekst <strong>${(r.max_model_len || 0).toLocaleString()}</strong>,
+        KV cache <strong>${escapeHtml(r.kv_cache_dtype || 'auto')}</strong>, max_num_seqs=${r.max_num_seqs || 0},
+        gpu_memory_utilization=${(r.gpu_memory_utilization || 0.9).toFixed(2)}.
+        ${args ? `<div class="adv-alert-args">${escapeHtml(args)}</div>` : ''}
+        ${warnings.length > 0 ? `<ul class="adv-alert-warn">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+// Presety kontekstu pokazywane jako chipy. Górny limit 1M — nawet jeśli
+// model deklaruje mniej, chipy ponad max są wyszarzone (klasa "exceeds").
+const CTX_PRESETS = [
+  { label: '4k',   value: 4096 },
+  { label: '8k',   value: 8192 },
+  { label: '16k',  value: 16384 },
+  { label: '32k',  value: 32768 },
+  { label: '64k',  value: 65536 },
+  { label: '128k', value: 131072 },
+  { label: '262k', value: 262144 },
+  { label: '512k', value: 524288 },
+  { label: '1M',   value: 1048576 },
+];
+
+function renderAdvancedManualControls(adv, rec) {
+  const recCfg = rec?.recommended || {};
+  // Maksymalny kontekst: bierzemy z config.json modelu (max_position_embeddings),
+  // albo z `max_supported_model_len` (limit z VRAM), wybieramy większą wartość żeby
+  // user mógł próbować ekstremalnych ustawień nawet gdy auto-tuned ograniczył do mniej.
+  // Hard ceiling 1M (1_048_576) — modele typu Llama 3.1 mają 1M, więcej w praktyce nikt nie używa.
+  const modelMaxCtx = rec?.model_spec?.max_position_embeddings || 0;
+  const vramMaxCtx = rec?.max_supported_model_len || 0;
+  const ABSOLUTE_MAX = 1_048_576;
+  const maxCtx = Math.min(ABSOLUTE_MAX, Math.max(modelMaxCtx, vramMaxCtx, 32768));
+  const maxSeqs = rec?.max_supported_num_seqs || 256;
+
   const tp = adv.tensor_parallel ?? recCfg.tensor_parallel ?? 1;
   const pp = adv.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
   const ctx = adv.max_model_len ?? recCfg.max_model_len ?? 8192;
@@ -592,64 +669,93 @@ function renderAdvancedManualControls(adv) {
   const memUtil = adv.gpu_memory_utilization ?? recCfg.gpu_memory_utilization ?? 0.9;
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
+  // Chipy presetów — disabled gdy przekraczają max modelu.
+  const chips = CTX_PRESETS.map((p) => {
+    const exceeds = p.value > maxCtx;
+    const active = !exceeds && Math.abs(p.value - ctx) < 1024;
+    const cls = ['adv-ctx-chip'];
+    if (active) cls.push('active');
+    if (exceeds) cls.push('exceeds');
+    const title = exceeds ? `Przekracza max modelu (${maxCtx.toLocaleString()})` : `Ustaw ${p.label}`;
+    return `<button type="button" class="${cls.join(' ')}" data-ctx="${p.value}" title="${escapeAttr(title)}" ${exceeds ? 'disabled' : ''}>${escapeHtml(p.label)}</button>`;
+  }).join('');
+
   return `
-    <div class="form-group">
-      <label>Tensor Parallel (1..${totalGpus})</label>
-      <input type="number" id="edw-adv-tp" min="1" max="${totalGpus}" step="1" value="${tp}"
-        style="width: 80px;">
-      <span class="form-hint inline">musi dzielic num_attention_heads modelu</span>
+    <div class="adv-form-row">
+      <label>
+        <span>Długość kontekstu (max_model_len)</span>
+        <span class="v" id="edw-adv-ctx-val">${ctx.toLocaleString()}</span>
+      </label>
+      <input type="range" class="adv-range" id="edw-adv-ctx" min="512" max="${maxCtx}" step="512" value="${ctx}">
+      <div class="adv-ctx-presets">${chips}</div>
+      <div class="adv-hint">Max z konfiguracji modelu: <strong>${modelMaxCtx ? modelMaxCtx.toLocaleString() : '?'}</strong>${vramMaxCtx ? ` · z VRAM: <strong>${vramMaxCtx.toLocaleString()}</strong>` : ''}.</div>
     </div>
-    <div class="form-group">
-      <label>Pipeline Parallel (1..${totalGpus})</label>
-      <input type="number" id="edw-adv-pp" min="1" max="${totalGpus}" step="1" value="${pp}"
-        style="width: 80px;">
-      <span class="form-hint inline">TP × PP musi byc <= liczba GPU; PP dzieli num_hidden_layers</span>
+
+    <div class="adv-row-2">
+      <div class="adv-form-row">
+        <label><span>Tensor Parallel</span><span class="v">${tp}</span></label>
+        <tf-input type="number" id="edw-adv-tp" min="1" max="${totalGpus}" value="${tp}"></tf-input>
+        <div class="adv-hint">Musi dzielić num_attention_heads. Limit ${totalGpus} GPU.</div>
+      </div>
+      <div class="adv-form-row">
+        <label><span>Pipeline Parallel</span><span class="v">${pp}</span></label>
+        <tf-input type="number" id="edw-adv-pp" min="1" max="${totalGpus}" value="${pp}"></tf-input>
+        <div class="adv-hint">TP × PP ≤ ${totalGpus}. PP dzieli num_hidden_layers.</div>
+      </div>
     </div>
-    <div class="form-group">
-      <label>Max model length (kontekst): <span id="edw-adv-ctx-val">${ctx.toLocaleString()}</span></label>
-      <input type="range" id="edw-adv-ctx" min="512" max="${maxCtx}" step="512" value="${ctx}" style="width: 100%;">
-      <span class="form-hint">Max wspierane: ${maxCtx.toLocaleString()} (limit z VRAM dla aktualnej konfiguracji)</span>
+
+    <div class="adv-row-2">
+      <div class="adv-form-row">
+        <label><span>Max num seqs</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
+        <input type="range" class="adv-range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}">
+        <div class="adv-hint">Liczba równoległych zapytań w batch (max ${maxSeqs}).</div>
+      </div>
+      <div class="adv-form-row">
+        <label><span>GPU memory utilization</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
+        <input type="range" class="adv-range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}">
+        <div class="adv-hint">Procent VRAM dla vLLM, reszta na CUDA workspace.</div>
+      </div>
     </div>
-    <div class="form-group">
-      <label>Max równoległych zapytań: <span id="edw-adv-seqs-val">${seqs}</span></label>
-      <input type="range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}" style="width: 100%;">
-      <span class="form-hint">Max wspierane: ${maxSeqs}</span>
+
+    <div class="adv-form-row">
+      <label>KV Cache dtype</label>
+      <tf-select id="edw-adv-kv" value="${escapeAttr(kv)}">
+        <option value="auto">auto (fp16 default)</option>
+        <option value="fp16">fp16 (2 B/elem)</option>
+        <option value="bfloat16">bfloat16 (2 B/elem)</option>
+        <option value="fp8">fp8 (1 B/elem · 2× kontekst)</option>
+      </tf-select>
+      <div class="adv-hint">fp8 jest dwa razy tańszy w VRAM przy zachowanej jakości.</div>
     </div>
-    <div class="form-group">
-      <label>KV Cache Dtype</label>
-      <select id="edw-adv-kv" style="padding: 4px;">
-        <option value="auto" ${kv === 'auto' ? 'selected' : ''}>auto (fp16, default)</option>
-        <option value="fp16" ${kv === 'fp16' ? 'selected' : ''}>fp16 (2 bytes/elem)</option>
-        <option value="bfloat16" ${kv === 'bfloat16' ? 'selected' : ''}>bfloat16 (2 bytes/elem)</option>
-        <option value="fp8" ${kv === 'fp8' ? 'selected' : ''}>fp8 (1 byte/elem - 2× wiecej kontekstu)</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label>GPU memory utilization: <span id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
-      <input type="range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}" style="width: 100%;">
-      <span class="form-hint">Ile VRAM mozna uzyc (0.5 = 50%, 0.95 = 95%; rezerwuje miejsce dla CUDA workspace)</span>
-    </div>
-    <div class="form-hint" style="margin-top: 8px;">
-      Wartosci sa zapisywane jako VLLM_ARGS w deploy. Suwaki maja hard limits z aktualnej konfiguracji - jezeli ustawisz wieksze, deploy moze sie OOM-owac.
+
+    <div class="adv-hint" style="margin-top:10px;">
+      Wartości są zapisywane jako VLLM_ARGS w deploy. Suwaki nie wymuszają hard-limitów — możesz spróbować ekstremalnych ustawień, ale kalkulator powyżej pokaże gdy konfiguracja nie zmieści się w VRAM.
     </div>
   `;
 }
 
 function bindAdvancedHandlers() {
-  document.querySelectorAll('[data-adv-mode]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      selection.advanced.mode = btn.getAttribute('data-adv-mode');
-      rerenderStepBody();
+  // Tryb auto/manual — tf-segmented emituje "change" z detail.value.
+  const modeSeg = document.getElementById('edw-adv-mode');
+  if (modeSeg) {
+    modeSeg.addEventListener('change', (e) => {
+      const v = e.detail?.value || 'auto';
+      if (v !== selection.advanced.mode) {
+        selection.advanced.mode = v;
+        refreshModal();
+      }
     });
-  });
+  }
 
   const debounceRecompute = (overrides) => {
     if (advancedRecommendDebounceTimer) clearTimeout(advancedRecommendDebounceTimer);
     advancedRecommendDebounceTimer = setTimeout(async () => {
       advancedRecommendation = await fetchVllmRecommendation(overrides);
-      const summaryDiv = document.getElementById('edw-adv-summary');
-      if (summaryDiv && advancedRecommendation) {
-        summaryDiv.innerHTML = renderRecommendationSummary(advancedRecommendation);
+      // Re-render tylko body kroku, BEZ niszczenia stepper'a / footera.
+      const body = document.getElementById('edw-body');
+      if (body) {
+        body.innerHTML = renderStepIndicator() + renderStepBody();
+        bindStepInputs();
       }
     }, 300);
   };
@@ -666,7 +772,7 @@ function bindAdvancedHandlers() {
     };
   };
 
-  const bindRange = (id, valSpanId, key, transform = (v) => v, displayFn = null) => {
+  const bindRange = (id, valSpanId, key, transform, displayFn) => {
     const el = document.getElementById(id);
     const valSpan = document.getElementById(valSpanId);
     if (!el) return;
@@ -678,32 +784,55 @@ function bindAdvancedHandlers() {
     });
   };
 
-  bindRange('edw-adv-ctx', 'edw-adv-ctx-val', 'max_model_len', (v) => parseInt(v));
-  bindRange('edw-adv-seqs', 'edw-adv-seqs-val', 'max_num_seqs', (v) => parseInt(v));
+  bindRange('edw-adv-ctx', 'edw-adv-ctx-val', 'max_model_len', (v) => parseInt(v, 10), (v) => v.toLocaleString());
+  bindRange('edw-adv-seqs', 'edw-adv-seqs-val', 'max_num_seqs', (v) => parseInt(v, 10), (v) => String(v));
   bindRange('edw-adv-mem', 'edw-adv-mem-val', 'gpu_memory_utilization',
     (v) => parseFloat(v),
     (v) => `${(v * 100).toFixed(0)}%`);
 
-  ['edw-adv-tp', 'edw-adv-pp'].forEach((id) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.addEventListener('change', () => {
-      const key = id === 'edw-adv-tp' ? 'tensor_parallel' : 'pipeline_parallel';
-      selection.advanced[key] = parseInt(el.value);
+  // Chipy presetów kontekstu — klik ustawia suwak i wyzwala recompute.
+  document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      if (chip.classList.contains('exceeds')) return;
+      const v = parseInt(chip.dataset.ctx, 10);
+      if (!Number.isFinite(v)) return;
+      selection.advanced.max_model_len = v;
+      const slider = document.getElementById('edw-adv-ctx');
+      if (slider) slider.value = String(v);
+      const valSpan = document.getElementById('edw-adv-ctx-val');
+      if (valSpan) valSpan.textContent = v.toLocaleString();
+      document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
       debounceRecompute(buildOverrides());
     });
   });
 
+  // tf-input dla TP/PP (emituje "change" z detail.value).
+  ['edw-adv-tp', 'edw-adv-pp'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', (e) => {
+      const raw = e.detail?.value ?? el.value;
+      const key = id === 'edw-adv-tp' ? 'tensor_parallel' : 'pipeline_parallel';
+      const v = parseInt(raw, 10);
+      if (Number.isFinite(v)) {
+        selection.advanced[key] = v;
+        debounceRecompute(buildOverrides());
+      }
+    });
+  });
+
+  // tf-select dla KV dtype.
   const kvSelect = document.getElementById('edw-adv-kv');
   if (kvSelect) {
-    kvSelect.addEventListener('change', () => {
-      selection.advanced.kv_cache_dtype = kvSelect.value;
+    kvSelect.addEventListener('change', (e) => {
+      const v = e.detail?.value ?? kvSelect.value;
+      selection.advanced.kv_cache_dtype = v;
       debounceRecompute(buildOverrides());
     });
   }
 
-  // Wyzwalaj initial fetch jezeli jeszcze nie ma rekomendacji (np. user
-  // wszedl w step pierwszy raz bez auto-trigger).
+  // Initial fetch gdy jeszcze nie ma rekomendacji.
   if (!advancedRecommendation) {
     debounceRecompute({});
   }
@@ -955,14 +1084,6 @@ function bindStepInputs() {
     case 'advanced': bindAdvancedHandlers(); break;
     case 'runtime':  bindStepRuntimeInputs(); break;
   }
-}
-
-// Re-render zachowuje pozycje step ale przerysowuje body (np. po zmianie
-// trybu auto/manual w Advanced step). renderShell powtarza wszystkie nagłówki
-// + footer + bindings - tanie operacje (no DOM diff).
-function rerenderStepBody() {
-  renderShell(renderStepBody());
-  bindStepInputs();
 }
 
 function bindStepMethodInputs() {
