@@ -1,27 +1,30 @@
 /* =============================================================================
    File: profile-compare.css
    Purpose: Style dla widoku Compare Sessions (modules/profile-compare.js).
-            Kolorystyka i naming bazuje na profile-report.css; uzywa
-            zmiennych pr-* zeby trzymac spojny look-and-feel.
+            Naming odzwierciedla mockup section 13 (.compare-grid, .compare-card,
+            .kpi-tile, .delta-up/.delta-down, .flame-wrap, .diff-flamegraph,
+            .diff-rect.slower-red/.faster-green/.unchanged, .compare-meta-table).
+            Selektory są scope'owane pod .profile-compare żeby nie kolidowały
+            z istniejącymi stylami globalnymi.
    ============================================================================= */
 
 .profile-compare {
-  --pc-better:  var(--success, #22c55e);
-  --pc-worse:   var(--danger, #ef4444);
-  --pc-neutral: var(--text-3, #6a7196);
-  --pc-a:       var(--accent-1, #6366f1);
-  --pc-b:       var(--accent-2, #a78bfa);
-  --pc-bg:      var(--bg-2, #0a0d24);
+  --pc-better:   var(--success, #22c55e);
+  --pc-worse:    var(--danger,  #ef4444);
+  --pc-neutral:  var(--text-3,  #6a7196);
+  --pc-bg:       var(--bg-2,    #0a0d24);
+  --pc-bg-card:  var(--bg-3,    #11163a);
   --pc-bg-input: var(--bg-input, #0b0e22);
-  --pc-border:  var(--border, #1f2548);
-  --pc-text:    var(--text, #e8ebf5);
-  --pc-text-2:  var(--text-2, #a0a8c8);
-  --pc-text-3:  var(--text-3, #6a7196);
-  --pc-radius:  10px;
+  --pc-border:   var(--border,  #1f2548);
+  --pc-text:     var(--text,    #e8ebf5);
+  --pc-text-2:   var(--text-2,  #a0a8c8);
+  --pc-text-3:   var(--text-3,  #6a7196);
+  --pc-radius:   10px;
   padding: 16px 20px 32px;
   color: var(--pc-text);
 }
 
+/* Breadcrumb (reused look) */
 .profile-compare .pr-breadcrumb {
   display: flex;
   align-items: center;
@@ -34,49 +37,47 @@
 .profile-compare .pr-breadcrumb a:hover { color: var(--pc-text); }
 .profile-compare .pr-breadcrumb .sep { color: var(--pc-text-3); }
 
-.pc-header {
+/* =========================================================================
+   compare-header — tytuł + akcja Back.
+   ========================================================================= */
+.profile-compare .compare-header {
   display: flex;
   align-items: flex-start;
   gap: 14px;
   margin-bottom: 14px;
 }
-.pc-title-block { flex: 1; min-width: 0; }
-.pc-title { font-size: 20px; font-weight: 700; margin: 0; }
-.pc-sub { display: flex; align-items: center; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
-.pc-vs { color: var(--pc-text-3); font-size: 12px; font-weight: 600; }
-.pc-meta {
-  font-size: 12px;
-  color: var(--pc-text-2);
-  margin-top: 6px;
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-}
-.pc-meta .sep { color: var(--pc-text-3); }
-.pc-meta .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
-
-.pc-chip {
-  display: inline-block;
-  padding: 3px 10px;
-  border-radius: 999px;
-  font-size: 11px;
+.profile-compare .compare-title-block { flex: 1; min-width: 0; }
+.profile-compare .compare-title {
+  font-size: 20px;
   font-weight: 700;
-  letter-spacing: 0.04em;
-  border: 1px solid transparent;
+  margin: 0;
 }
-.pc-chip-a { background: rgba(99, 102, 241, 0.15); color: var(--pc-a); border-color: rgba(99, 102, 241, 0.35); }
-.pc-chip-b { background: rgba(167, 139, 250, 0.15); color: var(--pc-b); border-color: rgba(167, 139, 250, 0.35); }
+.profile-compare .compare-sub {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 13px;
+}
+.profile-compare .compare-vs {
+  color: var(--pc-text-3);
+  font-size: 12px;
+  font-weight: 600;
+}
+.profile-compare .compare-actions { display: flex; gap: 8px; }
 
-.pc-actions { display: flex; gap: 8px; }
-
-.pc-body { display: block; }
-
-.pc-section {
+/* =========================================================================
+   compare-section — wrapper każdej sekcji widoku.
+   ========================================================================= */
+.profile-compare .compare-section {
   background: var(--pc-bg);
   border: 1px solid var(--pc-border);
   border-radius: var(--pc-radius);
   padding: 14px 16px;
   margin-bottom: 14px;
 }
-.pc-h3 {
+.profile-compare .compare-section-h3 {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -85,145 +86,170 @@
   margin: 0 0 10px;
 }
 
-/* KPI table — 4 kolumny: nazwa | A | B | delta */
-.pc-kpi-table {
-  display: flex; flex-direction: column;
-  border: 1px solid var(--pc-border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-.pc-kpi-head, .pc-kpi-row {
-  display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr 1fr;
-  gap: 10px;
-  padding: 8px 12px;
-  font-size: 12px;
-}
-.pc-kpi-head {
-  background: var(--pc-bg-input);
-  font-weight: 700;
-  color: var(--pc-text-2);
-  border-bottom: 1px solid var(--pc-border);
-}
-.pc-kpi-row { border-bottom: 1px dashed rgba(99, 102, 241, 0.12); }
-.pc-kpi-row:last-child { border-bottom: none; }
-.pc-kpi-name { color: var(--pc-text); font-weight: 600; }
-.pc-kpi-a, .pc-kpi-b { font-family: 'JetBrains Mono', ui-monospace, monospace; }
-.pc-kpi-a { color: var(--pc-a); }
-.pc-kpi-b { color: var(--pc-b); }
-.pc-col-a { color: var(--pc-a); }
-.pc-col-b { color: var(--pc-b); }
-.pc-col-d { color: var(--pc-text-2); }
-
-.pc-delta {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
-  border: 1px solid transparent;
-  background: rgba(106, 113, 150, 0.12);
-  color: var(--pc-neutral);
-}
-.pc-delta.better { background: rgba(34, 197, 94, 0.14); color: var(--pc-better); border-color: rgba(34, 197, 94, 0.35); }
-.pc-delta.worse  { background: rgba(239, 68, 68, 0.14);  color: var(--pc-worse);  border-color: rgba(239, 68, 68, 0.35); }
-.pc-delta.neutral { background: rgba(106, 113, 150, 0.12); color: var(--pc-neutral); border-color: rgba(106, 113, 150, 0.25); }
-
-.pc-legend {
-  display: flex; gap: 16px; flex-wrap: wrap;
-  margin-top: 12px;
-  font-size: 11px;
-  color: var(--pc-text-2);
-}
-.pc-legend .sw {
-  display: inline-block;
-  width: 10px; height: 10px;
-  border-radius: 3px;
-  margin-right: 6px;
-  vertical-align: middle;
-}
-.pc-legend .sw.better { background: rgba(34, 197, 94, 0.6); }
-.pc-legend .sw.worse  { background: rgba(239, 68, 68, 0.6); }
-.pc-legend .sw.neutral { background: rgba(106, 113, 150, 0.45); }
-
-/* Flame side-by-side */
-.pc-flame-grid {
+/* =========================================================================
+   compare-grid + compare-card (mockup section 13 side-by-side cards).
+   ========================================================================= */
+.profile-compare .compare-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
-  align-items: stretch;
 }
-.pc-flame-pane {
-  display: flex; flex-direction: column;
+@media (max-width: 1000px) {
+  .profile-compare .compare-grid { grid-template-columns: 1fr; }
+}
+.profile-compare .compare-card {
+  background: var(--pc-bg-card);
   border: 1px solid var(--pc-border);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--pc-bg-input);
-  min-height: 360px;
+  border-radius: var(--pc-radius);
+  padding: 14px 16px;
 }
-.pc-pane-head {
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--pc-border);
-  background: var(--pc-bg);
+.profile-compare .compare-card-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
 }
-.pc-flame-host {
-  flex: 1;
-  min-height: 320px;
-  padding: 6px;
+.profile-compare .compare-card-title {
+  font-size: 13px;
+  color: var(--pc-text);
+}
+.profile-compare .compare-card-meta {
+  margin-left: auto;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--pc-text-3);
 }
 
-@media (max-width: 1024px) {
-  .pc-flame-grid { grid-template-columns: 1fr; }
+/* KPI tile grid (mockup .kpi-grid + .kpi-tile + .kpi-label + .kpi-value) */
+.profile-compare .kpi-grid {
+  display: grid;
+  gap: 10px;
 }
-
-.pc-flame-deltas { margin-top: 14px; }
-
-/* Generic GPU/Memory card-style block */
-.pc-card {
+.profile-compare .kpi-grid-2 { grid-template-columns: repeat(2, 1fr); }
+.profile-compare .kpi-tile {
   background: var(--pc-bg-input);
   border: 1px solid var(--pc-border);
   border-radius: 8px;
   padding: 10px 12px;
-  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
-.pc-card-head {
-  font-size: 12px;
+.profile-compare .kpi-label {
+  font-size: 11px;
+  color: var(--pc-text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.profile-compare .kpi-value {
+  font-size: 18px;
   font-weight: 700;
   color: var(--pc-text);
-  margin-bottom: 8px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
 }
-.pc-card .pc-kpi-row {
-  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
-  padding: 6px 0;
-}
-.pc-card .pc-kpi-row:last-child { border-bottom: none; }
 
-/* Top-symbol delta table */
-.pc-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
+/* Delta pills — mockup uses .delta-up (czerwony, gorzej) / .delta-down
+   (zielony, lepiej / spadek). Aliasy .compare-delta.up/.down/.same dla
+   spec'a z karty zadania. */
+.profile-compare .delta-up,
+.profile-compare .compare-delta.up {
+  color: var(--pc-worse);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 11px;
 }
-.pc-table thead th {
-  text-align: left;
-  padding: 8px 10px;
-  background: var(--pc-bg-input);
-  border-bottom: 1px solid var(--pc-border);
-  color: var(--pc-text-2);
+.profile-compare .delta-down,
+.profile-compare .compare-delta.down {
+  color: var(--pc-better);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-weight: 700;
+  font-size: 11px;
+}
+.profile-compare .delta-flat,
+.profile-compare .compare-delta.same {
+  color: var(--pc-neutral);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+}
+
+/* status-pill (lokalna kopia mockup'owa, scope'owana — niezależna od
+   globalnych stylów żeby kolory były stałe w widoku Compare). */
+.profile-compare .status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.04em;
-  font-size: 11px;
   text-transform: uppercase;
+  white-space: nowrap;
 }
-.pc-table tbody td {
-  padding: 6px 10px;
-  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
+.profile-compare .status-pill.local {
+  background: rgba(167, 139, 250, 0.14);
+  color: var(--accent-2, #a78bfa);
 }
-.pc-table .num { text-align: right; font-family: 'JetBrains Mono', ui-monospace, monospace; }
-.pc-table .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.profile-compare .status-pill.sso {
+  background: rgba(96, 165, 250, 0.14);
+  color: var(--info, #60a5fa);
+}
 
-.pc-empty {
+/* =========================================================================
+   diff-flamegraph — różnicowy SVG flamegraph (mockup section 13).
+   ========================================================================= */
+.profile-compare .flame-wrap {
+  background: var(--pc-bg-input);
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  padding: 10px;
+  overflow-x: auto;
+}
+.profile-compare .flame-svg {
+  display: block;
+  width: 100%;
+  min-width: 920px;
+}
+.profile-compare .diff-flamegraph .flame-svg text {
+  fill: #0a0d24;
+  pointer-events: none;
+  user-select: none;
+}
+.profile-compare .diff-rect {
+  stroke: rgba(0, 0, 0, 0.25);
+  stroke-width: 0.5;
+}
+.profile-compare .diff-rect.slower-red  { fill: #fca5a5; }
+.profile-compare .diff-rect.faster-green { fill: #86efac; }
+.profile-compare .diff-rect.unchanged   { fill: #fcd34d; }
+.profile-compare .diff-rect:hover { stroke: #fff; stroke-width: 1; }
+
+/* Legenda diff-flamegraph (.diff-legend + .sw) */
+.profile-compare .diff-legend {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--pc-text-2);
+  margin-top: 8px;
+}
+.profile-compare .diff-legend .sw {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+.profile-compare .diff-legend .sw.slower-red  { background: #fca5a5; }
+.profile-compare .diff-legend .sw.faster-green { background: #86efac; }
+.profile-compare .diff-legend .sw.unchanged   { background: #fcd34d; }
+
+.profile-compare .diff-flamegraph-empty {
   padding: 18px;
   text-align: center;
   color: var(--pc-text-2);
@@ -233,17 +259,72 @@
   border-radius: 8px;
 }
 
-.pc-loading { padding: 20px; }
-.pc-error .pc-error-card {
+/* =========================================================================
+   compare-meta-table — tabela metadata sesji A vs B.
+   ========================================================================= */
+.profile-compare .compare-meta-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  background: var(--pc-bg-input);
+  border: 1px solid var(--pc-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.profile-compare .compare-meta-table thead th {
+  text-align: left;
+  padding: 8px 12px;
+  background: var(--pc-bg);
+  border-bottom: 1px solid var(--pc-border);
+  color: var(--pc-text-2);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.profile-compare .compare-meta-table tbody td {
+  padding: 7px 12px;
+  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
+  color: var(--pc-text);
+}
+.profile-compare .compare-meta-table tbody tr:last-child td { border-bottom: none; }
+.profile-compare .compare-meta-table .meta-label {
+  color: var(--pc-text-2);
+  font-weight: 600;
+  width: 30%;
+}
+.profile-compare .compare-meta-table .mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* =========================================================================
+   States: loading + error + empty.
+   ========================================================================= */
+.profile-compare.pc-loading { padding: 20px; }
+.profile-compare.pc-error .pc-error-card {
   padding: 20px;
   background: rgba(239, 68, 68, 0.08);
   border: 1px solid rgba(239, 68, 68, 0.35);
   border-radius: 10px;
   margin: 20px;
 }
-.pc-error pre { white-space: pre-wrap; word-break: break-word; }
+.profile-compare.pc-error pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.profile-compare .pc-empty {
+  padding: 18px;
+  text-align: center;
+  color: var(--pc-text-2);
+  font-size: 12px;
+  background: var(--pc-bg-input);
+  border: 1px dashed var(--pc-border);
+  border-radius: 8px;
+}
 
-/* Sessions list — multi-select footer */
+/* =========================================================================
+   Sessions list — multi-select compare bar (used by profiling-sessions.js).
+   ========================================================================= */
 .profiling-sessions .ps-compare-bar {
   display: flex;
   align-items: center;
