@@ -1233,7 +1233,25 @@ impl Router {
         rx: tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>,
     ) {
         self.service_manager.set_snapshot_rx(rx.clone());
-        *self.services_snapshot_rx.write() = Some(rx);
+        *self.services_snapshot_rx.write() = Some(rx.clone());
+
+        // Hydrate legacy DashMap stores once on every snapshot update so that
+        // chat.rs / adapter callers that still consult `service_backends`
+        // observe newly-deployed services without waiting for the next request
+        // cycle. Skipped when no Tokio runtime is available (unit tests wiring
+        // a snapshot directly through `set_snapshot_rx`).
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let manager = self.service_manager.clone();
+            let mut rx = rx;
+            // Run the initial hydration eagerly so the very first snapshot
+            // (typically empty / first-tick result) is reflected immediately.
+            manager.hydrate_from_snapshot();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    manager.hydrate_from_snapshot();
+                }
+            });
+        }
     }
 
     /// Returns the current services snapshot, or `None` if `main.rs` hasn't
