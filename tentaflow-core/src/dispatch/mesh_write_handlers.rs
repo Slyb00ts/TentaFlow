@@ -722,11 +722,49 @@ async fn handle_nsight_local(
             }))
         }
         NsightPayload::ReportRequest(req) => {
+            // Najpierw v1 storage (legacy nsys-only). Jesli sesja w v1 brak,
+            // fallback do storage_v2 (multi-source). Multi-source sesje zapisuja
+            // ProfileReportEnvelope::V1Legacy(ProfileReport) gdy collectorzy
+            // wygenerowali metryki kompatybilne z legacy view (nsys path), albo
+            // V2 gdy nowy format - w drugim przypadku zwracamy konkretny error
+            // zeby GUI wiedzialo zeby uzyc V2 view.
             let storage = local_profile_storage(ctx);
-            let report = storage
-                .read_summary(&req.session_id)
-                .map_err(profiling_err_to_proto)?;
-            Ok(NsightPayload::ReportResponse(NsightReportResponse { report }))
+            match storage.read_summary(&req.session_id) {
+                Ok(report) => {
+                    return Ok(NsightPayload::ReportResponse(NsightReportResponse { report }));
+                }
+                Err(crate::profiling::ProfilingError::NotFound(_)) => {
+                    // v1 nie ma - sprobuj v2.
+                }
+                Err(e) => return Err(profiling_err_to_proto(e)),
+            }
+            // Fallback v2: multi-source sesje zyja w <home>/profiling/<node>/<session>/
+            let storage_v2 = std::sync::Arc::clone(&crate::profiling::PROFILE_STORAGE_V2);
+            let local_node_id = ctx.state.local_node_id.as_ref().to_string();
+            match storage_v2.read_report(&local_node_id, &req.session_id).await {
+                Ok(envelope) => {
+                    use tentaflow_protocol::profiling::ProfileReportEnvelope;
+                    match envelope {
+                        ProfileReportEnvelope::V1Legacy(report) => {
+                            Ok(NsightPayload::ReportResponse(NsightReportResponse { report }))
+                        }
+                        ProfileReportEnvelope::V2(_v2_report) => {
+                            // V2 ma inne pola (multi-source timeline, frames, stacks
+                            // itp.) ktorych legacy NsightReport view nie potrafi
+                            // wyrenderowac. Zwracamy bad-request zeby GUI uzyl V2 view.
+                            Err(ProtocolError::bad_request(format!(
+                                "sesja {} to multi-source profilowanie (V2). \
+                                 Otwórz przez Profile Report V2 (mesh detail -> Sessions -> ten przycisk).",
+                                req.session_id
+                            )))
+                        }
+                    }
+                }
+                Err(_e) => Err(ProtocolError::not_found(format!(
+                    "session {} not found in either v1 nsight nor v2 profiling storage",
+                    req.session_id
+                ))),
+            }
         }
         NsightPayload::DeleteRequest(req) => {
             let storage = local_profile_storage(ctx);
