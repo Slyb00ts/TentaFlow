@@ -253,7 +253,7 @@ function renderListTab() {
   `;
 }
 
-// Maps services_v2.status (running|degraded|failed|starting|stopped) onto the
+// Maps services.status (running|degraded|failed|starting|stopped) onto the
 // tf-chip status palette. degraded → pending (yellow), failed → err (red).
 function mapStatusToChip(status) {
   switch ((status || '').toLowerCase()) {
@@ -778,7 +778,7 @@ async function stopService(id, name) {
   if (!ok) return;
   try {
     // REST DELETE /api/services/:id stops the runtime and removes the row,
-    // cascading to model_registry_v2 (services_v2 pipeline).
+    // cascading to model_registry via FK ON DELETE CASCADE.
     await apiDelete(`/api/services/${encodeURIComponent(id)}`);
     toast(I18n.t('services.delete_success', { name }), 'success');
     const fresh = await apiGet('/api/services').catch(() => services);

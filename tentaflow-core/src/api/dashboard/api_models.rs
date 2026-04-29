@@ -40,7 +40,7 @@ pub struct UpdateModelEntryRequest {
     pub config_json: Option<String>,
 }
 
-/// GET /api/models - alive models served by services_v2 (running or degraded).
+/// GET /api/models - alive models served by services (running or degraded).
 /// Phase 5 flip: legacy `model_registry` is no longer queried here. Pagination
 /// kept for compatibility — applied client-side to the JOIN result.
 pub fn handle_list_entries(pool: &DbPool, offset: i64, limit: i64) -> Result<(u16, String)> {
@@ -279,7 +279,7 @@ pub fn broadcast_alias_mutation(
 }
 
 #[cfg(test)]
-mod tests_v2_endpoint {
+mod tests_endpoint {
     use super::*;
     use crate::services::transport::Transport;
     use crate::services_repo::models::{insert as model_insert, NewModel};
@@ -317,7 +317,7 @@ mod tests_v2_endpoint {
     }
 
     #[test]
-    fn v2_endpoint_returns_only_alive() {
+    fn endpoint_returns_only_alive() {
         let db = open_db();
         seed(&db, "running-engine", ServiceStatus::Running);
         seed(&db, "starting-engine", ServiceStatus::Starting);

@@ -377,11 +377,17 @@ pub fn model_list_request(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
+    // Source the model list from the unified services pipeline. Each row in
+    // `model_registry` carries the model name + the service it is hosted on;
+    // status/category come from the joined `services` row.
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let rows = crate::services_repo::models::list_alive(&conn).map_err(db_err)?;
+    drop(conn);
 
-    // ACL filter — gdy zalogowany user nie-admin, ukrywamy modele do ktorych
-    // jego grupa lub on sam ma deny. Anonymous sees nothing additional (full
-    // list — fallback do legacy zachowania, niezalogowani na wewn. dashboardzie).
     let user_acl = match &ctx.session {
         crate::dispatch::SessionAuth::UserSession { user_id, role, .. } => {
             let role_str = role.clone().unwrap_or_else(|| "user".to_string());
@@ -396,45 +402,48 @@ pub fn model_list_request(
         _ => None,
     };
 
-    let models: Vec<ModelSummary> = services
+    let models: Vec<ModelSummary> = rows
         .into_iter()
-        .filter(|s| match &user_acl {
-            Some((uid, role)) => {
-                crate::routing::acl::check_access_safe(&ctx.state.db, "model", &s.name, *uid, role)
-            }
+        .filter(|m| match &user_acl {
+            Some((uid, role)) => crate::routing::acl::check_access_safe(
+                &ctx.state.db,
+                "model",
+                &m.model_name,
+                *uid,
+                role,
+            ),
             None => true,
         })
-        .map(|s| {
-            // display_name: parsuj `deployed_model` z config_json (np.
-            // "Qwen/Qwen3.5-0.8B") zeby GUI pokazywalo HF repo a nie nazwe
-            // service'u (typu "tentaflow-vllm-metal-2izlb"). Fallback: nazwa.
-            let display_name = serde_json::from_str::<serde_json::Value>(&s.config_json)
-                .ok()
-                .and_then(|v| {
-                    v.get("deployed_model")
-                        .and_then(|m| m.as_str())
-                        .map(String::from)
-                })
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| s.name.clone());
-            // engine_id: takze z config_json (vllm-metal/mlx/llama-cpp), nie
-            // service_type (= zawsze "llm"/"stt"/...).
-            let engine_id = serde_json::from_str::<serde_json::Value>(&s.config_json)
-                .ok()
-                .and_then(|v| v.get("engine").and_then(|m| m.as_str()).map(String::from))
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| s.service_type.clone());
+        .map(|m| {
+            let display_name = m.display_name.clone().unwrap_or_else(|| m.model_name.clone());
             ModelSummary {
-                id: s.name,
+                id: m.model_name,
                 display_name,
-                category: s.model_category.unwrap_or_else(|| "llm".into()),
-                engine_id,
-                availability: s.status,
+                category: capability_to_category(&m.capabilities),
+                engine_id: m.engine_id,
+                availability: m.status,
             }
         })
         .collect();
     Ok(MessageBody::ModelListResponse { models })
 }
+
+/// Maps the JSON-encoded capabilities array (e.g. `["chat"]`) onto a coarse
+/// category bucket the GUI uses for filtering. Unknown / empty defaults to llm.
+fn capability_to_category(capabilities_json: &str) -> String {
+    let value: serde_json::Value =
+        serde_json::from_str(capabilities_json).unwrap_or(serde_json::Value::Null);
+    let first = value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str());
+    match first {
+        Some("chat") => "llm".into(),
+        Some(other) => other.to_string(),
+        None => "llm".into(),
+    }
+}
+
 
 #[handler(variant = "ModelDetailRequest", since = (1, 0))]
 #[policy(UserSession)]
@@ -448,20 +457,25 @@ pub fn model_detail_request(
         _ => return Err(ProtocolError::bad_request("expected ModelDetailRequest")),
     };
 
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let svc = services
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let row = crate::services_repo::models::list_alive(&conn)
+        .map_err(db_err)?
         .into_iter()
-        .find(|s| s.name == *model_id)
+        .find(|m| m.model_name == *model_id)
         .ok_or_else(|| ProtocolError::not_found("model not found"))?;
 
     Ok(MessageBody::ModelDetailResponse(ModelDetail {
-        id: svc.name,
-        category: svc.model_category.unwrap_or_else(|| "llm".into()),
-        engine_id: svc.service_type,
+        id: row.model_name.clone(),
+        category: capability_to_category(&row.capabilities),
+        engine_id: row.engine_id,
         local_path: None,
         size_bytes: 0,
-        availability: svc.status,
-        description: format!("Service strategy: {}", svc.strategy),
+        availability: row.status,
+        description: format!("Hosted by service id={} ({})", row.service_id, row.deploy_method),
         checksum_sha256: None,
     }))
 }
@@ -499,29 +513,35 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         _ => return Err(ProtocolError::bad_request("expected ModelDeleteRequest")),
     };
 
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let svc = services
-        .into_iter()
-        .find(|s| s.name == *model_id)
-        .ok_or_else(|| ProtocolError::not_found("model not found"))?;
+    // Resolve the model to its hosting service via the unified registry, then
+    // delete the service row (cascade removes the model registry entry).
+    let (service_id, engine_id) = {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        let row = crate::services_repo::models::list_alive(&conn)
+            .map_err(db_err)?
+            .into_iter()
+            .find(|m| m.model_name == *model_id)
+            .ok_or_else(|| ProtocolError::not_found("model not found"))?;
+        (row.service_id, row.engine_id)
+    };
 
-    // Cascade — usun wpisy w `model_registry` powiazane z tym serwisem,
-    // inaczej zostaja jako sierota w panelu Modele po deleted serwisu.
-    if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, svc.id) {
-        tracing::warn!(
-            service_id = svc.id,
-            "delete_model_entries_by_service: {}",
-            e
-        );
-    }
-    // Wyrejestruj z mesh registry, inaczej router dalej forwarduje requesty
-    // na nieistniejacy serwis ("Mesh STT serwis nie polaczony").
-    let mesh_service_id = format!("native-{}-{}", svc.service_type, svc.name);
+    let mesh_service_id = format!("native-{}-{}", engine_id, model_id);
     ctx.state
         .router
         .unregister_native_service_from_mesh(&mesh_service_id);
 
-    repository::delete_service(&ctx.state.db, svc.id).map_err(db_err)?;
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::delete(&conn, service_id).map_err(db_err)?;
+    }
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
@@ -529,8 +549,8 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         user_id,
         None,
         "model.delete",
-        Some(&format!("model:{}", svc.id)),
-        Some(&svc.name),
+        Some(&format!("model:{}", service_id)),
+        Some(model_id),
         None,
         Some(&ctx.state.local_node_id),
     );
@@ -2173,6 +2193,29 @@ pub fn vision_infer(
                         .keypoints
                         .map(|k| k.iter().map(|p| (p.0, p.1)).collect())
                         .unwrap_or_default(),
+                })
+                .collect(),
+        ),
+        crate::vision::InferOutput::Poses(poses) => tentaflow_protocol::VisionInferResult::Poses(
+            poses
+                .into_iter()
+                .map(|p| tentaflow_protocol::VisionPoseDet {
+                    x1: p.bbox.0,
+                    y1: p.bbox.1,
+                    x2: p.bbox.2,
+                    y2: p.bbox.3,
+                    score: p.score,
+                    keypoints: p
+                        .keypoints
+                        .into_iter()
+                        .map(|k| tentaflow_protocol::VisionPoseKeypoint {
+                            id: k.id,
+                            name: k.name.to_string(),
+                            x: k.x,
+                            y: k.y,
+                            score: k.score,
+                        })
+                        .collect(),
                 })
                 .collect(),
         ),

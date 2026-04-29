@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use rusqlite::Transaction;
 
 use super::{
-    build_new_service, models_from_manifest, transport_hint, DeployError, DeployResult,
-    DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
+    build_new_service, category_tag, models_from_manifest, resolve_display_name, transport_hint,
+    DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -325,6 +325,8 @@ impl DeployStrategy for DockerDeploy {
 
         Ok(PreparedDeploy {
             engine_id: self.manifest.engine.id.clone(),
+            category: category_tag(&self.manifest).to_string(),
+            display_name: resolve_display_name(&self.manifest),
             deploy_method: DeployMethod::Docker,
             transport,
             runtime,

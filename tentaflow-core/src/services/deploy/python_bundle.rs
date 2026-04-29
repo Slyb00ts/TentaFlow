@@ -16,9 +16,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::{
-    build_new_service, host_os_supported, http_health_wait, models_from_manifest,
-    standard_engine_env, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
-    RuntimeHandle,
+    build_new_service, category_tag, host_os_supported, http_health_wait, models_from_manifest,
+    resolve_display_name, standard_engine_env, DeployError, DeployResult, DeployStrategy, LogSink,
+    PreparedDeploy, RuntimeHandle,
 };
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -338,6 +338,8 @@ impl DeployStrategy for PythonBundleDeploy {
 
         Ok(PreparedDeploy {
             engine_id: self.manifest.engine.id.clone(),
+            category: category_tag(&self.manifest).to_string(),
+            display_name: resolve_display_name(&self.manifest),
             deploy_method: DeployMethod::NativePythonBundle,
             transport: Transport::HttpDirect,
             runtime,
