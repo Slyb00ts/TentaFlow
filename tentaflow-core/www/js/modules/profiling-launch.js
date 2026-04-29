@@ -801,8 +801,13 @@ export class ProfilingLaunchModal {
   }
 
   _validate() {
+    // Auto-fill label gdy puste — nie blokujemy startu z powodu braku etykiety,
+    // user pisze ja opcjonalnie. `session-YYYYMMDD-HHMMSS` jest deterministyczny
+    // i czytelny w liscie sesji.
     if (!this.label || !this.label.trim()) {
-      return 'Label is required.';
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      this.label = `session-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
     }
     if (this.label.length > MAX_LABEL_LEN) {
       return `Label too long (max ${MAX_LABEL_LEN}).`;
@@ -874,6 +879,7 @@ export class ProfilingLaunchModal {
   }
 
   async _handleStart() {
+    this._clearError();
     const err = this._validate();
     const startBtn = document.getElementById('profiling-launch-start-btn');
     if (err) {
@@ -883,6 +889,7 @@ export class ProfilingLaunchModal {
     if (startBtn) startBtn.setAttribute('disabled', '');
     try {
       const scope = this._buildScope();
+      console.log('[profiling-launch] starting session:', { nodeId: this.nodeId, scope });
       const elevationPassword = this.elevationPassword || undefined;
       // Zapisz do permissions store (in-memory, per-tab) — kolejna sesja
       // uniknie pytania o haslo dopoki uzytkownik nie zamknie zakladki.
@@ -910,10 +917,30 @@ export class ProfilingLaunchModal {
     if (foot) {
       foot.textContent = `⚠ ${msg}`;
       foot.style.color = 'var(--tf-danger, #ef4444)';
-      setTimeout(() => {
-        foot.style.color = '';
-        this._updateEstimate();
-      }, 3500);
+      foot.style.fontWeight = '600';
+    }
+    // Globalny banner u gory modala — persistent dopoki user nie kliknie zamkniecia
+    // ani nie wystartuje sesji ponownie. Mockup-friendly (czerwone tlo, biala czcionka).
+    let banner = document.getElementById('pl-error-banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'pl-error-banner';
+      banner.style.cssText = 'background:rgba(239,68,68,0.16);border:1px solid var(--tf-danger,#ef4444);color:#fecaca;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-size:13px;display:flex;align-items:center;gap:8px;';
+      const body = document.querySelector('#tf-launch-body') || document.querySelector('.tf-window-body');
+      if (body && body.firstChild) body.insertBefore(banner, body.firstChild);
+      else if (body) body.appendChild(banner);
+    }
+    banner.innerHTML = `<span>⚠</span><span>${escapeHtml(msg)}</span>`;
+  }
+
+  _clearError() {
+    const banner = document.getElementById('pl-error-banner');
+    if (banner) banner.remove();
+    const foot = document.getElementById('profiling-estimate-foot');
+    if (foot) {
+      foot.style.color = '';
+      foot.style.fontWeight = '';
+      this._updateEstimate();
     }
   }
 }

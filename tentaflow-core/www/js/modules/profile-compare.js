@@ -57,8 +57,9 @@ async function loadTwoReports({ nodeId, sessionA, sessionB }) {
 // surowy V2). Po cleanup #11 nie wspieramy V1 ani envelope.kind.
 function unpackReport(raw) {
   if (!raw || typeof raw !== 'object') return null;
+  if (raw.report && typeof raw.report === 'object') return raw.report;
   if ('V2' in raw && raw.V2) return raw.V2;
-  if (raw.schema_version === 2) return raw;
+  if (raw.schema_version === 2 || raw.schemaVersion === 2) return raw;
   return null;
 }
 
