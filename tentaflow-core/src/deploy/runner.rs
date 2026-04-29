@@ -856,7 +856,7 @@ async fn do_binary_native_deploy(
                 log_line(&log_db, &log_deploy_id, &log_tx, "log", line);
             });
         phase(db, deploy_id, tx, "building", 50, "provisioning chromium");
-        match crate::deploy::chromium_provisioner::ensure_chromium(&log_sink) {
+        match crate::deploy::chromium_provisioner::ensure_chromium(&log_sink).await {
             Ok(path) => Some(path.to_string_lossy().into_owned()),
             Err(e) => {
                 log_line(
