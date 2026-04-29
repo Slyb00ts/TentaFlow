@@ -215,7 +215,9 @@ export class ProfilingActiveBanner {
     const openBtn = this.root.querySelector('[data-action="open-when-done"]');
     if (openBtn) {
       openBtn.addEventListener('click', () => {
-        location.hash = `#/profiling/report/${encodeURIComponent(sess.session_id)}`;
+        if (window.Router && typeof window.Router.navigate === 'function') {
+          window.Router.navigate('profile-report', { nodeId: this.nodeId, sessionId: sess.session_id });
+        }
       });
     }
   }
@@ -229,8 +231,10 @@ export class ProfilingActiveBanner {
         location.assign(res.report_url);
         return;
       }
-      // Bez report_url — nawiguj do hash route raportu.
-      location.hash = `#/profiling/report/${encodeURIComponent(sid)}`;
+      // Bez report_url — nawiguj do widoku raportu przez SPA Router.
+      if (window.Router && typeof window.Router.navigate === 'function') {
+        window.Router.navigate('profile-report', { nodeId: this.nodeId, sessionId: sid });
+      }
     } catch (err) {
       console.error('failed to stop profiling session', err);
     }
