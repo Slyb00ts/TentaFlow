@@ -358,11 +358,20 @@ impl RouterClient {
         text: &str,
         voice: &str,
         model: &str,
+        language: Option<&str>,
         mut on_chunk: F,
     ) -> Result<()>
     where
         F: FnMut(Vec<u8>) -> Result<()>,
     {
+        // Pusty/whitespace string traktujemy jak brak wartosci, zeby caller
+        // mogl bezpiecznie podac np. cfg.meeting_language bez sprawdzania.
+        let resolved_language = language
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "en".to_string());
+
         let request = ModelRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload: ModelPayload::Audio(AudioPayload {
@@ -372,7 +381,7 @@ impl RouterClient {
                     voice: voice.to_string(),
                     format: Some("pcm".to_string()),
                     speed: None,
-                    language: None,
+                    language: Some(resolved_language),
                 },
             }),
             stream: true,
