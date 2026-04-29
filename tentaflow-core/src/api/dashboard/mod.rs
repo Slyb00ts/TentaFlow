@@ -25,7 +25,6 @@ pub mod api_services_manifest;
 pub mod api_services_v2;
 pub mod api_tts_rules;
 pub mod auth;
-pub mod auto_register;
 pub mod handlers_addon_lifecycle;
 pub mod handlers_addon_oauth;
 pub mod handlers_addon_permissions;
@@ -40,7 +39,6 @@ pub mod server;
 pub mod static_files;
 pub mod vnc_tunnel;
 pub mod ws_binary;
-pub mod ws_deploy;
 pub mod ws_metrics;
 
 #[cfg(feature = "inference-diarization")]

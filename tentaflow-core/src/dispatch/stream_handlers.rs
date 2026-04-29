@@ -584,49 +584,6 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                     );
                     return;
                 }
-            } else if let Ok(Some(row)) =
-                // FAZA-8: legacy `deployments` table is read-only fallback for
-                // deploys started under the pre-unification path. Drop in cleanup.
-                crate::db::repository::deployments::get(&db, &deploy_id)
-            {
-                for (idx, line) in row.log_tail.split('\n').enumerate() {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let chunk = DeploymentStreamChunk {
-                        deploy_id: deploy_id.clone(),
-                        kind: "log".to_string(),
-                        line: line.to_string(),
-                        phase: row.phase.clone(),
-                        progress_pct: row.progress_pct as i32,
-                        ts_ms: idx as i64,
-                    };
-                    if push_chunk(
-                        &sub,
-                        MessageBody::DeploymentBody(DeploymentPayload::StreamChunk(chunk)),
-                    )
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                if matches!(row.status.as_str(), "success" | "failure" | "cancelled") {
-                    let end = DeploymentStreamEnd {
-                        deploy_id: deploy_id.clone(),
-                        final_status: row.status.clone(),
-                        image_tag: row.image_tag.clone(),
-                        container_name: row.container_name.clone(),
-                        error_message: row.error_message.unwrap_or_default(),
-                        duration_ms: 0,
-                    };
-                    let _ = push_end(
-                        &sub,
-                        Some(MessageBody::DeploymentBody(DeploymentPayload::StreamEnd(
-                            end,
-                        ))),
-                    );
-                    return;
-                }
             }
         }
 
