@@ -510,11 +510,13 @@ impl CrdtOperation {
     }
 }
 
-/// Stan CRDT — log operacji + version vector do delta sync
+/// Stan CRDT — log operacji + version vector do delta sync.
+/// Klucz `version_vector` to `node_id_hash` (u64) zamiast stringowej formy —
+/// hot path heartbeat/delta_since nie placi `format!()` per operacja.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrdtState {
     pub operations_log: Vec<CrdtOperation>,
-    pub version_vector: HashMap<String, u64>,
+    pub version_vector: HashMap<u64, u64>,
 }
 
 impl CrdtState {
@@ -527,7 +529,7 @@ impl CrdtState {
 
     /// Zastosuj operacje (lokalna zmiana)
     pub fn apply(&mut self, op: CrdtOperation) {
-        let node_key = op.source_node_hash().to_string();
+        let node_key = op.source_node_hash();
         let time = op.clock().time;
 
         // Aktualizuj version vector
@@ -544,7 +546,7 @@ impl CrdtState {
         let mut new_ops = Vec::new();
 
         for op in &remote.operations_log {
-            let node_key = op.source_node_hash().to_string();
+            let node_key = op.source_node_hash();
             let time = op.clock().time;
             let local_time = self.version_vector.get(&node_key).copied().unwrap_or(0);
 
@@ -554,14 +556,15 @@ impl CrdtState {
             }
         }
 
-        // Zastosuj nowe operacje
-        for op in &new_ops {
-            self.apply(op.clone());
+        // Zastosuj nowe operacje na lokalnym stanie. Klonujemy raz w pojedynczym
+        // przebiegu — `new_ops` zachowuje oryginaly do zwrotu callerowi.
+        for op in new_ops.iter().cloned() {
+            self.apply(op);
         }
 
         // Aktualizuj version vector z remote
-        for (node, &time) in &remote.version_vector {
-            let entry = self.version_vector.entry(node.clone()).or_insert(0);
+        for (&node, &time) in &remote.version_vector {
+            let entry = self.version_vector.entry(node).or_insert(0);
             if time > *entry {
                 *entry = time;
             }
@@ -571,12 +574,12 @@ impl CrdtState {
     }
 
     /// Delta od danej wersji — operacje nowsze niz podany version vector
-    pub fn delta_since(&self, version_vector: &HashMap<String, u64>) -> CrdtState {
+    pub fn delta_since(&self, version_vector: &HashMap<u64, u64>) -> CrdtState {
         let ops: Vec<CrdtOperation> = self
             .operations_log
             .iter()
             .filter(|op| {
-                let node_key = op.source_node_hash().to_string();
+                let node_key = op.source_node_hash();
                 let time = op.clock().time;
                 let known_time = version_vector.get(&node_key).copied().unwrap_or(0);
                 time > known_time
@@ -846,7 +849,7 @@ mod tests {
         assert_eq!(state.operations_log.len(), 2);
 
         // Delta od pustego version vector — powinno zwrocic wszystko
-        let empty_vv: HashMap<String, u64> = HashMap::new();
+        let empty_vv: HashMap<u64, u64> = HashMap::new();
         let delta = state.delta_since(&empty_vv);
         assert_eq!(delta.operations_log.len(), 2);
 

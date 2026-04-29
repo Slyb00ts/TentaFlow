@@ -180,7 +180,7 @@ pub struct WakeWord {
 /// Lista wszystkich slow aktywujacych (wlaczonych i wylaczonych).
 pub fn list_wake_words(pool: &DbPool) -> Result<Vec<WakeWord>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, word, enabled, created_at FROM teams_bot_wake_words ORDER BY word",
     )?;
     let rows = stmt
@@ -199,7 +199,7 @@ pub fn list_wake_words(pool: &DbPool) -> Result<Vec<WakeWord>> {
 /// Lista samych wlaczonych slow w postaci CSV — uzywane przy spawn bota.
 pub fn enabled_wake_words_csv(pool: &DbPool) -> Result<String> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT word FROM teams_bot_wake_words WHERE enabled = 1 ORDER BY word",
     )?;
     let words: Vec<String> = stmt
@@ -254,7 +254,7 @@ const BACKEND_COLS: &str = "id, service_id, connection_type, config_json, max_co
 
 pub fn list_services(pool: &DbPool) -> Result<Vec<DbService>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM services ORDER BY name",
         SERVICE_COLS
     ))?;
@@ -270,7 +270,7 @@ pub fn list_services_with_backends(
 ) -> Result<Vec<(DbService, Vec<DbServiceBackend>)>> {
     let conn = acquire(pool)?;
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, s.pinned, s.paused, s.vram_estimate_mb, s.deployed_source_hash, \
          b.id, b.service_id, b.connection_type, b.config_json, b.max_concurrent, b.timeout_ms, b.weight, b.model_name_override, b.health_check_path, b.is_active \
          FROM services s LEFT JOIN service_backends b ON s.id = b.service_id ORDER BY s.name, b.id",
@@ -333,7 +333,7 @@ pub fn list_services_with_backends(
 
 pub fn get_service(pool: &DbPool, id: i64) -> Result<Option<DbService>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM services WHERE id = ?1",
         SERVICE_COLS
     ))?;
@@ -501,7 +501,7 @@ pub fn delete_service_cascade_by_name(pool: &DbPool, name: &str) -> Result<u32> 
 
 pub fn list_backends_for_service(pool: &DbPool, service_id: i64) -> Result<Vec<DbServiceBackend>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM service_backends WHERE service_id = ?1",
         BACKEND_COLS
     ))?;
@@ -550,7 +550,7 @@ pub fn delete_backends_by_service(pool: &DbPool, service_id: i64) -> Result<usiz
 
 pub fn get_backend(pool: &DbPool, id: i64) -> Result<Option<DbServiceBackend>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM service_backends WHERE id = ?1",
         BACKEND_COLS
     ))?;
@@ -601,7 +601,7 @@ fn row_to_api_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbApiKey> {
 
 pub fn list_api_keys(pool: &DbPool) -> Result<Vec<DbApiKey>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at, owner_user_id FROM api_keys ORDER BY name",
     )?;
     let keys = stmt
@@ -645,7 +645,7 @@ pub fn delete_api_key(pool: &DbPool, id: i64) -> Result<usize> {
 
 pub fn verify_api_key(pool: &DbPool, key_hash: &str) -> Result<Option<DbApiKey>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM api_keys WHERE key_hash = ?1 AND is_active = 1",
         API_KEY_COLS
     ))?;
@@ -660,7 +660,7 @@ pub fn verify_api_key(pool: &DbPool, key_hash: &str) -> Result<Option<DbApiKey>>
 pub fn list_aliases(pool: &DbPool) -> Result<Vec<DbServiceAlias>> {
     let conn = acquire(pool)?;
     let mut stmt =
-        conn.prepare("SELECT id, alias, target_service_id FROM service_aliases ORDER BY alias")?;
+        conn.prepare_cached("SELECT id, alias, target_service_id FROM service_aliases ORDER BY alias")?;
     let aliases = stmt
         .query_map([], |row| {
             Ok(DbServiceAlias {
@@ -758,7 +758,7 @@ pub fn delete_setting(pool: &DbPool, key: &str) -> Result<()> {
 
 pub fn list_settings(pool: &DbPool) -> Result<Vec<DbSetting>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare("SELECT key, value, updated_at FROM settings ORDER BY key")?;
+    let mut stmt = conn.prepare_cached("SELECT key, value, updated_at FROM settings ORDER BY key")?;
     let settings = stmt
         .query_map([], |row| {
             Ok(DbSetting {
@@ -777,7 +777,7 @@ pub fn list_settings(pool: &DbPool) -> Result<Vec<DbSetting>> {
 pub fn list_settings_with_prefix(pool: &DbPool, prefix: &str) -> Result<Vec<(String, String)>> {
     let conn = acquire(pool)?;
     let pattern = format!("{}%", prefix);
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT key, value FROM settings WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key",
     )?;
     let rows = stmt
@@ -794,7 +794,7 @@ pub fn list_settings_with_prefix(pool: &DbPool, prefix: &str) -> Result<Vec<(Str
 
 pub fn get_user_by_username(pool: &DbPool, username: &str) -> Result<Option<DbUser>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, username, password_hash, role, created_at, last_login_at, must_change_password FROM users WHERE username = ?1",
     )?;
     let result = stmt
@@ -903,7 +903,7 @@ const PROMPT_COLS: &str = "id, prompt_id, name, description, content, prompt_typ
 
 pub fn list_prompts(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbPrompt>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts ORDER BY name LIMIT ?1 OFFSET ?2",
         PROMPT_COLS
     ))?;
@@ -915,7 +915,7 @@ pub fn list_prompts(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbProm
 
 pub fn get_prompt(pool: &DbPool, id: i64) -> Result<Option<DbPrompt>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE id = ?1",
         PROMPT_COLS
     ))?;
@@ -927,7 +927,7 @@ pub fn get_prompt(pool: &DbPool, id: i64) -> Result<Option<DbPrompt>> {
 
 pub fn get_prompt_by_prompt_id(pool: &DbPool, prompt_id: &str) -> Result<Option<DbPrompt>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE prompt_id = ?1 ORDER BY (language = 'pl') DESC, language ASC LIMIT 1",
         PROMPT_COLS
     ))?;
@@ -946,7 +946,7 @@ pub fn find_prompt(
     language: &str,
 ) -> Result<Option<DbPrompt>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE prompt_id = ?1 AND language = ?2",
         PROMPT_COLS
     ))?;
@@ -995,7 +995,7 @@ const MODEL_ENTRY_COLS: &str = "id, model_name, display_name, service_type, conn
 
 pub fn list_model_entries(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbModelEntry>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_registry ORDER BY model_name LIMIT ?1 OFFSET ?2",
         MODEL_ENTRY_COLS
     ))?;
@@ -1007,7 +1007,7 @@ pub fn list_model_entries(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<
 
 pub fn get_model_entry(pool: &DbPool, id: i64) -> Result<Option<DbModelEntry>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_registry WHERE id = ?1",
         MODEL_ENTRY_COLS
     ))?;
@@ -1019,7 +1019,7 @@ pub fn get_model_entry(pool: &DbPool, id: i64) -> Result<Option<DbModelEntry>> {
 
 pub fn get_model_by_name(pool: &DbPool, model_name: &str) -> Result<Option<DbModelEntry>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_registry WHERE model_name = ?1",
         MODEL_ENTRY_COLS
     ))?;
@@ -1151,7 +1151,7 @@ fn row_to_model_alias(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbModelAlias>
 
 pub fn list_model_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_aliases ORDER BY alias",
         MODEL_ALIAS_COLS
     ))?;
@@ -1163,7 +1163,7 @@ pub fn list_model_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
 
 pub fn get_model_alias(pool: &DbPool, id: i64) -> Result<Option<DbModelAlias>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_aliases WHERE id = ?1",
         MODEL_ALIAS_COLS
     ))?;
@@ -1175,7 +1175,7 @@ pub fn get_model_alias(pool: &DbPool, id: i64) -> Result<Option<DbModelAlias>> {
 
 pub fn resolve_model_alias(pool: &DbPool, alias: &str) -> Result<Option<DbModelAlias>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_aliases WHERE alias = ?1 AND is_active = 1",
         MODEL_ALIAS_COLS
     ))?;
@@ -1323,7 +1323,7 @@ pub fn create_cluster(
 
 pub fn list_clusters(pool: &DbPool) -> Result<Vec<DbCluster>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM clusters ORDER BY name",
         CLUSTER_COLS
     ))?;
@@ -1335,7 +1335,7 @@ pub fn list_clusters(pool: &DbPool) -> Result<Vec<DbCluster>> {
 
 pub fn get_cluster(pool: &DbPool, cluster_id: &str) -> Result<Option<DbCluster>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM clusters WHERE cluster_id = ?1",
         CLUSTER_COLS
     ))?;
@@ -1427,7 +1427,7 @@ pub fn list_clusters_with_counts(
          FROM clusters c ORDER BY name",
         CLUSTER_COLS.split(',').map(|s| format!("c.{}", s.trim())).collect::<Vec<_>>().join(", ")
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map([], |row| {
             let cluster = row_to_cluster(row)?;
@@ -1486,7 +1486,7 @@ pub fn update_cluster_full(
 
 pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClusterMember>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM cluster_members WHERE cluster_id = ?1 ORDER BY joined_at",
         CLUSTER_MEMBER_COLS
     ))?;
@@ -1502,7 +1502,7 @@ const FLOW_COLS: &str = "id, name, description, version, is_default, service_typ
 
 pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flows ORDER BY name LIMIT ?1 OFFSET ?2",
         FLOW_COLS
     ))?;
@@ -1514,7 +1514,7 @@ pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>>
 
 pub fn get_flow(pool: &DbPool, id: i64) -> Result<Option<DbFlow>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!("SELECT {} FROM flows WHERE id = ?1", FLOW_COLS))?;
+    let mut stmt = conn.prepare_cached(&format!("SELECT {} FROM flows WHERE id = ?1", FLOW_COLS))?;
     let result = stmt
         .query_row(rusqlite::params![id], row_to_flow)
         .optional()?;
@@ -1526,7 +1526,7 @@ pub fn get_default_flow_for_service_type(
     service_type: &str,
 ) -> Result<Option<DbFlow>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flows WHERE is_default = 1 AND service_type = ?1 AND status = 'active' LIMIT 1", FLOW_COLS
     ))?;
     let result = stmt
@@ -1537,7 +1537,7 @@ pub fn get_default_flow_for_service_type(
 
 pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFlow>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.created_at, f.updated_at \
          FROM flows f INNER JOIN flow_model_bindings b ON f.id = b.flow_id \
          WHERE ?1 LIKE REPLACE(b.model_pattern, '*', '%') AND f.status = 'active' ORDER BY b.priority DESC LIMIT 1",
@@ -1621,7 +1621,7 @@ fn row_to_flow_version_full(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowV
 /// Zwraca liste wersji (bez flow_json) posortowana malejaco, max 5.
 pub fn list_flow_versions(pool: &DbPool, flow_id: i64) -> Result<Vec<DbFlowVersion>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_versions WHERE flow_id = ?1 \
          ORDER BY version_num DESC LIMIT {}",
         FLOW_VERSION_LIST_COLS, FLOW_VERSIONS_KEEP
@@ -1639,7 +1639,7 @@ pub fn get_flow_version(
     version_id: i64,
 ) -> Result<Option<DbFlowVersion>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_versions WHERE flow_id = ?1 AND id = ?2",
         FLOW_VERSION_FULL_COLS
     ))?;
@@ -1750,7 +1750,7 @@ fn row_to_flow_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowModelB
 
 pub fn list_flow_model_bindings(pool: &DbPool) -> Result<Vec<DbFlowModelBinding>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_model_bindings ORDER BY priority DESC",
         FLOW_BINDING_COLS
     ))?;
@@ -1762,7 +1762,7 @@ pub fn list_flow_model_bindings(pool: &DbPool) -> Result<Vec<DbFlowModelBinding>
 
 pub fn get_flow_model_binding(pool: &DbPool, id: i64) -> Result<Option<DbFlowModelBinding>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_model_bindings WHERE id = ?1",
         FLOW_BINDING_COLS
     ))?;
@@ -1829,7 +1829,7 @@ fn row_to_node_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowNodeT
 
 pub fn list_flow_node_templates(pool: &DbPool) -> Result<Vec<DbFlowNodeTemplate>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_node_templates ORDER BY category, label",
         NODE_TEMPLATE_COLS
     ))?;
@@ -1841,7 +1841,7 @@ pub fn list_flow_node_templates(pool: &DbPool) -> Result<Vec<DbFlowNodeTemplate>
 
 pub fn get_flow_node_template(pool: &DbPool, id: i64) -> Result<Option<DbFlowNodeTemplate>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_node_templates WHERE id = ?1",
         NODE_TEMPLATE_COLS
     ))?;
@@ -1891,7 +1891,7 @@ const PII_RULE_COLS: &str = "id, name, category, pattern, replacement, is_active
 
 pub fn list_pii_rules(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbPiiRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM pii_rules ORDER BY priority DESC LIMIT ?1 OFFSET ?2",
         PII_RULE_COLS
     ))?;
@@ -1903,7 +1903,7 @@ pub fn list_pii_rules(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbPi
 
 pub fn list_pii_rules_active(pool: &DbPool) -> Result<Vec<DbPiiRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM pii_rules WHERE is_active = 1 ORDER BY priority DESC",
         PII_RULE_COLS
     ))?;
@@ -1915,7 +1915,7 @@ pub fn list_pii_rules_active(pool: &DbPool) -> Result<Vec<DbPiiRule>> {
 
 pub fn get_pii_rule(pool: &DbPool, id: i64) -> Result<Option<DbPiiRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM pii_rules WHERE id = ?1",
         PII_RULE_COLS
     ))?;
@@ -1960,7 +1960,7 @@ pub fn list_fast_path_patterns(
     limit: i64,
 ) -> Result<Vec<DbFastPathPattern>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM fast_path_patterns ORDER BY module, priority DESC LIMIT ?1 OFFSET ?2",
         FAST_PATH_COLS
     ))?;
@@ -1975,7 +1975,7 @@ pub fn list_fast_path_patterns_by_module(
     module: &str,
 ) -> Result<Vec<DbFastPathPattern>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM fast_path_patterns WHERE module = ?1 AND is_active = 1 ORDER BY priority DESC", FAST_PATH_COLS
     ))?;
     let rows = stmt
@@ -1986,7 +1986,7 @@ pub fn list_fast_path_patterns_by_module(
 
 pub fn get_fast_path_pattern(pool: &DbPool, id: i64) -> Result<Option<DbFastPathPattern>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM fast_path_patterns WHERE id = ?1",
         FAST_PATH_COLS
     ))?;
@@ -2041,7 +2041,7 @@ pub fn list_tts_cleaning_rules(
     limit: i64,
 ) -> Result<Vec<DbTtsCleaningRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM tts_cleaning_rules ORDER BY priority LIMIT ?1 OFFSET ?2",
         TTS_RULE_COLS
     ))?;
@@ -2053,7 +2053,7 @@ pub fn list_tts_cleaning_rules(
 
 pub fn list_tts_cleaning_rules_active(pool: &DbPool) -> Result<Vec<DbTtsCleaningRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM tts_cleaning_rules WHERE is_active = 1 ORDER BY priority",
         TTS_RULE_COLS
     ))?;
@@ -2065,7 +2065,7 @@ pub fn list_tts_cleaning_rules_active(pool: &DbPool) -> Result<Vec<DbTtsCleaning
 
 pub fn get_tts_cleaning_rule(pool: &DbPool, id: i64) -> Result<Option<DbTtsCleaningRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM tts_cleaning_rules WHERE id = ?1",
         TTS_RULE_COLS
     ))?;
@@ -2119,7 +2119,7 @@ pub fn list_flow_executions(
     limit: i64,
 ) -> Result<Vec<DbFlowExecution>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_executions ORDER BY id DESC LIMIT ?1 OFFSET ?2",
         FLOW_EXEC_COLS
     ))?;
@@ -2135,7 +2135,7 @@ pub fn list_flow_executions_for_flow(
     limit: i64,
 ) -> Result<Vec<DbFlowExecution>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_executions WHERE flow_id = ?1 ORDER BY id DESC LIMIT ?2",
         FLOW_EXEC_COLS
     ))?;
@@ -2147,7 +2147,7 @@ pub fn list_flow_executions_for_flow(
 
 pub fn get_flow_execution(pool: &DbPool, id: i64) -> Result<Option<DbFlowExecution>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_executions WHERE id = ?1",
         FLOW_EXEC_COLS
     ))?;
@@ -2217,7 +2217,7 @@ fn row_to_portainer_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbPort
 
 pub fn list_portainer_instances(pool: &DbPool) -> Result<Vec<DbPortainerInstance>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM portainer_instances ORDER BY name",
         PORTAINER_INSTANCE_COLS
     ))?;
@@ -2229,7 +2229,7 @@ pub fn list_portainer_instances(pool: &DbPool) -> Result<Vec<DbPortainerInstance
 
 pub fn get_portainer_instance(pool: &DbPool, id: i64) -> Result<Option<DbPortainerInstance>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM portainer_instances WHERE id = ?1",
         PORTAINER_INSTANCE_COLS
     ))?;
@@ -2302,7 +2302,7 @@ fn row_to_docker_registry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbDockerR
 
 pub fn list_registries(pool: &DbPool) -> Result<Vec<DbDockerRegistry>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM registries ORDER BY name",
         DOCKER_REGISTRY_COLS
     ))?;
@@ -2314,7 +2314,7 @@ pub fn list_registries(pool: &DbPool) -> Result<Vec<DbDockerRegistry>> {
 
 pub fn get_registry(pool: &DbPool, id: i64) -> Result<Option<DbDockerRegistry>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM registries WHERE id = ?1",
         DOCKER_REGISTRY_COLS
     ))?;
@@ -2433,7 +2433,7 @@ pub fn create_user_account(
 /// Pobiera uzytkownika po nazwie z tabeli user_accounts.
 pub fn get_user_account_by_username(pool: &DbPool, username: &str) -> Result<Option<UserAccount>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE username = ?1",
         USER_ACCOUNT_COLS
     ))?;
@@ -2446,7 +2446,7 @@ pub fn get_user_account_by_username(pool: &DbPool, username: &str) -> Result<Opt
 /// Pobiera uzytkownika po ID z tabeli user_accounts.
 pub fn get_user_account_by_id(pool: &DbPool, id: i64) -> Result<Option<UserAccount>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE id = ?1",
         USER_ACCOUNT_COLS
     ))?;
@@ -2459,7 +2459,7 @@ pub fn get_user_account_by_id(pool: &DbPool, id: i64) -> Result<Option<UserAccou
 /// Lista wszystkich uzytkownikow z tabeli user_accounts.
 pub fn list_user_accounts(pool: &DbPool) -> Result<Vec<UserAccount>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts ORDER BY id",
         USER_ACCOUNT_COLS
     ))?;
@@ -2550,7 +2550,7 @@ pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<i64>
 pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
     let conn = acquire(pool)?;
     let mut stmt =
-        conn.prepare("SELECT id, name, description, created_at FROM user_groups ORDER BY id")?;
+        conn.prepare_cached("SELECT id, name, description, created_at FROM user_groups ORDER BY id")?;
     let rows = stmt
         .query_map([], |row| {
             Ok(UserGroup {
@@ -2587,7 +2587,7 @@ pub fn remove_user_from_group(pool: &DbPool, group_id: i64, user_id: i64) -> Res
 /// Pobiera grupy do ktorych nalezy uzytkownik.
 pub fn get_user_groups(pool: &DbPool, user_id: i64) -> Result<Vec<UserGroup>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT g.id, g.name, g.description, g.created_at \
          FROM user_groups g \
          JOIN group_members gm ON g.id = gm.group_id \
@@ -2619,7 +2619,7 @@ pub fn update_group(pool: &DbPool, id: i64, name: &str, description: &str) -> Re
 /// Lista czlonkow grupy (user accounts).
 pub fn list_group_members(pool: &DbPool, group_id: i64) -> Result<Vec<UserAccount>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts u \
          JOIN group_members gm ON u.id = gm.user_id \
          WHERE gm.group_id = ?1 ORDER BY u.id",
@@ -2688,7 +2688,7 @@ pub fn set_addon_permission(
 /// Pobiera wszystkie uprawnienia danego addonu.
 pub fn get_addon_permissions(pool: &DbPool, addon_id: &str) -> Result<Vec<AddonPermission>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, subject_type, subject_id, permission_id, granted, created_at \
          FROM addon_permissions WHERE addon_id = ?1 ORDER BY id",
     )?;
@@ -2744,7 +2744,7 @@ pub fn check_permission(
 /// Pobiera wszystkie uprawnienia (bezposrednie i przez grupy) dla danego uzytkownika.
 pub fn get_user_permissions(pool: &DbPool, user_id: i64) -> Result<Vec<AddonPermission>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, subject_type, subject_id, permission_id, granted, created_at \
          FROM addon_permissions \
          WHERE (subject_type = 'user' AND subject_id = ?1) \
@@ -2845,7 +2845,7 @@ pub fn list_audit_logs(
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(AuditLogEntry {
@@ -2939,7 +2939,7 @@ pub fn register_addon(
 /// Lista wszystkich addonow.
 pub fn list_addons(pool: &DbPool) -> Result<Vec<Addon>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, name, version, description, author, platforms, \
          manifest_json, is_enabled, is_system, installed_at, updated_at, \
          COALESCE(category, ''), COALESCE(icon, ''), \
@@ -2974,7 +2974,7 @@ pub fn list_addons(pool: &DbPool) -> Result<Vec<Addon>> {
 /// Pobiera addon po addon_id.
 pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, name, version, description, author, platforms, \
          manifest_json, is_enabled, is_system, installed_at, updated_at, \
          COALESCE(category, ''), COALESCE(icon, ''), \
@@ -3125,7 +3125,7 @@ pub fn create_sso_provider(
 /// Lista wszystkich SSO providerow.
 pub fn list_sso_providers(pool: &DbPool) -> Result<Vec<SsoProvider>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, name, provider_type, client_id, client_secret_encrypted, \
          discovery_url, enabled, auto_create_users, default_group_id, created_at \
          FROM sso_providers ORDER BY name",
@@ -3296,7 +3296,7 @@ pub fn get_user_account_by_sso(
     sso_subject: &str,
 ) -> Result<Option<UserAccount>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE sso_provider = ?1 AND sso_subject = ?2",
         USER_ACCOUNT_COLS
     ))?;
@@ -3639,7 +3639,7 @@ pub fn get_addon_config_values(
 ) -> Result<std::collections::HashMap<String, String>> {
     let conn = acquire(pool)?;
     let prefix = format!("addon_config:{}:", addon_id);
-    let mut stmt = conn.prepare("SELECT key, value FROM settings WHERE key LIKE ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT key, value FROM settings WHERE key LIKE ?1")?;
     let rows = stmt.query_map(rusqlite::params![format!("{}%", prefix)], |row| {
         let full_key: String = row.get(0)?;
         let value: String = row.get(1)?;
@@ -3681,7 +3681,7 @@ pub fn add_trusted_node(
 /// Pobiera liste zaufanych nodow
 pub fn list_trusted_nodes(pool: &DbPool) -> Result<Vec<TrustedNode>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, node_id, public_key, hostname, approved_by, approved_at, is_active, last_addresses \
          FROM trusted_nodes WHERE is_active = 1 ORDER BY approved_at DESC",
     )?;
@@ -3797,7 +3797,7 @@ pub fn get_pending_pairing(pool: &DbPool, remote_node_id: &str) -> Result<Option
 /// Pobiera wszystkie oczekujace parowania
 pub fn list_pending_pairings(pool: &DbPool) -> Result<Vec<PendingPairing>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, remote_node_id, pin_code, direction, expires_at \
          FROM pending_pairings ORDER BY created_at DESC",
     )?;
@@ -3984,7 +3984,7 @@ pub fn remove_revoked_node(pool: &DbPool, node_id: &str) -> Result<()> {
 /// Lista wszystkich revoked nodow
 pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<String>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare("SELECT node_id FROM revoked_nodes ORDER BY revoked_at DESC")?;
+    let mut stmt = conn.prepare_cached("SELECT node_id FROM revoked_nodes ORDER BY revoked_at DESC")?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4049,7 +4049,7 @@ pub fn list_voice_profiles(pool: &DbPool) -> Result<Vec<DbVoiceProfile>> {
          ORDER BY COALESCE(last_seen_at, '0') DESC, name ASC",
         VOICE_PROFILE_COLUMNS
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([], row_to_voice_profile)?;
     let mut result = Vec::new();
     for row in rows {
@@ -4065,7 +4065,7 @@ pub fn get_voice_profile(pool: &DbPool, id: i64) -> Result<Option<DbVoiceProfile
         "SELECT {} FROM voice_profiles WHERE id = ?1",
         VOICE_PROFILE_COLUMNS
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let row = stmt
         .query_row(rusqlite::params![id], row_to_voice_profile)
         .optional()?;
@@ -4079,7 +4079,7 @@ pub fn get_voice_profile_by_name(pool: &DbPool, name: &str) -> Result<Option<DbV
         "SELECT {} FROM voice_profiles WHERE name = ?1",
         VOICE_PROFILE_COLUMNS
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let row = stmt
         .query_row(rusqlite::params![name], row_to_voice_profile)
         .optional()?;
@@ -4183,7 +4183,7 @@ pub fn list_voice_profile_samples(
     profile_id: i64,
 ) -> Result<Vec<DbVoiceProfileSample>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, profile_id, embedding, duration_ms, snr_db, intra_similarity,
                 meeting_id, source, created_at
          FROM voice_profile_samples
@@ -4260,7 +4260,7 @@ pub fn list_voice_temp_speakers(
     meeting_id: &str,
 ) -> Result<Vec<DbVoiceTempSpeaker>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, meeting_id, temp_label, embeddings_blob, sample_count,
                 total_duration_ms, assigned_profile_id, created_at
          FROM voice_temp_speakers
@@ -4536,12 +4536,12 @@ pub mod transcripts {
         );
         match owner_user_id {
             Some(uid) => {
-                let mut stmt = conn.prepare(&sql_owner)?;
+                let mut stmt = conn.prepare_cached(&sql_owner)?;
                 let rows = stmt.query_map(rusqlite::params![uid], row_to_session)?;
                 Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             }
             None => {
-                let mut stmt = conn.prepare(&sql_all)?;
+                let mut stmt = conn.prepare_cached(&sql_all)?;
                 let rows = stmt.query_map([], row_to_session)?;
                 Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
             }
@@ -4570,7 +4570,7 @@ pub mod transcripts {
     /// Wszystkie wpisy transkrypcji dla sesji w kolejnosci chronologicznej.
     pub fn list_transcripts(pool: &DbPool, session_id: i64) -> Result<Vec<TranscriptRow>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, timestamp_ms, speaker, profile_id, confidence,
                     is_enrolled, text, model
              FROM meeting_transcripts
@@ -4792,7 +4792,7 @@ pub mod transcripts {
              WHERE s.status IN ('joining','active','leaving')",
             SESSION_COLS
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map([], row_to_session)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -4824,7 +4824,7 @@ pub mod transcripts {
 
     pub fn list_reserved_ports(pool: &DbPool, kind: &str) -> Result<Vec<u16>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT port FROM meeting_port_allocations WHERE kind = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT port FROM meeting_port_allocations WHERE kind = ?1")?;
         let rows = stmt.query_map(rusqlite::params![kind], |row| {
             let p: i64 = row.get(0)?;
             Ok(p as u16)
@@ -4850,7 +4850,7 @@ pub mod transcripts {
 
     pub fn list_user_settings(pool: &DbPool, user_id: i64) -> Result<Vec<(String, String)>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT key, value FROM meeting_settings WHERE user_id = ?1 ORDER BY key ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![user_id], |row| {
@@ -4914,7 +4914,7 @@ pub mod transcripts {
         limit: u32,
     ) -> Result<Vec<DbMeetingSummary>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, created_at, decisions_text, summary_text, model
              FROM meeting_summaries
              WHERE session_id = ?1
@@ -4984,7 +4984,7 @@ pub mod transcripts {
         };
         let rows: Vec<DbMeetingActionItem> = match status_filter {
             Some(s) => {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT id, session_id, owner, task, deadline, status,
                             content_hash, created_at, updated_at
                      FROM meeting_action_items
@@ -4995,7 +4995,7 @@ pub mod transcripts {
                 iter.collect::<rusqlite::Result<Vec<_>>>()?
             }
             None => {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT id, session_id, owner, task, deadline, status,
                             content_hash, created_at, updated_at
                      FROM meeting_action_items
@@ -5138,7 +5138,7 @@ pub struct DbOAuthPendingState {
 
 pub fn list_addon_visibility(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonVisibilityRow>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT g.id, g.name, COALESCE(g.description, ''), COALESCE(v.visible, 0), \
                 (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) AS user_count \
          FROM user_groups g \
@@ -5382,7 +5382,7 @@ pub fn count_addon_tools(pool: &DbPool, addon_id: &str) -> Result<i64> {
 pub fn compute_addon_oauth_mode(pool: &DbPool, addon_id: &str) -> Result<Option<String>> {
     let conn = acquire(pool)?;
     let mut stmt =
-        conn.prepare("SELECT DISTINCT mode FROM addon_oauth_providers WHERE addon_id = ?1")?;
+        conn.prepare_cached("SELECT DISTINCT mode FROM addon_oauth_providers WHERE addon_id = ?1")?;
     let modes: Vec<String> = stmt
         .query_map(rusqlite::params![addon_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5499,7 +5499,7 @@ pub fn get_addon_badges(pool: &DbPool, addon_id: &str) -> Result<AddonBadges> {
     // oauth_mode: jesli brak providerow -> None; jesli wszyscy maja ten sam mode -> ten mode;
     // inaczej "mixed".
     let mut stmt =
-        conn.prepare("SELECT DISTINCT mode FROM addon_oauth_providers WHERE addon_id = ?1")?;
+        conn.prepare_cached("SELECT DISTINCT mode FROM addon_oauth_providers WHERE addon_id = ?1")?;
     let modes: Vec<String> = stmt
         .query_map(rusqlite::params![addon_id], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5524,7 +5524,7 @@ pub fn list_permission_catalog(
     addon_id: &str,
 ) -> Result<Vec<DbAddonPermissionCatalogEntry>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT addon_id, permission_id, display_name, description, risk, sort_order \
          FROM addon_permission_catalog WHERE addon_id = ?1 ORDER BY sort_order, permission_id",
     )?;
@@ -5609,7 +5609,7 @@ pub fn list_permission_matrix(
     addon_id: &str,
 ) -> Result<(Vec<DbAddonPermissionRow>, Vec<DbAddonPermissionDefault>)> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT addon_id, subject_type, subject_id, permission_id, grant_mode, updated_at \
          FROM addon_permissions WHERE addon_id = ?1",
     )?;
@@ -5625,7 +5625,7 @@ pub fn list_permission_matrix(
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut stmt2 = conn.prepare(
+    let mut stmt2 = conn.prepare_cached(
         "SELECT addon_id, permission_id, grant_mode, updated_at \
          FROM addon_permission_defaults WHERE addon_id = ?1",
     )?;
@@ -5848,7 +5848,7 @@ pub fn resolve_permission(
         }
     }
     // 3. group explicit — dowolna deny => deny; w przeciwnym razie jesli ktoras allow => allow.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT p.grant_mode FROM addon_permissions p \
          JOIN group_members ugm ON ugm.group_id = p.subject_id \
          WHERE p.addon_id = ?1 AND p.subject_type = 'group' AND ugm.user_id = ?2 \
@@ -5889,7 +5889,7 @@ pub fn list_oauth_providers_decl(
     addon_id: &str,
 ) -> Result<Vec<DbAddonOAuthProviderDecl>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT addon_id, provider_id, display_name, authorize_url, token_url, revoke_url, \
                 scopes, mode, pkce \
          FROM addon_oauth_providers WHERE addon_id = ?1 ORDER BY provider_id",
@@ -5947,7 +5947,7 @@ pub fn upsert_oauth_providers_decl(pool: &DbPool, decl: &DbAddonOAuthProviderDec
 
 pub fn list_oauth_config(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonOAuthConfig>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT addon_id, provider_id, client_id, client_secret_encrypted, redirect_uri, \
                 enabled, updated_at, oauth_mode \
          FROM addon_oauth_config WHERE addon_id = ?1 ORDER BY provider_id",
@@ -6075,7 +6075,7 @@ pub fn clear_oauth_config_secret(pool: &DbPool, addon_id: &str, provider_id: &st
 /// Uzywane przez migracje master-key (re-encrypt wszystkich blobow nowym kluczem).
 pub fn list_all_oauth_config_secrets(pool: &DbPool) -> Result<Vec<(i64, Vec<u8>)>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, client_secret_encrypted FROM addon_oauth_config \
          WHERE client_secret_encrypted IS NOT NULL",
     )?;
@@ -6104,7 +6104,7 @@ pub fn list_all_user_oauth_token_blobs(
     pool: &DbPool,
 ) -> Result<Vec<(i64, Vec<u8>, Option<Vec<u8>>)>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, access_token_encrypted, refresh_token_encrypted \
          FROM user_oauth_accounts WHERE access_token_encrypted IS NOT NULL",
     )?;
@@ -6338,7 +6338,7 @@ pub fn list_user_oauth_accounts_for_user(
         "SELECT {} FROM user_oauth_accounts WHERE user_id = ?1 ORDER BY addon_id, provider_id",
         OAUTH_ACCOUNT_COLS
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map(rusqlite::params![user_id], row_to_oauth_account)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6354,7 +6354,7 @@ pub fn list_user_oauth_accounts_for_addon(
         "SELECT {} FROM user_oauth_accounts WHERE addon_id = ?1 ORDER BY user_id, provider_id",
         OAUTH_ACCOUNT_COLS
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map(rusqlite::params![addon_id], row_to_oauth_account)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6451,7 +6451,7 @@ pub fn list_my_oauth_entries(pool: &DbPool, user_id: i64) -> Result<Vec<MyOAuthE
           AND a.is_enabled = 1
         ORDER BY a.addon_id, p.provider_id
     ";
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let now = chrono::Utc::now().timestamp();
     let rows = stmt
         .query_map(rusqlite::params![user_id], |row| {
@@ -6644,7 +6644,7 @@ pub struct AddonConfigRow {
 pub fn list_addon_config_rows(pool: &DbPool, addon_id: &str) -> Result<Vec<AddonConfigRow>> {
     let conn = acquire(pool)?;
     let mut stmt =
-        conn.prepare("SELECT key, value, is_secret FROM addon_config WHERE addon_id = ?1")?;
+        conn.prepare_cached("SELECT key, value, is_secret FROM addon_config WHERE addon_id = ?1")?;
     let rows = stmt
         .query_map(rusqlite::params![addon_id], |row| {
             Ok(AddonConfigRow {
@@ -6734,7 +6734,7 @@ pub fn list_addon_audit_logs(
         |row| row.get(0),
     )?;
 
-    let mut stmt = conn.prepare(&sql_list)?;
+    let mut stmt = conn.prepare_cached(&sql_list)?;
     let rows = stmt
         .query_map(
             rusqlite::params![
@@ -6819,7 +6819,7 @@ pub fn get_addon_declared_network_rules(
     addon_id: &str,
 ) -> Result<Vec<AddonDeclaredNetworkRule>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT host, port, protocol, required FROM addon_network_rules \
          WHERE addon_id = ?1 ORDER BY host, port",
     )?;
@@ -6899,7 +6899,7 @@ const NOTE_COLS: &str = "id, user_id, title, body, pinned, created_at, updated_a
 
 pub fn list_notes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<Note>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM notes WHERE user_id = ?1 ORDER BY pinned DESC, updated_at DESC",
         NOTE_COLS
     ))?;
@@ -6911,7 +6911,7 @@ pub fn list_notes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<Note>> {
 
 pub fn get_note(pool: &DbPool, note_id: i64, user_id: i64) -> Result<Option<Note>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM notes WHERE id = ?1 AND user_id = ?2",
         NOTE_COLS
     ))?;
@@ -8284,7 +8284,7 @@ mod permission_and_oauth_tests {
     fn test_migration_43_adds_ui_metadata_columns() {
         let db = setup_db();
         let conn = db.lock().unwrap();
-        let mut stmt = conn.prepare("PRAGMA table_info(addons)").unwrap();
+        let mut stmt = conn.prepare_cached("PRAGMA table_info(addons)").unwrap();
         let cols: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -8687,7 +8687,7 @@ pub mod deployments {
             where_sql,
             limit.max(1).min(500)
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             bind_params.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(param_refs.as_slice(), row_to_deployment)?;
@@ -8782,7 +8782,7 @@ pub mod resource_permissions {
         resource_id: &str,
     ) -> Result<Vec<ResourcePermission>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
              FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2
@@ -8810,7 +8810,7 @@ pub mod resource_permissions {
         subject_id: i64,
     ) -> Result<Vec<ResourcePermission>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
              FROM resource_permissions
              WHERE subject_type = ?1 AND subject_id = ?2
@@ -8867,7 +8867,7 @@ pub mod resource_permissions {
         }
 
         // 4. + 5. Group-level check — any deny wygrywa nad allow.
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT access_level FROM resource_permissions rp
              JOIN group_members gm ON rp.subject_id = gm.group_id
              WHERE rp.resource_type = ?1 AND rp.resource_id = ?2
@@ -8937,7 +8937,7 @@ pub mod mesh_topology {
         let mut conn = pool.lock().unwrap();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO mesh_topology
                    (node_id, hostname, platform, os_info, connected_to, direct_addrs,
                     port, services_json, models_json, last_epoch, last_seen_ms)
@@ -8984,7 +8984,7 @@ pub mod mesh_topology {
 
     pub fn list_all(pool: &DbPool) -> Result<Vec<TopologySnapshot>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT node_id, hostname, platform, os_info, connected_to, direct_addrs,
                     port, last_epoch, last_seen_ms
              FROM mesh_topology",
@@ -9304,7 +9304,7 @@ mod delete_service_cascade_tests {
                 model_name: "apple-tts-zosia-pl",
                 display_name: Some("Apple TTS"),
                 service_type: "tts",
-                connection_type: "local",
+                connection_type: "internal",
                 service_id: None,
                 flow_id: None,
                 is_public: true,
@@ -9370,14 +9370,15 @@ mod delete_service_cascade_tests {
         )
         .unwrap();
 
-        // 2. Local orphan — rowniez DO usuniecia (sierota po embedded deploy).
+        // 2. Internal orphan — rowniez DO usuniecia (sierota po embedded deploy
+        //    natywnym, prefix `apple-tts-` pasuje do listy w prune_orphaned_quic_models).
         create_model_entry(
             &db,
             &NewModelEntry {
-                model_name: "local-orphan",
+                model_name: "apple-tts-orphan",
                 display_name: None,
                 service_type: "tts",
-                connection_type: "local",
+                connection_type: "internal",
                 service_id: None,
                 flow_id: None,
                 is_public: false,
@@ -9392,7 +9393,7 @@ mod delete_service_cascade_tests {
             &NewModelEntry {
                 model_name: "gpt-4",
                 display_name: Some("OpenAI GPT-4"),
-                service_type: "chat",
+                service_type: "llm",
                 connection_type: "openai_api",
                 service_id: None,
                 flow_id: None,
