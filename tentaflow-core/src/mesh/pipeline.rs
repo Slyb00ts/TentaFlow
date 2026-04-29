@@ -248,150 +248,25 @@ pub async fn start_mesh_pipeline(
                 }
             }
 
-            // Reconnect loop — co 15s iteruje peer_store i dla kazdego peera
-            // ktory nie jest aktualnie polaczony (quic_connected=false) probuje
-            // `connect_to_peer`. Iroh rozwiazuje adres przez mDNS/DHT. Dzieki
-            // temu peer ktory padl (PeerDisconnected) zostanie automatycznie
-            // redialowany bez czekania na kolejny DiscoveryEvent.
-            //
-            // Dodatkowo na Resume (iOS wake z suspendu) robimy natychmiastowy
-            // przebieg bez czekania do 15s — peerzy po naszej stronie mogli
-            // nas uznac za martwych i trzeba od nowa zestawic QUIC.
-            {
-                let qm = quic_mesh.clone();
-                let store = mesh_peer_store.clone();
-                let self_id = local_node_id.clone();
-                let sec = mesh_security.clone();
-                let mut lifecycle_rx = crate::lifecycle_signal::subscribe();
-                tokio::spawn(async move {
-                    let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-                    let mut ticker = tokio::time::interval(Duration::from_secs(15));
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // PR4: reconnect is now event-driven via ReconnectManager; the
+            // legacy 15s polling loop has been removed. ReconnectManager
+            // subscribes to PeerDelta events and schedules dials with
+            // exponential backoff + jitter against the registry timeline.
+            if let Some(registry) = mesh_peer_store.registry().cloned() {
+                let mgr = crate::mesh::reconnect::ReconnectManager::new(
+                    registry,
+                    quic_mesh.clone(),
+                    local_node_id.clone(),
+                );
+                mgr.spawn();
+            }
 
-                    // Counter consecutive failures per peer. Po N failures
-                    // przelaczamy z hint-based dial na pure DHT lookup -
-                    // hints z parowania moga byc stale (peer dostal nowy
-                    // IP po restarcie), iroh.connect() z addresses sprobuje
-                    // tylko ich i nie zrobi address-lookup. connect_to_peer
-                    // (no addresses) wymusza pkarr/mDNS lookup.
-                    let failure_counts: Arc<dashmap::DashMap<String, u32>> =
-                        Arc::new(dashmap::DashMap::new());
-                    const FAILURE_THRESHOLD: u32 = 2;
-
-                    let run_iteration = |trigger: &str| {
-                        let peers = store.list();
-                        let mut redialed = 0usize;
-                        for p in peers.iter() {
-                            if p.node_id == self_id || p.quic_connected {
-                                // Reset counter po success connection.
-                                failure_counts.remove(&p.node_id);
-                                continue;
-                            }
-                            let qm2 = qm.clone();
-                            let nid = p.node_id.clone();
-                            let hints = trusted_contact_hints_for_peer(sec.as_ref(), &nid);
-                            let counts = failure_counts.clone();
-                            let fail_count = counts.get(&nid).map(|v| *v).unwrap_or(0);
-                            tokio::spawn(async move {
-                                let result = if fail_count >= FAILURE_THRESHOLD {
-                                    // Force pure DHT lookup - peer mogl dostac nowy IP
-                                    if fail_count == FAILURE_THRESHOLD {
-                                        info!(
-                                            peer_id = %nid,
-                                            "reconnect: hints stale (>={} failures), fallback do pure DHT lookup",
-                                            FAILURE_THRESHOLD
-                                        );
-                                    }
-                                    qm2.connect_to_peer(&nid, dummy).await
-                                } else if let Some(hints) = hints {
-                                    qm2.connect_to_peer_with_hints(&hints).await
-                                } else {
-                                    qm2.connect_to_peer(&nid, dummy).await
-                                };
-                                match result {
-                                    Ok(()) => {
-                                        counts.remove(&nid);
-                                    }
-                                    Err(e) => {
-                                        counts
-                                            .entry(nid.clone())
-                                            .and_modify(|v| *v = v.saturating_add(1))
-                                            .or_insert(1);
-                                        debug!(peer_id = %nid, fail_count = ?counts.get(&nid).map(|v| *v), "Reconnect loop fail: {}", e);
-                                    }
-                                }
-                            });
-                            redialed += 1;
-                        }
-                        if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
-                            for node in trusted {
-                                if node.node_id == self_id || store.is_quic_connected(&node.node_id) {
-                                    failure_counts.remove(&node.node_id);
-                                    continue;
-                                }
-                                if peers.iter().any(|p| p.node_id == node.node_id) {
-                                    continue;
-                                }
-                                let qm2 = qm.clone();
-                                let nid = node.node_id.clone();
-                                let counts = failure_counts.clone();
-                                let fail_count = counts.get(&nid).map(|v| *v).unwrap_or(0);
-                                let hints = trusted_contact_hints_for_peer(sec.as_ref(), &nid);
-                                tokio::spawn(async move {
-                                    let result = if fail_count >= FAILURE_THRESHOLD {
-                                        if fail_count == FAILURE_THRESHOLD {
-                                            info!(
-                                                peer_id = %nid,
-                                                "reconnect: hints stale (>={} failures), fallback do pure DHT lookup",
-                                                FAILURE_THRESHOLD
-                                            );
-                                        }
-                                        qm2.connect_to_peer(&nid, dummy).await
-                                    } else if let Some(hints) = hints {
-                                        qm2.connect_to_peer_with_hints(&hints).await
-                                    } else {
-                                        qm2.connect_to_peer(&nid, dummy).await
-                                    };
-                                    match result {
-                                        Ok(()) => {
-                                            counts.remove(&nid);
-                                        }
-                                        Err(e) => {
-                                            counts
-                                                .entry(nid.clone())
-                                                .and_modify(|v| *v = v.saturating_add(1))
-                                                .or_insert(1);
-                                            debug!(peer_id = %nid, "Reconnect loop trusted-only fail: {}", e);
-                                        }
-                                    }
-                                });
-                                redialed += 1;
-                            }
-                        }
-                        if redialed > 0 {
-                            debug!("reconnect-loop({}): {} peer(ow) redial", trigger, redialed);
-                        }
-                    };
-
-                    loop {
-                        tokio::select! {
-                            _ = ticker.tick() => {
-                                run_iteration("timer");
-                            }
-                            lc = lifecycle_rx.recv() => {
-                                match lc {
-                                    Ok(crate::lifecycle_signal::LifecycleEvent::Resume) => {
-                                        info!("mesh reconnect: Resume — force redial wszystkich peerow");
-                                        run_iteration("resume");
-                                    }
-                                    Ok(_) => {}
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
-                                }
-                            }
-                        }
-                    }
-                });
+            // PR4: liveness scanning runs as a dedicated task that walks
+            // the registry and emits LivenessTick triggers. The state
+            // machine in peer_registry::state owns the actual transitions.
+            if let Some(registry) = mesh_peer_store.registry().cloned() {
+                let task = crate::mesh::liveness::LivenessTask::new(registry);
+                task.spawn();
             }
 
             // Bootstrap peer_store z persistowanych snapshotow mesh_topology
@@ -454,14 +329,6 @@ pub async fn start_mesh_pipeline(
                 local_node_id.clone(),
                 db_pool.clone(),
             );
-            spawn_liveness_timer(
-                mesh_peer_store.clone(),
-                quic_mesh.clone(),
-                local_node_id.clone(),
-                Some(mesh_security.clone()),
-                db_pool.clone(),
-            );
-
             spawn_pairing_cleanup(mesh_security.clone());
 
             info!("Mesh networking uruchomiony (iroh transport)");
@@ -1420,22 +1287,30 @@ fn spawn_quic_event_handler(
                 Ok(IrohMeshEvent::PairingRequestReceived { peer_id, data }) => {
                     info!(peer_id = %peer_id, data_len = data.len(), "Odebrano PairingRequest przez QUIC");
                     if let Some(ref sec) = mesh_security {
-                        match serde_json::from_slice::<serde_json::Value>(&data) {
+                        match rkyv::from_bytes::<
+                            tentaflow_protocol::mesh::MeshPairingRequestPayload,
+                            rkyv::rancor::Error,
+                        >(&data)
+                        {
                             Ok(val) => {
-                                let from_node_id = val["from_node_id"].as_str().unwrap_or(&peer_id);
+                                let from_node_id = if val.from_node_id.is_empty() {
+                                    peer_id.as_str()
+                                } else {
+                                    val.from_node_id.as_str()
+                                };
                                 info!(
                                     from_node_id = %from_node_id,
                                     peer_id = %peer_id,
-                                    has_pin = !val["pin"].as_str().unwrap_or("").is_empty(),
-                                    has_pubkey = !val["public_key"].as_str().unwrap_or("").is_empty(),
+                                    has_pin = !val.pin.is_empty(),
+                                    has_pubkey = !val.public_key.is_empty(),
                                     "PairingRequest szczegoly"
                                 );
                                 if from_node_id == local_node_id {
                                     warn!("Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)");
                                     continue;
                                 }
-                                let pin = val["pin"].as_str().unwrap_or("");
-                                let public_key = val["public_key"].as_str().unwrap_or("");
+                                let pin = val.pin.as_str();
+                                let public_key = val.public_key.as_str();
                                 if let Err(e) =
                                     sec.receive_pairing_request(from_node_id, pin, public_key)
                                 {
@@ -1451,58 +1326,69 @@ fn spawn_quic_event_handler(
                                             from = %from_node_id,
                                             "PairingRequest PIN zgodny z QR invite — auto-confirm"
                                         );
-                                        let body_json = serde_json::json!({
-                                            "pin": pin,
-                                            "hostname": "",
-                                        })
-                                        .to_string();
                                         let quic_mesh_clone = Some(qm_events.clone());
-                                        let res =
-                                            crate::api::dashboard::api_mesh::handle_confirm_pairing(
-                                                sec,
-                                                from_node_id,
-                                                body_json.as_bytes(),
-                                                &quic_mesh_clone,
-                                                &local_node_id,
-                                            );
+                                        let res = crate::mesh::admin_ops::confirm_pairing(
+                                            sec,
+                                            from_node_id,
+                                            Some(pin),
+                                            &quic_mesh_clone,
+                                            &local_node_id,
+                                            &peer_store,
+                                        );
                                         match res {
-                                            Ok((status, _body)) if status == 200 => {
+                                            Ok(_) => {
                                                 info!(from = %from_node_id, "Auto-confirm OK");
                                             }
-                                            Ok((status, body)) => {
-                                                warn!(from = %from_node_id, status, body = %body, "Auto-confirm: non-200");
-                                            }
                                             Err(e) => {
-                                                warn!(from = %from_node_id, "Auto-confirm: {}", e);
+                                                warn!(from = %from_node_id, kind = ?e.kind, "Auto-confirm: {}", e.message);
                                             }
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!(peer_id = %peer_id, "Blad parsowania PairingRequest JSON: {}", e);
+                                warn!(peer_id = %peer_id, "Blad parsowania PairingRequest rkyv: {}", e);
                             }
                         }
                     }
                 }
                 Ok(IrohMeshEvent::PairingConfirmReceived { peer_id, data }) => {
-                    // Parsuj JSON i zatwierdz parowanie — dodaj do zaufanych
+                    // Parsuj rkyv i zatwierdz parowanie — dodaj do zaufanych
                     if let Some(ref sec) = mesh_security {
-                        match serde_json::from_slice::<serde_json::Value>(&data) {
+                        match rkyv::from_bytes::<
+                            tentaflow_protocol::mesh::MeshPairingConfirmPayload,
+                            rkyv::rancor::Error,
+                        >(&data)
+                        {
                             Ok(val) => {
-                                let from_node_id = val["from_node_id"].as_str().unwrap_or(&peer_id);
-                                let public_key = val["public_key"].as_str().unwrap_or("");
-                                let hostname = val["hostname"].as_str().unwrap_or("");
-                                let received_pin = val["pin"].as_str().unwrap_or("");
+                                let from_node_id = if val.from_node_id.is_empty() {
+                                    peer_id.as_str()
+                                } else {
+                                    val.from_node_id.as_str()
+                                };
+                                let public_key = val.public_key.as_str();
+                                let hostname = val.hostname.as_str();
+                                let received_pin = val.pin.as_str();
 
-                                // Weryfikuj PIN — inicjator sprawdza czy receiver podal poprawny PIN
+                                // Weryfikuj PIN — inicjator sprawdza czy receiver podal poprawny PIN.
+                                // Constant-time compare: identical short PIN strings, but keep ct_eq
+                                // for hardening against future variable-length PINs.
                                 if let Ok(Some(expected_pin)) = sec.get_pending_pin(from_node_id) {
-                                    if !received_pin.is_empty() && received_pin != expected_pin {
-                                        warn!(
-                                            "PairingConfirm od {} — nieprawidlowy PIN",
-                                            from_node_id
-                                        );
-                                        continue;
+                                    if !received_pin.is_empty() {
+                                        use subtle::ConstantTimeEq;
+                                        let same = received_pin.len() == expected_pin.len()
+                                            && bool::from(
+                                                received_pin
+                                                    .as_bytes()
+                                                    .ct_eq(expected_pin.as_bytes()),
+                                            );
+                                        if !same {
+                                            warn!(
+                                                "PairingConfirm od {} — nieprawidlowy PIN",
+                                                from_node_id
+                                            );
+                                            continue;
+                                        }
                                     }
                                 }
 
@@ -1619,11 +1505,19 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::PairingRejectReceived { peer_id, data }) => {
-                    // Parsuj JSON i usun oczekujace parowanie
+                    // Parsuj rkyv i usun oczekujace parowanie
                     if let Some(ref sec) = mesh_security {
-                        match serde_json::from_slice::<serde_json::Value>(&data) {
+                        match rkyv::from_bytes::<
+                            tentaflow_protocol::mesh::MeshPairingRejectPayload,
+                            rkyv::rancor::Error,
+                        >(&data)
+                        {
                             Ok(val) => {
-                                let from_node_id = val["from_node_id"].as_str().unwrap_or(&peer_id);
+                                let from_node_id = if val.from_node_id.is_empty() {
+                                    peer_id.as_str()
+                                } else {
+                                    val.from_node_id.as_str()
+                                };
                                 if let Err(e) = sec.reject_pairing(from_node_id) {
                                     warn!("Blad odrzucenia parowania od {}: {}", peer_id, e);
                                 } else {
@@ -1635,7 +1529,7 @@ fn spawn_quic_event_handler(
                                 }
                             }
                             Err(e) => {
-                                warn!(peer_id = %peer_id, "Blad parsowania PairingReject JSON: {}", e);
+                                warn!(peer_id = %peer_id, "Blad parsowania PairingReject rkyv: {}", e);
                             }
                         }
                     }
@@ -2204,130 +2098,6 @@ fn spawn_slow_refresh(
                     docker_version,
                     os_info,
                 );
-            }
-        }
-    });
-}
-
-/// Liveness timer — co 1s sprawdza ile czasu minelo od ostatniego heartbeatu
-/// dla kazdego trusted peera. Heartbeaty leca co 500ms, wiec:
-///  - age < 2000ms  → OK, nic nie rob
-///  - 2000..5000ms  → status='degraded', emit event (jesli byl 'connected')
-///  - age > 5000ms  → status='offline', force disconnect, clear heartbeat,
-///                     emit event 'offline' (auto-reconnect loop sie zaopiekuje).
-fn spawn_liveness_timer(
-    peer_store: MeshPeerStore,
-    quic_mesh: Arc<IrohMeshManager>,
-    local_node_id: String,
-    mesh_security: Option<Arc<MeshSecurity>>,
-    db_pool: Option<crate::db::DbPool>,
-) {
-    tokio::spawn(async move {
-        // Progi dobrane z zapasem — iroh multi-path czasem opuszcza heartbeat
-        // podczas reroutingu. Liveness timer dziala TYLKO na zaufanych peerach
-        // (dla nich gwarantujemy stabilny heartbeat co 500ms). Dla discovered/
-        // unpaired iroh sam zarzadza zyciem polaczenia — nie wtracamy sie.
-        // QUIC keep-alive idzie co 10s a idle_timeout=25s (patrz net/iroh/
-        // endpoint.rs). Wiec jesli Quinn nie zdazyl zamknac sesji w 25s, a
-        // my nie widzimy heartbeatu wiekszego z nadmiarem, cos realnie padlo.
-        // OFFLINE_MS trzymamy lekko wyzej zeby nie wyscigac z Quinn close.
-        const DEGRADED_MS: i64 = 15_000;
-        const OFFLINE_MS: i64 = 45_000;
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            let ages = peer_store.heartbeat_ages();
-            for (node_id, age_ms) in ages {
-                if node_id == local_node_id {
-                    continue;
-                }
-                // Tylko trusted peery — niezaufane moga sie laczyc/rozlaczac
-                // po uznaniu iroh (multi-path, NAT rebinding, relay rotacja).
-                let is_trusted = match &mesh_security {
-                    Some(sec) => sec.is_trusted(&node_id),
-                    None => false,
-                };
-                if !is_trusted {
-                    continue;
-                }
-                let peer = match peer_store.get(&node_id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                if !peer.quic_connected {
-                    continue;
-                }
-                if age_ms > OFFLINE_MS {
-                    warn!(
-                        peer = %node_id,
-                        age_ms,
-                        "Liveness timer: trusted peer nieaktywny > 45s — force disconnect + reconnect"
-                    );
-                    peer_store.set_quic_connected(&node_id, false);
-                    peer_store.set_status(&node_id, "offline");
-                    // NIE czyscimy heartbeat tutaj. clear_heartbeat zeruje
-                    // licznik age — jesli nowe polaczenie zestawi sie
-                    // szybciej niz nadejdzie pierwszy HB, nastepny tick
-                    // zobaczy age=0 i bedzie czekal pelne 45s. Pozwalamy
-                    // zeby clear_heartbeat zostal wywolany dopiero przez
-                    // handle_peer_disconnected gdy iroh faktycznie potwierdzi
-                    // smierc starego polaczenia.
-                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
-                        &node_id,
-                        &peer.hostname,
-                        "offline",
-                        "heartbeat timeout",
-                    );
-                    let qm = quic_mesh.clone();
-                    let nid = node_id.clone();
-                    let db_for_reconnect = db_pool.clone();
-                    tokio::spawn(async move {
-                        qm.disconnect_peer(&nid).await;
-                        // Po kill-u od razu probujemy ponownie nawiazac polaczenie
-                        // dla zaufanego peera — uzywamy zapisanych hints (addrs +
-                        // relay) z trusted_contact:*, zeby nie czekac na kolejny
-                        // mDNS tick albo DHT lookup. Dla cross-network pairingu
-                        // jedyna sciezka to relay i hints ja niosa.
-                        if let Some(pool) = db_for_reconnect {
-                            match crate::net::iroh::pairing::load_trusted_contact_hints(
-                                &pool, &nid,
-                            ) {
-                                Ok(Some(hints)) => {
-                                    if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
-                                        warn!(
-                                            peer = %nid,
-                                            "Liveness reconnect nieudany: {}",
-                                            e
-                                        );
-                                    } else {
-                                        info!(peer = %nid, "Liveness reconnect ok");
-                                    }
-                                }
-                                Ok(None) => {
-                                    debug!(
-                                        peer = %nid,
-                                        "Liveness: brak zapisanych hints — reconnect pominiety"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        peer = %nid,
-                                        "Liveness: load_trusted_contact_hints blad: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    });
-                } else if age_ms > DEGRADED_MS && peer.status != "degraded" {
-                    peer_store.set_status(&node_id, "degraded");
-                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
-                        &node_id,
-                        &peer.hostname,
-                        "degraded",
-                        "slow heartbeats",
-                    );
-                }
             }
         }
     });

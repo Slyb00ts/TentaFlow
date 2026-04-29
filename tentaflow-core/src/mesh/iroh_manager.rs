@@ -544,6 +544,7 @@ impl IrohMeshManager {
         IrohMeshManagerRef {
             connections: Arc::clone(&self.connections),
             event_tx: self.event_tx.clone(),
+            security: Arc::clone(&self.security),
         }
     }
 
@@ -1468,6 +1469,7 @@ impl IrohMeshManager {
 struct IrohMeshManagerRef {
     connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
+    security: Arc<MeshSecurity>,
 }
 
 impl IrohMeshManagerRef {
@@ -1539,6 +1541,35 @@ impl IrohMeshManagerRef {
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
         if payload.len() > MAX_MSG_BYTES {
             return Err(IrohStreamError::FrameTooLarge(payload.len()));
+        }
+
+        // Pre-trust whitelist: untrusted peers may only send pairing handshake
+        // frames. Every other mesh frame is dropped before any application
+        // state (peer_store, registry, command executor, ...) is touched.
+        let frame_type = disc[0];
+        if !crate::mesh::frame_policy::is_pre_trust_frame(frame_type)
+            && !self.security.is_trusted(&remote_hex)
+        {
+            warn!(
+                peer = %remote_hex,
+                frame_type = format!("0x{:02X}", frame_type),
+                "iroh_mesh: rejected mesh frame from untrusted peer"
+            );
+            let details = format!(
+                "{{\"peer\":\"{}\",\"frame_type\":\"0x{:02X}\"}}",
+                remote_hex, frame_type
+            );
+            let _ = crate::db::repository::log_audit(
+                &self.security.db,
+                None,
+                None,
+                "mesh.frame_rejected",
+                None,
+                Some(&details),
+                None,
+                Some(&remote_hex),
+            );
+            return Ok(());
         }
 
         use tentaflow_protocol::mesh::*;
