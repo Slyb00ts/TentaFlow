@@ -16,8 +16,7 @@ use tokio::process::{Child, Command};
 use super::{
     build_new_service, category_tag, host_os_supported, models_from_manifest, resolve_display_name,
     smart_health_probe, standard_engine_env, DeployError, DeployResult, DeployStrategy,
-    LogActivityCounter, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig,
-    SmartProbeOutcome,
+    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
@@ -142,19 +141,14 @@ impl DeployStrategy for BinaryDeploy {
         let pid = child.id().map(|v| v as i64);
 
         // Pipe stdout / stderr into the log sink line-by-line so the dashboard
-        // sees engine startup output in real time AND so the smart health
-        // probe can tell "still working" from "deadlocked" via the activity
-        // counter. Both pipes are owned tasks; they end when the child
-        // closes its descriptors.
-        let activity = Arc::new(LogActivityCounter::new());
+        // sees engine startup output in real time. Both pipes are owned tasks;
+        // they end when the child closes its descriptors.
         let sink_opt = self.log_sink.clone();
         if let Some(stdout) = child.stdout.take() {
             let s = sink_opt.clone();
-            let counter = activity.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    counter.bump();
                     if let Some(sink) = &s {
                         sink.emit("log", &line);
                     }
@@ -163,11 +157,9 @@ impl DeployStrategy for BinaryDeploy {
         }
         if let Some(stderr) = child.stderr.take() {
             let s = sink_opt.clone();
-            let counter = activity.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    counter.bump();
                     if let Some(sink) = &s {
                         sink.emit("log", &line);
                     }
@@ -183,16 +175,13 @@ impl DeployStrategy for BinaryDeploy {
         }
 
         // Smart probe: vllm-ish openai-compat exposes /v1/models, sherpa-onnx
-        // / teams-bot etc. expose /health. Default stagnation 180s for
-        // binaries (no model download in this path).
+        // / teams-bot etc. expose /health.
         let probe_cfg = SmartProbeConfig {
             readiness_urls: vec![
                 format!("http://127.0.0.1:{}/health", port),
                 format!("http://127.0.0.1:{}/v1/models", port),
             ],
-            stagnation_window: Duration::from_secs(180),
             status_report_interval: Duration::from_secs(30),
-            log_activity: activity,
             log_sink: self.log_sink.clone(),
         };
         let outcome = smart_health_probe(probe_cfg, move || async move {
@@ -214,11 +203,6 @@ impl DeployStrategy for BinaryDeploy {
                     "engine process exited before becoming ready{}",
                     code.map(|c| format!(" (code {})", c)).unwrap_or_default()
                 )));
-            }
-            SmartProbeOutcome::Stalled(silent) => {
-                self.kill_child().await;
-                let _ = self.ports.release(port);
-                return Err(DeployError::HealthTimeout(silent.as_secs()));
             }
         }
 

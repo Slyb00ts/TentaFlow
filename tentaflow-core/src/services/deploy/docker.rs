@@ -17,8 +17,7 @@ use rusqlite::Transaction;
 use super::{
     build_new_service, category_tag, models_from_manifest, resolve_display_name,
     smart_health_probe, transport_hint, DeployError, DeployResult, DeployStrategy,
-    LogActivityCounter, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig,
-    SmartProbeOutcome,
+    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -416,15 +415,11 @@ impl DeployStrategy for DockerDeploy {
             ));
         }
 
-        // Stream container logs into the dashboard sink AND into the
-        // activity counter so the smart probe can tell "container still
-        // booting" from "container alive but stuck". Background task ends
-        // when the container stops or the daemon closes the stream.
-        let activity = Arc::new(LogActivityCounter::new());
+        // Stream container logs into the dashboard sink. Background task
+        // ends when the container stops or the daemon closes the stream.
         {
             let docker_for_logs = docker.clone();
             let name_for_logs = container_name.clone();
-            let counter = activity.clone();
             let sink = self.log_sink.clone();
             tokio::spawn(async move {
                 use futures::StreamExt;
@@ -442,7 +437,6 @@ impl DeployStrategy for DockerDeploy {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        counter.bump();
                         if let Some(s) = &sink {
                             s.emit("log", trimmed);
                         }
@@ -451,17 +445,14 @@ impl DeployStrategy for DockerDeploy {
             });
         }
 
-        // Smart probe: race readiness URLs forever, abort on container
-        // exit OR `stagnation_window` of zero log activity. Default 300s
-        // covers slow image start + first model download.
+        // Smart probe: race readiness URLs forever, abort only on
+        // container exit.
         let probe_cfg = SmartProbeConfig {
             readiness_urls: vec![
                 format!("http://127.0.0.1:{}/v1/models", host_http),
                 format!("http://127.0.0.1:{}/health", host_http),
             ],
-            stagnation_window: std::time::Duration::from_secs(300),
             status_report_interval: std::time::Duration::from_secs(30),
-            log_activity: activity,
             log_sink: self.log_sink.clone(),
         };
         let docker_for_probe = docker.clone();
@@ -511,20 +502,6 @@ impl DeployStrategy for DockerDeploy {
                     "container '{}' exited before readiness",
                     container_name
                 )));
-            }
-            SmartProbeOutcome::Stalled(silent) => {
-                if let Some(s) = &self.log_sink {
-                    s.info(&format!(
-                        "[docker] container '{}' stalled: no log activity for {}s",
-                        container_name,
-                        silent.as_secs()
-                    ));
-                }
-                let _ = backend::stop_and_remove(&docker, &id).await;
-                for p in &allocated {
-                    let _ = self.ports.release(*p);
-                }
-                return Err(DeployError::HealthTimeout(silent.as_secs()));
             }
         }
 
