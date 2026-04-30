@@ -122,7 +122,7 @@ impl DeployStrategy for EmbeddedDeploy {
         self.prepare_embedded_vision().await?;
 
         let runtime = RuntimeHandle::default();
-        let models = models_from_manifest(&self.manifest);
+        let models = models_from_manifest(&self.manifest, &self.user_config);
         let config_json = serde_json::to_string(&self.user_config)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
