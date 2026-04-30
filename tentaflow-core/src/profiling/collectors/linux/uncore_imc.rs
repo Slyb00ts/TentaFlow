@@ -87,7 +87,8 @@ impl ProfileCollector for LinuxUncoreImcCollector {
             let events = detect_uncore_events();
             if events.is_empty() {
                 return ProbeResult::Unavailable {
-                    reason: "no uncore_imc_* (Intel) ani amd_df (AMD) events found via perf list".into(),
+                    reason: "no uncore_imc_* (Intel) ani amd_df (AMD) events found via perf list"
+                        .into(),
                 };
             }
             // Sprawdz paranoid level - uncore zazwyczaj wymaga 0.
@@ -208,10 +209,7 @@ impl RunningCollector for LinuxUncoreImcRunning {
 
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("source".into(), "perf stat -e uncore_imc_*/amd_df".into());
-        metadata.insert(
-            "cache_line_bytes".into(),
-            CACHE_LINE_BYTES.to_string(),
-        );
+        metadata.insert("cache_line_bytes".into(), CACHE_LINE_BYTES.to_string());
 
         let artifacts = if self.csv_path.exists() {
             vec![self.csv_path.clone()]
@@ -408,14 +406,22 @@ mod tests {
         let events = parse_uncore_csv(csv);
         assert_eq!(events.len(), 2);
         // 1st interval: read = (1M + 1M) * 64B = 128 MB; per second = 128 MB/s.
-        if let EventPayload::RamBandwidth { read_bps, write_bps } = &events[0].payload {
+        if let EventPayload::RamBandwidth {
+            read_bps,
+            write_bps,
+        } = &events[0].payload
+        {
             assert_eq!(*read_bps, 2_000_000 * 64);
             assert_eq!(*write_bps, 1_000_000 * 64);
         } else {
             panic!("expected RamBandwidth");
         }
         // 2nd interval: read = 2M * 64B = 128 MB.
-        if let EventPayload::RamBandwidth { read_bps, write_bps } = &events[1].payload {
+        if let EventPayload::RamBandwidth {
+            read_bps,
+            write_bps,
+        } = &events[1].payload
+        {
             assert_eq!(*read_bps, 2_000_000 * 64);
             assert_eq!(*write_bps, 1_000_000 * 64);
         } else {

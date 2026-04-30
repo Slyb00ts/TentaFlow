@@ -9066,7 +9066,10 @@ pub struct PeerHintRow {
 
 fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
     if blob.len() != 32 {
-        anyhow::bail!("peer_persisted.node_id: expected 32 bytes, got {}", blob.len());
+        anyhow::bail!(
+            "peer_persisted.node_id: expected 32 bytes, got {}",
+            blob.len()
+        );
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&blob);
@@ -9182,11 +9185,7 @@ pub fn upsert_peer_persisted_batch(pool: &DbPool, rows: &[PeerPersistedRow]) -> 
 /// Replace the hint set for a node atomically. Hints are union-merged in
 /// memory by the writer before this call, so a single call carries the
 /// authoritative current set.
-pub fn replace_peer_hints(
-    pool: &DbPool,
-    node_id: &[u8; 32],
-    hints: &[PeerHintRow],
-) -> Result<()> {
+pub fn replace_peer_hints(pool: &DbPool, node_id: &[u8; 32], hints: &[PeerHintRow]) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     tx.execute(
@@ -9276,7 +9275,11 @@ pub fn migrate_settings_trusted_contacts_to_peer_hints(pool: &DbPool) -> Result<
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let host_opt: Option<&str> = if hostname.is_empty() { None } else { Some(hostname) };
+            let host_opt: Option<&str> = if hostname.is_empty() {
+                None
+            } else {
+                Some(hostname)
+            };
             let n = ins_peer.execute(rusqlite::params![
                 node_id.as_slice(),
                 pubkey,
@@ -9864,12 +9867,18 @@ mod settings_to_peer_hints_migration_tests {
         let persisted_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(persisted_count, 1, "expected 1 peer_persisted row after migration");
+        assert_eq!(
+            persisted_count, 1,
+            "expected 1 peer_persisted row after migration"
+        );
 
         let hints_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(hints_count, 3, "expected 3 hint rows (1 addr + 1 relay + 1 hostname)");
+        assert_eq!(
+            hints_count, 3,
+            "expected 3 hint rows (1 addr + 1 relay + 1 hostname)"
+        );
 
         let leftover: i64 = conn
             .query_row(
@@ -9878,7 +9887,10 @@ mod settings_to_peer_hints_migration_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(leftover, 0, "settings rows should be purged after migration");
+        assert_eq!(
+            leftover, 0,
+            "settings rows should be purged after migration"
+        );
         drop(conn);
 
         // Idempotency: a second run must not duplicate rows.

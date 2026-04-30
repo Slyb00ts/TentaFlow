@@ -90,7 +90,6 @@ impl MeshCommandExecutor {
         self.service_actions.read().await.clone()
     }
 
-
     /// Wykonaj komende od zdalnego noda. Sprawdza trust przed wykonaniem.
     pub async fn execute(&self, from_node_id: &str, command: MeshCommandType) -> CommandResponse {
         if !self.security.is_trusted(from_node_id) {

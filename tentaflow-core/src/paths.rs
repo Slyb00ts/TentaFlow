@@ -89,7 +89,9 @@ pub const CONTAINER_MODELS_PATH: &str = "/data/models";
 /// strategies resolve manifest `context_path` / `binary_path` /
 /// `bundle_path` against this root.
 pub fn containers_root() -> PathBuf {
-    tentaflow_home().join("containers").join("tentaflow-containers")
+    tentaflow_home()
+        .join("containers")
+        .join("tentaflow-containers")
 }
 
 /// Persistent application data (sqlite database, runtime state).

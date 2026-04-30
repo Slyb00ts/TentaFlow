@@ -14,10 +14,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::{
-    build_new_service, category_tag, host_os_supported, http_health_wait, models_from_manifest,
-    resolve_display_name, standard_engine_env, DeployError, DeployResult, DeployStrategy, LogSink,
-    PreparedDeploy, RuntimeHandle,
+    build_new_service, category_tag, host_os_supported, models_from_manifest, resolve_display_name,
+    smart_health_probe, standard_engine_env, DeployError, DeployResult, DeployStrategy,
+    LogActivityCounter, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig,
+    SmartProbeOutcome,
 };
+use crate::deploy::process_ctl;
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
@@ -140,49 +142,84 @@ impl DeployStrategy for BinaryDeploy {
         let pid = child.id().map(|v| v as i64);
 
         // Pipe stdout / stderr into the log sink line-by-line so the dashboard
-        // sees engine startup output in real time. Both pipes are owned tasks;
-        // they end when the child closes its descriptors.
-        if let Some(sink) = self.log_sink.clone() {
-            if let Some(stdout) = child.stdout.take() {
-                let s = sink.clone();
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        s.emit("log", &line);
-                    }
-                });
-            }
-            if let Some(stderr) = child.stderr.take() {
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
+        // sees engine startup output in real time AND so the smart health
+        // probe can tell "still working" from "deadlocked" via the activity
+        // counter. Both pipes are owned tasks; they end when the child
+        // closes its descriptors.
+        let activity = Arc::new(LogActivityCounter::new());
+        let sink_opt = self.log_sink.clone();
+        if let Some(stdout) = child.stdout.take() {
+            let s = sink_opt.clone();
+            let counter = activity.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    counter.bump();
+                    if let Some(sink) = &s {
                         sink.emit("log", &line);
                     }
-                });
-            }
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let s = sink_opt.clone();
+            let counter = activity.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    counter.bump();
+                    if let Some(sink) = &s {
+                        sink.emit("log", &line);
+                    }
+                }
+            });
         }
 
         // Stash the child for later rollback / for keep-alive across the
         // commit await.
+        let pid_for_probe = child.id();
         if let Ok(mut slot) = self.child.lock() {
             *slot = Some(child);
         }
 
-        // Health check.
-        let health_url = format!("http://127.0.0.1:{}/health", port);
-        // Some engines (vllm, openai-compat) only expose /v1/models — try
-        // /health first, fall back to /v1/models.
-        let res = wait_either(
-            &health_url,
-            &format!("http://127.0.0.1:{}/v1/models", port),
-            30,
-        )
+        // Smart probe: vllm-ish openai-compat exposes /v1/models, sherpa-onnx
+        // / teams-bot etc. expose /health. Default stagnation 180s for
+        // binaries (no model download in this path).
+        let probe_cfg = SmartProbeConfig {
+            readiness_urls: vec![
+                format!("http://127.0.0.1:{}/health", port),
+                format!("http://127.0.0.1:{}/v1/models", port),
+            ],
+            stagnation_window: Duration::from_secs(180),
+            status_report_interval: Duration::from_secs(30),
+            log_activity: activity,
+            log_sink: self.log_sink.clone(),
+        };
+        let outcome = smart_health_probe(probe_cfg, move || async move {
+            match pid_for_probe {
+                Some(pid) if process_ctl::is_alive(pid) => None,
+                Some(_) => Some(None),
+                // No PID at all — treat as gone.
+                None => Some(None),
+            }
+        })
         .await;
-        if let Err(e) = res {
-            // Best-effort cleanup before bubbling up.
-            self.kill_child().await;
-            let _ = self.ports.release(port);
-            return Err(e);
+
+        match outcome {
+            SmartProbeOutcome::Ready => {}
+            SmartProbeOutcome::ProcessExited(code) => {
+                self.kill_child().await;
+                let _ = self.ports.release(port);
+                return Err(DeployError::Spawn(format!(
+                    "engine process exited before becoming ready{}",
+                    code.map(|c| format!(" (code {})", c)).unwrap_or_default()
+                )));
+            }
+            SmartProbeOutcome::Stalled(silent) => {
+                self.kill_child().await;
+                let _ = self.ports.release(port);
+                return Err(DeployError::HealthTimeout(silent.as_secs()));
+            }
         }
 
         let runtime = RuntimeHandle {
@@ -251,19 +288,6 @@ impl BinaryDeploy {
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             let _ = child.kill().await;
         }
-    }
-}
-
-/// Probes two URLs in parallel; returns Ok as soon as either responds 2xx.
-async fn wait_either(a: &str, b: &str, timeout_secs: u64) -> DeployResult<()> {
-    use tokio::select;
-    let fa = http_health_wait(a, timeout_secs);
-    let fb = http_health_wait(b, timeout_secs);
-    tokio::pin!(fa);
-    tokio::pin!(fb);
-    select! {
-        r = &mut fa => r,
-        r = &mut fb => r,
     }
 }
 

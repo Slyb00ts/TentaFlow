@@ -343,13 +343,17 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ProfilingPayload::StopRequest(_) => "ProfilingStopRequest",
             tentaflow_protocol::ProfilingPayload::StopResponse(_) => "ProfilingStopResponse",
             tentaflow_protocol::ProfilingPayload::SessionsRequest(_) => "ProfilingSessionsRequest",
-            tentaflow_protocol::ProfilingPayload::SessionsResponse(_) => "ProfilingSessionsResponse",
+            tentaflow_protocol::ProfilingPayload::SessionsResponse(_) => {
+                "ProfilingSessionsResponse"
+            }
             tentaflow_protocol::ProfilingPayload::ReportRequest(_) => "ProfilingReportRequest",
             tentaflow_protocol::ProfilingPayload::ReportResponse(_) => "ProfilingReportResponse",
             tentaflow_protocol::ProfilingPayload::DeleteRequest(_) => "ProfilingDeleteRequest",
             tentaflow_protocol::ProfilingPayload::DeleteResponse(_) => "ProfilingDeleteResponse",
             tentaflow_protocol::ProfilingPayload::DownloadRequest(_) => "ProfilingDownloadRequest",
-            tentaflow_protocol::ProfilingPayload::DownloadResponse(_) => "ProfilingDownloadResponse",
+            tentaflow_protocol::ProfilingPayload::DownloadResponse(_) => {
+                "ProfilingDownloadResponse"
+            }
             tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(_) => {
                 "ProfilingActiveInfoRequest"
             }

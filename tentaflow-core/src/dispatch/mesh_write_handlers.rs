@@ -940,9 +940,7 @@ pub async fn profiling_dispatch(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ProfilingBody(p) => p.clone(),
-        _ => {
-            return Err(ProtocolError::bad_request("expected ProfilingBody"))
-        }
+        _ => return Err(ProtocolError::bad_request("expected ProfilingBody")),
     };
     let res = profiling_route(ctx, payload).await?;
     Ok(MessageBody::ProfilingBody(res))
@@ -1195,4 +1193,3 @@ mod profiling_tests {
         }
     }
 }
-

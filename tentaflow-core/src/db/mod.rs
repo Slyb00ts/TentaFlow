@@ -87,7 +87,6 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
         Err(e) => tracing::warn!("peer_persisted migration failed: {}", e),
     }
 
-
     info!("Baza danych zainicjalizowana pomyslnie");
 
     Ok(pool)
