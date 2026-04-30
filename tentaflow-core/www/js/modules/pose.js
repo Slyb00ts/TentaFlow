@@ -18,7 +18,7 @@ let camera = null;
 let poseModels = [];
 let state = {
   model: '',
-  camera: localStorage.getItem(STORAGE_CAMERA_KEY) || 'user',
+  camera: localStorage.getItem(STORAGE_CAMERA_KEY) || 'environment',
   fps: localStorage.getItem(STORAGE_FPS_KEY) || '8',
   running: false,
   lastLatencyMs: 0,
@@ -233,7 +233,7 @@ const PoseScreen = {
       camera?.setServiceName(state.model);
     });
     byId('pose-camera')?.addEventListener('change', (e) => {
-      state.camera = e.detail.value || 'user';
+      state.camera = e.detail.value || 'environment';
       localStorage.setItem(STORAGE_CAMERA_KEY, state.camera);
     });
     byId('pose-fps')?.addEventListener('change', (e) => {
