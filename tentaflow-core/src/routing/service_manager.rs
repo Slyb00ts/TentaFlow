@@ -2602,7 +2602,19 @@ impl ServiceManager {
     }
 
     /// Inicjalizuje model_pool z bazy danych (skanuje serwisy po deployed_model w config_json)
+    ///
+    /// Self-heal przy starcie procesu: czyscimy in-memory `model_pool`,
+    /// `dynamic_backends` i `local_inference_models` przed odbudowa z DB.
+    /// Powod: `service_stop`/`model_delete` (i HTTP DELETE) usuwaja serwis z DB
+    /// ale nie ruszaja in-memory rejestrow, a kolejne deploye dokladaja nowe
+    /// service_name'y do tej samej listy w `model_pool`. Po wielu cyklach
+    /// deploy/undeploy `dispatch_with_fallback` trafia najpierw na sieroty
+    /// (BackendClient ze starym URL), zanim dojdzie do aktualnego serwisu.
     pub fn init_model_pool(&self, db: &crate::db::DbPool) {
+        self.model_pool.clear();
+        self.dynamic_backends.clear();
+        self.local_inference_models.clear();
+
         if let Ok(services) = crate::db::repository::list_services(db) {
             for svc in &services {
                 if let Ok(config) = serde_json::from_str::<serde_json::Value>(&svc.config_json) {
