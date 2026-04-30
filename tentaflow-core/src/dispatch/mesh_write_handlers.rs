@@ -500,9 +500,7 @@ pub async fn mesh_node_network_config(
                 Some(ctx.state.local_node_id.as_ref()),
             );
             Ok(MessageBody::MeshNodeNetworkConfigResponseBody(
-                MeshNodeNetworkConfigResponse {
-                    ok: response.ok,
-                },
+                MeshNodeNetworkConfigResponse { ok: response.ok },
             ))
         }
         Err(e) => Err(ProtocolError::new(
@@ -529,9 +527,7 @@ fn profiling_v2_err_to_proto(e: crate::profiling::SessionError) -> ProtocolError
             "no collectors available for the requested scope",
         ),
         SE::AllCollectorsFailed => ProtocolError::internal("all collectors failed to start"),
-        SE::InvalidScope(reason) => {
-            ProtocolError::bad_request(format!("invalid scope: {reason}"))
-        }
+        SE::InvalidScope(reason) => ProtocolError::bad_request(format!("invalid scope: {reason}")),
         SE::Storage(s) => ProtocolError::internal(format!("storage: {s}")),
         SE::CollectorStartFailure { id, error } => {
             ProtocolError::internal(format!("collector {id} start failure: {error}"))
@@ -545,17 +541,13 @@ fn profiling_v2_err_to_proto(e: crate::profiling::SessionError) -> ProtocolError
 fn storage_err_to_proto(e: crate::profiling::StorageError) -> ProtocolError {
     use crate::profiling::StorageError as SE;
     match e {
-        SE::InvalidSessionId(s) => {
-            ProtocolError::bad_request(format!("invalid session id: {s}"))
-        }
+        SE::InvalidSessionId(s) => ProtocolError::bad_request(format!("invalid session id: {s}")),
         SE::InvalidNodeId(s) => ProtocolError::bad_request(format!("invalid node id: {s}")),
         SE::InvalidCollectorId(s) => {
             ProtocolError::bad_request(format!("invalid collector id: {s}"))
         }
         SE::NotFound(s) => ProtocolError::not_found(s),
-        SE::PathTraversal(s) => {
-            ProtocolError::bad_request(format!("path traversal rejected: {s}"))
-        }
+        SE::PathTraversal(s) => ProtocolError::bad_request(format!("path traversal rejected: {s}")),
         SE::SizeCapExceeded { actual, cap } => {
             ProtocolError::internal(format!("size cap exceeded: {actual} > {cap}"))
         }
@@ -697,9 +689,7 @@ async fn handle_profiling_local(
     ctx: &HandlerContext,
     payload: tentaflow_protocol::ProfilingPayload,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use crate::profiling::{
-        ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE,
-    };
+    use crate::profiling::{ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE};
     use tentaflow_protocol::ProfilingPayload as PP;
     use tentaflow_protocol::{
         ProfilingActiveInfoResponse, ProfilingActiveSessionInfo, ProfilingDeleteResponse,
@@ -838,8 +828,10 @@ async fn handle_profiling_local(
             }))
         }
         PP::ActiveInfoRequest(_req) => {
-            let info = orchestrator.active_info().await.map(|i| {
-                ProfilingActiveSessionInfo {
+            let info = orchestrator
+                .active_info()
+                .await
+                .map(|i| ProfilingActiveSessionInfo {
                     session_id: i.session_id,
                     node_id: i.node_id,
                     label: i.label,
@@ -848,8 +840,7 @@ async fn handle_profiling_local(
                     elapsed_ns: i.elapsed_ns,
                     collectors_running: i.collectors_running,
                     collectors_skipped: map_storage_skipped(i.collectors_skipped),
-                }
-            });
+                });
             Ok(PP::ActiveInfoResponse(ProfilingActiveInfoResponse { info }))
         }
         PP::ValidateSudoRequest(req) => {
@@ -949,9 +940,7 @@ pub async fn profiling_dispatch(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ProfilingBody(p) => p.clone(),
-        _ => {
-            return Err(ProtocolError::bad_request("expected ProfilingBody"))
-        }
+        _ => return Err(ProtocolError::bad_request("expected ProfilingBody")),
     };
     let res = profiling_route(ctx, payload).await?;
     Ok(MessageBody::ProfilingBody(res))
@@ -972,8 +961,14 @@ macro_rules! register_profiling_variant {
     };
 }
 
-register_profiling_variant!("ProfilingStartRequest", "tentaflow_ws_handler_profiling_start");
-register_profiling_variant!("ProfilingStopRequest", "tentaflow_ws_handler_profiling_stop");
+register_profiling_variant!(
+    "ProfilingStartRequest",
+    "tentaflow_ws_handler_profiling_start"
+);
+register_profiling_variant!(
+    "ProfilingStopRequest",
+    "tentaflow_ws_handler_profiling_stop"
+);
 register_profiling_variant!(
     "ProfilingSessionsRequest",
     "tentaflow_ws_handler_profiling_sessions"
@@ -1198,4 +1193,3 @@ mod profiling_tests {
         }
     }
 }
-

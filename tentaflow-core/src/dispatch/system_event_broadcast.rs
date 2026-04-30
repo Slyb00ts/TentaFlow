@@ -34,12 +34,7 @@ pub fn subscribe() -> broadcast::Receiver<SystemEventPayload> {
 }
 
 /// Helper — publish `ServiceStatusChanged` event.
-pub fn publish_service_status(
-    service_name: &str,
-    service_type: &str,
-    status: &str,
-    message: &str,
-) {
+pub fn publish_service_status(service_name: &str, service_type: &str, status: &str, message: &str) {
     publish(SystemEventPayload::ServiceStatusChanged {
         service_name: service_name.to_string(),
         service_type: service_type.to_string(),
@@ -49,12 +44,7 @@ pub fn publish_service_status(
 }
 
 /// Helper — publish `MeshPeerStatusChanged` event.
-pub fn publish_mesh_peer_status(
-    node_id: &str,
-    hostname: &str,
-    status: &str,
-    message: &str,
-) {
+pub fn publish_mesh_peer_status(node_id: &str, hostname: &str, status: &str, message: &str) {
     publish(SystemEventPayload::MeshPeerStatusChanged {
         node_id: node_id.to_string(),
         hostname: hostname.to_string(),

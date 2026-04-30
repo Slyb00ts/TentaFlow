@@ -19,13 +19,13 @@ use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, Nod
 use crate::mesh::relay_health::{spawn_relay_health_monitor, RelayHealth};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
-use parking_lot::RwLock as PlRwLock;
-use tokio_util::sync::CancellationToken;
 use crate::net::iroh::pairing::{
     load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
     PairingContactHints,
 };
 use crate::routing::live_metrics;
+use parking_lot::RwLock as PlRwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Snapshot live-metrics routera — zwracany do heartbeat.
 fn routing_metrics_snapshot() -> (u32, f32) {
@@ -116,6 +116,7 @@ pub async fn start_mesh_pipeline(
     db_pool: Option<crate::db::DbPool>,
     _settings_cipher: std::sync::Arc<crate::crypto::SettingsCipher>,
     mesh_security: Arc<MeshSecurity>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Result<MeshPipelineHandles> {
     let app_node_id = &config.node_id;
     let mesh_config = &config.mesh_config;
@@ -233,7 +234,8 @@ pub async fn start_mesh_pipeline(
                         let nid = node.node_id.clone();
                         let sec = sec.clone();
                         tokio::spawn(async move {
-                            if let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &nid) {
+                            if let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &nid)
+                            {
                                 if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
                                     debug!(peer_id = %nid, "Reconnect via trusted hints: {}", e);
                                 }
@@ -315,6 +317,7 @@ pub async fn start_mesh_pipeline(
                 Some(mesh_security.clone()),
                 local_node_id.clone(),
                 db_pool.clone(),
+                mesh_services_registry.clone(),
             );
 
             let docker_cache = spawn_docker_cache();
@@ -323,6 +326,8 @@ pub async fn start_mesh_pipeline(
                 mesh_peer_store.clone(),
                 local_node_id.clone(),
                 docker_cache,
+                db_pool.clone(),
+                mesh_services_registry.clone(),
             );
             spawn_slow_refresh(
                 mesh_peer_store.clone(),
@@ -378,7 +383,11 @@ fn upsert_local_peer(
         Some(db) => {
             let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
             let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
-            crate::mesh::network_interfaces::filter_advertise_ips(&raw_addresses, &filters, &kind_map)
+            crate::mesh::network_interfaces::filter_advertise_ips(
+                &raw_addresses,
+                &filters,
+                &kind_map,
+            )
         }
         None => raw_addresses
             .into_iter()
@@ -428,7 +437,9 @@ fn trusted_contact_hints_for_peer(
     security: &MeshSecurity,
     node_id: &str,
 ) -> Option<PairingContactHints> {
-    load_trusted_contact_hints(&security.db, node_id).ok().flatten()
+    load_trusted_contact_hints(&security.db, node_id)
+        .ok()
+        .flatten()
 }
 
 fn prefer_address_first(addresses: &mut Vec<String>, preferred: Option<&str>) {
@@ -539,8 +550,7 @@ async fn handle_peer_connected(
                     if let Ok(sync_data) =
                         rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
                     {
-                        if let Err(e) =
-                            qm_events.send_trusted_keys_sync(&node_id, &sync_data).await
+                        if let Err(e) = qm_events.send_trusted_keys_sync(&node_id, &sync_data).await
                         {
                             warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
                         }
@@ -570,6 +580,26 @@ async fn handle_peer_connected(
                 last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
             }
         }
+
+        // Pull-on-connect: poprosic peera o pelny snapshot jego serwisow.
+        // Wynik trafia do `MeshServicesRegistry` w handlerze
+        // `ServicesGetResponseReceived`. Wysylamy tylko dla zaufanych — peer
+        // i tak odrzuci request od niezaufanego (defense in depth).
+        let pull = tentaflow_protocol::mesh::MeshServicesGetPayload {
+            from_node_id: local_node_id.clone(),
+        };
+        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&pull) {
+            if let Err(e) = qm_events
+                .send_to_peer(
+                    &node_id,
+                    tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET,
+                    &bytes,
+                )
+                .await
+            {
+                debug!(peer = %node_id, "MeshServicesGet send failed: {}", e);
+            }
+        }
     } else {
         debug!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
     }
@@ -594,55 +624,55 @@ async fn handle_peer_connected(
                             "contact_snapshot: wszystkie adresy odrzucone przez advertise filters — pomijam persist"
                         );
                     } else {
-                    let mut direct_addresses: Vec<String> = filtered_ips
-                        .iter()
-                        .map(|ip| format!("{}:{}", ip, port))
-                        .collect();
-                    let snapshot = qm_events.connection_snapshot(&node_id);
-                    let selected_address = snapshot.as_ref().and_then(|c| c.address.as_deref());
-                    let selected_is_direct = snapshot
-                        .as_ref()
-                        .map(|c| c.transport.as_str() == "p2p")
-                        .unwrap_or(false);
-                    if selected_is_direct {
-                        prefer_address_first(&mut direct_addresses, selected_address);
-                    }
-                    // Gdy user wlaczyl prefer_same_subnet, po filtrze przestawiamy
-                    // adres z tej samej /24 co peer na poczatek listy.
-                    if crate::mesh::network_interfaces::load_prefer_same_subnet(&sec.db) {
-                        crate::mesh::network_interfaces::sort_prefer_same_subnet(
-                            &mut direct_addresses,
-                            selected_address,
+                        let mut direct_addresses: Vec<String> = filtered_ips
+                            .iter()
+                            .map(|ip| format!("{}:{}", ip, port))
+                            .collect();
+                        let snapshot = qm_events.connection_snapshot(&node_id);
+                        let selected_address = snapshot.as_ref().and_then(|c| c.address.as_deref());
+                        let selected_is_direct = snapshot
+                            .as_ref()
+                            .map(|c| c.transport.as_str() == "p2p")
+                            .unwrap_or(false);
+                        if selected_is_direct {
+                            prefer_address_first(&mut direct_addresses, selected_address);
+                        }
+                        // Gdy user wlaczyl prefer_same_subnet, po filtrze przestawiamy
+                        // adres z tej samej /24 co peer na poczatek listy.
+                        if crate::mesh::network_interfaces::load_prefer_same_subnet(&sec.db) {
+                            crate::mesh::network_interfaces::sort_prefer_same_subnet(
+                                &mut direct_addresses,
+                                selected_address,
+                            );
+                        }
+                        let addr_str = direct_addresses.join(",");
+                        tracing::info!(
+                            peer = %node_id,
+                            raw_count = addresses.len(),
+                            filtered_count = direct_addresses.len(),
+                            advertised = %addr_str,
+                            "advertise to peer: addresses po filtrach"
                         );
-                    }
-                    let addr_str = direct_addresses.join(",");
-                    tracing::info!(
-                        peer = %node_id,
-                        raw_count = addresses.len(),
-                        filtered_count = direct_addresses.len(),
-                        advertised = %addr_str,
-                        "advertise to peer: addresses po filtrach"
-                    );
-                    let _ = crate::db::repository::update_trusted_node_addresses(
-                        &sec.db, &node_id, &addr_str,
-                    );
-                    let relay_url = snapshot
-                        .as_ref()
-                        .and_then(|c| c.relay_url.clone())
-                        .or_else(|| qm_events.relay_url().map(|url| url.to_string()))
-                        .unwrap_or_default();
-                    let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
-                    let hints = merge_contact_hints(
-                        current,
-                        PairingContactHints {
-                            node_id: node_id.clone(),
-                            public_key_hex: String::new(),
-                            hostname,
-                            addresses: direct_addresses,
-                            relay_url,
-                        },
-                    );
-                    let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
+                        let _ = crate::db::repository::update_trusted_node_addresses(
+                            &sec.db, &node_id, &addr_str,
+                        );
+                        let relay_url = snapshot
+                            .as_ref()
+                            .and_then(|c| c.relay_url.clone())
+                            .or_else(|| qm_events.relay_url().map(|url| url.to_string()))
+                            .unwrap_or_default();
+                        let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
+                        let hints = merge_contact_hints(
+                            current,
+                            PairingContactHints {
+                                node_id: node_id.clone(),
+                                public_key_hex: String::new(),
+                                hostname,
+                                addresses: direct_addresses,
+                                relay_url,
+                            },
+                        );
+                        let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
                     }
                 }
             }
@@ -729,6 +759,7 @@ fn spawn_quic_event_handler(
     mesh_security: Option<Arc<MeshSecurity>>,
     local_node_id: String,
     db_pool: Option<crate::db::DbPool>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) {
     let qm_events = quic_mesh.clone();
     let mut event_rx = quic_mesh.subscribe();
@@ -992,34 +1023,10 @@ fn spawn_quic_event_handler(
                                 .collect();
                             peer_store.update_models(&entry.node_id, models);
                         }
-                        // Uslugi — wpisujemy do service_registry jako remote
-                        // (pozwala GUI mesh-service browserowi pokazac spark-002 uslugi).
-                        if !entry.services.is_empty() {
-                            let services: Vec<tentaflow_protocol::mesh::MeshServiceInfo> = entry
-                                .services
-                                .iter()
-                                .map(|s| tentaflow_protocol::mesh::MeshServiceInfo {
-                                    service_id: format!("{}-{}", entry.node_id, s.name),
-                                    service_name: s.name.clone(),
-                                    service_type: s.service_type.clone(),
-                                    node_id: entry.node_id.clone(),
-                                    quic_port: entry.port,
-                                    quic_url: String::new(),
-                                    status: if s.ready {
-                                        "ready".to_string()
-                                    } else {
-                                        "stopped".to_string()
-                                    },
-                                    models: Vec::new(),
-                                    load_percent: 0,
-                                    engine_id: None,
-                                    model_sizes_mb: Vec::new(),
-                                })
-                                .collect();
-                            qm_events
-                                .service_registry()
-                                .update_remote(&entry.node_id, services);
-                        }
+                        // Cross-node service inventory now flows over the V2
+                        // `MeshServicesAnnounce/Update` protocol (discriminants
+                        // 0x40-0x43) into `mesh_services_registry`. The legacy
+                        // `service_registry().update_remote` path is gone.
                         // Persystuj snapshot do DB — bootstrap po restarcie.
                         // Serializujemy bezposrednio Vec<ServiceSummary>/<ModelSummary>
                         // (derive SerdeSerialize) — omija intermediate serde_json::Value tree.
@@ -1080,15 +1087,13 @@ fn spawn_quic_event_handler(
                             let recent = last_dial_at
                                 .get(&entry.node_id)
                                 .map(|t| {
-                                    t.elapsed()
-                                        < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                                    t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
                                 })
                                 .unwrap_or(false);
                             if recent {
                                 continue;
                             }
-                            last_dial_at
-                                .insert(entry.node_id.clone(), std::time::Instant::now());
+                            last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
                             let target = entry.node_id.clone();
                             let qm = qm_events.clone();
                             let hints = merge_contact_hints(
@@ -1243,6 +1248,11 @@ fn spawn_quic_event_handler(
                         debug!(peer_id = %node_id, "QUIC peer — duplicate disconnect event");
                         continue;
                     }
+
+                    // Mesh services registry — wyrzuc snapshot zerwanego peera.
+                    // Bez tego GUI aggregate (krok N3b) widzialby duchowe serwisy
+                    // niedostepnego nodu az do nastepnego anti-drift broadcastu.
+                    mesh_services_registry.remove_node(&node_id);
 
                     // [SCALE] Debounce + reszta przeniesione do spawnowanego
                     // taska z per-peer lockiem (wspolny z PeerConnected).
@@ -1801,6 +1811,141 @@ fn spawn_quic_event_handler(
                     peer_store.set_status(&node_id, "discovered");
                     debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
                 }
+                Ok(IrohMeshEvent::ServicesGetReceived { from_node_id, .. }) => {
+                    // Peer prosi o pelny snapshot lokalnych serwisow. Tylko
+                    // trusted — defense in depth, send_to_peer wymagal trustu
+                    // po stronie inicjatora ale ktos moze otworzyc surowy stream.
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesGet od niezaufanego peera — ignoruje");
+                        continue;
+                    }
+                    let pool = match &db_pool {
+                        Some(p) => p.clone(),
+                        None => {
+                            debug!("MeshServicesGet: brak db_pool, pomijam odpowiedz");
+                            continue;
+                        }
+                    };
+                    let qm = qm_events.clone();
+                    let local = local_node_id.clone();
+                    let peer = from_node_id.clone();
+                    tokio::spawn(async move {
+                        let services = match crate::services::snapshot_builder::build_local_snapshot(
+                            &pool, &local,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(error = %e, "MeshServicesGet: build_local_snapshot failed");
+                                return;
+                            }
+                        };
+                        let payload = tentaflow_protocol::mesh::MeshServicesGetResponsePayload {
+                            from_node_id: local,
+                            services,
+                        };
+                        let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "MeshServicesGetResponse: rkyv encode failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = qm
+                            .send_to_peer(
+                                &peer,
+                                tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET_RESPONSE,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            debug!(peer = %peer, "MeshServicesGetResponse send failed: {}", e);
+                        }
+                    });
+                }
+                Ok(IrohMeshEvent::ServicesGetResponseReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesGetResponse od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshServicesGetResponsePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            debug!(
+                                peer = %from_node_id,
+                                count = payload.services.len(),
+                                "MeshServicesGetResponse: replace_node"
+                            );
+                            mesh_services_registry
+                                .replace_node(payload.from_node_id, payload.services);
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "MeshServicesGetResponse decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::ServicesAnnounceReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesAnnounce od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshServicesAnnouncePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            debug!(
+                                peer = %from_node_id,
+                                count = payload.services.len(),
+                                "MeshServicesAnnounce: replace_node"
+                            );
+                            mesh_services_registry
+                                .replace_node(payload.from_node_id, payload.services);
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "MeshServicesAnnounce decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::ServicesUpdateReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "MeshServicesUpdate od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match rkyv::from_bytes::<
+                        tentaflow_protocol::mesh::MeshServicesUpdatePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            debug!(peer = %from_node_id, "MeshServicesUpdate: apply_change");
+                            mesh_services_registry
+                                .apply_change(payload.from_node_id, payload.change);
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "MeshServicesUpdate decode error: {}", e);
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Event receiver opuscil {} wiadomosci", n);
@@ -1841,6 +1986,8 @@ fn spawn_heartbeat_sender(
     peer_store: MeshPeerStore,
     local_node_id: String,
     docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>,
+    db_pool: Option<crate::db::DbPool>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -1935,10 +2082,43 @@ fn spawn_heartbeat_sender(
                     peer_store.maybe_recalculate_routes(&local_node_id);
                 }
 
+                // Mesh services registry — anti-drift snapshot broadcast co 600
+                // heartbeatow (~5 min). Naprawia rozjazd rejestru po nieudanych
+                // push delta'ach (`MeshServicesUpdate`) lub gdy peer dolaczyl
+                // bez pull-on-connect (np. po zmianie sieci, hardlinkowy reuse).
+                if heartbeat_count % 600 == 0 {
+                    if let Some(ref pool) = db_pool {
+                        match crate::services::snapshot_builder::build_local_snapshot(
+                            pool,
+                            &local_node_id,
+                        ) {
+                            Ok(services) => {
+                                let payload =
+                                    tentaflow_protocol::mesh::MeshServicesAnnouncePayload {
+                                        from_node_id: local_node_id.clone(),
+                                        services,
+                                    };
+                                if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                                    let _ = quic_mesh
+                                        .broadcast_to_trusted(
+                                            tentaflow_protocol::mesh::MESH_MSG_SERVICES_ANNOUNCE,
+                                            &bytes,
+                                            None,
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "MeshServicesAnnounce: build_local_snapshot failed");
+                            }
+                        }
+                    }
+                }
+
                 // ModelsSync broadcast co 60 heartbeatow (~30s). Serwer-side
                 // scrape z service_registry zwraca aktualne aliasy + stan zaladowania.
                 if heartbeat_count % 60 == 0 {
-                    let models = collect_local_models(&quic_mesh);
+                    let models = collect_local_models(&mesh_services_registry);
                     peer_store.update_models(&local_node_id, models.clone());
                     let sync = crate::mesh::peer_store::ModelsSync { models };
                     if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&sync) {
@@ -1950,18 +2130,19 @@ fn spawn_heartbeat_sender(
                 // Kazdy node anonsuje SIEBIE: hostname + platform + bezposredni sasiedzi
                 // + modele + uslugi. Flooding z dedupem (origin, epoch) dociera az do 5 hopow.
                 if heartbeat_count % 60 == 30 {
-                    let services: Vec<tentaflow_protocol::mesh::ServiceSummary> = quic_mesh
-                        .service_registry()
-                        .local_services()
-                        .into_iter()
-                        .map(|s| tentaflow_protocol::mesh::ServiceSummary {
-                            name: s.service_name,
-                            service_type: s.service_type,
-                            ready: matches!(s.status.as_str(), "running" | "ready"),
-                        })
-                        .collect();
+                    let services: Vec<tentaflow_protocol::mesh::ServiceSummary> =
+                        mesh_services_registry
+                            .local()
+                            .services
+                            .iter()
+                            .map(|s| tentaflow_protocol::mesh::ServiceSummary {
+                                name: s.display_name.clone(),
+                                service_type: s.category.clone(),
+                                ready: matches!(s.status.as_str(), "running" | "ready"),
+                            })
+                            .collect();
                     let models_summary: Vec<tentaflow_protocol::mesh::ModelSummary> =
-                        collect_local_models(&quic_mesh)
+                        collect_local_models(&mesh_services_registry)
                             .into_iter()
                             .map(|m| tentaflow_protocol::mesh::ModelSummary {
                                 alias: m.alias,
@@ -2033,30 +2214,29 @@ fn spawn_heartbeat_sender(
     });
 }
 
-/// Buduje liste `PeerModelInfo` z lokalnego service_registry. Tylko LOKALNE
-/// serwisy (te na biezacym nodzie) — modele z peerow przychodza przez
-/// ModelsSync od ich wlascicieli.
+/// Builds `PeerModelInfo` list from the local snapshot of the V2 mesh services
+/// registry. Only LOCAL services — peers' models arrive via `ModelsSync` from
+/// their owners.
 fn collect_local_models(
-    quic_mesh: &Arc<IrohMeshManager>,
+    mesh_services_registry: &Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Vec<crate::mesh::peer_store::PeerModelInfo> {
-    let registry = quic_mesh.service_registry();
-    registry
-        .local_services()
-        .into_iter()
+    let local = mesh_services_registry.local();
+    local
+        .services
+        .iter()
         .flat_map(|svc| {
-            let kind = svc.service_type.clone();
-            let backend = svc.engine_id.clone().unwrap_or_default();
-            let sizes = svc.model_sizes_mb.clone();
+            let kind = svc.category.clone();
+            let backend = svc.engine_id.clone();
             let loaded = matches!(svc.status.as_str(), "running" | "ready");
-            svc.models.into_iter().enumerate().map(move |(idx, alias)| {
-                crate::mesh::peer_store::PeerModelInfo {
-                    alias,
+            svc.models
+                .iter()
+                .map(move |m| crate::mesh::peer_store::PeerModelInfo {
+                    alias: m.model_name.clone(),
                     kind: kind.clone(),
                     backend: backend.clone(),
-                    size_mb: sizes.get(idx).copied().unwrap_or(0),
+                    size_mb: 0,
                     loaded,
-                }
-            })
+                })
         })
         .collect()
 }
@@ -2080,8 +2260,7 @@ fn spawn_slow_refresh(
                 // chcemy zeby stary set adresow wrocil do peer_store.
                 let addresses = match db_for_task.as_ref() {
                     Some(db) => {
-                        let filters =
-                            crate::mesh::network_interfaces::load_advertise_filters(db);
+                        let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
                         let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
                         crate::mesh::network_interfaces::filter_advertise_ips(
                             &raw, &filters, &kind_map,

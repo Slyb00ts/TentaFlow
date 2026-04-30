@@ -8,6 +8,7 @@ pub mod api_apikeys;
 pub mod api_auth;
 pub mod api_clusters;
 pub mod api_dashboard;
+pub mod api_deploy_recommend;
 pub mod api_fast_path;
 pub mod api_flows;
 pub mod api_hub;
@@ -17,12 +18,9 @@ pub mod api_nim;
 pub mod api_pii_rules;
 pub mod api_prompts;
 pub mod api_registries;
-pub mod api_services;
 pub mod api_services_manifest;
-pub mod api_deploy_recommend;
 pub mod api_tts_rules;
 pub mod auth;
-pub mod auto_register;
 pub mod handlers_addon_lifecycle;
 pub mod handlers_addon_oauth;
 pub mod handlers_addon_permissions;
@@ -37,7 +35,6 @@ pub mod server;
 pub mod static_files;
 pub mod vnc_tunnel;
 pub mod ws_binary;
-pub mod ws_deploy;
 pub mod ws_metrics;
 
 #[cfg(feature = "inference-diarization")]

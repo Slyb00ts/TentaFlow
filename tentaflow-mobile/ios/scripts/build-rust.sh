@@ -7,6 +7,42 @@ CORE_DIR="$PROJECT_ROOT/core"
 
 echo "=== Building TentaFlow Mobile (Rust core) ==="
 
+# Pre-flight: vision modele musza byc na dysku zanim build.rs odpali
+# embed_vision_models. Bez tego embedded blob'y sa puste i deploy yolov8n-pose
+# / movenet-lightning na iOS wybucha na "vision model is not available after
+# download". Pobieramy inline (idempotentne — skip gdy plik > 100KB istnieje)
+# zeby build-rust.sh nie wymagal wczesniejszego odpalenia setup.sh.
+VISION_DIR="$PROJECT_ROOT/../tentaflow-core/models/vision"
+mkdir -p "$VISION_DIR"
+fetch_vision_model() {
+    local fname="$1"; local url="$2"
+    local target="$VISION_DIR/$fname"
+    if [ -f "$target" ] && [ "$(wc -c < "$target")" -ge 102400 ]; then
+        return 0
+    fi
+    echo "Pobieram $fname (brak lub za maly w $VISION_DIR)"
+    if ! curl -fL "$url" -o "$target.tmp" 2>&1 | tail -1; then
+        echo "WARN: pobieranie $fname nie powiodlo sie"
+        rm -f "$target.tmp"
+        return 1
+    fi
+    mv "$target.tmp" "$target"
+}
+fetch_vision_model "yolov8-face.onnx" \
+    "https://huggingface.co/AdamCodd/YOLOv11n-face-detection/resolve/main/model.onnx"
+fetch_vision_model "hsemotion.onnx" \
+    "https://github.com/HSE-asavchenko/face-emotion-recognition/raw/main/models/affectnet_emotions/onnx/enet_b0_8_best_afew.onnx"
+fetch_vision_model "mivolo_age.onnx" \
+    "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/age_gender/models/age_googlenet.onnx"
+fetch_vision_model "mivolo_gender.onnx" \
+    "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/age_gender/models/gender_googlenet.onnx"
+fetch_vision_model "yolov8n-pose.onnx" \
+    "https://huggingface.co/Xenova/yolov8n-pose/resolve/main/onnx/model.onnx"
+fetch_vision_model "movenet-lightning.onnx" \
+    "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/main/onnx/model.onnx"
+# Uwaga: scrfd.onnx wymaga unzip z buffalo_s.zip — robi to wylacznie setup.sh.
+# Jesli go brak na dysku, deploy SCRFD bedzie failowal; build kontynuuje.
+
 # Synchronizuj wersje clang w pbxproj z aktywnym Xcode. Po major upgrade Xcode
 # hardcoded sciezki do libclang_rt.ios.a pokazuja na starsza wersje clang i
 # linker sypie 'No such file or directory'. Skrypt jest idempotentny.

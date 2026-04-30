@@ -73,7 +73,9 @@ fn parse_relay_url(raw: &str) -> Result<RelayUrl, String> {
         .map_err(|e: url::ParseError| format!("blad parsowania: {e}"))?;
     match url.scheme() {
         "http" | "https" => Ok(url.into()),
-        other => Err(format!("nieobslugiwany scheme `{other}` (wymagany http/https)")),
+        other => Err(format!(
+            "nieobslugiwany scheme `{other}` (wymagany http/https)"
+        )),
     }
 }
 

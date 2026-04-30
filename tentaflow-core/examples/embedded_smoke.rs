@@ -92,9 +92,7 @@ async fn run_whisper(
 #[cfg(feature = "inference-sherpa")]
 fn run_sherpa(model_dir: std::path::PathBuf) -> anyhow::Result<()> {
     use std::time::Instant;
-    use tentaflow_core::tts::{
-        sherpa::SherpaTtsEngine, SynthesizeParams, TtsEngine,
-    };
+    use tentaflow_core::tts::{sherpa::SherpaTtsEngine, SynthesizeParams, TtsEngine};
 
     eprintln!("=== embedded_smoke: sherpa-onnx ===");
     eprintln!("model dir = {}", model_dir.display());
@@ -185,54 +183,54 @@ async fn main() -> anyhow::Result<()> {
             llamacpp::LlamaCppEngine, GenerateParams, InferenceEngine,
         };
 
-    let model_path = first
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/mnt/d/models/Qwen3.5-0.8B-Q4_0.gguf"));
+        let model_path = first
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/mnt/d/models/Qwen3.5-0.8B-Q4_0.gguf"));
 
-    if !model_path.exists() {
-        anyhow::bail!("model file not found: {}", model_path.display());
-    }
-    eprintln!("=== embedded_smoke: llama-cpp ===");
-    eprintln!("model = {}", model_path.display());
+        if !model_path.exists() {
+            anyhow::bail!("model file not found: {}", model_path.display());
+        }
+        eprintln!("=== embedded_smoke: llama-cpp ===");
+        eprintln!("model = {}", model_path.display());
 
-    let started = std::time::Instant::now();
-    let engine = LlamaCppEngine::new();
-    let info = engine.load_model(&model_path, Some(99)).await?;
-    eprintln!(
-        "+++ loaded in {:.1}s — name={} ctx={} backend={} vram={}MB",
-        started.elapsed().as_secs_f32(),
-        info.name,
-        info.context_length,
-        info.backend,
-        info.vram_used_mb,
-    );
+        let started = std::time::Instant::now();
+        let engine = LlamaCppEngine::new();
+        let info = engine.load_model(&model_path, Some(99)).await?;
+        eprintln!(
+            "+++ loaded in {:.1}s — name={} ctx={} backend={} vram={}MB",
+            started.elapsed().as_secs_f32(),
+            info.name,
+            info.context_length,
+            info.backend,
+            info.vram_used_mb,
+        );
 
-    let params = GenerateParams {
-        prompt: "Reply with exactly one word: OK".to_string(),
-        max_tokens: 16,
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 1,
-        repeat_penalty: 1.0,
-        stop_sequences: vec![],
-        system_prompt: None,
-    };
+        let params = GenerateParams {
+            prompt: "Reply with exactly one word: OK".to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 1,
+            repeat_penalty: 1.0,
+            stop_sequences: vec![],
+            system_prompt: None,
+        };
 
-    let gen_started = std::time::Instant::now();
-    let result = engine.generate(params).await?;
-    let gen_elapsed = gen_started.elapsed();
-    eprintln!(
-        "+++ generate ok in {:.2}s — text={:?} tokens={}",
-        gen_elapsed.as_secs_f32(),
-        result.text,
-        result.tokens_generated,
-    );
+        let gen_started = std::time::Instant::now();
+        let result = engine.generate(params).await?;
+        let gen_elapsed = gen_started.elapsed();
+        eprintln!(
+            "+++ generate ok in {:.2}s — text={:?} tokens={}",
+            gen_elapsed.as_secs_f32(),
+            result.text,
+            result.tokens_generated,
+        );
 
-    println!(
+        println!(
         "=== SUMMARY llama-cpp embedded: load_ok=true generate_ok=true total={:.1}s text={:?} ===",
         started.elapsed().as_secs_f32(),
         result.text,
     );
-    Ok(())
+        Ok(())
     } // cfg(feature = "inference-llamacpp")
 }

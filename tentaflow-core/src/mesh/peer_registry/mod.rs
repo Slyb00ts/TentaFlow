@@ -566,11 +566,7 @@ impl PeerRegistry {
     }
 
     /// Replace the container list for an entry.
-    pub fn set_containers(
-        &self,
-        id: &NodeId,
-        containers: Arc<[PeerContainerInfo]>,
-    ) -> PeerOutcome {
+    pub fn set_containers(&self, id: &NodeId, containers: Arc<[PeerContainerInfo]>) -> PeerOutcome {
         let Some(arc) = self.get_arc(id) else {
             return PeerOutcome::NoChange;
         };
@@ -610,8 +606,7 @@ impl PeerRegistry {
         let mut out = Vec::new();
         let now = Instant::now();
         for shard in self.shards.iter() {
-            let entries: Vec<Arc<RwLock<PeerEntry>>> =
-                shard.map.read().values().cloned().collect();
+            let entries: Vec<Arc<RwLock<PeerEntry>>> = shard.map.read().values().cloned().collect();
             for arc in entries {
                 let g = arc.read();
                 out.push(summary_from(&g, now));
@@ -636,8 +631,7 @@ impl PeerRegistry {
 
     pub fn for_each_connected<F: FnMut(&PeerEntry)>(&self, mut f: F) {
         for shard in self.shards.iter() {
-            let entries: Vec<Arc<RwLock<PeerEntry>>> =
-                shard.map.read().values().cloned().collect();
+            let entries: Vec<Arc<RwLock<PeerEntry>>> = shard.map.read().values().cloned().collect();
             for arc in entries {
                 let g = arc.read();
                 if matches!(g.conn, ConnectionState::Connected { .. }) {

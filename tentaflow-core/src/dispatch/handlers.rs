@@ -11,8 +11,8 @@ use tentaflow_protocol::{
     ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse,
     DashboardSnapshot, FlowDetail, FlowExecutionSummary, FlowSummary, HubEngineSummary,
     MeshPairInitResponse, MeshPeerSummary, MessageBody, ModelDetail, ModelSummary, PromptDetail,
-    PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
-    ServiceQuicStatus, ServiceSummary, SessionAuth, SettingEntry, TtsRule,
+    PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary, SessionAuth, SettingEntry,
+    TtsRule,
 };
 
 use super::HandlerContext;
@@ -377,11 +377,19 @@ pub fn model_list_request(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
+    // Source the model list from the unified services pipeline. Each row in
+    // `model_registry` carries the model name + the service it is hosted on;
+    // status/category come from the joined `services` row.
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let rows = crate::services_repo::models::list_alive(&conn).map_err(db_err)?;
+    drop(conn);
 
-    // ACL filter — gdy zalogowany user nie-admin, ukrywamy modele do ktorych
-    // jego grupa lub on sam ma deny. Anonymous sees nothing additional (full
-    // list — fallback do legacy zachowania, niezalogowani na wewn. dashboardzie).
+    let local_node_id = ctx.state.local_node_id.as_ref().to_string();
+
     let user_acl = match &ctx.session {
         crate::dispatch::SessionAuth::UserSession { user_id, role, .. } => {
             let role_str = role.clone().unwrap_or_else(|| "user".to_string());
@@ -396,40 +404,112 @@ pub fn model_list_request(
         _ => None,
     };
 
-    let models: Vec<ModelSummary> = services
+    let mut models: Vec<ModelSummary> = rows
         .into_iter()
-        .filter(|s| match &user_acl {
-            Some((uid, role)) => {
-                crate::routing::acl::check_access_safe(&ctx.state.db, "model", &s.name, *uid, role)
-            }
+        .filter(|m| match &user_acl {
+            Some((uid, role)) => crate::routing::acl::check_access_safe(
+                &ctx.state.db,
+                "model",
+                &m.model_name,
+                *uid,
+                role,
+            ),
             None => true,
         })
-        .map(|s| {
-            // display_name: parsuj `deployed_model` z config_json (np.
-            // "Qwen/Qwen3.5-0.8B") zeby GUI pokazywalo HF repo a nie nazwe
-            // service'u (typu "tentaflow-vllm-metal-2izlb"). Fallback: nazwa.
-            let display_name = serde_json::from_str::<serde_json::Value>(&s.config_json)
-                .ok()
-                .and_then(|v| v.get("deployed_model").and_then(|m| m.as_str()).map(String::from))
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| s.name.clone());
-            // engine_id: takze z config_json (vllm-metal/mlx/llama-cpp), nie
-            // service_type (= zawsze "llm"/"stt"/...).
-            let engine_id = serde_json::from_str::<serde_json::Value>(&s.config_json)
-                .ok()
-                .and_then(|v| v.get("engine").and_then(|m| m.as_str()).map(String::from))
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| s.service_type.clone());
+        .map(|m| {
+            let display_name = m
+                .display_name
+                .clone()
+                .unwrap_or_else(|| m.model_name.clone());
+            let capabilities = parse_capabilities_array(&m.capabilities);
+            let category = capability_to_category(&m.capabilities);
             ModelSummary {
-                id: s.name,
+                id: m.model_name.clone(),
+                model_name: m.model_name,
                 display_name,
-                category: s.model_category.unwrap_or_else(|| "llm".into()),
-                engine_id,
-                availability: s.status,
+                category,
+                engine_id: m.engine_id,
+                service_id: m.service_id,
+                node_id: local_node_id.clone(),
+                availability: m.status,
+                transport: m.transport,
+                endpoint_url: m.endpoint_url,
+                capabilities,
+                context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
+                quantization: m.quantization,
+                is_default: m.is_default,
             }
         })
         .collect();
+
+    // Merge model entries advertised by other mesh nodes (krok N3b). Each
+    // peer's `ServiceInfo` rolls up its own model rows; we flatten back into
+    // the legacy `ModelSummary` view the GUI expects, tagging every row with
+    // the owning node so the GUI can group / filter by host.
+    for (_peer_node_id, snapshot) in ctx.state.mesh_services_registry.all_remote() {
+        for svc in snapshot {
+            for entry in &svc.models {
+                let display_name = entry
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| entry.model_name.clone());
+                let category = match entry.capabilities.first().map(String::as_str) {
+                    Some("chat") => "llm".to_string(),
+                    Some(other) => other.to_string(),
+                    None => "llm".to_string(),
+                };
+                models.push(ModelSummary {
+                    id: entry.model_name.clone(),
+                    model_name: entry.model_name.clone(),
+                    display_name,
+                    category,
+                    engine_id: svc.engine_id.clone(),
+                    service_id: svc.id,
+                    node_id: svc.node_id.clone(),
+                    availability: svc.status.clone(),
+                    transport: svc.transport.clone(),
+                    endpoint_url: svc.endpoint_url.clone(),
+                    capabilities: entry.capabilities.clone(),
+                    context_length: entry.context_length,
+                    quantization: entry.quantization.clone(),
+                    is_default: entry.is_default,
+                });
+            }
+        }
+    }
+
     Ok(MessageBody::ModelListResponse { models })
+}
+
+/// Parses the JSON-encoded capabilities array from `model_registry.capabilities`.
+/// Defaults to an empty vector on malformed input — never fails.
+fn parse_capabilities_array(capabilities_json: &str) -> Vec<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(capabilities_json).unwrap_or(serde_json::Value::Null);
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Maps the JSON-encoded capabilities array (e.g. `["chat"]`) onto a coarse
+/// category bucket the GUI uses for filtering. Unknown / empty defaults to llm.
+fn capability_to_category(capabilities_json: &str) -> String {
+    let value: serde_json::Value =
+        serde_json::from_str(capabilities_json).unwrap_or(serde_json::Value::Null);
+    let first = value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str());
+    match first {
+        Some("chat") => "llm".into(),
+        Some(other) => other.to_string(),
+        None => "llm".into(),
+    }
 }
 
 #[handler(variant = "ModelDetailRequest", since = (1, 0))]
@@ -444,20 +524,28 @@ pub fn model_detail_request(
         _ => return Err(ProtocolError::bad_request("expected ModelDetailRequest")),
     };
 
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let svc = services
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let row = crate::services_repo::models::list_alive(&conn)
+        .map_err(db_err)?
         .into_iter()
-        .find(|s| s.name == *model_id)
+        .find(|m| m.model_name == *model_id)
         .ok_or_else(|| ProtocolError::not_found("model not found"))?;
 
     Ok(MessageBody::ModelDetailResponse(ModelDetail {
-        id: svc.name,
-        category: svc.model_category.unwrap_or_else(|| "llm".into()),
-        engine_id: svc.service_type,
+        id: row.model_name.clone(),
+        category: capability_to_category(&row.capabilities),
+        engine_id: row.engine_id,
         local_path: None,
         size_bytes: 0,
-        availability: svc.status,
-        description: format!("Service strategy: {}", svc.strategy),
+        availability: row.status,
+        description: format!(
+            "Hosted by service id={} ({})",
+            row.service_id, row.deploy_method
+        ),
         checksum_sha256: None,
     }))
 }
@@ -495,25 +583,32 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         _ => return Err(ProtocolError::bad_request("expected ModelDeleteRequest")),
     };
 
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let svc = services
-        .into_iter()
-        .find(|s| s.name == *model_id)
-        .ok_or_else(|| ProtocolError::not_found("model not found"))?;
+    // Resolve the model to its hosting service via the unified registry, then
+    // delete the service row (cascade removes the model registry entry).
+    let (service_id, engine_id) = {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        let row = crate::services_repo::models::list_alive(&conn)
+            .map_err(db_err)?
+            .into_iter()
+            .find(|m| m.model_name == *model_id)
+            .ok_or_else(|| ProtocolError::not_found("model not found"))?;
+        (row.service_id, row.engine_id)
+    };
 
-    // Cascade — usun wpisy w `model_registry` powiazane z tym serwisem,
-    // inaczej zostaja jako sierota w panelu Modele po deleted serwisu.
-    if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, svc.id) {
-        tracing::warn!(service_id = svc.id, "delete_model_entries_by_service: {}", e);
+    let _ = engine_id; // mesh dereg now driven by supervisor + services_repo delete
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::delete(&conn, service_id).map_err(db_err)?;
     }
-    // Wyrejestruj z mesh registry, inaczej router dalej forwarduje requesty
-    // na nieistniejacy serwis ("Mesh STT serwis nie polaczony").
-    let mesh_service_id = format!("native-{}-{}", svc.service_type, svc.name);
-    ctx.state
-        .router
-        .unregister_native_service_from_mesh(&mesh_service_id);
-
-    repository::delete_service(&ctx.state.db, svc.id).map_err(db_err)?;
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
@@ -521,8 +616,8 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         user_id,
         None,
         "model.delete",
-        Some(&format!("model:{}", svc.id)),
-        Some(&svc.name),
+        Some(&format!("model:{}", service_id)),
+        Some(model_id),
         None,
         Some(&ctx.state.local_node_id),
     );
@@ -856,13 +951,22 @@ pub fn flow_node_templates_list(
     let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
         .map(|t| {
-            let (input_ports, output_ports) = match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
-                Some(adapter) => (
-                    adapter.supported_input_ports().iter().map(|s| s.to_string()).collect(),
-                    adapter.supported_output_ports().iter().map(|s| s.to_string()).collect(),
-                ),
-                None => (Vec::new(), Vec::new()),
-            };
+            let (input_ports, output_ports) =
+                match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
+                    Some(adapter) => (
+                        adapter
+                            .supported_input_ports()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        adapter
+                            .supported_output_ports()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
             tentaflow_protocol::FlowNodeTemplate {
                 id: t.id,
                 node_type: t.node_type,
@@ -1856,554 +1960,6 @@ pub fn dashboard_metrics(
 }
 
 // =============================================================================
-// Services (deployments)
-// =============================================================================
-
-#[handler(variant = "ServiceListRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub fn service_list(
-    _req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let peers = ctx.state.mesh_peer_store.list();
-
-    let summaries: Vec<ServiceSummary> = services
-        .into_iter()
-        .map(|s| {
-            let node_hostname = s.node_id.as_ref().and_then(|nid| {
-                peers
-                    .iter()
-                    .find(|p| p.node_id == *nid)
-                    .map(|p| p.hostname.clone())
-            });
-            let (engine_id, model_id, deploy_method, endpoint_url) =
-                extract_deploy_fields(&s.service_type, &s.strategy, &s.config_json);
-            ServiceSummary {
-                id: s.id.to_string(),
-                name: s.name,
-                service_type: s.service_type,
-                strategy: s.strategy,
-                status: s.status,
-                config_json: s.config_json,
-                node_id: s.node_id,
-                node_hostname,
-                created_at: s.created_at.clone(),
-                deploy_method,
-                endpoint_url,
-                started_at_epoch: parse_ts_opt(&Some(s.created_at)),
-                engine_id,
-                model_id,
-                pinned: s.pinned,
-                paused: s.paused,
-                deployed_source_hash: s.deployed_source_hash,
-            }
-        })
-        .collect();
-    Ok(MessageBody::ServiceListResponse {
-        services: summaries,
-    })
-}
-
-/// Wyciaga pola specyficzne dla deployu silnika z config_json serwisu.
-/// Zwraca (engine_id, model_id, deploy_method, endpoint_url) dla serwisow
-/// pochodzacych z katalogu silnikow; dla user-defined endpointow wszystkie
-/// pola sa None poza endpoint_url ktory moze zawierac quic_url.
-fn extract_deploy_fields(
-    service_type: &str,
-    strategy: &str,
-    config_json: &str,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
-    let parsed: serde_json::Value = match serde_json::from_str(config_json) {
-        Ok(v) => v,
-        Err(_) => return (None, None, None, None),
-    };
-    let deploy_method = parsed
-        .get("deploy_method")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let endpoint_url = parsed
-        .get("quic_url")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| {
-            parsed
-                .get("endpoint_url")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        });
-
-    if deploy_method.is_some() {
-        // Serwis stworzony przez ServiceDeployRequest z katalogu silnikow:
-        // engine_id = service_type, model_id = name, strategy = deploy_method.
-        (
-            Some(service_type.to_string()),
-            Some(strategy.to_string()),
-            deploy_method,
-            endpoint_url,
-        )
-    } else {
-        (None, None, None, endpoint_url)
-    }
-}
-
-#[handler(variant = "ServiceCreateRequest", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub fn service_create(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::ServiceCreateRequestBody(p) => p,
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "expected ServiceCreateRequestBody",
-            ))
-        }
-    };
-
-    if payload.name.trim().is_empty() {
-        return Err(ProtocolError::bad_request("name is required"));
-    }
-    if !matches!(
-        payload.service_type.as_str(),
-        "llm" | "embedding" | "stt" | "tts" | "rag" | "tools" | "memory" | "reranker"
-    ) {
-        return Err(ProtocolError::bad_request(
-            "service_type must be one of llm/embedding/stt/tts/rag/tools/memory/reranker",
-        ));
-    }
-    let strategy = if payload.strategy.is_empty() {
-        "single"
-    } else {
-        payload.strategy.as_str()
-    };
-
-    // config_json wchodzi jako juz serializowany string z klienta, walidacja ze
-    // jest to poprawny JSON zeby zablokowac trash w DB.
-    let _: serde_json::Value = serde_json::from_str(&payload.config_json)
-        .map_err(|_| ProtocolError::bad_request("config_json must be valid JSON"))?;
-
-    let id = repository::create_service(
-        &ctx.state.db,
-        &payload.name,
-        &payload.service_type,
-        strategy,
-        None,
-        &payload.config_json,
-    )
-    .map_err(db_err)?;
-
-    // Po stworzeniu uzupelniamy node_id jezeli zostal podany — osobnym updatem.
-    if let Some(node_id_hex) = payload.node_id.as_deref() {
-        if !node_id_hex.is_empty() {
-            repository::set_service_node_id(&ctx.state.db, id, Some(node_id_hex))
-                .map_err(db_err)?;
-        }
-    }
-
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id,
-        None,
-        "service.create",
-        Some(&id.to_string()),
-        Some(&payload.name),
-        None,
-        Some(&ctx.state.local_node_id),
-    );
-
-    Ok(MessageBody::ServiceCreateResponse { id: id.to_string() })
-}
-
-#[handler(variant = "ServiceUpdateRequest", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub fn service_update(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::ServiceUpdateRequestBody(p) => p,
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "expected ServiceUpdateRequestBody",
-            ))
-        }
-    };
-
-    let id: i64 = payload
-        .id
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("id must be integer"))?;
-
-    // Sprawdz czy serwis istnieje — repository::update_service nie zwraca
-    // informacji o liczbie wierszy (zawsze Ok(())).
-    let exists = repository::get_service(&ctx.state.db, id)
-        .map_err(db_err)?
-        .is_some();
-    if !exists {
-        return Ok(MessageBody::ServiceUpdateResponse { updated: false });
-    }
-
-    let _: serde_json::Value = serde_json::from_str(&payload.config_json)
-        .map_err(|_| ProtocolError::bad_request("config_json must be valid JSON"))?;
-
-    repository::update_service(
-        &ctx.state.db,
-        id,
-        &payload.name,
-        &payload.service_type,
-        &payload.strategy,
-        None,
-        &payload.status,
-        &payload.config_json,
-    )
-    .map_err(db_err)?;
-
-    let node_id_opt = payload.node_id.as_deref().filter(|s| !s.is_empty());
-    repository::set_service_node_id(&ctx.state.db, id, node_id_opt).map_err(db_err)?;
-
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id,
-        None,
-        "service.update",
-        Some(&id.to_string()),
-        Some(&payload.name),
-        None,
-        Some(&ctx.state.local_node_id),
-    );
-
-    Ok(MessageBody::ServiceUpdateResponse { updated: true })
-}
-
-#[handler(variant = "ServiceQuicStatusRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub fn service_quic_status(
-    _req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    // Zwraca lista (name, status) dla kazdego serwisu ze statusem okreslonym
-    // na podstawie pola `status` w DB + probki konfiguracji. Realna probe QUIC
-    // przez iroh jest wykonywana przez tlo background task — tu zwracamy
-    // ostatni znany stan.
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let statuses: Vec<ServiceQuicStatus> = services
-        .into_iter()
-        .map(|s| ServiceQuicStatus {
-            name: s.name,
-            status: map_db_status_to_quic(&s.status, &s.config_json),
-        })
-        .collect();
-    Ok(MessageBody::ServiceQuicStatusResponse { statuses })
-}
-
-/// Mapa statusu z DB + konfiguracji na reprezentacje uzywana przez GUI.
-fn map_db_status_to_quic(db_status: &str, config_json: &str) -> String {
-    let has_quic = serde_json::from_str::<serde_json::Value>(config_json)
-        .ok()
-        .and_then(|v| {
-            v.get("quic_url")
-                .and_then(|q| q.as_str())
-                .map(|s| !s.is_empty())
-        })
-        .unwrap_or(false);
-
-    if !has_quic && db_status != "running" {
-        return "config_error".to_string();
-    }
-    match db_status {
-        "running" => "connected".to_string(),
-        "starting" => "connecting".to_string(),
-        "stopped" | "inactive" => "disconnected".to_string(),
-        "error" => "config_error".to_string(),
-        "ready" | "active" => "ready".to_string(),
-        _ => "none".to_string(),
-    }
-}
-
-#[handler(variant = "ServiceDeployRequest", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub fn service_deploy(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::ServiceDeployRequestBody(p) => p,
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "expected ServiceDeployRequestBody",
-            ))
-        }
-    };
-
-    if payload.engine_id.is_empty() || payload.model_id.is_empty() {
-        return Err(ProtocolError::bad_request(
-            "engine_id and model_id required",
-        ));
-    }
-    if !matches!(
-        payload.deploy_method.as_str(),
-        "docker" | "native" | "external"
-    ) {
-        return Err(ProtocolError::bad_request(
-            "deploy_method must be docker/native/external",
-        ));
-    }
-
-    let config_json = serde_json::json!({
-        "deploy_method": payload.deploy_method,
-        "node_id": hex::encode(payload.node_id),
-    })
-    .to_string();
-
-    let service_row_id = repository::create_service(
-        &ctx.state.db,
-        &payload.model_id,
-        &payload.engine_id,
-        &payload.deploy_method,
-        None,
-        &config_json,
-    )
-    .map_err(db_err)?;
-
-    repository::set_service_node_id(
-        &ctx.state.db,
-        service_row_id,
-        Some(&hex::encode(payload.node_id)),
-    )
-    .map_err(db_err)?;
-
-    let deploy_id = service_row_id.to_string();
-
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id,
-        None,
-        "service.deploy",
-        Some(&deploy_id),
-        Some(&format!("{}/{}", payload.engine_id, payload.model_id)),
-        None,
-        Some(&ctx.state.local_node_id),
-    );
-
-    Ok(MessageBody::ServiceDeployAccepted { deploy_id })
-}
-
-#[handler(variant = "ServiceStopRequest", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub async fn service_stop(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let service_id_str = match req {
-        MessageBody::ServiceStopRequest { service_id } => service_id,
-        _ => return Err(ProtocolError::bad_request("expected ServiceStopRequest")),
-    };
-    let service_id: i64 = service_id_str
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("service_id must be integer"))?;
-
-    // Existence check via list — delete_service nie raisuje na missing.
-    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
-    let svc = match services.iter().find(|s| s.id == service_id) {
-        Some(s) => s.clone(),
-        None => return Ok(MessageBody::ServiceStopResponse { stopped: false }),
-    };
-
-    // Przed delete z DB: zabij podleglu proces (native) albo kontener (docker)
-    // zeby nie zostawic zombie zajmujacego RAM/VRAM/GPU. Brak zabicia NIE
-    // zatrzymuje delete — wpis serwisu i tak znika, user dostaje warning
-    // w logu audytu.
-    let config: serde_json::Value =
-        serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
-    let deploy_mode = config
-        .get("deploy_mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let mut stop_warnings: Vec<String> = Vec::new();
-
-    if deploy_mode == "native" {
-        if let Some(pid) = config.get("pid").and_then(|v| v.as_u64()) {
-            match crate::deploy::process_ctl::terminate(pid as u32) {
-                Ok(killed) => {
-                    if killed {
-                        tracing::info!(
-                            service = %svc.name, pid, "native service: proces zabity"
-                        );
-                    } else {
-                        tracing::info!(
-                            service = %svc.name, pid,
-                            "native service: PID juz martwy przed stop"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        service = %svc.name, pid, error = %e,
-                        "native service: blad podczas zabijania PID"
-                    );
-                    stop_warnings.push(format!("kill PID {} nieudane: {:#}", pid, e));
-                }
-            }
-        }
-    } else if deploy_mode == "docker" {
-        #[cfg(feature = "docker")]
-        {
-            if let Some(container) = config
-                .get("container_name")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                if let Err(e) = crate::deploy::docker::stop(container).await {
-                    tracing::warn!(
-                        service = %svc.name, container, error = %e,
-                        "docker service: blad zatrzymywania kontenera"
-                    );
-                    stop_warnings.push(format!("docker stop {} nieudane: {:#}", container, e));
-                } else {
-                    tracing::info!(service = %svc.name, container, "docker kontener zatrzymany");
-                }
-            }
-        }
-    }
-
-    // Usun powiazane wpisy model_registry — inaczej GUI Modele pokazuje stale
-    // status (Załadowany / Niezaładowany) mimo ze serwis juz nie istnieje.
-    if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, service_id) {
-        tracing::warn!(
-            service = %svc.name, error = %e,
-            "delete_model_entries_by_service nieudane"
-        );
-        stop_warnings.push(format!("cleanup model_registry nieudany: {:#}", e));
-    }
-
-    // Usun klucz Ed25519 + config sidecara — inaczej redeploy z ta sama nazwa
-    // wskrzesilby stary EndpointId (i zywego peera-zombie w discovery DHT/mDNS).
-    if deploy_mode == "docker" {
-        let sidecar_dir = crate::paths::tentaflow_home()
-            .join("sidecar-keys")
-            .join(&svc.name);
-        if sidecar_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&sidecar_dir) {
-                tracing::warn!(
-                    service = %svc.name, dir = %sidecar_dir.display(), error = %e,
-                    "cleanup sidecar-keys nieudany"
-                );
-                stop_warnings.push(format!("cleanup sidecar-keys nieudany: {:#}", e));
-            }
-        }
-    }
-
-    repository::delete_service(&ctx.state.db, service_id).map_err(db_err)?;
-
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let audit_detail = if stop_warnings.is_empty() {
-        format!("service:{}", service_id)
-    } else {
-        format!("service:{} warnings=[{}]", service_id, stop_warnings.join("; "))
-    };
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id,
-        None,
-        "service.stop",
-        Some(&audit_detail),
-        None,
-        None,
-        Some(&ctx.state.local_node_id),
-    );
-
-    Ok(MessageBody::ServiceStopResponse { stopped: true })
-}
-
-#[handler(variant = "ServiceFlagsBody", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub async fn service_flags_update(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let (service_id_str, pinned_opt, paused_opt) = match req {
-        MessageBody::ServiceFlagsBody(tentaflow_protocol::ServiceFlagsPayload::Req(r)) => {
-            (&r.service_id, r.pinned, r.paused)
-        }
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "expected ServiceFlagsUpdateRequest",
-            ))
-        }
-    };
-    let service_id: i64 = service_id_str
-        .parse()
-        .map_err(|_| ProtocolError::bad_request("service_id must be integer"))?;
-
-    let svc = repository::list_services(&ctx.state.db)
-        .map_err(db_err)?
-        .into_iter()
-        .find(|s| s.id == service_id)
-        .ok_or_else(|| ProtocolError::not_found("service not found"))?;
-
-    if let Some(p) = pinned_opt {
-        repository::set_service_pinned(&ctx.state.db, service_id, p).map_err(db_err)?;
-        let _ = crate::memory::guard_global().set_pinned(&svc.name, p);
-    }
-    if let Some(p) = paused_opt {
-        repository::set_service_paused(&ctx.state.db, service_id, p).map_err(db_err)?;
-        let _ = crate::memory::guard_global().set_paused(&svc.name, p);
-        // Pause = natychmiast zwolnij VRAM (nie czekaj do restartu).
-        if p {
-            if let Err(e) = crate::memory::guard_global().force_unload(&svc.name).await {
-                tracing::warn!(service = %svc.name, error = %e,
-                    "service_flags_update: force_unload przy pause nieudany");
-            }
-        }
-    }
-
-    let final_pinned = pinned_opt.unwrap_or(svc.pinned);
-    let final_paused = paused_opt.unwrap_or(svc.paused);
-
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id,
-        None,
-        "service.flags_update",
-        Some(&format!(
-            "service:{} pinned={} paused={}",
-            service_id, final_pinned, final_paused
-        )),
-        None,
-        None,
-        Some(&ctx.state.local_node_id),
-    );
-
-    Ok(MessageBody::ServiceFlagsBody(
-        tentaflow_protocol::ServiceFlagsPayload::Res(
-            tentaflow_protocol::ServiceFlagsUpdateResponse {
-                ok: true,
-                pinned: final_pinned,
-                paused: final_paused,
-            },
-        ),
-    ))
-}
-
-// =============================================================================
 // Prompts
 // =============================================================================
 
@@ -2624,7 +2180,6 @@ pub fn tts_rule_delete(
     Ok(MessageBody::TtsRuleDeleteResponse { deleted: true })
 }
 
-
 #[handler(variant = "PiiRuleListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -2661,7 +2216,11 @@ pub fn vision_infer(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::VisionBody(tentaflow_protocol::VisionInferPayload::InferRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected VisionBody/InferRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected VisionBody/InferRequest",
+            ))
+        }
     };
 
     let started = std::time::Instant::now();
@@ -2688,28 +2247,51 @@ pub fn vision_infer(
         .map_err(|e| ProtocolError::internal(&format!("vision::infer: {e}")))?;
 
     let result = match out {
-        crate::vision::InferOutput::Faces(faces) => {
-            tentaflow_protocol::VisionInferResult::Faces(
-                faces
-                    .into_iter()
-                    .map(|f| tentaflow_protocol::VisionFaceDet {
-                        x1: f.bbox.0,
-                        y1: f.bbox.1,
-                        x2: f.bbox.2,
-                        y2: f.bbox.3,
-                        score: f.score,
-                        keypoints: f
-                            .keypoints
-                            .map(|k| k.iter().map(|p| (p.0, p.1)).collect())
-                            .unwrap_or_default(),
-                    })
-                    .collect(),
-            )
+        crate::vision::InferOutput::Faces(faces) => tentaflow_protocol::VisionInferResult::Faces(
+            faces
+                .into_iter()
+                .map(|f| tentaflow_protocol::VisionFaceDet {
+                    x1: f.bbox.0,
+                    y1: f.bbox.1,
+                    x2: f.bbox.2,
+                    y2: f.bbox.3,
+                    score: f.score,
+                    keypoints: f
+                        .keypoints
+                        .map(|k| k.iter().map(|p| (p.0, p.1)).collect())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        ),
+        crate::vision::InferOutput::Poses(poses) => tentaflow_protocol::VisionInferResult::Poses(
+            poses
+                .into_iter()
+                .map(|p| tentaflow_protocol::VisionPoseDet {
+                    x1: p.bbox.0,
+                    y1: p.bbox.1,
+                    x2: p.bbox.2,
+                    y2: p.bbox.3,
+                    score: p.score,
+                    keypoints: p
+                        .keypoints
+                        .into_iter()
+                        .map(|k| tentaflow_protocol::VisionPoseKeypoint {
+                            id: k.id,
+                            name: k.name.to_string(),
+                            x: k.x,
+                            y: k.y,
+                            score: k.score,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        ),
+        crate::vision::InferOutput::AgeGender(ag) => {
+            tentaflow_protocol::VisionInferResult::AgeGender {
+                age_years: ag.age_years,
+                gender_male_prob: ag.gender_male_prob,
+            }
         }
-        crate::vision::InferOutput::AgeGender(ag) => tentaflow_protocol::VisionInferResult::AgeGender {
-            age_years: ag.age_years,
-            gender_male_prob: ag.gender_male_prob,
-        },
         crate::vision::InferOutput::Emotion(em) => tentaflow_protocol::VisionInferResult::Emotion {
             label: em.label,
             probabilities: em.probabilities,
@@ -3003,9 +2585,7 @@ pub async fn mesh_node_list(
                 now_ms,
             ))
         });
-        nodes.push(
-            store_peer_to_proto(local, local_node_id, true, route, connection).await,
-        );
+        nodes.push(store_peer_to_proto(local, local_node_id, true, route, connection).await);
         emitted.insert(local.node_id.clone());
     }
 
@@ -3042,9 +2622,7 @@ pub async fn mesh_node_list(
                         Some(r.next_hop.clone())
                     },
                 });
-            nodes.push(
-                store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await,
-            );
+            nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await);
         } else {
             // No peer_store entry — trusted node offline (or freshly seeded).
             // Render with whatever the registry knows; rich device fields stay
@@ -3101,9 +2679,7 @@ pub async fn mesh_node_list(
                     Some(r.next_hop.clone())
                 },
             });
-        nodes.push(
-            store_peer_to_proto(p, local_node_id, is_trusted, route, None).await,
-        );
+        nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, None).await);
     }
 
     Ok(MessageBody::MeshNodeListResponseBody(
@@ -3139,11 +2715,10 @@ pub async fn mesh_node_detail(
     })?;
     let is_local = peer.node_id == local_node_id;
     let registry = store.registry().cloned();
-    let summary = registry
-        .as_ref()
-        .and_then(|r| parse_node_id_hex(&peer.node_id).and_then(|id| {
-            r.snapshot_summary().into_iter().find(|s| s.node_id == id)
-        }));
+    let summary = registry.as_ref().and_then(|r| {
+        parse_node_id_hex(&peer.node_id)
+            .and_then(|id| r.snapshot_summary().into_iter().find(|s| s.node_id == id))
+    });
     let is_trusted = is_local
         || summary
             .as_ref()
@@ -3179,9 +2754,9 @@ pub async fn mesh_node_detail(
         .as_ref()
         .and_then(|qm| qm.connection_snapshot(&payload.node_id));
     let now_ms = crate::mesh::proto_conv::now_unix_ms();
-    let connection = summary.as_ref().map(|s| {
-        crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms)
-    });
+    let connection = summary
+        .as_ref()
+        .map(|s| crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms));
     let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
@@ -3296,24 +2871,18 @@ pub fn mesh_services_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let services: Vec<tentaflow_protocol::MeshServicesEntry> = match &ctx.state.quic_mesh {
-        Some(qm) => qm
-            .service_registry()
-            .visible_services()
-            .into_iter()
-            .map(|s| tentaflow_protocol::MeshServicesEntry {
-                service_name: s.service_name,
-                node_id: s.node_id,
-                status: s.status,
-                endpoint: if s.quic_url.is_empty() {
-                    None
-                } else {
-                    Some(s.quic_url)
-                },
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let services: Vec<tentaflow_protocol::MeshServicesEntry> = ctx
+        .state
+        .mesh_services_registry
+        .visible_services()
+        .into_iter()
+        .map(|s| tentaflow_protocol::MeshServicesEntry {
+            service_name: s.display_name,
+            node_id: s.node_id,
+            status: s.status,
+            endpoint: s.endpoint_url,
+        })
+        .collect();
     Ok(MessageBody::MeshServicesListResponseBody(
         tentaflow_protocol::MeshServicesListResponse { services },
     ))
@@ -3381,7 +2950,7 @@ pub fn models_unified_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let mut models = unified_from_service_registry(&ctx.state.quic_mesh);
+    let mut models = unified_from_service_registry(&ctx.state.mesh_services_registry);
     merge_peer_store_models(
         &mut models,
         &ctx.state.mesh_peer_store,
@@ -3399,9 +2968,9 @@ pub fn models_unified_list(
 }
 
 fn unified_from_service_registry(
-    quic_mesh: &Option<std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
+    registry: &std::sync::Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Vec<tentaflow_protocol::UnifiedModel> {
-    crate::api::dashboard::api_models::collect_unified(quic_mesh)
+    crate::api::dashboard::api_models::collect_unified(registry)
         .into_iter()
         .map(|m| tentaflow_protocol::UnifiedModel {
             model_name: m.model_name,
@@ -3813,7 +3382,7 @@ pub async fn nim_catalog_list(
 #[handler(variant = "ServiceManifestDeployRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_manifest_deploy(
+pub async fn service_manifest_deploy(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -3828,6 +3397,66 @@ pub fn service_manifest_deploy(
 
     if payload.engine_id.is_empty() || payload.node_id.is_empty() {
         return Err(ProtocolError::bad_request("engine_id i node_id wymagane"));
+    }
+
+    // Cross-node deploy forwarding (krok N3b). When the request targets a
+    // different mesh node, forward it as `ServiceDeployRemote` and return the
+    // slug allocated on the receiver. The deploy log websocket lives on the
+    // receiver side — cross-node log streaming is intentionally out of scope.
+    let local_node_id = ctx.state.local_node_id.as_ref();
+    if !payload.node_id.is_empty() && payload.node_id != local_node_id {
+        let target = payload.node_id.clone();
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {
+            engine_id: payload.engine_id.clone(),
+            deploy_method: payload.deploy_method.clone(),
+            config_json: payload.config_json.clone(),
+        };
+        let iroh =
+            ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+        if let Some(security) = ctx.state.mesh_security.as_ref() {
+            if !security.is_trusted(&target) {
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
+            }
+        }
+        let resp = iroh
+            .send_command_and_wait(&target, cmd, 30)
+            .await
+            .map_err(|e| ProtocolError::internal(e.to_string()))?;
+        if !resp.ok {
+            return Err(ProtocolError::internal(
+                resp.error
+                    .unwrap_or_else(|| "remote deploy failed".to_string()),
+            ));
+        }
+        let (deploy_id, engine_id_resp, deploy_method_resp) = match resp.payload {
+            tentaflow_protocol::mesh::MeshCommandResponsePayload::ServiceDeployResult {
+                deploy_id,
+                engine_id,
+                deploy_method,
+            } => (deploy_id, engine_id, deploy_method),
+            _ => (
+                String::new(),
+                payload.engine_id.clone(),
+                payload.deploy_method.clone(),
+            ),
+        };
+        return Ok(MessageBody::DeploymentBody(
+            tentaflow_protocol::DeploymentPayload::ResStart(
+                tentaflow_protocol::ServiceManifestDeployResponse {
+                    status: "forwarded".to_string(),
+                    deploy_id: deploy_id.clone(),
+                    engine_id: engine_id_resp,
+                    deploy_method: deploy_method_resp,
+                    node_id: target,
+                    websocket_url: format!("/ws/deploy?id={}", deploy_id),
+                },
+            ),
+        ));
     }
 
     use crate::api::dashboard::api_services_manifest::{
@@ -3849,7 +3478,7 @@ pub fn service_manifest_deploy(
         },
     )?;
 
-    let deploy_id = uuid::Uuid::new_v4().to_string();
+    let slug = uuid::Uuid::new_v4().to_string();
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     audit(
@@ -3863,66 +3492,160 @@ pub fn service_manifest_deploy(
         )),
     );
 
-    // Record deployment row in DB + spawn background runner. Runner streams
-    // log lines to the subscription associated with deploy_id through the
-    // deployment log bus (see deploy/runner.rs + deploy/log_bus.rs).
-    let user_id_i64 = user_id;
-    let config_json = if payload.config_json.is_empty() {
-        "{}".to_string()
-    } else {
-        payload.config_json.clone()
-    };
-    if let Err(e) = repository::deployments::create(
-        &ctx.state.db,
-        &deploy_id,
-        &payload.engine_id,
-        &payload.deploy_method,
-        &payload.node_id,
-        &config_json,
-        user_id_i64,
-    ) {
-        return Err(ProtocolError::internal(format!(
-            "failed to persist deployment: {}",
-            e
-        )));
-    }
+    // Resolve the deploy method tag from the wire ("docker"/"native"/"external")
+    // into the internal `DeployMethod` enum used by the unified pipeline.
+    let manifest = crate::services::manifest::registry()
+        .by_id(&payload.engine_id)
+        .cloned()
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!(
+                "Silnik '{}' nie istnieje w manifescie",
+                payload.engine_id
+            ))
+        })?;
 
+    let deploy_method = resolve_deploy_method(&manifest, &payload.deploy_method)
+        .map_err(ProtocolError::bad_request)?;
+
+    let user_config: serde_json::Value = if payload.config_json.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&payload.config_json)
+            .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
+    };
+
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    let log_sender = crate::deploy::log_bus::sender_for(&slug);
     let db_clone = ctx.state.db.clone();
-    let service_manager = ctx.state.service_manager.clone();
-    let settings_cipher = ctx.state.settings_cipher.clone();
-    let deploy_id_task = deploy_id.clone();
-    let engine_id_task = payload.engine_id.clone();
-    let method_task = payload.deploy_method.clone();
-    let node_id_task = payload.node_id.clone();
-    let config_json_task = config_json.clone();
-    let router_task = ctx.state.router.clone();
+    let slug_task = slug.clone();
+    let manifest_task = manifest.clone();
+    let user_config_task = user_config.clone();
+    let log_sender_task = log_sender.clone();
+    let local_node_id_task = ctx.state.local_node_id.to_string();
+    let quic_mesh_task = ctx.state.quic_mesh.clone();
+
     tokio::spawn(async move {
-        crate::deploy::runner::run_deployment(
-            db_clone,
-            service_manager,
-            settings_cipher,
-            router_task,
-            deploy_id_task,
-            engine_id_task,
-            method_task,
-            node_id_task,
-            config_json_task,
+        let start_ms = crate::deploy::log_bus::now_ms();
+        let result = crate::services::deploy::deploy(
+            deploy_method,
+            &manifest_task,
+            &user_config_task,
+            &port_allocator,
+            &db_clone,
+            Some(log_sender_task.clone()),
+            Some(slug_task.clone()),
         )
         .await;
+        match result {
+            Ok(outcome) => {
+                let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
+                    deploy_id: slug_task.clone(),
+                    final_status: "success".to_string(),
+                    image_tag: String::new(),
+                    container_name: format!("service-id-{}", outcome.endpoint.handle.id),
+                    error_message: String::new(),
+                    duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                crate::deploy::log_bus::close(&slug_task);
+
+                // Push delta — peers' MeshServicesRegistry pick up the freshly
+                // deployed service immediately instead of waiting for the
+                // 5-min anti-drift announce.
+                if let Some(qm) = quic_mesh_task {
+                    let service_id = outcome.endpoint.handle.id;
+                    match crate::services::snapshot_builder::build_one(
+                        &db_clone,
+                        service_id,
+                        &local_node_id_task,
+                    ) {
+                        Ok(Some(info)) => {
+                            let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                from_node_id: local_node_id_task.clone(),
+                                change: tentaflow_protocol::ServiceChange::Added(info),
+                            };
+                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                                let _ = qm
+                                    .broadcast_to_trusted(
+                                        tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                        &bytes,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                service_id,
+                                "MeshServicesUpdate (Added): row missing right after deploy"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, service_id, "MeshServicesUpdate (Added): build_one failed");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
+                    deploy_id: slug_task.clone(),
+                    final_status: "failure".to_string(),
+                    image_tag: String::new(),
+                    container_name: String::new(),
+                    error_message: err.to_string(),
+                    duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                crate::deploy::log_bus::close(&slug_task);
+            }
+        }
     });
 
     Ok(MessageBody::DeploymentBody(
         tentaflow_protocol::DeploymentPayload::ResStart(
             tentaflow_protocol::ServiceManifestDeployResponse {
                 status: "started".to_string(),
-                deploy_id: deploy_id.clone(),
+                deploy_id: slug.clone(),
                 engine_id: payload.engine_id.clone(),
                 deploy_method: payload.deploy_method.clone(),
                 node_id: payload.node_id.clone(),
-                websocket_url: String::new(),
+                websocket_url: format!("/ws/deploy?id={}", slug),
             },
         ),
     ))
+}
+
+/// Maps the wire deploy method string ("docker"/"native"/"external") to the
+/// internal `DeployMethod` variant by inspecting which sections the manifest
+/// declares. "native" picks the runtime declared by `[deploy.native].runtime`.
+fn resolve_deploy_method(
+    manifest: &crate::services::manifest::ServiceManifest,
+    method: &str,
+) -> std::result::Result<crate::services_repo::services::DeployMethod, String> {
+    use crate::services::manifest::NativeRuntime;
+    use crate::services_repo::services::DeployMethod;
+    match method {
+        "docker" => Ok(DeployMethod::Docker),
+        "external" => Ok(DeployMethod::External),
+        "native" => {
+            let native =
+                manifest.deploy.native.as_ref().ok_or_else(|| {
+                    format!("engine '{}' has no [deploy.native]", manifest.engine.id)
+                })?;
+            Ok(match native.runtime {
+                NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
+                NativeRuntime::Binary => DeployMethod::NativeBinary,
+                NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
+            })
+        }
+        other => Err(format!(
+            "unknown deploy method '{}': expected docker/native/external",
+            other
+        )),
+    }
 }
 
 // =============================================================================
@@ -4029,104 +3752,6 @@ pub fn deployment_list(
         tentaflow_protocol::DeploymentPayload::ResList(
             tentaflow_protocol::DeploymentListResponse { deployments },
         ),
-    ))
-}
-
-// =============================================================================
-// Service redeploy - rebuild already-deployed service from refreshed sources.
-// =============================================================================
-
-#[handler(variant = "ServiceRedeployRequest", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub async fn service_redeploy(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqRedeploy(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected ReqRedeploy")),
-    };
-    if payload.service_id <= 0 {
-        return Err(ProtocolError::bad_request("service_id must be positive"));
-    }
-
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    audit(
-        ctx,
-        user_id,
-        "service.redeploy",
-        Some(&payload.service_id.to_string()),
-        Some(&format!("force={}", payload.force_if_active_sessions)),
-    );
-
-    let outcome = crate::deploy::redeploy::start_redeploy(
-        ctx.state.db.clone(),
-        ctx.state.service_manager.clone(),
-        payload.service_id,
-        payload.force_if_active_sessions,
-    )
-    .await;
-
-    let response = match outcome {
-        crate::deploy::redeploy::RedeployOutcome::Started { deploy_id } => {
-            tentaflow_protocol::ServiceRedeployResponse {
-                status: tentaflow_protocol::REDEPLOY_STATUS_STARTED.to_string(),
-                deploy_id,
-                new_hash: String::new(),
-                error: String::new(),
-                active_session_count: 0,
-            }
-        }
-        crate::deploy::redeploy::RedeployOutcome::ActiveSessions { count } => {
-            tentaflow_protocol::ServiceRedeployResponse {
-                status: tentaflow_protocol::REDEPLOY_STATUS_ACTIVE_SESSIONS.to_string(),
-                deploy_id: String::new(),
-                new_hash: String::new(),
-                error: String::new(),
-                active_session_count: count,
-            }
-        }
-        crate::deploy::redeploy::RedeployOutcome::NoSource => {
-            tentaflow_protocol::ServiceRedeployResponse {
-                status: tentaflow_protocol::REDEPLOY_STATUS_NO_SOURCE.to_string(),
-                deploy_id: String::new(),
-                new_hash: String::new(),
-                error: "manifest exposes no source_hash for this engine/deploy_mode"
-                    .to_string(),
-                active_session_count: 0,
-            }
-        }
-        crate::deploy::redeploy::RedeployOutcome::Unsupported { reason } => {
-            tentaflow_protocol::ServiceRedeployResponse {
-                status: tentaflow_protocol::REDEPLOY_STATUS_UNSUPPORTED.to_string(),
-                deploy_id: String::new(),
-                new_hash: String::new(),
-                error: reason,
-                active_session_count: 0,
-            }
-        }
-        crate::deploy::redeploy::RedeployOutcome::NotFound => {
-            tentaflow_protocol::ServiceRedeployResponse {
-                status: tentaflow_protocol::REDEPLOY_STATUS_NOT_FOUND.to_string(),
-                deploy_id: String::new(),
-                new_hash: String::new(),
-                error: format!("service id {} does not exist", payload.service_id),
-                active_session_count: 0,
-            }
-        }
-        crate::deploy::redeploy::RedeployOutcome::Failed { error } => {
-            tentaflow_protocol::ServiceRedeployResponse {
-                status: tentaflow_protocol::REDEPLOY_STATUS_FAILED.to_string(),
-                deploy_id: String::new(),
-                new_hash: String::new(),
-                error,
-                active_session_count: 0,
-            }
-        }
-    };
-    Ok(MessageBody::DeploymentBody(
-        tentaflow_protocol::DeploymentPayload::ResRedeploy(response),
     ))
 }
 
@@ -4773,7 +4398,9 @@ fn bool_to_setting(v: bool) -> &'static str {
     }
 }
 
-fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::NetworkConfig, ProtocolError> {
+fn load_network_config(
+    ctx: &HandlerContext,
+) -> Result<tentaflow_protocol::NetworkConfig, ProtocolError> {
     use network_config_keys::*;
     let pool = &ctx.state.db;
 
@@ -4783,8 +4410,10 @@ fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::Netwo
     let bind_ipv4 = repository::get_setting(pool, BIND_IPV4)
         .map_err(db_err)?
         .unwrap_or_default();
-    let hide_docker =
-        parse_bool_setting(&repository::get_setting(pool, HIDE_DOCKER).map_err(db_err)?, true);
+    let hide_docker = parse_bool_setting(
+        &repository::get_setting(pool, HIDE_DOCKER).map_err(db_err)?,
+        true,
+    );
     let hide_link_local = parse_bool_setting(
         &repository::get_setting(pool, HIDE_LINK_LOCAL).map_err(db_err)?,
         true,
@@ -4801,9 +4430,10 @@ fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::Netwo
         &repository::get_setting(pool, PREFER_SAME_SUBNET).map_err(db_err)?,
         true,
     );
-    let iroh_relay_url = repository::get_setting(pool, crate::net::iroh::relay::RELAY_URL_SETTING_KEY)
-        .map_err(db_err)?
-        .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
+    let iroh_relay_url =
+        repository::get_setting(pool, crate::net::iroh::relay::RELAY_URL_SETTING_KEY)
+            .map_err(db_err)?
+            .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
 
     Ok(tentaflow_protocol::NetworkConfig {
         bind_mode,
@@ -5020,3 +4650,589 @@ register_network_variant!(
     "tentaflow_ws_handler_network_relay_status",
     UserSession
 );
+
+// =============================================================================
+// Services (Krok N2) — local-only view powered by the unified `services` +
+// `model_registry` tables. Multi-node aggregation lands in Krok N5; for now the
+// list contains only services owned by this node. Every handler is admin-gated
+// because the sidebar is admin-only and the mutations affect runtime processes.
+// =============================================================================
+
+fn build_service_info(
+    conn: &rusqlite::Connection,
+    svc: crate::services_repo::services::ServiceRow,
+    local_node_id: &str,
+) -> Result<tentaflow_protocol::ServiceInfo, ProtocolError> {
+    crate::services::snapshot_builder::project_service_row(conn, svc, local_node_id).map_err(db_err)
+}
+
+/// Push a `ServiceChange` to every trusted mesh peer. Fires after every
+/// successful local mutation (deploy / stop / pin / pause / rename / delete)
+/// so peers' `MeshServicesRegistry` view converges in real time instead of
+/// waiting for the 5-min anti-drift announce. No-op when the mesh manager is
+/// not initialised (single-node mode, tests).
+fn broadcast_service_change(ctx: &HandlerContext, change: tentaflow_protocol::ServiceChange) {
+    let qm = match ctx.state.quic_mesh.as_ref() {
+        Some(q) => q.clone(),
+        None => return,
+    };
+    let from = ctx.state.local_node_id.to_string();
+    let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+        from_node_id: from,
+        change,
+    };
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            tracing::warn!(error = %e, "MeshServicesUpdate: rkyv encode failed");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let _ = qm
+            .broadcast_to_trusted(
+                tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                &bytes,
+                None,
+            )
+            .await;
+    });
+}
+
+/// Build a `ServiceInfo` for `service_id` (current DB state) and push it as
+/// `ServiceChange::Updated`. Used by mutating handlers that left the row in
+/// place but changed its fields (stop, pin, pause, rename, redeploy).
+fn push_service_updated(ctx: &HandlerContext, service_id: i64) {
+    let local = ctx.state.local_node_id.to_string();
+    let info = match crate::services::snapshot_builder::build_one(&ctx.state.db, service_id, &local)
+    {
+        Ok(Some(info)) => info,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, service_id, "push_service_updated: build_one failed");
+            return;
+        }
+    };
+    broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Updated(info));
+}
+
+#[handler(variant = "ServiceListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqList(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqList",
+            ))
+        }
+    };
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
+    let local_node_id = ctx.state.local_node_id.as_ref();
+
+    // Local rows first.
+    let mut services = Vec::with_capacity(rows.len());
+    for svc in rows {
+        if let Some(filter) = payload.engine_id_filter.as_deref() {
+            if !filter.is_empty() && svc.engine_id != filter {
+                continue;
+            }
+        }
+        if let Some(filter) = payload.category_filter.as_deref() {
+            if !filter.is_empty() && svc.category != filter {
+                continue;
+            }
+        }
+        services.push(build_service_info(&conn, svc, local_node_id)?);
+    }
+    drop(conn);
+
+    // Then merge in every peer's snapshot (krok N3b — single-flat list, GUI
+    // groups by `service.node_id`). Same filter semantics applied client-side
+    // here so the wire response stays consistent across local and remote rows.
+    for (_node_id, snapshot) in ctx.state.mesh_services_registry.all_remote() {
+        for svc in snapshot {
+            if let Some(filter) = payload.engine_id_filter.as_deref() {
+                if !filter.is_empty() && svc.engine_id != filter {
+                    continue;
+                }
+            }
+            if let Some(filter) = payload.category_filter.as_deref() {
+                if !filter.is_empty() && svc.category != filter {
+                    continue;
+                }
+            }
+            services.push(svc);
+        }
+    }
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResList(tentaflow_protocol::ServiceListResponse {
+            services,
+        }),
+    ))
+}
+
+/// True when the request's `node_id` refers to another mesh node and the
+/// action must be forwarded over `MeshCommandType::Service*Remote`. `None`
+/// or the local node id falls through to local execution.
+fn forward_target_node<'a>(ctx: &'a HandlerContext, target: &'a Option<String>) -> Option<&'a str> {
+    let target = target.as_deref()?;
+    if target.is_empty() || target == ctx.state.local_node_id.as_ref() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// Forward a service-action `MeshCommandType::*Remote` over iroh and convert
+/// the typed `MeshCommandResponse` envelope into the boolean ok/error pair the
+/// dispatch-side `Service*Response` expects. Errors from the transport
+/// itself surface as `success=false, error=Some(...)`.
+async fn forward_service_action(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> (bool, Option<String>) {
+    let iroh = match ctx.state.quic_mesh.as_ref() {
+        Some(m) => m.clone(),
+        None => {
+            return (
+                false,
+                Some("mesh transport not available on this node".to_string()),
+            )
+        }
+    };
+    if let Some(security) = ctx.state.mesh_security.as_ref() {
+        if !security.is_trusted(target_node_id) {
+            return (
+                false,
+                Some(format!("peer {} is not trusted", target_node_id)),
+            );
+        }
+    }
+    match iroh.send_command_and_wait(target_node_id, cmd, 10).await {
+        Ok(resp) => (resp.ok, resp.error),
+        Err(e) => (false, Some(e.to_string())),
+    }
+}
+
+/// Resolves a service row by id, returning a NotFound protocol error when the
+/// row is gone. Caller drops the lock before doing async work.
+fn fetch_service_row(
+    ctx: &HandlerContext,
+    service_id: i64,
+) -> Result<crate::services_repo::services::ServiceRow, ProtocolError> {
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    let row = crate::services_repo::services::get(&conn, service_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found(format!("service id={} not found", service_id)))?;
+    Ok(row)
+}
+
+#[handler(variant = "ServiceDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqDelete(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqDelete",
+            ))
+        }
+    };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeleteRemote {
+            service_id: payload.service_id,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResDelete(
+                tentaflow_protocol::ServiceDeleteResponse { success, error },
+            ),
+        ));
+    }
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    // Best-effort runtime stop first. Even if it fails (orphaned container,
+    // stale pid) we still drop the row so the GUI does not get stuck on a
+    // zombie entry. Surface the error for the toast but treat overall op as ok.
+    let stop_err = crate::services::deploy::stop(&svc, port_allocator)
+        .await
+        .err()
+        .map(|e| e.to_string());
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
+    drop(conn);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.delete",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} stop_err={}",
+            payload.service_id,
+            stop_err.as_deref().unwrap_or("none")
+        )),
+    );
+
+    broadcast_service_change(
+        ctx,
+        tentaflow_protocol::ServiceChange::Removed {
+            service_id: payload.service_id,
+        },
+    );
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResDelete(tentaflow_protocol::ServiceDeleteResponse {
+            success: true,
+            error: stop_err,
+        }),
+    ))
+}
+
+#[handler(variant = "ServicePinRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_pin(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqPin(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqPin",
+            ))
+        }
+    };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServicePinRemote {
+            service_id: payload.service_id,
+            pinned: payload.pinned,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResPin(tentaflow_protocol::ServicePinResponse {
+                success,
+                error,
+            }),
+        ));
+    }
+
+    let conn = ctx
+        .state
+        .db
+        .lock()
+        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+    crate::services_repo::services::set_pinned(&conn, payload.service_id, payload.pinned)
+        .map_err(db_err)?;
+    drop(conn);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.pin",
+        None,
+        Some(&format!(
+            "service_id={} pinned={}",
+            payload.service_id, payload.pinned
+        )),
+    );
+
+    push_service_updated(ctx, payload.service_id);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResPin(tentaflow_protocol::ServicePinResponse {
+            success: true,
+            error: None,
+        }),
+    ))
+}
+
+#[handler(variant = "ServicePauseRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_pause(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqPause(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqPause",
+            ))
+        }
+    };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServicePauseRemote {
+            service_id: payload.service_id,
+            paused: payload.paused,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResPause(
+                tentaflow_protocol::ServicePauseResponse { success, error },
+            ),
+        ));
+    }
+
+    // When transitioning into paused, actively stop the runtime so the user's
+    // intent ("frozen, do not consume resources") is enforced. Unpause does
+    // the inverse only on the bookkeeping side — the user must press Start
+    // to bring the engine back up.
+    let mut stop_error: Option<String> = None;
+    if payload.paused {
+        let svc = fetch_service_row(ctx, payload.service_id)?;
+        if matches!(
+            svc.status,
+            crate::services_repo::services::ServiceStatus::Running
+                | crate::services_repo::services::ServiceStatus::Degraded
+                | crate::services_repo::services::ServiceStatus::Starting
+        ) {
+            let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+                ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+            })?;
+            if let Err(e) = crate::services::deploy::stop(&svc, port_allocator).await {
+                stop_error = Some(e.to_string());
+            } else {
+                let conn = ctx
+                    .state
+                    .db
+                    .lock()
+                    .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+                crate::services_repo::services::update_status(
+                    &conn,
+                    payload.service_id,
+                    crate::services_repo::services::ServiceStatus::Stopped,
+                )
+                .map_err(db_err)?;
+                crate::services_repo::services::update_runtime(
+                    &conn,
+                    payload.service_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(db_err)?;
+            }
+        }
+    }
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::set_paused(&conn, payload.service_id, payload.paused)
+            .map_err(db_err)?;
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.pause",
+        None,
+        Some(&format!(
+            "service_id={} paused={} stop_err={}",
+            payload.service_id,
+            payload.paused,
+            stop_error.as_deref().unwrap_or("none")
+        )),
+    );
+
+    push_service_updated(ctx, payload.service_id);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResPause(tentaflow_protocol::ServicePauseResponse {
+            success: stop_error.is_none(),
+            error: stop_error,
+        }),
+    ))
+}
+
+#[handler(variant = "ServiceStartRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqStart(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqStart",
+            ))
+        }
+    };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceStartRemote {
+            service_id: payload.service_id,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResStart(
+                tentaflow_protocol::ServiceStartResponse { success, error },
+            ),
+        ));
+    }
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    // Idempotent: a service that is already up and not paused stays as-is.
+    if matches!(
+        svc.status,
+        crate::services_repo::services::ServiceStatus::Running
+            | crate::services_repo::services::ServiceStatus::Degraded
+    ) && !svc.paused
+    {
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResStart(
+                tentaflow_protocol::ServiceStartResponse {
+                    success: true,
+                    error: None,
+                },
+            ),
+        ));
+    }
+
+    // Start clears the pause flag; the user explicitly asked for the engine
+    // to come back up.
+    if svc.paused {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::set_paused(&conn, payload.service_id, false)
+            .map_err(db_err)?;
+    }
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::update_status(
+            &conn,
+            payload.service_id,
+            crate::services_repo::services::ServiceStatus::Starting,
+        )
+        .map_err(db_err)?;
+    }
+
+    let respawn_result = crate::services::deploy::respawn(
+        &svc.engine_id,
+        svc.deploy_method,
+        &svc.config_json,
+        port_allocator,
+    )
+    .await;
+
+    let (success, error) = match respawn_result {
+        Ok(handle) => {
+            let conn = ctx
+                .state
+                .db
+                .lock()
+                .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+            crate::services_repo::services::update_runtime(
+                &conn,
+                payload.service_id,
+                handle.pid,
+                handle.port,
+                handle.sidecar_port,
+                handle.endpoint_url.as_deref(),
+            )
+            .map_err(db_err)?;
+            crate::services_repo::services::update_status(
+                &conn,
+                payload.service_id,
+                crate::services_repo::services::ServiceStatus::Running,
+            )
+            .map_err(db_err)?;
+            (true, None)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let conn = ctx
+                .state
+                .db
+                .lock()
+                .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+            let _ = crate::services_repo::services::update_status(
+                &conn,
+                payload.service_id,
+                crate::services_repo::services::ServiceStatus::Failed,
+            );
+            let _ = crate::services_repo::services::update_health(
+                &conn,
+                payload.service_id,
+                false,
+                Some(&msg),
+            );
+            (false, Some(msg))
+        }
+    };
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.start",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} success={}",
+            payload.service_id, success
+        )),
+    );
+
+    push_service_updated(ctx, payload.service_id);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResStart(tentaflow_protocol::ServiceStartResponse {
+            success,
+            error,
+        }),
+    ))
+}

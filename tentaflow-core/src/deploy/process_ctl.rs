@@ -3,7 +3,7 @@
 // Opis: Cross-platform kontrola cyklu zycia subprocesow zdeployowanych przez
 //       python-bundle (vllm, vllm-metal, sglang, xtts itd.). Zabija proces
 //       grzecznie (SIGTERM/WM_CLOSE), po timeout twardo (SIGKILL/TerminateProcess).
-//       Uzywane przez dispatch::handlers::service_stop gdy user klika "Usun"
+//       Uzywane przez dispatch::handlers::service_delete gdy user klika "Usun"
 //       na natywnym silniku w GUI.
 // =============================================================================
 

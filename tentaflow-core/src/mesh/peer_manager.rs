@@ -701,9 +701,6 @@ impl PeerManager {
             | IrohMeshEvent::MeshCommandResponseReceived { .. }
             | IrohMeshEvent::MeshDeployProgressReceived { .. }
             | IrohMeshEvent::MeshLogChunkReceived { .. }
-            | IrohMeshEvent::ServiceAnnounceReceived { .. }
-            | IrohMeshEvent::ServiceQueryAllReceived { .. }
-            | IrohMeshEvent::ServiceResponseAllReceived { .. }
             | IrohMeshEvent::TrustRevokedReceived { .. }
             | IrohMeshEvent::KeyRotationReceived { .. }
             | IrohMeshEvent::KeyRotationResponseReceived { .. }
@@ -714,7 +711,11 @@ impl PeerManager {
             | IrohMeshEvent::PeerDiscovered { .. }
             | IrohMeshEvent::HelloReceived { .. }
             | IrohMeshEvent::TopologyAnnounceReceived { .. }
-            | IrohMeshEvent::KnownPeersReceived { .. } => {
+            | IrohMeshEvent::KnownPeersReceived { .. }
+            | IrohMeshEvent::ServicesGetReceived { .. }
+            | IrohMeshEvent::ServicesGetResponseReceived { .. }
+            | IrohMeshEvent::ServicesAnnounceReceived { .. }
+            | IrohMeshEvent::ServicesUpdateReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }

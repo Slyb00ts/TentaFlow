@@ -22,8 +22,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "windows.pdh.disk";
@@ -183,9 +183,7 @@ mod windows_impl {
         await_s: Option<PdhCounter>,
     }
 
-    pub fn start_session(
-        ctx: SessionCtx,
-    ) -> Result<Box<dyn RunningCollector>, CollectorError> {
+    pub fn start_session(ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
         fs::create_dir_all(&ctx.output_dir)?;
         let csv_path = ctx.output_dir.join(CSV_FILENAME);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -233,42 +231,36 @@ mod windows_impl {
         )?;
 
         let instances = enum_instances("PhysicalDisk").unwrap_or_default();
-        let query = PdhQuery::open()
-            .map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
+        let query =
+            PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
 
         let mut disks: Vec<DiskCounters> = Vec::new();
         for inst in instances {
             if inst == "_Total" {
                 continue;
             }
-            let read_bps = match query
-                .add_counter(&format!("\\PhysicalDisk({inst})\\Disk Read Bytes/sec"))
+            let read_bps =
+                match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Read Bytes/sec")) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+            let write_bps =
+                match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Write Bytes/sec")) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+            let iops_r = match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Reads/sec"))
             {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let write_bps = match query
-                .add_counter(&format!("\\PhysicalDisk({inst})\\Disk Write Bytes/sec"))
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let iops_r = match query
-                .add_counter(&format!("\\PhysicalDisk({inst})\\Disk Reads/sec"))
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let iops_w = match query
-                .add_counter(&format!("\\PhysicalDisk({inst})\\Disk Writes/sec"))
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            let iops_w =
+                match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Writes/sec")) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
             let await_s = query
-                .add_counter(&format!(
-                    "\\PhysicalDisk({inst})\\Avg. Disk sec/Transfer"
-                ))
+                .add_counter(&format!("\\PhysicalDisk({inst})\\Avg. Disk sec/Transfer"))
                 .ok();
             disks.push(DiskCounters {
                 device: sanitize_device(&inst),

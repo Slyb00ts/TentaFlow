@@ -87,7 +87,10 @@ async fn read_real_session_envelope() {
             println!("envelope = V2");
             println!("schema_version = {}", report.schema_version);
             println!("session_id     = {}", report.session_id);
-            println!("node_id (krotki) = {}", &report.node_id[..16.min(report.node_id.len())]);
+            println!(
+                "node_id (krotki) = {}",
+                &report.node_id[..16.min(report.node_id.len())]
+            );
             assert_eq!(report.schema_version, 2);
             assert_eq!(report.session_id, session_id);
         }
@@ -124,7 +127,9 @@ async fn read_real_session_serializes_to_json_for_gui() {
     // ProfileReportEnvelope nie ma derive Serialize bo rkyv go obsluguje
     // dla wire format. Sprawdzmy ze possible to access fields.
     let summary = match &envelope {
-        ProfileReportEnvelope::V2(r) => format!("V2 schema={} sid={}", r.schema_version, r.session_id),
+        ProfileReportEnvelope::V2(r) => {
+            format!("V2 schema={} sid={}", r.schema_version, r.session_id)
+        }
         ProfileReportEnvelope::V1Legacy(r) => format!("V1Legacy sid={}", r.meta.session_id),
     };
     println!("envelope summary: {}", summary);
@@ -156,12 +161,19 @@ async fn list_sessions_v2_returns_real_sessions() {
             Ok(list) => {
                 println!("  node {}: {} sesji", &nid[..16], list.len());
                 for s in &list {
-                    println!("    - {} ({} bytes, {} collectors)",
-                        &s.session_id, s.size_bytes, s.collectors_used.len());
+                    println!(
+                        "    - {} ({} bytes, {} collectors)",
+                        &s.session_id,
+                        s.size_bytes,
+                        s.collectors_used.len()
+                    );
                 }
             }
             Err(e) => println!("  node {}: list error {:?}", &nid[..16], e),
         }
     }
-    assert!(!node_ids.is_empty(), "powinna byc co najmniej 1 sesja w storage");
+    assert!(
+        !node_ids.is_empty(),
+        "powinna byc co najmniej 1 sesja w storage"
+    );
 }

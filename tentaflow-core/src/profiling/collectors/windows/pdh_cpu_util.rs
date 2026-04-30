@@ -18,8 +18,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "windows.pdh.cpu_util";
@@ -42,8 +42,7 @@ impl WindowsPdhCpuUtilCollector {
                     PlatformSet::WINDOWS_X64 | PlatformSet::WINDOWS_ARM64,
                 ),
                 vendor: None,
-                description:
-                    "Windows CPU utilization and frequency per core via PDH at 2 Hz.",
+                description: "Windows CPU utilization and frequency per core via PDH at 2 Hz.",
             },
             id: COLLECTOR_ID.to_string(),
         }
@@ -180,9 +179,7 @@ mod windows_impl {
         info.dwNumberOfProcessors.max(1)
     }
 
-    pub fn start_session(
-        ctx: SessionCtx,
-    ) -> Result<Box<dyn RunningCollector>, CollectorError> {
+    pub fn start_session(ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
         fs::create_dir_all(&ctx.output_dir)?;
         let csv_path = ctx.output_dir.join(CSV_FILENAME);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -223,8 +220,8 @@ mod windows_impl {
         writeln!(file, "timestamp_ns,cpu,util_pct,freq_mhz")?;
 
         let cores = logical_processor_count();
-        let query = PdhQuery::open()
-            .map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
+        let query =
+            PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
 
         // Per-core util counters; freq counters may fail on older Windows so
         // we keep them as Option and fall back to 0.
@@ -444,7 +441,11 @@ mod tests {
         assert_eq!(evs[0].category, EventCategory::CpuUtil);
         assert_eq!(evs[0].lane_hint, 0);
         match &evs[0].payload {
-            EventPayload::CpuUtil { core, util_pct, freq_mhz } => {
+            EventPayload::CpuUtil {
+                core,
+                util_pct,
+                freq_mhz,
+            } => {
                 assert_eq!(*core, 0);
                 assert!((*util_pct - 12.5).abs() < 0.01);
                 assert_eq!(*freq_mhz, 2400);

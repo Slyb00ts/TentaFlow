@@ -24,11 +24,18 @@ impl Router {
     ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                if !crate::routing::acl::check_access_safe(
+                    db,
+                    "model",
+                    &request.model,
+                    u.user_id,
+                    &u.role,
+                ) {
                     tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied STT model");
                     return Err(crate::error::CoreError::ModelNotFound {
                         model_name: request.model.clone(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -765,21 +772,10 @@ impl Router {
             speaker_id, memory_node_id, voice_id
         );
 
-        // Znajdz QUIC Memory client
-        let quic_client = {
-            let mut client = None;
-            let memory_handles: Vec<_> = self
-                .service_manager
-                .quic_memory_services.iter().map(|r| r.value().clone()).collect();
-            for handle in memory_handles {
-                let client_guard = handle.client.read().await;
-                if let Some(c) = client_guard.as_ref() {
-                    client = Some(c.clone());
-                    break;
-                }
-            }
-            client
-        };
+        let quic_client = self
+            .service_manager
+            .find_quic_client_for_model("memory")
+            .await;
 
         let Some(memory_client) = quic_client else {
             return Ok(ModelResponse {

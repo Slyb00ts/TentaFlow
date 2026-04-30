@@ -34,3 +34,9 @@ internal_port = 8000
 gpu_memory_gb = 8
 disk_gb = 20
 platforms = ["macos-aarch64"]
+
+[health]
+# vllm-metal install_vllm_metal() rebuilds C++ kernels with CXXFLAGS — uv pip
+# can sit silent for several minutes during linking on Apple Silicon, so we
+# extend the smart probe stagnation window past the default 300s.
+stagnation_window_secs = 600

@@ -159,7 +159,10 @@ mod tests {
         assert_eq!(collected.len(), 3);
         let first_chunk = collected[0].as_ref().unwrap();
         assert_eq!(first_chunk.model, "model-x");
-        assert_eq!(first_chunk.choices[0].delta.role.as_deref(), Some("assistant"));
+        assert_eq!(
+            first_chunk.choices[0].delta.role.as_deref(),
+            Some("assistant")
+        );
         assert_eq!(first_chunk.choices[0].delta.content.as_deref(), Some("Hel"));
 
         let second = collected[1].as_ref().unwrap();

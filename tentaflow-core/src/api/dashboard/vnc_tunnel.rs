@@ -39,10 +39,7 @@ pub struct VncTunnelEntry {
 pub const MAX_TUNNELS_PER_USER: usize = 3;
 
 /// Counts how many tunnel entries already belong to `user_id`.
-pub fn count_for_user(
-    registry: &DashMap<String, VncTunnelEntry>,
-    user_id: i64,
-) -> usize {
+pub fn count_for_user(registry: &DashMap<String, VncTunnelEntry>, user_id: i64) -> usize {
     registry
         .iter()
         .filter(|e| e.value().owner_user_id == user_id)

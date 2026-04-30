@@ -5,8 +5,8 @@
 
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_deploy_recommend,
-    api_fast_path, api_flows, api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts,
-    api_registries, api_services, api_tts_rules, auth, static_files,
+    api_fast_path, api_flows, api_hub, api_me_preferences, api_pii_rules, api_prompts,
+    api_registries, api_tts_rules, auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -47,6 +47,8 @@ pub struct DashboardServer {
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 }
 
 impl DashboardServer {
@@ -75,7 +77,20 @@ impl DashboardServer {
             permission_checker: None,
             license: Arc::new(StaticLicenseChecker::free()),
             mesh_relay_health: None,
+            port_allocator: None,
+            mesh_services_registry: Arc::new(
+                crate::services::mesh_registry::MeshServicesRegistry::new(),
+            ),
         }
+    }
+
+    /// Wstrzykuje shared `PortAllocator` (wlasnosciowo nalezy do supervisor).
+    pub fn with_port_allocator(
+        mut self,
+        allocator: Option<Arc<crate::services::ports::PortAllocator>>,
+    ) -> Self {
+        self.port_allocator = allocator;
+        self
     }
 
     /// Ustawia snapshot zdrowia relay aktualizowany w tle przez mesh pipeline.
@@ -140,6 +155,28 @@ impl DashboardServer {
         let permission_checker = self.permission_checker.clone();
         let license = self.license.clone();
         let mesh_relay_health = self.mesh_relay_health.clone();
+        let port_allocator = self.port_allocator.clone();
+        let mesh_services_registry = self.mesh_services_registry.clone();
+
+        // Wire up cross-node service action handlers (krok N3b). The mesh
+        // command executor is created by `start_mesh_pipeline` long before
+        // AppState (db_pool + port_allocator + iroh) is fully assembled, so
+        // we inject the action context here once everything exists. Without
+        // this the receiver of `ServiceDeleteRemote` / `ServicePinRemote` /
+        // ... returns "service action context not configured".
+        if let (Some(qm), Some(pa)) = (quic_mesh.clone(), port_allocator.clone()) {
+            if let Some(executor) = qm.command_executor().await {
+                executor
+                    .set_service_action_context(
+                        crate::mesh::command_executor::ServiceActionContext {
+                            db: db.clone(),
+                            port_allocator: pa,
+                            iroh: qm.clone(),
+                        },
+                    )
+                    .await;
+            }
+        }
 
         loop {
             let (stream, remote_addr) = match listener.accept().await {
@@ -165,6 +202,8 @@ impl DashboardServer {
             let pc_clone = permission_checker.clone();
             let lic_clone = license.clone();
             let mrh_clone = mesh_relay_health.clone();
+            let pa_clone = port_allocator.clone();
+            let msr_clone = mesh_services_registry.clone();
             // VULN-035: Przekaz remote_addr do handle_request (dual rate limiting)
             let remote_addr_str = remote_addr.to_string();
 
@@ -185,11 +224,13 @@ impl DashboardServer {
                     let pc = pc_clone.clone();
                     let lic = lic_clone.clone();
                     let mrh = mrh_clone.clone();
+                    let pa = pa_clone.clone();
+                    let msr = msr_clone.clone();
                     let ra = remote_addr_str.clone();
                     async move {
                         handle_request(
                             req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic,
-                            mrh, ra,
+                            mrh, pa, ra, msr,
                         )
                         .await
                     }
@@ -288,13 +329,6 @@ fn extract_id_from_path(path: &str, prefix: &str) -> Option<i64> {
         .and_then(|rest| rest.trim_matches('/').parse().ok())
 }
 
-/// Wyciaga id serwisu ze sciezki /api/services/:id/backends
-fn extract_service_id_for_backends(path: &str) -> Option<i64> {
-    let stripped = path.strip_prefix("/api/services/")?;
-    let id_str = stripped.strip_suffix("/backends")?;
-    id_str.parse().ok()
-}
-
 /// Glowny handler routingu
 pub async fn handle_request(
     mut req: Request<Incoming>,
@@ -311,7 +345,9 @@ pub async fn handle_request(
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     remote_addr: String,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -421,57 +457,6 @@ pub async fn handle_request(
         return Ok(response);
     }
 
-    // WebSocket upgrade /ws/deploy
-    if method == Method::GET && path == "/ws/deploy" {
-        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade(
-            &req,
-            &db,
-            &query_string,
-            cors_origin.as_deref(),
-            &settings_cipher,
-        ) {
-            Ok(v) => v,
-            Err(resp) => return Ok(resp),
-        };
-
-        let upgrade = hyper::upgrade::on(&mut req);
-        let db_clone = db.clone();
-        let settings_cipher_clone = settings_cipher.clone();
-        let router_clone = router.clone();
-        let lni_clone = local_node_id.clone();
-
-        tokio::spawn(async move {
-            match upgrade.await {
-                Ok(upgraded) => {
-                    let io = TokioIo::new(upgraded);
-                    super::ws_deploy::handle_ws_connection(
-                        io,
-                        db_clone,
-                        settings_cipher_clone,
-                        router_clone,
-                        lni_clone,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    error!("Blad WebSocket upgrade (deploy): {}", e);
-                }
-            }
-        });
-
-        let mut ws_resp = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .header("Upgrade", "websocket")
-            .header("Connection", "Upgrade")
-            .header("Sec-WebSocket-Accept", accept);
-        if let Some(ref proto) = ws_subprotocol {
-            ws_resp = ws_resp.header("Sec-WebSocket-Protocol", proto.as_str());
-        }
-        let response = ws_resp.body(Either::Left(Full::new(Bytes::new()))).unwrap();
-
-        return Ok(response);
-    }
-
     // WebSocket upgrade /ws/api — binary rkyv protocol (bootstrap, Task #30).
     // Dispatch do `ws_binary::handle_ws_connection`. Auth jest re-checkowany
     // wewnatrz loopu per MessageBody variant po implementacji #26/#27.
@@ -523,6 +508,9 @@ pub async fn handle_request(
             meeting_manager,
             vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
             mesh_relay_health: mesh_relay_health.clone(),
+            port_allocator: port_allocator.clone(),
+            mesh_services_registry: mesh_services_registry.clone(),
+            live_handles: service_manager.live_handles.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
@@ -897,7 +885,7 @@ pub async fn handle_request(
         ));
     }
 
-// Clusters API — CRUD clusterow i czlonkostwa
+    // Clusters API — CRUD clusterow i czlonkostwa
     if path.starts_with("/api/clusters") {
         let (status, response_body) =
             route_clusters_api(&method, &path, &db, &body_bytes, &claims, &quic_mesh).await;
@@ -1058,13 +1046,14 @@ pub async fn handle_request(
                 cors_origin.as_deref(),
             ));
         }
-        let (status, response_body) = match api_deploy_recommend::handle_recommend(&body_bytes).await {
-            Ok(p) => p,
-            Err(e) => (
-                500,
-                format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
-            ),
-        };
+        let (status, response_body) =
+            match api_deploy_recommend::handle_recommend(&body_bytes).await {
+                Ok(p) => p,
+                Err(e) => (
+                    500,
+                    format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
+                ),
+            };
         return Ok(json_response_cors(
             status,
             response_body,
@@ -1178,8 +1167,16 @@ pub async fn handle_request(
         ));
     }
 
-    let (status, response_body) =
-        route_api(&method, &path, &query_string, &db, &claims, &body_bytes);
+    let (status, response_body) = route_api(
+        &method,
+        &path,
+        &query_string,
+        &db,
+        &claims,
+        &body_bytes,
+        port_allocator.clone(),
+    )
+    .await;
 
     Ok(json_response_cors(
         status,
@@ -1223,13 +1220,17 @@ fn require_admin(claims: &auth::Claims, db: &DbPool) -> Option<(u16, String)> {
 }
 
 /// Routuje endpointy /api/* do odpowiednich handlerow
-fn route_api(
+async fn route_api(
     method: &Method,
     path: &str,
     query: &str,
     db: &DbPool,
     claims: &auth::Claims,
     body: &[u8],
+    // Reserved for REST handlers that mutate runtime services. After Krok N2
+    // every such mutation goes through binary RPC; kept on the signature so
+    // the call site (HTTP frame dispatcher) stays stable.
+    _port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
 ) -> (u16, String) {
     match (method, path) {
         // Auth
@@ -1249,15 +1250,10 @@ fn route_api(
         // Dashboard
         (&Method::GET, "/api/dashboard") => handle_result(api_dashboard::handle_overview(db), 500),
 
-        // Services
-        (&Method::GET, "/api/services") => handle_result(api_services::handle_list(db), 500),
-        (&Method::POST, "/api/services") => {
-            if let Some(err) = require_admin(claims, db) {
-                return err;
-            }
-            handle_result(api_services::handle_create(db, body), 400)
-        }
-
+        // Services — REST surface removed in Krok N2; Services tab and chat
+        // model picker run on binary RPC (`ServiceListRequest` /
+        // `ModelListRequest`). The deploy wizard catalog comes from the
+        // embedded `services-manifest.js` module, not from a REST endpoint.
 
         // API Keys
         (&Method::GET, "/api/apikeys") => handle_result(api_apikeys::handle_list(db), 500),
@@ -1281,18 +1277,9 @@ fn route_api(
             handle_result(api_prompts::handle_create(db, body), 400)
         }
 
-        // Models
-        (&Method::GET, "/api/models") => {
-            let offset = parse_query_param(query, "offset", 0);
-            let limit = parse_query_param(query, "limit", 50);
-            handle_result(api_models::handle_list_entries(db, offset, limit), 500)
-        }
-        (&Method::POST, "/api/models") => {
-            if let Some(err) = require_admin(claims, db) {
-                return err;
-            }
-            handle_result(api_models::handle_create_entry(db, body), 400)
-        }
+        // Models — REST surface removed in Krok N2. Chat model picker now
+        // talks to `ModelListRequest` over binary WS. Aliases CRUD already
+        // moved to binary RPC in FAZA 2 (see `api_models::*_alias`).
 
         // Flows — migracja do binary WS (FAZA 3). REST usuniety:
         // - GET  /api/flows                       → FlowListRequest
@@ -1378,63 +1365,8 @@ fn route_api(
                 )
             };
 
-            // Backendy serwisow: /api/services/:id/backends
-            if let Some(sid) = extract_service_id_for_backends(path) {
-                return match method {
-                    &Method::GET => handle_result(api_services::handle_list_backends(db, sid), 500),
-                    &Method::POST => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_services::handle_create_backend(db, sid, body), 400)
-                    }
-                    _ => (405, r#"{"error":"Metoda niedozwolona"}"#.to_string()),
-                };
-            }
-
-            // Backendy: /api/backends/:id
-            if let Some(id) = extract_id_from_path(path, "/api/backends/") {
-                return match method {
-                    &Method::PUT => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_services::handle_update_backend(db, id, body), 400)
-                    }
-                    &Method::DELETE => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_services::handle_delete_backend(db, id), 500)
-                    }
-                    _ => (405, r#"{"error":"Metoda niedozwolona"}"#.to_string()),
-                };
-            }
-
-            // Sciezki z :id - services/:id, services/:id/stats, apikeys/:id
-            if let Some(id) = extract_id_from_path(path, "/api/services/") {
-                if path.ends_with("/stats") {
-                    if *method == Method::GET {
-                        return handle_result(api_services::handle_stats(db, id), 500);
-                    }
-                } else {
-                    return match *method {
-                        Method::PUT => {
-                            if require_admin(claims, db).is_some() {
-                                return admin_err();
-                            }
-                            handle_result(api_services::handle_update(db, id, body), 400)
-                        }
-                        Method::DELETE => {
-                            if require_admin(claims, db).is_some() {
-                                return admin_err();
-                            }
-                            handle_result(api_services::handle_delete(db, id), 500)
-                        }
-                        _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
-                    };
-                }
-            }
+            // /api/services/:id — REST removed in Krok N2; binary RPC
+            // `ServiceDeleteRequest` is the single source of truth.
 
             if let Some(id) = extract_id_from_path(path, "/api/apikeys/") {
                 if *method == Method::DELETE {
@@ -1465,25 +1397,8 @@ fn route_api(
                 };
             }
 
-            // Models /:id
-            if let Some(id) = extract_id_from_path(path, "/api/models/") {
-                return match *method {
-                    Method::GET => handle_result(api_models::handle_get_entry(db, id), 500),
-                    Method::PUT => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_models::handle_update_entry(db, id, body), 400)
-                    }
-                    Method::DELETE => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_models::handle_delete_entry(db, id), 500)
-                    }
-                    _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
-                };
-            }
+            // Models /:id — REST removed in Krok N2 (binary RPC owns the
+            // surface; alias CRUD already lives on binary in FAZA 2).
 
             // Flow Versions + Flows /:id — zmigrowane do binary WS (FAZA 3).
             // GET/POST /api/flows/:id/versions[/:vid[/restore]] → FlowVersion{List,Get,Restore}Request

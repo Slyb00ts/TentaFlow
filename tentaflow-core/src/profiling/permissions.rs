@@ -250,8 +250,8 @@ fn compute_collectors_status() -> Vec<ProfilingCollectorStatus> {
             }
 
             let binary = binary_for_collector(&id);
-            let path = binary
-                .and_then(|name| which::which(name).ok().map(|p| p.display().to_string()));
+            let path =
+                binary.and_then(|name| which::which(name).ok().map(|p| p.display().to_string()));
             if version.is_none() {
                 if let Some(name) = binary {
                     if let Some(v) = quick_version(name) {
@@ -262,9 +262,7 @@ fn compute_collectors_status() -> Vec<ProfilingCollectorStatus> {
             if !available && path.is_some() && supports_platform {
                 available = true;
                 if note.is_none() {
-                    note = Some(
-                        "Wykryty przez PATH; pelna walidacja przy starcie sesji.".into(),
-                    );
+                    note = Some("Wykryty przez PATH; pelna walidacja przy starcie sesji.".into());
                 }
             }
 
@@ -499,19 +497,31 @@ mod tests {
 
     #[test]
     fn install_command_perf_per_distro() {
-        assert_eq!(install_command("perf", DetectedDistro::Arch), "sudo pacman -S perf");
+        assert_eq!(
+            install_command("perf", DetectedDistro::Arch),
+            "sudo pacman -S perf"
+        );
         assert_eq!(
             install_command("perf", DetectedDistro::Debian),
             "sudo apt install linux-tools-common linux-tools-generic"
         );
-        assert_eq!(install_command("perf", DetectedDistro::Fedora), "sudo dnf install perf");
+        assert_eq!(
+            install_command("perf", DetectedDistro::Fedora),
+            "sudo dnf install perf"
+        );
         assert!(install_command("perf", DetectedDistro::MacOs).contains("Instruments"));
     }
 
     #[test]
     fn install_command_iostat_per_distro() {
-        assert_eq!(install_command("iostat", DetectedDistro::Debian), "sudo apt install sysstat");
-        assert_eq!(install_command("iostat", DetectedDistro::Fedora), "sudo dnf install sysstat");
+        assert_eq!(
+            install_command("iostat", DetectedDistro::Debian),
+            "sudo apt install sysstat"
+        );
+        assert_eq!(
+            install_command("iostat", DetectedDistro::Fedora),
+            "sudo dnf install sysstat"
+        );
         assert!(install_command("iostat", DetectedDistro::MacOs).contains("built into"));
     }
 
