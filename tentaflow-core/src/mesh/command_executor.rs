@@ -7,11 +7,25 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::RwLock as AsyncRwLock;
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
+use crate::db::DbPool;
 use crate::mesh::security::MeshSecurity;
+use crate::services::ports::PortAllocator;
 use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
+
+/// Resources required by cross-node service action handlers (krok N3b).
+/// Wired up after `MeshCommandExecutor::new` once the rest of `AppState` is
+/// constructed; absent in tests / when the supervisor never started, in
+/// which case ServiceDeleteRemote / ServicePinRemote / ... return an error.
+#[derive(Clone)]
+pub struct ServiceActionContext {
+    pub db: DbPool,
+    pub port_allocator: Arc<PortAllocator>,
+    pub iroh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+}
 
 /// Odpowiedz na komende mesh — mapowana 1:1 na MeshMessage::MeshCommandResponse
 pub struct CommandResponse {
@@ -50,6 +64,9 @@ pub struct MeshCommandExecutor {
     /// Trzymane do walidacji `validate_target_dir` (cert provisioning).
     #[allow(dead_code)]
     data_dir: PathBuf,
+    /// Service-action context wired in after AppState initialisation. `None`
+    /// disables ServiceDeleteRemote / ServicePinRemote / ... handlers.
+    service_actions: AsyncRwLock<Option<ServiceActionContext>>,
 }
 
 impl MeshCommandExecutor {
@@ -58,7 +75,19 @@ impl MeshCommandExecutor {
             security,
             local_node_id,
             data_dir,
+            service_actions: AsyncRwLock::new(None),
         }
+    }
+
+    /// Inject the resources needed for cross-node service action handlers.
+    /// Called once during startup after the supervisor and iroh manager are
+    /// up. Subsequent calls overwrite the previous context.
+    pub async fn set_service_action_context(&self, ctx: ServiceActionContext) {
+        *self.service_actions.write().await = Some(ctx);
+    }
+
+    async fn service_action_ctx(&self) -> Option<ServiceActionContext> {
+        self.service_actions.read().await.clone()
     }
 
     /// Wykonaj komende od zdalnego noda. Sprawdza trust przed wykonaniem.
@@ -128,9 +157,7 @@ impl MeshCommandExecutor {
                 })
                 .await;
                 match result {
-                    Ok(Ok(output)) => {
-                        CommandResponse::ok(MeshCommandResponsePayload::Text(output))
-                    }
+                    Ok(Ok(output)) => CommandResponse::ok(MeshCommandResponsePayload::Text(output)),
                     Ok(Err(e)) => CommandResponse::fail(e.to_string()),
                     Err(e) => CommandResponse::fail(format!("Blad watku: {}", e)),
                 }
@@ -145,9 +172,7 @@ impl MeshCommandExecutor {
             MeshCommandType::ContainerRestart { container_id } => {
                 self.handle_container_restart(&container_id).await
             }
-            MeshCommandType::SystemPrune { volumes } => {
-                self.handle_system_prune(volumes).await
-            }
+            MeshCommandType::SystemPrune { volumes } => self.handle_system_prune(volumes).await,
 
             MeshCommandType::BandwidthProbe {
                 target_ip,
@@ -217,10 +242,12 @@ impl MeshCommandExecutor {
                         }
 
                         // Zwroc OBA porty — klient sprobuje RDMA, jesli fail uzyje TCP
-                        CommandResponse::ok(MeshCommandResponsePayload::BandwidthProbeServerStarted {
-                            tcp_port,
-                            rdma_port: server_rdma_port,
-                        })
+                        CommandResponse::ok(
+                            MeshCommandResponsePayload::BandwidthProbeServerStarted {
+                                tcp_port,
+                                rdma_port: server_rdma_port,
+                            },
+                        )
                     }
                     "client" => {
                         // Probuj RDMA jesli serwer zwrocil rdma_port > 0
@@ -300,7 +327,369 @@ impl MeshCommandExecutor {
             MeshCommandType::ProfilingActiveInfo(req) => {
                 self.handle_profiling_active_info(req).await
             }
+
+            MeshCommandType::ServiceStartRemote { service_id } => {
+                self.handle_service_start_remote(service_id).await
+            }
+            MeshCommandType::ServiceDeleteRemote { service_id } => {
+                self.handle_service_delete_remote(service_id).await
+            }
+            MeshCommandType::ServicePinRemote { service_id, pinned } => {
+                self.handle_service_pin_remote(service_id, pinned).await
+            }
+            MeshCommandType::ServicePauseRemote { service_id, paused } => {
+                self.handle_service_pause_remote(service_id, paused).await
+            }
+            MeshCommandType::ServiceDeployRemote {
+                engine_id,
+                deploy_method,
+                config_json,
+            } => {
+                self.handle_service_deploy_remote(&engine_id, &deploy_method, &config_json)
+                    .await
+            }
         }
+    }
+
+    // ----- Cross-node service action handlers (krok N3b) -----
+
+    async fn handle_service_delete_remote(&self, service_id: i64) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+        let svc = {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return CommandResponse::fail(format!("service id={} not found", service_id))
+                }
+                Err(e) => return CommandResponse::fail(e.to_string()),
+            }
+        };
+        // Best-effort runtime stop, then drop the row regardless.
+        let _ = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await;
+        // Scoped lock: drop the MutexGuard before awaiting again.
+        {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            if let Err(e) = crate::services_repo::services::delete(&conn, service_id) {
+                return CommandResponse::fail(e.to_string());
+            }
+        }
+        push_service_change_after_action(&actions, &self.local_node_id, service_id, true).await;
+        CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+    }
+
+    async fn handle_service_pin_remote(&self, service_id: i64, pinned: bool) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+        {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            if let Err(e) = crate::services_repo::services::set_pinned(&conn, service_id, pinned) {
+                return CommandResponse::fail(e.to_string());
+            }
+        }
+        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
+        CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+    }
+
+    async fn handle_service_pause_remote(&self, service_id: i64, paused: bool) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+
+        // When pausing, mirror the local handler: actively stop the runtime
+        // and clear runtime metadata so health checks don't keep flapping.
+        if paused {
+            let svc = {
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                match crate::services_repo::services::get(&conn, service_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        return CommandResponse::fail(format!(
+                            "service id={} not found",
+                            service_id
+                        ))
+                    }
+                    Err(e) => return CommandResponse::fail(e.to_string()),
+                }
+            };
+            if matches!(
+                svc.status,
+                crate::services_repo::services::ServiceStatus::Running
+                    | crate::services_repo::services::ServiceStatus::Degraded
+                    | crate::services_repo::services::ServiceStatus::Starting
+            ) {
+                if let Err(e) =
+                    crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await
+                {
+                    return CommandResponse::fail(e.to_string());
+                }
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                if let Err(e) = crate::services_repo::services::update_status(
+                    &conn,
+                    service_id,
+                    crate::services_repo::services::ServiceStatus::Stopped,
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+                if let Err(e) = crate::services_repo::services::update_runtime(
+                    &conn, service_id, None, None, None, None,
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+            }
+        }
+
+        {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            if let Err(e) = crate::services_repo::services::set_paused(&conn, service_id, paused) {
+                return CommandResponse::fail(e.to_string());
+            }
+        }
+        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
+        CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+    }
+
+    async fn handle_service_start_remote(&self, service_id: i64) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+        let svc = {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return CommandResponse::fail(format!("service id={} not found", service_id))
+                }
+                Err(e) => return CommandResponse::fail(e.to_string()),
+            }
+        };
+
+        // Idempotent for already-running services.
+        if matches!(
+            svc.status,
+            crate::services_repo::services::ServiceStatus::Running
+                | crate::services_repo::services::ServiceStatus::Degraded
+        ) && !svc.paused
+        {
+            return CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult);
+        }
+
+        // Clear pause + flip to Starting before respawn.
+        {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            if svc.paused {
+                if let Err(e) = crate::services_repo::services::set_paused(&conn, service_id, false)
+                {
+                    return CommandResponse::fail(e.to_string());
+                }
+            }
+            if let Err(e) = crate::services_repo::services::update_status(
+                &conn,
+                service_id,
+                crate::services_repo::services::ServiceStatus::Starting,
+            ) {
+                return CommandResponse::fail(e.to_string());
+            }
+        }
+
+        let respawn = crate::services::deploy::respawn(
+            &svc.engine_id,
+            svc.deploy_method,
+            &svc.config_json,
+            actions.port_allocator.clone(),
+        )
+        .await;
+
+        let result = match respawn {
+            Ok(handle) => {
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                if let Err(e) = crate::services_repo::services::update_runtime(
+                    &conn,
+                    service_id,
+                    handle.pid,
+                    handle.port,
+                    handle.sidecar_port,
+                    handle.endpoint_url.as_deref(),
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+                if let Err(e) = crate::services_repo::services::update_status(
+                    &conn,
+                    service_id,
+                    crate::services_repo::services::ServiceStatus::Running,
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+                CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if let Ok(conn) = actions.db.lock() {
+                    let _ = crate::services_repo::services::update_status(
+                        &conn,
+                        service_id,
+                        crate::services_repo::services::ServiceStatus::Failed,
+                    );
+                    let _ = crate::services_repo::services::update_health(
+                        &conn,
+                        service_id,
+                        false,
+                        Some(&msg),
+                    );
+                }
+                CommandResponse::fail(msg)
+            }
+        };
+
+        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
+        result
+    }
+
+    async fn handle_service_deploy_remote(
+        &self,
+        engine_id: &str,
+        deploy_method: &str,
+        config_json: &str,
+    ) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+
+        let manifest = match crate::services::manifest::registry().by_id(engine_id) {
+            Some(m) => m.clone(),
+            None => {
+                return CommandResponse::fail(format!(
+                    "engine '{}' not found in manifest",
+                    engine_id
+                ))
+            }
+        };
+
+        let resolved = match resolve_deploy_method(&manifest, deploy_method) {
+            Ok(m) => m,
+            Err(e) => return CommandResponse::fail(e),
+        };
+
+        let user_config: serde_json::Value = if config_json.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            match serde_json::from_str(config_json) {
+                Ok(v) => v,
+                Err(e) => return CommandResponse::fail(format!("invalid config_json: {}", e)),
+            }
+        };
+
+        let slug = uuid::Uuid::new_v4().to_string();
+        let log_sender = crate::deploy::log_bus::sender_for(&slug);
+        let db_clone = actions.db.clone();
+        let port_alloc = actions.port_allocator.clone();
+        let manifest_task = manifest.clone();
+        let user_config_task = user_config.clone();
+        let log_sender_task = log_sender.clone();
+        let slug_task = slug.clone();
+        let local_node_id_task = self.local_node_id.clone();
+        let iroh_task = actions.iroh.clone();
+
+        tokio::spawn(async move {
+            let start_ms = crate::deploy::log_bus::now_ms();
+            let result = crate::services::deploy::deploy(
+                resolved,
+                &manifest_task,
+                &user_config_task,
+                &port_alloc,
+                &db_clone,
+                Some(log_sender_task.clone()),
+                Some(slug_task.clone()),
+            )
+            .await;
+            match result {
+                Ok(outcome) => {
+                    let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
+                        deploy_id: slug_task.clone(),
+                        final_status: "success".to_string(),
+                        image_tag: String::new(),
+                        container_name: format!("service-id-{}", outcome.endpoint.handle.id),
+                        error_message: String::new(),
+                        duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    crate::deploy::log_bus::close(&slug_task);
+                    let service_id = outcome.endpoint.handle.id;
+                    if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+                        &db_clone,
+                        service_id,
+                        &local_node_id_task,
+                    ) {
+                        let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                            from_node_id: local_node_id_task.clone(),
+                            change: tentaflow_protocol::ServiceChange::Added(info),
+                        };
+                        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                            let _ = iroh_task
+                                .broadcast_to_trusted(
+                                    tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                                    &bytes,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
+                        deploy_id: slug_task.clone(),
+                        final_status: "failure".to_string(),
+                        image_tag: String::new(),
+                        container_name: String::new(),
+                        error_message: err.to_string(),
+                        duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    crate::deploy::log_bus::close(&slug_task);
+                }
+            }
+        });
+
+        CommandResponse::ok(MeshCommandResponsePayload::ServiceDeployResult {
+            deploy_id: slug,
+            engine_id: engine_id.to_string(),
+            deploy_method: deploy_method.to_string(),
+        })
     }
 
     /// Zapisuje certyfikaty do dozwolonego katalogu
@@ -456,9 +845,7 @@ impl MeshCommandExecutor {
         &self,
         req: tentaflow_protocol::ProfilingStartRequest,
     ) -> CommandResponse {
-        use crate::profiling::{
-            ElevationToken, MULTI_SOURCE, PROFILE_PARSERS,
-        };
+        use crate::profiling::{ElevationToken, MULTI_SOURCE, PROFILE_PARSERS};
         use std::time::{SystemTime, UNIX_EPOCH};
         let elevation = if req.elevation_password.is_empty() {
             None
@@ -529,7 +916,10 @@ impl MeshCommandExecutor {
         use crate::profiling::PROFILE_STORAGE;
         match PROFILE_STORAGE.list_sessions(&self.local_node_id).await {
             Ok(entries) => {
-                let entries = entries.into_iter().map(Self::map_session_entry_v2).collect();
+                let entries = entries
+                    .into_iter()
+                    .map(Self::map_session_entry_v2)
+                    .collect();
                 CommandResponse::ok(MeshCommandResponsePayload::ProfilingSessions(
                     tentaflow_protocol::ProfilingSessionsResponse {
                         node_id: req.node_id,
@@ -783,11 +1173,7 @@ impl MeshCommandExecutor {
                 .map(|v| v.len())
                 .unwrap_or(0);
             let containers_bytes = containers.space_reclaimed.unwrap_or(0);
-            let images_count = images
-                .images_deleted
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let images_count = images.images_deleted.as_ref().map(|v| v.len()).unwrap_or(0);
             let images_bytes = images.space_reclaimed.unwrap_or(0);
             let (volumes_count, volumes_bytes) = match volumes_resp {
                 Some(v) => (
@@ -815,6 +1201,75 @@ impl MeshCommandExecutor {
             let _ = volumes;
             CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
         }
+    }
+}
+
+// Cross-node service action: after a remote-triggered mutation succeeds the
+// receiver pushes a `MeshServicesUpdate` so every other peer's
+// `MeshServicesRegistry` (including the original initiator) reflects the new
+// state without waiting for the 5-min anti-drift announce.
+async fn push_service_change_after_action(
+    actions: &ServiceActionContext,
+    local_node_id: &str,
+    service_id: i64,
+    removed: bool,
+) {
+    let change = if removed {
+        Some(tentaflow_protocol::ServiceChange::Removed { service_id })
+    } else {
+        match crate::services::snapshot_builder::build_one(&actions.db, service_id, local_node_id) {
+            Ok(Some(info)) => Some(tentaflow_protocol::ServiceChange::Updated(info)),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, service_id, "MeshServicesUpdate (action result): build_one failed");
+                None
+            }
+        }
+    };
+    let Some(change) = change else { return };
+    let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+        from_node_id: local_node_id.to_string(),
+        change,
+    };
+    if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+        let _ = actions
+            .iroh
+            .broadcast_to_trusted(
+                tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
+                &bytes,
+                None,
+            )
+            .await;
+    }
+}
+
+/// Wire deploy method tag → internal `DeployMethod` variant. Mirrors the
+/// helper in `dispatch::handlers` but kept private here so the executor does
+/// not pull on the dispatch crate boundary.
+fn resolve_deploy_method(
+    manifest: &crate::services::manifest::ServiceManifest,
+    method: &str,
+) -> std::result::Result<crate::services_repo::services::DeployMethod, String> {
+    use crate::services::manifest::NativeRuntime;
+    use crate::services_repo::services::DeployMethod;
+    match method {
+        "docker" => Ok(DeployMethod::Docker),
+        "external" => Ok(DeployMethod::External),
+        "native" => {
+            let native =
+                manifest.deploy.native.as_ref().ok_or_else(|| {
+                    format!("engine '{}' has no [deploy.native]", manifest.engine.id)
+                })?;
+            Ok(match native.runtime {
+                NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
+                NativeRuntime::Binary => DeployMethod::NativeBinary,
+                NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
+            })
+        }
+        other => Err(format!(
+            "unknown deploy method '{}': expected docker/native/external",
+            other
+        )),
     }
 }
 

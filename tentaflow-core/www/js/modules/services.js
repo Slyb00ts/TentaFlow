@@ -1,31 +1,29 @@
 // =============================================================================
-// Plik: modules/services.js
-// Opis: Ekran Services — 3 zakladki (tf-tabs underline):
-//       1) Lista   — tabela deployowanych serwisow z auto-refresh 5s
-//       2) Aliasy  — CRUD aliasow modeli (binary: modelAlias*Request), edycja w tf-window
-//       3) Modele  — zbiorcza lista modeli ze wszystkich nodow mesh
-//      "Nowy serwis" otwiera Catalog (target picker → wizard). Edycja aliasu
-//      oraz potwierdzenia usuwania korzystaja z komponentu <tf-window>.
-//      Auto-refresh uzywa morphdom przez /js/lib/patch.js zeby nie migotac.
+// File: modules/services.js — Services screen with 3 tabs (tf-tabs underline)
+//   1) List     — deployed services table (binary serviceListRequest), 5s refresh
+//   2) Aliases  — model alias CRUD (binary modelAlias*Request), tf-window editor
+//   3) Models   — mesh-wide model aggregate (binary modelsUnifiedListRequest)
+//   "New service" opens Catalog (target picker → wizard). Aliases edit + delete
+//   confirmations use <tf-window>. Auto-refresh uses morphdom via /js/lib/patch.js
+//   so the table does not flicker. Multi-node aggregation lands in Krok N5;
+//   today the list is local-only.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
-import { openUpdateModal } from '/js/modules/services/update-modal.js';
 
 let services = [];
 let aliases = [];
 let meshNodes = [];
 let unifiedModels = [];
-let quicStatusMap = {};
+let modelsCache = [];
 let refresher = null;
-let quicRefresher = null;
 let currentTab = 'list';
 let lastQuery = '';
 
@@ -67,23 +65,15 @@ const ServicesScreen = {
       hiddenIntervalMs: 20000,
     });
     refresher.start();
-    quicRefresher = createRefresher({
-      run: loadQuicStatus,
-      intervalMs: 5000,
-      hiddenIntervalMs: 20000,
-    });
-    quicRefresher.start();
   },
   unmount() {
     if (refresher) refresher.dispose();
-    if (quicRefresher) quicRefresher.dispose();
     refresher = null;
-    quicRefresher = null;
     services = [];
     aliases = [];
     meshNodes = [];
     unifiedModels = [];
-    quicStatusMap = {};
+    modelsCache = [];
   },
 };
 
@@ -91,24 +81,25 @@ const ServicesScreen = {
 
 async function loadAll() {
   try {
-    const [svc, al, nodes, unified] = await Promise.all([
-      ApiBinary.list('serviceListRequest').catch(() => []),
+    const [svc, al, nodes, unified, models] = await Promise.all([
+      ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
       ManifestStore.init().catch(() => false),
     ]);
-    services = svc || [];
+    services = Array.isArray(svc) ? svc : [];
     aliases = al || [];
     meshNodes = nodes || [];
     unifiedModels = Array.isArray(unified) ? unified : [];
-    // Lokalny service_registry jest swiezy — /api/mesh/nodes nie ma modeli
-    // lokalnego noda az heartbeat nie ustabilizuje sie. Mergujemy z modelsUnifiedListRequest.
+    modelsCache = Array.isArray(models) ? models : [];
+    // Legacy unified merge feeds the per-node models[] still consumed by the
+    // Mesh detail page; the Models tab itself reads from modelsCache.
     mergeUnifiedModelsIntoNodes();
     renderTab();
     updateSubtitle();
     updateTabCounts();
-    await loadQuicStatus();
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
   }
@@ -117,19 +108,26 @@ async function loadAll() {
 async function loadForCurrentTab() {
   try {
     if (currentTab === 'list') {
-      services = await ApiBinary.list('serviceListRequest');
+      // meshNodes is needed for hostname resolution in the Node column. Both
+      // requests run in parallel — peer_store updates land lazily so the local
+      // node is always present even when remotes are offline.
+      const [svc, nodes] = await Promise.all([
+        ApiBinary.list('serviceListRequest', { arrayKey: 'services' }),
+        ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => meshNodes),
+      ]);
+      services = Array.isArray(svc) ? svc : [];
+      meshNodes = Array.isArray(nodes) ? nodes : meshNodes;
       patchListTab();
     } else if (currentTab === 'aliases') {
       aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
       patchAliasesTab();
     } else if (currentTab === 'models') {
-      const [nodes, unified] = await Promise.all([
+      const [nodes, models] = await Promise.all([
         ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
-        ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+        ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
       ]);
       meshNodes = nodes || [];
-      unifiedModels = Array.isArray(unified) ? unified : [];
-      mergeUnifiedModelsIntoNodes();
+      modelsCache = Array.isArray(models) ? models : [];
       patchModelsTab();
     }
     updateSubtitle();
@@ -139,20 +137,8 @@ async function loadForCurrentTab() {
   }
 }
 
-async function loadQuicStatus() {
-  try {
-    const resp = await ApiBinary.one('serviceQuicStatusRequest');
-    const next = {};
-    for (const item of resp.statuses ?? []) next[item.name] = item.status;
-    quicStatusMap = next;
-    if (currentTab === 'list') updateQuicDots();
-  } catch (err) {
-    console.warn('[services] quic status:', err.message);
-  }
-}
-
 function updateSubtitle() {
-  const running = services.filter((s) => ['running', 'active', 'ready'].includes((s.status || '').toLowerCase())).length;
+  const running = services.filter((s) => ['running'].includes((s.status || '').toLowerCase())).length;
   const total = services.length;
   const sub = byId('services-sub');
   if (!sub) return;
@@ -188,7 +174,6 @@ function renderTab() {
   else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
   else if (currentTab === 'models') body.innerHTML = renderModelsTab();
   bindTabEvents();
-  if (currentTab === 'list') updateQuicDots();
 }
 
 function patchListTab() {
@@ -197,7 +182,6 @@ function patchListTab() {
   if (!body) return;
   patchInner(body, renderListTab());
   bindTabEvents();
-  updateQuicDots();
 }
 
 function patchAliasesTab() {
@@ -220,42 +204,28 @@ function bindTabEvents() {
   const body = byId('svc-tab-body');
   if (!body) return;
 
-  // List tab
+  // List tab — N5 row actions: Pause/Play toggle, Pin toggle, Delete.
   body.querySelectorAll('[data-svc-delete]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      stopService(b.dataset.svcDelete, b.dataset.svcName);
+      stopService(
+        b.dataset.svcDelete,
+        b.dataset.svcName,
+        b.dataset.svcNode,
+        b.dataset.svcNodeLabel,
+      );
     };
   });
-  body.querySelectorAll('[data-svc-pin]').forEach((b) => {
-    b.onclick = async (e) => {
-      e.stopPropagation();
-      const newPin = b.dataset.pinned !== '1';
-      await toggleServiceFlag(b.dataset.svcPin, b.dataset.svcName, { pinned: newPin });
-    };
-  });
-  body.querySelectorAll('[data-svc-pause]').forEach((b) => {
-    b.onclick = async (e) => {
-      e.stopPropagation();
-      const newPause = b.dataset.paused !== '1';
-      await toggleServiceFlag(b.dataset.svcPause, b.dataset.svcName, { paused: newPause });
-    };
-  });
-  body.querySelectorAll('[data-svc-update]').forEach((b) => {
+  body.querySelectorAll('[data-svc-pause-play]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      const svc = services.find((x) => String(x.id) === b.dataset.svcUpdate);
-      if (svc) {
-        openUpdateModal({
-          service: svc,
-          onUpdated: async () => {
-            services = await ApiBinary.list('serviceListRequest').catch(() => services);
-            patchListTab();
-            updateSubtitle();
-            updateTabCounts();
-          },
-        });
-      }
+      togglePauseStart(b);
+    };
+  });
+  body.querySelectorAll('[data-svc-pin-toggle]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      togglePin(b);
     };
   });
   body.querySelectorAll('[data-empty-cta]').forEach((b) => {
@@ -294,12 +264,14 @@ function renderListTab() {
     <table class="data-table">
       <thead>
         <tr>
-          <th>${escapeHtml(I18n.t('services.col_name'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_type'))}</th>
           <th>${escapeHtml(I18n.t('services.col_node'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_quic_address'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_quic_status'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_created'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_engine'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_display_name'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_category'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_endpoint'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_models'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_restart'))}</th>
           <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
         </tr>
       </thead>
@@ -310,69 +282,156 @@ function renderListTab() {
   `;
 }
 
+// Resolve a friendly label for a service.node_id by joining against the cached
+// meshNodes list. Falls back to a 12-char short hex when hostname is missing.
+function nodeLabelFor(nodeId) {
+  if (!nodeId) return { label: '?', isLocal: false, hostname: null, full: '' };
+  const node = meshNodes.find((n) => (n.node_id || n.id) === nodeId);
+  const hostname = node?.hostname || null;
+  const label = hostname || nodeId.slice(0, 12);
+  return { label, isLocal: !!node?.is_local, hostname, full: nodeId };
+}
+
+// Maps services.status × paused flag onto the tf-chip palette. The paused flag
+// wins over the underlying status because a paused row has no live process.
+function mapStatusToChip(status, paused) {
+  if (paused) return { variant: 'info', dot: false, key: 'paused' };
+  const key = (status || '').toLowerCase();
+  switch (key) {
+    case 'running': return { variant: 'online', dot: true, key };
+    case 'degraded': return { variant: 'pending', dot: true, key };
+    case 'failed': return { variant: 'err', dot: true, key };
+    case 'starting': return { variant: 'info', dot: true, key };
+    case 'stopped': return { variant: 'offline', dot: false, key };
+    default: return { variant: 'info', dot: false, key };
+  }
+}
+
+// Color chip class for a category — reuses existing scope-chip palette so the
+// list looks visually consistent with the catalog tiles.
+function categoryChipClass(category) {
+  switch ((category || '').toLowerCase()) {
+    case 'llm': return 'chat';
+    case 'embeddings':
+    case 'embedding': return 'mesh-read';
+    case 'stt':
+    case 'tts': return 'deploy';
+    case 'image-gen':
+    case 'video-gen':
+    case 'music-gen': return 'mesh-admin';
+    case 'agents':
+    case 'tools': return 'license';
+    default: return 'mesh-read';
+  }
+}
+
 function renderRow(s) {
-  const cfg = parseConfig(s.configJson);
-  const quicAddr = extractQuicAddr(cfg);
-  const deployMode = extractDeployMode(cfg);
-  const nodeLabel = s.nodeHostname
-    || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
-  const updateInfo = evaluateUpdate(s, cfg);
-  const isOnDemand = String(s.status || '').toLowerCase() === 'on_demand' || !!cfg?.on_demand;
-  const onDemandLabel = I18n.t('services.status.on_demand');
-  const quicAddrCell = isOnDemand
-    ? `<span style="color:var(--text-3); font-style:italic;">${escapeHtml(onDemandLabel)}</span>`
-    : (quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>');
-  const quicStatusCell = isOnDemand
-    ? `<span class="tag-status pending">${escapeHtml(onDemandLabel)}</span>`
-    : `<span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span>`;
+  const paused = !!s.paused;
+  const statusInfo = mapStatusToChip(s.status, paused);
+  const statusLabel = I18n.t(`services.status.${statusInfo.key}`)
+    || s.status || '—';
+  const endpoint = s.endpoint_url
+    ? `<code style="font-size:11px;" title="${escapeAttr(s.endpoint_url)}">${escapeHtml(truncateMiddle(s.endpoint_url, 36))}</code>`
+    : '<span style="color:var(--text-3);">—</span>';
+  const models = Array.isArray(s.models) ? s.models : [];
+  const modelChips = models.length === 0
+    ? '<span style="color:var(--text-3);">—</span>'
+    : models
+        .map((m) => {
+          const label = m.display_name || m.model_name || '';
+          return `<tf-chip status="info">${escapeHtml(label)}</tf-chip>`;
+        })
+        .join(' ');
+  const restartCount = Number.isFinite(s.restart_count) ? s.restart_count : 0;
+  const restartTitle = s.health_last_err
+    ? `title="${escapeAttr(s.health_last_err)}"`
+    : '';
+  const restartCell = restartCount > 0
+    ? `<tf-chip status="warn" ${restartTitle}>${restartCount}</tf-chip>`
+    : '<span style="color:var(--text-3);">0</span>';
+
+  const displayName = s.display_name || s.engine_id || '';
+  const engineLabel = s.engine_id || '';
+  const category = s.category || '';
+  const nodeInfo = nodeLabelFor(s.node_id);
+  const nodeBadge = nodeInfo.isLocal
+    ? `<span class="svc-node-local">${escapeHtml(I18n.t('services.node_local_badge'))}</span>`
+    : '';
+  const nodeCell = `
+    <span class="svc-node-cell" title="${escapeAttr(nodeInfo.full)}">
+      ${escapeHtml(nodeInfo.label)}${nodeBadge}
+    </span>`;
+
+  // Pause/Play toggle — paused row OR not-running ⇒ Play (start). Running ⇒ Pause.
+  const isStarting = (s.status || '').toLowerCase() === 'starting';
+  const isRunning = ['running', 'degraded'].includes((s.status || '').toLowerCase()) && !paused;
+  const showPlay = paused || !isRunning;
+  const ppIcon = isStarting ? 'rotate' : (showPlay ? 'play' : 'pause');
+  const ppAction = showPlay ? 'start' : 'pause';
+  const ppTooltip = showPlay
+    ? I18n.t('services.btn_play')
+    : I18n.t('services.btn_pause');
+
+  // Pin toggle — outline by default, filled accent when pinned.
+  const pinned = !!s.pinned;
+  const pinTooltip = pinned
+    ? I18n.t('services.tooltip_pin_on')
+    : I18n.t('services.tooltip_pin_off');
+
+  const svcId = escapeAttr(s.id);
+  const svcNodeId = escapeAttr(s.node_id || '');
+  const svcNodeLabel = escapeAttr(nodeInfo.label);
+
   return `
-    <tr data-key="svc-${escapeAttr(s.id)}">
-      <td data-label="${escapeAttr(I18n.t('services.col_name'))}">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong>
-          ${deployMode ? `<span class="scope-chip mesh-admin">${escapeHtml(deployMode)}</span>` : ''}
-          ${updateInfo.badge ? `<tf-chip status="${updateInfo.badge.variant}" dot>${escapeHtml(I18n.t(updateInfo.badge.labelKey))}</tf-chip>` : ''}
-        </div>
+    <tr data-key="svc-${svcId}">
+      <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
+        <strong style="color: var(--accent-2);">${escapeHtml(engineLabel)}</strong>
       </td>
-      <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
-      <td data-label="${escapeAttr(I18n.t('services.col_node'))}" style="font-size: 12px;">${escapeHtml(nodeLabel)}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddrCell}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}">${quicStatusCell}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_display_name'))}">
+        ${escapeHtml(displayName)}
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_category'))}">
+        <span class="scope-chip ${categoryChipClass(category)}">${escapeHtml(category.toUpperCase() || '—')}</span>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
+        <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_endpoint'))}">${endpoint}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
+        <div style="display:flex;flex-wrap:wrap;gap:4px;">${modelChips}</div>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
-        <tf-button variant="${s.pinned ? 'primary' : 'ghost'}" size="sm" icon="lock"
-          data-svc-pin="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
-          data-pinned="${s.pinned ? '1' : '0'}"
-          title="${escapeAttr(I18n.t(s.pinned ? 'services.tooltip_pin_on' : 'services.tooltip_pin_off'))}"></tf-button>
-        <tf-button variant="${s.paused ? 'warning' : 'ghost'}" size="sm" icon="${s.paused ? 'play' : 'pause'}"
-          data-svc-pause="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
-          data-paused="${s.paused ? '1' : '0'}"
-          title="${escapeAttr(I18n.t(s.paused ? 'services.tooltip_pause_on' : 'services.tooltip_pause_off'))}"></tf-button>
-        ${updateInfo.canRebuild ? (() => {
-          const labelKey = updateInfo.updateAvailable ? 'services.update_button' : 'services.rebuild_button';
-          const variant = updateInfo.updateAvailable ? 'primary' : 'ghost';
-          return `<tf-button variant="${variant}" size="sm" icon="refresh" data-svc-update="${escapeAttr(s.id)}" title="${escapeAttr(I18n.t(labelKey))}">${escapeHtml(I18n.t(labelKey))}</tf-button>`;
-        })() : ''}
-        <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="${ppIcon}"
+          data-svc-pause-play="${svcId}"
+          data-svc-action="${ppAction}"
+          data-svc-node="${svcNodeId}"
+          ${isStarting ? 'disabled' : ''}
+          title="${escapeAttr(ppTooltip)}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="pin"
+          class="svc-pin-toggle${pinned ? ' pinned' : ''}"
+          data-svc-pin-toggle="${svcId}"
+          data-svc-pinned="${pinned ? 'true' : 'false'}"
+          data-svc-node="${svcNodeId}"
+          title="${escapeAttr(pinTooltip)}"></tf-button>
+        <tf-button variant="danger" size="sm" icon="trash"
+          data-svc-delete="${svcId}"
+          data-svc-name="${escapeAttr(displayName)}"
+          data-svc-node="${svcNodeId}"
+          data-svc-node-label="${svcNodeLabel}"
+          title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>
+        <span class="svc-row-error" data-svc-error="${svcId}" hidden></span>
       </td>
     </tr>
   `;
 }
 
-function updateQuicDots() {
-  document.querySelectorAll('[data-quic-status]').forEach((el) => {
-    const name = el.dataset.quicStatus;
-    const raw = (quicStatusMap[name] || 'none').toLowerCase();
-    let cls = 'offline', labelKey = 'services.status.none';
-    if (raw === 'connected' || raw === 'ready') {
-      cls = 'online';
-      labelKey = raw === 'ready' ? 'services.status.ready' : 'services.status.connected';
-    } else if (raw === 'connecting') { cls = 'pending'; labelKey = 'services.status.connecting'; }
-    else if (raw === 'disconnected') { cls = 'offline'; labelKey = 'services.status.disconnected'; }
-    else if (raw === 'config_error') { cls = 'offline'; labelKey = 'services.status.config_error'; }
-    const target = `<span class="tag-status ${cls}">${escapeHtml(I18n.t(labelKey))}</span>`;
-    if (el.innerHTML !== target) el.innerHTML = target;
-  });
+// Truncate a long string in the middle so both prefix and suffix remain visible.
+function truncateMiddle(value, max) {
+  if (!value || value.length <= max) return value || '';
+  const half = Math.floor((max - 1) / 2);
+  return value.slice(0, half) + '…' + value.slice(value.length - half);
 }
 
 // ---- Aliases tab ----------------------------------------------------------
@@ -481,27 +540,33 @@ function mergeUnifiedModelsIntoNodes() {
 
 
 function collectUniqueModels() {
-  // Zbiera z meshNodes[].models[] — grupuj po kluczu (alias|backend|kind).
+  // Source: modelListRequest (services_repo::models::list_alive) — JOIN of
+  // model_registry + services WHERE status IN ('running','degraded'). Keys by
+  // (model_name, engine_id) so the same alias served by multiple engines stays
+  // distinguishable, and aggregates node_id into a chip list per row.
   const map = new Map();
-  for (const n of meshNodes) {
-    const list = Array.isArray(n.models) ? n.models : [];
-    const nodeLabel = n.hostname || (n.node_id ? n.node_id.slice(0, 12) : '?');
-    for (const m of list) {
-      const key = `${m.alias}|${m.backend || ''}|${m.kind || ''}`;
-      if (!map.has(key)) {
-        map.set(key, {
-          alias: m.alias,
-          kind: m.kind || '',
-          backend: m.backend || '',
-          size_mb: m.size_mb || 0,
-          loaded: !!m.loaded,
-          nodes: [nodeLabel],
-        });
-      } else {
-        const entry = map.get(key);
-        if (!entry.nodes.includes(nodeLabel)) entry.nodes.push(nodeLabel);
-        entry.loaded = entry.loaded || m.loaded;
-      }
+  for (const m of modelsCache) {
+    const alias = m.model_name || m.modelName || m.id;
+    if (!alias) continue;
+    const backend = m.engine_id || m.engineId || '';
+    const kind = (m.category || '').toLowerCase();
+    const key = `${alias}|${backend}`;
+    const nodeInfo = nodeLabelFor(m.node_id || m.nodeId || '');
+    const nodeLabel = nodeInfo.label;
+    const isLoaded = (m.availability || '').toLowerCase() === 'running';
+    if (!map.has(key)) {
+      map.set(key, {
+        alias,
+        kind,
+        backend,
+        size_mb: 0,
+        loaded: isLoaded,
+        nodes: nodeLabel ? [nodeLabel] : [],
+      });
+    } else {
+      const entry = map.get(key);
+      if (nodeLabel && !entry.nodes.includes(nodeLabel)) entry.nodes.push(nodeLabel);
+      entry.loaded = entry.loaded || isLoaded;
     }
   }
   return [...map.values()].sort((a, b) => a.alias.localeCompare(b.alias));
@@ -803,124 +868,118 @@ async function deleteAlias(id, name) {
 
 // ---- Helpers --------------------------------------------------------------
 
-async function stopService(id, name) {
+async function stopService(id, name, nodeId, nodeLabel) {
   const ok = await TfWindow.confirm({
-    title: I18n.t('common.delete'),
-    message: I18n.t('services.delete_confirm', { name }),
-    confirmLabel: I18n.t('common.delete'),
+    title: I18n.t('services.confirm_delete_title'),
+    message: I18n.t('services.confirm_delete_body', {
+      name: name || id,
+      node: nodeLabel || nodeId || '—',
+    }),
+    confirmLabel: I18n.t('services.btn_delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,
   });
   if (!ok) return;
   try {
-    const r = await ApiBinary.action('serviceStopRequest', { serviceId: id });
-    if (r.stopped) {
-      toast(I18n.t('services.delete_success', { name }), 'success');
-      services = await ApiBinary.list('serviceListRequest');
-      patchListTab();
-      updateSubtitle();
-      updateTabCounts();
-    } else {
-      toast(I18n.t('services.delete_not_found'), 'warning');
-    }
-  } catch (err) {
-    toast(I18n.t('services.delete_error', { error: err.message }), 'error');
-  }
-}
-
-/// MemoryGuard: ustawia pinned/paused. Jeśli paused=true — backend od razu
-/// zwolni VRAM (force_unload). Po sukcesie odświeżamy listę.
-async function toggleServiceFlag(id, name, { pinned, paused }) {
-  try {
-    const r = await ApiBinary.action('serviceFlagsUpdateRequest', {
+    // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
+    // wipes attached model_registry rows. When nodeId points at a remote peer
+    // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.
+    const resp = await ApiBinary.action('serviceDeleteRequest', {
       serviceId: id,
-      pinned,
-      paused,
+      nodeId: nodeId || undefined,
     });
-    if (r.ok) {
-      let key;
-      if (pinned !== undefined) key = pinned ? 'services.toast_pinned' : 'services.toast_unpinned';
-      else key = paused ? 'services.toast_paused' : 'services.toast_resumed';
-      toast(I18n.t(key, { name }), 'success');
-      services = await ApiBinary.list('serviceListRequest');
-      patchListTab();
+    if (resp && resp.success === false) {
+      throw new Error(resp.error || 'Unknown error');
     }
+    await refreshServiceList();
   } catch (err) {
-    toast(I18n.t('services.toast_flag_error', { error: err.message }), 'error');
+    showRowError(id, err.message);
   }
 }
 
-function parseConfig(json) {
-  if (!json) return {};
-  try { return JSON.parse(json); } catch { return {}; }
+// Pause/Play toggle handler. Reads action from data-svc-action set by renderer
+// and posts the matching binary RPC. The button's icon is updated inline (rotate
+// = pending) until the refresh swaps the row in.
+async function togglePauseStart(button) {
+  const id = button.dataset.svcPausePlay;
+  const action = button.dataset.svcAction;
+  const nodeId = button.dataset.svcNode;
+  if (!id || !action) return;
+  button.setAttribute('disabled', '');
+  button.setAttribute('icon', 'rotate');
+  try {
+    if (action === 'pause') {
+      await ApiBinary.action('servicePauseRequest', {
+        serviceId: id,
+        nodeId: nodeId || undefined,
+        paused: true,
+      });
+    } else {
+      await ApiBinary.action('serviceStartRequest', {
+        serviceId: id,
+        nodeId: nodeId || undefined,
+      });
+    }
+    await refreshServiceList();
+  } catch (err) {
+    showRowError(id, err.message);
+    button.removeAttribute('disabled');
+    button.setAttribute('icon', action === 'pause' ? 'pause' : 'play');
+  }
 }
 
-function extractQuicAddr(cfg) {
-  if (!cfg) return '';
-  if (cfg.quic_url) return String(cfg.quic_url).replace(/^quic:\/\//, '');
-  if (cfg.quic_port && cfg.agent_domain) return `${cfg.agent_domain}:${cfg.quic_port}`;
-  return '';
+// Pin toggle handler — flips data-svc-pinned, posts servicePinRequest with the
+// new state, and refreshes the list. The .pinned class is rebuilt by render.
+async function togglePin(button) {
+  const id = button.dataset.svcPinToggle;
+  const nodeId = button.dataset.svcNode;
+  const current = button.dataset.svcPinned === 'true';
+  if (!id) return;
+  const next = !current;
+  button.setAttribute('disabled', '');
+  // Optimistic flip — keeps the icon state consistent during the round-trip.
+  button.classList.toggle('pinned', next);
+  button.dataset.svcPinned = next ? 'true' : 'false';
+  try {
+    await ApiBinary.action('servicePinRequest', {
+      serviceId: id,
+      nodeId: nodeId || undefined,
+      pinned: next,
+    });
+    await refreshServiceList();
+  } catch (err) {
+    // Rollback optimistic flip.
+    button.classList.toggle('pinned', current);
+    button.dataset.svcPinned = current ? 'true' : 'false';
+    button.removeAttribute('disabled');
+    showRowError(id, err.message);
+  }
 }
 
-/// Determines whether the deployed instance is out of date vs. the manifest's
-/// current source hash. Returns:
-///   - showButton: render the "Update" action button
-///   - badge: { variant, labelKey } or null (chip rendered next to service name)
-/// External / embedded / unknown-method deployments never show the button
-/// because we have no source tree to rebuild from.
-function evaluateUpdate(service, cfg) {
-  // On-demand services like teams-bot register without engine_id in config_json,
-  // so fall back to service.name which equals the manifest engine.id for them.
-  const engineId = service.engineId || cfg?.engine_id || cfg?.engineId || service.name || '';
-  // Registrations in the wild use deploy_mode, deploy_method, camelCase, or
-  // snake_case interchangeably — accept any of them rather than forcing a
-  // migration of existing rows.
-  const rawMethod = (
-    service.deployMethod
-    || cfg?.deploy_method
-    || cfg?.deployMethod
-    || cfg?.deploy_mode
-    || cfg?.deployMode
-    || ''
-  ).toLowerCase();
-  if (!engineId || !ManifestStore.isLoaded()) {
-    return { canRebuild: false, badge: null };
-  }
-  if (rawMethod === 'external') {
-    return { canRebuild: false, badge: { variant: 'info', labelKey: 'services.update_managed_externally' } };
-  }
-  if (rawMethod !== 'docker' && rawMethod !== 'native') {
-    return { canRebuild: false, badge: null };
-  }
-  const manifest = ManifestStore.byId(engineId);
-  if (!manifest) {
-    return { canRebuild: false, badge: null };
-  }
-  const manifestHash = rawMethod === 'docker'
-    ? (manifest.docker_source_hash || '')
-    : (manifest.native_source_hash || '');
-  if (!manifestHash) {
-    // Source-less deploy kind (embedded feature-flag, or manifest predates the
-    // hash feature) — nothing to compare, nothing to update.
-    return { canRebuild: false, badge: null };
-  }
-  const deployedHash = service.deployedSourceHash || '';
-  const updateAvailable = deployedHash !== manifestHash;
-  return {
-    canRebuild: true,
-    updateAvailable,
-    badge: updateAvailable
-      ? { variant: 'warn', labelKey: 'services.update_available' }
-      : null,
-  };
+// Pull a fresh service list and patch the table without flicker.
+async function refreshServiceList() {
+  const fresh = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' })
+    .catch(() => services);
+  services = Array.isArray(fresh) ? fresh : [];
+  patchListTab();
+  updateSubtitle();
+  updateTabCounts();
 }
 
-function extractDeployMode(cfg) {
-  if (!cfg) return '';
-  const raw = String(cfg.deploy_mode || cfg.deployMode || cfg.deploy_method || cfg.deployMethod || '').toLowerCase();
-  if (!raw) return '';
-  const translated = I18n.t(`wizard.method.${raw}`);
-  return translated && translated !== `wizard.method.${raw}` ? translated : raw;
+// Render a per-row error string under the action cell. Auto-hides via CSS
+// animation (5s). Replaces any prior message so the user sees the latest.
+function showRowError(serviceId, message) {
+  const el = document.querySelector(`[data-svc-error="${CSS.escape(String(serviceId))}"]`);
+  if (!el) return;
+  el.textContent = message || I18n.t('common.error');
+  el.hidden = false;
+  // Restart CSS animation by reflow + class toggle.
+  el.classList.remove('svc-row-error');
+  void el.offsetWidth; // force reflow
+  el.classList.add('svc-row-error');
+  setTimeout(() => {
+    if (el.isConnected) el.hidden = true;
+  }, 5000);
 }
 
 function typeChipClass(t) {
@@ -935,14 +994,6 @@ function typeChipClass(t) {
     case 'tool': return 'mesh-admin';
     default: return 'license';
   }
-}
-
-function formatDateOnly(s) {
-  try {
-    const d = new Date(s);
-    if (isNaN(d.getTime())) return s;
-    return d.toLocaleDateString(I18n.getLanguage(), { day: '2-digit', month: '2-digit', year: 'numeric' });
-  } catch { return s; }
 }
 
 export default ServicesScreen;

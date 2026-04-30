@@ -148,7 +148,10 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         .env("TTS_ALIAS", &req.tts_alias)
         .env("FLOW_ALIAS", &req.flow_alias)
         .env("LLM_ALIAS", &req.llm_alias)
-        .env("RESPOND_ENABLED", if req.respond_enabled { "true" } else { "false" })
+        .env(
+            "RESPOND_ENABLED",
+            if req.respond_enabled { "true" } else { "false" },
+        )
         .env("RESPONSE_MODE", &req.response_mode)
         .env("WAKE_WORDS", &req.wake_words)
         .env("TRANSPORT_PORT", req.ports.quic.to_string())
@@ -208,7 +211,11 @@ pub async fn stop(session_id: i64) -> Result<()> {
     // Czekaj max 10s na exit, potem kill.
     let exit = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
     match exit {
-        Ok(Ok(status)) => info!(session = session_id, ?status, "Meeting Bot subprocess zakonczony"),
+        Ok(Ok(status)) => info!(
+            session = session_id,
+            ?status,
+            "Meeting Bot subprocess zakonczony"
+        ),
         Ok(Err(e)) => warn!(session = session_id, "wait subprocess: {}", e),
         Err(_) => {
             warn!(session = session_id, "timeout 10s — wymuszam kill");

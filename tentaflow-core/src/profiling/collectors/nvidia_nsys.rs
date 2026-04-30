@@ -21,7 +21,9 @@ use crate::profiling::collectors::{
     CollectorCapability, CollectorError, PlatformSet, ProbeResult, ProfileCollector, RawCapture,
     RunningCollector, SessionCtx,
 };
-use crate::profiling::nsys::{build_nsys_args, nsys_binary, nsys_process_lock, send_sigterm, NsightScope};
+use crate::profiling::nsys::{
+    build_nsys_args, nsys_binary, nsys_process_lock, send_sigterm, NsightScope,
+};
 
 /// Stable identifier exposed by the collector.
 const COLLECTOR_ID: &str = "nvidia.nsys.gpu";

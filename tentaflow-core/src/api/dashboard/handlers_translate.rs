@@ -77,7 +77,8 @@ fn first_choice_text(resp: &crate::api::openai::types::ChatCompletionResponse) -
 // Selects an LLM identifier. Prefers the first unified LLM from mesh registry;
 // falls back to the generic "default" that local_inference resolves at runtime.
 fn pick_llm_model(ctx: &HandlerContext) -> String {
-    let unified = crate::api::dashboard::api_models::collect_unified(&ctx.state.quic_mesh);
+    let unified =
+        crate::api::dashboard::api_models::collect_unified(&ctx.state.mesh_services_registry);
     unified
         .into_iter()
         .find(|m| m.service_type.eq_ignore_ascii_case("llm"))
@@ -258,16 +259,18 @@ text, with no explanations, quotes, preface or meta-commentary.",
         translated_text.chars().count(),
     );
 
-    Ok(MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Res(TranslateResponse {
-        translated_text,
-        // Auto-detection of the source language is not surfaced by current
-        // LLM backends; leaving None until a detector is wired in.
-        detected_source_lang: None,
-        model_used: if response.model.is_empty() {
-            model_id
-        } else {
-            response.model
-        },
-        tokens_used,
-    })))
+    Ok(MessageBody::TranslateBody(
+        tentaflow_protocol::TranslatePayload::Res(TranslateResponse {
+            translated_text,
+            // Auto-detection of the source language is not surfaced by current
+            // LLM backends; leaving None until a detector is wired in.
+            detected_source_lang: None,
+            model_used: if response.model.is_empty() {
+                model_id
+            } else {
+                response.model
+            },
+            tokens_used,
+        }),
+    ))
 }

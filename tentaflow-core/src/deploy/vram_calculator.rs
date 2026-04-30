@@ -109,13 +109,22 @@ pub fn quant_label_to_bytes(label: &str) -> Option<f64> {
     let q = label.to_lowercase().replace('-', "_");
     match q.as_str() {
         // 4-bit: AWQ, GPTQ, AutoRound INT4, bnb-4bit, NVFP4, FP4, MXFP4, w4a16
-        "int4" | "awq" | "gptq" | "int4_autoround" | "auto_round"
-        | "bnb_4bit" | "bitsandbytes_4bit" | "load_in_4bit"
-        | "nvfp4" | "fp4" | "mxfp4" | "w4a16" | "compressed_tensors_4bit" => Some(0.5625),
+        "int4"
+        | "awq"
+        | "gptq"
+        | "int4_autoround"
+        | "auto_round"
+        | "bnb_4bit"
+        | "bitsandbytes_4bit"
+        | "load_in_4bit"
+        | "nvfp4"
+        | "fp4"
+        | "mxfp4"
+        | "w4a16"
+        | "compressed_tensors_4bit" => Some(0.5625),
         // 8-bit: int8, fp8, bnb-8bit, w8a8, w8a16
-        "int8" | "fp8" | "fp8_e4m3" | "fp8_e5m2"
-        | "bnb_8bit" | "bitsandbytes_8bit" | "load_in_8bit"
-        | "w8a8" | "w8a16" | "modelopt_fp8" => Some(1.0625),
+        "int8" | "fp8" | "fp8_e4m3" | "fp8_e5m2" | "bnb_8bit" | "bitsandbytes_8bit"
+        | "load_in_8bit" | "w8a8" | "w8a16" | "modelopt_fp8" => Some(1.0625),
         // 2-bit (rzadkie ale istnieje)
         "int2" | "w2a16" => Some(0.3125),
         // 16-bit warianty
@@ -139,11 +148,19 @@ pub fn detect_quant_from_name(repo: &str) -> Option<String> {
         (&["gptq"], "gptq"),
         (&["autoround"], "auto_round"),
         (&["w4a16"], "w4a16"),
-        (&["int4", "4bit", "4_bit", "q4_k", "q4_0", "q4_1", "gguf_q4", "gguf-q4"], "int4"),
+        (
+            &[
+                "int4", "4bit", "4_bit", "q4_k", "q4_0", "q4_1", "gguf_q4", "gguf-q4",
+            ],
+            "int4",
+        ),
         (&["w8a8"], "w8a8"),
         (&["w8a16"], "w8a16"),
         (&["fp8"], "fp8"),
-        (&["int8", "8bit", "8_bit", "q8_0", "gguf_q8", "gguf-q8"], "int8"),
+        (
+            &["int8", "8bit", "8_bit", "q8_0", "gguf_q8", "gguf-q8"],
+            "int8",
+        ),
     ];
     for (needles, label) in patterns {
         if needles.iter().any(|n| lower.contains(n)) {
@@ -168,10 +185,18 @@ pub fn quant_label_from_config(qc: &serde_json::Value) -> Option<String> {
     let bits = obj.get("bits").and_then(|v| v.as_u64()).unwrap_or(0);
 
     // bnb legacy: `load_in_4bit` / `load_in_8bit` bool flags.
-    if obj.get("load_in_4bit").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if obj
+        .get("load_in_4bit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return Some("bnb_4bit".into());
     }
-    if obj.get("load_in_8bit").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if obj
+        .get("load_in_8bit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return Some("bnb_8bit".into());
     }
 
@@ -337,7 +362,8 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     let per_gpu_gb = weights_per_gpu + kv_per_gpu + activations_per_gpu;
 
     // Walidacja TP/PP vs model heads/layers
-    if model.num_attention_heads > 0 && model.num_attention_heads % input.tensor_parallel as u64 != 0
+    if model.num_attention_heads > 0
+        && model.num_attention_heads % input.tensor_parallel as u64 != 0
     {
         warnings.push(format!(
             "tensor_parallel={} nie dzieli num_attention_heads={} - vLLM odrzuci konfiguracje",
@@ -352,8 +378,7 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
             input.tensor_parallel, model.num_key_value_heads
         ));
     }
-    if model.num_hidden_layers > 0
-        && model.num_hidden_layers % input.pipeline_parallel as u64 != 0
+    if model.num_hidden_layers > 0 && model.num_hidden_layers % input.pipeline_parallel as u64 != 0
     {
         warnings.push(format!(
             "pipeline_parallel={} nie dzieli num_hidden_layers={} - vLLM odrzuci konfiguracje",
@@ -433,9 +458,8 @@ pub fn analyze_gpu_compatibility(spec: &ModelSpec, gpu_count: u32) -> GpuCompati
     let heads = spec.num_attention_heads.max(1);
     let kv_heads = spec.num_key_value_heads.max(1);
     let layers = spec.num_hidden_layers.max(1);
-    let clean = heads % (tp as u64) == 0
-        && kv_heads % (tp as u64) == 0
-        && layers % (pp as u64) == 0;
+    let clean =
+        heads % (tp as u64) == 0 && kv_heads % (tp as u64) == 0 && layers % (pp as u64) == 0;
 
     // Lista "lepszych" gpu_counts dla tego modelu: szukamy w zakresie [1..16]
     // wszystkich N takich ze istnieje partycja TP*PP=N gdzie heads%TP=0,
@@ -457,24 +481,33 @@ pub fn analyze_gpu_compatibility(spec: &ModelSpec, gpu_count: u32) -> GpuCompati
         }
     }
 
-    let warning = if !clean {
-        Some(format!(
+    let warning =
+        if !clean {
+            Some(format!(
             "{} GPU nie dzieli sie idealnie dla tego modelu (heads={}, kv_heads={}, layers={}). \
              Wybrano TP={} PP={} jako fallback - czesc GPU moze byc nieoptymalnie wykorzystana \
              albo deploy moze sie nie udac. Lepsze liczby GPU: {}",
             gpu_count, heads, kv_heads, layers, tp, pp,
             better.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
         ))
-    } else if !uses_all {
-        Some(format!(
-            "{} GPU - {} bedzie nieuzywane (TP={} PP={} = {}). \
+        } else if !uses_all {
+            Some(format!(
+                "{} GPU - {} bedzie nieuzywane (TP={} PP={} = {}). \
              Lepsze liczby GPU: {}",
-            gpu_count, gpu_count - tp * pp, tp, pp, tp * pp,
-            better.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
-        ))
-    } else {
-        None
-    };
+                gpu_count,
+                gpu_count - tp * pp,
+                tp,
+                pp,
+                tp * pp,
+                better
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        } else {
+            None
+        };
 
     GpuCompatibilityReport {
         used_tp: tp,
@@ -508,10 +541,7 @@ pub fn recommend_parallelism(model: &ModelSpec, gpu_count: u32) -> (u32, u32) {
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
     for (tp, pp) in &candidates {
-        if heads % (*tp as u64) == 0
-            && kv_heads % (*tp as u64) == 0
-            && layers % (*pp as u64) == 0
-        {
+        if heads % (*tp as u64) == 0 && kv_heads % (*tp as u64) == 0 && layers % (*pp as u64) == 0 {
             return (*tp, *pp);
         }
     }
@@ -545,9 +575,7 @@ pub fn recommend_parallelism_vram_aware(
         .filter(|tp| gpu_count % tp == 0)
         .map(|tp| (tp, gpu_count / tp))
         .filter(|(tp, pp)| {
-            heads % (*tp as u64) == 0
-                && kv_heads % (*tp as u64) == 0
-                && layers % (*pp as u64) == 0
+            heads % (*tp as u64) == 0 && kv_heads % (*tp as u64) == 0 && layers % (*pp as u64) == 0
         })
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -750,8 +778,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             // Jesli przy zadanym ctx + seqs nie fits - obnizamy seqs (nie ctx).
             // Min 1 seq; jak nie fits przy 1 seq to dopiero kapujemy ctx.
             if kv_per_seq_full * new_seqs as f64 > kv_budget_bytes {
-                let max_seqs_at_req_ctx =
-                    (kv_budget_bytes / kv_per_seq_full).floor() as u64;
+                let max_seqs_at_req_ctx = (kv_budget_bytes / kv_per_seq_full).floor() as u64;
                 new_seqs = max_seqs_at_req_ctx.max(1).min(target_seqs);
                 if new_seqs < target_seqs {
                     auto_adjusted.push("max_num_seqs".into());
@@ -831,12 +858,12 @@ pub fn kv_bytes_per_seq_per_token(model: &ModelSpec, kv_cache_dtype: &str) -> f6
 
 /// Maksymalny `max_model_len` ktory zmiesci sie przy danej konfiguracji + batch.
 /// Iteracyjnie redukuje ctx_len az kv_cache + weights + overhead miesci sie w VRAM.
-pub fn max_context_for_budget(
-    model: &ModelSpec,
-    input: &VramEstimateInput,
-) -> u64 {
+pub fn max_context_for_budget(model: &ModelSpec, input: &VramEstimateInput) -> u64 {
     let mut lo: u64 = 512;
-    let mut hi: u64 = model.max_position_embeddings.max(input.max_model_len).max(8192);
+    let mut hi: u64 = model
+        .max_position_embeddings
+        .max(input.max_model_len)
+        .max(8192);
     // Binary search do najwiekszego ctx_len ktory fits.
     while lo + 256 < hi {
         let mid = (lo + hi) / 2;
@@ -853,10 +880,7 @@ pub fn max_context_for_budget(
 }
 
 /// Maksymalna `max_num_seqs` (rownoleglych zapytan) przy zadanym ctx_len.
-pub fn max_concurrent_seqs_for_budget(
-    model: &ModelSpec,
-    input: &VramEstimateInput,
-) -> u64 {
+pub fn max_concurrent_seqs_for_budget(model: &ModelSpec, input: &VramEstimateInput) -> u64 {
     let mut lo: u64 = 1;
     let mut hi: u64 = 1024;
     while lo + 4 < hi {
@@ -876,10 +900,7 @@ pub fn max_concurrent_seqs_for_budget(
 /// Parsuj HF config.json (przekazany jako serde_json::Value). Obsluguje
 /// `text_config` zagnieżdżony (multimodal). Wykrywa quantization z
 /// `quantization_config` lub nazwy modelu.
-pub fn parse_hf_config(
-    config_json: &serde_json::Value,
-    model_name: &str,
-) -> Result<ModelSpec> {
+pub fn parse_hf_config(config_json: &serde_json::Value, model_name: &str) -> Result<ModelSpec> {
     parse_hf_config_with_override(config_json, model_name, None)
 }
 
@@ -914,7 +935,10 @@ pub fn parse_hf_config_with_override(
     };
 
     let pick_str = |obj: &serde_json::Map<String, serde_json::Value>, key: &str| -> String {
-        obj.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
 
     let dtype = {
@@ -955,15 +979,26 @@ pub fn parse_hf_config_with_override(
             .iter()
             .any(|a| a.contains("ConditionalGeneration") || a.contains("Vision"));
     let has_audio = cfg.contains_key("audio_config")
-        || cfg.get("audio_token_id").map(|v| !v.is_null()).unwrap_or(false);
+        || cfg
+            .get("audio_token_id")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
 
     let kv_heads = pick_u64_either("num_key_value_heads");
-    let kv_heads_final = if kv_heads > 0 { kv_heads } else { num_attention_heads };
+    let kv_heads_final = if kv_heads > 0 {
+        kv_heads
+    } else {
+        num_attention_heads
+    };
 
     Ok(ModelSpec {
         model_type: pick_str(cfg, "model_type"),
         architectures,
-        dtype: if dtype.is_empty() { "bfloat16".into() } else { dtype },
+        dtype: if dtype.is_empty() {
+            "bfloat16".into()
+        } else {
+            dtype
+        },
         hidden_size,
         num_attention_heads,
         num_key_value_heads: kv_heads_final,
@@ -1021,9 +1056,18 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
     if let Some(q) = &spec.quantization {
         let q_norm = q.to_lowercase().replace('-', "_");
         match q_norm.as_str() {
-            "awq" => { parts.push("--quantization".into()); parts.push("awq".into()); }
-            "gptq" => { parts.push("--quantization".into()); parts.push("gptq".into()); }
-            "fp8" | "modelopt_fp8" => { parts.push("--quantization".into()); parts.push("fp8".into()); }
+            "awq" => {
+                parts.push("--quantization".into());
+                parts.push("awq".into());
+            }
+            "gptq" => {
+                parts.push("--quantization".into());
+                parts.push("gptq".into());
+            }
+            "fp8" | "modelopt_fp8" => {
+                parts.push("--quantization".into());
+                parts.push("fp8".into());
+            }
             "int4" | "int4_autoround" | "auto_round" => {
                 parts.push("--quantization".into());
                 parts.push("auto_round".into());
@@ -1141,7 +1185,11 @@ mod tests {
         assert!(est.fits_per_gpu, "Qwen 0.5B powinien sie miescic: {est:?}");
         // ~1 GB weights + KV + 5 GB workspace + 10% activations + 0.5 GB overhead = ~7 GB.
         // Margines do 12 GB chroni przed drobnymi zmianami formuly.
-        assert!(est.total_gb < 12.0, "Qwen 0.5B nie powinien zjesc >12GB: {}", est.total_gb);
+        assert!(
+            est.total_gb < 12.0,
+            "Qwen 0.5B nie powinien zjesc >12GB: {}",
+            est.total_gb
+        );
     }
 
     #[test]
@@ -1154,8 +1202,15 @@ mod tests {
             ..Default::default()
         };
         let est = estimate_vllm_vram(&m, &input);
-        assert!(!est.fits_per_gpu, "Gemma 31B nie moze sie miescic na 1x 24GB");
-        assert!(est.model_weights_gb > 50.0, "31B w bf16 to ~62GB: {}", est.model_weights_gb);
+        assert!(
+            !est.fits_per_gpu,
+            "Gemma 31B nie moze sie miescic na 1x 24GB"
+        );
+        assert!(
+            est.model_weights_gb > 50.0,
+            "31B w bf16 to ~62GB: {}",
+            est.model_weights_gb
+        );
     }
 
     #[test]
@@ -1181,7 +1236,10 @@ mod tests {
             ..Default::default()
         };
         let est = estimate_vllm_vram(&m, &input);
-        assert!(est.fits_per_gpu, "31B na 6x 3090 z TP*PP=6 musi sie miescic: {est:?}");
+        assert!(
+            est.fits_per_gpu,
+            "31B na 6x 3090 z TP*PP=6 musi sie miescic: {est:?}"
+        );
     }
 
     #[test]
@@ -1202,8 +1260,10 @@ mod tests {
         assert!(r.better_gpu_counts.contains(&1));
         assert!(r.better_gpu_counts.contains(&4));
         assert!(r.better_gpu_counts.contains(&6));
-        println!("Gemma 31B compat dla 5 GPU: tp={} pp={} better={:?} warning={:?}",
-            r.used_tp, r.used_pp, r.better_gpu_counts, r.warning);
+        println!(
+            "Gemma 31B compat dla 5 GPU: tp={} pp={} better={:?} warning={:?}",
+            r.used_tp, r.used_pp, r.better_gpu_counts, r.warning
+        );
     }
 
     #[test]
@@ -1244,7 +1304,7 @@ mod tests {
     #[test]
     fn recommend_parallelism_avoids_indivisible_heads() {
         let m = gemma4_31b(); // 32 heads
-        // 3 GPU: 32 % 3 != 0, wiec wybiera (1, 3) bo PP dziala lepiej
+                              // 3 GPU: 32 % 3 != 0, wiec wybiera (1, 3) bo PP dziala lepiej
         let (tp, pp) = recommend_parallelism(&m, 3);
         assert_eq!(tp * pp, 3);
         assert_eq!(32 % tp as u64, 0);
@@ -1270,7 +1330,8 @@ mod tests {
 
     #[test]
     fn parse_hf_config_extracts_text_config_for_multimodal() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
             "model_type": "gemma4",
             "architectures": ["Gemma4ForConditionalGeneration"],
             "dtype": "bfloat16",
@@ -1285,7 +1346,9 @@ mod tests {
                 "intermediate_size": 21504,
                 "max_position_embeddings": 131072
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let spec = parse_hf_config(&json, "google/gemma-4-31B-it").unwrap();
         assert_eq!(spec.hidden_size, 5376);
         assert_eq!(spec.num_attention_heads, 32);
@@ -1332,8 +1395,14 @@ mod tests {
         let ctx_fp16 = max_context_for_budget(&m, &input);
         input.kv_cache_dtype = "fp8".into();
         let ctx_fp8 = max_context_for_budget(&m, &input);
-        assert!(ctx_fp8 > ctx_fp16, "fp8 KV powinno dac wiecej ctx: fp8={ctx_fp8} fp16={ctx_fp16}");
-        assert!(ctx_fp8 >= ctx_fp16 * 2 - 512, "fp8 powinno dac ~2x wiecej (lub blisko): fp8={ctx_fp8} fp16={ctx_fp16}");
+        assert!(
+            ctx_fp8 > ctx_fp16,
+            "fp8 KV powinno dac wiecej ctx: fp8={ctx_fp8} fp16={ctx_fp16}"
+        );
+        assert!(
+            ctx_fp8 >= ctx_fp16 * 2 - 512,
+            "fp8 powinno dac ~2x wiecej (lub blisko): fp8={ctx_fp8} fp16={ctx_fp16}"
+        );
     }
 
     /// Zbudowany jak gemma-2-27b: 46 layers, GQA 32/16, hidden 4608, vocab 256k.
@@ -1379,15 +1448,30 @@ mod tests {
         // TP=2 PP=2 (13.5 GB weights + 5 GB act = ~18 GB per GPU). TP=4 PP=1 tez OK
         // ale wybierany rzadziej. Akceptujemy oba prawidlowe podzialy.
         let parallel = fit.applied.tensor_parallel * fit.applied.pipeline_parallel;
-        assert_eq!(parallel, 4, "TP*PP musi=4 dla 4 GPU: TP={} PP={}",
-            fit.applied.tensor_parallel, fit.applied.pipeline_parallel);
+        assert_eq!(
+            parallel, 4,
+            "TP*PP musi=4 dla 4 GPU: TP={} PP={}",
+            fit.applied.tensor_parallel, fit.applied.pipeline_parallel
+        );
         let est = estimate_vllm_vram(&m, &fit.applied);
         assert!(est.fits_per_gpu, "Per GPU musi fits: {est:?}");
-        assert!(est.kv_cache_gb < 30.0, "kv_cache_gb < 30: got {}", est.kv_cache_gb);
-        assert!(est.per_gpu_gb < 24.0, "per_gpu_gb < 24: got {}", est.per_gpu_gb);
+        assert!(
+            est.kv_cache_gb < 30.0,
+            "kv_cache_gb < 30: got {}",
+            est.kv_cache_gb
+        );
+        assert!(
+            est.per_gpu_gb < 24.0,
+            "per_gpu_gb < 24: got {}",
+            est.per_gpu_gb
+        );
         // Sprawdz max ctx (powinien byc znaczacy - co najmniej 4k).
         let max_ctx = max_context_for_budget(&m, &fit.applied);
-        assert!(max_ctx >= 4096, "max_supported_model_len >= 4k: got {}", max_ctx);
+        assert!(
+            max_ctx >= 4096,
+            "max_supported_model_len >= 4k: got {}",
+            max_ctx
+        );
     }
 
     #[test]
@@ -1555,8 +1639,17 @@ mod tests {
     fn quant_label_to_bytes_mapping() {
         // 4-bit warianty -> 0.5625 (z overhead skali)
         for q in &[
-            "nvfp4", "fp4", "mxfp4", "awq", "gptq", "int4", "auto-round",
-            "bnb_4bit", "load_in_4bit", "w4a16", "compressed-tensors-4bit",
+            "nvfp4",
+            "fp4",
+            "mxfp4",
+            "awq",
+            "gptq",
+            "int4",
+            "auto-round",
+            "bnb_4bit",
+            "load_in_4bit",
+            "w4a16",
+            "compressed-tensors-4bit",
         ] {
             assert_eq!(
                 quant_label_to_bytes(q),
@@ -1566,7 +1659,14 @@ mod tests {
             );
         }
         // 8-bit -> 1.0625
-        for q in &["int8", "fp8", "fp8-e4m3", "bnb_8bit", "w8a8", "load_in_8bit"] {
+        for q in &[
+            "int8",
+            "fp8",
+            "fp8-e4m3",
+            "bnb_8bit",
+            "w8a8",
+            "load_in_8bit",
+        ] {
             assert_eq!(
                 quant_label_to_bytes(q),
                 Some(1.0625),
@@ -1619,34 +1719,46 @@ mod tests {
 
     #[test]
     fn quantization_detected_from_hf_config() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
             "quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 128}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let q = detect_quantization("user/foo", &json, None);
         assert_eq!(q.as_deref(), Some("awq"));
 
         // bitsandbytes 4-bit przez load_in_4bit flag
-        let json2: serde_json::Value = serde_json::from_str(r#"{
+        let json2: serde_json::Value = serde_json::from_str(
+            r#"{
             "quantization_config": {"quant_method": "bitsandbytes", "load_in_4bit": true}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(
             detect_quantization("user/foo", &json2, None).as_deref(),
             Some("bnb_4bit")
         );
 
         // Modelopt NVFP4
-        let json3: serde_json::Value = serde_json::from_str(r#"{
+        let json3: serde_json::Value = serde_json::from_str(
+            r#"{
             "quantization_config": {"quant_method": "modelopt", "bits": 4}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(
             detect_quantization("user/foo", &json3, None).as_deref(),
             Some("nvfp4")
         );
 
         // compressed-tensors 8-bit
-        let json4: serde_json::Value = serde_json::from_str(r#"{
+        let json4: serde_json::Value = serde_json::from_str(
+            r#"{
             "quantization_config": {"quant_method": "compressed-tensors", "bits": 8}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(
             detect_quantization("user/foo", &json4, None).as_deref(),
             Some("w8a16")
@@ -1655,9 +1767,12 @@ mod tests {
 
     #[test]
     fn quantization_override_wins_over_config() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
             "quantization_config": {"quant_method": "awq", "bits": 4}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         // User wymusza fp16 mimo ze config mowi awq.
         assert_eq!(
             detect_quantization("user/foo", &json, Some("fp16")).as_deref(),

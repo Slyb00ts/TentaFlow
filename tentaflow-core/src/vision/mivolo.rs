@@ -92,8 +92,8 @@ fn rgb_to_bgr_nchw_caffe(img: &image::RgbImage) -> Vec<f32> {
     let mut buf = vec![0f32; plane * 3];
     for (i, p) in img.pixels().enumerate() {
         // BGR ordering w wyjsciowym buforze (kanal 0 = B, 1 = G, 2 = R).
-        buf[i] = p[2] as f32 - BGR_MEAN[0];           // B
-        buf[plane + i] = p[1] as f32 - BGR_MEAN[1];   // G
+        buf[i] = p[2] as f32 - BGR_MEAN[0]; // B
+        buf[plane + i] = p[1] as f32 - BGR_MEAN[1]; // G
         buf[2 * plane + i] = p[0] as f32 - BGR_MEAN[2]; // R
     }
     buf

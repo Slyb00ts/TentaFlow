@@ -5785,3 +5785,46 @@ tf-screen {
   cursor: not-allowed;
   text-decoration: line-through;
 }
+
+/* ============================================================================
+   Services list — pin toggle visual states + per-row inline error.
+   The pin button reuses tf-button "ghost" variant; .pinned switches the SVG
+   from outlined to a filled accent color so a glance tells you the row is
+   pinned in memory. Inline error sits under the action cell and auto-fades.
+   ============================================================================ */
+.svc-pin-toggle.pinned svg {
+  fill: var(--accent-2, #a78bfa);
+  stroke: var(--accent-2, #a78bfa);
+}
+.svc-pin-toggle.pinned button {
+  color: var(--accent-2, #a78bfa);
+}
+.svc-row-error {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--danger, #ef4444);
+  white-space: normal;
+  text-align: right;
+  animation: svcErrorFade 5s forwards;
+}
+@keyframes svcErrorFade {
+  0%, 80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+.svc-node-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 12px;
+}
+.svc-node-cell .svc-node-local {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(99,102,241,0.18);
+  color: var(--accent-2, #a78bfa);
+}

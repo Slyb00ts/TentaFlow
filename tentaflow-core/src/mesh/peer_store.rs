@@ -91,7 +91,9 @@ pub struct MeshPeerInfo {
 
 /// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
 /// (np. NVIDIA Nsight Systems wymaga `vendor == Nvidia`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+)]
 pub enum GpuVendor {
     Nvidia,
     Amd,
@@ -315,9 +317,7 @@ impl MeshPeerStore {
     /// Ensure the registry has an entry for `node_id`. Used as a prelude to
     /// state-machine triggers that require the entry to already exist.
     fn shadow_ensure(&self, node_id: &str) {
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.ensure_present(id);
         }
     }
@@ -326,8 +326,7 @@ impl MeshPeerStore {
     /// fresh conn_id and fires the DialStarted→DialOk pair the state
     /// machine expects when transitioning Disconnected/Offline → Connected.
     fn shadow_mark_connected(&self, node_id: &str) {
-        let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
+        let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         else {
             return;
         };
@@ -359,7 +358,9 @@ impl MeshPeerStore {
         // a no-op from non-{Connecting,Reconnecting}).
         reg.transition_state(
             &id,
-            StateTrigger::DialStarted { via: DialPath::Direct },
+            StateTrigger::DialStarted {
+                via: DialPath::Direct,
+            },
         );
         reg.transition_state(&id, StateTrigger::DialOk { conn_id, path });
     }
@@ -371,8 +372,7 @@ impl MeshPeerStore {
     /// live conn_id (e.g. peer never reached Connected before flipping
     /// to false — possible during early startup races).
     fn shadow_mark_disconnected(&self, node_id: &str) {
-        let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
+        let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         else {
             return;
         };
@@ -385,8 +385,7 @@ impl MeshPeerStore {
     /// to nothing.
     #[cfg(debug_assertions)]
     fn shadow_consistency_check(&self, node_id: &str, where_: &str) {
-        let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
+        let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         else {
             return;
         };
@@ -397,8 +396,7 @@ impl MeshPeerStore {
             return;
         };
         let store_connected = store.quic_connected;
-        let reg_connected =
-            matches!(detail.summary.conn_tag, ConnectionStateTag::Connected);
+        let reg_connected = matches!(detail.summary.conn_tag, ConnectionStateTag::Connected);
         if store_connected != reg_connected
             && !matches!(
                 detail.summary.conn_tag,
@@ -482,9 +480,7 @@ impl MeshPeerStore {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.last_heartbeat_ms.insert(node_id.to_string(), now_ms);
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             // Auto-create the entry — peer_store mark_heartbeat is a hot
             // path that runs before any explicit upsert in some races
             // (HeartbeatReceived can land before PeerConnected).
@@ -692,9 +688,7 @@ impl MeshPeerStore {
             (entry.port, entry.hostname.clone())
         };
         self.mark_dirty();
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             let hints = Self::hints_from(&addrs, port, &hostname);
             reg.upsert_discovered(id, hints);
         }
@@ -718,9 +712,7 @@ impl MeshPeerStore {
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.ensure_present(id);
             reg.set_hostname(&id, Arc::<str>::from(hostname.as_ref()));
         }
@@ -736,9 +728,7 @@ impl MeshPeerStore {
             .or_insert_with(|| Self::empty_peer(node_id))
             .platform = platform.to_string();
         self.mark_dirty();
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.ensure_present(id);
             reg.set_platform(&id, Arc::<str>::from(platform));
         }
@@ -763,9 +753,7 @@ impl MeshPeerStore {
     pub fn remove(&self, node_id: &str) {
         self.peers.remove(node_id);
         self.mark_dirty();
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.forget(&id);
         }
     }
@@ -790,8 +778,7 @@ impl MeshPeerStore {
     }
 
     fn rebuild_cache(&self) {
-        let list: Vec<MeshPeerInfo> =
-            self.peers.iter().map(|e| e.value().clone()).collect();
+        let list: Vec<MeshPeerInfo> = self.peers.iter().map(|e| e.value().clone()).collect();
         self.list_cache.store(Arc::new(list));
         self.dirty.store(false, Ordering::Release);
     }
@@ -840,10 +827,7 @@ impl MeshPeerStore {
 
     /// Snapshot hostname + addresses + port — dla persystencji trusted contact
     /// hints. Omija klonowanie pozostalych ~20 pol MeshPeerInfo.
-    pub fn contact_snapshot(
-        &self,
-        node_id: &str,
-    ) -> Option<(String, Vec<std::net::IpAddr>, u16)> {
+    pub fn contact_snapshot(&self, node_id: &str) -> Option<(String, Vec<std::net::IpAddr>, u16)> {
         self.peers
             .get(node_id)
             .map(|p| (p.hostname.clone(), p.addresses.clone(), p.port))
@@ -866,9 +850,7 @@ impl MeshPeerStore {
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.set_hostname(&id, Arc::<str>::from(hostname.as_ref()));
         }
         self.shadow_consistency_check(node_id, "update_hostname");
@@ -889,9 +871,7 @@ impl MeshPeerStore {
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
-        if let (Some(reg), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.ensure_present(id);
             let snap = RegNodeInfo {
                 hostname: Arc::<str>::from(hostname.as_str()),
@@ -947,9 +927,7 @@ impl MeshPeerStore {
         // peer_store today and PR3 will surface them through a richer
         // PeerSummary when reads switch over. For now we mirror containers
         // + platform so the shadow consistency check stays clean.
-        if let (Some(r), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             r.ensure_present(id);
             // Defense-in-depth: receiving metrics means the peer is alive; force
             // the registry to record a heartbeat so liveness state matches the
@@ -989,7 +967,14 @@ impl MeshPeerStore {
         docker_available: bool,
         docker_version: String,
     ) {
-        let (hostname, port, addrs_for_shadow, platform_for_shadow, ram_for_shadow, gpus_for_shadow) = {
+        let (
+            hostname,
+            port,
+            addrs_for_shadow,
+            platform_for_shadow,
+            ram_for_shadow,
+            gpus_for_shadow,
+        ) = {
             let mut entry = self
                 .peers
                 .entry(node_id.to_string())
@@ -1019,9 +1004,7 @@ impl MeshPeerStore {
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
-        if let (Some(r), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             let hints = Self::hints_from(&addrs_for_shadow, port, &hostname);
             r.upsert_discovered(id, hints);
             // node_id IS the Ed25519 pubkey (32 bytes hex). Feed the raw bytes
@@ -1068,9 +1051,7 @@ impl MeshPeerStore {
             .or_insert_with(|| Self::empty_peer(node_id))
             .models = models;
         self.mark_dirty();
-        if let (Some(r), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             r.ensure_present(id);
             let reg_models: Arc<[RegModelInfo]> = models_for_shadow
                 .iter()
@@ -1109,11 +1090,8 @@ impl MeshPeerStore {
             (entry.addresses.clone(), entry.port, entry.hostname.clone())
         };
         self.mark_dirty();
-        if let (Some(r), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
-            let hints =
-                Self::hints_from(&addrs_for_shadow, port_for_shadow, &hostname_for_shadow);
+        if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
+            let hints = Self::hints_from(&addrs_for_shadow, port_for_shadow, &hostname_for_shadow);
             r.upsert_discovered(id, hints);
         }
         self.shadow_consistency_check(node_id, "update_local_extras");
@@ -1264,9 +1242,7 @@ impl MeshPeerStore {
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &dedupe_hostname, dedupe_port);
         self.mark_dirty();
-        if let (Some(r), Some(id)) =
-            (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
-        {
+        if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             let hints = Self::hints_from(&addrs_after, dedupe_port, &hostname_after);
             r.upsert_discovered(id, hints);
             if !hostname_after.is_empty() {
@@ -1332,8 +1308,7 @@ mod tests {
         };
 
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gpu).expect("encode");
-        let decoded =
-            rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
+        let decoded = rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
 
         assert_eq!(decoded.name, gpu.name);
         assert_eq!(decoded.vram_total_mb, gpu.vram_total_mb);

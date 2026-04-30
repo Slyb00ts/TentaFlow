@@ -191,7 +191,10 @@ impl FlowDispatcher {
 
         let cache_key = format!("{}:{}", model_name, service_type);
 
-        let cached = match self.resolve_cached(&cache_key, model_name, service_type).await? {
+        let cached = match self
+            .resolve_cached(&cache_key, model_name, service_type)
+            .await?
+        {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -257,7 +260,10 @@ impl FlowDispatcher {
 
         let cache_key = format!("{}:{}", model_name, service_type);
 
-        let cached = match self.resolve_cached(&cache_key, model_name, service_type).await? {
+        let cached = match self
+            .resolve_cached(&cache_key, model_name, service_type)
+            .await?
+        {
             Some(c) => c,
             None => return Ok(None),
         };

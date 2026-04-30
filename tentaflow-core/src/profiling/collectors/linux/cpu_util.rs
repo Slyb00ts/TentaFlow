@@ -16,9 +16,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 #[cfg(target_os = "linux")]
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tentaflow_protocol::profiling::{
@@ -26,8 +26,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.proc.cpu_util";
@@ -303,7 +303,11 @@ fn compute_util(prev: &CpuJiffies, cur: &CpuJiffies) -> f32 {
 fn read_cpu_freq_mhz(cpu: u16) -> u32 {
     let p = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq");
     match fs::read_to_string(&p) {
-        Ok(s) => s.trim().parse::<u64>().map(|khz| (khz / 1000) as u32).unwrap_or(0),
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(|khz| (khz / 1000) as u32)
+            .unwrap_or(0),
         Err(_) => 0,
     }
 }
@@ -542,7 +546,11 @@ mod tests {
         assert!(!raw.artifacts.is_empty());
         let content = fs::read_to_string(&raw.artifacts[0]).unwrap();
         let lines: Vec<_> = content.lines().collect();
-        assert!(lines.len() > 1, "expected at least header + 1 row, got {}", lines.len());
+        assert!(
+            lines.len() > 1,
+            "expected at least header + 1 row, got {}",
+            lines.len()
+        );
         assert_eq!(lines[0], "timestamp_ns,cpu,util_pct,freq_mhz");
     }
 }

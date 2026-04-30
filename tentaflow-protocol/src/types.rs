@@ -284,12 +284,8 @@ pub enum VisionContentPart {
     Text { text: String },
 
     /// Image URL (data: URI lub HTTP URL)
-    ImageUrl {
-        url: String,
-        detail: Option<String>,
-    },
+    ImageUrl { url: String, detail: Option<String> },
 }
-
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -306,7 +302,6 @@ impl Default for RAGParams {
 }
 
 impl RAGParams {
-
     /// Tworzy parametry RAG dla wysokiej jakości (z reranking).
     pub fn high_quality() -> Self {
         Self {
@@ -808,9 +803,7 @@ pub enum MeetingEventPayload {
     },
     /// Lista action items wykryta przez bota. Router upsertuje po content_hash
     /// (owner+task), więc powtórzone pozycje tylko odświeżają deadline.
-    ActionItemsUpdate {
-        items: Vec<MeetingActionItemData>,
-    },
+    ActionItemsUpdate { items: Vec<MeetingActionItemData> },
     /// Pojedynczy fragment transkrypcji wygenerowany przez STT na bocie.
     /// Niesie metadane diarization/model surowo — router przed broadcastem
     /// może wzbogacić `speaker_name`/`is_enrolled` z DB voice_profiles.
@@ -838,9 +831,7 @@ pub enum MeetingEventPayload {
     /// poprzedni stan (snapshot, nie diff). Bot wysyła go raz na DOM scan
     /// zamiast N osobnych eventów per uczestnik — O(N) RT → O(1).
     /// Pusta lista = nikt poza botem nie jest widoczny.
-    RosterSnapshot {
-        entries: Vec<RosterEntry>,
-    },
+    RosterSnapshot { entries: Vec<RosterEntry> },
     /// Info o modelach używanych w sesji. Bot wysyła raz po join_meeting.
     /// Router przed broadcastem rozwija aliasy (`teams-stt` → rzeczywisty
     /// engine) — pola tu trzymają aliasy takie jak bot je dostał z configu.
@@ -1397,7 +1388,6 @@ pub enum AudioOperation {
         timestamp_granularities: Option<Vec<String>>,
 
         // === OPCJE FILTROWANIA ===
-
         /// Próg no_speech_prob do filtrowania halucynacji
         /// Segmenty z no_speech_prob >= threshold zostaną odfiltrowane
         /// None = brak filtrowania
@@ -1418,7 +1408,6 @@ pub enum AudioOperation {
     // =========================================================================
     // SPEAKER IDENTIFICATION - Zarządzanie bazą głosów
     // =========================================================================
-
     /// Rejestruje nowego mówcę z próbek audio.
     ///
     /// Wymaga co najmniej jednej próbki audio (zalecane 3-5).
@@ -1512,7 +1501,6 @@ pub enum AudioOperation {
     // =========================================================================
     // VOICE RECOGNITION FLOW - Extended operations
     // =========================================================================
-
     /// Identyfikuje mówcę z poziomem pewności (confidence level).
     ///
     /// W przeciwieństwie do SpeakerIdentify, ta operacja:
@@ -1577,7 +1565,6 @@ pub enum AudioOperation {
     // =========================================================================
     // WAKE WORD DETECTION - "Jarvis" activation
     // =========================================================================
-
     /// Wykrywa słowo aktywacji (wake word) w audio.
     ///
     /// Domyślnie słucha na "Jarvis", ale można skonfigurować inne słowa.
@@ -1666,7 +1653,6 @@ pub enum AudioOperation {
     // ========================================================================
     // CONVERSATION SESSION OPERATIONS
     // ========================================================================
-
     /// Rozpoczyna sesję konwersacyjną.
     ///
     /// Sesja konwersacyjna to wysokopoziomowa abstrakcja nad wake word + STT.
@@ -1966,7 +1952,6 @@ pub enum MemoryOperation {
         /// Czy zachować historię poprzedniej nazwy (tworzy relację WasPreviouslyKnownAs)
         preserve_history: bool,
     },
-
 }
 
 /// Fakt do zapisania w pamięci.
@@ -2189,7 +2174,6 @@ pub struct CompletionResult {
     pub tool_calls: Option<Vec<ToolCallResult>>,
 
     // === INTENT ANALYZER FIELDS (Bielik 1.5B) ===
-
     /// Wykryta intencja główna (Introduction, ToolCall, Conversation, etc.)
     pub detected_intent: Option<String>,
 
@@ -2309,7 +2293,6 @@ pub enum AudioResultData {
     // =========================================================================
     // SPEAKER IDENTIFICATION RESULTS
     // =========================================================================
-
     /// Wynik rejestracji/aktualizacji mówcy (SpeakerEnroll, SpeakerAddSamples)
     SpeakerEnrollResult {
         /// ID mówcy
@@ -2393,7 +2376,6 @@ pub enum AudioResultData {
     // =========================================================================
     // VOICE RECOGNITION FLOW RESULTS
     // =========================================================================
-
     /// Wynik identyfikacji z poziomem pewności (SpeakerIdentifyWithConfidence)
     SpeakerIdentifyWithConfidenceResult {
         /// Czy rozpoznano mówcę (jakikolwiek match powyżej medium_threshold)
@@ -2460,7 +2442,6 @@ pub enum AudioResultData {
     // =========================================================================
     // WAKE WORD DETECTION RESULTS
     // =========================================================================
-
     /// Wynik detekcji wake word (WakeWordDetect)
     WakeWordDetectResult {
         /// Czy wykryto wake word
@@ -2546,7 +2527,6 @@ pub enum AudioResultData {
     // ========================================================================
     // CONVERSATION SESSION RESULTS
     // ========================================================================
-
     /// Wynik rozpoczęcia sesji konwersacyjnej (ConversationStart)
     ConversationStartResult {
         /// ID sesji (używaj w ConversationAudio/End)
@@ -2902,19 +2882,13 @@ pub enum ActivationReason {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub enum DeactivationReason {
     /// Timeout ciszy
-    SilenceTimeout {
-        silence_duration_ms: u32,
-    },
+    SilenceTimeout { silence_duration_ms: u32 },
     /// Explicit stop phrase
-    StopPhrase {
-        detected_phrase: String,
-    },
+    StopPhrase { detected_phrase: String },
     /// Manualna deaktywacja
     Manual,
     /// Błąd
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// Rozłączenie klienta
     ClientDisconnected,
 }
@@ -3452,9 +3426,7 @@ pub enum DetailedMetrics {
     },
 
     /// Metryki dla audio
-    Audio {
-        audio_duration_sec: Option<f32>,
-    },
+    Audio { audio_duration_sec: Option<f32> },
 
     /// Metryki dla RAG
     RAG {
@@ -3502,13 +3474,23 @@ pub enum ErrorType {
     ContentFiltered,
 }
 
-
 // ============================================================================
 // PREFIX CACHE - KV Cache dla promptów systemowych
 // ============================================================================
 
 /// Kategoria modelu dla prefix cache
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    SerdeSerialize,
+    SerdeDeserialize,
+)]
 pub enum PrefixCacheModelCategory {
     /// Główny LLM (bielik-11b) - odpowiedzi użytkownikowi
     MainLlm,
@@ -3517,7 +3499,9 @@ pub enum PrefixCacheModelCategory {
 }
 
 /// Typ prompta w prefix cache
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(
+    Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize,
+)]
 pub enum PrefixCachePromptType {
     /// System prompt - pełny, stały
     System,
@@ -3648,17 +3632,27 @@ mod ingest_tests {
 
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).unwrap();
         println!("Serialized {} bytes", bytes.len());
-        println!("First 50 bytes: {:02X?}", &bytes[..std::cmp::min(50, bytes.len())]);
+        println!(
+            "First 50 bytes: {:02X?}",
+            &bytes[..std::cmp::min(50, bytes.len())]
+        );
 
         // Check if it looks like ASCII text (which would be wrong for rkyv)
-        let ascii_count = bytes.iter()
+        let ascii_count = bytes
+            .iter()
             .take(50)
             .filter(|&&b| b >= 0x20 && b < 0x7f)
             .count();
-        println!("ASCII printable chars in first 50 bytes: {}/50", ascii_count);
+        println!(
+            "ASCII printable chars in first 50 bytes: {}/50",
+            ascii_count
+        );
 
         // If more than 90% is printable ASCII, something is wrong
-        assert!(ascii_count < 45, "Data looks like ASCII text, not rkyv binary!");
+        assert!(
+            ascii_count < 45,
+            "Data looks like ASCII text, not rkyv binary!"
+        );
     }
 
     #[test]
@@ -3667,7 +3661,9 @@ mod ingest_tests {
         let request = IngestRequest {
             request_id: "f5e832ea-81a3-4b84-a944-e70a2359f5e8".to_string(),
             document_id: "test-doc-12345678901234567890123456789012".to_string(),
-            content: DocumentContent::Text("TentaFlow.AI to zaawansowana platforma sztucznej inteligencji.".to_string()),
+            content: DocumentContent::Text(
+                "TentaFlow.AI to zaawansowana platforma sztucznej inteligencji.".to_string(),
+            ),
             metadata: vec![
                 ("source".to_string(), "test".to_string()),
                 ("type".to_string(), "description".to_string()),
@@ -3678,19 +3674,29 @@ mod ingest_tests {
         // Serialize
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).unwrap();
         println!("Roundtrip test: serialized {} bytes", bytes.len());
-        println!("First 40 bytes: {:02X?}", &bytes[..std::cmp::min(40, bytes.len())]);
+        println!(
+            "First 40 bytes: {:02X?}",
+            &bytes[..std::cmp::min(40, bytes.len())]
+        );
 
         // Deserialize using access (same as Router does)
         let archived = rkyv::access::<ArchivedIngestRequest, rkyv::rancor::Error>(&bytes)
             .expect("Failed to access ArchivedIngestRequest");
 
         // Verify fields
-        assert_eq!(archived.request_id.as_str(), "f5e832ea-81a3-4b84-a944-e70a2359f5e8");
-        assert_eq!(archived.document_id.as_str(), "test-doc-12345678901234567890123456789012");
+        assert_eq!(
+            archived.request_id.as_str(),
+            "f5e832ea-81a3-4b84-a944-e70a2359f5e8"
+        );
+        assert_eq!(
+            archived.document_id.as_str(),
+            "test-doc-12345678901234567890123456789012"
+        );
 
         // Full deserialize
-        let deserialized: IngestRequest = rkyv::deserialize::<IngestRequest, rkyv::rancor::Error>(archived)
-            .expect("Failed to deserialize IngestRequest");
+        let deserialized: IngestRequest =
+            rkyv::deserialize::<IngestRequest, rkyv::rancor::Error>(archived)
+                .expect("Failed to deserialize IngestRequest");
 
         assert_eq!(deserialized.request_id, request.request_id);
         assert_eq!(deserialized.document_id, request.document_id);
@@ -3864,7 +3870,11 @@ mod meeting_event_tests {
         let entries: Vec<RosterEntry> = (0..50)
             .map(|i| RosterEntry {
                 speaker_id: format!("SPEAKER_{:02}", i),
-                speaker_name: if i % 3 == 0 { None } else { Some(format!("User {}", i)) },
+                speaker_name: if i % 3 == 0 {
+                    None
+                } else {
+                    Some(format!("User {}", i))
+                },
                 status: match i % 3 {
                     0 => "joined".to_string(),
                     1 => "speaking".to_string(),
@@ -3883,7 +3893,9 @@ mod meeting_event_tests {
             payload: ModelPayload::MeetingEvent(MeetingEventData {
                 meeting_key: "mkey-rs".to_string(),
                 timestamp_ms: 1_700_000_003_000,
-                payload: MeetingEventPayload::RosterSnapshot { entries: entries.clone() },
+                payload: MeetingEventPayload::RosterSnapshot {
+                    entries: entries.clone(),
+                },
             }),
             stream: false,
             metadata: None,
@@ -3896,7 +3908,9 @@ mod meeting_event_tests {
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
-                MeetingEventPayload::RosterSnapshot { entries: decoded_entries } => {
+                MeetingEventPayload::RosterSnapshot {
+                    entries: decoded_entries,
+                } => {
                     assert_eq!(decoded_entries.len(), 50);
                     assert_eq!(decoded_entries, entries);
                 }

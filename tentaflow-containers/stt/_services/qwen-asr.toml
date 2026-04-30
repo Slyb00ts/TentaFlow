@@ -15,6 +15,7 @@ version = "1.0.0"
 [deploy.docker]
 context_path = "stt/docker/qwen-asr"
 platforms = ["linux", "windows"]
+transport = "sidecar-quic"
 
 [deploy.native]
 platforms = ["linux", "windows"]

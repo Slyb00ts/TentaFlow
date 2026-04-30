@@ -22,7 +22,8 @@ fn dylib_has_metallib(p: &Path) -> bool {
         Some(d) => d,
         None => return false,
     };
-    dir.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib").exists()
+    dir.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib")
+        .exists()
         || dir.join("mlx.metallib").exists()
         || dir.join("Resources/mlx.metallib").exists()
 }
@@ -53,7 +54,10 @@ pub fn locate_mlx_bridge_dylib() -> Option<PathBuf> {
             None => break,
         }
     }
-    if let Some(found) = candidates.iter().find(|p| p.exists() && dylib_has_metallib(p)) {
+    if let Some(found) = candidates
+        .iter()
+        .find(|p| p.exists() && dylib_has_metallib(p))
+    {
         return Some(found.clone());
     }
     candidates.into_iter().find(|p| p.exists())
@@ -67,10 +71,15 @@ pub fn ensure_kokoro_metallib_next_to(dylib: &Path) {
         None => return,
     };
     let target = dir.join("mlx.metallib");
-    if target.exists() { return; }
+    if target.exists() {
+        return;
+    }
     let bundle_subpath = "mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib";
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest.parent().map(|p| p.to_path_buf()).unwrap_or(manifest.clone());
+    let workspace_root = manifest
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or(manifest.clone());
     let candidates = [
         dir.join(bundle_subpath),
         workspace_root.join(format!(
@@ -90,9 +99,17 @@ pub fn ensure_kokoro_metallib_next_to(dylib: &Path) {
     for src in &candidates {
         if src.exists() {
             if let Err(e) = std::fs::copy(src, &target) {
-                tracing::warn!("[macos_ffi-kokoro] copy {} -> {}: {}", src.display(), target.display(), e);
+                tracing::warn!(
+                    "[macos_ffi-kokoro] copy {} -> {}: {}",
+                    src.display(),
+                    target.display(),
+                    e
+                );
             } else {
-                info!("[macos_ffi-kokoro] mlx.metallib zainstalowane: {}", target.display());
+                info!(
+                    "[macos_ffi-kokoro] mlx.metallib zainstalowane: {}",
+                    target.display()
+                );
             }
             return;
         }

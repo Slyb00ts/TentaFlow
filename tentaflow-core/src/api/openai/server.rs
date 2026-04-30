@@ -280,7 +280,10 @@ async fn handle_chat_completions(
 
     if is_streaming {
         // === STREAMING MODE: SSE ===
-        match router.route_chat_completion_stream_for_user(request, user_ctx.clone()).await {
+        match router
+            .route_chat_completion_stream_for_user(request, user_ctx.clone())
+            .await
+        {
             Ok(route_result) => {
                 let metadata = route_result.metadata;
                 let chunk_stream = route_result.response;
@@ -354,7 +357,10 @@ async fn handle_chat_completions(
         }
     } else {
         // === NON-STREAMING MODE: JSON ===
-        match router.route_chat_completion_for_user(request, user_ctx).await {
+        match router
+            .route_chat_completion_for_user(request, user_ctx)
+            .await
+        {
             Ok(route_result) => {
                 let body = serde_json::to_vec(&route_result.response).unwrap();
                 let mut resp = json_response(StatusCode::OK, body);
@@ -470,7 +476,10 @@ async fn handle_audio_tts(
     );
 
     // Wywolaj Router.synthesize_speech()
-    match router.synthesize_speech_for_user(&tts_request, user_ctx).await {
+    match router
+        .synthesize_speech_for_user(&tts_request, user_ctx)
+        .await
+    {
         Ok(route_result) => {
             let audio_bytes = route_result.response;
             // Okresl content type na podstawie formatu

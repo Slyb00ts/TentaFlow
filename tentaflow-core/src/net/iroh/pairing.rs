@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
-use iroh::{EndpointAddr, RelayUrl};
 use iroh::protocol::ProtocolHandler;
+use iroh::{EndpointAddr, RelayUrl};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -139,7 +139,8 @@ impl PairingHandler {
             addresses: req.sender_addresses.clone(),
             relay_url: req.sender_relay_url.clone(),
         };
-        if let Err(e) = store_pending_contact_hints(&self.security.db, &req.sender_node_id, &hints) {
+        if let Err(e) = store_pending_contact_hints(&self.security.db, &req.sender_node_id, &hints)
+        {
             warn!(peer = %req.sender_node_id, "pairing: zapis pending contact hints nieudany: {}", e);
         }
 
@@ -269,11 +270,7 @@ pub async fn initiate_pairing_over_iroh(
     // stare/brakujace rekordy i padaja z 'connect: timed out' 25s.
     // Timeout 8s — relay connect zwykle <1s, publikacja <5s; gdy sie nie
     // uda w 8s i tak probujemy dalej (moze byc tryb offline-LAN).
-    if let Err(_) = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        endpoint.online(),
-    )
-    .await
+    if let Err(_) = tokio::time::timeout(std::time::Duration::from_secs(8), endpoint.online()).await
     {
         tracing::debug!("pairing: online() timeout 8s — proba bez pelnej rejestracji relay");
     }
@@ -298,12 +295,9 @@ pub async fn initiate_pairing_over_iroh(
     // Retry na timeout — pierwszy strzal moze trafic na stary pkarr rekord
     // (race po restarcie peera). Drugi strzal po 2s pauzie zwykle uderza w
     // juz wypublikowane swieze adresy.
-    let connection = connect_pairing_with_retry(
-        endpoint,
-        endpoint_addr.clone(),
-        &receiver_hints.node_id,
-    )
-    .await?;
+    let connection =
+        connect_pairing_with_retry(endpoint, endpoint_addr.clone(), &receiver_hints.node_id)
+            .await?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -381,8 +375,8 @@ pub fn store_pending_contact_hints(
     remote_node_id: &str,
     hints: &PairingContactHints,
 ) -> anyhow::Result<()> {
-    let raw = serde_json::to_string(hints)
-        .map_err(|e| anyhow::anyhow!("pending contact encode: {e}"))?;
+    let raw =
+        serde_json::to_string(hints).map_err(|e| anyhow::anyhow!("pending contact encode: {e}"))?;
     db::repository::set_setting(db, &pending_contact_setting_key(remote_node_id), &raw)?;
     Ok(())
 }
@@ -413,8 +407,8 @@ pub fn store_trusted_contact_hints(
     remote_node_id: &str,
     hints: &PairingContactHints,
 ) -> anyhow::Result<()> {
-    let raw = serde_json::to_string(hints)
-        .map_err(|e| anyhow::anyhow!("trusted contact encode: {e}"))?;
+    let raw =
+        serde_json::to_string(hints).map_err(|e| anyhow::anyhow!("trusted contact encode: {e}"))?;
     db::repository::set_setting(db, &trusted_contact_setting_key(remote_node_id), &raw)?;
     Ok(())
 }
@@ -517,8 +511,7 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
                 };
                 match ip_part.parse::<std::net::Ipv4Addr>() {
                     Ok(v4) => {
-                        let kind =
-                            kind_map.get(&v4).map(String::as_str).unwrap_or("unknown");
+                        let kind = kind_map.get(&v4).map(String::as_str).unwrap_or("unknown");
                         crate::mesh::network_interfaces::should_advertise_interface_ipv4(
                             v4, kind, &filters,
                         )
@@ -529,8 +522,7 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
             .cloned()
             .collect();
 
-        let changed =
-            hints.addresses != original_addresses || hints.relay_url != original_relay;
+        let changed = hints.addresses != original_addresses || hints.relay_url != original_relay;
         if !changed {
             continue;
         }
@@ -713,10 +705,7 @@ mod tests {
             node_id: "peer".to_string(),
             public_key_hex: "abcd".to_string(),
             hostname: "old-host".to_string(),
-            addresses: vec![
-                "10.0.0.8:8090".to_string(),
-                "192.168.0.8:8090".to_string(),
-            ],
+            addresses: vec!["10.0.0.8:8090".to_string(), "192.168.0.8:8090".to_string()],
             relay_url: "https://relay.old/".to_string(),
         };
         let fresh = PairingContactHints {
@@ -820,6 +809,9 @@ mod tests {
 
         let addr = endpoint_addr_from_hints(&hints).expect("endpoint addr");
         let direct: Vec<_> = addr.ip_addrs().copied().collect();
-        assert_eq!(direct, vec!["127.0.0.1:8090".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(
+            direct,
+            vec!["127.0.0.1:8090".parse::<SocketAddr>().unwrap()]
+        );
     }
 }

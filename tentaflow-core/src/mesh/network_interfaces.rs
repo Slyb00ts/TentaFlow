@@ -26,8 +26,11 @@ pub fn list_interfaces() -> Vec<NetworkInterfaceInfo> {
         .map(|iface| {
             let name = iface.name.clone();
             let kind = classify_interface(&iface);
-            let ipv4_addrs: Vec<String> =
-                iface.ipv4.iter().map(|net| net.addr().to_string()).collect();
+            let ipv4_addrs: Vec<String> = iface
+                .ipv4
+                .iter()
+                .map(|net| net.addr().to_string())
+                .collect();
             let mac = iface
                 .mac_addr
                 .as_ref()
@@ -226,19 +229,27 @@ fn parse_bool(raw: Option<String>, default: bool) -> bool {
 /// zachowywalaby sie inaczej niz to co widzi user w GUI.
 pub fn load_advertise_filters(db: &DbPool) -> AdvertiseFilters {
     let hide_docker = parse_bool(
-        repository::get_setting(db, SETTING_HIDE_DOCKER).ok().flatten(),
+        repository::get_setting(db, SETTING_HIDE_DOCKER)
+            .ok()
+            .flatten(),
         true,
     );
     let hide_link_local = parse_bool(
-        repository::get_setting(db, SETTING_HIDE_LINK_LOCAL).ok().flatten(),
+        repository::get_setting(db, SETTING_HIDE_LINK_LOCAL)
+            .ok()
+            .flatten(),
         true,
     );
     let hide_loopback = parse_bool(
-        repository::get_setting(db, SETTING_HIDE_LOOPBACK).ok().flatten(),
+        repository::get_setting(db, SETTING_HIDE_LOOPBACK)
+            .ok()
+            .flatten(),
         true,
     );
     let hide_cgnat = parse_bool(
-        repository::get_setting(db, SETTING_HIDE_CGNAT).ok().flatten(),
+        repository::get_setting(db, SETTING_HIDE_CGNAT)
+            .ok()
+            .flatten(),
         false,
     );
     AdvertiseFilters {
@@ -252,7 +263,9 @@ pub fn load_advertise_filters(db: &DbPool) -> AdvertiseFilters {
 /// Laduje flage `advertise_prefer_same_subnet` z settings (default `true`).
 pub fn load_prefer_same_subnet(db: &DbPool) -> bool {
     parse_bool(
-        repository::get_setting(db, SETTING_PREFER_SAME_SUBNET).ok().flatten(),
+        repository::get_setting(db, SETTING_PREFER_SAME_SUBNET)
+            .ok()
+            .flatten(),
         true,
     )
 }

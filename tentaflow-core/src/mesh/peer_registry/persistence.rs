@@ -10,8 +10,8 @@ use tracing::{error, warn};
 
 use crate::db::repository::{
     self, PeerHintRow, PeerPersistedRow, HINT_KIND_DIRECT_ADDR, HINT_KIND_HOSTNAME,
-    HINT_KIND_RELAY_URL, ROLE_EDGE, ROLE_NODE, ROLE_RELAY, TRUST_DISCOVERED,
-    TRUST_PENDING_PAIRING, TRUST_TRUSTED,
+    HINT_KIND_RELAY_URL, ROLE_EDGE, ROLE_NODE, ROLE_RELAY, TRUST_DISCOVERED, TRUST_PENDING_PAIRING,
+    TRUST_TRUSTED,
 };
 use crate::db::DbPool;
 use crate::mesh::peer_registry::entry::{NodeId, PeerRole, TrustState};
@@ -87,7 +87,9 @@ struct PendingWrite {
 impl PendingWrite {
     fn merge(&mut self, op: PersistOp) {
         match op {
-            PersistOp::UpsertEntry { snapshot, version, .. } => {
+            PersistOp::UpsertEntry {
+                snapshot, version, ..
+            } => {
                 // Latest version wins; out-of-order writes are also rejected
                 // by the SQL ON CONFLICT WHERE clause.
                 let is_newer = self
@@ -161,10 +163,7 @@ pub fn bucketize_30s(now_ms: i64) -> i64 {
 /// Sink trait — abstracts the underlying repository so unit tests can run
 /// without touching SQLite.
 pub trait PersistSink: Send + Sync + 'static {
-    fn write_peer_batch(
-        &self,
-        ops: &[(NodeId, PendingWriteSnapshot)],
-    ) -> anyhow::Result<()>;
+    fn write_peer_batch(&self, ops: &[(NodeId, PendingWriteSnapshot)]) -> anyhow::Result<()>;
 }
 
 /// Public, immutable view of the writer's coalesced pending state for one
@@ -178,7 +177,11 @@ pub struct PendingWriteSnapshot {
 
 impl From<PendingWrite> for PendingWriteSnapshot {
     fn from(p: PendingWrite) -> Self {
-        Self { snapshot: p.snapshot, hints: p.hints, delete: p.delete }
+        Self {
+            snapshot: p.snapshot,
+            hints: p.hints,
+            delete: p.delete,
+        }
     }
 }
 
@@ -194,10 +197,7 @@ impl DbSink {
 }
 
 impl PersistSink for DbSink {
-    fn write_peer_batch(
-        &self,
-        ops: &[(NodeId, PendingWriteSnapshot)],
-    ) -> anyhow::Result<()> {
+    fn write_peer_batch(&self, ops: &[(NodeId, PendingWriteSnapshot)]) -> anyhow::Result<()> {
         let now = now_ms();
         let mut entry_rows: Vec<PeerPersistedRow> = Vec::new();
         let mut hint_writes: Vec<(NodeId, Vec<PeerHintRow>)> = Vec::new();
@@ -260,10 +260,7 @@ pub struct PersistenceWriter {
 }
 
 impl PersistenceWriter {
-    pub fn new(
-        sink: Arc<dyn PersistSink>,
-        capacity: usize,
-    ) -> (Self, mpsc::Sender<PersistOp>) {
+    pub fn new(sink: Arc<dyn PersistSink>, capacity: usize) -> (Self, mpsc::Sender<PersistOp>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         (Self { sink, rx }, tx)
     }
@@ -312,8 +309,7 @@ impl PersistenceWriter {
         let sink = self.sink.clone();
         // Run blocking SQLite work on a dedicated thread; a flush stall must
         // not back up the channel.
-        let res = tokio::task::spawn_blocking(move || sink.write_peer_batch(&drained))
-            .await;
+        let res = tokio::task::spawn_blocking(move || sink.write_peer_batch(&drained)).await;
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!(err = %e, count, "PersistenceWriter flush failed"),
@@ -343,10 +339,7 @@ mod tests {
     }
 
     impl PersistSink for MockSink {
-        fn write_peer_batch(
-            &self,
-            ops: &[(NodeId, PendingWriteSnapshot)],
-        ) -> anyhow::Result<()> {
+        fn write_peer_batch(&self, ops: &[(NodeId, PendingWriteSnapshot)]) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(ops.to_vec());
             Ok(())
         }
@@ -393,7 +386,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 
         let calls = sink.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "expected exactly one flush, got {}", calls.len());
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one flush, got {}",
+            calls.len()
+        );
         assert_eq!(calls[0].len(), 1, "five ops on one node should coalesce");
         let (got_id, pend) = &calls[0][0];
         assert_eq!(got_id, &id);
@@ -438,7 +436,11 @@ mod tests {
         let id: NodeId = [9u8; 32];
         coalesce(
             &mut buf,
-            PersistOp::UpsertEntry { node_id: id, snapshot: snap(1), version: 1 },
+            PersistOp::UpsertEntry {
+                node_id: id,
+                snapshot: snap(1),
+                version: 1,
+            },
         );
         coalesce(&mut buf, PersistOp::Delete { node_id: id });
         let pend = buf.remove(&id).unwrap();

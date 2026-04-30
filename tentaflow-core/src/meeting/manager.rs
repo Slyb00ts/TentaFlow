@@ -31,23 +31,27 @@ enum BotBackend {
 /// Brak wpisu = Docker (wstecznie kompatybilne — przed dodaniem native
 /// botow tabela `services` nie zawierala teams-bota wcale).
 fn detect_backend(db: &DbPool) -> BotBackend {
-    let services = match repository::list_services(db) {
+    use crate::services_repo::services::{self as services_repo, DeployMethod};
+
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("detect_backend: pool poisoned ({}), fallback Docker", e);
+            return BotBackend::Docker;
+        }
+    };
+    let services = match services_repo::list_alive(&conn) {
         Ok(s) => s,
         Err(e) => {
-            warn!("detect_backend: list_services blad ({}), fallback Docker", e);
+            warn!("detect_backend: list_alive blad ({}), fallback Docker", e);
             return BotBackend::Docker;
         }
     };
     for svc in &services {
-        let config: serde_json::Value =
-            serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
-        let engine = config["engine"].as_str().or(config["manifest_engine_id"].as_str());
-        if engine != Some("teams-bot") {
+        if svc.engine_id != "teams-bot" {
             continue;
         }
-        let deploy_mode = config["deploy_mode"].as_str().unwrap_or("");
-        let runtime = config["runtime"].as_str().unwrap_or("");
-        if deploy_mode == "native" && runtime == "binary" {
+        if matches!(svc.deploy_method, DeployMethod::NativeBinary) {
             return BotBackend::Native;
         }
     }
@@ -148,7 +152,7 @@ impl MeetingManager {
         })
     }
 
-    /// Nazwa serwisu używana przy register_quic_service — zawiera session_id dla
+    /// Service name carrying the session_id for
     /// unikalności. Substring "meeting-bot" wymuszany przez spawn_connection_tasks
     /// żeby trafić do dedykowanego `meeting_bot_connection_loop` (reverse listener
     /// + transcript subscriber).
@@ -199,7 +203,11 @@ impl MeetingManager {
         }
 
         let backend = detect_backend(&self.db);
-        info!(session = session_id, ?backend, "Meeting session — wybrany backend");
+        info!(
+            session = session_id,
+            ?backend,
+            "Meeting session — wybrany backend"
+        );
 
         // Generuj secret key bota — iroh::SecretKey ma endpoint_id (public key) wbudowany.
         let secret = SecretKey::generate();
@@ -355,26 +363,12 @@ impl MeetingManager {
             "Meeting session spawnowana"
         );
 
-        // Rejestracja w ServiceManager — taka sama dla Docker i native (router
-        // laczy sie tym samym mechanizmem iroh, niezaleznie od backendu).
-        if let Some(ref sm) = self.service_manager {
-            let service_name = Self::service_name(session_id);
-            let iroh_url = format!("iroh://{}", bot_endpoint_id);
-            let direct_addrs = vec![format!("127.0.0.1:{}", quic_port)];
-            sm.register_quic_service_with_addrs(
-                service_name,
-                "meeting-bot",
-                iroh_url,
-                None,
-                None,
-                direct_addrs,
-            );
-        } else {
-            warn!(
-                session = session_id,
-                "brak ServiceManager — bot uruchomiony ale router nie połączy się"
-            );
-        }
+        // Meeting bot routing now flows through the V2 services pipeline:
+        // `services::deploy::deploy()` registers the service in the snapshot,
+        // the supervisor materialises a QUIC `BackendHandle` keyed by service
+        // id, and routing call sites resolve it via `find_quic_client_for_model`.
+        let _ = bot_endpoint_id;
+        let _ = quic_port;
 
         // Deskryptor budowany z DB + efektywnych aliasów (te nie są persystowane
         // w meeting_sessions — pochodzą wyłącznie z env kontenera). Dzięki temu
@@ -402,9 +396,11 @@ impl MeetingManager {
     /// task. The session row flips to `ended` once that task finishes.
     pub async fn leave_session(&self, session_id: i64) -> Result<()> {
         repository::transcripts::set_session_status(&self.db, session_id, "leaving")?;
-        if let Some(ref sm) = self.service_manager {
-            sm.remove_quic_service(&Self::service_name(session_id), "meeting-bot");
-        }
+        // Service deregistration follows the V2 services pipeline: deleting the
+        // services row drops the snapshot entry, the supervisor removes the
+        // matching `BackendHandle` from `live_handles`, and the QUIC reconnect
+        // loop terminates.
+        let _ = &self.service_manager;
         let backend = detect_backend(&self.db);
         let db = self.db.clone();
         tokio::spawn(async move {

@@ -32,30 +32,50 @@ fn transition_disconnected_to_connecting_on_dial_started() {
     let r = transition(
         &ConnectionState::Disconnected,
         &RetryState::default(),
-        &StateTrigger::DialStarted { via: DialPath::Direct },
+        &StateTrigger::DialStarted {
+            via: DialPath::Direct,
+        },
         now,
     );
-    assert!(matches!(r.new_state, Some(ConnectionState::Connecting { .. })));
+    assert!(matches!(
+        r.new_state,
+        Some(ConnectionState::Connecting { .. })
+    ));
 }
 
 #[test]
 fn transition_connecting_to_connected_on_dial_ok() {
     let now = t0();
-    let cur = ConnectionState::Connecting { since: now, via: DialPath::Direct };
+    let cur = ConnectionState::Connecting {
+        since: now,
+        via: DialPath::Direct,
+    };
     let r = transition(
         &cur,
         &RetryState::default(),
-        &StateTrigger::DialOk { conn_id: 1, path: dummy_path() },
+        &StateTrigger::DialOk {
+            conn_id: 1,
+            path: dummy_path(),
+        },
         now,
     );
-    assert!(matches!(r.new_state, Some(ConnectionState::Connected { conn_id: 1, .. })));
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::EmitOnline)));
+    assert!(matches!(
+        r.new_state,
+        Some(ConnectionState::Connected { conn_id: 1, .. })
+    ));
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::EmitOnline)
+    ));
 }
 
 #[test]
 fn transition_connecting_to_reconnecting_on_dial_fail() {
     let now = t0();
-    let cur = ConnectionState::Connecting { since: now, via: DialPath::Direct };
+    let cur = ConnectionState::Connecting {
+        since: now,
+        via: DialPath::Direct,
+    };
     let r = transition(
         &cur,
         &RetryState::default(),
@@ -63,7 +83,11 @@ fn transition_connecting_to_reconnecting_on_dial_fail() {
         now,
     );
     match r.new_state {
-        Some(ConnectionState::Reconnecting { attempt, backoff_until, .. }) => {
+        Some(ConnectionState::Reconnecting {
+            attempt,
+            backoff_until,
+            ..
+        }) => {
             assert_eq!(attempt, 1);
             // 1s backoff for attempt=1.
             let dt = backoff_until.saturating_duration_since(now);
@@ -71,7 +95,10 @@ fn transition_connecting_to_reconnecting_on_dial_fail() {
         }
         other => panic!("unexpected state: {other:?}"),
     }
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::BumpRetry { .. })));
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::BumpRetry { .. })
+    ));
 }
 
 #[test]
@@ -85,14 +112,24 @@ fn transition_reconnecting_increments_attempt() {
     };
     let r = transition(
         &cur,
-        &RetryState { attempts: 1, ..Default::default() },
+        &RetryState {
+            attempts: 1,
+            ..Default::default()
+        },
         &StateTrigger::DialFail { err: err("e2") },
         now,
     );
     match r.new_state {
-        Some(ConnectionState::Reconnecting { attempt, backoff_until, .. }) => {
+        Some(ConnectionState::Reconnecting {
+            attempt,
+            backoff_until,
+            ..
+        }) => {
             assert_eq!(attempt, 2);
-            assert_eq!(backoff_until.saturating_duration_since(now), Duration::from_millis(2000));
+            assert_eq!(
+                backoff_until.saturating_duration_since(now),
+                Duration::from_millis(2000)
+            );
         }
         other => panic!("unexpected state: {other:?}"),
     }
@@ -101,7 +138,11 @@ fn transition_reconnecting_increments_attempt() {
 #[test]
 fn transition_connected_to_degraded_on_liveness_15s_no_hb() {
     let now = t0();
-    let cur = ConnectionState::Connected { since: now, path: dummy_path(), conn_id: 7 };
+    let cur = ConnectionState::Connected {
+        since: now,
+        path: dummy_path(),
+        conn_id: 7,
+    };
     let later = now + Duration::from_secs(16);
     let r = transition(
         &cur,
@@ -109,7 +150,10 @@ fn transition_connected_to_degraded_on_liveness_15s_no_hb() {
         &StateTrigger::LivenessTick { now: later },
         later,
     );
-    assert!(matches!(r.new_state, Some(ConnectionState::Degraded { conn_id: 7, .. })));
+    assert!(matches!(
+        r.new_state,
+        Some(ConnectionState::Degraded { conn_id: 7, .. })
+    ));
 }
 
 #[test]
@@ -128,8 +172,14 @@ fn transition_degraded_to_reconnecting_on_liveness_45s_no_hb() {
         &StateTrigger::LivenessTick { now: later },
         later,
     );
-    assert!(matches!(r.new_state, Some(ConnectionState::Reconnecting { .. })));
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::ScheduleDial { .. })));
+    assert!(matches!(
+        r.new_state,
+        Some(ConnectionState::Reconnecting { .. })
+    ));
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::ScheduleDial { .. })
+    ));
 }
 
 #[test]
@@ -144,12 +194,18 @@ fn transition_reconnecting_to_offline_after_5min() {
     let later = now + Duration::from_secs(5 * 60 + 1);
     let r = transition(
         &cur,
-        &RetryState { attempts: 3, ..Default::default() },
+        &RetryState {
+            attempts: 3,
+            ..Default::default()
+        },
         &StateTrigger::LivenessTick { now: later },
         later,
     );
     assert!(matches!(r.new_state, Some(ConnectionState::Offline { .. })));
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::EmitOffline)));
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::EmitOffline)
+    ));
 }
 
 #[test]
@@ -163,8 +219,13 @@ fn transition_reconnecting_to_offline_after_12_attempts() {
     };
     let r = transition(
         &cur,
-        &RetryState { attempts: 13, ..Default::default() },
-        &StateTrigger::LivenessTick { now: now + Duration::from_secs(1) },
+        &RetryState {
+            attempts: 13,
+            ..Default::default()
+        },
+        &StateTrigger::LivenessTick {
+            now: now + Duration::from_secs(1),
+        },
         now + Duration::from_secs(1),
     );
     assert!(matches!(r.new_state, Some(ConnectionState::Offline { .. })));
@@ -186,13 +247,20 @@ fn transition_heartbeat_recovers_degraded_to_connected() {
         &StateTrigger::Heartbeat { at: later },
         later,
     );
-    assert!(matches!(r.new_state, Some(ConnectionState::Connected { conn_id: 9, .. })));
+    assert!(matches!(
+        r.new_state,
+        Some(ConnectionState::Connected { conn_id: 9, .. })
+    ));
 }
 
 #[test]
 fn transition_transport_closed_with_stale_conn_id_ignored() {
     let now = t0();
-    let cur = ConnectionState::Connected { since: now, path: dummy_path(), conn_id: 100 };
+    let cur = ConnectionState::Connected {
+        since: now,
+        path: dummy_path(),
+        conn_id: 100,
+    };
     let r = transition(
         &cur,
         &RetryState::default(),
@@ -206,41 +274,48 @@ fn transition_transport_closed_with_stale_conn_id_ignored() {
 #[test]
 fn transition_transport_closed_with_current_conn_id_to_reconnecting() {
     let now = t0();
-    let cur = ConnectionState::Connected { since: now, path: dummy_path(), conn_id: 100 };
+    let cur = ConnectionState::Connected {
+        since: now,
+        path: dummy_path(),
+        conn_id: 100,
+    };
     let r = transition(
         &cur,
         &RetryState::default(),
         &StateTrigger::TransportClosed { conn_id: 100 },
         now,
     );
-    assert!(matches!(r.new_state, Some(ConnectionState::Reconnecting { attempt: 1, .. })));
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::ScheduleDial { .. })));
+    assert!(matches!(
+        r.new_state,
+        Some(ConnectionState::Reconnecting { attempt: 1, .. })
+    ));
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::ScheduleDial { .. })
+    ));
 }
 
 #[test]
 fn transition_discovered_on_offline_returns_to_disconnected_with_schedule() {
     let now = t0();
     let cur = ConnectionState::Offline { since: now };
-    let r = transition(
-        &cur,
-        &RetryState::default(),
-        &StateTrigger::Discovered,
-        now,
-    );
+    let r = transition(&cur, &RetryState::default(), &StateTrigger::Discovered, now);
     assert!(matches!(r.new_state, Some(ConnectionState::Disconnected)));
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::ScheduleDial { .. })));
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::ScheduleDial { .. })
+    ));
 }
 
 #[test]
 fn transition_discovered_on_connected_no_change() {
     let now = t0();
-    let cur = ConnectionState::Connected { since: now, path: dummy_path(), conn_id: 1 };
-    let r = transition(
-        &cur,
-        &RetryState::default(),
-        &StateTrigger::Discovered,
-        now,
-    );
+    let cur = ConnectionState::Connected {
+        since: now,
+        path: dummy_path(),
+        conn_id: 1,
+    };
+    let r = transition(&cur, &RetryState::default(), &StateTrigger::Discovered, now);
     assert!(r.new_state.is_none());
     assert!(r.side_effect.is_none());
 }
@@ -248,14 +323,16 @@ fn transition_discovered_on_connected_no_change() {
 #[test]
 fn transition_forget_emits_forget_side_effect() {
     let now = t0();
-    let cur = ConnectionState::Connected { since: now, path: dummy_path(), conn_id: 1 };
-    let r = transition(
-        &cur,
-        &RetryState::default(),
-        &StateTrigger::Forget,
-        now,
-    );
-    assert!(matches!(r.side_effect, Some(TransitionSideEffect::EmitForget)));
+    let cur = ConnectionState::Connected {
+        since: now,
+        path: dummy_path(),
+        conn_id: 1,
+    };
+    let r = transition(&cur, &RetryState::default(), &StateTrigger::Forget, now);
+    assert!(matches!(
+        r.side_effect,
+        Some(TransitionSideEffect::EmitForget)
+    ));
 }
 
 #[test]
@@ -280,7 +357,9 @@ fn shard_distribution_uniform() {
     for _ in 0..10_000 {
         let mut id: NodeId = [0u8; 32];
         for byte in id.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *byte = (seed >> 56) as u8;
         }
         let idx = shard_for(&id, NUM_SHARDS);
@@ -338,7 +417,7 @@ fn peer_registry_subscribe_receives_delta_after_mutation() {
 // PR5: PersistenceWriter wiring + hydrate_from_db
 // =============================================================================
 
-use crate::mesh::peer_registry::persistence::{PersistOp, PersistSink, PendingWriteSnapshot};
+use crate::mesh::peer_registry::persistence::{PendingWriteSnapshot, PersistOp, PersistSink};
 use crate::mesh::peer_registry::HintKind;
 
 #[derive(Default)]
@@ -347,10 +426,7 @@ struct CountSink {
 }
 
 impl PersistSink for CountSink {
-    fn write_peer_batch(
-        &self,
-        ops: &[(NodeId, PendingWriteSnapshot)],
-    ) -> anyhow::Result<()> {
+    fn write_peer_batch(&self, ops: &[(NodeId, PendingWriteSnapshot)]) -> anyhow::Result<()> {
         self.inner.lock().unwrap().push(ops.to_vec());
         Ok(())
     }
@@ -358,7 +434,8 @@ impl PersistSink for CountSink {
 
 fn install_test_writer(reg: &PeerRegistry) -> Arc<std::sync::Mutex<Vec<PersistOp>>> {
     use tokio::sync::mpsc;
-    let collected: Arc<std::sync::Mutex<Vec<PersistOp>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected: Arc<std::sync::Mutex<Vec<PersistOp>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let (tx, mut rx) = mpsc::channel::<PersistOp>(1024);
     let collected_clone = collected.clone();
     // Drain the channel synchronously into a vector for inspection. Spawn a
@@ -430,7 +507,8 @@ async fn peer_registry_record_heartbeat_persists_on_bucket_change() {
     assert!(
         after_second > after_first,
         "expected ≥1 additional persist op when bucket advances (got {} → {})",
-        after_first, after_second
+        after_first,
+        after_second
     );
 }
 
@@ -554,9 +632,9 @@ async fn peer_registry_set_pubkey_persists_when_provided() {
 
     let ops = collected.lock().unwrap();
     let upsert_with_pubkey = ops.iter().rev().find_map(|op| match op {
-        PersistOp::UpsertEntry { snapshot, node_id, .. } if node_id == &id => {
-            Some(snapshot.pubkey.clone())
-        }
+        PersistOp::UpsertEntry {
+            snapshot, node_id, ..
+        } if node_id == &id => Some(snapshot.pubkey.clone()),
         _ => None,
     });
     assert_eq!(

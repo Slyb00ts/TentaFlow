@@ -15,8 +15,6 @@ pub mod chromium_provisioner;
 pub mod log_bus;
 pub mod process_ctl;
 pub mod python_venv;
-pub mod redeploy;
-pub mod runner;
 
 pub use bundle::extract_to;
 pub mod vram_calculator;

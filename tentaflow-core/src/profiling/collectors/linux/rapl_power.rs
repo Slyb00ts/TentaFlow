@@ -27,8 +27,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.rapl.power";
@@ -305,10 +305,7 @@ fn polling_loop(
             break;
         }
         let now_at = Instant::now();
-        let dt_us = now_at
-            .saturating_duration_since(prev_at)
-            .as_micros()
-            .max(1) as u64;
+        let dt_us = now_at.saturating_duration_since(prev_at).as_micros().max(1) as u64;
         prev_at = now_at;
         let ts_ns = started_at.elapsed().as_nanos() as u64;
 
@@ -323,11 +320,7 @@ fn polling_loop(
             let watts = (delta_uj as f64) / (dt_us as f64);
             // delta_uj/us = uW per us = uW; we want Watts so divide by 1e6.
             let watts = (watts / 1_000_000.0) as f32;
-            writeln!(
-                file,
-                "{ts_ns},{},{},{:.6}",
-                d.name, d.idx, watts.max(0.0)
-            )?;
+            writeln!(file, "{ts_ns},{},{},{:.6}", d.name, d.idx, watts.max(0.0))?;
             samples_observed.fetch_add(1, Ordering::Relaxed);
             prev_uj.insert(d.idx, cur);
         }

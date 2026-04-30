@@ -16,3 +16,4 @@ gpu_supported = false
 [deploy.docker]
 compose_path = "tools/docker/iroh-relay/stack.yml"
 platforms = ["linux"]
+transport = "direct-http"

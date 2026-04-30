@@ -16,7 +16,10 @@ use crate::deploy::python_venv::LogSink;
 /// systemowa instalacje, potem cache, potem pobiera Chrome for Testing.
 pub async fn ensure_chromium(log: &LogSink) -> Result<PathBuf> {
     if let Some(path) = find_system_chromium() {
-        log(&format!("chromium: znaleziony systemowy {}", path.display()));
+        log(&format!(
+            "chromium: znaleziony systemowy {}",
+            path.display()
+        ));
         check_runtime_libs(&path, log);
         return Ok(path);
     }
@@ -85,7 +88,12 @@ fn find_system_chromium() -> Option<PathBuf> {
     let names: &[&str] = if cfg!(target_os = "windows") {
         &["chrome.exe", "chromium.exe", "msedge.exe", "brave.exe"]
     } else {
-        &["chromium", "chromium-browser", "google-chrome", "brave-browser"]
+        &[
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "brave-browser",
+        ]
     };
     for name in names {
         if let Some(found) = which_in_path(name) {
@@ -158,9 +166,8 @@ async fn download_chrome_for_testing(cache_dir: &Path, log: &LogSink) -> Result<
         ));
     }
 
-    std::fs::create_dir_all(cache_dir).with_context(|| {
-        format!("tworzenie katalogu cache {}", cache_dir.display())
-    })?;
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("tworzenie katalogu cache {}", cache_dir.display()))?;
 
     // Async reqwest: synchroniczny `reqwest::blocking::Client` tworzyl wlasny
     // tokio runtime i przy drop panikowal `Cannot drop a runtime in a context
@@ -296,12 +303,10 @@ fn check_runtime_libs(chrome: &Path, log: &LogSink) {
         missing.len(),
         missing.join(", ")
     ));
-    log(
-        "chromium: doinstaluj zaleznosci, np.: \
+    log("chromium: doinstaluj zaleznosci, np.: \
          apt-get install -y libnss3 libgbm1 libasound2 libdrm2 libatk-bridge2.0-0 \
          libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libxss1 libpango-1.0-0 \
-         fonts-liberation",
-    );
+         fonts-liberation");
 }
 
 #[cfg(not(target_os = "linux"))]

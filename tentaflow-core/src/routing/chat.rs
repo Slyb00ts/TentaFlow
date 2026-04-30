@@ -39,16 +39,29 @@ impl Router {
         user: Option<crate::routing::acl::UserContext>,
     ) -> Result<
         crate::routing::RouteResult<
-            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::api::openai::types::ChatCompletionChunk>> + Send>>,
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::api::openai::types::ChatCompletionChunk>,
+                        > + Send,
+                >,
+            >,
         >,
     > {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                if !crate::routing::acl::check_access_safe(
+                    db,
+                    "model",
+                    &request.model,
+                    u.user_id,
+                    &u.role,
+                ) {
                     tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied model access (stream)");
                     return Err(crate::error::CoreError::AllBackendsUnavailable {
                         model_name: request.model.clone(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -69,12 +82,16 @@ impl Router {
         // route_chat_completion ktorego potem wywolujemy z model-level ACL).
         if let Some(ref u) = user {
             if let Some(ref dispatcher) = self.flow_dispatcher {
-                let ctx = crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
-                if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await {
+                let ctx =
+                    crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
+                if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await
+                {
                     use crate::routing::chat::flow_result_to_chat_response;
                     let response = flow_result_to_chat_response(result, &request.model);
                     let metadata = crate::routing::RouteMetadata {
-                        served_by_node: hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "unknown".to_string()),
+                        served_by_node: hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string()),
                         backend_type: "flow_engine".to_string(),
                         strategy_used: "direct".to_string(),
                         fallbacks_tried: 0,
@@ -647,10 +664,14 @@ impl Router {
     ) -> Result<ChatCompletionResponse> {
         debug!("Routing to RAG engine: {}", rag_engine_name);
 
-        let rag_handle = self.service_manager.rag_services.get(&rag_engine_name).map(|r| r.value().clone())
-        .ok_or_else(|| CoreError::ModelNotFound {
-            model_name: rag_engine_name.clone(),
-        })?;
+        let rag_handle = self
+            .service_manager
+            .rag_services
+            .get(&rag_engine_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| CoreError::ModelNotFound {
+                model_name: rag_engine_name.clone(),
+            })?;
 
         let rag_client =
             rag_handle
@@ -1004,118 +1025,70 @@ impl Router {
                     input.len()
                 );
 
-                let emb_handle = service_manager.quic_embedding_services.get(&model).map(|r| r.value().clone());
-                if let Some(quic_handle) = emb_handle {
-                    if let Some(quic_client) = quic_handle.get_client().await {
-                        debug!("Uzywam QUIC client dla embeddingow: {}", model);
-
-                        let quic_request = ModelRequest {
-                            request_id: request_id.clone(),
-                            payload: ModelPayload::Embeddings(embeddings_payload),
-                            stream: false,
-                            metadata: None,
-                            session_id: None,
-                        };
-
-                        match quic_client.send_request(quic_request).await {
-                            Ok(response) => {
-                                debug!("QUIC embedding callback sukces");
-                                return response;
-                            }
-                            Err(e) => {
-                                error!("QUIC embedding callback error: {}", e);
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!("QUIC embedding error: {}", e),
-                                        details: Some(e.to_string()),
-                                    }),
-                                    metrics: None,
-                                };
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "QUIC embedding client '{}' nie jest polaczony, fallback do HTTP",
-                            model
-                        );
-                    }
-                }
-
-                let backends = match service_manager.service_backends.get(&model) {
-                    Some(b) => b,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::ModelNotFound,
-                                message: format!("Model embedding '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)", model),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                if backends.is_empty() {
-                    return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!("Brak dostepnych backendow dla modelu '{}'", model),
-                            details: None,
-                        }),
-                        metrics: None,
+                // Snapshot-driven: V2 live handles cache resolves model -> QUIC client.
+                if let Some(quic_client) = service_manager.find_quic_client_for_model(&model).await
+                {
+                    debug!("Uzywam QUIC client dla embeddingow: {}", model);
+                    let quic_request = ModelRequest {
+                        request_id: request_id.clone(),
+                        payload: ModelPayload::Embeddings(embeddings_payload.clone()),
+                        stream: false,
+                        metadata: None,
+                        session_id: None,
                     };
+                    match quic_client.send_request(quic_request).await {
+                        Ok(response) => {
+                            debug!("QUIC embedding callback sukces");
+                            return response;
+                        }
+                        Err(e) => {
+                            error!("QUIC embedding error: {}", e);
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::InternalError,
+                                    message: format!("QUIC embedding error: {}", e),
+                                    details: Some(e.to_string()),
+                                }),
+                                metrics: None,
+                            };
+                        }
+                    }
                 }
 
-                let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                    Some(s) => s,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!(
-                                    "Brak strategii load balancing dla modelu '{}'",
-                                    model
-                                ),
-                                details: None,
-                            }),
-                            metrics: None,
+                // Snapshot-driven HTTP backend lookup: live handles cache resolves
+                // model -> HTTP BackendClient. When unresolved, the model is unknown.
+                let backend =
+                    match service_manager
+                        .find_http_backend_for_model(&model)
+                        .or_else(|| {
+                            service_manager
+                                .resolve_http_backends_via_snapshot(&model)
+                                .and_then(|v| v.into_iter().next())
+                        }) {
+                        Some(b) => b,
+                        None => {
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::ModelNotFound,
+                                    message: format!(
+                                        "Model embedding '{}' nie znaleziony (snapshot empty)",
+                                        model
+                                    ),
+                                    details: None,
+                                }),
+                                metrics: None,
+                            };
                         }
-                    }
-                };
+                    };
 
-                let backend_idx = match strategy.select_backend(backends) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Blad wyboru backendu: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend = &backends[backend_idx];
-
-                debug!(
-                    "Wybrany backend ({}): {} [{}]",
-                    strategy.name(),
-                    backend.url(),
-                    backend_idx
-                );
+                debug!("Embedding callback: backend url={}", backend.url());
 
                 match backend.embedding(input).await {
                     Ok(embeddings) => {
                         debug!("Embedding callback sukces: {} wektorow", embeddings.len());
-                        ModelResponse {
+                        return ModelResponse {
                             request_id,
                             result: ModelResult::Embeddings(EmbeddingsResult {
                                 embeddings,
@@ -1123,11 +1096,11 @@ impl Router {
                                 model,
                             }),
                             metrics: None,
-                        }
+                        };
                     }
                     Err(e) => {
                         error!("Embedding callback error: {}", e);
-                        ModelResponse {
+                        return ModelResponse {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InternalError,
@@ -1135,7 +1108,7 @@ impl Router {
                                 details: Some(e.to_string()),
                             }),
                             metrics: None,
-                        }
+                        };
                     }
                 }
             }
@@ -1156,131 +1129,79 @@ impl Router {
                     prompt.as_ref().map(|p| p.len())
                 );
 
-                let llm_handle = service_manager.quic_llm_services.get(&model).map(|r| r.value().clone());
-                if let Some(quic_handle) = llm_handle {
-                    if let Some(quic_client) = quic_handle.get_client().await {
-                        debug!("Uzywam QUIC client dla LLM: {}", model);
-
-                        let quic_request = ModelRequest {
-                            request_id: request_id.clone(),
-                            payload: ModelPayload::Completion(CompletionPayload {
-                                model: model.clone(),
-                                prompt,
-                                messages,
-                                temperature,
-                                max_tokens,
-                                top_p,
-                                stop,
-                                presence_penalty: None,
-                                frequency_penalty: None,
-                                tts_options: None,
-                                memory_options: None,
-                                audio_input: None,
-                                prefix_cache_id: None,
-                                prefix_text: None,
-                            }),
-                            stream: false,
-                            metadata: None,
-                            session_id: None,
-                        };
-
-                        match quic_client.send_request(quic_request).await {
-                            Ok(response) => {
-                                debug!("QUIC LLM callback sukces");
-                                return response;
-                            }
-                            Err(e) => {
-                                error!("QUIC LLM callback error: {}", e);
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!("QUIC LLM error: {}", e),
-                                        details: Some(e.to_string()),
-                                    }),
-                                    metrics: None,
-                                };
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "QUIC LLM client '{}' nie jest polaczony, fallback do HTTP",
-                            model
-                        );
-                    }
-                }
-
-                let backends = match service_manager.service_backends.get(&model) {
-                    Some(b) => b,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::ModelNotFound,
-                                message: format!(
-                                "Model LLM '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)",
-                                model
-                            ),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                if backends.is_empty() {
-                    return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!("No backends available for model: {}", model),
-                            details: None,
+                // Snapshot-driven: V2 live handles cache resolves model -> QUIC client.
+                if let Some(quic_client) = service_manager.find_quic_client_for_model(&model).await
+                {
+                    debug!("Uzywam QUIC client dla LLM: {}", model);
+                    let quic_request = ModelRequest {
+                        request_id: request_id.clone(),
+                        payload: ModelPayload::Completion(CompletionPayload {
+                            model: model.clone(),
+                            prompt: prompt.clone(),
+                            messages: messages.clone(),
+                            temperature,
+                            max_tokens,
+                            top_p,
+                            stop: stop.clone(),
+                            presence_penalty: None,
+                            frequency_penalty: None,
+                            tts_options: None,
+                            memory_options: None,
+                            audio_input: None,
+                            prefix_cache_id: None,
+                            prefix_text: None,
                         }),
-                        metrics: None,
+                        stream: false,
+                        metadata: None,
+                        session_id: None,
                     };
+                    match quic_client.send_request(quic_request).await {
+                        Ok(response) => {
+                            debug!("QUIC LLM callback sukces");
+                            return response;
+                        }
+                        Err(e) => {
+                            error!("QUIC LLM callback error: {}", e);
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::InternalError,
+                                    message: format!("QUIC LLM error: {}", e),
+                                    details: Some(e.to_string()),
+                                }),
+                                metrics: None,
+                            };
+                        }
+                    }
                 }
 
-                let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                    Some(s) => s,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!(
-                                    "Brak strategii load balancing dla modelu '{}'",
-                                    model
-                                ),
-                                details: None,
-                            }),
-                            metrics: None,
+                // Snapshot-driven HTTP backend lookup.
+                let backend =
+                    match service_manager
+                        .find_http_backend_for_model(&model)
+                        .or_else(|| {
+                            service_manager
+                                .resolve_http_backends_via_snapshot(&model)
+                                .and_then(|v| v.into_iter().next())
+                        }) {
+                        Some(b) => b,
+                        None => {
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::ModelNotFound,
+                                    message: format!(
+                                        "Model LLM '{}' nie znaleziony (snapshot empty)",
+                                        model
+                                    ),
+                                    details: None,
+                                }),
+                                metrics: None,
+                            };
                         }
-                    }
-                };
+                    };
 
-                let backend_idx = match strategy.select_backend(backends) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Blad wyboru backendu: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend = &backends[backend_idx];
-
-                debug!(
-                    "Callback ChatCompletion - wybrany backend ({}): {} [{}]",
-                    strategy.name(),
-                    backend.url(),
-                    backend_idx
-                );
+                debug!("Completion callback: backend url={}", backend.url());
 
                 let openai_messages: Vec<Message> = messages
                     .iter()
@@ -1398,7 +1319,13 @@ impl Router {
                             audio_data.len()
                         );
 
-                        let backends = match service_manager.service_backends.get(&model) {
+                        let backend = match service_manager
+                            .find_http_backend_for_model(&model)
+                            .or_else(|| {
+                                service_manager
+                                    .resolve_http_backends_via_snapshot(&model)
+                                    .and_then(|v| v.into_iter().next())
+                            }) {
                             Some(b) => b,
                             None => {
                                 return ModelResponse {
@@ -1409,56 +1336,9 @@ impl Router {
                                         details: None,
                                     }),
                                     metrics: None,
-                                }
+                                };
                             }
                         };
-
-                        if backends.is_empty() {
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::ModelNotFound,
-                                    message: format!("No backends available for model: {}", model),
-                                    details: None,
-                                }),
-                                metrics: None,
-                            };
-                        }
-
-                        let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                            Some(s) => s,
-                            None => {
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!(
-                                            "Brak strategii load balancing dla modelu '{}'",
-                                            model
-                                        ),
-                                        details: None,
-                                    }),
-                                    metrics: None,
-                                }
-                            }
-                        };
-
-                        let backend_idx = match strategy.select_backend(backends) {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!("Blad wyboru backendu: {}", e),
-                                        details: Some(e.to_string()),
-                                    }),
-                                    metrics: None,
-                                }
-                            }
-                        };
-
-                        let backend = &backends[backend_idx];
 
                         let filename = format!("audio_{}.mp3", uuid::Uuid::new_v4());
 
@@ -1604,67 +1484,27 @@ impl Router {
                     messages.len()
                 );
 
-                let backends = match service_manager.service_backends.get(&model) {
-                    Some(b) => b,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::ModelNotFound,
-                                message: format!("Model not found: {}", model),
-                                details: None,
-                            }),
-                            metrics: None,
+                let backend =
+                    match service_manager
+                        .find_http_backend_for_model(&model)
+                        .or_else(|| {
+                            service_manager
+                                .resolve_http_backends_via_snapshot(&model)
+                                .and_then(|v| v.into_iter().next())
+                        }) {
+                        Some(b) => b,
+                        None => {
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::ModelNotFound,
+                                    message: format!("Model not found: {}", model),
+                                    details: None,
+                                }),
+                                metrics: None,
+                            };
                         }
-                    }
-                };
-
-                if backends.is_empty() {
-                    return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!("No backends available for model: {}", model),
-                            details: None,
-                        }),
-                        metrics: None,
                     };
-                }
-
-                let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                    Some(s) => s,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!(
-                                    "Brak strategii load balancing dla modelu '{}'",
-                                    model
-                                ),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend_idx = match strategy.select_backend(backends) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Blad wyboru backendu: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend = &backends[backend_idx];
 
                 match backend
                     .vision(model.clone(), messages.clone(), max_tokens)
@@ -1714,49 +1554,46 @@ impl Router {
                     rerank_payload.documents.len()
                 );
 
-                let rerank_handle = service_manager.quic_embedding_services.get(&model).map(|r| r.value().clone());
-                if let Some(quic_handle) = rerank_handle {
-                    if let Some(quic_client) = quic_handle.get_client().await {
-                        debug!("Uzywam QUIC client dla rerankingu: {}", model);
-
-                        let quic_request = ModelRequest {
-                            request_id: request_id.clone(),
-                            payload: ModelPayload::Rerank(rerank_payload),
-                            stream: false,
-                            metadata: None,
-                            session_id: None,
+                let quic_client = match service_manager.find_quic_client_for_model(&model).await {
+                    Some(c) => c,
+                    None => {
+                        warn!("Rerank service '{}' not found or not connected", model);
+                        return ModelResponse {
+                            request_id,
+                            result: ModelResult::Error(ErrorInfo {
+                                error_type: ErrorType::ModelNotFound,
+                                message: format!(
+                                    "Rerank service '{}' not found or not connected",
+                                    model
+                                ),
+                                details: None,
+                            }),
+                            metrics: None,
                         };
-
-                        match quic_client.send_request(quic_request).await {
-                            Ok(response) => {
-                                debug!("QUIC rerank callback sukces");
-                                return response;
-                            }
-                            Err(e) => {
-                                error!("QUIC rerank callback error: {}", e);
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!("QUIC rerank error: {}", e),
-                                        details: Some(e.to_string()),
-                                    }),
-                                    metrics: None,
-                                };
-                            }
+                    }
+                };
+                debug!("Using QUIC client for reranking: {}", model);
+                let quic_request = ModelRequest {
+                    request_id: request_id.clone(),
+                    payload: ModelPayload::Rerank(rerank_payload),
+                    stream: false,
+                    metadata: None,
+                    session_id: None,
+                };
+                match quic_client.send_request(quic_request).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("QUIC rerank error: {}", e);
+                        ModelResponse {
+                            request_id,
+                            result: ModelResult::Error(ErrorInfo {
+                                error_type: ErrorType::InternalError,
+                                message: format!("QUIC rerank error: {}", e),
+                                details: Some(e.to_string()),
+                            }),
+                            metrics: None,
                         }
                     }
-                }
-
-                warn!("Serwis rerankera '{}' nie znaleziony", model);
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::ModelNotFound,
-                        message: format!("Serwis rerankera '{}' nie znaleziony", model),
-                        details: None,
-                    }),
-                    metrics: None,
                 }
             }
 
@@ -1803,8 +1640,7 @@ impl Router {
                         error_type: ErrorType::InvalidRequest,
                         message: "MeetingEvent is not valid in chat callbacks".to_string(),
                         details: Some(
-                            "MeetingEvent is handled by dispatch_reverse_request only"
-                                .to_string(),
+                            "MeetingEvent is handled by dispatch_reverse_request only".to_string(),
                         ),
                     }),
                     metrics: None,
@@ -1821,8 +1657,7 @@ impl Router {
                         error_type: ErrorType::InvalidRequest,
                         message: "PromptFetch is not valid in chat callbacks".to_string(),
                         details: Some(
-                            "PromptFetch is handled by dispatch_reverse_request only"
-                                .to_string(),
+                            "PromptFetch is handled by dispatch_reverse_request only".to_string(),
                         ),
                     }),
                     metrics: None,
@@ -2152,21 +1987,13 @@ impl Router {
             std::mem::discriminant(&payload.operation)
         );
 
-        let quic_client = {
-            let mut client = None;
-            let memory_handles: Vec<_> = self
-                .service_manager
-                .quic_memory_services.iter().map(|r| r.value().clone()).collect();
-            for handle in memory_handles {
-                if let Some(c) = handle.get_client().await {
-                    client = Some(c);
-                    break;
-                }
-            }
-            client.ok_or_else(|| CoreError::AllBackendsUnavailable {
+        let quic_client = self
+            .service_manager
+            .find_quic_client_for_model("memory")
+            .await
+            .ok_or_else(|| CoreError::AllBackendsUnavailable {
                 model_name: "memory".to_string(),
-            })?
-        };
+            })?;
 
         let request_id = uuid::Uuid::new_v4().to_string();
 

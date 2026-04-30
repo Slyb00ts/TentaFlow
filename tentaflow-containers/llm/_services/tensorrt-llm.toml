@@ -16,6 +16,7 @@ version = "1.2.1"
 [deploy.docker]
 context_path = "llm/docker/tensorrt-llm"
 platforms = ["linux", "windows"]
+transport = "sidecar-quic"
 
 [deploy.native]
 runtime = "python-bundle"

@@ -9,17 +9,17 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::process::{Child, Command};
-#[cfg(target_os = "linux")]
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use tentaflow_protocol::profiling::{
@@ -28,8 +28,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.nvsmi.gpu_util";
@@ -57,8 +57,7 @@ impl LinuxNvsmiGpuCollector {
                     PlatformSet::LINUX_X64 | PlatformSet::LINUX_ARM64,
                 ),
                 vendor: Some(GpuVendor::Nvidia),
-                description:
-                    "NVIDIA GPU utilization, memory and power via nvidia-smi at 1 Hz. \
+                description: "NVIDIA GPU utilization, memory and power via nvidia-smi at 1 Hz. \
                      Complements nsys with continuous sampling.",
             },
             id: COLLECTOR_ID.to_string(),
@@ -122,9 +121,8 @@ impl ProfileCollector for LinuxNvsmiGpuCollector {
 
     #[cfg(target_os = "linux")]
     fn start(&self, ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
-        let bin = nvidia_smi_binary().ok_or_else(|| {
-            CollectorError::Spawn("nvidia-smi binary not found".into())
-        })?;
+        let bin = nvidia_smi_binary()
+            .ok_or_else(|| CollectorError::Spawn("nvidia-smi binary not found".into()))?;
         fs::create_dir_all(&ctx.output_dir)?;
         let csv_path = ctx.output_dir.join(CSV_FILENAME);
 
@@ -162,9 +160,7 @@ impl ProfileCollector for LinuxNvsmiGpuCollector {
         let handle = thread::Builder::new()
             .name("tf-nvsmi-collector".into())
             .spawn(move || {
-                if let Err(e) =
-                    reader_loop(child_for_reader, csv_t, stop_t, samples_t, started_t)
-                {
+                if let Err(e) = reader_loop(child_for_reader, csv_t, stop_t, samples_t, started_t) {
                     eprintln!("linux.nvsmi.gpu_util reader loop ended: {e}");
                 }
             })
@@ -292,9 +288,9 @@ fn reader_loop(
     // Take the stdout handle out of the child so we can BufReader it without
     // holding the mutex during reads.
     let stdout = {
-        let mut guard = child.lock().map_err(|_| {
-            CollectorError::Custom("nvsmi child mutex poisoned".into())
-        })?;
+        let mut guard = child
+            .lock()
+            .map_err(|_| CollectorError::Custom("nvsmi child mutex poisoned".into()))?;
         guard
             .as_mut()
             .and_then(|c| c.stdout.take())
@@ -510,7 +506,8 @@ mod tests {
     fn nvsmi_parser_emits_three_events_per_row() {
         let dir = TempDir::new().unwrap();
         let csv = dir.path().join("nvsmi.csv");
-        let body = "timestamp_ns,index,util_gpu,util_mem,mem_used_mib,mem_free_mib,temp_c,power_w\n\
+        let body =
+            "timestamp_ns,index,util_gpu,util_mem,mem_used_mib,mem_free_mib,temp_c,power_w\n\
                     1000,0,42.0,15.0,1024,7168,55.0,120.5\n\
                     2000,0,55.0,20.0,1500,6692,60.0,135.7\n";
         fs::write(&csv, body).unwrap();

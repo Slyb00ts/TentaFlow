@@ -50,6 +50,7 @@ fn docker_deploy(context_path: &str, platforms: Vec<TargetOs>) -> DockerDeploy {
         platforms,
         download_image: None,
         download_size_mb: None,
+        transport: Some(DockerTransport::SidecarQuic),
     }
 }
 
@@ -60,6 +61,7 @@ fn docker_compose_deploy(compose_path: &str, platforms: Vec<TargetOs>) -> Docker
         platforms,
         download_image: None,
         download_size_mb: None,
+        transport: Some(DockerTransport::SidecarQuic),
     }
 }
 
@@ -325,6 +327,7 @@ fn validate_docker_without_context_or_compose_fails() {
                 platforms: vec![TargetOs::Linux],
                 download_image: None,
                 download_size_mb: None,
+                transport: Some(DockerTransport::SidecarQuic),
             }),
             native: None,
             external: None,
@@ -347,6 +350,7 @@ fn validate_docker_with_context_and_compose_fails() {
                 platforms: vec![TargetOs::Linux],
                 download_image: None,
                 download_size_mb: None,
+                transport: Some(DockerTransport::SidecarQuic),
             }),
             native: None,
             external: None,
@@ -356,6 +360,31 @@ fn validate_docker_with_context_and_compose_fails() {
     assert!(errs
         .iter()
         .any(|e| matches!(e, ValidationError::DockerRequiresSingleSource { .. })));
+}
+
+/// Phase 6: Reguła 5 — [deploy.docker] bez `transport` musi byc odrzucony,
+/// nawet gdy reszta sekcji jest poprawna.
+#[test]
+fn validate_docker_without_transport_fails() {
+    let manifest = make_manifest(
+        make_engine("e", Category::Llm),
+        DeploySection {
+            docker: Some(DockerDeploy {
+                context_path: Some("llm/docker/llama-cpp".to_string()),
+                compose_path: None,
+                platforms: vec![TargetOs::Linux],
+                download_image: None,
+                download_size_mb: None,
+                transport: None,
+            }),
+            native: None,
+            external: None,
+        },
+    );
+    let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
+    assert!(errs
+        .iter()
+        .any(|e| matches!(e, ValidationError::DockerRequiresTransport { .. })));
 }
 
 /// B2.-: Reguła 2 — brak wszystkich sekcji deploy daje NoDeploySection.
@@ -815,7 +844,10 @@ fn registry_non_empty_categories_only_used() {
 fn loaded_manifest_has_engines() {
     let reg = super::registry::registry();
     let count = reg.engines().len();
-    assert!(count > 0, "REGISTRY pusty — build.rs nie wygenerowal manifestow?");
+    assert!(
+        count > 0,
+        "REGISTRY pusty — build.rs nie wygenerowal manifestow?"
+    );
 }
 
 /// E2: Wszystkie zaladowane manifesty przechodza walidacje semantyczna

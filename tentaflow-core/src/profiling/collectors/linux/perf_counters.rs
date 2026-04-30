@@ -23,8 +23,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.perf.pmu_counters";
@@ -327,11 +327,19 @@ fn parse_perf_stat_csv(content: &str, names: &mut NameInterner) -> Vec<TimelineE
         }
         // CacheMissL3 — perf "cache-misses" jest LLC by default
         if cache_refs > 0.0 {
-            push(&mut events, CounterKind::CacheMissL3, cache_misses / cache_refs);
+            push(
+                &mut events,
+                CounterKind::CacheMissL3,
+                cache_misses / cache_refs,
+            );
         }
         // BranchMiss
         if branches > 0.0 {
-            push(&mut events, CounterKind::BranchMiss, branch_misses / branches);
+            push(
+                &mut events,
+                CounterKind::BranchMiss,
+                branch_misses / branches,
+            );
         }
         if ctx_sw > 0.0 {
             push(&mut events, CounterKind::ContextSwitches, ctx_sw);

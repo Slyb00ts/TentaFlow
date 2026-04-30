@@ -23,11 +23,6 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Envelope.sequence u32 -> u64 (overflow bug fix)
 ///   - SessionAuth::UserSession adds `role: Option<String>` (RBAC)
 ///   - Resume tokens now bind to originating_user_id (P0 fix)
-/// v4 changes (2026-04-18):
-///   - ServiceSummary rozszerzony o name/service_type/strategy/config_json/
-///     node_id/node_hostname/created_at (migracja funkcjonalnosci starego dashboardu)
-///   - Nowe wiadomosci ServiceCreateRequest/Response, ServiceUpdateRequest/Response
-///   - Nowe wiadomosci ServiceQuicStatusRequest/Response do monitorowania QUIC
 /// v5 changes (2026-04-18): BREAKING — brak backward compat z nodami na v4
 ///   - Mesh transport zmieniony z quinn (custom TLS + ChaCha20-Poly1305 wrap +
 ///     epoch rotation + nonce counter + sliding window replay) na iroh
@@ -455,11 +450,7 @@ mod tests {
         // + [16] UserSession.user_id + [4] role_len + [4] "user" bytes
         assert_eq!(msg.len(), 16 + 8 + 32 + 1 + 16 + 4 + 4);
         assert_eq!(&msg[0..16], &[7u8; 16]);
-        assert_eq!(
-            &msg[16..24],
-            &1_700_000_000u64.to_le_bytes(),
-            "epoch LE"
-        );
+        assert_eq!(&msg[16..24], &1_700_000_000u64.to_le_bytes(), "epoch LE");
         assert_eq!(&msg[24..56], &[9u8; 32]);
         assert_eq!(msg[56], 2, "UserSession discriminant");
         assert_eq!(&msg[57..73], &[7u8; 16], "user_id");

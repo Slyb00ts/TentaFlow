@@ -36,11 +36,18 @@ impl Router {
     ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                if !crate::routing::acl::check_access_safe(
+                    db,
+                    "model",
+                    &request.model,
+                    u.user_id,
+                    &u.role,
+                ) {
                     tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied TTS model");
                     return Err(crate::error::CoreError::ModelNotFound {
                         model_name: request.model.clone(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -106,19 +113,21 @@ impl Router {
                             let name = name.clone();
                             let text = input_c.clone();
                             let speed_v = speed;
-                            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, u32)> {
-                                let mgr = crate::tts::shared_tts_manager();
-                                let guard = mgr.blocking_read();
-                                let out = guard.synthesize(
-                                    &name,
-                                    crate::tts::SynthesizeParams {
-                                        text,
-                                        speaker_id: 0,
-                                        speed: speed_v,
-                                    },
-                                )?;
-                                Ok((out.samples, out.sample_rate))
-                            })
+                            let res = tokio::task::spawn_blocking(
+                                move || -> anyhow::Result<(Vec<f32>, u32)> {
+                                    let mgr = crate::tts::shared_tts_manager();
+                                    let guard = mgr.blocking_read();
+                                    let out = guard.synthesize(
+                                        &name,
+                                        crate::tts::SynthesizeParams {
+                                            text,
+                                            speaker_id: 0,
+                                            speed: speed_v,
+                                        },
+                                    )?;
+                                    Ok((out.samples, out.sample_rate))
+                                },
+                            )
                             .await
                             .map_err(|e| anyhow::anyhow!("LocalTts join: {e}"))??;
                             let (samples, sr) = res;
@@ -135,12 +144,10 @@ impl Router {
                             // POST /v1/audio/speech. BackendClient z
                             // register_native_http_backend ma juz zbudowany
                             // audio_speech_url, model_name_override i auth.
-                            let backend = this.select_http_backend(name)
-                                .ok_or_else(|| anyhow::anyhow!("Brak HTTP backendow dla {}", name))?;
-                            debug!(
-                                "Using HTTP TTS backend: {} (url={})",
-                                name, backend.url()
-                            );
+                            let backend = this.select_http_backend(name).ok_or_else(|| {
+                                anyhow::anyhow!("Brak HTTP backendow dla {}", name)
+                            })?;
+                            debug!("Using HTTP TTS backend: {} (url={})", name, backend.url());
                             // Skopiuj request bez `Cow` borrow — BackendClient
                             // wykonuje async POST i potrzebuje 'static fields.
                             let req = crate::api::openai::types::TTSRequest {
@@ -272,7 +279,9 @@ impl Router {
                 // w DB ale `target_model` jest pusty albo wskazuje na nieistniejacy
                 // serwis, log pokazuje user'owi co dokladnie trzeba zrobic.
                 if let Some(ref db) = self.db {
-                    if let Ok(Some(alias)) = crate::db::repository::resolve_model_alias(db, &tts_model) {
+                    if let Ok(Some(alias)) =
+                        crate::db::repository::resolve_model_alias(db, &tts_model)
+                    {
                         if alias.target_model.trim().is_empty() {
                             tracing::warn!(
                                 alias = %tts_model,

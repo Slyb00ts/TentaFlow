@@ -86,7 +86,10 @@ fn validate_remote_relay_url(url_str: &str) -> Result<(), AdminError> {
         return Ok(());
     }
     let parsed = url::Url::parse(url_str).map_err(|_| {
-        AdminError::new(AdminErrorKind::BadRequest, "remote_relay_url is not a valid URL")
+        AdminError::new(
+            AdminErrorKind::BadRequest,
+            "remote_relay_url is not a valid URL",
+        )
     })?;
     if parsed.scheme() != "https" {
         return Err(AdminError::new(
@@ -94,9 +97,9 @@ fn validate_remote_relay_url(url_str: &str) -> Result<(), AdminError> {
             "remote_relay_url must use https scheme",
         ));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| AdminError::new(AdminErrorKind::BadRequest, "remote_relay_url missing host"))?;
+    let host = parsed.host_str().ok_or_else(|| {
+        AdminError::new(AdminErrorKind::BadRequest, "remote_relay_url missing host")
+    })?;
     // Direct IP literal — apply SSRF guard.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !is_safe_remote_ip(ip) {
@@ -219,7 +222,10 @@ fn local_contact_hints(
         public_key_hex: String::new(),
         hostname,
         addresses,
-        relay_url: qm.relay_url().map(|url| url.to_string()).unwrap_or_default(),
+        relay_url: qm
+            .relay_url()
+            .map(|url| url.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -297,7 +303,10 @@ pub async fn initiate_pairing(
     pin_hint: &str,
 ) -> Result<InitiateOutcome, AdminError> {
     if !is_valid_id(remote_node_id) {
-        return Err(AdminError::new(AdminErrorKind::BadRequest, "invalid node_id"));
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "invalid node_id",
+        ));
     }
 
     // Validate user-controlled transport hints BEFORE any DB write or I/O.
@@ -494,7 +503,10 @@ pub fn confirm_pairing(
             remote_node_id,
             remote_node_id.as_bytes()
         );
-        return Err(AdminError::new(AdminErrorKind::BadRequest, "invalid node_id"));
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "invalid node_id",
+        ));
     }
 
     if !security.check_pin_rate_limit(remote_node_id) {
@@ -533,9 +545,7 @@ pub fn confirm_pairing(
         ));
     }
 
-    let hostname = peer_store
-        .get_hostname(remote_node_id)
-        .unwrap_or_default();
+    let hostname = peer_store.get_hostname(remote_node_id).unwrap_or_default();
 
     security
         .confirm_pairing(remote_node_id, &remote_public_key, &hostname, "admin")
@@ -554,7 +564,10 @@ pub fn confirm_pairing(
     ) {
         let mut id_bytes = [0u8; 32];
         if hex::decode_to_slice(remote_node_id, &mut id_bytes).is_ok() {
-            reg.set_pubkey(&id_bytes, std::sync::Arc::<[u8]>::from(pubkey_bytes.as_slice()));
+            reg.set_pubkey(
+                &id_bytes,
+                std::sync::Arc::<[u8]>::from(pubkey_bytes.as_slice()),
+            );
             reg.set_trust(&id_bytes, crate::mesh::peer_registry::TrustState::Trusted);
         }
     }
@@ -622,8 +635,7 @@ pub fn confirm_pairing(
                         public_key_hex: pk.clone(),
                     })
                     .collect();
-                let payload =
-                    tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
                 if let Ok(sync_data) =
                     rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
                 {
@@ -641,10 +653,8 @@ pub fn confirm_pairing(
         });
     }
 
-    let _ = db::repository::delete_setting(
-        &security.db,
-        &format!("pending_pubkey:{}", remote_node_id),
-    );
+    let _ =
+        db::repository::delete_setting(&security.db, &format!("pending_pubkey:{}", remote_node_id));
     let _ = delete_pending_contact_hints(&security.db, remote_node_id);
 
     Ok(ConfirmOutcome {
@@ -659,7 +669,10 @@ pub fn reject_pairing(
     quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) -> Result<(), AdminError> {
     if !is_valid_id(remote_node_id) {
-        return Err(AdminError::new(AdminErrorKind::BadRequest, "invalid node_id"));
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "invalid node_id",
+        ));
     }
 
     security.reject_pairing(remote_node_id).map_err(|e| {
@@ -708,7 +721,10 @@ pub fn revoke_trust(
     local_node_id: &str,
 ) -> Result<(), AdminError> {
     if !is_valid_id(node_id) {
-        return Err(AdminError::new(AdminErrorKind::BadRequest, "Niepoprawny node_id"));
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "Niepoprawny node_id",
+        ));
     }
 
     let _ = crate::db::repository::log_audit(
@@ -780,7 +796,10 @@ pub fn revoke_trust(
 /// Przywraca zaufanie po revocation (admin override).
 pub fn retrust(security: &Arc<MeshSecurity>, node_id: &str) -> Result<(), AdminError> {
     if !is_valid_id(node_id) {
-        return Err(AdminError::new(AdminErrorKind::BadRequest, "Niepoprawny node_id"));
+        return Err(AdminError::new(
+            AdminErrorKind::BadRequest,
+            "Niepoprawny node_id",
+        ));
     }
 
     security.admin_retrust(node_id).map_err(|e| {

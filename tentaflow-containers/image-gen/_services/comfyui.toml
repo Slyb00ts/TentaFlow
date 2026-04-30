@@ -16,6 +16,7 @@ version = "0.3.10"
 [deploy.docker]
 context_path = "image-gen/docker/comfyui"
 platforms = ["linux", "windows"]
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux", "windows"]

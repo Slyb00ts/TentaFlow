@@ -22,6 +22,7 @@ pub mod stream_helpers;
 pub mod streaming;
 pub mod stt;
 pub mod transcript_store;
+pub mod transport_client;
 pub mod tts;
 pub mod video_pipeline;
 

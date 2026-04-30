@@ -109,6 +109,35 @@ pub struct DockerDeploy {
     pub download_image: Option<String>,
     #[serde(default)]
     pub download_size_mb: Option<u64>,
+    /// How TentaFlow reaches the container at runtime. `sidecar-quic` wraps the
+    /// engine's HTTP API in a QUIC sidecar so mesh peers route through QUIC;
+    /// `direct-http` exposes the host-mapped HTTP port directly with no sidecar.
+    /// Required for every `[deploy.docker]` section as of Phase 6. Modelled as
+    /// `Option<>` here so a missing TOML field surfaces as a typed validation
+    /// error rather than a serde "missing field" message.
+    #[serde(default)]
+    pub transport: Option<DockerTransport>,
+}
+
+/// Transport variant declared by `[deploy.docker].transport`. The build-time
+/// validator in `build.rs` rejects manifests that omit this field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockerTransport {
+    /// TentaFlow runs a Rust QUIC sidecar in front of the engine's HTTP API.
+    SidecarQuic,
+    /// TentaFlow speaks HTTP directly to the host-mapped engine port.
+    DirectHttp,
+}
+
+impl DockerTransport {
+    /// Stable kebab-case tag used in TOML and JSON.
+    pub fn as_kebab_str(self) -> &'static str {
+        match self {
+            DockerTransport::SidecarQuic => "sidecar-quic",
+            DockerTransport::DirectHttp => "direct-http",
+        }
+    }
 }
 
 /// `[deploy.native]` section for native execution.

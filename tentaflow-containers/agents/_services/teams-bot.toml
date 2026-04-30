@@ -15,6 +15,7 @@ version = "0.1.0"
 [deploy.docker]
 context_path = "agents/docker/teams-bot"
 platforms = ["linux"]
+transport = "direct-http"
 
 # Native bundle — binarka `tentaflow-meeting` budowana razem z `tentaflow`
 # (patrz tentaflow/build.rs). Deploy.native runtime=binary rejestruje serwis

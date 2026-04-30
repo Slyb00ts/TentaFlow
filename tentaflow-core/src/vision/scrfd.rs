@@ -177,7 +177,9 @@ struct TensorBucket {
 }
 
 fn find_bucket(buckets: &[TensorBucket], head: Head, anchors: usize) -> Option<&TensorBucket> {
-    buckets.iter().find(|b| b.head == head && b.anchors == anchors)
+    buckets
+        .iter()
+        .find(|b| b.head == head && b.anchors == anchors)
 }
 
 /// Decode jednego stride'a. `scores` (anchors,1), `bboxes` (anchors,4),

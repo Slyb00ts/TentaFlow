@@ -43,10 +43,17 @@ async fn vllm_recommend_qwen_05b_fits_single_3090() {
         activation_overhead_pct: 10.0,
     };
     let est = estimate_vllm_vram(&spec, &input);
-    println!("Qwen 0.5B estimate: total={:.2}GB per_gpu={:.2}GB", est.total_gb, est.per_gpu_gb);
+    println!(
+        "Qwen 0.5B estimate: total={:.2}GB per_gpu={:.2}GB",
+        est.total_gb, est.per_gpu_gb
+    );
     assert!(est.fits_per_gpu, "Qwen 0.5B musi fits 1x 3090");
     assert!(est.total_gb < 5.0);
-    assert!(est.warnings.is_empty(), "no warnings expected: {:?}", est.warnings);
+    assert!(
+        est.warnings.is_empty(),
+        "no warnings expected: {:?}",
+        est.warnings
+    );
 }
 
 #[tokio::test]
@@ -61,8 +68,10 @@ async fn vllm_recommend_gemma4_31b_picks_tp2_pp3_for_6_gpus() {
         .expect("HF fetch");
     let spec = parse_hf_config(&cfg, "google/gemma-4-31B-it").expect("parse");
 
-    println!("Gemma 4 31B: heads={} layers={} dtype={} multimodal={}",
-        spec.num_attention_heads, spec.num_hidden_layers, spec.dtype, spec.has_vision);
+    println!(
+        "Gemma 4 31B: heads={} layers={} dtype={} multimodal={}",
+        spec.num_attention_heads, spec.num_hidden_layers, spec.dtype, spec.has_vision
+    );
     assert_eq!(spec.model_type, "gemma4");
     assert!(spec.has_vision);
     assert!(spec.num_attention_heads >= 16);
@@ -86,10 +95,16 @@ async fn vllm_recommend_gemma4_31b_picks_tp2_pp3_for_6_gpus() {
         activation_overhead_pct: 10.0,
     };
     let est = estimate_vllm_vram(&spec, &input);
-    println!("Gemma 31B 6x3090 TP{} PP{}: weights={:.1}GB kv={:.1}GB per_gpu={:.1}GB fits={}",
-        tp, pp, est.model_weights_gb, est.kv_cache_gb, est.per_gpu_gb, est.fits_per_gpu);
+    println!(
+        "Gemma 31B 6x3090 TP{} PP{}: weights={:.1}GB kv={:.1}GB per_gpu={:.1}GB fits={}",
+        tp, pp, est.model_weights_gb, est.kv_cache_gb, est.per_gpu_gb, est.fits_per_gpu
+    );
     // Z fp8 KV i niskim batch musi fits.
-    assert!(est.fits_per_gpu, "31B na 6x3090 z TP{}xPP{} musi fits: {est:?}", tp, pp);
+    assert!(
+        est.fits_per_gpu,
+        "31B na 6x3090 z TP{}xPP{} musi fits: {est:?}",
+        tp, pp
+    );
 }
 
 #[tokio::test]
@@ -104,15 +119,26 @@ async fn vllm_recommend_intel_gemma31b_int4_fits_single_3090() {
         .expect("HF fetch INT4");
     let spec = parse_hf_config(&cfg, "Intel/gemma-4-31B-it-int4-AutoRound").expect("parse");
 
-    println!("INT4 Gemma 31B: quant={:?} bytes_per_param={}",
-        spec.quantization, spec.bytes_per_param());
+    println!(
+        "INT4 Gemma 31B: quant={:?} bytes_per_param={}",
+        spec.quantization,
+        spec.bytes_per_param()
+    );
     // HF uzywa "auto-round" - mialy mapowac na 0.5 bytes/param przez
     // bytes_per_param().
     assert!(
-        matches!(spec.quantization.as_deref(), Some("auto-round") | Some("int4")),
-        "expected auto-round or int4, got {:?}", spec.quantization
+        matches!(
+            spec.quantization.as_deref(),
+            Some("auto-round") | Some("int4")
+        ),
+        "expected auto-round or int4, got {:?}",
+        spec.quantization
     );
-    assert_eq!(spec.bytes_per_param(), 0.5, "AutoRound INT4 = 0.5 bytes/param");
+    assert_eq!(
+        spec.bytes_per_param(),
+        0.5,
+        "AutoRound INT4 = 0.5 bytes/param"
+    );
 
     // Realistyczna konfiguracja dla 1x 3090 24GB: weights ~14GB, zostaje ~7GB
     // dla KV cache + workspace. ctx=2048 max_seqs=2 = ~1.9GB KV (fp8) - fits.
@@ -128,11 +154,19 @@ async fn vllm_recommend_intel_gemma31b_int4_fits_single_3090() {
         ..Default::default()
     };
     let est = estimate_vllm_vram(&spec, &input);
-    println!("INT4 31B 1x3090 ctx2k seqs2 fp8: weights={:.1}GB kv={:.1}GB total={:.1}GB fits={}",
-        est.model_weights_gb, est.kv_cache_gb, est.total_gb, est.fits_per_gpu);
-    assert!(est.model_weights_gb < 20.0, "INT4 31B = ~14-16GB, dostalismy {}", est.model_weights_gb);
-    assert!(est.fits_per_gpu,
-        "INT4 31B z ctx=2048 max_seqs=2 fp8 musi fits 1x 3090: {est:?}");
+    println!(
+        "INT4 31B 1x3090 ctx2k seqs2 fp8: weights={:.1}GB kv={:.1}GB total={:.1}GB fits={}",
+        est.model_weights_gb, est.kv_cache_gb, est.total_gb, est.fits_per_gpu
+    );
+    assert!(
+        est.model_weights_gb < 20.0,
+        "INT4 31B = ~14-16GB, dostalismy {}",
+        est.model_weights_gb
+    );
+    assert!(
+        est.fits_per_gpu,
+        "INT4 31B z ctx=2048 max_seqs=2 fp8 musi fits 1x 3090: {est:?}"
+    );
 }
 
 #[tokio::test]
@@ -159,6 +193,9 @@ async fn max_ctx_responds_to_kv_dtype_change_for_real_model() {
     let ctx_fp16 = max_context_for_budget(&spec, &input);
     input.kv_cache_dtype = "fp8".into();
     let ctx_fp8 = max_context_for_budget(&spec, &input);
-    println!("Qwen 7B max_ctx: fp16={} fp8={} (powinno byc ~2x wiecej z fp8)", ctx_fp16, ctx_fp8);
+    println!(
+        "Qwen 7B max_ctx: fp16={} fp8={} (powinno byc ~2x wiecej z fp8)",
+        ctx_fp16, ctx_fp8
+    );
     assert!(ctx_fp8 > ctx_fp16, "fp8 daje wiecej ctx");
 }

@@ -1199,14 +1199,36 @@ const ChatScreen = {
     // rozdzielamy lokalnie per service_type. Zrodlem prawdy jest ApiBinary
     // (rkyv binary protocol) — REST /api/services/deployed nie istnieje.
     try {
-      const all = (await ApiBinary.list('modelListRequest')) || [];
+      // Binary RPC `modelListRequest` is the unified surface fed by services +
+      // model_registry. We split locally per category; STT/TTS engines are
+      // needed for the audio mode (chat-audio.js), chat only routes "chat"
+      // capable models.
+      const all = (await ApiBinary.list('modelListRequest', { arrayKey: 'models' })) || [];
+      const list = Array.isArray(all) ? all : [];
       const catOf = (m) => (m.category || m.service_type || '').toLowerCase();
-      modelOptions = all.filter((m) => {
-        const cat = catOf(m);
-        return cat === '' || cat === 'llm';
+
+      // Filter by capabilities (more granular than category — embedding-only
+      // LLM rows would otherwise leak into chat dispatch).
+      const chatOnly = list.filter((m) => {
+        const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+        return caps.length === 0 || caps.includes('chat');
       });
-      engineCache.stt = all.filter((m) => catOf(m) === 'stt');
-      engineCache.tts = all.filter((m) => catOf(m) === 'tts');
+      const counts = new Map();
+      for (const m of chatOnly) {
+        counts.set(m.model_name, (counts.get(m.model_name) || 0) + 1);
+      }
+      modelOptions = chatOnly.map((m) => {
+        const baseLabel = m.display_name || m.model_name;
+        const dup = counts.get(m.model_name) > 1;
+        return {
+          id: m.model_name,
+          serviceId: m.service_id,
+          engineId: m.engine_id || '',
+          label: dup && m.engine_id ? `${baseLabel} (${m.engine_id})` : baseLabel,
+        };
+      });
+      engineCache.stt = list.filter((m) => catOf(m) === 'stt');
+      engineCache.tts = list.filter((m) => catOf(m) === 'tts');
     } catch {
       modelOptions = [];
       engineCache.stt = [];
@@ -1218,8 +1240,7 @@ const ChatScreen = {
     const optionsHtml = modelOptions.length === 0
       ? `<option value="default">default</option>`
       : modelOptions.map((m) => {
-          const label = m.display_name || m.displayName || m.id;
-          return `<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`;
+          return `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`;
         }).join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;

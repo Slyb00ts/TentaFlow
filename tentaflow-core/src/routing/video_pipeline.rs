@@ -113,13 +113,14 @@ pub fn maybe_spawn_inference(
     // Throttle check pod mutexem — krótkim, bo nie blokujemy nic długiego.
     {
         let mut guard = states().lock();
-        let entry = guard.entry(participant_id.clone()).or_insert(ParticipantState {
-            // `Instant::now() - 1h` jako sentinel "dawno temu" — pierwsze
-            // wywołanie zawsze przechodzi throttle bez special-case.
-            last_inference_at: Instant::now()
-                - std::time::Duration::from_secs(3600),
-            emotion_smoothed: None,
-        });
+        let entry = guard
+            .entry(participant_id.clone())
+            .or_insert(ParticipantState {
+                // `Instant::now() - 1h` jako sentinel "dawno temu" — pierwsze
+                // wywołanie zawsze przechodzi throttle bez special-case.
+                last_inference_at: Instant::now() - std::time::Duration::from_secs(3600),
+                emotion_smoothed: None,
+            });
         let elapsed = entry.last_inference_at.elapsed().as_millis();
         if elapsed < THROTTLE_MS {
             return;
@@ -261,9 +262,11 @@ fn run_inference_blocking(
 
     // Wybierz twarz z najwyższym score — typowo jedna twarz per kafelek
     // Teams (jeden uczestnik), ale przy wąskim kadrze może wpaść druga.
-    let best_face = faces
-        .iter()
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    let best_face = faces.iter().max_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let Some(face) = best_face else {
         // Brak twarzy — wciąż chcemy wyemitować event z `None`, żeby

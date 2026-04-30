@@ -531,7 +531,6 @@ Format de la transcription en entrée : chaque intervention est précédée d'un
 
 N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie uniquement du JSON valide."#;
 
-
 /// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
     let flows: &[(&str, &str, &str, &str, i64)] = &[
@@ -668,10 +667,17 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(other, 0, "nie powinno byc innych promptow niz transcription_summarization");
+        assert_eq!(
+            other, 0,
+            "nie powinno byc innych promptow niz transcription_summarization"
+        );
 
         let is_system_all: i64 = conn
-            .query_row("SELECT COUNT(*) FROM prompts WHERE is_system = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM prompts WHERE is_system = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(is_system_all, 5);
     }
@@ -716,12 +722,7 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&flow_json).unwrap();
             let nodes = parsed["nodes"].as_array().unwrap();
             let edges = parsed["edges"].as_array().unwrap();
-            assert_eq!(
-                nodes.len(),
-                expected_types.len(),
-                "{}: node count",
-                name
-            );
+            assert_eq!(nodes.len(), expected_types.len(), "{}: node count", name);
             assert_eq!(edges.len(), expected_edges, "{}: edge count", name);
             let types: Vec<&str> = nodes.iter().map(|n| n["type"].as_str().unwrap()).collect();
             assert_eq!(types, expected_types, "{}: node types", name);
@@ -744,11 +745,7 @@ mod tests {
         assert_eq!(st, "tts");
         assert_eq!(def, 1);
 
-        let (st, _) = assert_dag(
-            "teams-flow",
-            &["trigger", "llm", "pii_filter", "output"],
-            3,
-        );
+        let (st, _) = assert_dag("teams-flow", &["trigger", "llm", "pii_filter", "output"], 3);
         assert_eq!(st, "agents");
 
         // teams-flow: llm node musi miec model_alias = teams-summarization.
@@ -785,9 +782,10 @@ mod tests {
         assert_eq!(en.language, "en");
 
         // Jezyk nieistniejacy -> fallback na pl
-        let fallback = crate::db::repository::find_prompt(&pool, "transcription_summarization", "it")
-            .unwrap()
-            .expect("fallback na pl");
+        let fallback =
+            crate::db::repository::find_prompt(&pool, "transcription_summarization", "it")
+                .unwrap()
+                .expect("fallback na pl");
         assert_eq!(fallback.language, "pl");
 
         // Nieistniejacy prompt -> None

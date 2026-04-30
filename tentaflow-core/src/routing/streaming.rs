@@ -249,10 +249,7 @@ impl Router {
                         // robilismy serde_json::to_string per token (w
                         // local_inference) → unfold serde_json::from_str (tu),
                         // co dla 14 tok/s jest waste 100-400µs/chunk.
-                        let chunk_rx = match self
-                            .local_inference
-                            .stream_chat_chunks(&request)
-                            .await
+                        let chunk_rx = match self.local_inference.stream_chat_chunks(&request).await
                         {
                             Ok(rx) => rx,
                             Err(e) => {
@@ -454,7 +451,10 @@ impl Router {
 
         let stream = stream.chain(
             futures::stream::once(async move {
-                let _ = collected_response.lock().map(|r| r.clone()).unwrap_or_default();
+                let _ = collected_response
+                    .lock()
+                    .map(|r| r.clone())
+                    .unwrap_or_default();
 
                 let mut final_metrics = metrics;
                 final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
@@ -499,10 +499,14 @@ impl Router {
             .cloned()
             .unwrap_or_else(|| request.model.clone());
 
-        let rag_handle = self.service_manager.rag_services.get(&model_name).map(|r| r.value().clone())
-        .ok_or_else(|| CoreError::ModelNotFound {
-            model_name: model_name.clone(),
-        })?;
+        let rag_handle = self
+            .service_manager
+            .rag_services
+            .get(&model_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| CoreError::ModelNotFound {
+                model_name: model_name.clone(),
+            })?;
 
         let rag_client =
             rag_handle
@@ -1048,7 +1052,10 @@ impl Router {
 
         let stream = stream.chain(
             futures::stream::once(async move {
-                let _ = collected_response.lock().map(|r| r.clone()).unwrap_or_default();
+                let _ = collected_response
+                    .lock()
+                    .map(|r| r.clone())
+                    .unwrap_or_default();
 
                 let mut final_metrics = metrics;
                 final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);

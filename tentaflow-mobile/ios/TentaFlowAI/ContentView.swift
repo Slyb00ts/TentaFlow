@@ -64,7 +64,7 @@ struct TentaFlowWebView: UIViewRepresentable {
         // i musza byc ladowane z serwera zawsze na swiezo po aktualizacji
         config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
 
-        // Kamera / mikrofon w JS (getUserMedia w dashboard QR scannerze).
+        // Kamera / mikrofon w JS (getUserMedia dla QR scanner i vision preview).
         // Bez tych dwoch flag WKWebView nie pozwoli odtworzyc strumienia video
         // i wymaga gestu uzytkownika przed kazdym play().
         config.allowsInlineMediaPlayback = true
