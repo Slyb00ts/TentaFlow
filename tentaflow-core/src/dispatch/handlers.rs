@@ -515,6 +515,24 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
 
     repository::delete_service(&ctx.state.db, svc.id).map_err(db_err)?;
 
+    // In-memory cleanup ServiceManagera — analogicznie do `service_stop`.
+    // Patrz `init_model_pool` dla uzasadnienia (self-heal sierot).
+    let config: serde_json::Value =
+        serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
+    let sm = ctx.state.router.service_manager();
+    if let Some(model_name) = config
+        .get("deployed_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        sm.remove_model_mapping(model_name, &svc.name);
+    }
+    sm.remove_model_mapping(&svc.name, &svc.name);
+    sm.dynamic_backends.remove(&svc.name);
+    sm.remove_quic_service(&svc.name, &svc.service_type);
+    sm.local_inference_models.remove(&svc.name);
+    crate::memory::guard_global().unregister(&svc.name);
+
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -2310,6 +2328,26 @@ pub async fn service_stop(
     }
 
     repository::delete_service(&ctx.state.db, service_id).map_err(db_err)?;
+
+    // In-memory cleanup ServiceManagera. Bez tego `model_pool`,
+    // `dynamic_backends`, `local_inference_models` i mesh registry trzymaja
+    // sieroty po delete; dispatch_with_fallback iteruje listy targetow i
+    // potrafi trafic w stary BackendClient ze starym URL zanim dojdzie do
+    // aktualnego serwisu (po kolejnym deploy). `init_model_pool` zalatwia
+    // self-heal przy restarcie procesu, ten cleanup zalatwia za jego zycia.
+    let sm = ctx.state.router.service_manager();
+    if let Some(model_name) = config
+        .get("deployed_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        sm.remove_model_mapping(model_name, &svc.name);
+    }
+    sm.remove_model_mapping(&svc.name, &svc.name);
+    sm.dynamic_backends.remove(&svc.name);
+    sm.remove_quic_service(&svc.name, &svc.service_type);
+    sm.local_inference_models.remove(&svc.name);
+    crate::memory::guard_global().unregister(&svc.name);
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let audit_detail = if stop_warnings.is_empty() {
