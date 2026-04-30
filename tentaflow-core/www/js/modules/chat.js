@@ -18,6 +18,8 @@ import { I18n } from '/js/i18n.js';
 import { measureItemHeight, getDefaultFont, getDefaultLineHeight } from '/js/lib/text-measure.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
 import { renderMarkdown, extractPlainText } from '/js/lib/md-lite.js';
+import FaceBackground from '/js/modules/faceBackground.js';
+import { AudioPipeline } from '/js/modules/chat-audio.js';
 
 const STORAGE_KEY = 'tentaflow_chat_conversations_v1';
 const MAX_INPUT_CHARS = 4096;
@@ -39,6 +41,22 @@ let resizeListener = null;
 let listWidth = 800;
 let nextMsgId = 1;
 let searchFilter = '';
+
+// Tryb audio (Etap 1) — handle do FaceBackground.embed plus cache silnikow.
+// faceHandle null gdy aktywna rozmowa jest w trybie tekstowym, niepusty gdy
+// audio. engineCache wypelniany raz przy mount() z /api/services/deployed.
+let faceHandle = null;
+let engineCache = { stt: [], tts: [] };
+let escKeyHandler = null;
+
+// AudioPipeline (Etap 2) — zywy obiekt tylko gdy aktywna konwersacja jest w
+// trybie audio I uzytkownik kliknal mic (gesture-gate). null w pozostalych
+// stanach. spaceHeldHandler trzymamy w globalu zeby unmount() mogl je
+// odlaczyc razem z escKeyHandler.
+let audioPipeline = null;
+let spaceKeydownHandler = null;
+let spaceKeyupHandler = null;
+let spaceHeld = false;
 
 // ---- Persistence ---------------------------------------------------------
 
@@ -63,6 +81,21 @@ function saveConversations() {
   }
 }
 
+function defaultAudioConfig() {
+  // STT/TTS engine wypelnia ensureAudioConfigDefaults() na bazie
+  // /api/services/deployed. Pole `language` slesha jezyk transkrypcji per
+  // konwersacja — defaultowo PL, w Etapie 2 caller (AudioPipeline) ustawi
+  // wg `I18n.getLanguage()`.
+  return {
+    sttModel: 'whisper-1',
+    ttsModel: 'tts-1',
+    voice: 'nova',
+    language: 'pl',
+    sttEngine: null,
+    ttsEngine: null,
+  };
+}
+
 function newConversation(title) {
   const id = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   return {
@@ -71,7 +104,21 @@ function newConversation(title) {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     messages: [],
+    mode: 'text',
+    audioConfig: defaultAudioConfig(),
   };
+}
+
+// Migracja konwersacji wczytanych z localStorage (sprzed wprowadzenia
+// trybu audio). In-place — wolane zaraz po loadConversations(). Bez bumpu
+// klucza STORAGE_KEY zeby nie tracic istniejacych rozmow uzytkownika.
+function migrateConversations(list) {
+  for (const c of list) {
+    if (typeof c.mode !== 'string') c.mode = 'text';
+    if (!c.audioConfig || typeof c.audioConfig !== 'object') {
+      c.audioConfig = defaultAudioConfig();
+    }
+  }
 }
 
 function activeConv() {
@@ -121,10 +168,15 @@ function groupByDay(items) {
 }
 
 function renderConvItem(conv) {
-  const cls = `conv-item${conv.id === activeConvId ? ' active' : ''}`;
+  const isActive = conv.id === activeConvId;
+  const isAudioActive = conv.mode === 'audio' && isActive;
+  let cls = 'conv-item';
+  if (isActive) cls += ' active';
+  if (isAudioActive) cls += ' audio-now';
+  const liveDot = isAudioActive ? '<span class="live-dot" aria-hidden="true"></span>' : '';
   return `
     <div class="${cls}" data-conv-id="${escapeHtml(conv.id)}">
-      <span class="conv-title">${escapeHtml(conv.title)}</span>
+      <span class="conv-title">${liveDot}${escapeHtml(conv.title)}</span>
       <span class="conv-time">${escapeHtml(formatTime(conv.updatedAt))}</span>
       <span class="conv-snippet">${escapeHtml(lastMessagePreview(conv))}</span>
     </div>
@@ -308,14 +360,339 @@ function remountIfWidthChanged() {
   }
 }
 
+// ---- Audio mode (Etap 1) -------------------------------------------------
+
+// Statyczna lista 8 dotow rozlozonych po obwodzie face-canvas. delay rozsuniety
+// rownomiernie 0..1.05s zeby pulse wygladal jak fala biegnaca dookola.
+const AMP_DOT_COUNT = 8;
+function renderAmpDots() {
+  let html = '';
+  for (let i = 0; i < AMP_DOT_COUNT; i++) {
+    const angle = (360 / AMP_DOT_COUNT) * i;
+    const delay = (i * 0.13).toFixed(2);
+    html += `<div class="amp-dot" style="--angle:${angle}deg;--delay:${delay}s"></div>`;
+  }
+  return html;
+}
+
+// Statyczne 20 barow waveform — animacja CSS waveDance, fazy rozsuniete.
+const WAVE_BAR_COUNT = 20;
+function renderWaveBars() {
+  let html = '';
+  for (let i = 0; i < WAVE_BAR_COUNT; i++) {
+    const delay = (i * 0.045).toFixed(3);
+    html += `<div class="bar" style="animation-delay:${delay}s"></div>`;
+  }
+  return html;
+}
+
+function renderAudioStage(conv) {
+  const cfg = conv.audioConfig;
+  const sttName = cfg.sttEngine || I18n.t('chat.audio_no_engine');
+  const ttsName = cfg.ttsEngine || I18n.t('chat.audio_no_engine');
+  const pendingTip = escapeHtml(I18n.t('chat.audio_pipeline_pending'));
+  return `
+    <div class="audio-stage" id="audio-stage" data-state="idle">
+      <div class="audio-status" id="audio-status">
+        <span class="dot"></span>
+        <span class="label" id="audio-status-label">${escapeHtml(I18n.t('chat.audio_state_idle'))}</span>
+        <span class="engine" id="audio-engine-name">—</span>
+      </div>
+      <div class="engine-pills">
+        <button class="engine-pill" id="stt-pill" type="button" title="STT engine">
+          <span class="lab">STT</span>
+          <span class="name">${escapeHtml(sttName)}</span>
+          <svg class="icon chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+        </button>
+        <button class="engine-pill" id="tts-pill" type="button" title="TTS engine">
+          <span class="lab">TTS</span>
+          <span class="name">${escapeHtml(ttsName)}</span>
+          <svg class="icon chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+        </button>
+      </div>
+      <aside class="rail" id="audio-rail">
+        <div class="rail-title">${escapeHtml(I18n.t('chat.audio_recent_entries'))}</div>
+      </aside>
+      <div class="face-stage">
+        <div class="face-canvas" id="chat-face-stage"></div>
+        ${renderAmpDots()}
+      </div>
+      <div class="subtitle" id="audio-subtitle">
+        <div class="who" id="audio-who"></div>
+        <div class="text" id="audio-text">${escapeHtml(I18n.t('chat.audio_preview_hint'))}</div>
+      </div>
+      <div class="wave" id="audio-wave">${renderWaveBars()}</div>
+      <div class="audio-controls">
+        <tf-button variant="ghost" icon="volume" id="audio-volume" disabled
+          aria-label="${pendingTip}" title="${pendingTip}"></tf-button>
+        <tf-button variant="primary" icon="mic" id="audio-mic" disabled
+          aria-label="${pendingTip}" title="${pendingTip}"></tf-button>
+        <tf-button variant="ghost" icon="pause" id="audio-pause" disabled
+          aria-label="${pendingTip}" title="${pendingTip}"></tf-button>
+        <tf-button variant="ghost" icon="x" id="audio-exit"
+          aria-label="${escapeHtml(I18n.t('chat.audio_exit'))}"
+          title="${escapeHtml(I18n.t('chat.audio_exit'))}">${escapeHtml(I18n.t('chat.audio_exit'))}</tf-button>
+      </div>
+    </div>
+  `;
+}
+
+async function loadEngineCache() {
+  try {
+    const resp = await fetch('/api/services/deployed', { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const all = await resp.json();
+    const list = Array.isArray(all) ? all : (all?.deployments || all?.items || []);
+    engineCache.stt = list.filter((s) => (s.category || s.engine_category || '').toLowerCase() === 'stt');
+    engineCache.tts = list.filter((s) => (s.category || s.engine_category || '').toLowerCase() === 'tts');
+  } catch {
+    engineCache.stt = [];
+    engineCache.tts = [];
+  }
+}
+
+function engineLabel(engine) {
+  return engine.engine_id || engine.id || engine.name || 'unknown';
+}
+
+function ensureAudioConfigDefaults(conv) {
+  if (!conv.audioConfig.sttEngine && engineCache.stt.length) {
+    conv.audioConfig.sttEngine = engineLabel(engineCache.stt[0]);
+  }
+  if (!conv.audioConfig.ttsEngine && engineCache.tts.length) {
+    conv.audioConfig.ttsEngine = engineLabel(engineCache.tts[0]);
+  }
+}
+
+function renderRail() {
+  const conv = activeConv();
+  const rail = byId('audio-rail');
+  if (!rail || !conv) return;
+  const last = conv.messages.slice(-4);
+  const titleHtml = `<div class="rail-title">${escapeHtml(I18n.t('chat.audio_recent_entries'))}</div>`;
+  if (last.length === 0) {
+    rail.innerHTML = titleHtml +
+      `<div class="rail-msg" style="opacity:.6">${escapeHtml(I18n.t('chat.audio_no_history'))}</div>`;
+    return;
+  }
+  const itemsHtml = last.map((m) => {
+    const cls = m.role === 'user' ? 'user' : 'bot';
+    const who = m.role === 'user'
+      ? I18n.t('chat.you')
+      : (m.modelLabel || I18n.t('chat.assistant'));
+    const time = formatBubbleTime(m.ts);
+    const preview = extractPlainText(m.text || '').slice(0, 200);
+    return `
+      <div class="rail-msg ${cls}">
+        <div class="who">${escapeHtml(who)} · ${escapeHtml(time)}</div>
+        <div>${escapeHtml(preview)}</div>
+      </div>
+    `;
+  }).join('');
+  rail.innerHTML = titleHtml + itemsHtml;
+}
+
+function updateAudioStatus(stateName, text) {
+  const stage = byId('audio-stage');
+  if (stage) stage.dataset.state = stateName;
+  const label = byId('audio-status-label');
+  if (label) label.textContent = text || I18n.t(`chat.audio_state_${stateName}`);
+}
+
+function updateEngineLabels() {
+  const conv = activeConv();
+  if (!conv) return;
+  const sttPillName = byId('stt-pill')?.querySelector('.name');
+  const ttsPillName = byId('tts-pill')?.querySelector('.name');
+  if (sttPillName) sttPillName.textContent = conv.audioConfig.sttEngine || I18n.t('chat.audio_no_engine');
+  if (ttsPillName) ttsPillName.textContent = conv.audioConfig.ttsEngine || I18n.t('chat.audio_no_engine');
+  const eng = byId('audio-engine-name');
+  if (eng) eng.textContent = conv.audioConfig.sttEngine || '—';
+}
+
+function mountFace() {
+  const stage = byId('chat-face-stage');
+  if (!stage) return;
+  if (faceHandle) faceHandle.destroy();
+  faceHandle = FaceBackground.embed(stage);
+  // Etap 1: tylko idle. Inne stany (listen/think/speak) czekaja na
+  // AudioPipeline (Etap 2) — API juz gotowe pod przyszlego callera.
+  faceHandle.setMode('idle');
+}
+
+function destroyFace() {
+  if (faceHandle) {
+    faceHandle.destroy();
+    faceHandle = null;
+  }
+}
+
+// Otwiera prosty picker silnika — uzywa native <dialog>-style listy w
+// kontekscie pill'a. tf-menu wymaga ze dzieci sa staticznie zadeklarowane,
+// wiec zamiast tego budujemy ad-hoc menu w light DOM przy pillu. Wybor
+// utrwala sie w conv.audioConfig i odswieza pill label.
+function openEnginePicker(kind) {
+  const list = engineCache[kind];
+  if (!list || list.length === 0) {
+    toast(I18n.t('chat.audio_engine_missing'), 'warning');
+    return;
+  }
+  const conv = activeConv();
+  if (!conv) return;
+  const pill = byId(`${kind}-pill`);
+  if (!pill) return;
+
+  // Usun ewentualnie poprzednie ad-hoc menu (np. drugi klik w ten sam pill).
+  pill.querySelector('.engine-pill-menu')?.remove();
+
+  const menu = document.createElement('div');
+  menu.className = 'engine-pill-menu';
+  menu.setAttribute('role', 'menu');
+  menu.innerHTML = list.map((e) => {
+    const id = engineLabel(e);
+    return `<button type="button" role="menuitem" data-engine-id="${escapeHtml(id)}">${escapeHtml(id)}</button>`;
+  }).join('');
+  pill.appendChild(menu);
+
+  const closeMenu = () => {
+    menu.remove();
+    document.removeEventListener('pointerdown', onDocDown, true);
+  };
+  function onDocDown(ev) {
+    if (!menu.contains(ev.target) && ev.target !== pill && !pill.contains(ev.target)) {
+      closeMenu();
+    }
+  }
+  document.addEventListener('pointerdown', onDocDown, true);
+  menu.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-engine-id]');
+    if (!btn) return;
+    const id = btn.dataset.engineId;
+    if (kind === 'stt') conv.audioConfig.sttEngine = id;
+    else conv.audioConfig.ttsEngine = id;
+    saveConversations();
+    updateEngineLabels();
+    closeMenu();
+  });
+}
+
+function bindAudioStageHandlers() {
+  byId('audio-exit')?.addEventListener('click', () => switchMode('text'));
+  byId('stt-pill')?.addEventListener('click', () => openEnginePicker('stt'));
+  byId('tts-pill')?.addEventListener('click', () => openEnginePicker('tts'));
+
+  byId('audio-mic')?.addEventListener('click', async () => {
+    if (!audioPipeline) {
+      // Pierwszy klik = startuje pipeline (wymagany user gesture dla
+      // getUserMedia). enableAudioControls() wywolane dopiero po sukcesie.
+      await startAudioPipeline();
+      return;
+    }
+    // Pipeline aktywny — toggle mute na mikrofonie.
+    const willMute = !audioPipeline.isMuted();
+    audioPipeline.mute(willMute);
+    setMicMutedVisual(willMute);
+  });
+
+  byId('audio-pause')?.addEventListener('click', () => {
+    if (!audioPipeline) return;
+    // "Przerwij" — abort aktywnego LLM/TTS, zostaje listening.
+    audioPipeline.abort();
+  });
+
+  byId('audio-volume')?.addEventListener('click', () => {
+    if (!audioPipeline) return;
+    const muted = audioPipeline.toggleSpeaker();
+    byId('audio-volume')?.classList.toggle('muted', muted);
+    if (muted) toast(I18n.t('chat.audio_speaker_muted'), 'info');
+  });
+}
+
+function setActiveModeToggle(mode) {
+  const textBtn = byId('chat-mode-text');
+  const audioBtn = byId('chat-mode-audio');
+  const isAudio = mode === 'audio';
+  textBtn?.classList.toggle('active', !isAudio);
+  audioBtn?.classList.toggle('active', isAudio);
+  // tf-button variant przelaczamy zeby aktywny mial primary look (tf-button
+  // exposuje setAttribute variant). Pozwala uzyskac wizualny kontrast bez
+  // walki z shadow-DOM stylowaniem od zewnatrz.
+  if (textBtn) textBtn.setAttribute('variant', isAudio ? 'ghost' : 'primary');
+  if (audioBtn) audioBtn.setAttribute('variant', isAudio ? 'primary' : 'ghost');
+}
+
+function switchMode(targetMode) {
+  const conv = ensureActiveConv();
+  if (!conv) return;
+  if (conv.mode === targetMode) return;
+
+  if (targetMode === 'audio') {
+    if (engineCache.stt.length === 0 || engineCache.tts.length === 0) {
+      toast(I18n.t('chat.audio_engine_missing'), 'warning');
+      return;
+    }
+    ensureAudioConfigDefaults(conv);
+  }
+
+  conv.mode = targetMode;
+  conv.updatedAt = Date.now();
+  saveConversations();
+  applyMode(conv);
+  renderConvList();
+  updateHeaderTitle();
+  setActiveModeToggle(targetMode);
+}
+
+// applyMode swapuje zawartosc #chat-body miedzy widokiem tekstowym a audio
+// w zaleznosci od conv.mode. Wolane przez switchMode i selectConversation.
+function applyMode(conv) {
+  const body = byId('chat-body');
+  if (!body) return;
+  if (conv.mode === 'audio') {
+    if (vlist) { vlist.destroy(); vlist = null; }
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    body.classList.add('audio-mode');
+    body.innerHTML = renderAudioStage(conv);
+    bindAudioStageHandlers();
+    mountFace();
+    renderRail();
+    updateAudioStatus('idle');
+    updateEngineLabels();
+    // Mic enabled w trybie pre-gesture — czeka na klik aby uruchomic
+    // AudioPipeline (getUserMedia wymaga user-gesture). Volume/Pause zostaja
+    // disabled do momentu gdy pipeline ruszy.
+    const mic = byId('audio-mic');
+    if (mic) {
+      mic.removeAttribute('disabled');
+      mic.setAttribute('title', I18n.t('chat.audio_start_mic'));
+    }
+  } else {
+    stopAudioPipeline();
+    destroyFace();
+    body.classList.remove('audio-mode');
+    body.innerHTML = '';
+    mountVList();
+  }
+}
+
 // ---- Conversation switching ----------------------------------------------
 
 function selectConversation(id) {
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  // Switch konwersacji = inny audioConfig + inny conv ref → pipeline z poprzedniej
+  // rozmowy nie pasuje. Zatrzymujemy bezwarunkowo, applyMode() w docelowym mode
+  // ponownie udostepni mic-button.
+  stopAudioPipeline();
   activeConvId = id;
   renderConvList();
   updateHeaderTitle();
-  mountVList();
+  const conv = activeConv();
+  if (conv) {
+    applyMode(conv);
+    setActiveModeToggle(conv.mode);
+  } else {
+    mountVList();
+  }
 }
 
 function updateHeaderTitle() {
@@ -341,7 +718,10 @@ function ensureActiveConv() {
   saveConversations();
   renderConvList();
   updateHeaderTitle();
+  // Nowa konwersacja zawsze startuje w trybie tekstowym — bez specjalnej
+  // sciezki audio (uzytkownik musi swiadomie kliknac toggle).
   mountVList();
+  setActiveModeToggle('text');
   return conv;
 }
 
@@ -356,35 +736,45 @@ function setInputValue(value) {
 }
 
 function sendMessage() {
-  const modelSel = byId('chat-model');
-  const modelId = modelSel?.value || (modelOptions[0]?.id ?? 'default');
-  const userMessage = currentInputValue().trim();
-  if (!userMessage) return;
-
-  const conv = ensureActiveConv();
+  const text = currentInputValue().trim();
+  if (!text) return;
   setInputValue('');
   updateInputCounter();
+  sendMessageInternal(text, { source: 'text' });
+}
+
+// sendMessageInternal — wspolna sciezka dla wiadomosci tekstowych (z input box)
+// i glosowych (transkrybowanych przez AudioPipeline). opts.source pozwala
+// callerowi rozroznic via=voice w meta wiadomosci, a zarazem decyduje
+// czy assistant deltas trzeba feedowac do AudioPipeline.
+function sendMessageInternal(text, opts = {}) {
+  const modelSel = byId('chat-model');
+  const modelId = modelSel?.value || (modelOptions[0]?.id ?? 'default');
+  const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
   if (!conv.messages.length && (conv.title === 'Nowa rozmowa' || conv.title === (I18n.t('chat.new_conversation') || 'Nowa rozmowa'))) {
-    conv.title = userMessage.slice(0, 40) + (userMessage.length > 40 ? '…' : '');
+    conv.title = text.slice(0, 40) + (text.length > 40 ? '…' : '');
   }
 
-  pushMessage(conv, { id: nextMsgId++, role: 'user', text: userMessage, ts: Date.now() });
+  pushMessage(conv, { id: nextMsgId++, role: 'user', text, ts: Date.now(), via: opts.source || 'text' });
 
   const modelLabel = currentModelLabel();
-  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel };
+  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: opts.source || 'text' };
   pushMessage(conv, assistantMsg);
+
+  const feedAudio = audioPipeline && conv.mode === 'audio';
 
   ApiBinary.subscribe(
     'chatStreamRequest',
-    { modelId, userMessage },
+    { modelId, userMessage: text },
     {
       onChunk: (body) => {
         if (body.variant === 'ChatStreamChunk') {
           assistantMsg.text += body.delta;
           conv.updatedAt = Date.now();
           onStreamTick();
+          if (feedAudio) audioPipeline.feedAssistantDelta(body.delta);
         }
       },
       onEnd: () => {
@@ -398,6 +788,8 @@ function sendMessage() {
         onStreamTick();
         renderConvList();
         updateHeaderTitle();
+        if (feedAudio) audioPipeline.feedAssistantEnd();
+        if (conv.mode === 'audio' && conv.id === activeConvId) renderRail();
       },
       onError: (err) => {
         assistantMsg.streaming = false;
@@ -406,13 +798,114 @@ function sendMessage() {
         saveConversations();
         onStreamTick();
         unsubscribe = null;
+        if (feedAudio) audioPipeline.feedAssistantError(err);
       },
     },
   ).then((unsub) => {
     unsubscribe = unsub;
   }).catch((err) => {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    if (feedAudio) audioPipeline.feedAssistantError(err);
   });
+}
+
+// ---- AudioPipeline plumbing ---------------------------------------------
+
+async function startAudioPipeline() {
+  if (audioPipeline) return;
+  const conv = activeConv();
+  if (!conv || conv.mode !== 'audio' || !faceHandle) return;
+  // Jezyk transkrypcji bierzemy z aktywnego I18n — w Etapie 1 conv.audioConfig
+  // mial sztywne 'pl', ale uzytkownik moze rozmawiac w innym jezyku.
+  const lang = (I18n.getLanguage && I18n.getLanguage()) || conv.audioConfig.language || 'pl';
+  conv.audioConfig.language = lang;
+  try {
+    audioPipeline = new AudioPipeline({
+      conv,
+      faceHandle,
+      i18n: I18n,
+      onUserUtterance: (text) => {
+        if (!text || text.trim().length === 0) {
+          toast(I18n.t('chat.audio_empty_transcript'), 'info');
+          return;
+        }
+        sendMessageInternal(text, { source: 'voice' });
+      },
+      onStateChange: (state) => {
+        // FSM AudioPipeline → state stage'u 'idle'/'listen'/'think'/'speak'.
+        const map = { idle: 'idle', listening: 'listen', transcribing: 'think', thinking: 'think', speaking: 'speak', error: 'idle' };
+        updateAudioStatus(map[state] || 'idle');
+        // Rail moze odswiezac sie czesto — to tani re-render z 4 wpisow.
+        if (conv.id === activeConvId) renderRail();
+      },
+      onError: (err) => {
+        // Loguj + toast — pipeline sam wraca do listen.
+        // eslint-disable-next-line no-console
+        console.error('[audio]', err);
+        toast(`${I18n.t('chat.audio_error')}: ${err.message || err.name || 'unknown'}`, 'error');
+      },
+      bargeInAbort: () => {
+        // Wywolywane gdy AudioPipeline zatrzymuje aktywny TTS i chce ze
+        // nasz LLM stream tez zostal anulowany. Mark assistant msg.
+        if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+        const c = activeConv();
+        if (!c) return;
+        const last = c.messages[c.messages.length - 1];
+        if (last && last.role === 'assistant' && last.streaming) {
+          last.streaming = false;
+          const tag = I18n.t('chat.audio_interrupted') || '[interrupted]';
+          last.text = (last.text || '') + ' ' + tag;
+          saveConversations();
+          onStreamTick();
+        }
+      },
+    });
+    await audioPipeline.start();
+    enableAudioControls(true);
+  } catch (err) {
+    audioPipeline = null;
+    enableAudioControls(false);
+    if (err && err.name === 'NotAllowedError') {
+      toast(I18n.t('chat.audio_mic_denied'), 'error');
+    } else if (err && err.name === 'NotFoundError') {
+      toast(I18n.t('chat.audio_no_mic'), 'error');
+    } else {
+      toast(`${I18n.t('chat.audio_error')}: ${err.message || err.name || err}`, 'error');
+    }
+  }
+}
+
+function stopAudioPipeline() {
+  if (!audioPipeline) return;
+  try { audioPipeline.stop(); } catch { /* ignore */ }
+  audioPipeline = null;
+  enableAudioControls(false);
+}
+
+function enableAudioControls(enabled) {
+  // Toggle disabled na mic/volume/pause razem z tooltip update'em. Mic ma
+  // odrebny title w stanie "click to start" (przed startAudioPipeline) —
+  // tym sterujemy w applyMode dla stanu pre-gesture.
+  const ids = ['audio-mic', 'audio-volume', 'audio-pause'];
+  const tip = enabled ? '' : escapeHtml(I18n.t('chat.audio_pipeline_pending'));
+  for (const id of ids) {
+    const el = byId(id);
+    if (!el) continue;
+    if (enabled) el.removeAttribute('disabled');
+    else el.setAttribute('disabled', '');
+    if (tip) el.setAttribute('title', tip);
+    else el.removeAttribute('title');
+  }
+}
+
+// Ikona muted — toggluje wizualnie button. tf-button nie expose'uje ikony do
+// runtime change, ale klasa .muted na hostie zmieni opacity i kolor; ikona
+// zostaje 'mic' (uzytkownik widzi po opacity ze mic jest off).
+function setMicMutedVisual(muted) {
+  const el = byId('audio-mic');
+  if (!el) return;
+  el.classList.toggle('muted', muted);
+  el.setAttribute('title', muted ? I18n.t('chat.audio_unmute') : I18n.t('chat.audio_mute'));
 }
 
 function currentModelLabel() {
@@ -432,6 +925,11 @@ function pushMessage(conv, msg) {
   }
   conv.updatedAt = Date.now();
   saveConversations();
+  // Audio mode trzyma rail z 4 ostatnimi repliki — odswiez gdy nowa
+  // wiadomosc dochodzi w trakcie rozmowy.
+  if (conv.mode === 'audio' && conv.id === activeConvId) {
+    renderRail();
+  }
 }
 
 // Direct call (no rAF) — background tabs throttle rAF to <1Hz in Chrome,
@@ -576,7 +1074,11 @@ function clearActiveConversation() {
   conv.messages = [];
   conv.updatedAt = Date.now();
   saveConversations();
-  mountVList();
+  if (conv.mode === 'audio') {
+    renderRail();
+  } else {
+    mountVList();
+  }
   renderConvList();
   updateHeaderTitle();
   toast(I18n.t('chat.clear_done'), 'info');
@@ -590,9 +1092,25 @@ function deleteActiveConversation() {
   conversations = conversations.filter((c) => c.id !== conv.id);
   activeConvId = conversations[0]?.id || null;
   saveConversations();
+  // Po usunieciu rozmowy audio pipeline + face musza zniknac — applyMode
+  // dla nowo aktywnej (lub czystego stanu) zalatwia obie sciezki.
+  stopAudioPipeline();
+  destroyFace();
   renderConvList();
   updateHeaderTitle();
-  mountVList();
+  const next = activeConv();
+  if (next) {
+    applyMode(next);
+    setActiveModeToggle(next.mode);
+  } else {
+    const body = byId('chat-body');
+    if (body) {
+      body.classList.remove('audio-mode');
+      body.innerHTML = '';
+    }
+    mountVList();
+    setActiveModeToggle('text');
+  }
   toast(I18n.t('chat.delete_done'), 'info');
 }
 
@@ -628,6 +1146,14 @@ const ChatScreen = {
               </span>
             </div>
             <div class="head-actions">
+              <div class="mode-toggle" role="tablist" aria-label="${escapeHtml(I18n.t('chat.title'))}">
+                <tf-button variant="primary" icon="message" id="chat-mode-text" data-mode="text"
+                  title="${escapeHtml(I18n.t('chat.mode_text'))}"
+                  aria-label="${escapeHtml(I18n.t('chat.mode_text'))}">${escapeHtml(I18n.t('chat.mode_text'))}</tf-button>
+                <tf-button variant="ghost" icon="mic" id="chat-mode-audio" data-mode="audio"
+                  title="${escapeHtml(I18n.t('chat.mode_audio'))}"
+                  aria-label="${escapeHtml(I18n.t('chat.mode_audio'))}">${escapeHtml(I18n.t('chat.mode_audio'))}</tf-button>
+              </div>
               <tf-button variant="ghost" icon="download" id="chat-export" aria-label="${escapeHtml(I18n.t('chat.export'))}" title="${escapeHtml(I18n.t('chat.export'))}"></tf-button>
               <tf-button variant="ghost" icon="share" id="chat-share" aria-label="${escapeHtml(I18n.t('chat.share'))}" title="${escapeHtml(I18n.t('chat.share'))}"></tf-button>
               <div class="chat-more-wrap">
@@ -664,10 +1190,15 @@ const ChatScreen = {
 
   async mount() {
     conversations = loadConversations();
+    migrateConversations(conversations);
     activeConvId = conversations.length ? conversations.sort((a, b) => b.updatedAt - a.updatedAt)[0].id : null;
     let maxId = 0;
     for (const c of conversations) for (const m of c.messages) if (m.id > maxId) maxId = m.id;
     nextMsgId = maxId + 1;
+
+    // Lista zainstalowanych silnikow STT/TTS — uzywana zarowno przy
+    // przelaczeniu na audio mode (dostepnosc) jak i przy openEnginePicker.
+    await loadEngineCache();
 
     try {
       // Binary RPC `ModelListRequest` is the unified surface fed by services +
@@ -712,8 +1243,53 @@ const ChatScreen = {
 
     renderConvList();
     updateHeaderTitle();
-    mountVList();
+    const initialConv = activeConv();
+    if (initialConv && initialConv.mode === 'audio') {
+      // Restore audio mode po reloadzie — mountFace dziala dopiero po render(),
+      // a render() juz sie wykonal gdy mount() jest wywolywany.
+      applyMode(initialConv);
+    } else {
+      mountVList();
+    }
+    setActiveModeToggle(initialConv?.mode || 'text');
     updateInputCounter();
+
+    byId('chat-mode-text')?.addEventListener('click', () => switchMode('text'));
+    byId('chat-mode-audio')?.addEventListener('click', () => switchMode('audio'));
+
+    // Esc w trybie audio wraca do tekstu — keyboard escape hatch dla
+    // uzytkownikow ktorzy nie znajda przycisku 'Zakoncz rozmowe'.
+    escKeyHandler = (e) => {
+      if (e.key !== 'Escape') return;
+      const conv = activeConv();
+      if (conv?.mode === 'audio') {
+        switchMode('text');
+      }
+    };
+    document.addEventListener('keydown', escKeyHandler);
+
+    // Push-to-talk — Spacja w trybie audio (poza textarea/input) jest
+    // manualnym override VAD. Trzymanie = mowa (ignoruje threshold), puscic
+    // = end-of-utterance natychmiast. Ulatwia testy i uzycie w halasliwym
+    // otoczeniu gdzie adaptive threshold jest nieskuteczny.
+    spaceKeydownHandler = (e) => {
+      if (e.key !== ' ' && e.code !== 'Space') return;
+      if (activeConv()?.mode !== 'audio') return;
+      const tgt = e.target;
+      if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) return;
+      if (spaceHeld) return;
+      spaceHeld = true;
+      if (audioPipeline) audioPipeline.pushToTalkStart();
+      e.preventDefault();
+    };
+    spaceKeyupHandler = (e) => {
+      if (e.key !== ' ' && e.code !== 'Space') return;
+      if (!spaceHeld) return;
+      spaceHeld = false;
+      if (audioPipeline && activeConv()?.mode === 'audio') audioPipeline.pushToTalkEnd();
+    };
+    document.addEventListener('keydown', spaceKeydownHandler);
+    document.addEventListener('keyup', spaceKeyupHandler);
 
     byId('chat-search')?.addEventListener('search', (e) => {
       searchFilter = e.detail.value || '';
@@ -725,9 +1301,16 @@ const ChatScreen = {
       conversations.push(conv);
       activeConvId = conv.id;
       saveConversations();
+      // Nowa rozmowa = tryb tekstowy; jesli wczesniej byl mountowany face,
+      // applyMode sprzata go i przywraca vlist.
+      stopAudioPipeline();
+      destroyFace();
+      const body = byId('chat-body');
+      if (body) body.classList.remove('audio-mode');
       renderConvList();
       updateHeaderTitle();
       mountVList();
+      setActiveModeToggle('text');
       byId('chat-input')?.focus();
       document.querySelector('.chat-shell')?.classList.remove('drawer-open');
     });
@@ -791,6 +1374,20 @@ const ChatScreen = {
   async unmount() {
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
     if (vlist) { vlist.destroy(); vlist = null; }
+    stopAudioPipeline();
+    destroyFace();
+    if (escKeyHandler) {
+      document.removeEventListener('keydown', escKeyHandler);
+      escKeyHandler = null;
+    }
+    if (spaceKeydownHandler) {
+      document.removeEventListener('keydown', spaceKeydownHandler);
+      spaceKeydownHandler = null;
+    }
+    if (spaceKeyupHandler) {
+      document.removeEventListener('keyup', spaceKeyupHandler);
+      spaceKeyupHandler = null;
+    }
     if (resizeListener) {
       window.removeEventListener('resize', resizeListener);
       resizeListener = null;

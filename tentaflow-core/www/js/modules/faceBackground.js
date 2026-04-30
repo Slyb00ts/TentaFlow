@@ -1,12 +1,19 @@
 // =============================================================================
 // Plik: js/modules/faceBackground.js
-// Opis: Pełnoekranowe tło wireframe twarzy (port Head_5 "piotr.bin" z projektu
-//       tentaflow-buddy) rysowane na canvas 2D. Pipeline: blendshape'y →
-//       rotacja yaw/pitch → projekcja perspektywiczna → stroke krawędzi.
-//       Idle-animacje: mrugnięcia, mikrouśmiechy, oddech, ruchy brwi, ziewanie,
-//       mikro-visemes, cheek puff, marszczenie brwi, plus parallax z myszy.
-//       Back-face culling wg aproksymowanych normali (kierunek od centroidu).
+// Opis: Wireframe twarzy (port Head_5 "piotr.bin" z tentaflow-buddy) rysowany
+//       na canvas 2D. Pipeline: blendshape'y → rotacja yaw/pitch → projekcja
+//       perspektywiczna → stroke krawędzi. Idle-animacje: mrugnięcia,
+//       mikrouśmiechy, oddech, ruchy brwi, ziewanie, mikro-visemes, cheek puff,
+//       marszczenie brwi, plus parallax z myszy.
+//
+//       Tryby mountowania (state.mountMode):
+//         - 'fullscreen' — pełnoekranowe tło logowania (FaceBackground.show())
+//         - 'embed'      — osadzenie w kontenerze (FaceBackground.embed(host))
+//                          z ResizeObserver, parallaxem względem hostu i API
+//                          setMode/setSpeechAmplitude/setListenAmplitude pod
+//                          tryb audio chatu.
 // Przykład: FaceBackground.show(); ... FaceBackground.hide();
+//           const handle = FaceBackground.embed(node); handle.setMode('idle');
 // =============================================================================
 
 import {
@@ -257,7 +264,25 @@ const state = {
   // dynamicznej korekty (np. reduced-motion).
   shakeT0: null,
   shakeDuration: 0.8,
+  // Tryb mountowania: 'none' = singleton wolny, 'fullscreen' = show() aktywny
+  // (login), 'embed' = osadzony w kontenerze (chat audio). Tylko jeden tryb na
+  // raz — przejscie embed↔fullscreen przechodzi przez destroy/hide.
+  mountMode: 'none',
+  embedContainer: null,
+  embedResizeObserver: null,
+  // Aktywne API trybu embed — uzywane do guard'a i propagacji do CSS hosta.
+  // 'idle' to default rowniez podczas fullscreen; pozostale wartosci w tym
+  // wydaniu nie sa wywolywane (caller AudioPipeline dopiero w Etapie 2),
+  // ale tickIdle juz potrafi je obsluzyc.
+  uiMode: 'idle',
+  speechAmp: 0,
+  listenAmp: 0,
 };
+
+// Aktywny handle trybu embed. Trzymamy globalny ref, zeby show() (login po
+// wylogowaniu) mogl zniszczyc niedomkniety embed zamiast wpasc w niespojny
+// stan dwoch zywych canvasow.
+let activeEmbedHandle = null;
 
 function setFaceLayerOpacity(opacity) {
   const value = String(opacity);
@@ -614,6 +639,26 @@ function evalActions(now, m) {
  * marszczenie brwi, ziewanie, mikro-viseme, cheek puff, pół-uśmieszki).
  * Wartości `mimicry` są zerowane i składane od nowa w każdej klatce.
  */
+// Modyfikatory mimiki w trybie 'speak' — uzywany w tickIdle do zlozenia
+// auto-mouth z rzeczywistego RMS speechAmp i lekkiej alternacji visemes.
+// Wynosimy do osobnej funkcji dla czytelnosci (tickIdle juz jest dlugi).
+function applySpeakMode(m) {
+  // Wyzeruj idle-akcje na starcie 'speak' — gdyby cos z poprzedniego trybu
+  // jeszcze trwalo (np. yawn), przerywamy bez fade'a, bo TTS ma pierwszenstwo.
+  state.actions.length = 0;
+  m.smile = 0;
+  m.frown = 0;
+  m.cheek_puff = 0;
+  // Lerp do speechAmp z 0.4 — kompromis miedzy responsywnoscia a smoothem.
+  m.mouth_open = m.mouth_open + (state.speechAmp - m.mouth_open) * 0.4;
+  // Alternujace visemes (aa↔oo) skalowane RMS, ze sin/cos w przeciwfazie
+  // dajacym efekt 'mlaskania' synchronizowanego z mowa.
+  const wobble = Math.abs(Math.sin(state.phase * 8));
+  const wobble2 = Math.abs(Math.cos(state.phase * 8));
+  m.vis_aa += 0.3 * state.speechAmp * wobble;
+  m.vis_oo += 0.3 * state.speechAmp * wobble2;
+}
+
 function tickIdle() {
   const m = state.mimicry;
   const t = state.phase;
@@ -680,10 +725,21 @@ function tickIdle() {
     return;
   }
 
+  // 'speak' i 'think' calkowicie wylaczaja losowe akcje idle — zostawiamy
+  // tylko mrugniecie i oddech (juz zaaplikowane wyzej).
+  const uiMode = state.uiMode;
+  const suppressLively = uiMode === 'speak' || uiMode === 'think';
+  // 'listen' tlumi zywsze akcje (yawn, cheek puff nigdy; smile rzadziej i z
+  // mniejsza amplituda), pozostawiajac mikro-visemes i brwi.
+  const dampenLively = uiMode === 'listen';
+
   // Mikro-uśmieszki / grymasy — losowa polaryzacja (obie strony zerowe lub ujemne).
-  if (t >= state.nextSmileAt) {
+  // W 'listen' redukujemy peak o 50% i zwiekszamy odstep, w 'speak'/'think'
+  // pomijamy w calosci (suppressLively).
+  if (!suppressLively && t >= state.nextSmileAt) {
     const polarity = Math.random() < 0.7 ? 1 : -1;
-    const peak = polarity > 0 ? 0.15 + Math.random() * 0.15 : -(0.1 + Math.random() * 0.15);
+    let peak = polarity > 0 ? 0.15 + Math.random() * 0.15 : -(0.1 + Math.random() * 0.15);
+    if (dampenLively) peak *= 0.5;
     scheduleAction(t, {
       bsKey: 'smile',
       peakValue: peak,
@@ -695,7 +751,7 @@ function tickIdle() {
   }
 
   // Brew zaskoczenia — oba brwi równo w górę, często z mikro-mouthOpen.
-  if (t >= state.nextBrowSurpriseAt) {
+  if (!suppressLively && t >= state.nextBrowSurpriseAt) {
     scheduleAction(t, {
       bsKey: 'eyebrow',
       side: 'both',
@@ -717,7 +773,7 @@ function tickIdle() {
   }
 
   // Asymetryczny brew flex — jedna brew w górę.
-  if (t >= state.nextBrowAsymAt) {
+  if (!suppressLively && t >= state.nextBrowAsymAt) {
     const side = Math.random() < 0.5 ? 'left' : 'right';
     scheduleAction(t, {
       bsKey: 'eyebrow',
@@ -731,7 +787,7 @@ function tickIdle() {
   }
 
   // Marszczenie brwi (angry) — długie, łagodne.
-  if (t >= state.nextFrownAt) {
+  if (!suppressLively && t >= state.nextFrownAt) {
     scheduleAction(t, {
       bsKey: 'angry',
       peakValue: 0.4,
@@ -743,7 +799,8 @@ function tickIdle() {
   }
 
   // Ziewnięcie / westchnięcie — szeroko otwarte usta + lekki brew lift.
-  if (t >= state.nextYawnAt) {
+  // Wylaczane w 'listen'/'speak'/'think' — zywsza akcja, latwo zepsuje immersję.
+  if (!suppressLively && !dampenLively && t >= state.nextYawnAt) {
     scheduleAction(t, {
       bsKey: 'mouth_open',
       peakValue: 0.4,
@@ -763,7 +820,8 @@ function tickIdle() {
   }
 
   // Mikro-viseme — losowy dźwięk przez ~0.35 s (jakby mruczała pod nosem).
-  if (t >= state.nextVisemeAt) {
+  // W 'speak' visemes pochodza z applySpeakMode() — losowe wylaczamy.
+  if (uiMode !== 'speak' && t >= state.nextVisemeAt) {
     const choices = ['vis_aa', 'vis_oo', 'vis_ee', 'vis_mm'];
     const key = choices[Math.floor(Math.random() * choices.length)];
     const peak = 0.3 + Math.random() * 0.2;
@@ -777,8 +835,8 @@ function tickIdle() {
     state.nextVisemeAt = t + 5.0 + Math.random() * 4.0;
   }
 
-  // Delikatny cheek puff.
-  if (t >= state.nextCheekAt) {
+  // Delikatny cheek puff. Wylaczany w 'listen'/'speak'/'think'.
+  if (!suppressLively && !dampenLively && t >= state.nextCheekAt) {
     scheduleAction(t, {
       bsKey: 'cheek_puff',
       peakValue: 0.3,
@@ -790,6 +848,22 @@ function tickIdle() {
   }
 
   evalActions(t, m);
+
+  // Modyfikatory mimiki dla aktywnego trybu UI. Aplikowane PO evalActions,
+  // zeby nadpisac/uzupelnic stale offsety nad swiezo zewaluowanymi akcjami.
+  if (uiMode === 'listen') {
+    // Lekkie podniesienie brwi sygnalizuje uwage/sluchanie.
+    m.eyebrow_left += 0.10;
+    m.eyebrow_right += 0.10;
+  } else if (uiMode === 'think') {
+    // Stalle, lekkie zafrapowanie + obnizone brwi.
+    m.angry += 0.15;
+    m.eyebrow_left -= 0.05;
+    m.eyebrow_right -= 0.05;
+    m.mouth_open = 0;
+  } else if (uiMode === 'speak') {
+    applySpeakMode(m);
+  }
 }
 
 /**
@@ -899,13 +973,21 @@ function renderStaticFrame() {
 }
 
 /**
- * Synchronizuje wymiary canvas z viewportem (DPR × innerWidth/Height).
+ * Synchronizuje wymiary canvas z aktualnym hostem. W trybie 'fullscreen' —
+ * `window.innerWidth/Height`. W trybie 'embed' — clientWidth/Height kontenera.
  */
 function syncCanvasSize() {
   const dpr = window.devicePixelRatio || 1;
   state.dpr = dpr;
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  let w;
+  let h;
+  if (state.mountMode === 'embed' && state.embedContainer) {
+    w = Math.max(1, state.embedContainer.clientWidth);
+    h = Math.max(1, state.embedContainer.clientHeight);
+  } else {
+    w = window.innerWidth;
+    h = window.innerHeight;
+  }
   state.canvas.width = Math.max(1, Math.floor(w * dpr));
   state.canvas.height = Math.max(1, Math.floor(h * dpr));
   state.canvas.style.width = `${w}px`;
@@ -932,7 +1014,27 @@ function stopLoop() {
 // Parallax: kursor w prawo → twarz patrzy w prawo, kursor w dół → twarz
 // schyla się (patrzy w dół). Znak pitch odwrócony względem `my`, bo z-osą
 // do kamery dodatni pitch obracał czubek nosa do góry (iluzja spojrzenia w górę).
+//
+// W trybie 'embed' wartosci sa liczone wzgledem getBoundingClientRect() hosta
+// — kursor poza hostem pada na targetYaw=0/targetPitch=0, zeby twarz wracala
+// do frontalnej pozycji zamiast utykac w skrajnym wychyleniu.
 function handleMouseMove(e) {
+  if (state.mountMode === 'embed' && state.embedContainer) {
+    const rect = state.embedContainer.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const inside = e.clientX >= rect.left && e.clientX <= rect.right
+                && e.clientY >= rect.top && e.clientY <= rect.bottom;
+    if (!inside) {
+      state.targetYaw = 0;
+      state.targetPitch = 0;
+      return;
+    }
+    const mx = ((e.clientX - rect.left) / rect.width - 0.5) * 2;
+    const my = ((e.clientY - rect.top) / rect.height - 0.5) * 2;
+    state.targetYaw = mx * 0.25;
+    state.targetPitch = -my * 0.18;
+    return;
+  }
   const mx = (e.clientX / window.innerWidth - 0.5) * 2;
   const my = (e.clientY / window.innerHeight - 0.5) * 2;
   state.targetYaw = mx * 0.25;
@@ -1061,10 +1163,24 @@ function handleVisibilityChange() {
 }
 
 function handleResize() {
+  // Listener tylko dla trybu fullscreen — embed uzywa ResizeObserver.
+  if (state.mountMode !== 'fullscreen') return;
   syncCanvasSize();
   // Rotacja telefonu albo zmiana rozmiaru okna może zmienić klasyfikację
   // mobile/desktop — skala bazowa musi reagować.
   state.scaleMul = isMobileViewport() ? MOBILE_SCALE_MUL : DESKTOP_SCALE_MUL;
+  if (state.reducedMotion) {
+    renderStaticFrame();
+  }
+}
+
+// Callback dla ResizeObserver w trybie embed. Embed zawsze trzyma
+// DESKTOP_SCALE_MUL (kontener jest maly — full mobile-scale by przepelnil),
+// wiec tutaj tylko aktualizujemy bitmape canvasow i ewentualnie odswiezamy
+// statyczna klatke gdy reduced-motion.
+function handleEmbedResize() {
+  if (state.mountMode !== 'embed') return;
+  syncCanvasSize();
   if (state.reducedMotion) {
     renderStaticFrame();
   }
@@ -1112,6 +1228,13 @@ function computeEyeOffset(indices, yaw, pitch) {
 export const FaceBackground = {
   show() {
     if (document.getElementById(CONTAINER_ID)) return;
+
+    // Rzadki, ale realny scenariusz: aktywny embed (np. uzytkownik byl w
+    // chacie audio) → wylogowanie → ponowny show(). Singleton state byl by
+    // niespojny gdyby zostawic dwa zywe canvasy, wiec niszczymy embed.
+    if (state.mountMode === 'embed' && activeEmbedHandle) {
+      activeEmbedHandle.destroy();
+    }
 
     const container = document.createElement('div');
     container.id = CONTAINER_ID;
@@ -1161,6 +1284,10 @@ export const FaceBackground = {
     state.gammaBaseline = null;
     state.shakeT0 = null;
     state.shakeDuration = 0.8;
+    state.mountMode = 'fullscreen';
+    state.uiMode = 'idle';
+    state.speechAmp = 0;
+    state.listenAmp = 0;
     state.scaleMul = isMobileViewport() ? MOBILE_SCALE_MUL : DESKTOP_SCALE_MUL;
 
     syncCanvasSize();
@@ -1384,6 +1511,10 @@ export const FaceBackground = {
   },
 
   hide() {
+    if (state.mountMode === 'embed') {
+      console.warn('[faceBg] hide() not applicable in embed mode — use handle.destroy()');
+      return;
+    }
     const container = document.getElementById(CONTAINER_ID);
     if (!container) return;
 
@@ -1421,7 +1552,167 @@ export const FaceBackground = {
       state.ctx = null;
       state.glowCanvas = null;
       state.glowCtx = null;
+      state.mountMode = 'none';
     }, 650);
+  },
+
+  /**
+   * Mountuje wireframe twarzy w podanym kontenerze (audio mode w chat).
+   * Tworzy dwa canvasy (glow + main) wewnatrz hosta, rejestruje
+   * ResizeObserver i lokalny mousemove (relatywny do hosta). Zwraca handle
+   * z API setMode/setSpeechAmplitude/setListenAmplitude/destroy.
+   *
+   * Tylko jeden embed lub jeden fullscreen na raz. Jesli aktywny jest
+   * fullscreen, zostaje zniszczony (rzadki przypadek przez bezposrednie API
+   * — w praktyce login wywoluje hide() przed mountowaniem chatu).
+   */
+  embed(container) {
+    if (!container || !(container instanceof HTMLElement)) {
+      throw new Error('FaceBackground.embed: container must be HTMLElement');
+    }
+    if (state.mountMode === 'embed' && activeEmbedHandle) {
+      // Re-mount tego samego hosta — zwracamy istniejacy handle.
+      if (state.embedContainer === container) return activeEmbedHandle;
+      activeEmbedHandle.destroy();
+    }
+    if (state.mountMode === 'fullscreen') {
+      FaceBackground.hide();
+    }
+
+    container.classList.add('face-embed-host');
+
+    // Glow przed main — z-order skladania jak w show().
+    const glowCanvas = document.createElement('canvas');
+    glowCanvas.className = 'face-glow-canvas';
+    glowCanvas.setAttribute('aria-hidden', 'true');
+    container.appendChild(glowCanvas);
+
+    const canvas = document.createElement('canvas');
+    canvas.className = 'face-bg-canvas';
+    canvas.setAttribute('aria-hidden', 'true');
+    container.appendChild(canvas);
+
+    state.canvas = canvas;
+    state.ctx = canvas.getContext('2d', { alpha: true });
+    state.glowCanvas = glowCanvas;
+    state.glowCtx = glowCanvas.getContext('2d', { alpha: true });
+    state.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    resetFaceLayerStyles();
+
+    // Reset harmonogramu idle-animacji — kazdy embed startuje czysty.
+    state.phase = 0;
+    state.lastFrameMs = 0;
+    state.blinkState = null;
+    state.actions.length = 0;
+    state.nextBlinkAt = 1.5 + Math.random() * 2.0;
+    state.nextSmileAt = 4.0 + Math.random() * 4.0;
+    state.nextBrowSurpriseAt = 6.0 + Math.random() * 6.0;
+    state.nextBrowAsymAt = 3.0 + Math.random() * 5.0;
+    state.nextFrownAt = 10.0 + Math.random() * 8.0;
+    state.nextYawnAt = 15.0 + Math.random() * 10.0;
+    state.nextVisemeAt = 2.0 + Math.random() * 4.0;
+    state.nextCheekAt = 12.0 + Math.random() * 10.0;
+    state.targetYaw = 0;
+    state.targetPitch = 0;
+    state.parallaxYaw = 0;
+    state.parallaxPitch = 0;
+    state.shakeT0 = null;
+    state.shakeDuration = 0.8;
+    state.zoomCx = null;
+    state.zoomCy = null;
+    state.yawOverride = null;
+    state.pitchOverride = null;
+    // Embed zawsze ma maly host — full mobile-scale przepelnilby.
+    state.scaleMul = DESKTOP_SCALE_MUL;
+    state.mountMode = 'embed';
+    state.embedContainer = container;
+    state.uiMode = 'idle';
+    state.speechAmp = 0;
+    state.listenAmp = 0;
+
+    syncCanvasSize();
+    renderStaticFrame();
+
+    // ResizeObserver zamiast window.resize — kontener moze sie zmieniac
+    // niezaleznie od viewportu (np. drawer chowa sidebar, body sie rozszerza).
+    if (typeof ResizeObserver !== 'undefined') {
+      state.embedResizeObserver = new ResizeObserver(handleEmbedResize);
+      state.embedResizeObserver.observe(container);
+    }
+
+    if (!state.reducedMotion) {
+      state.mouseHandler = handleMouseMove;
+      window.addEventListener('mousemove', state.mouseHandler);
+      state.visibilityHandler = handleVisibilityChange;
+      document.addEventListener('visibilitychange', state.visibilityHandler);
+      startLoop();
+    }
+
+    const handle = {
+      setMode(mode) {
+        if (mode !== 'idle' && mode !== 'listen' && mode !== 'think' && mode !== 'speak') {
+          console.warn('[faceBg] setMode: unknown mode', mode);
+          return;
+        }
+        state.uiMode = mode;
+        if (state.embedContainer) {
+          state.embedContainer.style.setProperty('--ui-mode', mode);
+          state.embedContainer.dataset.uiMode = mode;
+        }
+        // Wejscie w 'speak' zeruje akcje natychmiast — applySpeakMode i tak
+        // czysci kazda klatka, ale chcemy uniknac flasha resztek z idle.
+        if (mode === 'speak') state.actions.length = 0;
+      },
+      setSpeechAmplitude(rms) {
+        const v = Number(rms);
+        if (!Number.isFinite(v)) return;
+        state.speechAmp = Math.max(0, Math.min(1, v));
+      },
+      setListenAmplitude(rms) {
+        const v = Number(rms);
+        if (!Number.isFinite(v)) return;
+        state.listenAmp = Math.max(0, Math.min(1, v));
+        if (state.embedContainer) {
+          state.embedContainer.style.setProperty('--listen-amp', state.listenAmp.toFixed(3));
+        }
+      },
+      destroy() {
+        if (state.mountMode !== 'embed' || state.embedContainer !== container) return;
+        stopLoop();
+        if (state.mouseHandler) {
+          window.removeEventListener('mousemove', state.mouseHandler);
+          state.mouseHandler = null;
+        }
+        if (state.visibilityHandler) {
+          document.removeEventListener('visibilitychange', state.visibilityHandler);
+          state.visibilityHandler = null;
+        }
+        if (state.embedResizeObserver) {
+          state.embedResizeObserver.disconnect();
+          state.embedResizeObserver = null;
+        }
+        // Czyscimy tylko canvasy — sam container nalezy do callera (chat.js).
+        if (canvas.parentNode === container) container.removeChild(canvas);
+        if (glowCanvas.parentNode === container) container.removeChild(glowCanvas);
+        container.classList.remove('face-embed-host');
+        container.style.removeProperty('--ui-mode');
+        container.style.removeProperty('--listen-amp');
+        delete container.dataset.uiMode;
+
+        state.canvas = null;
+        state.ctx = null;
+        state.glowCanvas = null;
+        state.glowCtx = null;
+        state.mountMode = 'none';
+        state.embedContainer = null;
+        state.uiMode = 'idle';
+        state.speechAmp = 0;
+        state.listenAmp = 0;
+        if (activeEmbedHandle === handle) activeEmbedHandle = null;
+      },
+    };
+    activeEmbedHandle = handle;
+    return handle;
   },
 };
 
