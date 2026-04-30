@@ -5,6 +5,7 @@
 // =============================================================================
 
 use std::path::PathBuf;
+#[cfg(target_os = "android")]
 use tracing::info;
 
 /// Informacje o urzadzeniu mobilnym
