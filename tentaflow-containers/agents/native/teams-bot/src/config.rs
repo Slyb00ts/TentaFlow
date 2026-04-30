@@ -211,9 +211,9 @@ fn default_response_prompt() -> String {
     // ZAWSZE odpowiadaj. Bez instrukcji ucieczki typu `<NO_RESPONSE>` ani
     // klauzul "tylko gdy zadaje pytanie" — bot dostaje wylacznie wypowiedzi
     // ze slowem aktywujacym (response_mode=wake_word), wiec mowca jasno
-    // skierowal sie do bota i oczekuje reakcji. Krotko, po polsku, do rzeczy.
-    "Jestes asystentem na spotkaniu Teams. Odpowiadaj zawsze, po polsku, \
-1-2 zdaniami."
+    // skierowal sie do bota i oczekuje reakcji. Krotko, po angielsku, do rzeczy.
+    "You are an assistant in a Teams meeting. Always answer in English, \
+1-2 sentences."
         .to_string()
 }
 
