@@ -15,8 +15,10 @@ use async_trait::async_trait;
 use rusqlite::Transaction;
 
 use super::{
-    build_new_service, category_tag, models_from_manifest, resolve_display_name, transport_hint,
-    DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
+    build_new_service, category_tag, models_from_manifest, resolve_display_name,
+    smart_health_probe, transport_hint, DeployError, DeployResult, DeployStrategy,
+    LogActivityCounter, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig,
+    SmartProbeOutcome,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -104,7 +106,10 @@ mod backend {
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(false),
-            Err(e) => Err(DeployError::Docker(format!("inspect_image({}): {}", tag, e))),
+            Err(e) => Err(DeployError::Docker(format!(
+                "inspect_image({}): {}",
+                tag, e
+            ))),
         }
     }
 
@@ -411,16 +416,116 @@ impl DeployStrategy for DockerDeploy {
             ));
         }
 
-        // Health check on the host-mapped HTTP port.
-        let url_a = format!("http://127.0.0.1:{}/v1/models", host_http);
-        let url_b = format!("http://127.0.0.1:{}/health", host_http);
-        let res = wait_either(&url_a, &url_b, 60).await;
-        if let Err(e) = res {
-            let _ = backend::stop_and_remove(&docker, &id).await;
-            for p in &allocated {
-                let _ = self.ports.release(*p);
+        // Stream container logs into the dashboard sink AND into the
+        // activity counter so the smart probe can tell "container still
+        // booting" from "container alive but stuck". Background task ends
+        // when the container stops or the daemon closes the stream.
+        let activity = Arc::new(LogActivityCounter::new());
+        {
+            let docker_for_logs = docker.clone();
+            let name_for_logs = container_name.clone();
+            let counter = activity.clone();
+            let sink = self.log_sink.clone();
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                let opts = bollard::query_parameters::LogsOptionsBuilder::default()
+                    .follow(true)
+                    .stdout(true)
+                    .stderr(true)
+                    .tail("0")
+                    .build();
+                let mut stream = docker_for_logs.logs(&name_for_logs, Some(opts));
+                while let Some(item) = stream.next().await {
+                    if let Ok(out) = item {
+                        let line = out.to_string();
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        counter.bump();
+                        if let Some(s) = &sink {
+                            s.emit("log", trimmed);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Smart probe: race readiness URLs forever, abort on container
+        // exit OR `stagnation_window` of zero log activity. Default 300s
+        // covers slow image start + first model download.
+        let probe_cfg = SmartProbeConfig {
+            readiness_urls: vec![
+                format!("http://127.0.0.1:{}/v1/models", host_http),
+                format!("http://127.0.0.1:{}/health", host_http),
+            ],
+            stagnation_window: std::time::Duration::from_secs(300),
+            status_report_interval: std::time::Duration::from_secs(30),
+            log_activity: activity,
+            log_sink: self.log_sink.clone(),
+        };
+        let docker_for_probe = docker.clone();
+        let name_for_probe = container_name.clone();
+        let outcome = smart_health_probe(probe_cfg, move || {
+            let d = docker_for_probe.clone();
+            let n = name_for_probe.clone();
+            async move {
+                match d.inspect_container(&n, None).await {
+                    Ok(info) => {
+                        let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+                        if running {
+                            None
+                        } else {
+                            // Exited — surface the exit code if Docker
+                            // reported one.
+                            let code = info
+                                .state
+                                .as_ref()
+                                .and_then(|s| s.exit_code)
+                                .map(|c| c as i32);
+                            Some(code)
+                        }
+                    }
+                    // Inspect failed — likely the container vanished.
+                    Err(_) => Some(None),
+                }
             }
-            return Err(e);
+        })
+        .await;
+
+        match outcome {
+            SmartProbeOutcome::Ready => {}
+            SmartProbeOutcome::ProcessExited(code) => {
+                if let Some(s) = &self.log_sink {
+                    s.info(&format!(
+                        "[docker] container '{}' exited{} before becoming ready",
+                        container_name,
+                        code.map(|c| format!(" (code {})", c)).unwrap_or_default()
+                    ));
+                }
+                let _ = backend::stop_and_remove(&docker, &id).await;
+                for p in &allocated {
+                    let _ = self.ports.release(*p);
+                }
+                return Err(DeployError::Spawn(format!(
+                    "container '{}' exited before readiness",
+                    container_name
+                )));
+            }
+            SmartProbeOutcome::Stalled(silent) => {
+                if let Some(s) = &self.log_sink {
+                    s.info(&format!(
+                        "[docker] container '{}' stalled: no log activity for {}s",
+                        container_name,
+                        silent.as_secs()
+                    ));
+                }
+                let _ = backend::stop_and_remove(&docker, &id).await;
+                for p in &allocated {
+                    let _ = self.ports.release(*p);
+                }
+                return Err(DeployError::HealthTimeout(silent.as_secs()));
+            }
         }
 
         let endpoint_url = match transport {
@@ -490,19 +595,6 @@ impl DeployStrategy for DockerDeploy {
             let _ = self.ports.release(*p);
         }
         Ok(())
-    }
-}
-
-#[cfg(feature = "docker")]
-async fn wait_either(a: &str, b: &str, timeout_secs: u64) -> DeployResult<()> {
-    use tokio::select;
-    let fa = super::http_health_wait(a, timeout_secs);
-    let fb = super::http_health_wait(b, timeout_secs);
-    tokio::pin!(fa);
-    tokio::pin!(fb);
-    select! {
-        r = &mut fa => r,
-        r = &mut fb => r,
     }
 }
 

@@ -91,16 +91,28 @@ pub struct TransitionResult {
 
 impl TransitionResult {
     fn no_change() -> Self {
-        Self { new_state: None, side_effect: None }
+        Self {
+            new_state: None,
+            side_effect: None,
+        }
     }
     fn state(s: ConnectionState) -> Self {
-        Self { new_state: Some(s), side_effect: None }
+        Self {
+            new_state: Some(s),
+            side_effect: None,
+        }
     }
     fn state_with(s: ConnectionState, eff: TransitionSideEffect) -> Self {
-        Self { new_state: Some(s), side_effect: Some(eff) }
+        Self {
+            new_state: Some(s),
+            side_effect: Some(eff),
+        }
     }
     fn effect_only(eff: TransitionSideEffect) -> Self {
-        Self { new_state: None, side_effect: Some(eff) }
+        Self {
+            new_state: None,
+            side_effect: Some(eff),
+        }
     }
 }
 
@@ -174,10 +186,7 @@ pub fn transition(
                 side_effect: Some(TransitionSideEffect::BumpRetry { err: err.clone() }),
             }
         }
-        (
-            ConnectionState::Reconnecting { since, attempt, .. },
-            StateTrigger::DialFail { err },
-        ) => {
+        (ConnectionState::Reconnecting { since, attempt, .. }, StateTrigger::DialFail { err }) => {
             let next_attempt = attempt.saturating_add(1);
             // Give up if we exceed the attempt cap.
             if next_attempt > RECONNECT_GIVEUP_ATTEMPTS {
@@ -201,8 +210,7 @@ pub fn transition(
 
         // ---- TransportClosed ---------------------------------------------
         (
-            ConnectionState::Connected { conn_id, .. }
-            | ConnectionState::Degraded { conn_id, .. },
+            ConnectionState::Connected { conn_id, .. } | ConnectionState::Degraded { conn_id, .. },
             StateTrigger::TransportClosed { conn_id: closed_id },
         ) => {
             if conn_id != closed_id {
@@ -230,14 +238,13 @@ pub fn transition(
             // PeerEntry updates last_app_heartbeat; state stays Connected.
             TransitionResult::no_change()
         }
-        (
-            ConnectionState::Degraded { path, conn_id, .. },
-            StateTrigger::Heartbeat { .. },
-        ) => TransitionResult::state(ConnectionState::Connected {
-            since: now,
-            path: path.clone(),
-            conn_id: *conn_id,
-        }),
+        (ConnectionState::Degraded { path, conn_id, .. }, StateTrigger::Heartbeat { .. }) => {
+            TransitionResult::state(ConnectionState::Connected {
+                since: now,
+                path: path.clone(),
+                conn_id: *conn_id,
+            })
+        }
         (_, StateTrigger::Heartbeat { .. }) => TransitionResult::no_change(),
 
         // ---- LivenessTick -------------------------------------------------
@@ -257,10 +264,7 @@ pub fn transition(
                 missed_heartbeats: 1,
             })
         }
-        (
-            ConnectionState::Degraded { .. },
-            StateTrigger::LivenessTick { now: tick_now },
-        ) => {
+        (ConnectionState::Degraded { .. }, StateTrigger::LivenessTick { now: tick_now }) => {
             let attempt = 1u32;
             let err: ArcStr = std::sync::Arc::<str>::from("liveness_timeout");
             let backoff_until = *tick_now + backoff(attempt);

@@ -2585,9 +2585,7 @@ pub async fn mesh_node_list(
                 now_ms,
             ))
         });
-        nodes.push(
-            store_peer_to_proto(local, local_node_id, true, route, connection).await,
-        );
+        nodes.push(store_peer_to_proto(local, local_node_id, true, route, connection).await);
         emitted.insert(local.node_id.clone());
     }
 
@@ -2624,9 +2622,7 @@ pub async fn mesh_node_list(
                         Some(r.next_hop.clone())
                     },
                 });
-            nodes.push(
-                store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await,
-            );
+            nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await);
         } else {
             // No peer_store entry — trusted node offline (or freshly seeded).
             // Render with whatever the registry knows; rich device fields stay
@@ -2683,9 +2679,7 @@ pub async fn mesh_node_list(
                     Some(r.next_hop.clone())
                 },
             });
-        nodes.push(
-            store_peer_to_proto(p, local_node_id, is_trusted, route, None).await,
-        );
+        nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, None).await);
     }
 
     Ok(MessageBody::MeshNodeListResponseBody(
@@ -2721,11 +2715,10 @@ pub async fn mesh_node_detail(
     })?;
     let is_local = peer.node_id == local_node_id;
     let registry = store.registry().cloned();
-    let summary = registry
-        .as_ref()
-        .and_then(|r| parse_node_id_hex(&peer.node_id).and_then(|id| {
-            r.snapshot_summary().into_iter().find(|s| s.node_id == id)
-        }));
+    let summary = registry.as_ref().and_then(|r| {
+        parse_node_id_hex(&peer.node_id)
+            .and_then(|id| r.snapshot_summary().into_iter().find(|s| s.node_id == id))
+    });
     let is_trusted = is_local
         || summary
             .as_ref()
@@ -2761,9 +2754,9 @@ pub async fn mesh_node_detail(
         .as_ref()
         .and_then(|qm| qm.connection_snapshot(&payload.node_id));
     let now_ms = crate::mesh::proto_conv::now_unix_ms();
-    let connection = summary.as_ref().map(|s| {
-        crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms)
-    });
+    let connection = summary
+        .as_ref()
+        .map(|s| crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms));
     let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
