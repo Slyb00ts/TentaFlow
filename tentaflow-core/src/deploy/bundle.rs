@@ -7,11 +7,26 @@
 // =============================================================================
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// tar.gz wbudowany przez build.rs (patrz: pack_container_contexts).
 const CONTAINER_BUNDLE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/container_bundle.tar.gz"));
+
+/// Stable fingerprint of the embedded bundle bytes. Used as a marker so
+/// `paths::ensure_app_dirs()` re-extracts only when the build.rs output
+/// actually changed (new repo snapshot baked into the binary).
+pub fn bundle_hash() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CONTAINER_BUNDLE);
+    hex::encode(hasher.finalize())
+}
+
+/// Returns true if build.rs successfully produced a non-empty bundle.
+pub fn is_embedded() -> bool {
+    !CONTAINER_BUNDLE.is_empty()
+}
 
 /// Rozpakowuje wbudowany kontekst kontenerow do podanego katalogu.
 /// Po rozpakowaniu w `target` znajdziesz `tentaflow-containers/`,

@@ -68,7 +68,10 @@ impl BinaryDeploy {
                 self.manifest.engine.id
             ))
         })?;
-        let path = PathBuf::from(bp);
+        // Manifest binary_path is relative to the extracted containers tree.
+        // PathBuf::join is a no-op when `bp` is absolute (e.g. tests pass a
+        // tempdir path), so this stays compatible with both layouts.
+        let path = crate::paths::containers_root().join(bp);
         if !path.exists() {
             return Err(DeployError::Manifest(format!(
                 "binary_path does not exist: {}",
