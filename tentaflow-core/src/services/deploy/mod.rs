@@ -40,8 +40,6 @@ pub enum DeployError {
     Docker(String),
     #[error("process spawn failed: {0}")]
     Spawn(String),
-    #[error("health check timeout after {0}s")]
-    HealthTimeout(u64),
     #[error("manifest validation: {0}")]
     Manifest(String),
     #[error("db error: {0}")]
@@ -488,29 +486,7 @@ pub(crate) fn resolve_display_name(manifest: &ServiceManifest) -> String {
 
 // ----- Smart liveness+readiness probe ---------------------------------------
 
-/// Side-channel counter incremented by strategy code each time a fresh log
-/// line arrives from the engine (stdout, stderr, docker logs). The probe
-/// reads it to distinguish "slow startup, still working" from "process
-/// silent — likely deadlocked".
-#[derive(Debug, Default)]
-pub struct LogActivityCounter {
-    count: std::sync::atomic::AtomicU64,
-}
-
-impl LogActivityCounter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn snapshot(&self) -> u64 {
-        self.count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    pub fn bump(&self) {
-        self.count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Probe outcome. `Ready` is success; both other variants are deploy-fatal.
+/// Probe outcome. `Ready` is success; `ProcessExited` is deploy-fatal.
 #[derive(Debug)]
 pub enum SmartProbeOutcome {
     /// HTTP readiness URL responded 2xx.
@@ -519,29 +495,21 @@ pub enum SmartProbeOutcome {
     /// code if the strategy could fetch one (None when only liveness is
     /// observable, e.g. via `kill(pid, 0)`).
     ProcessExited(Option<i32>),
-    /// Engine alive but produced no log line and no successful HTTP response
-    /// for `stagnation_window`. Typically a hung wheel build or a model
-    /// download stuck on a dead mirror.
-    Stalled(std::time::Duration),
 }
 
 /// Probe configuration. `readiness_urls` are raced; the first 2xx wins.
 pub struct SmartProbeConfig {
     pub readiness_urls: Vec<String>,
-    pub stagnation_window: std::time::Duration,
     /// How often the probe emits a "still starting…" line through
     /// `log_sink` so the dashboard sees progress.
     pub status_report_interval: std::time::Duration,
-    pub log_activity: Arc<LogActivityCounter>,
     pub log_sink: Option<LogSink>,
 }
 
 /// Smart liveness+readiness probe with no hard timeout. Loops until one of:
 ///
 /// * a readiness URL answers 2xx → `Ready`;
-/// * `is_alive_check` reports the process gone → `ProcessExited`;
-/// * the engine emits no log line **and** no readiness response within
-///   `stagnation_window` → `Stalled`.
+/// * `is_alive_check` reports the process gone → `ProcessExited`.
 ///
 /// `is_alive_check` is an async closure returning `Some(exit_code)` when
 /// the supervised process has exited (None inside Some means "exited but
@@ -556,8 +524,6 @@ where
 {
     use std::time::{Duration, Instant};
     let started = Instant::now();
-    let mut last_log_count = cfg.log_activity.snapshot();
-    let mut last_log_time = Instant::now();
     let mut last_status_emit = Instant::now();
     let probe_interval = Duration::from_millis(500);
 
@@ -567,19 +533,17 @@ where
     {
         Ok(c) => c,
         Err(_) => {
-            // If we cannot even build a client we have to bail; treat as
-            // immediate stagnation so caller can roll back cleanly.
-            return SmartProbeOutcome::Stalled(Duration::from_secs(0));
+            // Without an HTTP client we cannot observe readiness; treat as
+            // an immediate exit so the caller can roll back cleanly.
+            return SmartProbeOutcome::ProcessExited(None);
         }
     };
 
     loop {
-        // 1. Liveness — has the process died?
         if let Some(exit) = is_alive_check().await {
             return SmartProbeOutcome::ProcessExited(exit);
         }
 
-        // 2. Readiness — race all candidate URLs.
         for url in &cfg.readiness_urls {
             if let Ok(resp) = client.get(url).send().await {
                 if resp.status().is_success() {
@@ -588,27 +552,11 @@ where
             }
         }
 
-        // 3. Stagnation tracking — bumped counter resets the silent window.
-        let current = cfg.log_activity.snapshot();
-        if current != last_log_count {
-            last_log_count = current;
-            last_log_time = Instant::now();
-        }
-        let silent_for = last_log_time.elapsed();
-        if silent_for > cfg.stagnation_window {
-            return SmartProbeOutcome::Stalled(silent_for);
-        }
-
-        // 4. Periodic status report so the dashboard sees progress. We
-        //    emit through `info()` deliberately — that does not bump the
-        //    activity counter, so synthetic status lines cannot mask a
-        //    real stall.
         if last_status_emit.elapsed() >= cfg.status_report_interval {
             if let Some(sink) = &cfg.log_sink {
                 sink.info(&format!(
-                    "[health] still starting (alive {}s, no log activity for {}s, waiting for ready)",
-                    started.elapsed().as_secs(),
-                    silent_for.as_secs()
+                    "[health] still starting (alive {}s, waiting for ready)",
+                    started.elapsed().as_secs()
                 ));
             }
             last_status_emit = Instant::now();
@@ -803,9 +751,7 @@ mod tests {
 
         let cfg = SmartProbeConfig {
             readiness_urls: vec![format!("{}/v1/models", server.uri())],
-            stagnation_window: Duration::from_secs(60),
             status_report_interval: Duration::from_secs(60),
-            log_activity: Arc::new(LogActivityCounter::new()),
             log_sink: None,
         };
         let alive = AtomicBool::new(true);
@@ -827,9 +773,7 @@ mod tests {
         let cfg = SmartProbeConfig {
             // Bind-loopback URL on a closed port so readiness never wins.
             readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
-            stagnation_window: Duration::from_secs(60),
             status_report_interval: Duration::from_secs(60),
-            log_activity: Arc::new(LogActivityCounter::new()),
             log_sink: None,
         };
         let outcome = smart_health_probe(cfg, || async { Some(Some(137)) }).await;
@@ -837,60 +781,6 @@ mod tests {
             SmartProbeOutcome::ProcessExited(Some(137)) => {}
             other => panic!("expected ProcessExited(137), got {:?}", other),
         }
-    }
-
-    #[tokio::test]
-    async fn smart_probe_returns_stalled_when_no_log_activity() {
-        use std::time::Duration;
-
-        let cfg = SmartProbeConfig {
-            readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
-            // Tiny window so the test runs in <2s.
-            stagnation_window: Duration::from_millis(800),
-            status_report_interval: Duration::from_secs(60),
-            log_activity: Arc::new(LogActivityCounter::new()),
-            log_sink: None,
-        };
-        let outcome = smart_health_probe(cfg, || async { None }).await;
-        assert!(matches!(outcome, SmartProbeOutcome::Stalled(_)));
-    }
-
-    #[tokio::test]
-    async fn smart_probe_log_activity_resets_stagnation() {
-        use std::time::Duration;
-
-        let activity = Arc::new(LogActivityCounter::new());
-        let bumper = activity.clone();
-        // Keep bumping every 200ms — the stagnation window is 600ms, so the
-        // probe must never trip and we have to give up via timeout.
-        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_clone = stop_flag.clone();
-        let bump_task = tokio::spawn(async move {
-            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                bumper.bump();
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        });
-
-        let cfg = SmartProbeConfig {
-            readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
-            stagnation_window: Duration::from_millis(600),
-            status_report_interval: Duration::from_secs(60),
-            log_activity: activity,
-            log_sink: None,
-        };
-        // Race the probe against a 1500ms wall-clock guard. If activity
-        // really resets stagnation, the probe runs longer than 600ms.
-        let probe_handle =
-            tokio::spawn(async move { smart_health_probe(cfg, || async { None }).await });
-        let timed = tokio::time::timeout(Duration::from_millis(1500), probe_handle).await;
-        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = bump_task.await;
-        // If activity-reset works the probe is still running -> timeout fires.
-        assert!(
-            timed.is_err(),
-            "probe should have stayed alive past stagnation_window thanks to log activity"
-        );
     }
 
     #[tokio::test]

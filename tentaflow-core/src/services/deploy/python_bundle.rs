@@ -16,8 +16,8 @@ use rusqlite::Transaction;
 
 use super::{
     build_new_service, category_tag, host_os_supported, models_from_manifest, resolve_display_name,
-    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogActivityCounter, LogSink,
-    PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
+    RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -57,15 +57,11 @@ impl PythonBundleDeploy {
         }
     }
 
-    /// Builds a `python_venv::LogSink` callback that (1) bumps the shared
-    /// activity counter so the health probe can tell "still working" from
-    /// "deadlocked", and (2) forwards every line into the service-layer
-    /// `LogSink` (broadcaster + DB log_tail). The counter is the side-channel
-    /// the smart probe relies on.
-    fn build_venv_log(&self, activity: Arc<LogActivityCounter>) -> python_venv::LogSink {
+    /// Builds a `python_venv::LogSink` callback that forwards every line
+    /// into the service-layer `LogSink` (broadcaster + DB log_tail).
+    fn build_venv_log(&self) -> python_venv::LogSink {
         let outer = self.log_sink.clone();
         Arc::new(move |line: &str| {
-            activity.bump();
             if let Some(sink) = &outer {
                 sink.emit("log", line);
             }
@@ -128,10 +124,7 @@ impl DeployStrategy for PythonBundleDeploy {
             instance_name: Some(instance_name.clone()),
             env,
         };
-        // Activity counter shared with the engine log sink; the smart probe
-        // observes it to distinguish slow startup from a hard stall.
-        let activity = Arc::new(LogActivityCounter::new());
-        let log = self.build_venv_log(activity.clone());
+        let log = self.build_venv_log();
 
         if let Some(s) = &self.log_sink {
             s.info(&format!(
@@ -139,22 +132,6 @@ impl DeployStrategy for PythonBundleDeploy {
                 engine_id, port
             ));
         }
-
-        // Read the bundle spec once up-front so we can honor `[health]`
-        // overrides without parsing TOML twice. Failure here is non-fatal:
-        // we just fall back to the strategy default.
-        let bundle_spec = {
-            let engine_for_spec = engine_id.clone();
-            tokio::task::spawn_blocking(move || -> Option<python_venv::BundleSpec> {
-                let workspace = crate::paths::containers_root()
-                    .parent()
-                    .map(|p| p.to_path_buf())?;
-                python_venv::read_bundle_spec(&workspace, &engine_for_spec).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-        };
 
         // bootstrap (Python + uv + venv + wheels + git/pypi/vllm-metal install)
         // and engine spawn are blocking; offload onto the blocking pool so we
@@ -177,23 +154,15 @@ impl DeployStrategy for PythonBundleDeploy {
             *slot = Some(RunningState { pid });
         }
 
-        // Smart probe: race readiness URLs forever, but bail early on
-        // process exit OR `stagnation_window` of zero log activity. vllm,
-        // sglang, qwen-asr, parakeet expose /v1/models; xtts/voxcpm wrappers
-        // expose /health. Default stagnation 300s; bundle.toml `[health]
-        // stagnation_window_secs` overrides per-engine.
-        let stagnation = bundle_spec
-            .as_ref()
-            .and_then(|s| s.health.stagnation_window_secs)
-            .unwrap_or(300);
+        // Smart probe: race readiness URLs forever, bail only on process
+        // exit. vllm, sglang, qwen-asr, parakeet expose /v1/models;
+        // xtts/voxcpm wrappers expose /health.
         let probe_cfg = SmartProbeConfig {
             readiness_urls: vec![
                 format!("http://127.0.0.1:{}/v1/models", port),
                 format!("http://127.0.0.1:{}/health", port),
             ],
-            stagnation_window: Duration::from_secs(stagnation),
             status_report_interval: Duration::from_secs(30),
-            log_activity: activity,
             log_sink: self.log_sink.clone(),
         };
         let outcome = smart_health_probe(probe_cfg, move || async move {
@@ -224,18 +193,6 @@ impl DeployStrategy for PythonBundleDeploy {
                     "engine process exited before becoming ready (see {}/engine.log)",
                     venv_dir.display()
                 )));
-            }
-            SmartProbeOutcome::Stalled(silent) => {
-                if let Some(s) = &self.log_sink {
-                    s.info(&format!(
-                        "[python-bundle] stalled: no log activity for {}s — see {}/engine.log",
-                        silent.as_secs(),
-                        venv_dir.display()
-                    ));
-                }
-                self.kill_running().await;
-                let _ = self.ports.release(port);
-                return Err(DeployError::HealthTimeout(silent.as_secs()));
             }
         }
 
