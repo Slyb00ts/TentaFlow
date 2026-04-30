@@ -59,25 +59,121 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     // iroh EndpointId z MeshSecurity.public_key_hex().
     let _ = db::repository::delete_setting(&db, "node_id");
 
-    // Inicjalizacja routera
-    info!("Inicjalizacja routera...");
-    let router = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
-    router.start();
-    info!("Router uruchomiony");
-
-    // Zaladuj serwisy z bazy danych (wspolna metoda Core)
-    router.load_db_services();
-
-    // Ladowanie master key z pliku i inicjalizacja SettingsCipher (potrzebne
-    // dla restore_native_services, ktore deszyfruje sekrety w configu).
+    // Ladowanie master key z pliku i inicjalizacja SettingsCipher (deszyfruje
+    // sekrety w configach serwisow przy starcie i podczas runtime).
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
         .expect("Nie udalo sie zaladowac master key z pliku");
     let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
         &file_master_key,
     ));
 
-    // Przywroc natywne serwisy (in-process MLX/llama.cpp) z bazy
-    router.restore_native_services(&settings_cipher).await;
+    // Mesh services registry — agregator widokow `services` ze wszystkich
+    // zaufanych peerow (single source of truth po N7). Pisze do niego pipeline
+    // mesh, czyta routing/forwarding i unified server.
+    let mesh_services_registry =
+        Arc::new(tentaflow_core::services::mesh_registry::MeshServicesRegistry::new());
+
+    // MeshSecurity wczesniej niz na desktopie — supervisor stempluje
+    // `local_node_id` na ServiceInfo wpychanych do mesh_services_registry,
+    // wiec musi znac Ed25519 hex zanim odpalimy `run_first_tick`.
+    let mesh_security = Arc::new(
+        MeshSecurity::new(db.clone(), settings_cipher.clone())
+            .map_err(|e| {
+                error!("MeshSecurity init: {}", e);
+                e
+            })?,
+    );
+    let node_id = mesh_security.ed25519_public_key_hex();
+    info!("Mesh identity: {}", &node_id[..16.min(node_id.len())]);
+
+    // Port allocator dla supervisor'a — alokuje porty in-process inference
+    // serwerom (MLX/llama.cpp). Mobile nie ma Dockera, ale ma deploymenty
+    // `embedded` zapisane w services_repo (auto-load po starcie aplikacji).
+    // Excluded set jak na desktopie: porty juz przypisane zywym wierszom
+    // `services` zeby allocator nie wystawil ich rownolegle.
+    let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
+        use std::collections::HashSet;
+        use tentaflow_core::services::ports::PortAllocator;
+        use tentaflow_core::services_repo::services as services_v2_repo;
+
+        let services_runtime_cfg = config.services_runtime.clone();
+
+        let mut excluded: HashSet<u16> = HashSet::new();
+        if let Ok(conn) = db.lock() {
+            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
+                for row in rows {
+                    if let Some(p) = row.runtime_port {
+                        excluded.insert(p);
+                    }
+                    if let Some(p) = row.sidecar_quic_port {
+                        excluded.insert(p);
+                    }
+                }
+            }
+        }
+
+        match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
+            Ok(allocator) => Some(Arc::new(allocator)),
+            Err(e) => {
+                tracing::warn!(
+                    "Services supervisor disabled: invalid port_range {:?}: {}",
+                    services_runtime_cfg.port_range,
+                    e
+                );
+                None
+            }
+        }
+    };
+
+    // Inicjalizacja routera (non-blocking)
+    info!("Inicjalizacja routera...");
+    let router = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
+
+    // Supervisor — autoload natywnych deploymentow (MLX/llama.cpp embedded)
+    // z bazy po starcie. Live_handles wspoldzielony z router::service_manager
+    // zeby reconcile() pisal do tego samego cache co czyta routing.
+    // Snapshot_rx musi byc podpiety PRZED `router.start()`.
+    let services_snapshot_rx_for_router: Option<
+        tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
+    > = if let Some(port_allocator) = services_port_allocator.clone() {
+        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
+        let services_runtime_cfg = config.services_runtime.clone();
+        let live_handles = router.service_manager().live_handles.clone();
+        let (supervisor, snapshot_rx) = Supervisor::new(
+            &services_runtime_cfg,
+            db.clone(),
+            port_allocator,
+            node_id.clone(),
+            mesh_services_registry.clone(),
+            live_handles,
+        );
+        let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
+
+        if let Err(e) = supervisor.run_first_tick().await {
+            tracing::warn!("services supervisor: first_tick failed: {}", e);
+        }
+
+        let supervisor_handle = supervisor.spawn();
+        info!(
+            "Services supervisor started (interval={}ms, port_range={:?})",
+            services_runtime_cfg.health_check_interval_ms, services_runtime_cfg.port_range
+        );
+        let _supervisor_handle = supervisor_handle;
+        Some(snapshot_rx)
+    } else {
+        None
+    };
+
+    if let Some(rx) = services_snapshot_rx_for_router {
+        router.set_services_snapshot_rx(rx);
+    }
+
+    // Wire registry przed startem — routing path resolve'uje handles cross-node.
+    router
+        .service_manager()
+        .set_mesh_services_registry(mesh_services_registry.clone());
+    router.start();
+    info!("Router uruchomiony");
 
     // Zainstaluj wbudowane addony (WASM — wasmi interpreter na mobile)
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
@@ -99,19 +195,6 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
         Err(e) => error!("Blad migracji sekretow: {}", e),
         _ => {}
     }
-
-    // MeshSecurity — single source of truth dla tozsamosci. Ed25519 keypair
-    // jest zapisany zaszyfrowany w settings; iroh uzywa tego klucza jako
-    // EndpointId. Dashboard mesh porownuje node_id po Ed25519 hex.
-    let mesh_security = Arc::new(
-        MeshSecurity::new(db.clone(), settings_cipher.clone())
-            .map_err(|e| {
-                error!("MeshSecurity init: {}", e);
-                e
-            })?,
-    );
-    let node_id = mesh_security.ed25519_public_key_hex();
-    info!("Mesh identity: {}", &node_id[..16.min(node_id.len())]);
 
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard
     let mut mesh_peer_store = MeshPeerStore::new();
@@ -152,6 +235,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
             Some(db.clone()),
             settings_cipher.clone(),
             mesh_security.clone(),
+            mesh_services_registry.clone(),
         )
         .await
         {
@@ -183,6 +267,9 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     let mesh_relay_health_for_server = mesh_handles.as_ref().map(|h| h.relay_health.clone());
     let local_node_id: Arc<str> = Arc::from(node_id.as_str());
 
+    // Mobile nie uruchamia services supervisor — port allocator None oznacza,
+    // ze deploy/health-check sciezka jest wylaczona (mobile: brak Dockera, brak
+    // cieżkich procesow). Inferencja in-process jest sterowana z dashboarda.
     tentaflow_core::api::unified_server::start_unified_server(
         &config,
         &db,
@@ -193,6 +280,8 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
         local_node_id,
         mesh_security_for_server,
         mesh_relay_health_for_server,
+        None,
+        mesh_services_registry.clone(),
     )?;
 
     info!("Wszystkie serwisy uruchomione (tryb mobilny)");
