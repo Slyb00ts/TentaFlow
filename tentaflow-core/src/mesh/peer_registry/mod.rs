@@ -258,6 +258,21 @@ impl PeerRegistry {
         PeerOutcome::Created { delta }
     }
 
+    /// Tworzy pusty wpis dla `id` gdy go nie ma; w innym wypadku zostawia
+    /// istniejacy wpis nietkniety (w szczegolnosci NIE nadpisuje
+    /// `TransportHints` na default). Uzywane przez peer_store gdy chce tylko
+    /// upewnic sie ze entry istnieje przed wywolaniem state-machine
+    /// trigger'a (set_quic_connected, set_status itd.) — bez tego kazde takie
+    /// wywolanie kasowalo realne hints zlozone wczesniej przez gossip /
+    /// mesh_topology bootstrap, przez co ReconnectManager nie mial adresow do
+    /// dialu i peer utykal w Connecting.
+    pub fn ensure_present(&self, id: NodeId) -> PeerOutcome {
+        if self.shard(&id).map.read().contains_key(&id) {
+            return PeerOutcome::NoChange;
+        }
+        self.upsert_discovered(id, TransportHints::default())
+    }
+
     pub fn record_heartbeat(&self, id: &NodeId, at: Instant) -> PeerOutcome {
         let Some(arc) = self.get_arc(id) else {
             return PeerOutcome::NoChange;
