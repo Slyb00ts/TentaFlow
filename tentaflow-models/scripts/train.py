@@ -14,7 +14,11 @@ import hashlib
 import json
 import os
 import random as _random
+import re
 import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
 
 import torch
 from datasets import Dataset, concatenate_datasets
@@ -143,10 +147,107 @@ def check_training_status(output_dir, current_fingerprint):
     return "resume"
 
 
-def get_qwen_datasets(task, fraction=1.0, balance=False):
+# ---------------------------------------------------------------------------
+# Timing instrumentation
+# ---------------------------------------------------------------------------
+
+def slugify(s):
+    """Zamienia znaki niealfanumeryczne na '-' (np. Qwen3.5-4B -> Qwen3-5-4B)."""
+    return re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-")
+
+
+@contextmanager
+def phase_timer(name, phases):
+    """Mierzy czas wykonania bloku, zapisuje sekundy do phases dict."""
+    t0 = time.perf_counter()
+    yield
+    phases[name] = time.perf_counter() - t0
+
+
+def fmt_duration(seconds):
+    """Formatuje sekundy jako HH:MM:SS lub MM:SS."""
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def print_and_save_timing(phases, output_dir, run_id, started_at, finished_at,
+                          config, training_stats):
+    """Printuje ASCII summary + zapisuje timing-<id>.json + symlink timing-latest.json."""
+    total = finished_at - started_at
+    sum_phases = sum(phases.values())
+
+    print()
+    print("=" * 60)
+    print("  TIMING SUMMARY")
+    print("=" * 60)
+    print(f"  Started:  {datetime.fromtimestamp(started_at).isoformat(timespec='seconds')}")
+    print(f"  Finished: {datetime.fromtimestamp(finished_at).isoformat(timespec='seconds')}")
+    print(f"  Total:    {fmt_duration(total)}")
+    print()
+    print(f"  {'Phase':<28} {'Duration':>10}    {'%':>6}")
+    print(f"  {'-' * 28} {'-' * 10}    {'-' * 6}")
+    for name, dur in phases.items():
+        pct = (dur / total * 100) if total > 0 else 0
+        print(f"  {name:<28} {fmt_duration(dur):>10}    {pct:5.1f}%")
+    print(f"  {'-' * 28} {'-' * 10}    {'-' * 6}")
+    print()
+    if training_stats:
+        print("  Training stats:")
+        if training_stats.get("total_steps"):
+            print(f"    Steps:           {training_stats['total_steps']}")
+        if training_stats.get("avg_seconds_per_step"):
+            print(f"    Avg/step:        {training_stats['avg_seconds_per_step']:.2f}s")
+        if training_stats.get("effective_batch"):
+            print(f"    Effective batch: {training_stats['effective_batch']}")
+        if training_stats.get("samples_per_sec"):
+            print(f"    Samples/sec:     {training_stats['samples_per_sec']:.2f}")
+        if training_stats.get("tokens_per_sec"):
+            print(f"    Tokens/sec:      {training_stats['tokens_per_sec']:,.0f}")
+        if training_stats.get("final_loss") is not None:
+            print(f"    Final loss:      {training_stats['final_loss']:.4f}")
+    print("=" * 60)
+
+    os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "timestamps": {
+            "started": datetime.fromtimestamp(started_at).isoformat(timespec="seconds"),
+            "finished": datetime.fromtimestamp(finished_at).isoformat(timespec="seconds"),
+            "duration_seconds": round(total, 2),
+        },
+        "config": config,
+        "phases": {k: round(v, 2) for k, v in phases.items()},
+        "training_stats": training_stats,
+    }
+    timing_path = os.path.join(output_dir, f"timing-{run_id}.json")
+    with open(timing_path, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    latest_link = os.path.join(output_dir, "timing-latest.json")
+    if os.path.islink(latest_link) or os.path.exists(latest_link):
+        try:
+            os.unlink(latest_link)
+        except OSError:
+            pass
+    try:
+        os.symlink(os.path.basename(timing_path), latest_link)
+    except OSError:
+        pass
+
+    print(f"  Saved timing: {timing_path}")
+    print(f"  Latest:       {latest_link}")
+
+
+def get_qwen_datasets(task, fraction=1.0, balance=False, extra_train_files=None, extra_eval_files=None):
     """Zwraca (train_dataset, eval_dataset) dla Qwen."""
     train_files = []
     eval_files = []
+    extra_train_files = extra_train_files or []
+    extra_eval_files = extra_eval_files or []
 
     datasets = {
         "intent": "intent",
@@ -224,6 +325,18 @@ def get_qwen_datasets(task, fraction=1.0, balance=False):
         if records:
             eval_records.extend(records)
 
+    for f in extra_train_files:
+        records = load_jsonl(f)
+        if records:
+            train_records.extend(records)
+            print(f"  extra train {f}: {len(records)} rekordow")
+
+    for f in extra_eval_files:
+        records = load_jsonl(f)
+        if records:
+            eval_records.extend(records)
+            print(f"  extra eval {f}: {len(records)} rekordow")
+
     return train_records, eval_records
 
 
@@ -238,14 +351,23 @@ def get_llama_datasets():
 # Trening Qwen (QLoRA)
 # ---------------------------------------------------------------------------
 
-def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=False):
-    """Trening Qwen3.5-0.8B — qlora, lora, full, dora."""
+def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=False,
+               extra_train_files=None, extra_eval_files=None):
+    """Trening Qwen — qlora, lora, full, dora."""
+    qwen_label = os.path.basename(QWEN_MODEL.rstrip("/"))
+    qwen_slug = slugify(qwen_label)
     print("=" * 60)
-    print(f"Trening Qwen3.5-0.8B | task: {task} | method: {method}")
+    print(f"Trening {qwen_label} | task: {task} | method: {method}")
     print("=" * 60)
 
-    # Nazwa katalogu wyjsciowego: qwen-{task}-{method} + opcjonalny suffix fraction
-    dir_name = f"qwen-{task}-{method}"
+    phases = {}
+    started_at_wall = time.time()
+    run_id = datetime.fromtimestamp(started_at_wall).strftime("%Y%m%d-%H%M%S")
+
+    # SETUP — manual timer because of early-return on skip
+    setup_t0 = time.perf_counter()
+
+    dir_name = f"{qwen_slug}-{task}-{method}"
     if fraction < 1.0:
         if fraction <= 0.34:
             dir_name += "-low"
@@ -255,7 +377,6 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
             dir_name += "-high"
     output_dir = os.path.join(ROOT, "output", dir_name)
 
-    # Fingerprint danych — wykryj czy dane sie zmienily
     datasets_map = {
         "intent": "intent", "guard": "guard", "model": "model",
         "plan": "plan", "check": "check", "toolcalling": "toolcalling",
@@ -268,9 +389,10 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
                    or (task == "orchestrator" and ds_name in orchestrator_tasks))
         if include:
             fp_files.append(os.path.join(ROOT, "data", ds_dir, "qwen_train.jsonl"))
-    current_fp = compute_data_fingerprint(fp_files)
+    extra_train_files = extra_train_files or []
+    extra_eval_files = extra_eval_files or []
+    current_fp = compute_data_fingerprint(fp_files + extra_train_files + extra_eval_files)
 
-    # Sprawdz status: skip / resume / fresh
     if resume_from is None:
         status = check_training_status(output_dir, current_fp)
         if status == "skip":
@@ -284,37 +406,19 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
             else:
                 print(f"\n  FRESH: brak checkpointu, trening od zera")
 
-    # Tokenizer
-    print("\nTokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    special_tokens = [
-        "<|guard|>", "<|intent|>", "<|tools|>", "<|query|>",
-        "<|memory|>", "<|summary|>", "<|feedback|>", "<|recall|>",
-        "<|extract|>", "<|model|>", "<|plan|>", "<|check|>",
-    ]
-    num_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
-    print(f"  Special tokeny: +{num_added}")
-
-    # Multi-GPU (DeepSpeed) nie moze uzyc device_map="auto" — model ladowany na CPU,
-    # DeepSpeed sam rozdziela na karty. Single-GPU uzywa device_map="auto".
     is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     dm = None if is_distributed else "auto"
     if is_distributed:
         print(f"  Multi-GPU: device_map=None (DeepSpeed zarzadza dystrybucja)")
 
-    # Attention — flash_attention_2 > sdpa > eager (fallback)
     try:
         import flash_attn  # noqa: F401
         attn_impl = "flash_attention_2"
         print("  Attention: flash_attention_2")
     except ImportError:
-        attn_impl = "sdpa"  # PyTorch native, ~1.5x szybszy niz eager
+        attn_impl = "sdpa"
         print("  Attention: sdpa (PyTorch native)")
 
-    # Wspolne parametry ladowania modelu
     load_kwargs = dict(
         device_map=dm,
         trust_remote_code=True,
@@ -322,192 +426,229 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
     )
     if attn_impl:
         load_kwargs["attn_implementation"] = attn_impl
-
-    if method == "full":
-        # Full fine-tune — caly model, bez quantyzacji, bez LoRA
-        print("Model (full fine-tune, bf16)...")
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL, **load_kwargs,
-        )
-        model.resize_token_embeddings(len(tokenizer))
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  trainable params: {trainable:,} || all params: {total:,} || trainable%: 100.0")
-
-    elif method == "lora":
-        # LoRA bez quantyzacji (bf16 + adapter)
-        print("Model (bf16 + LoRA)...")
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL, **load_kwargs,
-        )
-        model.resize_token_embeddings(len(tokenizer))
-
-        print("LoRA...")
-        lora_config = LoraConfig(
-            r=64,
-            lora_alpha=128,
-            lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
-
-    elif method == "dora":
-        # DoRA — Weight-Decomposed Low-Rank Adaptation
-        print("Model (bf16 + DoRA)...")
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL, **load_kwargs,
-        )
-        model.resize_token_embeddings(len(tokenizer))
-
-        print("DoRA...")
-        lora_config = LoraConfig(
-            r=64,
-            lora_alpha=128,
-            lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-            task_type="CAUSAL_LM",
-            use_dora=True,
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
-
-    else:
-        # QLoRA (domyslne — 4-bit quantyzacja + LoRA)
-        print("Model (4-bit QLoRA)...")
-        bnb_config = BitsAndBytesConfig(
+    if method == "qlora":
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
-        qlora_kwargs = dict(load_kwargs)
-        qlora_kwargs["quantization_config"] = bnb_config
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL, **qlora_kwargs,
-        )
+
+    phases["setup"] = time.perf_counter() - setup_t0
+
+    with phase_timer("tokenizer", phases):
+        print("\nTokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        special_tokens = [
+            "<|guard|>", "<|intent|>", "<|tools|>", "<|query|>",
+            "<|memory|>", "<|summary|>", "<|feedback|>", "<|recall|>",
+            "<|extract|>", "<|model|>", "<|plan|>", "<|check|>",
+        ]
+        num_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        print(f"  Special tokeny: +{num_added}")
+
+    with phase_timer("model_load", phases):
+        load_label = {
+            "full": "full fine-tune, bf16",
+            "lora": "bf16 + LoRA",
+            "dora": "bf16 + DoRA",
+            "qlora": "4-bit QLoRA",
+        }[method]
+        print(f"Model ({load_label})...")
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(QWEN_MODEL, **load_kwargs)
         model.resize_token_embeddings(len(tokenizer))
-        model = prepare_model_for_kbit_training(model)
 
-        print("QLoRA...")
-        lora_config = LoraConfig(
-            r=32,
-            lora_alpha=64,
-            lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-            task_type="CAUSAL_LM",
+    with phase_timer("peft_wrap", phases):
+        if method == "full":
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: 100.0")
+        else:
+            if method == "qlora":
+                model = prepare_model_for_kbit_training(model)
+                lora_config = LoraConfig(
+                    r=32, lora_alpha=64, lora_dropout=0.05,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
+                    bias="none", task_type="CAUSAL_LM",
+                )
+            elif method == "dora":
+                lora_config = LoraConfig(
+                    r=64, lora_alpha=128, lora_dropout=0.05,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
+                    bias="none", task_type="CAUSAL_LM", use_dora=True,
+                )
+            else:  # lora
+                lora_config = LoraConfig(
+                    r=64, lora_alpha=128, lora_dropout=0.05,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
+                    bias="none", task_type="CAUSAL_LM",
+                )
+            print(f"{method.upper()}...")
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+
+    train_dataset = None
+    eval_dataset = None
+    total_train_tokens = 0
+    with phase_timer("dataset", phases):
+        print("\nDane...")
+        train_records, eval_records = get_qwen_datasets(
+            task,
+            fraction=fraction,
+            balance=balance,
+            extra_train_files=extra_train_files,
+            extra_eval_files=extra_eval_files,
         )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+        if train_records:
+            def format_chat(record):
+                return tokenizer.apply_chat_template(
+                    record["messages"], tokenize=False, add_generation_prompt=False
+                )
 
-    # Dane
-    print("\nDane...")
-    train_records, eval_records = get_qwen_datasets(task, fraction=fraction, balance=balance)
-    if not train_records:
+            train_texts = [format_chat(r) for r in train_records]
+            eval_texts = [format_chat(r) for r in eval_records] if eval_records else []
+
+            train_dataset = Dataset.from_dict({"text": train_texts})
+            eval_dataset = Dataset.from_dict({"text": eval_texts}) if eval_texts else None
+
+            total_train_tokens = sum(
+                len(tokenizer.encode(t, add_special_tokens=False)) for t in train_texts
+            )
+            print(f"  Train: {len(train_texts)}, Eval: {len(eval_texts)}, Tokens: {total_train_tokens:,}")
+
+    if train_dataset is None:
         print("BLAD: Brak danych! Uruchom convert.py najpierw.")
         return
 
-    def format_chat(record):
-        return tokenizer.apply_chat_template(
-            record["messages"], tokenize=False, add_generation_prompt=False
-        )
-
-    train_texts = [format_chat(r) for r in train_records]
-    eval_texts = [format_chat(r) for r in eval_records] if eval_records else []
-
-    train_dataset = Dataset.from_dict({"text": train_texts})
-    eval_dataset = Dataset.from_dict({"text": eval_texts}) if eval_texts else None
-
-    print(f"  Train: {len(train_texts)}, Eval: {len(eval_texts)}")
-
-    # Hiperparametry per metoda
-    is_multi_gpu = int(os.environ.get("WORLD_SIZE", "1")) > 1
     num_gpus = int(os.environ.get("WORLD_SIZE", "1"))
-
-    # Hiperparametry — model 0.8B na 1 GPU (24GB RTX 3090)
-    # bf16 model (~1.6GB) + optimizer + gradienty + aktywacje
-    # QLoRA: 4-bit model (~0.5GB) — wiekszy batch
-    # LoRA/DoRA/Full: bf16 model — mniejszy batch (cross_entropy na vocab 150k zjada duzo)
     if method == "full":
         lr = 5e-5
-        batch = 2
-        grad_accum = 16
+        batch = 8
+        grad_accum = 4
         epochs = 3
     elif method in ("lora", "dora"):
         lr = 1e-4
-        batch = 2
-        grad_accum = 16
+        batch = 14
+        grad_accum = 3
         epochs = 5
     else:  # qlora
         lr = 2e-4
-        batch = 2
-        grad_accum = 16
+        batch = 16
+        grad_accum = 2
         epochs = 5
 
     eff_batch = batch * grad_accum * num_gpus
+    max_length = 2048
+    packing = False
+    gradient_checkpointing = False
 
-    # Trening
-    print(f"\nTrening (method={method}, lr={lr}, batch={batch}x{grad_accum}x{num_gpus}gpu={eff_batch})...")
-    training_args = SFTConfig(
-        output_dir=output_dir,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch,
-        per_device_eval_batch_size=batch,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=lr,
-        lr_scheduler_type="cosine",
-        warmup_steps=50,
-        weight_decay=0.01,
-        bf16=True,
-        tf32=True,
-        gradient_checkpointing=True,
-        dataloader_num_workers=4,
-        dataloader_pin_memory=True,
-        logging_steps=10,
-        eval_strategy="no",
-        save_strategy="steps",
-        save_steps=500,
-        save_total_limit=2,
-        report_to="none",
-        max_grad_norm=1.0,
-        max_length=2048,
-        dataset_text_field="text",
-        packing=False,
-    )
+    with phase_timer("trainer_init", phases):
+        print(f"\nTrening (method={method}, lr={lr}, batch={batch}x{grad_accum}x{num_gpus}gpu={eff_batch})...")
+        training_args = SFTConfig(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch,
+            per_device_eval_batch_size=batch,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=lr,
+            lr_scheduler_type="cosine",
+            warmup_steps=50,
+            weight_decay=0.01,
+            bf16=True,
+            tf32=True,
+            gradient_checkpointing=gradient_checkpointing,
+            optim="adamw_torch_fused",
+            use_liger_kernel=True,
+            dataloader_num_workers=8,
+            dataloader_pin_memory=True,
+            dataloader_persistent_workers=True,
+            dataloader_prefetch_factor=4,
+            logging_steps=10,
+            eval_strategy="no",
+            save_strategy="steps",
+            save_steps=500,
+            save_total_limit=2,
+            report_to="none",
+            max_grad_norm=1.0,
+            max_length=max_length,
+            dataset_text_field="text",
+            packing=packing,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+        )
 
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=tokenizer,
-    )
+    with phase_timer("training", phases):
+        if resume_from:
+            print(f"  Resume from: {resume_from}")
+            trainer.train(resume_from_checkpoint=resume_from)
+        else:
+            trainer.train()
 
-    if resume_from:
-        print(f"  Resume from: {resume_from}")
-        trainer.train(resume_from_checkpoint=resume_from)
-    else:
-        trainer.train()
-
-    print(f"\nZapis do {output_dir}...")
-    if method == "full":
-        # Full fine-tune — zapisz caly model
-        model.save_pretrained(output_dir)
-        print(f"  Zapisano pelny model ({method})")
-    else:
-        # LoRA/QLoRA/DoRA — zapisz adapter
-        trainer.save_model(output_dir)
-        print(f"  Zapisano adapter ({method})")
-    tokenizer.save_pretrained(output_dir)
-    save_fingerprint(output_dir, current_fp)
+    with phase_timer("save", phases):
+        print(f"\nZapis do {output_dir}...")
+        if method == "full":
+            model.save_pretrained(output_dir)
+            print(f"  Zapisano pelny model ({method})")
+        else:
+            trainer.save_model(output_dir)
+            print(f"  Zapisano adapter ({method})")
+        tokenizer.save_pretrained(output_dir)
+        save_fingerprint(output_dir, current_fp)
     print(f"Qwen trening zakonczony! (method={method})")
+
+    finished_at_wall = time.time()
+
+    training_seconds = phases.get("training", 0.0)
+    total_steps = int(getattr(trainer.state, "global_step", 0))
+    avg_per_step = (training_seconds / total_steps) if total_steps > 0 else 0.0
+    samples_per_sec = (total_steps * eff_batch / training_seconds) if training_seconds > 0 else 0.0
+    total_tokens_seen = total_train_tokens * epochs
+    tokens_per_sec = (total_tokens_seen / training_seconds) if training_seconds > 0 else 0.0
+
+    final_loss = None
+    for entry in reversed(trainer.state.log_history or []):
+        if "loss" in entry:
+            final_loss = float(entry["loss"])
+            break
+
+    config = {
+        "task": task,
+        "method": method,
+        "qwen_base": qwen_label,
+        "fraction": fraction,
+        "balance": balance,
+        "batch_size": batch,
+        "grad_accum": grad_accum,
+        "effective_batch": eff_batch,
+        "epochs": epochs,
+        "learning_rate": lr,
+        "max_length": max_length,
+        "packing": packing,
+        "gradient_checkpointing": gradient_checkpointing,
+        "num_gpus": num_gpus,
+    }
+    training_stats = {
+        "total_steps": total_steps,
+        "avg_seconds_per_step": round(avg_per_step, 3),
+        "effective_batch": eff_batch,
+        "samples_per_sec": round(samples_per_sec, 2),
+        "tokens_per_sec": round(tokens_per_sec, 0),
+        "total_tokens_seen": int(total_tokens_seen),
+        "final_loss": final_loss,
+    }
+    print_and_save_timing(phases, output_dir, run_id, started_at_wall, finished_at_wall,
+                          config, training_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +663,13 @@ def train_llama():
     print("Trening Llama Prompt Guard 86M | task: guard (short only)")
     print("=" * 60)
 
-    output_dir = os.path.join(ROOT, "output", "llama-guard")
+    phases = {}
+    started_at_wall = time.time()
+    run_id = datetime.fromtimestamp(started_at_wall).strftime("%Y%m%d-%H%M%S")
 
-    # Fingerprint danych llama guard
+    setup_t0 = time.perf_counter()
+
+    output_dir = os.path.join(ROOT, "output", "llama-guard")
     fp_files = [
         os.path.join(ROOT, "data", "guard", "llama_train.jsonl"),
         os.path.join(ROOT, "data", "guard", "llama_eval.jsonl"),
@@ -542,73 +687,128 @@ def train_llama():
         if resume_from:
             print(f"\n  RESUME: checkpoint {resume_from}")
 
-    # Tokenizer + model
-    print("\nModel...")
-    tokenizer = AutoTokenizer.from_pretrained(LLAMA_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        LLAMA_MODEL,
-        num_labels=3,
-        id2label={0: "SAFE", 1: "INJECTION", 2: "JAILBREAK"},
-        label2id={"SAFE": 0, "INJECTION": 1, "JAILBREAK": 2},
-        ignore_mismatched_sizes=True,
-    )
+    phases["setup"] = time.perf_counter() - setup_t0
 
-    # Dane
-    print("Dane...")
-    train_records, eval_records = get_llama_datasets()
-    if not train_records:
+    with phase_timer("tokenizer", phases):
+        print("\nTokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(LLAMA_MODEL)
+
+    with phase_timer("model_load", phases):
+        print("Model...")
+        model = AutoModelForSequenceClassification.from_pretrained(
+            LLAMA_MODEL,
+            num_labels=3,
+            id2label={0: "SAFE", 1: "INJECTION", 2: "JAILBREAK"},
+            label2id={"SAFE": 0, "INJECTION": 1, "JAILBREAK": 2},
+            ignore_mismatched_sizes=True,
+        )
+
+    train_dataset = None
+    eval_dataset = None
+    total_train_tokens = 0
+    with phase_timer("dataset", phases):
+        print("Dane...")
+        train_records, eval_records = get_llama_datasets()
+        if train_records:
+            train_dataset = Dataset.from_list(train_records)
+            eval_dataset = Dataset.from_list(eval_records) if eval_records else None
+
+            def tokenize(examples):
+                return tokenizer(examples["text"], truncation=True, padding=True, max_length=512)
+
+            train_dataset = train_dataset.map(tokenize, batched=True)
+            if eval_dataset:
+                eval_dataset = eval_dataset.map(tokenize, batched=True)
+
+            total_train_tokens = sum(len(ids) for ids in train_dataset["input_ids"])
+            print(f"  Train: {len(train_dataset)}, Eval: {len(eval_dataset) if eval_dataset else 0}, Tokens: {total_train_tokens:,}")
+
+    if train_dataset is None:
         print("BLAD: Brak danych! Uruchom convert.py guard najpierw.")
         return
 
-    train_dataset = Dataset.from_list(train_records)
-    eval_dataset = Dataset.from_list(eval_records) if eval_records else None
+    batch = 16
+    epochs = 3
+    eff_batch = batch * int(os.environ.get("WORLD_SIZE", "1"))
 
-    def tokenize(examples):
-        return tokenizer(examples["text"], truncation=True, padding=True, max_length=512)
+    with phase_timer("trainer_init", phases):
+        print("\nTrening...")
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch,
+            per_device_eval_batch_size=batch,
+            learning_rate=2e-5,
+            weight_decay=0.01,
+            eval_strategy="epoch" if eval_dataset else "no",
+            save_strategy="epoch",
+            save_total_limit=2,
+            load_best_model_at_end=True if eval_dataset else False,
+            report_to="none",
+            bf16=True,
+            optim="adamw_torch_fused",
+            dataloader_num_workers=8,
+            dataloader_pin_memory=True,
+            dataloader_persistent_workers=True,
+            dataloader_prefetch_factor=4,
+        )
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+            data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+        )
 
-    train_dataset = train_dataset.map(tokenize, batched=True)
-    if eval_dataset:
-        eval_dataset = eval_dataset.map(tokenize, batched=True)
+    with phase_timer("training", phases):
+        if resume_from:
+            print(f"  Resume from: {resume_from}")
+            trainer.train(resume_from_checkpoint=resume_from)
+        else:
+            trainer.train()
 
-    print(f"  Train: {len(train_dataset)}, Eval: {len(eval_dataset) if eval_dataset else 0}")
-
-    # Trening
-    print("\nTrening...")
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=3,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        learning_rate=2e-5,
-        weight_decay=0.01,
-        eval_strategy="epoch" if eval_dataset else "no",
-        save_strategy="epoch",
-        save_total_limit=2,
-        load_best_model_at_end=True if eval_dataset else False,
-        report_to="none",
-        bf16=True,
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=tokenizer,
-        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
-    )
-
-    if resume_from:
-        print(f"  Resume from: {resume_from}")
-        trainer.train(resume_from_checkpoint=resume_from)
-    else:
-        trainer.train()
-
-    print(f"\nZapis do {output_dir}...")
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    save_fingerprint(output_dir, current_fp)
+    with phase_timer("save", phases):
+        print(f"\nZapis do {output_dir}...")
+        model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        save_fingerprint(output_dir, current_fp)
     print("Llama Guard trening zakonczony!")
+
+    finished_at_wall = time.time()
+    training_seconds = phases.get("training", 0.0)
+    total_steps = int(getattr(trainer.state, "global_step", 0))
+    avg_per_step = (training_seconds / total_steps) if total_steps > 0 else 0.0
+    samples_per_sec = (total_steps * eff_batch / training_seconds) if training_seconds > 0 else 0.0
+    tokens_per_sec = (total_train_tokens * epochs / training_seconds) if training_seconds > 0 else 0.0
+
+    final_loss = None
+    for entry in reversed(trainer.state.log_history or []):
+        if "loss" in entry:
+            final_loss = float(entry["loss"])
+            break
+
+    config = {
+        "model": "llama-prompt-guard-86m",
+        "task": "guard",
+        "method": "full",
+        "batch_size": batch,
+        "effective_batch": eff_batch,
+        "epochs": epochs,
+        "learning_rate": 2e-5,
+        "max_length": 512,
+    }
+    training_stats = {
+        "total_steps": total_steps,
+        "avg_seconds_per_step": round(avg_per_step, 3),
+        "effective_batch": eff_batch,
+        "samples_per_sec": round(samples_per_sec, 2),
+        "tokens_per_sec": round(tokens_per_sec, 0),
+        "total_tokens_seen": int(total_train_tokens * epochs),
+        "final_loss": final_loss,
+    }
+    print_and_save_timing(phases, output_dir, run_id, started_at_wall, finished_at_wall,
+                          config, training_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +872,23 @@ Przyklady:
                         help="Frakcja danych treningowych (0.0-1.0, domyslnie 1.0)")
     parser.add_argument("--balance", action="store_true",
                         help="Zrownowaz datasety (cap do mediany)")
+    parser.add_argument("--qwen-base", default=None,
+                        help="Nazwa katalogu bazowego Qwen w models/ albo absolutna sciezka (np. Qwen3.5-4B)")
+    parser.add_argument("--extra-train", nargs="+", action="append", default=[],
+                        help="Dodatkowe pliki JSONL w formacie Qwen chat dolaczane do train")
+    parser.add_argument("--extra-eval", nargs="+", action="append", default=[],
+                        help="Dodatkowe pliki JSONL w formacie Qwen chat dolaczane do eval")
     args = parser.parse_args()
+    args.extra_train = [path for group in args.extra_train for path in group]
+    args.extra_eval = [path for group in args.extra_eval for path in group]
+
+    if args.qwen_base:
+        global QWEN_MODEL
+        QWEN_MODEL = args.qwen_base if os.path.isabs(args.qwen_base) \
+            else os.path.join(ROOT, "models", args.qwen_base)
+        if not os.path.exists(QWEN_MODEL):
+            print(f"Brak katalogu bazowego Qwen: {QWEN_MODEL}")
+            sys.exit(1)
 
     if args.model == "llama":
         if args.task not in ("guard", "all"):
@@ -699,12 +915,20 @@ Przyklady:
             cmd.extend(["--fraction", str(args.fraction)])
         if args.balance:
             cmd.append("--balance")
+        if args.qwen_base:
+            cmd.extend(["--qwen-base", args.qwen_base])
+        for path in args.extra_train:
+            cmd.extend(["--extra-train", path])
+        for path in args.extra_eval:
+            cmd.extend(["--extra-eval", path])
         print(f"Multi-GPU: {args.gpus} kart, DeepSpeed {'ZeRO-3' if args.method == 'full' else 'ZeRO-2'}")
         print(f"Komenda: {' '.join(cmd)}")
         os.execvp(cmd[0], cmd)
     else:
         train_qwen(args.task, resume_from=args.resume, method=args.method,
-                   fraction=args.fraction, balance=args.balance)
+                   fraction=args.fraction, balance=args.balance,
+                   extra_train_files=args.extra_train,
+                   extra_eval_files=args.extra_eval)
 
 
 if __name__ == "__main__":
