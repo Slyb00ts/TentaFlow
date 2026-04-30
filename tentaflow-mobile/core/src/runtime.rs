@@ -267,9 +267,11 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     let mesh_relay_health_for_server = mesh_handles.as_ref().map(|h| h.relay_health.clone());
     let local_node_id: Arc<str> = Arc::from(node_id.as_str());
 
-    // Mobile nie uruchamia services supervisor — port allocator None oznacza,
-    // ze deploy/health-check sciezka jest wylaczona (mobile: brak Dockera, brak
-    // cieżkich procesow). Inferencja in-process jest sterowana z dashboarda.
+    // Mobile uruchamia supervisor dla deploymentow `embedded` (MLX/llama.cpp
+    // in-process). Allocator skonstruowany wyzej musi byc przekazany do dispatcher
+    // AppState, inaczej handlery deploy/start/stop rzucaja "port allocator not
+    // initialized". Brak Dockera nie przeszkadza — embedded deploymenty (np.
+    // yolo8n-pose, MLX modele) i tak nie alokuja portow zewnetrznych.
     tentaflow_core::api::unified_server::start_unified_server(
         &config,
         &db,
@@ -280,7 +282,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
         local_node_id,
         mesh_security_for_server,
         mesh_relay_health_for_server,
-        None,
+        services_port_allocator.clone(),
         mesh_services_registry.clone(),
     )?;
 
