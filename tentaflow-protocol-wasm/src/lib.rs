@@ -2069,6 +2069,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "engine_id", m.engine_id.into());
                 set(&item, "serviceId", (m.service_id as f64).into());
                 set(&item, "service_id", (m.service_id as f64).into());
+                set(&item, "nodeId", m.node_id.clone().into());
+                set(&item, "node_id", m.node_id.into());
                 set(&item, "availability", m.availability.into());
                 set(&item, "transport", m.transport.into());
                 if let Some(url) = m.endpoint_url {

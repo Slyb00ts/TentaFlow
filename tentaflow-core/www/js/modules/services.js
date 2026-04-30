@@ -22,6 +22,7 @@ let services = [];
 let aliases = [];
 let meshNodes = [];
 let unifiedModels = [];
+let modelsCache = [];
 let refresher = null;
 let currentTab = 'list';
 let lastQuery = '';
@@ -72,6 +73,7 @@ const ServicesScreen = {
     aliases = [];
     meshNodes = [];
     unifiedModels = [];
+    modelsCache = [];
   },
 };
 
@@ -79,20 +81,21 @@ const ServicesScreen = {
 
 async function loadAll() {
   try {
-    const [svc, al, nodes, unified] = await Promise.all([
+    const [svc, al, nodes, unified, models] = await Promise.all([
       ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
       ManifestStore.init().catch(() => false),
     ]);
     services = Array.isArray(svc) ? svc : [];
     aliases = al || [];
     meshNodes = nodes || [];
     unifiedModels = Array.isArray(unified) ? unified : [];
-    // Local service_registry is fresh — /api/mesh/nodes does not surface this
-    // node's models until the first heartbeat lands. Merge the unified list so
-    // the Models tab paints something on first load.
+    modelsCache = Array.isArray(models) ? models : [];
+    // Legacy unified merge feeds the per-node models[] still consumed by the
+    // Mesh detail page; the Models tab itself reads from modelsCache.
     mergeUnifiedModelsIntoNodes();
     renderTab();
     updateSubtitle();
@@ -119,13 +122,12 @@ async function loadForCurrentTab() {
       aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
       patchAliasesTab();
     } else if (currentTab === 'models') {
-      const [nodes, unified] = await Promise.all([
+      const [nodes, models] = await Promise.all([
         ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
-        ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+        ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
       ]);
       meshNodes = nodes || [];
-      unifiedModels = Array.isArray(unified) ? unified : [];
-      mergeUnifiedModelsIntoNodes();
+      modelsCache = Array.isArray(models) ? models : [];
       patchModelsTab();
     }
     updateSubtitle();
@@ -538,27 +540,33 @@ function mergeUnifiedModelsIntoNodes() {
 
 
 function collectUniqueModels() {
-  // Zbiera z meshNodes[].models[] — grupuj po kluczu (alias|backend|kind).
+  // Source: modelListRequest (services_repo::models::list_alive) — JOIN of
+  // model_registry + services WHERE status IN ('running','degraded'). Keys by
+  // (model_name, engine_id) so the same alias served by multiple engines stays
+  // distinguishable, and aggregates node_id into a chip list per row.
   const map = new Map();
-  for (const n of meshNodes) {
-    const list = Array.isArray(n.models) ? n.models : [];
-    const nodeLabel = n.hostname || (n.node_id ? n.node_id.slice(0, 12) : '?');
-    for (const m of list) {
-      const key = `${m.alias}|${m.backend || ''}|${m.kind || ''}`;
-      if (!map.has(key)) {
-        map.set(key, {
-          alias: m.alias,
-          kind: m.kind || '',
-          backend: m.backend || '',
-          size_mb: m.size_mb || 0,
-          loaded: !!m.loaded,
-          nodes: [nodeLabel],
-        });
-      } else {
-        const entry = map.get(key);
-        if (!entry.nodes.includes(nodeLabel)) entry.nodes.push(nodeLabel);
-        entry.loaded = entry.loaded || m.loaded;
-      }
+  for (const m of modelsCache) {
+    const alias = m.model_name || m.modelName || m.id;
+    if (!alias) continue;
+    const backend = m.engine_id || m.engineId || '';
+    const kind = (m.category || '').toLowerCase();
+    const key = `${alias}|${backend}`;
+    const nodeInfo = nodeLabelFor(m.node_id || m.nodeId || '');
+    const nodeLabel = nodeInfo.label;
+    const isLoaded = (m.availability || '').toLowerCase() === 'running';
+    if (!map.has(key)) {
+      map.set(key, {
+        alias,
+        kind,
+        backend,
+        size_mb: 0,
+        loaded: isLoaded,
+        nodes: nodeLabel ? [nodeLabel] : [],
+      });
+    } else {
+      const entry = map.get(key);
+      if (nodeLabel && !entry.nodes.includes(nodeLabel)) entry.nodes.push(nodeLabel);
+      entry.loaded = entry.loaded || isLoaded;
     }
   }
   return [...map.values()].sort((a, b) => a.alias.localeCompare(b.alias));

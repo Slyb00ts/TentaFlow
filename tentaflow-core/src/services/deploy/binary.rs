@@ -225,7 +225,7 @@ impl DeployStrategy for BinaryDeploy {
             // Infra & agents have no model registry rows.
             Vec::new()
         } else {
-            models_from_manifest(&self.manifest)
+            models_from_manifest(&self.manifest, &self.user_config)
         };
 
         let config_json = serde_json::to_string(&self.user_config)

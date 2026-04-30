@@ -204,7 +204,7 @@ impl DeployStrategy for PythonBundleDeploy {
             container_id: None,
             instance_dir: Some(venv_dir),
         };
-        let models = models_from_manifest(&self.manifest);
+        let models = models_from_manifest(&self.manifest, &self.user_config);
         let config_json = serde_json::to_string(&self.user_config)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 

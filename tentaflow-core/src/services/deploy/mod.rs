@@ -566,25 +566,78 @@ where
     }
 }
 
-/// Pulls model presets from the manifest into `NewModel` rows. `service_id`
-/// is filled by the dispatcher after commit.
-pub(crate) fn models_from_manifest(manifest: &ServiceManifest) -> Vec<NewModel> {
-    manifest
+/// Builds `NewModel` rows from the manifest filtered by user wizard choice.
+/// `service_id` is filled by the dispatcher after commit.
+///
+/// Selection priority:
+///   1. `user_config.model_repo` — custom HF repo, single row, no preset.
+///   2. `user_config.model_preset_id` — single preset matched by id.
+///   3. Recommended preset (or first) — fallback when wizard sent neither.
+///   4. Empty Vec — engines without presets at all (e.g. teams-bot).
+pub(crate) fn models_from_manifest(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> Vec<NewModel> {
+    let capabilities = format!("[\"{}\"]", manifest.engine.capability_tag());
+
+    // 1. Custom HF repo from the wizard wins outright.
+    if let Some(repo) = user_config
+        .get("model_repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return vec![NewModel {
+            service_id: 0,
+            model_name: repo.to_string(),
+            display_name: Some(repo.to_string()),
+            capabilities,
+            context_length: None,
+            quantization: None,
+            is_default: true,
+        }];
+    }
+
+    // 2. Explicit preset selection by id.
+    if let Some(id) = user_config
+        .get("model_preset_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(p) = manifest.model_presets.iter().find(|m| m.id == id) {
+            return vec![NewModel {
+                service_id: 0,
+                model_name: p.id.clone(),
+                display_name: Some(p.display_name.clone()),
+                capabilities,
+                context_length: None,
+                quantization: p.quantization.clone(),
+                is_default: true,
+            }];
+        }
+        // Unknown id — fall through to default fallback so the deploy still
+        // produces a usable row instead of failing silently.
+    }
+
+    // 3. Fallback to recommended (or first) preset.
+    if manifest.model_presets.is_empty() {
+        return Vec::new();
+    }
+    let chosen = manifest
         .model_presets
         .iter()
-        .enumerate()
-        .map(|(idx, p)| NewModel {
-            service_id: 0,
-            model_name: p.id.clone(),
-            display_name: Some(p.display_name.clone()),
-            capabilities: format!("[\"{}\"]", manifest.engine.capability_tag()),
-            context_length: None,
-            quantization: p.quantization.clone(),
-            // First preset becomes default if none is marked recommended.
-            is_default: p.recommended
-                || (idx == 0 && manifest.model_presets.iter().all(|m| !m.recommended)),
-        })
-        .collect()
+        .find(|p| p.recommended)
+        .unwrap_or(&manifest.model_presets[0]);
+    vec![NewModel {
+        service_id: 0,
+        model_name: chosen.id.clone(),
+        display_name: Some(chosen.display_name.clone()),
+        capabilities,
+        context_length: None,
+        quantization: chosen.quantization.clone(),
+        is_default: true,
+    }]
 }
 
 /// Reads the optional `transport_explicit` hint from user_config. Used by
