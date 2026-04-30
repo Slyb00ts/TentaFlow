@@ -800,6 +800,8 @@ export class FlowCanvas {
           pointerId: ev.pointerId,
         };
         try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
+        // Wyłącz hit-paths edge'ów na czas łączenia, żeby elementFromPoint trafiał w port-in
+        this.root.classList.add('connecting');
         ev.preventDefault();
       }
       return;
@@ -934,6 +936,8 @@ export class FlowCanvas {
     }
 
     if (this._connecting && this._connecting.pointerId === ev.pointerId) {
+      // Zdjęcie klasy musi być bezwarunkowe — także gdy release jest poza portem (cancel)
+      this.root.classList.remove('connecting');
       const target = document.elementFromPoint(ev.clientX, ev.clientY);
       const portIn = target?.closest?.('.fb-port-in');
       if (portIn) {
