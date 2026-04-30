@@ -78,10 +78,11 @@ mod backend {
     use super::*;
     use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
     use bollard::query_parameters::{
-        CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
+        BuildImageOptions, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
     };
     use bollard::Docker;
     use std::collections::HashMap;
+    use std::path::Path;
 
     pub(super) async fn connect() -> DeployResult<Docker> {
         Docker::connect_with_local_defaults()
@@ -96,14 +97,93 @@ mod backend {
             .map_err(|e| DeployError::Docker(format!("ping: {}", e)))
     }
 
+    /// Returns true when a tagged image is already present locally.
+    pub(super) async fn image_exists(docker: &Docker, tag: &str) -> DeployResult<bool> {
+        match docker.inspect_image(tag).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(DeployError::Docker(format!("inspect_image({}): {}", tag, e))),
+        }
+    }
+
+    /// Builds an image from `<containers_root>/<context_path>/`. Streams build
+    /// log lines into `log` (when present). The Dockerfile is expected at
+    /// `<context>/Dockerfile`; bollard reads it relative to the tar root, so
+    /// we pack the context directory itself (not its parent) and point at
+    /// `Dockerfile`.
+    pub(super) async fn build_image_from_context(
+        docker: &Docker,
+        context: &Path,
+        tag: &str,
+        log: Option<&LogSink>,
+    ) -> DeployResult<()> {
+        use futures::StreamExt;
+
+        if !context.is_dir() {
+            return Err(DeployError::Manifest(format!(
+                "docker context not a directory: {}",
+                context.display()
+            )));
+        }
+
+        // Pack the context root as the tar root so the Dockerfile is at the
+        // top level. Bollard streams this body as the build context.
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        tar_builder
+            .append_dir_all(".", context)
+            .map_err(|e| DeployError::Docker(format!("tar context: {}", e)))?;
+        let tar_bytes = tar_builder
+            .into_inner()
+            .map_err(|e| DeployError::Docker(format!("tar finalize: {}", e)))?;
+
+        let opts = BuildImageOptions {
+            dockerfile: "Dockerfile".to_string(),
+            t: Some(tag.to_string()),
+            rm: true,
+            ..Default::default()
+        };
+
+        use bollard::body_full;
+        use hyper::body::Bytes;
+        let body = body_full(Bytes::from(tar_bytes));
+        let mut stream = docker.build_image(opts, None, Some(body));
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(info) => {
+                    if let Some(line) = info.stream {
+                        let trimmed = line.trim_end();
+                        if !trimmed.is_empty() {
+                            if let Some(s) = log {
+                                s.info(&format!("[docker build] {}", trimmed));
+                            } else {
+                                tracing::info!(target: "docker_build", "{}", trimmed);
+                            }
+                        }
+                    }
+                    if let Some(err_detail) = info.error_detail {
+                        return Err(DeployError::Docker(format!(
+                            "build error: {}",
+                            err_detail.message.unwrap_or_default()
+                        )));
+                    }
+                }
+                Err(e) => return Err(DeployError::Docker(format!("build stream: {}", e))),
+            }
+        }
+        Ok(())
+    }
+
     /// Creates and starts a container. Returns container id.
+    /// `binds` entries: (host_path, container_path, read_only).
     pub(super) async fn run(
         docker: &Docker,
         image: &str,
         name: &str,
         ports: &[(u16, u16, &str)], // (host, container, proto: "tcp"|"udp")
         env: &HashMap<String, String>,
-        binds: &[(PathBuf, String)],
+        binds: &[(PathBuf, String, bool)],
         labels: &HashMap<String, String>,
     ) -> DeployResult<String> {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
@@ -123,7 +203,13 @@ mod backend {
         let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         let binds_vec: Vec<String> = binds
             .iter()
-            .map(|(h, c)| format!("{}:{}:ro", h.display(), c))
+            .map(|(h, c, ro)| {
+                if *ro {
+                    format!("{}:{}:ro", h.display(), c)
+                } else {
+                    format!("{}:{}", h.display(), c)
+                }
+            })
             .collect();
 
         let host_config = HostConfig {
@@ -216,16 +302,36 @@ impl DeployStrategy for DockerDeploy {
         let docker = backend::connect().await?;
         backend::ping(&docker).await?;
 
-        // Phase 2: assume the image is already present (built by the legacy
-        // path, by `docker pull`, or out-of-band). If it's missing, the run
-        // step below fails with a clear `Docker(...)` error, and the user is
-        // expected to build it — wiring the bundle build pipeline here is
-        // tracked for Phase 5/6 once the legacy path is dismantled.
+        // Resolve build context against the extracted containers tree.
+        let context_dir = crate::paths::containers_root().join(context_path);
+        if !context_dir.exists() {
+            return Err(DeployError::Manifest(format!(
+                "docker context_path does not exist: {}",
+                context_dir.display()
+            )));
+        }
         let image_tag = format!(
             "tentaflow/{}:{}",
             self.manifest.engine.id, self.manifest.engine.version
         );
-        let _ = context_path; // path validation is delegated to image-build phase
+
+        // Build only when missing — repeated deploys reuse the cached image.
+        if !backend::image_exists(&docker, &image_tag).await? {
+            if let Some(s) = &self.log_sink {
+                s.info(&format!(
+                    "[docker] building image {} from {}",
+                    image_tag,
+                    context_dir.display()
+                ));
+            }
+            backend::build_image_from_context(
+                &docker,
+                &context_dir,
+                &image_tag,
+                self.log_sink.as_ref(),
+            )
+            .await?;
+        }
 
         let transport = self.pick_transport();
         let internal_port = self.manifest.engine.default_port;
@@ -270,13 +376,25 @@ impl DeployStrategy for DockerDeploy {
                 container_name, image_tag, host_http
             ));
         }
+
+        // Mount the shared host models cache so HF / Torch downloads from a
+        // Docker engine end up in the same place as native deploys. Read-write
+        // because the container is the one populating the cache.
+        let models_host = crate::paths::models_root();
+        let _ = std::fs::create_dir_all(&models_host);
+        let binds = vec![(
+            models_host,
+            crate::paths::CONTAINER_MODELS_PATH.to_string(),
+            false,
+        )];
+
         let id = backend::run(
             &docker,
             &image_tag,
             &container_name,
             &port_map,
             &env,
-            &[],
+            &binds,
             &labels,
         )
         .await?;

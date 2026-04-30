@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use tentaflow_core::config::NodeConfig;
 use tentaflow_core::db;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
+use tentaflow_core::paths;
 use tentaflow_core::routing::Router;
 
 #[cfg(target_os = "macos")]
@@ -44,9 +45,15 @@ struct Args {
     #[arg(short = 'q', long = "quic-port")]
     quic_port: Option<u16>,
 
-    /// Sciezka do bazy SQLite
-    #[arg(long = "db", default_value = "router.db")]
-    db_path: PathBuf,
+    /// Sciezka do bazy SQLite (domyslnie <tentaflow_home>/data/router.db)
+    #[arg(long = "db")]
+    db_path: Option<PathBuf>,
+
+    /// Override portable home directory (domyslnie katalog binarki). Ustawia
+    /// TENTAFLOW_HOME zanim pliki zostana wyliczone — przydatne dla
+    /// deploymentow systemd / docker volume.
+    #[arg(long = "home")]
+    home: Option<PathBuf>,
 
     /// Wylacz mesh networking
     #[arg(long = "no-mesh")]
@@ -86,6 +93,12 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
+    // Apply --home BEFORE first call to paths::tentaflow_home() so the
+    // OnceLock captures the override.
+    if let Some(home) = args.home.as_ref() {
+        std::env::set_var("TENTAFLOW_HOME", home);
+    }
+
     if let Some(cmd) = &args.command {
         return run_subcommand(cmd, args.verbose);
     }
@@ -113,7 +126,21 @@ async fn run_server(args: Args) -> Result<()> {
     }
 
     info!("Uruchamianie TentaFlow.Router...");
+    info!("Tentaflow home: {}", paths::tentaflow_home().display());
     info!("Konfiguracja: {:?}", args.config);
+
+    // Materializuj portable layout: data/, models/, cache/, containers/.
+    // Bez tego deploy strategie (python-bundle, binary, docker context) nie
+    // znajda manifestow i nie wystartuja.
+    if let Err(e) = paths::ensure_app_dirs() {
+        error!("ensure_app_dirs nieudany: {}", e);
+        return Err(anyhow::anyhow!("ensure_app_dirs: {}", e));
+    }
+
+    let db_path: PathBuf = args
+        .db_path
+        .clone()
+        .unwrap_or_else(paths::database_path);
 
     // Wczytaj konfiguracje lub utworz domyslna
     let mut config = if args.config.exists() {
@@ -142,8 +169,8 @@ async fn run_server(args: Args) -> Result<()> {
     info!("Konfiguracja wczytana pomyslnie");
 
     // Inicjalizacja bazy danych
-    info!("Inicjalizacja bazy danych: {:?}", args.db_path);
-    let db = db::init(&args.db_path).map_err(|e| {
+    info!("Inicjalizacja bazy danych: {:?}", db_path);
+    let db = db::init(&db_path).map_err(|e| {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
@@ -152,7 +179,7 @@ async fn run_server(args: Args) -> Result<()> {
     // iroh EndpointId z MeshSecurity.public_key_hex().
     let _ = db::repository::delete_setting(&db, "node_id");
 
-    log_config_summary(&config, &args.db_path);
+    log_config_summary(&config, &db_path);
 
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key()

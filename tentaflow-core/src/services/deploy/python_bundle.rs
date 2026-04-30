@@ -50,16 +50,14 @@ impl PythonBundleDeploy {
     }
 }
 
-/// Cache root for venv templates / instances. Honors `TENTAFLOW_CACHE_DIR`.
+/// Cache root for venv templates / instances. Delegates to `paths::cache_dir`
+/// which honors `TENTAFLOW_CACHE_DIR`.
 fn cache_root() -> PathBuf {
-    if let Ok(v) = std::env::var("TENTAFLOW_CACHE_DIR") {
-        let p = PathBuf::from(v);
-        if !p.exists() {
-            let _ = std::fs::create_dir_all(&p);
-        }
-        return p;
+    let p = crate::paths::cache_dir();
+    if !p.exists() {
+        let _ = std::fs::create_dir_all(&p);
     }
-    crate::paths::tentaflow_home().join("cache")
+    p
 }
 
 fn template_dir(engine: &str, hash: &str) -> PathBuf {
@@ -217,7 +215,10 @@ impl DeployStrategy for PythonBundleDeploy {
             .bundle_path
             .as_deref()
             .ok_or_else(|| DeployError::Manifest("python-bundle requires bundle_path".into()))?;
-        let bundle = PathBuf::from(bundle_path);
+        // Manifest paths are relative to the extracted `tentaflow-containers/`
+        // tree, which `paths::ensure_app_dirs` guarantees lives under
+        // `<tentaflow_home>/containers/`.
+        let bundle = crate::paths::containers_root().join(bundle_path);
         if !bundle.exists() {
             return Err(DeployError::Manifest(format!(
                 "bundle_path does not exist: {}",

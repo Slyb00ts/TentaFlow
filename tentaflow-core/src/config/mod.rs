@@ -720,7 +720,9 @@ fn default_cluster_name() -> String {
 }
 
 fn default_models_dir() -> String {
-    "./models".to_string()
+    // Portable layout: shared models cache under <tentaflow_home>/models so
+    // every backend (Docker, native venv, in-process) hits the same HF cache.
+    crate::paths::models_root().to_string_lossy().into_owned()
 }
 
 fn default_inference_backend() -> String {
