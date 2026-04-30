@@ -318,7 +318,7 @@ impl MeshPeerStore {
         if let (Some(reg), Some(id)) =
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
-            reg.upsert_discovered(id, TransportHints::default());
+            reg.ensure_present(id);
         }
     }
 
@@ -417,7 +417,7 @@ impl MeshPeerStore {
                     ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
                 )
             {
-                reg.upsert_discovered(id, TransportHints::default());
+                reg.ensure_present(id);
                 tracing::info!(
                     target: "mesh::shadow",
                     node_id = %node_id,
@@ -488,7 +488,7 @@ impl MeshPeerStore {
             // Auto-create the entry — peer_store mark_heartbeat is a hot
             // path that runs before any explicit upsert in some races
             // (HeartbeatReceived can land before PeerConnected).
-            reg.upsert_discovered(id, TransportHints::default());
+            reg.ensure_present(id);
             reg.record_heartbeat(&id, Instant::now());
         }
     }
@@ -721,7 +721,7 @@ impl MeshPeerStore {
         if let (Some(reg), Some(id)) =
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
-            reg.upsert_discovered(id, TransportHints::default());
+            reg.ensure_present(id);
             reg.set_hostname(&id, Arc::<str>::from(hostname.as_ref()));
         }
         self.shadow_consistency_check(node_id, "set_hostname");
@@ -739,7 +739,7 @@ impl MeshPeerStore {
         if let (Some(reg), Some(id)) =
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
-            reg.upsert_discovered(id, TransportHints::default());
+            reg.ensure_present(id);
             reg.set_platform(&id, Arc::<str>::from(platform));
         }
         self.shadow_consistency_check(node_id, "set_platform");
@@ -892,7 +892,7 @@ impl MeshPeerStore {
         if let (Some(reg), Some(id)) =
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
-            reg.upsert_discovered(id, TransportHints::default());
+            reg.ensure_present(id);
             let snap = RegNodeInfo {
                 hostname: Arc::<str>::from(hostname.as_str()),
                 platform: Arc::<str>::from(""),
@@ -950,7 +950,7 @@ impl MeshPeerStore {
         if let (Some(r), Some(id)) =
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
-            r.upsert_discovered(id, TransportHints::default());
+            r.ensure_present(id);
             // Defense-in-depth: receiving metrics means the peer is alive; force
             // the registry to record a heartbeat so liveness state matches the
             // physical reality even if the HEARTBEAT frame path missed for any
@@ -1071,7 +1071,7 @@ impl MeshPeerStore {
         if let (Some(r), Some(id)) =
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
-            r.upsert_discovered(id, TransportHints::default());
+            r.ensure_present(id);
             let reg_models: Arc<[RegModelInfo]> = models_for_shadow
                 .iter()
                 .map(|m| RegModelInfo {
