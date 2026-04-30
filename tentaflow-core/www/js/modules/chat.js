@@ -44,7 +44,7 @@ let searchFilter = '';
 
 // Tryb audio (Etap 1) — handle do FaceBackground.embed plus cache silnikow.
 // faceHandle null gdy aktywna rozmowa jest w trybie tekstowym, niepusty gdy
-// audio. engineCache wypelniany raz przy mount() z /api/services/deployed.
+// audio. engineCache wypelniany raz przy mount() z ApiBinary modelListRequest.
 let faceHandle = null;
 let engineCache = { stt: [], tts: [] };
 let escKeyHandler = null;
@@ -437,30 +437,20 @@ function renderAudioStage(conv) {
   `;
 }
 
-async function loadEngineCache() {
-  try {
-    const resp = await fetch('/api/services/deployed', { credentials: 'same-origin' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const all = await resp.json();
-    const list = Array.isArray(all) ? all : (all?.deployments || all?.items || []);
-    engineCache.stt = list.filter((s) => (s.category || s.engine_category || '').toLowerCase() === 'stt');
-    engineCache.tts = list.filter((s) => (s.category || s.engine_category || '').toLowerCase() === 'tts');
-  } catch {
-    engineCache.stt = [];
-    engineCache.tts = [];
-  }
+function engineLabel(engine) {
+  return engine.display_name || engine.displayName || engine.id || engine.engine_id || engine.name || 'unknown';
 }
 
-function engineLabel(engine) {
-  return engine.engine_id || engine.id || engine.name || 'unknown';
+function engineId(engine) {
+  return engine.id || engine.engine_id || engine.name || 'unknown';
 }
 
 function ensureAudioConfigDefaults(conv) {
   if (!conv.audioConfig.sttEngine && engineCache.stt.length) {
-    conv.audioConfig.sttEngine = engineLabel(engineCache.stt[0]);
+    conv.audioConfig.sttEngine = engineId(engineCache.stt[0]);
   }
   if (!conv.audioConfig.ttsEngine && engineCache.tts.length) {
-    conv.audioConfig.ttsEngine = engineLabel(engineCache.tts[0]);
+    conv.audioConfig.ttsEngine = engineId(engineCache.tts[0]);
   }
 }
 
@@ -502,12 +492,20 @@ function updateAudioStatus(stateName, text) {
 function updateEngineLabels() {
   const conv = activeConv();
   if (!conv) return;
+  // Mapuje zapisany engine_id na display_name z aktualnego cache; gdy silnik
+  // zniknal po deinstalacji pokazujemy ID jako fallback zamiast pustego pilla.
+  const sttDisplay = (engineCache.stt.find((e) => engineId(e) === conv.audioConfig.sttEngine)
+    && engineLabel(engineCache.stt.find((e) => engineId(e) === conv.audioConfig.sttEngine)))
+    || conv.audioConfig.sttEngine;
+  const ttsDisplay = (engineCache.tts.find((e) => engineId(e) === conv.audioConfig.ttsEngine)
+    && engineLabel(engineCache.tts.find((e) => engineId(e) === conv.audioConfig.ttsEngine)))
+    || conv.audioConfig.ttsEngine;
   const sttPillName = byId('stt-pill')?.querySelector('.name');
   const ttsPillName = byId('tts-pill')?.querySelector('.name');
-  if (sttPillName) sttPillName.textContent = conv.audioConfig.sttEngine || I18n.t('chat.audio_no_engine');
-  if (ttsPillName) ttsPillName.textContent = conv.audioConfig.ttsEngine || I18n.t('chat.audio_no_engine');
+  if (sttPillName) sttPillName.textContent = sttDisplay || I18n.t('chat.audio_no_engine');
+  if (ttsPillName) ttsPillName.textContent = ttsDisplay || I18n.t('chat.audio_no_engine');
   const eng = byId('audio-engine-name');
-  if (eng) eng.textContent = conv.audioConfig.sttEngine || '—';
+  if (eng) eng.textContent = sttDisplay || '—';
 }
 
 function mountFace() {
@@ -549,8 +547,9 @@ function openEnginePicker(kind) {
   menu.className = 'engine-pill-menu';
   menu.setAttribute('role', 'menu');
   menu.innerHTML = list.map((e) => {
-    const id = engineLabel(e);
-    return `<button type="button" role="menuitem" data-engine-id="${escapeHtml(id)}">${escapeHtml(id)}</button>`;
+    const id = engineId(e);
+    const label = engineLabel(e);
+    return `<button type="button" role="menuitem" data-engine-id="${escapeHtml(id)}">${escapeHtml(label)}</button>`;
   }).join('');
   pill.appendChild(menu);
 
@@ -1196,18 +1195,22 @@ const ChatScreen = {
     for (const c of conversations) for (const m of c.messages) if (m.id > maxId) maxId = m.id;
     nextMsgId = maxId + 1;
 
-    // Lista zainstalowanych silnikow STT/TTS — uzywana zarowno przy
-    // przelaczeniu na audio mode (dostepnosc) jak i przy openEnginePicker.
-    await loadEngineCache();
-
+    // Jeden round-trip do backendu po wszystkie zarejestrowane silniki/modele;
+    // rozdzielamy lokalnie per service_type. Zrodlem prawdy jest ApiBinary
+    // (rkyv binary protocol) — REST /api/services/deployed nie istnieje.
     try {
-      const all = await ApiBinary.list('modelListRequest');
-      modelOptions = (all || []).filter((m) => {
-        const cat = (m.category || m.service_type || '').toLowerCase();
+      const all = (await ApiBinary.list('modelListRequest')) || [];
+      const catOf = (m) => (m.category || m.service_type || '').toLowerCase();
+      modelOptions = all.filter((m) => {
+        const cat = catOf(m);
         return cat === '' || cat === 'llm';
       });
+      engineCache.stt = all.filter((m) => catOf(m) === 'stt');
+      engineCache.tts = all.filter((m) => catOf(m) === 'tts');
     } catch {
       modelOptions = [];
+      engineCache.stt = [];
+      engineCache.tts = [];
     }
 
     const sel = byId('chat-model');
