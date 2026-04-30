@@ -144,17 +144,32 @@ pub struct RunningEngine {
     pub internal_port: u16,
 }
 
-/// Katalog cache tentaflow (`~/.cache/tentaflow/` na linux,
-/// `~/Library/Caches/tentaflow/` na macOS).
+/// Katalog cache tentaflow. Delegates to the portable layout in
+/// `crate::paths::cache_dir()` (honors `TENTAFLOW_CACHE_DIR`, falls back
+/// to `<tentaflow_home>/cache`).
 pub fn cache_root() -> Result<PathBuf> {
-    if let Ok(override_dir) = std::env::var("TENTAFLOW_CACHE_DIR") {
-        let path = PathBuf::from(override_dir);
-        std::fs::create_dir_all(&path)?;
-        return Ok(path);
+    let path = crate::paths::cache_dir();
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("create cache dir {}", path.display()))?;
+    Ok(path)
+}
+
+/// Workspace root that already contains the extracted `tentaflow-containers/`
+/// tree. `paths::ensure_app_dirs()` populates this at startup, so deploy
+/// flows skip the legacy "extract bundle into a tmpdir" step.
+fn runtime_bundle_root() -> Result<PathBuf> {
+    let containers = crate::paths::containers_root();
+    let parent = containers
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("containers_root has no parent: {}", containers.display()))?
+        .to_path_buf();
+    if !containers.is_dir() {
+        anyhow::bail!(
+            "tentaflow-containers/ not extracted yet at {} — run paths::ensure_app_dirs() first",
+            containers.display()
+        );
     }
-    dirs::cache_dir()
-        .map(|c| c.join("tentaflow"))
-        .ok_or_else(|| anyhow::anyhow!("nie mozna ustalic cache dir"))
+    Ok(parent)
 }
 
 /// Znajduje katalog bundla Pythona dla danego silnika.
@@ -218,9 +233,8 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
 }
 
 pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEngine> {
-    let extracted = tempfile::tempdir()?;
-    super::bundle::extract_to(extracted.path())?;
-    let spec = read_bundle_spec(extracted.path(), engine)?;
+    let workspace = runtime_bundle_root()?;
+    let spec = read_bundle_spec(&workspace, engine)?;
     check_platform_compat(&spec.requires)?;
 
     let detected = crate::system_check::collect();
@@ -235,7 +249,7 @@ pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEn
     let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
     let uv_bin = ensure_uv(&cache, log).ok();
 
-    let bundle_src = find_bundle_dir(extracted.path(), engine)
+    let bundle_src = find_bundle_dir(&workspace, engine)
         .ok_or_else(|| anyhow::anyhow!(
             "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
             engine
@@ -270,9 +284,8 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
 }
 
 pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<RunningEngine> {
-    let extracted = tempfile::tempdir()?;
-    super::bundle::extract_to(extracted.path())?;
-    let spec = read_bundle_spec(extracted.path(), &req.engine)?;
+    let workspace = runtime_bundle_root()?;
+    let spec = read_bundle_spec(&workspace, &req.engine)?;
 
     check_platform_compat(&spec.requires)?;
 
@@ -290,7 +303,7 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
     let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
     let uv_bin = ensure_uv(&cache, log).ok();
 
-    let bundle_src = find_bundle_dir(extracted.path(), &req.engine)
+    let bundle_src = find_bundle_dir(&workspace, &req.engine)
         .ok_or_else(|| anyhow::anyhow!(
             "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
             req.engine
@@ -1023,9 +1036,8 @@ fn install_deps(
 /// istnieje z poprzedniego deploy — jesli nie, zwraca blad i caller powinien
 /// zdecydowac czy oznaczyc serwis jako `stopped` w DB.
 pub fn relaunch(req: &NativeDeployRequest) -> Result<RunningEngine> {
-    let extracted = tempfile::tempdir()?;
-    super::bundle::extract_to(extracted.path())?;
-    let spec = read_bundle_spec(extracted.path(), &req.engine)?;
+    let workspace = runtime_bundle_root()?;
+    let spec = read_bundle_spec(&workspace, &req.engine)?;
     check_platform_compat(&spec.requires)?;
 
     let cache = cache_root()?;
