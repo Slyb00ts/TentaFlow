@@ -389,6 +389,7 @@
   pointer-events: stroke;
   cursor: pointer;
 }
+.fb-canvas.connecting .fb-edges .fb-edge-hit { pointer-events: none; }
 .fb-edge-path {
   fill: none;
   stroke: var(--tf-accent-1, #6366f1);
@@ -530,8 +531,9 @@
 .fb-port::before {
   content: '';
   position: absolute;
-  inset: -10px;
 }
+.fb-port-in::before  { inset: -8px 0 -8px -10px; }
+.fb-port-out::before { inset: -8px -10px -8px 0; }
 .fb-port:hover, .fb-port.drop-target {
   background: var(--node-color, var(--tf-accent-1, #6366f1));
   transform: scale(1.3);
