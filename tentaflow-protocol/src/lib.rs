@@ -214,6 +214,7 @@ pub use message_body::{
     MeetingTranscriptsListResponse,
     MeetingWakeWordRequest,
     MeetingWakeWordResponse,
+    MeshConnState,
     MeshConnectRequest,
     MeshConnectResponse,
     MeshConnectionInfo,
