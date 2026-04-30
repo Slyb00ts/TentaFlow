@@ -43,23 +43,6 @@ pub struct BundleSpec {
     pub requires: Requires,
     #[serde(default, rename = "install_variants")]
     pub install_variants: Vec<InstallVariant>,
-    /// Per-bundle override for the smart health probe in the python-bundle
-    /// deploy strategy. Optional — strategy supplies a default when absent.
-    #[serde(default)]
-    pub health: HealthSpec,
-}
-
-/// Optional `[health]` block tuning the deploy-time probe. The probe never
-/// has a hard timeout: it only fails when the engine process exits or when
-/// it stops emitting log lines for `stagnation_window_secs` while still
-/// not answering a readiness URL.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct HealthSpec {
-    /// Max seconds without **engine log output** AND without a successful
-    /// readiness response before the deploy is declared stalled. `None`
-    /// makes the strategy use its built-in default (300s for python-bundle).
-    #[serde(default)]
-    pub stagnation_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1902,7 +1885,6 @@ mod tests {
             },
             requires: Requires::default(),
             install_variants: vec![],
-            health: HealthSpec::default(),
         }
     }
 
