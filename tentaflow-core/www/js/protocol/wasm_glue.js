@@ -2963,78 +2963,16 @@ export function encodeRegistryListRequest() {
 }
 
 /**
- * MessageBody::ServiceCreateRequest { name, service_type, strategy, config_json,
- * node_id?, cluster_id? }. `node_id` jest hex-enkodowanym ciagiem 64 znakow
- * (32 bajty), pusty string traktowany jako None.
- * @param {string} name
- * @param {string} service_type
- * @param {string} strategy
- * @param {string} config_json
+ * MessageBody::ServiceBody(ServicePayload::ReqDelete) — stop + delete the row
+ * (cascades to `model_registry`).
+ * @param {number} service_id
  * @param {string | null} [node_id]
- * @param {string | null} [cluster_id]
  * @returns {Uint8Array}
  */
-export function encodeServiceCreateRequest(name, service_type, strategy, config_json, node_id, cluster_id) {
-    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(service_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(strategy, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passStringToWasm0(config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len3 = WASM_VECTOR_LEN;
-    var ptr4 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    var len4 = WASM_VECTOR_LEN;
-    var ptr5 = isLikeNone(cluster_id) ? 0 : passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    var len5 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeServiceCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v7;
-}
-
-/**
- * MessageBody::ServiceDeployRequest { engine_id, model_id, deploy_method, node_id }.
- * node_id MUSI byc 32 bajtami.
- * @param {string} engine_id
- * @param {string} model_id
- * @param {string} deploy_method
- * @param {Uint8Array} node_id
- * @returns {Uint8Array}
- */
-export function encodeServiceDeployRequest(engine_id, model_id, deploy_method, node_id) {
-    const ptr0 = passStringToWasm0(engine_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(deploy_method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passArray8ToWasm0(node_id, wasm.__wbindgen_malloc);
-    const len3 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeServiceDeployRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v5;
-}
-
-/**
- * MessageBody::ServiceFlagsUpdateRequest { service_id, pinned, paused }.
- * pinned/paused jako i32 (-1 = nie zmieniaj, 0 = false, 1 = true).
- * @param {string} service_id
- * @param {number} pinned
- * @param {number} paused
- * @returns {Uint8Array}
- */
-export function encodeServiceFlagsUpdateRequest(service_id, pinned, paused) {
-    const ptr0 = passStringToWasm0(service_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeServiceFlagsUpdateRequest(ptr0, len0, pinned, paused);
+export function encodeServiceDeleteRequest(service_id, node_id) {
+    var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceDeleteRequest(service_id, ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -3044,17 +2982,24 @@ export function encodeServiceFlagsUpdateRequest(service_id, pinned, paused) {
 }
 
 /**
- * MessageBody::ServiceListRequest (unit).
+ * MessageBody::ServiceBody(ServicePayload::ReqList). Empty filter values are
+ * treated as "no filter".
+ * @param {string | null} [engine_id_filter]
+ * @param {string | null} [category_filter]
  * @returns {Uint8Array}
  */
-export function encodeServiceListRequest() {
-    const ret = wasm.encodeServiceListRequest();
+export function encodeServiceListRequest(engine_id_filter, category_filter) {
+    var ptr0 = isLikeNone(engine_id_filter) ? 0 : passStringToWasm0(engine_id_filter, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(category_filter) ? 0 : passStringToWasm0(category_filter, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceListRequest(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
+    return v3;
 }
 
 /**
@@ -3088,46 +3033,17 @@ export function encodeServiceManifestDeployRequest(engine_id, deploy_method, nod
 }
 
 /**
- * MessageBody::ServiceQuicStatusRequest (unit). Periodyczne polling QUIC.
- * @returns {Uint8Array}
- */
-export function encodeServiceQuicStatusRequest() {
-    const ret = wasm.encodeServiceQuicStatusRequest();
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
-}
-
-/**
- * MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy). Force flag asks
- * backend to terminate active sessions (agents) rather than returning
- * `active_sessions`.
+ * MessageBody::ServiceBody(ServicePayload::ReqPause) — supervisor leaves a
+ * paused service untouched.
  * @param {number} service_id
- * @param {boolean} force_if_active_sessions
+ * @param {boolean} paused
+ * @param {string | null} [node_id]
  * @returns {Uint8Array}
  */
-export function encodeServiceRedeployRequest(service_id, force_if_active_sessions) {
-    const ret = wasm.encodeServiceRedeployRequest(service_id, force_if_active_sessions);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
-}
-
-/**
- * MessageBody::ServiceStopRequest { service_id }.
- * @param {string} service_id
- * @returns {Uint8Array}
- */
-export function encodeServiceStopRequest(service_id) {
-    const ptr0 = passStringToWasm0(service_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeServiceStopRequest(ptr0, len0);
+export function encodeServicePauseRequest(service_id, paused, node_id) {
+    var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServicePauseRequest(service_id, paused, ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -3137,42 +3053,42 @@ export function encodeServiceStopRequest(service_id) {
 }
 
 /**
- * MessageBody::ServiceUpdateRequest { id, name, service_type, strategy, status,
- * config_json, node_id?, cluster_id? }.
- * @param {string} id
- * @param {string} name
- * @param {string} service_type
- * @param {string} strategy
- * @param {string} status
- * @param {string} config_json
+ * MessageBody::ServiceBody(ServicePayload::ReqPin) — toggles the pin flag
+ * used by the supervisor for auto-respawn.
+ * @param {number} service_id
+ * @param {boolean} pinned
  * @param {string | null} [node_id]
- * @param {string | null} [cluster_id]
  * @returns {Uint8Array}
  */
-export function encodeServiceUpdateRequest(id, name, service_type, strategy, status, config_json, node_id, cluster_id) {
-    const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(service_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passStringToWasm0(strategy, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len3 = WASM_VECTOR_LEN;
-    const ptr4 = passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len4 = WASM_VECTOR_LEN;
-    const ptr5 = passStringToWasm0(config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len5 = WASM_VECTOR_LEN;
-    var ptr6 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    var len6 = WASM_VECTOR_LEN;
-    var ptr7 = isLikeNone(cluster_id) ? 0 : passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    var len7 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeServiceUpdateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7);
+export function encodeServicePinRequest(service_id, pinned, node_id) {
+    var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServicePinRequest(service_id, pinned, ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v9 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v9;
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqStart) — unpause + spawn the
+ * engine when stopped/failed/paused. Idempotent for already-running services.
+ * @param {number} service_id
+ * @param {string | null} [node_id]
+ * @returns {Uint8Array}
+ */
+export function encodeServiceStartRequest(service_id, node_id) {
+    var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceStartRequest(service_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**

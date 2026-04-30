@@ -15,7 +15,7 @@ use tentaflow_protocol::{
 
 use super::vnc_tunnel::{self, MAX_TUNNELS_PER_USER};
 use crate::dispatch::subscription::{
-    push_chunk, push_end, find_stream_handler, StreamHandlerMeta, Subscription,
+    find_stream_handler, push_chunk, push_end, StreamHandlerMeta, Subscription,
 };
 use crate::dispatch::{HandlerContext, SessionAuthKind};
 
@@ -81,15 +81,15 @@ fn emit_open_status(sub: &Subscription, status: &str, error: &str) {
 // `Chunk { bytes }`. On any failure before the TCP dial we emit ResOpen with a
 // non-ok status followed by push_end (no bridge task ever spawns).
 
-fn vnc_tunnel_open_handler(
-    req: MessageBody,
-    ctx: HandlerContext,
-    sub: Arc<Subscription>,
-) {
+fn vnc_tunnel_open_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
     let session_id = match req {
         MessageBody::VncTunnelBody(VncTunnelPayload::ReqOpen(r)) => r.session_id,
         _ => {
-            emit_open_status(&sub, VNC_TUNNEL_OPEN_FAILED, "expected VncTunnelOpenRequest");
+            emit_open_status(
+                &sub,
+                VNC_TUNNEL_OPEN_FAILED,
+                "expected VncTunnelOpenRequest",
+            );
             return;
         }
     };

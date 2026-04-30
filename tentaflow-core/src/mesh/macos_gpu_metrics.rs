@@ -38,13 +38,21 @@ unsafe extern "C" {
 fn load_lib(path: &str) -> Option<*mut c_void> {
     let c = CString::new(path).ok()?;
     let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
-    if h.is_null() { None } else { Some(h) }
+    if h.is_null() {
+        None
+    } else {
+        Some(h)
+    }
 }
 
 unsafe fn load_sym(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
     let c = CString::new(name).ok()?;
     let s = unsafe { dlsym(handle, c.as_ptr()) };
-    if s.is_null() { None } else { Some(s) }
+    if s.is_null() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -80,8 +88,7 @@ type FnIOReportCreateSamplesDelta = unsafe extern "C" fn(
 ) -> CFDictionaryRef;
 
 type FnIOReportChannelGetCFString = unsafe extern "C" fn(sample: CFDictionaryRef) -> CFStringRef;
-type FnIOReportSimpleGetIntegerValue =
-    unsafe extern "C" fn(sample: CFDictionaryRef, a: i32) -> i64;
+type FnIOReportSimpleGetIntegerValue = unsafe extern "C" fn(sample: CFDictionaryRef, a: i32) -> i64;
 
 struct IOReportSyms {
     copy_channels: FnIOReportCopyChannelsInGroup,
@@ -567,7 +574,11 @@ fn sum_gpu_energy_nj(syms: &IOReportSyms, samples: CFDictionaryRef) -> Option<i6
         }
     });
 
-    if found { Some(total) } else { None }
+    if found {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 fn is_energy_group(group: &str) -> bool {

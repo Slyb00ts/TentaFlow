@@ -15,10 +15,6 @@ use crate::profiling::{
     ProfilingStopResponse,
 };
 
-fn default_service_status() -> String {
-    "running".to_string()
-}
-
 // =============================================================================
 // Typ operacji CRDT
 // =============================================================================
@@ -53,44 +49,6 @@ pub struct CrdtSyncOp {
 }
 
 // =============================================================================
-// Informacja o serwisie AI
-// =============================================================================
-
-/// Opis serwisu AI dostepnego na nodzie mesh.
-/// Uzywany w service discovery i load balancingu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct MeshServiceInfo {
-    /// Identyfikator serwisu (UUID)
-    #[serde(default)]
-    pub service_id: String,
-    /// Nazwa serwisu
-    pub service_name: String,
-    /// Typ serwisu: "llm", "tts", "embedding" itp.
-    pub service_type: String,
-    /// Identyfikator noda na ktorym dziala serwis
-    pub node_id: String,
-    /// Port QUIC na ktorym serwis nasluchuje
-    pub quic_port: u16,
-    /// Adres QUIC serwisu (z perspektywy owner node)
-    #[serde(default)]
-    pub quic_url: String,
-    /// Status serwisu: "running", "stopped", "error"
-    #[serde(default = "default_service_status")]
-    pub status: String,
-    /// Lista modeli dostepnych w serwisie
-    pub models: Vec<String>,
-    /// Obciazenie noda w procentach (0-100)
-    pub load_percent: u8,
-    /// Engine serving these models (e.g. "llama-cpp", "vllm", "mlx", "whisper-rs").
-    #[serde(default)]
-    pub engine_id: Option<String>,
-    /// Parallel array to `models`: weights size in MB per entry (0 when unknown).
-    /// Empty when no size metadata is available.
-    #[serde(default)]
-    pub model_sizes_mb: Vec<u64>,
-}
-
-// =============================================================================
 // Glowny enum wiadomosci mesh
 // =============================================================================
 
@@ -99,18 +57,11 @@ pub struct MeshServiceInfo {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshMessage {
     // -- Gossip --
-
     /// Ping do sprawdzenia czy nod zyje
-    Ping {
-        from: String,
-        incarnation: u64,
-    },
+    Ping { from: String, incarnation: u64 },
 
     /// Odpowiedz na ping
-    PingAck {
-        from: String,
-        incarnation: u64,
-    },
+    PingAck { from: String, incarnation: u64 },
 
     /// Posredni ping przez inny nod (protocol SWIM)
     IndirectPing {
@@ -120,7 +71,6 @@ pub enum MeshMessage {
     },
 
     // -- Membership --
-
     /// Dolaczenie noda do mesh
     Join {
         node_id: String,
@@ -130,12 +80,9 @@ pub enum MeshMessage {
     },
 
     /// Opuszczenie mesh przez nod
-    Leave {
-        node_id: String,
-    },
+    Leave { node_id: String },
 
     // -- CRDT sync --
-
     /// Synchronizacja stanu CRDT - lista operacji do zaaplikowania
     StateSync {
         from: String,
@@ -143,33 +90,9 @@ pub enum MeshMessage {
     },
 
     /// Zadanie synchronizacji stanu od podanego czasu
-    StateSyncRequest {
-        from: String,
-        since_time: u64,
-    },
-
-    // -- Service discovery --
-
-    /// Ogloszenie dostepnych serwisow na nodzie
-    ServiceAnnounce {
-        node_id: String,
-        services: Vec<MeshServiceInfo>,
-    },
-
-    /// Zapytanie o serwisy danego typu
-    ServiceQuery {
-        service_type: String,
-        from: String,
-    },
-
-    /// Odpowiedz z lista serwisow
-    ServiceResponse {
-        services: Vec<MeshServiceInfo>,
-        from: String,
-    },
+    StateSyncRequest { from: String, since_time: u64 },
 
     // -- Forwarding --
-
     /// Przekazanie requestu do innego noda
     ForwardRequest {
         request_id: String,
@@ -184,7 +107,6 @@ pub enum MeshMessage {
     },
 
     // -- Stale polaczenia QUIC --
-
     /// Heartbeat wysylany co 500ms na stalym polaczeniu
     Heartbeat(MeshHeartbeat),
 
@@ -211,12 +133,8 @@ pub enum MeshMessage {
     },
 
     // -- Parowanie mesh (bezpieczenstwo) --
-
     /// Zadanie parowania — wysylane do noda po mDNS discovery
-    PairingRequest {
-        from_node_id: String,
-        pin: String,
-    },
+    PairingRequest { from_node_id: String, pin: String },
 
     /// Potwierdzenie parowania — wymiana kluczy publicznych
     PairingConfirm {
@@ -225,19 +143,13 @@ pub enum MeshMessage {
     },
 
     /// Odrzucenie parowania
-    PairingReject {
-        from_node_id: String,
-    },
+    PairingReject { from_node_id: String },
 
     /// Cofniecie zaufania — node nie jest juz zaufany
-    TrustRevoked {
-        node_id: String,
-    },
+    TrustRevoked { node_id: String },
 
     /// Synchronizacja kluczy zaufanych nodow po zatwierdzeniu parowania
-    TrustedKeysSync {
-        keys: Vec<(String, Vec<u8>)>,
-    },
+    TrustedKeysSync { keys: Vec<(String, Vec<u8>)> },
 
     /// Rotacja klucza szyfrowania — wymiana ephemeral X25519 public key
     KeyRotation {
@@ -252,12 +164,9 @@ pub enum MeshMessage {
     },
 
     /// Graceful leave — node opuszcza mesh (nie revoke, chwilowe odlaczenie)
-    NodeLeaving {
-        node_id: String,
-    },
+    NodeLeaving { node_id: String },
 
     // -- Komendy zarzadzania --
-
     /// Komenda zarzadzania wyslana do sparowanego noda
     MeshCommand {
         command_id: String,
@@ -295,7 +204,6 @@ pub enum MeshMessage {
     },
 
     // -- Cluster --
-
     /// Informacja o clusterze nodow
     ClusterInfo {
         cluster_id: String,
@@ -304,20 +212,6 @@ pub enum MeshMessage {
         strategy: String,
     },
 
-    // -- Service discovery rozszerzony --
-
-    /// Zapytanie o wszystkie widoczne serwisy w mesh
-    ServiceQueryAll {
-        from_node_id: String,
-        request_id: String,
-    },
-
-    /// Odpowiedz z pelna lista serwisow (z dedup)
-    ServiceResponseAll {
-        from_node_id: String,
-        request_id: String,
-        services: Vec<MeshServiceInfo>,
-    },
 }
 
 // =============================================================================
@@ -439,8 +333,6 @@ pub struct MeshFullState {
     pub models: Vec<MeshModelInfo>,
     /// Dzialajace kontenery Docker
     pub containers: Vec<MeshContainerInfo>,
-    /// Dostepne serwisy AI
-    pub services: Vec<MeshServiceInfo>,
     /// Operacje CRDT do synchronizacji
     pub crdt_operations: Vec<CrdtSyncOp>,
     /// Wektor wersji: pary (hash_noda, czas_logiczny)
@@ -466,17 +358,25 @@ pub struct MeshFullState {
 #[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshCommandType {
     /// Uruchomienie kontenera
-    ContainerStart { container_id: String },
+    ContainerStart {
+        container_id: String,
+    },
     /// Zatrzymanie kontenera
-    ContainerStop { container_id: String },
+    ContainerStop {
+        container_id: String,
+    },
     /// Restart kontenera
-    ContainerRestart { container_id: String },
+    ContainerRestart {
+        container_id: String,
+    },
     /// Lista kontenerow
     ListContainers,
     /// Lista obrazow Docker
     ListImages,
     /// Czyszczenie Docker (prune)
-    SystemPrune { volumes: bool },
+    SystemPrune {
+        volumes: bool,
+    },
     /// Wgranie certyfikatow TLS
     ProvisionCerts {
         cert_pem: String,
@@ -484,7 +384,9 @@ pub enum MeshCommandType {
         target_dir: String,
     },
     /// Dodanie serwisu na nodzie
-    AddService { service_config: String },
+    AddService {
+        service_config: String,
+    },
     /// Zmiana konfiguracji sieciowej na zdalnym nodzie
     NetworkConfig {
         interface: String,
@@ -522,6 +424,34 @@ pub enum MeshCommandType {
     ProfilingDownload(ProfilingDownloadRequest),
     /// Multi-source profiling: snapshot aktywnej sesji (Some) albo None.
     ProfilingActiveInfo(ProfilingActiveInfoRequest),
+
+    // -- Cross-node service action forwarding (krok N3b). `service_id` is
+    //    interpreted in the receiver's local SQLite namespace; the receiver
+    //    runs the action against its own DB and returns the result.
+    ServiceStartRemote {
+        service_id: i64,
+    },
+    ServiceDeleteRemote {
+        service_id: i64,
+    },
+    ServicePinRemote {
+        service_id: i64,
+        pinned: bool,
+    },
+    ServicePauseRemote {
+        service_id: i64,
+        paused: bool,
+    },
+    /// Forwarded `ServiceManifestDeployRequest`. The receiver re-runs the same
+    /// validation + tokio::spawn deploy that a local request would, and
+    /// returns the synchronously generated `deploy_id` (slug). Logs continue
+    /// to flow on the receiver's local websocket bus — cross-node log
+    /// streaming is intentionally not part of N3b.
+    ServiceDeployRemote {
+        engine_id: String,
+        deploy_method: String,
+        config_json: String,
+    },
 }
 
 // =============================================================================
@@ -541,10 +471,7 @@ pub enum MeshCommandResponsePayload {
     /// Lista obrazow zwracana przez `ListImages`.
     ImageList(Vec<String>),
     /// Wynik probing przepustowosci (server side: porty otwarte do polaczenia).
-    BandwidthProbeServerStarted {
-        tcp_port: u16,
-        rdma_port: u16,
-    },
+    BandwidthProbeServerStarted { tcp_port: u16, rdma_port: u16 },
     /// Wynik probing przepustowosci (client side: zmierzone metryki).
     BandwidthProbeClientResult {
         bandwidth_mbps: f64,
@@ -572,61 +499,78 @@ pub enum MeshCommandResponsePayload {
     ProfilingDownload(ProfilingDownloadResponse),
     /// Multi-source profiling: snapshot aktywnej sesji.
     ProfilingActiveInfo(ProfilingActiveInfoResponse),
+
+    /// Cross-node service action result (stop/delete/pin/pause/rename) — the
+    /// generic ok/error already lives in the outer `MeshCommandResponse`, so
+    /// the payload is `Empty` for all five.
+    ServiceActionResult,
+    /// Cross-node deploy result — carries the slug allocated by the receiver
+    /// so the initiator can wire the deploy log websocket back to that node.
+    ServiceDeployResult {
+        deploy_id: String,
+        engine_id: String,
+        deploy_method: String,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ContainerStart { container_id } => {
-                f.debug_struct("ContainerStart")
-                    .field("container_id", container_id)
-                    .finish()
-            }
-            Self::ContainerStop { container_id } => {
-                f.debug_struct("ContainerStop")
-                    .field("container_id", container_id)
-                    .finish()
-            }
-            Self::ContainerRestart { container_id } => {
-                f.debug_struct("ContainerRestart")
-                    .field("container_id", container_id)
-                    .finish()
-            }
+            Self::ContainerStart { container_id } => f
+                .debug_struct("ContainerStart")
+                .field("container_id", container_id)
+                .finish(),
+            Self::ContainerStop { container_id } => f
+                .debug_struct("ContainerStop")
+                .field("container_id", container_id)
+                .finish(),
+            Self::ContainerRestart { container_id } => f
+                .debug_struct("ContainerRestart")
+                .field("container_id", container_id)
+                .finish(),
             Self::ListContainers => write!(f, "ListContainers"),
             Self::ListImages => write!(f, "ListImages"),
-            Self::SystemPrune { volumes } => {
-                f.debug_struct("SystemPrune")
-                    .field("volumes", volumes)
-                    .finish()
-            }
-            Self::ProvisionCerts { cert_pem: _, key_pem: _, target_dir } => {
-                f.debug_struct("ProvisionCerts")
-                    .field("cert_pem", &"[CERT]")
-                    .field("key_pem", &"***")
-                    .field("target_dir", target_dir)
-                    .finish()
-            }
-            Self::AddService { service_config } => {
-                f.debug_struct("AddService")
-                    .field("service_config", service_config)
-                    .finish()
-            }
-            Self::NetworkConfig { interface, ipv4, netmask, gateway, dhcp, sudo_password: _ } => {
-                f.debug_struct("NetworkConfig")
-                    .field("interface", interface)
-                    .field("ipv4", ipv4)
-                    .field("netmask", netmask)
-                    .field("gateway", gateway)
-                    .field("dhcp", dhcp)
-                    .field("sudo_password", &"***")
-                    .finish()
-            }
-            Self::BandwidthProbe { target_ip, mode, .. } => {
-                f.debug_struct("BandwidthProbe")
-                    .field("target_ip", target_ip)
-                    .field("mode", mode)
-                    .finish()
-            }
+            Self::SystemPrune { volumes } => f
+                .debug_struct("SystemPrune")
+                .field("volumes", volumes)
+                .finish(),
+            Self::ProvisionCerts {
+                cert_pem: _,
+                key_pem: _,
+                target_dir,
+            } => f
+                .debug_struct("ProvisionCerts")
+                .field("cert_pem", &"[CERT]")
+                .field("key_pem", &"***")
+                .field("target_dir", target_dir)
+                .finish(),
+            Self::AddService { service_config } => f
+                .debug_struct("AddService")
+                .field("service_config", service_config)
+                .finish(),
+            Self::NetworkConfig {
+                interface,
+                ipv4,
+                netmask,
+                gateway,
+                dhcp,
+                sudo_password: _,
+            } => f
+                .debug_struct("NetworkConfig")
+                .field("interface", interface)
+                .field("ipv4", ipv4)
+                .field("netmask", netmask)
+                .field("gateway", gateway)
+                .field("dhcp", dhcp)
+                .field("sudo_password", &"***")
+                .finish(),
+            Self::BandwidthProbe {
+                target_ip, mode, ..
+            } => f
+                .debug_struct("BandwidthProbe")
+                .field("target_ip", target_ip)
+                .field("mode", mode)
+                .finish(),
             Self::BandwidthProbeCancel => write!(f, "BandwidthProbeCancel"),
             Self::ProfilingStart(req) => f
                 .debug_struct("ProfilingStart")
@@ -662,6 +606,33 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("ProfilingActiveInfo")
                 .field("node_id", &req.node_id)
                 .finish(),
+            Self::ServiceStartRemote { service_id } => f
+                .debug_struct("ServiceStartRemote")
+                .field("service_id", service_id)
+                .finish(),
+            Self::ServiceDeleteRemote { service_id } => f
+                .debug_struct("ServiceDeleteRemote")
+                .field("service_id", service_id)
+                .finish(),
+            Self::ServicePinRemote { service_id, pinned } => f
+                .debug_struct("ServicePinRemote")
+                .field("service_id", service_id)
+                .field("pinned", pinned)
+                .finish(),
+            Self::ServicePauseRemote { service_id, paused } => f
+                .debug_struct("ServicePauseRemote")
+                .field("service_id", service_id)
+                .field("paused", paused)
+                .finish(),
+            Self::ServiceDeployRemote {
+                engine_id,
+                deploy_method,
+                ..
+            } => f
+                .debug_struct("ServiceDeployRemote")
+                .field("engine_id", engine_id)
+                .field("deploy_method", deploy_method)
+                .finish(),
         }
     }
 }
@@ -677,7 +648,6 @@ pub const MESH_MSG_FORWARD_REQ: u8 = 0x13;
 pub const MESH_MSG_FORWARD_RES: u8 = 0x14;
 pub const MESH_MSG_MODEL_LIST: u8 = 0x15;
 pub const MESH_MSG_CONTAINER_LIST: u8 = 0x16;
-pub const MESH_MSG_SERVICE_ANNOUNCE: u8 = 0x17;
 pub const MESH_MSG_NODE_INFO: u8 = 0x18;
 /// Minimal hello — hostname + platform. Wysylany przy kazdym PeerConnected
 /// (trusted LUB discovered), zeby GUI mogl pokazac ludzka nazwe (spark-002)
@@ -703,8 +673,6 @@ pub const MESH_MSG_COMMAND: u8 = 0x30;
 pub const MESH_MSG_COMMAND_RESPONSE: u8 = 0x31;
 pub const MESH_MSG_DEPLOY_PROGRESS: u8 = 0x32;
 pub const MESH_MSG_LOG_CHUNK: u8 = 0x33;
-pub const MESH_MSG_SERVICE_QUERY_ALL: u8 = 0x34;
-pub const MESH_MSG_SERVICE_RESPONSE_ALL: u8 = 0x35;
 pub const MESH_MSG_CLUSTER_INFO: u8 = 0x36;
 pub const MESH_MSG_KEY_ROTATION: u8 = 0x25;
 pub const MESH_MSG_KEY_ROTATION_RESPONSE: u8 = 0x26;
@@ -712,6 +680,14 @@ pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
 pub const MESH_MSG_RELAY_FRAME: u8 = 0x37;
 pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
 pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
+/// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
+pub const MESH_MSG_SERVICES_GET: u8 = 0x40;
+/// Odpowiedz na `MESH_MSG_SERVICES_GET` — pelen snapshot lokalnego nodu.
+pub const MESH_MSG_SERVICES_GET_RESPONSE: u8 = 0x41;
+/// Periodyczny anti-drift broadcast pelnego stanu serwisow (co ~5min).
+pub const MESH_MSG_SERVICES_ANNOUNCE: u8 = 0x42;
+/// Push delta — pojedyncza zmiana (deploy/stop/pin/pause/rename/delete).
+pub const MESH_MSG_SERVICES_UPDATE: u8 = 0x43;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
@@ -876,6 +852,48 @@ pub struct MeshRelayFrame {
 }
 
 // =============================================================================
+// Mesh services registry — wire payloads (krok N3a)
+// =============================================================================
+//
+// Cross-node services sync flows over four discriminants 0x40..0x43. The full
+// `ServiceInfo` struct lives in `message_body` (it is also returned by the
+// local `ServiceListRequest`); we re-use it here so receivers can drop a
+// snapshot straight into the in-memory `MeshServicesRegistry`.
+
+/// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesGetPayload {
+    pub from_node_id: String,
+}
+
+/// Odpowiedz na `MeshServicesGetPayload` — pelen snapshot lokalnego nodu.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesGetResponsePayload {
+    pub from_node_id: String,
+    pub services: Vec<crate::message_body::ServiceInfo>,
+}
+
+/// Periodyczny anti-drift broadcast (co ~5 min). Pelen stan zastepuje to co
+/// odbiorca trzyma w `MeshServicesRegistry` dla danego nodu.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesAnnouncePayload {
+    pub from_node_id: String,
+    pub services: Vec<crate::message_body::ServiceInfo>,
+}
+
+/// Push delta — wysylane natychmiast po lokalnej mutacji (deploy/stop/pin/
+/// pause/rename/delete). Odbiorca aplikuje `change` na swoim widoku nodu.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesUpdatePayload {
+    pub from_node_id: String,
+    pub change: crate::message_body::ServiceChange,
+}
+
+// =============================================================================
 // Typy protokolu meeting bot sidecar
 // =============================================================================
 
@@ -965,9 +983,11 @@ mod tests {
             incarnation: 42,
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja ping powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja ping powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja ping powinna sie udac");
+        let archived =
+            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja ping powinna sie udac");
 
         match archived {
             ArchivedMeshMessage::Ping { from, incarnation } => {
@@ -987,13 +1007,18 @@ mod tests {
             capabilities: vec!["llm".to_string(), "embedding".to_string()],
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja join powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja join powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja join powinna sie udac");
+        let archived =
+            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja join powinna sie udac");
 
         match archived {
             ArchivedMeshMessage::Join {
-                node_id, addr, role, capabilities,
+                node_id,
+                addr,
+                role,
+                capabilities,
             } => {
                 assert_eq!(node_id.as_str(), "node-2");
                 assert_eq!(addr.as_str(), "192.168.1.10:4433");
@@ -1026,7 +1051,9 @@ mod tests {
             operations: ops,
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja state sync powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja state sync powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja state sync powinna sie udac");
 
@@ -1040,41 +1067,6 @@ mod tests {
     }
 
     #[test]
-    fn test_service_info_roundtrip() {
-        let msg = MeshMessage::ServiceAnnounce {
-            node_id: "node-4".to_string(),
-            services: vec![MeshServiceInfo {
-                service_id: String::new(),
-                service_name: "llm-server".to_string(),
-                service_type: "llm".to_string(),
-                node_id: "node-4".to_string(),
-                quic_port: 4433,
-                quic_url: String::new(),
-                status: "running".to_string(),
-                models: vec!["llama3-8b".to_string(), "mistral-7b".to_string()],
-                load_percent: 35,
-                engine_id: None,
-                model_sizes_mb: Vec::new(),
-            }],
-        };
-
-        let bytes = msg.serialize_rkyv().expect("Serializacja service announce powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja service announce powinna sie udac");
-
-        match archived {
-            ArchivedMeshMessage::ServiceAnnounce { node_id, services } => {
-                assert_eq!(node_id.as_str(), "node-4");
-                assert_eq!(services.len(), 1);
-                assert_eq!(services[0].quic_port, 4433);
-                assert_eq!(services[0].load_percent, 35);
-                assert_eq!(services[0].models.len(), 2);
-            }
-            _ => panic!("Oczekiwano wariantu ServiceAnnounce"),
-        }
-    }
-
-    #[test]
     fn test_forward_roundtrip() {
         let payload = vec![1u8, 2, 3, 4, 5];
         let msg = MeshMessage::ForwardRequest {
@@ -1083,13 +1075,17 @@ mod tests {
             payload: payload.clone(),
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja forward powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja forward powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja forward powinna sie udac");
+        let archived =
+            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja forward powinna sie udac");
 
         match archived {
             ArchivedMeshMessage::ForwardRequest {
-                request_id, target_node, payload: archived_payload,
+                request_id,
+                target_node,
+                payload: archived_payload,
             } => {
                 assert_eq!(request_id.as_str(), "req-001");
                 assert_eq!(target_node.as_str(), "node-5");
@@ -1178,7 +1174,10 @@ mod tests {
 
         match archived {
             ArchivedMeetingControl::Join { meeting_url } => {
-                assert_eq!(meeting_url.as_str(), "https://teams.microsoft.com/l/meetup-join/abc");
+                assert_eq!(
+                    meeting_url.as_str(),
+                    "https://teams.microsoft.com/l/meetup-join/abc"
+                );
             }
             _ => panic!("Oczekiwano wariantu Join"),
         }
@@ -1214,7 +1213,9 @@ mod tests {
 
     #[test]
     fn test_meeting_control_state_changed_joining() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::Joining };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Joining,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1230,7 +1231,9 @@ mod tests {
 
     #[test]
     fn test_meeting_control_state_changed_connected() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::Connected };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Connected,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1246,7 +1249,9 @@ mod tests {
 
     #[test]
     fn test_meeting_control_state_changed_reconnecting() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::Reconnecting };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Reconnecting,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1263,7 +1268,9 @@ mod tests {
     #[test]
     fn test_meeting_control_state_changed_ended() {
         let ctrl = MeetingControl::StateChanged {
-            state: MeetingState::Ended { reason: "host ended".to_string() },
+            state: MeetingState::Ended {
+                reason: "host ended".to_string(),
+            },
         };
 
         let bytes = rkyv_serialize!(&ctrl);
@@ -1271,21 +1278,21 @@ mod tests {
             .expect("Dostep do archived powinna sie udac");
 
         match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                match state {
-                    ArchivedMeetingState::Ended { reason } => {
-                        assert_eq!(reason.as_str(), "host ended");
-                    }
-                    _ => panic!("Oczekiwano MeetingState::Ended"),
+            ArchivedMeetingControl::StateChanged { state } => match state {
+                ArchivedMeetingState::Ended { reason } => {
+                    assert_eq!(reason.as_str(), "host ended");
                 }
-            }
+                _ => panic!("Oczekiwano MeetingState::Ended"),
+            },
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
     }
 
     #[test]
     fn test_meeting_control_state_changed_auth_expired() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::AuthExpired };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::AuthExpired,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1302,7 +1309,9 @@ mod tests {
     #[test]
     fn test_meeting_control_state_changed_kicked() {
         let ctrl = MeetingControl::StateChanged {
-            state: MeetingState::Kicked { reason: "disruption".to_string() },
+            state: MeetingState::Kicked {
+                reason: "disruption".to_string(),
+            },
         };
 
         let bytes = rkyv_serialize!(&ctrl);
@@ -1310,14 +1319,12 @@ mod tests {
             .expect("Dostep do archived powinna sie udac");
 
         match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                match state {
-                    ArchivedMeetingState::Kicked { reason } => {
-                        assert_eq!(reason.as_str(), "disruption");
-                    }
-                    _ => panic!("Oczekiwano MeetingState::Kicked"),
+            ArchivedMeetingControl::StateChanged { state } => match state {
+                ArchivedMeetingState::Kicked { reason } => {
+                    assert_eq!(reason.as_str(), "disruption");
                 }
-            }
+                _ => panic!("Oczekiwano MeetingState::Kicked"),
+            },
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
     }
@@ -1398,10 +1405,15 @@ mod tests {
     fn test_meeting_control_serde_json_roundtrip() {
         // JSON roundtrip dla kazdego wariantu MeetingControl
         let controls = vec![
-            MeetingControl::Join { meeting_url: "https://test".to_string() },
+            MeetingControl::Join {
+                meeting_url: "https://test".to_string(),
+            },
             MeetingControl::Leave,
             MeetingControl::Mute { muted: true },
-            MeetingControl::SidecarHealth { healthy: false, uptime_s: 0 },
+            MeetingControl::SidecarHealth {
+                healthy: false,
+                uptime_s: 0,
+            },
         ];
 
         for ctrl in &controls {
@@ -1467,7 +1479,9 @@ mod tests {
             docker_running: true,
         });
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja heartbeat powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja heartbeat powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja heartbeat powinna sie udac");
 
@@ -1508,19 +1522,6 @@ mod tests {
                 cpu_percent: 55.0,
                 memory_mb: 4096,
             }],
-            services: vec![MeshServiceInfo {
-                service_id: String::new(),
-                service_name: "llm-vllm".to_string(),
-                service_type: "llm".to_string(),
-                node_id: "node-20".to_string(),
-                quic_port: 4433,
-                quic_url: String::new(),
-                status: "running".to_string(),
-                models: vec!["llama3-70b".to_string()],
-                load_percent: 55,
-                engine_id: None,
-                model_sizes_mb: Vec::new(),
-            }],
             crdt_operations: vec![CrdtSyncOp {
                 clock_time: 200,
                 clock_node_hash: 0xCAFE,
@@ -1535,7 +1536,9 @@ mod tests {
             cluster_id: Some("gpu-farm".to_string()),
         });
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja full state powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja full state powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja full state powinna sie udac");
 
@@ -1549,7 +1552,6 @@ mod tests {
                 assert_eq!(state.models[0].max_context, 8192);
                 assert_eq!(state.containers.len(), 1);
                 assert_eq!(state.containers[0].name.as_str(), "vllm-server");
-                assert_eq!(state.services.len(), 1);
                 assert_eq!(state.crdt_operations.len(), 1);
                 assert_eq!(state.version_vector.len(), 2);
             }

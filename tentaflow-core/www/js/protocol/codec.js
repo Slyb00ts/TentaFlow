@@ -835,18 +835,6 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ServiceStopRequest { serviceId } */
-  serviceStopRequest(correlationId, { serviceId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceStopRequest(serviceId);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
   /** MessageBody::ServiceFlagsUpdateRequest { serviceId, pinned?, paused? }
    *  pinned/paused: undefined/null = nie zmieniaj, true/false = ustaw. */
   serviceFlagsUpdateRequest(correlationId, { serviceId, pinned, paused }, sequence = 1) {
@@ -2299,6 +2287,90 @@ export const encode = {
     const body = _wasm.encodeIamListPermsForSubjectRequest(String(p.subjectType), Number(p.subjectId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
+
+  // ---- Services (Krok N2 — packed in MessageBody::ServiceBody) -----------
+
+  /**
+   * MessageBody::ServiceBody(ServicePayload::ReqList). The list shape lets the
+   * shared `ApiBinary.list('serviceListRequest', …)` helper call without a
+   * payload (it forwards `(corrId, sequence)`); we accept both call styles.
+   */
+  serviceListRequest(correlationId, payloadOrSeq, sequence = 1) {
+    assertReady();
+    let payload = {};
+    let seq = sequence;
+    if (typeof payloadOrSeq === 'number' || typeof payloadOrSeq === 'bigint') {
+      seq = payloadOrSeq;
+    } else if (payloadOrSeq && typeof payloadOrSeq === 'object') {
+      payload = payloadOrSeq;
+    }
+    const engineFilter = payload.engineIdFilter ? String(payload.engineIdFilter) : undefined;
+    const categoryFilter = payload.categoryFilter ? String(payload.categoryFilter) : undefined;
+    const body = _wasm.encodeServiceListRequest(engineFilter, categoryFilter);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(seq),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqDelete). */
+  serviceDeleteRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceDeleteRequest(Number(serviceId), nodeId ?? undefined);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqPin). */
+  servicePinRequest(correlationId, { serviceId, pinned, nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServicePinRequest(
+      Number(serviceId),
+      Boolean(pinned),
+      nodeId ?? undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqPause). */
+  servicePauseRequest(correlationId, { serviceId, paused, nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServicePauseRequest(
+      Number(serviceId),
+      Boolean(paused),
+      nodeId ?? undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqStart) — unpause + spawn. */
+  serviceStartRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceStartRequest(Number(serviceId), nodeId ?? undefined);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 };
 
 // =============================================================================

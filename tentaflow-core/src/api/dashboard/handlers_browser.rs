@@ -78,11 +78,13 @@ pub async fn browser_capture(
         BROWSER_CAPTURE_KIND_SCREENSHOT => BrowserOperation::Screenshot { full_page },
         BROWSER_CAPTURE_KIND_DOM => BrowserOperation::Dom,
         other => {
-            return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-                other,
-                BROWSER_CAPTURE_FAILED,
-                format!("unknown kind: {other}"),
-            ))));
+            return Ok(MessageBody::BrowserCaptureBody(
+                BrowserCapturePayload::Response(failure(
+                    other,
+                    BROWSER_CAPTURE_FAILED,
+                    format!("unknown kind: {other}"),
+                )),
+            ));
         }
     };
 
@@ -94,26 +96,32 @@ pub async fn browser_capture(
     let desc = match ctx.state.meeting_manager.session_detail(session_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
-            return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-                &kind,
-                BROWSER_CAPTURE_NOT_FOUND,
-                "session not found",
-            ))));
+            return Ok(MessageBody::BrowserCaptureBody(
+                BrowserCapturePayload::Response(failure(
+                    &kind,
+                    BROWSER_CAPTURE_NOT_FOUND,
+                    "session not found",
+                )),
+            ));
         }
         Err(e) => {
-            return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-                &kind,
-                BROWSER_CAPTURE_FAILED,
-                format!("db error: {e}"),
-            ))));
+            return Ok(MessageBody::BrowserCaptureBody(
+                BrowserCapturePayload::Response(failure(
+                    &kind,
+                    BROWSER_CAPTURE_FAILED,
+                    format!("db error: {e}"),
+                )),
+            ));
         }
     };
     if !is_admin(ctx) && desc.owner_user_id != Some(me) {
-        return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-            &kind,
-            BROWSER_CAPTURE_FORBIDDEN,
-            "not your session",
-        ))));
+        return Ok(MessageBody::BrowserCaptureBody(
+            BrowserCapturePayload::Response(failure(
+                &kind,
+                BROWSER_CAPTURE_FORBIDDEN,
+                "not your session",
+            )),
+        ));
     }
 
     // 2. Locate the bot's QUIC client. MeetingManager registers under
@@ -126,11 +134,13 @@ pub async fn browser_capture(
         .get_quic_llm_client(&service_name)
         .await
     else {
-        return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-            &kind,
-            BROWSER_CAPTURE_FAILED,
-            "bot QUIC client not available",
-        ))));
+        return Ok(MessageBody::BrowserCaptureBody(
+            BrowserCapturePayload::Response(failure(
+                &kind,
+                BROWSER_CAPTURE_FAILED,
+                "bot QUIC client not available",
+            )),
+        ));
     };
 
     // 3. Dispatch Browser ModelRequest. Bot replies with ModelResult::Browser
@@ -147,18 +157,22 @@ pub async fn browser_capture(
     let response = match tokio::time::timeout(CAPTURE_BUDGET, send).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-                &kind,
-                BROWSER_CAPTURE_FAILED,
-                format!("bot dispatch: {e}"),
-            ))));
+            return Ok(MessageBody::BrowserCaptureBody(
+                BrowserCapturePayload::Response(failure(
+                    &kind,
+                    BROWSER_CAPTURE_FAILED,
+                    format!("bot dispatch: {e}"),
+                )),
+            ));
         }
         Err(_) => {
-            return Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(failure(
-                &kind,
-                BROWSER_CAPTURE_FAILED,
-                "bot reply timeout (12s)",
-            ))));
+            return Ok(MessageBody::BrowserCaptureBody(
+                BrowserCapturePayload::Response(failure(
+                    &kind,
+                    BROWSER_CAPTURE_FAILED,
+                    "bot reply timeout (12s)",
+                )),
+            ));
         }
     };
 
@@ -181,8 +195,14 @@ pub async fn browser_capture(
             BrowserResult::Error { message } => failure(&kind, BROWSER_CAPTURE_FAILED, message),
         },
         ModelResult::Error(e) => failure(&kind, BROWSER_CAPTURE_FAILED, e.message),
-        _ => failure(&kind, BROWSER_CAPTURE_FAILED, "unexpected ModelResult variant"),
+        _ => failure(
+            &kind,
+            BROWSER_CAPTURE_FAILED,
+            "unexpected ModelResult variant",
+        ),
     };
 
-    Ok(MessageBody::BrowserCaptureBody(BrowserCapturePayload::Response(payload)))
+    Ok(MessageBody::BrowserCaptureBody(
+        BrowserCapturePayload::Response(payload),
+    ))
 }

@@ -74,20 +74,8 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // Seed domyslnych danych
     seed::seed_defaults(&conn)?;
 
-    // Migracja: zaktualizuj connection_type na 'quic' dla serwisow zarejestrowanych przez mesh
-    conn.execute_batch(
-        "UPDATE model_registry SET connection_type = 'quic' WHERE service_id IS NOT NULL AND connection_type IN ('openai_api', 'http_api');"
-    )?;
-
     let pool = Arc::new(Mutex::new(conn));
     set_global_pool(pool.clone());
-
-    // Czyszczenie sierot po historycznych usunieciach serwisow sprzed
-    // kaskadowego `delete_service` (FK byl wczesniej `ON DELETE SET NULL`).
-    // Bez tego GUI pokazywal duchy modeli blokujace re-deploy.
-    if let Err(e) = repository::prune_orphaned_quic_models(&pool) {
-        tracing::warn!("prune_orphaned_quic_models przy starcie: {}", e);
-    }
 
     // Upgrade path for PR5: copy `trusted_nodes` rows + parse legacy
     // `settings.trusted_contact:*` JSON entries into peer_persisted /

@@ -10,7 +10,6 @@
 
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
 // =============================================================================
@@ -46,13 +45,6 @@ pub struct NodeConfig {
     /// Load balancing (health checks, circuit breaker)
     pub load_balancing: LoadBalancingConfig,
 
-    /// Zunifikowana lista wszystkich serwisow AI
-    pub services: Vec<ServiceConnection>,
-
-    /// Aliasy serwisow (wiele nazw -> jeden serwis)
-    #[serde(default)]
-    pub service_aliases: Vec<ServiceAlias>,
-
     /// Monitoring (Prometheus, health checks)
     #[serde(default)]
     pub monitoring: MonitoringConfig,
@@ -76,6 +68,63 @@ pub struct NodeConfig {
     /// Konfiguracja lokalnej inferencji (opcjonalna)
     #[serde(default)]
     pub inference: Option<InferenceConfig>,
+
+    /// Runtime services subsystem (port range, supervisor cadence, restart policy).
+    /// Used by the unified services refactor (services_repo + services::deploy/supervisor).
+    #[serde(default)]
+    pub services_runtime: ServicesRuntimeConfig,
+}
+
+// =============================================================================
+// Konfiguracja runtime serwisow (additive — wariant B refactor unifikacji)
+// =============================================================================
+
+/// Konfiguracja podsystemu runtime'u serwisow zarzadzanych przez `services_repo`
+/// i `services::deploy/supervisor`. Sekcja TOML: `[services_runtime]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServicesRuntimeConfig {
+    /// Inclusive zakres portow ktore allocator moze rozdawac dla deploymentow.
+    #[serde(default = "default_services_port_range")]
+    pub port_range: (u16, u16),
+
+    /// Interwal probek health-check w milisekundach.
+    #[serde(default = "default_services_health_interval_ms")]
+    pub health_check_interval_ms: u64,
+
+    /// Maksymalna liczba prob restartow zanim supervisor oznaczy serwis jako Failed.
+    #[serde(default = "default_services_max_restart_attempts")]
+    pub max_restart_attempts: u32,
+
+    /// Gorny limit (cap) dla exponential backoff miedzy restartami, w milisekundach.
+    #[serde(default = "default_services_restart_backoff_max_ms")]
+    pub restart_backoff_max_ms: u64,
+}
+
+impl Default for ServicesRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            port_range: default_services_port_range(),
+            health_check_interval_ms: default_services_health_interval_ms(),
+            max_restart_attempts: default_services_max_restart_attempts(),
+            restart_backoff_max_ms: default_services_restart_backoff_max_ms(),
+        }
+    }
+}
+
+fn default_services_port_range() -> (u16, u16) {
+    (5000, 6000)
+}
+
+fn default_services_health_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_services_max_restart_attempts() -> u32 {
+    5
+}
+
+fn default_services_restart_backoff_max_ms() -> u64 {
+    60_000
 }
 
 // =============================================================================
@@ -356,41 +405,8 @@ pub struct LoadBalancingConfig {
 }
 
 // =============================================================================
-// Zunifikowana architektura serwisow AI
+// Runtime types reused przez warstwe transport_client / backend client
 // =============================================================================
-
-/// Typ serwisu AI
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceType {
-    /// Large Language Model (chat completions, text generation)
-    LLM,
-
-    /// Embedding generation (wektoryzacja tekstu dla RAG/search)
-    Embedding,
-
-    /// RAG (Retrieval-Augmented Generation)
-    RAG,
-
-    /// Vision/OCR (rozpoznawanie obrazow, OCR, image understanding)
-    Vision,
-
-    /// Speech-to-Text (transkrypcja audio -> text)
-    STT,
-
-    /// Text-to-Speech (synteza mowy text -> audio)
-    TTS,
-
-    /// Memory Engine (graf wiedzy, entity storage, semantic search)
-    Memory,
-
-    /// Reranker (rerankowanie wynikow wyszukiwania)
-    Reranker,
-
-    /// Meeting Bot (sidecar do spotkan Teams/Zoom/Meet)
-    #[serde(rename = "meeting-bot")]
-    MeetingBot,
-}
 
 /// Typ polaczenia do backendu AI
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -509,37 +525,6 @@ pub enum LlmModelCategory {
     Main,
     /// Analyzer LLM (bielik-1.5b) — analiza dla Memory, tools
     Analyzer,
-}
-
-/// Definicja serwisu AI z jednym lub wieloma backendami
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ServiceConnection {
-    /// Nazwa serwisu (unikalna, uzywana w routing i aliasach)
-    pub name: String,
-
-    /// Typ serwisu (LLM, Embedding, RAG, Vision, STT, TTS)
-    pub service_type: ServiceType,
-
-    /// Kategoria modelu LLM (tylko dla ServiceType::LLM)
-    #[serde(default)]
-    pub model_category: LlmModelCategory,
-
-    /// Strategia load balancingu dla multi-backend
-    #[serde(default = "default_lb_strategy")]
-    pub strategy: String,
-
-    /// Lista backendow dla tego serwisu (minimum 1)
-    pub backends: Vec<ServiceBackend>,
-}
-
-/// Alias serwisu (wiele nazw -> jeden serwis)
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ServiceAlias {
-    /// Alias (krotsza/alternatywna nazwa)
-    pub alias: String,
-
-    /// Target (prawdziwa nazwa serwisu)
-    pub target: String,
 }
 
 // =============================================================================
@@ -702,10 +687,6 @@ fn default_keepalive() -> u64 {
     10_000 // 10 sekund
 }
 
-fn default_lb_strategy() -> String {
-    "single".to_string()
-}
-
 fn default_tts_model() -> String {
     "tts-1".to_string()
 }
@@ -739,7 +720,9 @@ fn default_cluster_name() -> String {
 }
 
 fn default_models_dir() -> String {
-    "./models".to_string()
+    // Portable layout: shared models cache under <tentaflow_home>/models so
+    // every backend (Docker, native venv, in-process) hits the same HF cache.
+    crate::paths::models_root().to_string_lossy().into_owned()
 }
 
 fn default_inference_backend() -> String {
@@ -788,41 +771,6 @@ impl NodeConfig {
             self.validate_protocol_config(&self.protocols.openai_api, "openai_api")?;
         }
 
-        let mut service_names = std::collections::HashSet::new();
-        for service in &self.services {
-            if !service_names.insert(&service.name) {
-                return Err(CoreError::ConfigError {
-                    message: format!("Duplikat nazwy serwisu: '{}'", service.name),
-                    source: anyhow::anyhow!("Nazwa serwisu musi byc unikalna"),
-                }
-                .into());
-            }
-
-            if service.backends.is_empty() {
-                return Err(CoreError::ConfigError {
-                    message: format!("Serwis '{}' nie ma zadnych backendow", service.name),
-                    source: anyhow::anyhow!("backends jest puste"),
-                }
-                .into());
-            }
-
-            match service.strategy.as_str() {
-                "single" | "least_loaded" | "round_robin" | "weighted" => {}
-                _ => {
-                    return Err(CoreError::ConfigError {
-                        message: format!(
-                            "Nieznana strategia load balancingu '{}' dla serwisu '{}'",
-                            service.strategy, service.name
-                        ),
-                        source: anyhow::anyhow!(
-                            "Dozwolone: single, least_loaded, round_robin, weighted"
-                        ),
-                    }
-                    .into());
-                }
-            }
-        }
-
         // Walidacja mesh config jesli obecna
         if let Some(ref mesh) = self.mesh {
             if mesh.enabled && mesh.port == 0 {
@@ -862,38 +810,6 @@ impl NodeConfig {
             }
             .into()
         })
-    }
-
-    /// Buduje mape aliasow serwisow dla szybkiego lookup.
-    pub fn build_service_alias_map(&self) -> HashMap<String, String> {
-        self.service_aliases
-            .iter()
-            .map(|a| (a.alias.clone(), a.target.clone()))
-            .collect()
-    }
-
-    /// Znajduje serwis po nazwie (z uwzglednieniem aliasow).
-    pub fn find_service(&self, service_name: &str) -> Option<&ServiceConnection> {
-        let target_name = self
-            .service_aliases
-            .iter()
-            .find(|a| a.alias == service_name)
-            .map(|a| a.target.as_str())
-            .unwrap_or(service_name);
-
-        self.services
-            .iter()
-            .find(|service| service.name == target_name)
-    }
-
-    /// Znajduje wszystkie serwisy danego typu.
-    pub fn find_services_by_type(
-        &self,
-        service_type: ServiceType,
-    ) -> impl Iterator<Item = &ServiceConnection> {
-        self.services
-            .iter()
-            .filter(move |service| service.service_type == service_type)
     }
 }
 
@@ -973,8 +889,6 @@ impl Default for NodeConfig {
             middleware: MiddlewareConfig::default(),
             rate_limiting: RateLimitingConfig::default(),
             load_balancing: LoadBalancingConfig::default(),
-            services: vec![],
-            service_aliases: vec![],
             monitoring: MonitoringConfig::default(),
             memory: None,
             security: None,
@@ -990,6 +904,7 @@ impl Default for NodeConfig {
                 iroh_relay_url: default_iroh_relay_url(),
             }),
             inference: None,
+            services_runtime: ServicesRuntimeConfig::default(),
         }
     }
 }

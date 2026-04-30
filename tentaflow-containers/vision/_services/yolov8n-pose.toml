@@ -1,0 +1,27 @@
+# =============================================================================
+# YOLOv8n Pose — multi-person body pose estimation.
+# Embedded native: ONNX model downloaded on deploy and executed with tract-onnx.
+# =============================================================================
+
+[engine]
+id = "yolov8n-pose"
+category = "vision"
+name = "YOLOv8n Pose"
+description_pl = "Estymacja pozy ciala dla wielu osob: 17 punktow COCO i bbox. Szybki model nano ONNX do podgladu na zywo."
+description_en = "Multi-person body pose estimation: 17 COCO keypoints and bounding boxes. Fast nano ONNX model for live preview."
+homepage = "https://docs.ultralytics.com/tasks/pose/"
+license = "AGPL-3.0"
+icon = "yolo"
+default_port = 0
+api = "custom"
+version = "8n-pose-onnx"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "yolov8n-pose-coco"
+display_name = "YOLOv8n Pose COCO"
+repo = "Xenova/yolov8n-pose"
+recommended = true

@@ -1,0 +1,27 @@
+# =============================================================================
+# MoveNet Lightning — ultra-fast single-person body pose estimation.
+# Embedded native: ONNX model downloaded on deploy and executed with tract-onnx.
+# =============================================================================
+
+[engine]
+id = "movenet-lightning"
+category = "vision"
+name = "MoveNet Lightning"
+description_pl = "Ultraszybka estymacja pozy jednej osoby: 17 punktow COCO. Dobry wybor dla kamery na telefonie."
+description_en = "Ultra-fast single-person pose estimation: 17 COCO keypoints. A strong fit for phone camera preview."
+homepage = "https://www.tensorflow.org/lite/examples/pose_estimation/overview"
+license = "Apache-2.0"
+icon = "movenet"
+default_port = 0
+api = "custom"
+version = "singlepose-lightning-onnx"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "movenet-lightning-singlepose"
+display_name = "MoveNet Lightning SinglePose"
+repo = "Xenova/movenet-singlepose-lightning"
+recommended = true

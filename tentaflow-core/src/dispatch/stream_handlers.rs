@@ -537,10 +537,11 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
 
     let db = ctx.state.db.clone();
     tokio::spawn(async move {
-        // Replay historycznych linii z DB.
+        // Replay historycznych linii — najpierw z deployments po slug,
+        // fallback do legacy `deployments` jesli rekord nie istnieje w v2.
         if replay_tail {
-            if let Ok(Some(row)) = crate::db::repository::deployments::get(&db, &deploy_id) {
-                for (idx, line) in row.log_tail.split('\n').enumerate() {
+            if let Ok(Some(v2)) = crate::services_repo::deployments::get_by_slug(&db, &deploy_id) {
+                for (idx, line) in v2.log_tail.split('\n').enumerate() {
                     if line.is_empty() {
                         continue;
                     }
@@ -548,8 +549,8 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         deploy_id: deploy_id.clone(),
                         kind: "log".to_string(),
                         line: line.to_string(),
-                        phase: row.phase.clone(),
-                        progress_pct: row.progress_pct as i32,
+                        phase: String::new(),
+                        progress_pct: 0,
                         ts_ms: idx as i64,
                     };
                     if push_chunk(
@@ -561,14 +562,18 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         return;
                     }
                 }
-                // Jeśli deployment już zakończony → emit End od razu i koniec.
-                if matches!(row.status.as_str(), "success" | "failure" | "cancelled") {
+                let final_status = match v2.status {
+                    crate::services_repo::deployments::DeploymentStatus::Success => "success",
+                    crate::services_repo::deployments::DeploymentStatus::Failed => "failure",
+                    _ => "",
+                };
+                if !final_status.is_empty() {
                     let end = DeploymentStreamEnd {
                         deploy_id: deploy_id.clone(),
-                        final_status: row.status.clone(),
-                        image_tag: row.image_tag.clone(),
-                        container_name: row.container_name.clone(),
-                        error_message: row.error_message.unwrap_or_default(),
+                        final_status: final_status.to_string(),
+                        image_tag: String::new(),
+                        container_name: String::new(),
+                        error_message: v2.error_text.unwrap_or_default(),
                         duration_ms: 0,
                     };
                     let _ = push_end(

@@ -16,7 +16,9 @@ pub struct Shard {
 
 impl Shard {
     pub fn new() -> Self {
-        Self { map: RwLock::new(HashMap::new()) }
+        Self {
+            map: RwLock::new(HashMap::new()),
+        }
     }
 }
 

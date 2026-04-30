@@ -144,17 +144,32 @@ pub struct RunningEngine {
     pub internal_port: u16,
 }
 
-/// Katalog cache tentaflow (`~/.cache/tentaflow/` na linux,
-/// `~/Library/Caches/tentaflow/` na macOS).
+/// Katalog cache tentaflow. Delegates to the portable layout in
+/// `crate::paths::cache_dir()` (honors `TENTAFLOW_CACHE_DIR`, falls back
+/// to `<tentaflow_home>/cache`).
 pub fn cache_root() -> Result<PathBuf> {
-    if let Ok(override_dir) = std::env::var("TENTAFLOW_CACHE_DIR") {
-        let path = PathBuf::from(override_dir);
-        std::fs::create_dir_all(&path)?;
-        return Ok(path);
+    let path = crate::paths::cache_dir();
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("create cache dir {}", path.display()))?;
+    Ok(path)
+}
+
+/// Workspace root that already contains the extracted `tentaflow-containers/`
+/// tree. `paths::ensure_app_dirs()` populates this at startup, so deploy
+/// flows skip the legacy "extract bundle into a tmpdir" step.
+fn runtime_bundle_root() -> Result<PathBuf> {
+    let containers = crate::paths::containers_root();
+    let parent = containers
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("containers_root has no parent: {}", containers.display()))?
+        .to_path_buf();
+    if !containers.is_dir() {
+        anyhow::bail!(
+            "tentaflow-containers/ not extracted yet at {} — run paths::ensure_app_dirs() first",
+            containers.display()
+        );
     }
-    dirs::cache_dir()
-        .map(|c| c.join("tentaflow"))
-        .ok_or_else(|| anyhow::anyhow!("nie mozna ustalic cache dir"))
+    Ok(parent)
 }
 
 /// Znajduje katalog bundla Pythona dla danego silnika.
@@ -218,9 +233,8 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
 }
 
 pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEngine> {
-    let extracted = tempfile::tempdir()?;
-    super::bundle::extract_to(extracted.path())?;
-    let spec = read_bundle_spec(extracted.path(), engine)?;
+    let workspace = runtime_bundle_root()?;
+    let spec = read_bundle_spec(&workspace, engine)?;
     check_platform_compat(&spec.requires)?;
 
     let detected = crate::system_check::collect();
@@ -235,7 +249,7 @@ pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEn
     let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
     let uv_bin = ensure_uv(&cache, log).ok();
 
-    let bundle_src = find_bundle_dir(extracted.path(), engine)
+    let bundle_src = find_bundle_dir(&workspace, engine)
         .ok_or_else(|| anyhow::anyhow!(
             "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
             engine
@@ -270,9 +284,8 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
 }
 
 pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<RunningEngine> {
-    let extracted = tempfile::tempdir()?;
-    super::bundle::extract_to(extracted.path())?;
-    let spec = read_bundle_spec(extracted.path(), &req.engine)?;
+    let workspace = runtime_bundle_root()?;
+    let spec = read_bundle_spec(&workspace, &req.engine)?;
 
     check_platform_compat(&spec.requires)?;
 
@@ -290,7 +303,7 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
     let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
     let uv_bin = ensure_uv(&cache, log).ok();
 
-    let bundle_src = find_bundle_dir(extracted.path(), &req.engine)
+    let bundle_src = find_bundle_dir(&workspace, &req.engine)
         .ok_or_else(|| anyhow::anyhow!(
             "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
             req.engine
@@ -941,7 +954,10 @@ fn install_deps(
             let clone_dir = venv.join("src").join(&spec.bundle.engine);
             if !clone_dir.exists() {
                 std::fs::create_dir_all(clone_dir.parent().unwrap()).ok();
-                log(&format!("git clone --depth 1 --branch {} {}", refname, repo));
+                log(&format!(
+                    "git clone --depth 1 --branch {} {}",
+                    refname, repo
+                ));
                 run_with_logs(
                     Command::new("git")
                         .arg("clone")
@@ -1020,9 +1036,8 @@ fn install_deps(
 /// istnieje z poprzedniego deploy — jesli nie, zwraca blad i caller powinien
 /// zdecydowac czy oznaczyc serwis jako `stopped` w DB.
 pub fn relaunch(req: &NativeDeployRequest) -> Result<RunningEngine> {
-    let extracted = tempfile::tempdir()?;
-    super::bundle::extract_to(extracted.path())?;
-    let spec = read_bundle_spec(extracted.path(), &req.engine)?;
+    let workspace = runtime_bundle_root()?;
+    let spec = read_bundle_spec(&workspace, &req.engine)?;
     check_platform_compat(&spec.requires)?;
 
     let cache = cache_root()?;
@@ -1099,11 +1114,7 @@ fn install_vllm_metal(installer: &Installer<'_>, meta: &BundleMeta, log: &LogSin
     cmd.env("CXXFLAGS", "-Wno-parentheses");
     cmd.arg("install");
     installer.add_install_flags(&mut cmd);
-    cmd.arg(
-        vllm_src
-            .to_str()
-            .context("nie-UTF8 sciezka do vllm src")?,
-    );
+    cmd.arg(vllm_src.to_str().context("nie-UTF8 sciezka do vllm src")?);
     run_with_logs(&mut cmd, log).context("kompilacja vllm ze zrodla")?;
 
     let wheel_dir = tempfile::tempdir().context("tmpdir dla wheel vllm-metal")?;
@@ -1684,7 +1695,10 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     // node'ie to powoduje ze caly host wisi przez kilka minut przy starcie
     // modelu). Polowa CPU domyslnie. Override przez TENTAFLOW_COMPILE_THREADS.
     if !req.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
-        && !spec.launch.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
+        && !spec
+            .launch
+            .env
+            .contains_key("TORCHINDUCTOR_COMPILE_THREADS")
     {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1693,10 +1707,7 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or_else(|| std::cmp::max(2, cpus / 2));
-        cmd.env(
-            "TORCHINDUCTOR_COMPILE_THREADS",
-            compile_threads.to_string(),
-        );
+        cmd.env("TORCHINDUCTOR_COMPILE_THREADS", compile_threads.to_string());
         // MAX_JOBS jest honorowane przez setuptools/cmake (flashinfer JIT
         // cz. nvcc fork-bomb) i ninja przy build_and_load.
         cmd.env("MAX_JOBS", compile_threads.to_string());
@@ -1786,9 +1797,7 @@ fn venv_bin(venv: &Path, bin: &str) -> PathBuf {
 fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let program = format!("{:?}", cmd.get_program());
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn {}", program))?;
+    let mut child = cmd.spawn().with_context(|| format!("spawn {}", program))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -1809,9 +1818,7 @@ fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
         }
     });
 
-    let status = child
-        .wait()
-        .with_context(|| format!("wait {}", program))?;
+    let status = child.wait().with_context(|| format!("wait {}", program))?;
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
     if !status.success() {
@@ -1866,9 +1873,12 @@ mod tests {
                 args: vec![
                     "-m".to_string(),
                     "vllm.entrypoints.openai.api_server".to_string(),
-                    "--host".to_string(), "127.0.0.1".to_string(),
-                    "--port".to_string(), "${PORT:-8000}".to_string(),
-                    "--model".to_string(), "${MODEL}".to_string(),
+                    "--host".to_string(),
+                    "127.0.0.1".to_string(),
+                    "--port".to_string(),
+                    "${PORT:-8000}".to_string(),
+                    "--model".to_string(),
+                    "${MODEL}".to_string(),
                 ],
                 internal_port: 8000,
                 env: HashMap::new(),
@@ -1892,7 +1902,9 @@ mod tests {
         let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
 
         // Bundle defaults
-        assert!(args.iter().any(|a| a == "vllm.entrypoints.openai.api_server"));
+        assert!(args
+            .iter()
+            .any(|a| a == "vllm.entrypoints.openai.api_server"));
         assert!(args.contains(&"Qwen/Qwen2.5-0.5B-Instruct".to_string()));
         assert!(args.contains(&"9001".to_string()));
 
@@ -1920,8 +1932,11 @@ mod tests {
         assert!(args.contains(&"2".to_string()));
         assert!(args.contains(&"--override-generation-config".to_string()));
         // shlex powinien zachowac JSON jako jeden token (bez surrounding ')
-        assert!(args.iter().any(|a| a == r#"{"max_tokens": 100}"#),
-            "args: {:?}", args);
+        assert!(
+            args.iter().any(|a| a == r#"{"max_tokens": 100}"#),
+            "args: {:?}",
+            args
+        );
     }
 
     #[test]

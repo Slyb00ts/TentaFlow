@@ -42,7 +42,11 @@ impl ReconnectManager {
         iroh: Arc<IrohMeshManager>,
         local_node_id_hex: String,
     ) -> Arc<Self> {
-        Arc::new(Self { registry, iroh, local_node_id_hex })
+        Arc::new(Self {
+            registry,
+            iroh,
+            local_node_id_hex,
+        })
     }
 
     pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
@@ -153,13 +157,16 @@ impl ReconnectManager {
 
         self.registry.transition_state(
             &id,
-            StateTrigger::DialStarted { via: DialPath::Direct },
+            StateTrigger::DialStarted {
+                via: DialPath::Direct,
+            },
         );
 
         let id_hex = hex::encode(id);
         let result = match detail.as_ref() {
-            Some(d) if attempts_before < HINT_FAILURE_THRESHOLD
-                && (!d.hints.addresses.is_empty() || d.hints.relay_url.is_some()) =>
+            Some(d)
+                if attempts_before < HINT_FAILURE_THRESHOLD
+                    && (!d.hints.addresses.is_empty() || d.hints.relay_url.is_some()) =>
             {
                 let pairing = pairing_hints_from(&id_hex, &d.hints);
                 self.iroh.connect_to_peer_with_hints(&pairing).await
@@ -182,10 +189,8 @@ impl ReconnectManager {
             Err(e) => {
                 let err_msg: Arc<str> = format!("{e:#}").into();
                 debug!(peer = %id_hex, error = %err_msg, "ReconnectManager: dial failed");
-                self.registry.transition_state(
-                    &id,
-                    StateTrigger::DialFail { err: err_msg },
-                );
+                self.registry
+                    .transition_state(&id, StateTrigger::DialFail { err: err_msg });
             }
         }
     }
@@ -235,10 +240,7 @@ fn schedule(timers: &mut BTreeMap<Instant, NodeId>, mut at: Instant, id: NodeId)
     timers.insert(at, id);
 }
 
-fn pop_due(
-    timers: &mut BTreeMap<Instant, NodeId>,
-    now: Instant,
-) -> Option<(Instant, NodeId)> {
+fn pop_due(timers: &mut BTreeMap<Instant, NodeId>, now: Instant) -> Option<(Instant, NodeId)> {
     let key = *timers.range(..=now).next()?.0;
     timers.remove_entry(&key)
 }
@@ -264,11 +266,7 @@ fn pairing_hints_from(node_id_hex: &str, hints: &TransportHints) -> PairingConta
             .as_deref()
             .map(|s| s.to_string())
             .unwrap_or_default(),
-        addresses: hints
-            .addresses
-            .iter()
-            .map(|a| a.to_string())
-            .collect(),
+        addresses: hints.addresses.iter().map(|a| a.to_string()).collect(),
         relay_url: hints
             .relay_url
             .as_deref()
@@ -304,11 +302,7 @@ mod tests {
             local_node_id_hex: String,
         }
         impl Stub {
-            fn handle(
-                &self,
-                delta: PeerDelta,
-                timers: &mut BTreeMap<Instant, NodeId>,
-            ) {
+            fn handle(&self, delta: PeerDelta, timers: &mut BTreeMap<Instant, NodeId>) {
                 match delta {
                     PeerDelta::Discovered { node_id } => {
                         if hex::encode(node_id) == self.local_node_id_hex {
@@ -335,10 +329,8 @@ mod tests {
     #[test]
     fn pairing_hints_roundtrip() {
         let mut h = TransportHints::default();
-        h.addresses.push(std::net::SocketAddr::from((
-            [192u8, 168, 1, 5],
-            8090,
-        )));
+        h.addresses
+            .push(std::net::SocketAddr::from(([192u8, 168, 1, 5], 8090)));
         h.relay_url = Some(Arc::<str>::from("https://relay.example/"));
         h.hostname_dns = Some(Arc::<str>::from("alice.local"));
         let p = pairing_hints_from("aabb", &h);

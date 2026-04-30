@@ -132,7 +132,7 @@ impl TtsEngine for AppleTtsEngine {
         let info = TtsModelInfo {
             name: "apple-tts".to_string(),
             backend: "apple-tts".to_string(),
-            sample_rate: 22_050,  // typowy dla Apple compact voices
+            sample_rate: 22_050, // typowy dla Apple compact voices
             speakers: 1,
         };
         *self.info.lock().unwrap() = Some(info.clone());
@@ -164,7 +164,10 @@ impl TtsEngine for AppleTtsEngine {
         let buf_ptr = unsafe {
             synth_fn(
                 c_text.as_ptr(),
-                c_voice.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+                c_voice
+                    .as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
                 c_lang.as_ptr(),
                 rate,
                 &mut sample_rate as *mut _,

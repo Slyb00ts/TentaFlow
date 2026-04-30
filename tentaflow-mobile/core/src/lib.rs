@@ -125,6 +125,12 @@ fn start_app() -> Result<()> {
     }
     info!("data_dir={}", data_dir.display());
 
+    // tentaflow_core::paths::tentaflow_home() domyslnie spada na current_exe().parent(),
+    // ktore w sandboxie iOS pokazuje na read-only Bundle. Wymuszamy writable Documents
+    // PRZED pierwszym uzyciem paths::* (OnceLock cache'uje pierwszy dostep). Bez tego
+    // vision_models::extract_blob i kazdy inny zapis do models_root() failuje EROFS.
+    std::env::set_var("TENTAFLOW_HOME", &data_dir);
+
     // Konfiguracja dla trybu mobilnego
     let config = create_mobile_config(&data_dir);
 
@@ -257,8 +263,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             circuit_breaker_threshold: 5,
             circuit_breaker_timeout_ms: 60_000,
         },
-        services: vec![],
-        service_aliases: vec![],
+        services_runtime: ServicesRuntimeConfig::default(),
         monitoring: MonitoringConfig::default(),
         memory: None,
         security: None,

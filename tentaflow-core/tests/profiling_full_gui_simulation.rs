@@ -72,11 +72,20 @@ async fn full_gui_flow_10s_auto_stop() {
     println!("  is_active: {}", session.is_active().await);
 
     // Sprawdz ze active_info zwraca info.
-    let info = session.active_info().await.expect("active_info should be Some");
+    let info = session
+        .active_info()
+        .await
+        .expect("active_info should be Some");
     println!("  active_info.session_id={}", info.session_id);
-    println!("  active_info.collectors_running={:?}", info.collectors_running);
+    println!(
+        "  active_info.collectors_running={:?}",
+        info.collectors_running
+    );
     assert_eq!(info.session_id, session_id);
-    assert!(!info.collectors_running.is_empty(), "min 1 collector active");
+    assert!(
+        !info.collectors_running.is_empty(),
+        "min 1 collector active"
+    );
 
     // KROK 2: czekaj na auto-stop. 10s + 3s buffer.
     println!("\n=== KROK 2: Czekaj 13s na watchdog auto-stop ===");
@@ -111,8 +120,12 @@ async fn full_gui_flow_10s_auto_stop() {
 
     // List wszystko w tmp dir zeby zobaczyc co backend faktycznie zapisał.
     fn ls_recursive(dir: &std::path::Path, depth: usize) {
-        if depth > 5 { return; }
-        let Ok(rd) = std::fs::read_dir(dir) else { return; };
+        if depth > 5 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             let prefix = "  ".repeat(depth);
@@ -128,30 +141,54 @@ async fn full_gui_flow_10s_auto_stop() {
     ls_recursive(tmp.path(), 1);
 
     // ProfileStorageV2::new() dokleja "profiling" jako subdir storage root.
-    let session_dir = tmp.path().join("profiling").join(&node_id).join(&session_id);
+    let session_dir = tmp
+        .path()
+        .join("profiling")
+        .join(&node_id)
+        .join(&session_id);
     println!("  expected session_dir = {}", session_dir.display());
     assert!(session_dir.exists(), "session dir nie istnieje");
 
     let manifest_path = session_dir.join("manifest.json");
     let summary_path = session_dir.join("summary.bin");
-    println!("  manifest.json exists: {} ({} bytes)",
+    println!(
+        "  manifest.json exists: {} ({} bytes)",
         manifest_path.exists(),
-        std::fs::metadata(&manifest_path).map(|m| m.len()).unwrap_or(0));
-    println!("  summary.bin  exists: {} ({} bytes)",
+        std::fs::metadata(&manifest_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
+    println!(
+        "  summary.bin  exists: {} ({} bytes)",
         summary_path.exists(),
-        std::fs::metadata(&summary_path).map(|m| m.len()).unwrap_or(0));
-    assert!(manifest_path.exists(), "BUG: manifest.json nie zostal zapisany przez auto-stop!");
-    assert!(summary_path.exists(), "BUG: summary.bin nie zostal zapisany przez auto-stop!");
+        std::fs::metadata(&summary_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
+    assert!(
+        manifest_path.exists(),
+        "BUG: manifest.json nie zostal zapisany przez auto-stop!"
+    );
+    assert!(
+        summary_path.exists(),
+        "BUG: summary.bin nie zostal zapisany przez auto-stop!"
+    );
 
     // KROK 5: list_sessions zwraca nasza sesje.
     println!("\n=== KROK 5: storage.list_sessions zwraca sesje? ===");
-    let list = storage.list_sessions(&node_id).await.expect("list_sessions failed");
+    let list = storage
+        .list_sessions(&node_id)
+        .await
+        .expect("list_sessions failed");
     println!("  Sessions w liscie: {}", list.len());
     for s in &list {
         println!("    - {} ({} bytes)", s.session_id, s.size_bytes);
     }
     let found = list.iter().find(|s| s.session_id == session_id);
-    assert!(found.is_some(), "BUG: nasza sesja {session_id} NIE w list_sessions!");
+    assert!(
+        found.is_some(),
+        "BUG: nasza sesja {session_id} NIE w list_sessions!"
+    );
 
     // KROK 6: read_report zwraca prawidlowy envelope.
     println!("\n=== KROK 6: storage.read_report zwraca envelope ===");
@@ -163,7 +200,11 @@ async fn full_gui_flow_10s_auto_stop() {
         ProfileReportEnvelope::V2(report) => {
             println!("  envelope: V2");
             println!("  session_id: {}", report.session_id);
-            println!("  duration_ns: {} ({:.2}s)", report.duration_ns, report.duration_ns as f64 / 1e9);
+            println!(
+                "  duration_ns: {} ({:.2}s)",
+                report.duration_ns,
+                report.duration_ns as f64 / 1e9
+            );
             println!("  collectors: {}", report.collectors.len());
             println!("  events: {}", report.events.len());
             assert_eq!(report.session_id, session_id);

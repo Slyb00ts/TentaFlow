@@ -331,32 +331,38 @@ fn parse_perf_script(
     let mut cur_t_ns: u64 = 0;
     let mut have_header = false;
 
-    let flush =
-        |events: &mut Vec<TimelineEvent>,
-         cur_frames: &mut Vec<u32>,
-         frames_intern: &mut FrameInterner,
-         tid: u32,
-         cpu: u16,
-         t_ns: u64| {
-            if cur_frames.is_empty() {
-                return;
-            }
-            // Stack: leaf-first order (perf script).
-            let stack_id = frames_intern.intern_stack(std::mem::take(cur_frames));
-            events.push(TimelineEvent {
-                source_idx: 0,
-                t_start_ns: t_ns,
-                t_end_ns: t_ns,
-                category: EventCategory::CpuSample,
-                lane_hint: cpu,
-                payload: EventPayload::CpuSample { tid, cpu, stack_id },
-            });
-        };
+    let flush = |events: &mut Vec<TimelineEvent>,
+                 cur_frames: &mut Vec<u32>,
+                 frames_intern: &mut FrameInterner,
+                 tid: u32,
+                 cpu: u16,
+                 t_ns: u64| {
+        if cur_frames.is_empty() {
+            return;
+        }
+        // Stack: leaf-first order (perf script).
+        let stack_id = frames_intern.intern_stack(std::mem::take(cur_frames));
+        events.push(TimelineEvent {
+            source_idx: 0,
+            t_start_ns: t_ns,
+            t_end_ns: t_ns,
+            category: EventCategory::CpuSample,
+            lane_hint: cpu,
+            payload: EventPayload::CpuSample { tid, cpu, stack_id },
+        });
+    };
 
     for line in text.lines() {
         if line.trim().is_empty() {
             if have_header {
-                flush(&mut events, &mut cur_frames, frames, cur_tid, cur_cpu, cur_t_ns);
+                flush(
+                    &mut events,
+                    &mut cur_frames,
+                    frames,
+                    cur_tid,
+                    cur_cpu,
+                    cur_t_ns,
+                );
             }
             have_header = false;
             continue;
@@ -364,7 +370,14 @@ fn parse_perf_script(
         if !line.starts_with(' ') && !line.starts_with('\t') {
             // Header line (e.g. "tentaflow 14872/14872 [001] 12345.678901: cycles:").
             if have_header {
-                flush(&mut events, &mut cur_frames, frames, cur_tid, cur_cpu, cur_t_ns);
+                flush(
+                    &mut events,
+                    &mut cur_frames,
+                    frames,
+                    cur_tid,
+                    cur_cpu,
+                    cur_t_ns,
+                );
             }
             if let Some((tid, cpu, t_ns)) = parse_header(line) {
                 cur_tid = tid;
@@ -382,7 +395,14 @@ fn parse_perf_script(
         }
     }
     if have_header {
-        flush(&mut events, &mut cur_frames, frames, cur_tid, cur_cpu, cur_t_ns);
+        flush(
+            &mut events,
+            &mut cur_frames,
+            frames,
+            cur_tid,
+            cur_cpu,
+            cur_t_ns,
+        );
     }
     events
 }
@@ -403,7 +423,11 @@ fn parse_header(line: &str) -> Option<(u32, u16, u64)> {
                 tid = parts[1].parse().ok();
             }
         } else if cpu.is_none() && tok.starts_with('[') && tok.ends_with(']') {
-            cpu = tok.trim_start_matches('[').trim_end_matches(']').parse().ok();
+            cpu = tok
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse()
+                .ok();
         } else if t_ns.is_none() && tok.ends_with(':') {
             // 12345.678901: -> seconds.nanoseconds. We want monotonic ns.
             let core = tok.trim_end_matches(':');
@@ -527,7 +551,12 @@ tentaflow 14872/14881 [002] 12.510000000: cycles:
         assert_eq!(events.len(), 2);
         for e in &events {
             assert_eq!(e.category, EventCategory::CpuSample);
-            if let EventPayload::CpuSample { tid, cpu, stack_id: _ } = e.payload {
+            if let EventPayload::CpuSample {
+                tid,
+                cpu,
+                stack_id: _,
+            } = e.payload
+            {
                 assert_eq!(tid, 14881);
                 assert!(cpu == 1 || cpu == 2);
             } else {

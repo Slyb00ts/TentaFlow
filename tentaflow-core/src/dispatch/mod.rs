@@ -25,9 +25,8 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
-pub mod meeting_live_broadcast;
-pub mod system_event_broadcast;
 pub mod handlers;
+pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod recorder;
@@ -35,6 +34,7 @@ pub mod resume_token;
 pub mod state;
 pub mod stream_handlers;
 pub mod subscription;
+pub mod system_event_broadcast;
 
 pub use state::AppState;
 
@@ -343,19 +343,35 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ProfilingPayload::StopRequest(_) => "ProfilingStopRequest",
             tentaflow_protocol::ProfilingPayload::StopResponse(_) => "ProfilingStopResponse",
             tentaflow_protocol::ProfilingPayload::SessionsRequest(_) => "ProfilingSessionsRequest",
-            tentaflow_protocol::ProfilingPayload::SessionsResponse(_) => "ProfilingSessionsResponse",
+            tentaflow_protocol::ProfilingPayload::SessionsResponse(_) => {
+                "ProfilingSessionsResponse"
+            }
             tentaflow_protocol::ProfilingPayload::ReportRequest(_) => "ProfilingReportRequest",
             tentaflow_protocol::ProfilingPayload::ReportResponse(_) => "ProfilingReportResponse",
             tentaflow_protocol::ProfilingPayload::DeleteRequest(_) => "ProfilingDeleteRequest",
             tentaflow_protocol::ProfilingPayload::DeleteResponse(_) => "ProfilingDeleteResponse",
             tentaflow_protocol::ProfilingPayload::DownloadRequest(_) => "ProfilingDownloadRequest",
-            tentaflow_protocol::ProfilingPayload::DownloadResponse(_) => "ProfilingDownloadResponse",
-            tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(_) => "ProfilingActiveInfoRequest",
-            tentaflow_protocol::ProfilingPayload::ActiveInfoResponse(_) => "ProfilingActiveInfoResponse",
-            tentaflow_protocol::ProfilingPayload::ValidateSudoRequest(_) => "ProfilingValidateSudoRequest",
-            tentaflow_protocol::ProfilingPayload::ValidateSudoResponse(_) => "ProfilingValidateSudoResponse",
-            tentaflow_protocol::ProfilingPayload::CollectorsStatusRequest(_) => "ProfilingCollectorsStatusRequest",
-            tentaflow_protocol::ProfilingPayload::CollectorsStatusResponse(_) => "ProfilingCollectorsStatusResponse",
+            tentaflow_protocol::ProfilingPayload::DownloadResponse(_) => {
+                "ProfilingDownloadResponse"
+            }
+            tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(_) => {
+                "ProfilingActiveInfoRequest"
+            }
+            tentaflow_protocol::ProfilingPayload::ActiveInfoResponse(_) => {
+                "ProfilingActiveInfoResponse"
+            }
+            tentaflow_protocol::ProfilingPayload::ValidateSudoRequest(_) => {
+                "ProfilingValidateSudoRequest"
+            }
+            tentaflow_protocol::ProfilingPayload::ValidateSudoResponse(_) => {
+                "ProfilingValidateSudoResponse"
+            }
+            tentaflow_protocol::ProfilingPayload::CollectorsStatusRequest(_) => {
+                "ProfilingCollectorsStatusRequest"
+            }
+            tentaflow_protocol::ProfilingPayload::CollectorsStatusResponse(_) => {
+                "ProfilingCollectorsStatusResponse"
+            }
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",
@@ -381,23 +397,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::FlowDeleteResponse { .. } => "FlowDeleteResponse",
         MessageBody::FlowExecutionsListRequest { .. } => "FlowExecutionsListRequest",
         MessageBody::FlowExecutionsListResponse { .. } => "FlowExecutionsListResponse",
-        MessageBody::ServiceListRequest => "ServiceListRequest",
-        MessageBody::ServiceListResponse { .. } => "ServiceListResponse",
-        MessageBody::ServiceCreateRequestBody(_) => "ServiceCreateRequest",
-        MessageBody::ServiceCreateResponse { .. } => "ServiceCreateResponse",
-        MessageBody::ServiceUpdateRequestBody(_) => "ServiceUpdateRequest",
-        MessageBody::ServiceUpdateResponse { .. } => "ServiceUpdateResponse",
-        MessageBody::ServiceDeployRequestBody(_) => "ServiceDeployRequest",
-        MessageBody::ServiceDeployAccepted { .. } => "ServiceDeployAccepted",
-        MessageBody::ServiceDeployProgressBody(_) => "ServiceDeployProgress",
-        MessageBody::ServiceStopRequest { .. } => "ServiceStopRequest",
-        MessageBody::ServiceStopResponse { .. } => "ServiceStopResponse",
-        MessageBody::ServiceFlagsBody(p) => match p {
-            tentaflow_protocol::ServiceFlagsPayload::Req(_) => "ServiceFlagsUpdateRequest",
-            tentaflow_protocol::ServiceFlagsPayload::Res(_) => "ServiceFlagsUpdateResponse",
-        },
-        MessageBody::ServiceQuicStatusRequest => "ServiceQuicStatusRequest",
-        MessageBody::ServiceQuicStatusResponse { .. } => "ServiceQuicStatusResponse",
         MessageBody::PromptListRequest => "PromptListRequest",
         MessageBody::PromptListResponse { .. } => "PromptListResponse",
         MessageBody::PromptDetailRequest { .. } => "PromptDetailRequest",
@@ -428,8 +427,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::DeploymentPayload::ReqLogStream(_) => "DeploymentLogStreamRequest",
             tentaflow_protocol::DeploymentPayload::StreamChunk(_) => "DeploymentStreamChunk",
             tentaflow_protocol::DeploymentPayload::StreamEnd(_) => "DeploymentStreamEnd",
-            tentaflow_protocol::DeploymentPayload::ReqRedeploy(_) => "ServiceRedeployRequest",
-            tentaflow_protocol::DeploymentPayload::ResRedeploy(_) => "ServiceRedeployResponse",
+        },
+        MessageBody::ServiceBody(p) => match p {
+            tentaflow_protocol::ServicePayload::ReqList(_) => "ServiceListRequest",
+            tentaflow_protocol::ServicePayload::ResList(_) => "ServiceListResponse",
+            tentaflow_protocol::ServicePayload::ReqDelete(_) => "ServiceDeleteRequest",
+            tentaflow_protocol::ServicePayload::ResDelete(_) => "ServiceDeleteResponse",
+            tentaflow_protocol::ServicePayload::ReqPin(_) => "ServicePinRequest",
+            tentaflow_protocol::ServicePayload::ResPin(_) => "ServicePinResponse",
+            tentaflow_protocol::ServicePayload::ReqPause(_) => "ServicePauseRequest",
+            tentaflow_protocol::ServicePayload::ResPause(_) => "ServicePauseResponse",
+            tentaflow_protocol::ServicePayload::ReqStart(_) => "ServiceStartRequest",
+            tentaflow_protocol::ServicePayload::ResStart(_) => "ServiceStartResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
@@ -636,7 +645,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::IamPayload::ReqUpdateUser { .. } => "IamUpdateUserRequest",
             tentaflow_protocol::IamPayload::ReqDeleteUser { .. } => "IamDeleteUserRequest",
             tentaflow_protocol::IamPayload::ReqSetUserGroups { .. } => "IamSetUserGroupsRequest",
-            tentaflow_protocol::IamPayload::ReqResetUserPassword { .. } => "IamResetUserPasswordRequest",
+            tentaflow_protocol::IamPayload::ReqResetUserPassword { .. } => {
+                "IamResetUserPasswordRequest"
+            }
             tentaflow_protocol::IamPayload::ReqListGroups => "IamListGroupsRequest",
             tentaflow_protocol::IamPayload::ResListGroups { .. } => "IamListGroupsResponse",
             tentaflow_protocol::IamPayload::ReqCreateGroup { .. } => "IamCreateGroupRequest",
@@ -646,10 +657,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::IamPayload::ReqGroupMembers { .. } => "IamGroupMembersRequest",
             tentaflow_protocol::IamPayload::ResGroupMembers { .. } => "IamGroupMembersResponse",
             tentaflow_protocol::IamPayload::ReqSetPermission { .. } => "IamSetPermissionRequest",
-            tentaflow_protocol::IamPayload::ReqClearPermission { .. } => "IamClearPermissionRequest",
-            tentaflow_protocol::IamPayload::ReqListPermsForResource { .. } => "IamListPermsForResourceRequest",
-            tentaflow_protocol::IamPayload::ReqListPermsForSubject { .. } => "IamListPermsForSubjectRequest",
-            tentaflow_protocol::IamPayload::ResListPermissions { .. } => "IamListPermissionsResponse",
+            tentaflow_protocol::IamPayload::ReqClearPermission { .. } => {
+                "IamClearPermissionRequest"
+            }
+            tentaflow_protocol::IamPayload::ReqListPermsForResource { .. } => {
+                "IamListPermsForResourceRequest"
+            }
+            tentaflow_protocol::IamPayload::ReqListPermsForSubject { .. } => {
+                "IamListPermsForSubjectRequest"
+            }
+            tentaflow_protocol::IamPayload::ResListPermissions { .. } => {
+                "IamListPermissionsResponse"
+            }
             tentaflow_protocol::IamPayload::ResOk => "IamOkResponse",
         },
         MessageBody::AuditLogListRequestBody(_) => "AuditLogListRequest",

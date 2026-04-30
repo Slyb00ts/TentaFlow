@@ -17,6 +17,9 @@ use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;
 use crate::routing::service_manager::ServiceManager;
+use crate::services::handles_cache::LiveHandlesCache;
+use crate::services::mesh_registry::MeshServicesRegistry;
+use crate::services::ports::PortAllocator;
 
 /// Wszystkie shared resources serwera. Handlery uzywaja przez `ctx.state`.
 pub struct AppState {
@@ -36,12 +39,26 @@ pub struct AppState {
     /// Active VNC tunnels for same-node websockify bridging. Keyed by server-
     /// generated tunnel_id (UUID). Instantiated per WS connection so tunnels
     /// die with the socket that spawned them.
-    pub vnc_tunnels: Arc<dashmap::DashMap<String, crate::api::dashboard::vnc_tunnel::VncTunnelEntry>>,
+    pub vnc_tunnels:
+        Arc<dashmap::DashMap<String, crate::api::dashboard::vnc_tunnel::VncTunnelEntry>>,
     /// Snapshot zdrowia relay iroh + faktyczny adres bind. Aktualizowany w tle
     /// przez `mesh::relay_health::spawn_relay_health_monitor`. Czytany przez
     /// handler `NetworkRelayStatusRequest`. `None` gdy mesh w ogole nie wystartowal
     /// (np. przy testach lub `mesh.enabled=false`).
     pub mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    /// Shared port allocator owned by the supervisor and consumed by the
+    /// unified service deploy pipeline (`services::deploy::deploy`). `None`
+    /// only in tests / when the supervisor failed to initialise.
+    pub port_allocator: Option<Arc<PortAllocator>>,
+    /// In-memory aggregator of services advertised by every reachable remote
+    /// mesh node. The local node is read directly from the `services` SQLite
+    /// table; remote snapshots arrive via `MeshServicesGet`/`Announce`/`Update`
+    /// messages handled in `mesh::pipeline`.
+    pub mesh_services_registry: Arc<MeshServicesRegistry>,
+    /// Lock-free cache of live runtime handles (HTTP / QUIC / Embedded) keyed
+    /// by `(node_id, service_id)`. Populated by the supervisor (krok N7.2);
+    /// consumed by routing call sites (krok N7.3). Empty in N7.1.
+    pub live_handles: Arc<LiveHandlesCache>,
 }
 
 impl AppState {
@@ -66,6 +83,7 @@ impl AppState {
         let config = RouterConfig::default();
         let router = Arc::new(Router::new(config, Some(db.clone())).expect("test router"));
         let service_manager = router.service_manager().clone();
+        let live_handles = service_manager.live_handles.clone();
         let mesh_peer_store = MeshPeerStore::new();
 
         let meeting_manager =
@@ -86,6 +104,9 @@ impl AppState {
             meeting_manager,
             vnc_tunnels: Arc::new(dashmap::DashMap::new()),
             mesh_relay_health: None,
+            port_allocator: None,
+            mesh_services_registry: Arc::new(MeshServicesRegistry::new()),
+            live_handles,
         })
     }
 }

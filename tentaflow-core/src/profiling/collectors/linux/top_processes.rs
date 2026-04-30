@@ -26,8 +26,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.proc.top_processes";
@@ -195,7 +195,10 @@ fn polling_loop(
     started_at: Instant,
 ) -> Result<(), CollectorError> {
     let mut file = fs::File::create(&csv_path)?;
-    writeln!(file, "timestamp_ns,pid,comm,rss_kb,vsz_kb,read_bytes,write_bytes")?;
+    writeln!(
+        file,
+        "timestamp_ns,pid,comm,rss_kb,vsz_kb,read_bytes,write_bytes"
+    )?;
 
     while !stop_flag.load(Ordering::Relaxed) {
         thread::sleep(SAMPLE_PERIOD);

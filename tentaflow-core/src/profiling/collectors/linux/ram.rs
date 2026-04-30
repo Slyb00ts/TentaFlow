@@ -24,8 +24,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.proc.ram";
@@ -195,7 +195,10 @@ fn polling_loop(
     started_at: Instant,
 ) -> Result<(), CollectorError> {
     let mut file = fs::File::create(&csv_path)?;
-    writeln!(file, "timestamp_ns,used_bytes,available_bytes,page_faults_per_s")?;
+    writeln!(
+        file,
+        "timestamp_ns,used_bytes,available_bytes,page_faults_per_s"
+    )?;
 
     let mut prev_pgfault: Option<u64> = read_pgfault_total().ok();
     let mut prev_at = Instant::now();
@@ -211,7 +214,10 @@ fn polling_loop(
         };
         let now_pgfault = read_pgfault_total().ok();
         let now = Instant::now();
-        let dt = now.saturating_duration_since(prev_at).as_secs_f64().max(1e-3);
+        let dt = now
+            .saturating_duration_since(prev_at)
+            .as_secs_f64()
+            .max(1e-3);
         let pf_per_s = match (prev_pgfault, now_pgfault) {
             (Some(p), Some(c)) => ((c.saturating_sub(p)) as f64 / dt) as u64,
             _ => 0,
@@ -254,7 +260,11 @@ fn read_meminfo() -> Result<MemSnapshot, CollectorError> {
             _ => {}
         }
     }
-    let avail = if available_kb > 0 { available_kb } else { free_kb };
+    let avail = if available_kb > 0 {
+        available_kb
+    } else {
+        free_kb
+    };
     let used_kb = total_kb.saturating_sub(avail);
     Ok(MemSnapshot {
         used_bytes: used_kb * 1024,
@@ -390,7 +400,11 @@ mod tests {
     fn ram_parser_handles_empty_csv() {
         let dir = TempDir::new().unwrap();
         let csv = dir.path().join("ram.csv");
-        fs::write(&csv, "timestamp_ns,used_bytes,available_bytes,page_faults_per_s\n").unwrap();
+        fs::write(
+            &csv,
+            "timestamp_ns,used_bytes,available_bytes,page_faults_per_s\n",
+        )
+        .unwrap();
         let raw = RawCapture {
             artifacts: vec![csv],
             metadata: HashMap::new(),

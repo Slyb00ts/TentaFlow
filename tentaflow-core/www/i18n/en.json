@@ -31,6 +31,7 @@
     "audit": "Audit Log",
     "profiling_sessions": "Profiling",
     "meeting": "Meeting Bot",
+    "pose": "Pose",
     "section_general": "General",
     "section_core": "Core",
     "section_workflows": "Workflows",
@@ -210,6 +211,27 @@
     "col_endpoint": "Endpoint",
     "col_started": "Started",
     "col_actions": "Actions",
+    "col_transport": "Transport",
+    "col_models": "Models",
+    "col_restart": "Restarts",
+    "col_category": "Category",
+    "col_display_name": "Service",
+    "col_pin": "Pin",
+    "btn_play": "Start",
+    "btn_pause": "Stop",
+    "btn_pin": "Pin",
+    "btn_delete": "Delete",
+    "node_local_badge": "local",
+    "confirm_delete_title": "Delete service",
+    "confirm_delete_body": "Delete \"{name}\" from {node}?",
+    "status": {
+      "running": "Running",
+      "starting": "Starting",
+      "degraded": "Degraded",
+      "failed": "Failed",
+      "stopped": "Stopped",
+      "paused": "Paused"
+    },
     "tooltip_pin_off": "Always keep in memory",
     "tooltip_pin_on": "Always kept in memory — click to disable",
     "tooltip_pause_off": "Stop (frees memory, won't autostart)",
@@ -291,6 +313,8 @@
       "running": "Running",
       "starting": "Starting",
       "stopped": "Stopped",
+      "degraded": "Degraded",
+      "failed": "Failed",
       "error": "Error",
       "on_demand": "On demand"
     },
@@ -2602,6 +2626,28 @@
     "accept_license": "Accept License on NVIDIA",
     "retry": "Retry Deploy"
   },
+  "pose": {
+    "title": "Pose",
+    "subtitle": "Live camera preview with local body skeleton overlay",
+    "live_chip": "Live",
+    "model_label": "Pose model",
+    "camera_label": "Camera",
+    "camera_front": "Front",
+    "camera_back": "Back",
+    "fps_label": "Frame rate",
+    "start": "Start",
+    "stop": "Stop",
+    "status": "Status",
+    "status_idle": "Ready",
+    "status_running": "Analyzing live",
+    "latency": "Latency",
+    "poses": "Bodies",
+    "no_model_title": "No deployed pose model",
+    "no_model_desc": "Deploy MoveNet Lightning or YOLOv8n Pose from the service catalog. The model downloads automatically during deployment.",
+    "camera_error": "Could not start the camera",
+    "inference_error": "Could not estimate pose",
+    "models_error": "Could not load models"
+  },
   "meeting": {
     "title": "Meeting Bot",
     "url_label": "Teams Meeting URL",
@@ -3214,6 +3260,10 @@
     "meeting": {
       "name": "Meeting Bot",
       "desc": "Capture and summarize meetings"
+    },
+    "pose": {
+      "name": "Pose",
+      "desc": "Camera preview with body skeleton overlay"
     },
     "flows": {
       "name": "Workflows",

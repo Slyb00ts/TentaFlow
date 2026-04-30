@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use tentaflow_core::config::NodeConfig;
 use tentaflow_core::db;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
+use tentaflow_core::paths;
 use tentaflow_core::routing::Router;
 
 #[cfg(target_os = "macos")]
@@ -44,9 +45,15 @@ struct Args {
     #[arg(short = 'q', long = "quic-port")]
     quic_port: Option<u16>,
 
-    /// Sciezka do bazy SQLite
-    #[arg(long = "db", default_value = "router.db")]
-    db_path: PathBuf,
+    /// Sciezka do bazy SQLite (domyslnie <tentaflow_home>/data/router.db)
+    #[arg(long = "db")]
+    db_path: Option<PathBuf>,
+
+    /// Override portable home directory (domyslnie katalog binarki). Ustawia
+    /// TENTAFLOW_HOME zanim pliki zostana wyliczone — przydatne dla
+    /// deploymentow systemd / docker volume.
+    #[arg(long = "home")]
+    home: Option<PathBuf>,
 
     /// Wylacz mesh networking
     #[arg(long = "no-mesh")]
@@ -86,6 +93,12 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
+    // Apply --home BEFORE first call to paths::tentaflow_home() so the
+    // OnceLock captures the override.
+    if let Some(home) = args.home.as_ref() {
+        std::env::set_var("TENTAFLOW_HOME", home);
+    }
+
     if let Some(cmd) = &args.command {
         return run_subcommand(cmd, args.verbose);
     }
@@ -113,7 +126,21 @@ async fn run_server(args: Args) -> Result<()> {
     }
 
     info!("Uruchamianie TentaFlow.Router...");
+    info!("Tentaflow home: {}", paths::tentaflow_home().display());
     info!("Konfiguracja: {:?}", args.config);
+
+    // Materializuj portable layout: data/, models/, cache/, containers/.
+    // Bez tego deploy strategie (python-bundle, binary, docker context) nie
+    // znajda manifestow i nie wystartuja.
+    if let Err(e) = paths::ensure_app_dirs() {
+        error!("ensure_app_dirs nieudany: {}", e);
+        return Err(anyhow::anyhow!("ensure_app_dirs: {}", e));
+    }
+
+    let db_path: PathBuf = args
+        .db_path
+        .clone()
+        .unwrap_or_else(paths::database_path);
 
     // Wczytaj konfiguracje lub utworz domyslna
     let mut config = if args.config.exists() {
@@ -142,8 +169,8 @@ async fn run_server(args: Args) -> Result<()> {
     info!("Konfiguracja wczytana pomyslnie");
 
     // Inicjalizacja bazy danych
-    info!("Inicjalizacja bazy danych: {:?}", args.db_path);
-    let db = db::init(&args.db_path).map_err(|e| {
+    info!("Inicjalizacja bazy danych: {:?}", db_path);
+    let db = db::init(&db_path).map_err(|e| {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
@@ -152,7 +179,7 @@ async fn run_server(args: Args) -> Result<()> {
     // iroh EndpointId z MeshSecurity.public_key_hex().
     let _ = db::repository::delete_setting(&db, "node_id");
 
-    log_config_summary(&config, &args.db_path);
+    log_config_summary(&config, &db_path);
 
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key()
@@ -214,6 +241,12 @@ async fn run_server(args: Args) -> Result<()> {
         let _writer_handle = writer.spawn();
     }
 
+    // Mesh services registry — agregator widokow `services` ze wszystkich
+    // zaufanych peerow. Pisze do niego pipeline mesh (handlery
+    // `MeshServicesGet/Announce/Update`); czyta GUI/forwarding (krok N3b).
+    let mesh_services_registry =
+        Arc::new(tentaflow_core::services::mesh_registry::MeshServicesRegistry::new());
+
     // Seed lokalnego noda w peer_store — synchronicznie, przed startupem mesh.
     // Dzieki temu catalog/services/mesh GUI zawsze ma target "local" do dyspozycji.
     {
@@ -243,17 +276,113 @@ async fn run_server(args: Args) -> Result<()> {
         info!(node_id = %local_node_id_str, "Local node seeded in peer_store");
     }
 
+    // === Phase 4: port allocator (services supervisor instantiated after the
+    // router so it can share the same `LiveHandlesCache` instance). ===
+    let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
+        use std::collections::HashSet;
+        use tentaflow_core::services::ports::PortAllocator;
+        use tentaflow_core::services_repo::services as services_v2_repo;
+
+        let services_runtime_cfg = config.services_runtime.clone();
+
+        // Reserve ports already owned by alive services_v2 rows so the allocator
+        // never hands them to a parallel deploy.
+        let mut excluded: HashSet<u16> = HashSet::new();
+        if let Ok(conn) = db.lock() {
+            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
+                for row in rows {
+                    if let Some(p) = row.runtime_port {
+                        excluded.insert(p);
+                    }
+                    if let Some(p) = row.sidecar_quic_port {
+                        excluded.insert(p);
+                    }
+                }
+            }
+        }
+
+        match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
+            Ok(allocator) => Some(Arc::new(allocator)),
+            Err(e) => {
+                tracing::warn!(
+                    "Services supervisor disabled: invalid port_range {:?}: {}",
+                    services_runtime_cfg.port_range,
+                    e
+                );
+                None
+            }
+        }
+    };
+
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
+
+    // === Phase 4 (cont.): wire the supervisor against the router's
+    // `LiveHandlesCache` so reconcile() updates the same cache the routing
+    // call sites read. Order matters: router first, supervisor second. ===
+    let services_snapshot_rx_for_router: Option<
+        tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
+    > = if let Some(port_allocator) = services_port_allocator.clone() {
+        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
+        let services_runtime_cfg = config.services_runtime.clone();
+        let live_handles = router.service_manager().live_handles.clone();
+        let (supervisor, snapshot_rx) = Supervisor::new(
+            &services_runtime_cfg,
+            db.clone(),
+            port_allocator,
+            local_node_id_str.clone(),
+            mesh_services_registry.clone(),
+            live_handles,
+        );
+        let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
+
+        // First tick is synchronous so the initial snapshot is non-empty
+        // before the router goes online. Failures are logged but not fatal.
+        if let Err(e) = supervisor.run_first_tick().await {
+            tracing::warn!("services supervisor: first_tick failed: {}", e);
+        }
+
+        let supervisor_handle = supervisor.spawn();
+        info!(
+            "Services supervisor started (interval={}ms, port_range={:?})",
+            services_runtime_cfg.health_check_interval_ms, services_runtime_cfg.port_range
+        );
+        // Keep the supervisor task alive for the lifetime of the process.
+        let _supervisor_handle = supervisor_handle;
+        Some(snapshot_rx)
+    } else {
+        None
+    };
+
+    if let Some(rx) = services_snapshot_rx_for_router {
+        router.set_services_snapshot_rx(rx);
+    }
+
+    // Best-effort discovery of user-managed external daemons (Ollama). Runs in
+    // the background so a slow probe does not block the rest of startup; any
+    // failure is logged and ignored — auto-detect is a convenience, not a
+    // requirement.
+    if let Some(port_allocator) = services_port_allocator.clone() {
+        let db_for_detect = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tentaflow_core::services::auto_detect::auto_register_ollama(
+                &db_for_detect,
+                port_allocator,
+            )
+            .await
+            {
+                tracing::warn!("auto_detect ollama failed: {}", e);
+            }
+        });
+    }
+    // Wire the shared V2 mesh registry into the service manager so the routing
+    // path can call `find_live_handle_for_model` to resolve handles across
+    // local + remote nodes (krok N7.3).
+    router
+        .service_manager()
+        .set_mesh_services_registry(mesh_services_registry.clone());
     router.start();
-
-    // Zaladuj serwisy QUIC z bazy danych (metoda w Core)
-    router.load_db_services();
-
-    // Native service restoration is deferred until mesh is attached below.
-    // Calling restore_native_services() here would silently skip mesh
-    // registration because Router.mesh_manager is still None.
 
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
@@ -297,6 +426,7 @@ async fn run_server(args: Args) -> Result<()> {
                 Some(db.clone()),
                 settings_cipher.clone(),
                 mesh_security.clone(),
+                mesh_services_registry.clone(),
             )
             .await
             {
@@ -310,9 +440,6 @@ async fn run_server(args: Args) -> Result<()> {
                     // zwraca ten sam hex — nie ma potrzeby podmieniac peer_store entry.
                     if let Some(ref mesh_mgr) = handles.quic_mesh {
                         router.set_mesh_manager(mesh_mgr.clone());
-                        router
-                            .service_manager()
-                            .set_mesh_registry(mesh_mgr.service_registry().clone());
 
                         // Ustaw forward handler — zdalny node uzywa routera do obslugi forwardowanych requestow
                         let router_for_forward = router.clone();
@@ -397,11 +524,6 @@ async fn run_server(args: Args) -> Result<()> {
         _mesh_handles = None;
     }
 
-    // Restore native services (in-process MLX/llama.cpp) from DB. Done after
-    // mesh attachment so register_native_service_in_mesh can publish them to
-    // the mesh service registry.
-    router.restore_native_services(&settings_cipher).await;
-
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
@@ -440,6 +562,8 @@ async fn run_server(args: Args) -> Result<()> {
         local_node_id_for_server,
         mesh_security_for_server,
         mesh_relay_health_for_server,
+        services_port_allocator.clone(),
+        mesh_services_registry.clone(),
     )?;
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
@@ -574,7 +698,7 @@ fn apply_cli_overrides(config: &mut NodeConfig, args: &Args) {
 // =============================================================================
 
 fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
-    info!("   - Serwisy: {}", config.services.len());
+    info!("   - Serwisy: snapshot-driven (DB + mesh registry)");
     info!(
         "   - OpenAI API: {} ({})",
         if config.protocols.openai_api.enabled {

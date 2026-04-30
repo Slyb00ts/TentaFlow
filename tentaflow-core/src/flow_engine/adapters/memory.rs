@@ -30,21 +30,12 @@ impl MemoryNodeAdapter {
         }
     }
 
-    /// Pobiera pierwszego dostepnego klienta QUIC Memory
+    /// Resolves the first available Memory QUIC client via the live handles cache.
     async fn get_memory_client(&self) -> Result<Arc<crate::net::quic::QuicClient>> {
-        let handles: Vec<_> = self
-            .service_manager
-            .quic_memory_services
-            .iter()
-            .map(|r| r.value().clone())
-            .collect();
-        for handle in handles {
-            if let Some(client) = handle.get_client().await {
-                return Ok(client);
-            }
-        }
-
-        bail!("Memory adapter: brak polaczonego serwisu Memory");
+        self.service_manager
+            .find_quic_client_for_model("memory")
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Memory adapter: no connected Memory service"))
     }
 
     /// Rozwiazuje tekst wejsciowy z kontekstu flow - szuka wstecz w execution_log

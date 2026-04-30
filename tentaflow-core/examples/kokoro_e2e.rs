@@ -28,12 +28,12 @@ fn write_wav(samples: &[f32], sample_rate: u32, path: &str) -> Result<()> {
     buf.extend_from_slice(b"WAVE");
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());     // PCM
-    buf.extend_from_slice(&1u16.to_le_bytes());     // mono
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1u16.to_le_bytes()); // mono
     buf.extend_from_slice(&sample_rate.to_le_bytes());
     buf.extend_from_slice(&(sample_rate as u32 * bytes_per_sample as u32).to_le_bytes());
     buf.extend_from_slice(&(bytes_per_sample as u16).to_le_bytes());
-    buf.extend_from_slice(&16u16.to_le_bytes());    // bits/sample
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
     buf.extend_from_slice(b"data");
     buf.extend_from_slice(&(data_size as u32).to_le_bytes());
     for s in samples {
@@ -66,14 +66,21 @@ async fn main() -> Result<()> {
     let mut engine = MlxKokoroEngine::new();
     engine.set_default_voice(voice.clone());
     let info = engine.load_model(&model_path)?;
-    println!("[e2e] loaded: backend={} sr={}", info.backend, info.sample_rate);
+    println!(
+        "[e2e] loaded: backend={} sr={}",
+        info.backend, info.sample_rate
+    );
 
     let result = engine.synthesize(SynthesizeParams {
         text: text.clone(),
         speaker_id: 0,
         speed: 1.0,
     })?;
-    println!("[e2e] {} samples @ {} Hz", result.samples.len(), result.sample_rate);
+    println!(
+        "[e2e] {} samples @ {} Hz",
+        result.samples.len(),
+        result.sample_rate
+    );
     write_wav(&result.samples, result.sample_rate, out_path)?;
     println!("[e2e] saved: {}", out_path);
     Ok(())
