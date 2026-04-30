@@ -18,6 +18,13 @@ use tracing::debug;
 /// jednoczesnie pojedynczy frame ma ~3 KB, co jest tanie.
 const TTS_STREAM_CHUNK_BYTES: usize = 3_200;
 
+/// Docelowy sample rate jakiego oczekuje teams-bot (browser_inject.js
+/// hardkoduje `TARGET_RATE = 16000` w MediaStreamTrackGenerator) i jakiego
+/// ufa router przy chunkowaniu (`TTS_STREAM_CHUNK_BYTES = 16000/10*2`).
+/// Kazdy lokalny silnik TTS (sherpa Piper 22050, kokoro, apple) musi byc
+/// rzutowany na te wartosc przed pakowaniem do WAV.
+const TARGET_TTS_RATE: u32 = 16_000;
+
 impl Router {
     /// Syntezuje mowe z tekstu uzywajac QUIC TTS lub HTTP TTS.
     ///
@@ -122,11 +129,16 @@ impl Router {
                             .await
                             .map_err(|e| anyhow::anyhow!("LocalTts join: {e}"))??;
                             let (samples, sr) = res;
-                            // Pakujemy jako WAV PCM16 — `synthesize_speech_stream`
-                            // strip'uje header tolerancyjnie. Surowe i16 LE
-                            // bez header'a tez by zadzialalo, ale WAV jest
-                            // bezpieczniejszy jezeli ktos uzywa wyniku spoza
-                            // streama (np. blocking sciezka z dashboardu).
+                            // Bot konsumuje chunki w stalej wielkosci 3200 B
+                            // (`TTS_STREAM_CHUNK_BYTES`) interpretowane jako
+                            // 16 kHz mono PCM16. Sherpa Piper VITS produkuje
+                            // 22050 Hz, kokoro/apple czasem inne — bez
+                            // resample bot odtwarza w zlym tempie.
+                            let (samples, sr) = if sr != TARGET_TTS_RATE {
+                                (resample_linear(&samples, sr, TARGET_TTS_RATE), TARGET_TTS_RATE)
+                            } else {
+                                (samples, sr)
+                            };
                             Ok(samples_to_wav_pcm16(&samples, sr))
                         }
                         BackendHandle::Http(name) => {
@@ -342,6 +354,33 @@ impl Router {
         }
         Ok(())
     }
+}
+
+/// Linear-interpolated resample dla mowy. Bez anty-aliasingowego filtra,
+/// ale dla speech 22050 -> 16000 (sherpa Piper) artefakty sa pomijalne —
+/// energia powyzej 8 kHz to glownie sybilanty/szum, nie ton. Polyphase FIR
+/// (rubato/scipy) bylby lepszy ale wymagalby kolejnej dependency.
+fn resample_linear(samples: &[f32], src_sr: u32, dst_sr: u32) -> Vec<f32> {
+    if samples.is_empty() || src_sr == dst_sr {
+        return samples.to_vec();
+    }
+    let ratio = src_sr as f64 / dst_sr as f64;
+    let out_len = ((samples.len() as f64) / ratio).floor() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    let last = samples.len() - 1;
+    for i in 0..out_len {
+        let pos = i as f64 * ratio;
+        let idx = pos.floor() as usize;
+        if idx >= last {
+            out.push(samples[last]);
+            continue;
+        }
+        let frac = (pos - idx as f64) as f32;
+        let s0 = samples[idx];
+        let s1 = samples[idx + 1];
+        out.push(s0 + (s1 - s0) * frac);
+    }
+    out
 }
 
 /// Pakuje samples f32 [-1, 1] do WAV PCM16 mono. Header 44B + dane.
