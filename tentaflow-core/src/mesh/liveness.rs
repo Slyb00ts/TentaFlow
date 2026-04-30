@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
-use crate::mesh::peer_registry::{
-    ConnectionState, ConnectionStateTag, PeerRegistry, StateTrigger,
-};
+use crate::mesh::peer_registry::{ConnectionState, ConnectionStateTag, PeerRegistry, StateTrigger};
 
 /// How often we walk the registry to check heartbeat ages.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -28,7 +26,10 @@ pub struct LivenessTask {
 
 impl LivenessTask {
     pub fn new(registry: Arc<PeerRegistry>) -> Arc<Self> {
-        Arc::new(Self { registry, tick_interval: TICK_INTERVAL })
+        Arc::new(Self {
+            registry,
+            tick_interval: TICK_INTERVAL,
+        })
     }
 
     pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
@@ -123,10 +124,18 @@ mod tests {
     }
 
     fn force_connected(registry: &PeerRegistry, id: NodeId) {
-        registry.transition_state(&id, Trigger::DialStarted { via: DialPath::Direct });
         registry.transition_state(
             &id,
-            Trigger::DialOk { conn_id: 1, path: dummy_path() },
+            Trigger::DialStarted {
+                via: DialPath::Direct,
+            },
+        );
+        registry.transition_state(
+            &id,
+            Trigger::DialOk {
+                conn_id: 1,
+                path: dummy_path(),
+            },
         );
     }
 
@@ -152,7 +161,10 @@ mod tests {
         task.scan_once();
 
         let summary = registry.snapshot_summary();
-        let s = summary.iter().find(|s| s.node_id == id).expect("entry exists");
+        let s = summary
+            .iter()
+            .find(|s| s.node_id == id)
+            .expect("entry exists");
         assert_eq!(s.conn_tag, ConnectionStateTag::Degraded);
     }
 
@@ -180,7 +192,10 @@ mod tests {
         task.scan_once();
 
         let summary = registry.snapshot_summary();
-        let s = summary.iter().find(|s| s.node_id == id).expect("entry exists");
+        let s = summary
+            .iter()
+            .find(|s| s.node_id == id)
+            .expect("entry exists");
         assert_eq!(s.conn_tag, ConnectionStateTag::Reconnecting);
     }
 
@@ -198,7 +213,10 @@ mod tests {
         task.scan_once();
 
         let summary = registry.snapshot_summary();
-        let s = summary.iter().find(|s| s.node_id == id).expect("entry exists");
+        let s = summary
+            .iter()
+            .find(|s| s.node_id == id)
+            .expect("entry exists");
         assert_eq!(s.conn_tag, ConnectionStateTag::Connected);
     }
 }

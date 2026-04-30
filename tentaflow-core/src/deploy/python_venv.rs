@@ -43,6 +43,23 @@ pub struct BundleSpec {
     pub requires: Requires,
     #[serde(default, rename = "install_variants")]
     pub install_variants: Vec<InstallVariant>,
+    /// Per-bundle override for the smart health probe in the python-bundle
+    /// deploy strategy. Optional — strategy supplies a default when absent.
+    #[serde(default)]
+    pub health: HealthSpec,
+}
+
+/// Optional `[health]` block tuning the deploy-time probe. The probe never
+/// has a hard timeout: it only fails when the engine process exits or when
+/// it stops emitting log lines for `stagnation_window_secs` while still
+/// not answering a readiness URL.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HealthSpec {
+    /// Max seconds without **engine log output** AND without a successful
+    /// readiness response before the deploy is declared stalled. `None`
+    /// makes the strategy use its built-in default (300s for python-bundle).
+    #[serde(default)]
+    pub stagnation_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1695,7 +1712,10 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     // node'ie to powoduje ze caly host wisi przez kilka minut przy starcie
     // modelu). Polowa CPU domyslnie. Override przez TENTAFLOW_COMPILE_THREADS.
     if !req.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
-        && !spec.launch.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
+        && !spec
+            .launch
+            .env
+            .contains_key("TORCHINDUCTOR_COMPILE_THREADS")
     {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1704,10 +1724,7 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or_else(|| std::cmp::max(2, cpus / 2));
-        cmd.env(
-            "TORCHINDUCTOR_COMPILE_THREADS",
-            compile_threads.to_string(),
-        );
+        cmd.env("TORCHINDUCTOR_COMPILE_THREADS", compile_threads.to_string());
         // MAX_JOBS jest honorowane przez setuptools/cmake (flashinfer JIT
         // cz. nvcc fork-bomb) i ninja przy build_and_load.
         cmd.env("MAX_JOBS", compile_threads.to_string());
@@ -1885,6 +1902,7 @@ mod tests {
             },
             requires: Requires::default(),
             install_variants: vec![],
+            health: HealthSpec::default(),
         }
     }
 

@@ -74,12 +74,21 @@ async fn audit_real_session_3s() {
     println!("schema_version: {}", report.schema_version);
     println!("session_id: {}", report.session_id);
     println!("node_id: {}", report.node_id);
-    println!("duration_ns: {} ({:.2}s)", report.duration_ns, report.duration_ns as f64 / 1e9);
+    println!(
+        "duration_ns: {} ({:.2}s)",
+        report.duration_ns,
+        report.duration_ns as f64 / 1e9
+    );
     println!("collectors: {}", report.collectors.len());
     for c in &report.collectors {
         println!(
             "  {} status={:?} samples={} raw_size={}B duration_ns={} cat={:?}",
-            c.id, c.status, c.samples_collected, c.raw_size_bytes, c.duration_ns, c.primary_category
+            c.id,
+            c.status,
+            c.samples_collected,
+            c.raw_size_bytes,
+            c.duration_ns,
+            c.primary_category
         );
     }
     println!("frames: {}", report.frames.len());
@@ -139,7 +148,10 @@ async fn audit_real_session_3s() {
         .expect("read_manifest");
     println!("manifest.size_bytes: {}", manifest.size_bytes);
     println!("manifest.kind: {:?}", manifest.kind);
-    println!("manifest.collectors_used: {}", manifest.collectors_used.len());
+    println!(
+        "manifest.collectors_used: {}",
+        manifest.collectors_used.len()
+    );
 
     let envelope = storage
         .read_report("node-phase1", &session_id)
@@ -147,7 +159,11 @@ async fn audit_real_session_3s() {
         .expect("read_report");
     match envelope {
         tentaflow_protocol::profiling::ProfileReportEnvelope::V2(r) => {
-            println!("envelope: V2 ({} events, schema={})", r.events.len(), r.schema_version);
+            println!(
+                "envelope: V2 ({} events, schema={})",
+                r.events.len(),
+                r.schema_version
+            );
             assert_eq!(r.events.len(), report.events.len());
         }
         tentaflow_protocol::profiling::ProfileReportEnvelope::V1Legacy(_) => {
