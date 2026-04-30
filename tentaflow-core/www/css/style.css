@@ -34,6 +34,16 @@
   --gradient-logo: linear-gradient(90deg, #ffffff 0%, #60a5fa 50%, #a78bfa 100%);
   --gradient-soft: linear-gradient(135deg, rgba(99,102,241,0.15) 0%, rgba(167,139,250,0.12) 100%);
 
+  /* Audio mode (chat głosowy) — listen/think/speak per stan rozmowy. */
+  --listen: #22c55e;
+  --listen-glow: rgba(34, 197, 94, 0.45);
+  --speak: #a78bfa;
+  --speak-glow: rgba(167, 139, 250, 0.55);
+  --think: #f59e0b;
+  --think-glow: rgba(245, 158, 11, 0.40);
+  --gradient-listen: linear-gradient(135deg, #22c55e 0%, #06b6d4 100%);
+  --gradient-speak: linear-gradient(135deg, #a78bfa 0%, #6366f1 100%);
+
   /* Radius */
   --radius-sm: 6px;
   --radius: 10px;

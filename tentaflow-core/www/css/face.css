@@ -77,6 +77,31 @@ body.has-face-bg .login-card {
   }
 }
 
+/* ---- Embed mode (chat audio stage) -------------------------------------- */
+
+/* Host trybu embed (np. .face-stage w chat audio). FaceBackground.embed()
+   wstrzykuje canvasy bezposrednio jako dzieci hosta i ustawia te klasy.
+   Glow leci ten sam pipeline co fullscreen — blur+mix-blend-mode w GPU. */
+.face-embed-host {
+  position: relative;
+}
+.face-embed-host > .face-bg-canvas,
+.face-embed-host > .face-glow-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  image-rendering: auto;
+}
+.face-embed-host > .face-glow-canvas {
+  filter: blur(8px);
+  opacity: 0.85;
+  mix-blend-mode: plus-lighter;
+  will-change: filter;
+}
+
 /* ---- Przejście login → main UI (render natywny) -------------------------- */
 
 /* Karta logowania — fade-out + blur, bez scale (żeby nie konkurowała wizualnie
