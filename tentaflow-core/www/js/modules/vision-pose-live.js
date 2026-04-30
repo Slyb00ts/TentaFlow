@@ -25,7 +25,7 @@ export const COCO_POSE_EDGES = [
 ];
 
 const DEFAULTS = {
-  facingMode: 'user',
+  facingMode: 'environment',
   captureWidth: 320,
   targetFps: 8,
   jpegQuality: 0.68,
