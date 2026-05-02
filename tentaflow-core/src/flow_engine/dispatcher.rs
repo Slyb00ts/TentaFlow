@@ -5,7 +5,7 @@
 // =============================================================================
 
 use crate::config::RouterConfig;
-use crate::db::{repository, DbPool};
+use crate::db::DbPool;
 use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
 use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
 use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
@@ -27,21 +27,17 @@ use crate::flow_engine::resolver;
 use crate::flow_engine::types::{FlowContext, FlowExecutionResult};
 use crate::routing::service_manager::ServiceManager;
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
 const FLOW_TIMEOUT_SECS: u64 = 120;
-const ENABLED_CACHE_TTL_SECS: u64 = 5;
 
 /// Dispatcher flow engine - brama wejsciowa do systemu flow
 pub struct FlowDispatcher {
     db: DbPool,
     cache: FlowCache,
     registry: Arc<AdapterRegistry>,
-    enabled_cache: AtomicBool,
-    enabled_last_check: std::sync::Mutex<std::time::Instant>,
 }
 
 impl FlowDispatcher {
@@ -82,11 +78,6 @@ impl FlowDispatcher {
             db,
             cache: FlowCache::new(60),
             registry: Arc::new(registry),
-            enabled_cache: AtomicBool::new(false),
-            enabled_last_check: std::sync::Mutex::new(
-                std::time::Instant::now()
-                    - std::time::Duration::from_secs(ENABLED_CACHE_TTL_SECS + 1),
-            ),
         }
     }
 
@@ -137,58 +128,14 @@ impl FlowDispatcher {
         }
     }
 
-    /// Sprawdza czy flow engine jest wlaczony (setting w DB, cache na 5s)
-    async fn is_enabled(&self) -> bool {
-        let should_refresh = {
-            if let Ok(last_check) = self.enabled_last_check.lock() {
-                last_check.elapsed().as_secs() >= ENABLED_CACHE_TTL_SECS
-            } else {
-                true
-            }
-        };
-
-        if should_refresh {
-            let db_clone = self.db.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                repository::get_setting(&db_clone, "flow_engine_enabled")
-            })
-            .await;
-
-            match result {
-                Ok(Ok(value)) => {
-                    let enabled = value.as_deref() == Some("true");
-                    self.enabled_cache.store(enabled, Ordering::Relaxed);
-                    if let Ok(mut last_check) = self.enabled_last_check.lock() {
-                        *last_check = std::time::Instant::now();
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("Blad odczytu ustawienia flow_engine_enabled z DB: {}", e);
-                }
-                Err(e) => {
-                    warn!(
-                        "Blad spawn_blocking przy sprawdzaniu flow_engine_enabled: {}",
-                        e
-                    );
-                }
-            }
-        }
-
-        self.enabled_cache.load(Ordering::Relaxed)
-    }
-
     /// Probuje znalezc i wykonac flow dla danego modelu/service_type.
-    /// Zwraca None jesli flow engine wylaczony lub brak flow (fallback na stary pipeline).
+    /// Zwraca None jesli brak flow (fallback na bezposredni dispatch).
     pub async fn try_dispatch(
         &self,
         model_name: &str,
         service_type: &str,
         mut ctx: FlowContext,
     ) -> Result<Option<FlowExecutionResult>> {
-        if !self.is_enabled().await {
-            return Ok(None);
-        }
-
         let cache_key = format!("{}:{}", model_name, service_type);
 
         let cached = match self
@@ -254,10 +201,6 @@ impl FlowDispatcher {
         service_type: &str,
         mut ctx: FlowContext,
     ) -> Result<Option<AdapterChunkStream>> {
-        if !self.is_enabled().await {
-            return Ok(None);
-        }
-
         let cache_key = format!("{}:{}", model_name, service_type);
 
         let cached = match self
@@ -320,5 +263,104 @@ impl FlowDispatcher {
     /// Inwaliduj cache (wywoływane po zmianach w flow/bindings przez dashboard)
     pub fn invalidate_cache(&self) {
         self.cache.invalidate_all();
+    }
+
+    /// Lista typow node'ow zarejestrowanych w AdapterRegistry. Uzywane przez
+    /// snapshot test R0d (parytet z seed flow_node_templates) i przez
+    /// walidacje flow_json przy zapisie.
+    pub fn registered_node_types(&self) -> Vec<String> {
+        self.registry
+            .registered_types()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod r0d_snapshot {
+    use super::*;
+    use crate::config::RouterConfig;
+    use crate::db::seed;
+    use crate::routing::service_manager::ServiceManager;
+    use rusqlite::Connection;
+    use std::collections::BTreeSet;
+
+    /// R0d: typy node'ow zarejestrowane w AdapterRegistry musza odpowiadac
+    /// dokladnie typom z seedowanych szablonow `flow_node_templates`.
+    /// Rozjazd oznacza ze GUI pokazuje element ktorego executor nie umie
+    /// wykonac, albo odwrotnie — adapter istnieje ale palette go nie eksponuje.
+    #[test]
+    fn registered_adapters_match_seeded_node_templates() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        seed::seed_defaults(&conn).unwrap();
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+        let mut seeded: BTreeSet<String> = BTreeSet::new();
+        {
+            let conn = pool.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT node_type FROM flow_node_templates")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            for r in rows {
+                seeded.insert(r.unwrap());
+            }
+        }
+
+        let config = std::sync::Arc::new(RouterConfig::default());
+        let service_manager = std::sync::Arc::new(
+            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
+        );
+        let dispatcher = FlowDispatcher::new(pool, service_manager, config);
+        let registered: BTreeSet<String> =
+            dispatcher.registered_node_types().into_iter().collect();
+
+        assert_eq!(
+            seeded, registered,
+            "flow_node_templates seed != AdapterRegistry typy.\nseed: {:?}\nregistry: {:?}",
+            seeded, registered
+        );
+    }
+
+    /// R0e: regression dla B1 — po fresh seed musi istniec domyslny aktywny
+    /// flow z service_type='chat' (uzywany przez routing/chat.rs przy
+    /// `try_dispatch(model, "chat", ctx)`). Wczesniej seed wpisywal 'llm'
+    /// i resolver nigdy nie znajdowal default flow.
+    #[test]
+    fn seeded_default_flow_uses_chat_service_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        seed::seed_defaults(&conn).unwrap();
+
+        let (name, status, is_default): (String, String, i64) = conn
+            .query_row(
+                "SELECT name, status, is_default FROM flows \
+                 WHERE service_type = 'chat' AND is_default = 1 AND status = 'active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("musi istniec domyslny aktywny flow dla service_type='chat'");
+
+        assert_eq!(name, "Standardowy pipeline LLM");
+        assert_eq!(status, "active");
+        assert_eq!(is_default, 1);
+
+        let llm_under_old_key: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flows WHERE service_type = 'llm'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            llm_under_old_key, 0,
+            "stary klucz service_type='llm' nie powinien wiecej istniec po migracji 66"
+        );
     }
 }

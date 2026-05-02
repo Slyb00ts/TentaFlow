@@ -191,7 +191,7 @@ pub fn llm_generate(
     // Most async→sync: host function jest synchroniczna, router jest async.
     // Uzywamy tokio::task::block_in_place aby uniknac deadlocka w wielowatkowym runtime.
     let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(router.route_chat_completion(request))
+        tokio::runtime::Handle::current().block_on(router.route_chat_completion(request, None))
     });
 
     let result_text = match result {

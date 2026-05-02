@@ -1947,5 +1947,24 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX IF NOT EXISTS idx_peer_hints_node ON peer_hints(node_id);
         ",
     ),
+    (
+        66,
+        "flows_service_type_llm_to_chat",
+        "
+            -- B1 fix: routing/chat.rs uzywa service_type='chat' przy try_dispatch,
+            -- a seed wczesniej wpisywal 'llm'. Synchronizujemy istniejace wpisy.
+            UPDATE flows SET service_type = 'chat' WHERE service_type = 'llm';
+        ",
+    ),
+    (
+        67,
+        "drop_flow_engine_enabled_setting",
+        "
+            -- B3 fix: feature flag flow_engine_enabled usuniety. Dispatcher dziala
+            -- bezwarunkowo — flow uruchamia sie zawsze gdy istnieje pasujace
+            -- powiazanie modelu/service_type.
+            DELETE FROM settings WHERE key = 'flow_engine_enabled';
+        ",
+    ),
 ]
 }

@@ -81,7 +81,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             audio_input: None,
         };
 
-        let route_result = match router.route_chat_completion_stream(request).await {
+        let route_result = match router.route_chat_completion_stream(request, None).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("chat_stream: route_chat_completion_stream failed: {:#}", e);
