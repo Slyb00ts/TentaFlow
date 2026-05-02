@@ -254,8 +254,8 @@ impl CrdtStore {
             }
 
             CrdtOperation::UpsertSetting { key, value, .. } => {
-                // Legacy key — usuniete w R0c. Stare peery moga jeszcze go propagowac;
-                // ignorujemy zamiast zapisywac dead state do lokalnej bazy.
+                // Retired feature flag — older peers may still propagate it.
+                // Drop silently instead of writing dead state into settings.
                 if key == "flow_engine_enabled" {
                     return Ok(());
                 }

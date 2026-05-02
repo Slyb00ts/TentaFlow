@@ -23,25 +23,17 @@ use tentaflow_protocol::*;
 use tracing::{debug, error, info, warn};
 
 impl Router {
-    /// Routuje chat completion request do odpowiedniego backendu lub RAG engine.
+    /// Single entry point for non-streaming chat completion.
     ///
-    /// Algorytm:
-    /// 1. Rozwiaz alias modelu (jesli uzywany)
-    /// 2. Sprawdz czy to RAG model -> route do RAG engine
-    /// 3. Jesli nie RAG, znajdz standardowy model pool
-    /// 4. Wybierz backend z pool (load balancing)
-    /// 5. Wyslij request do backendu/RAG
-    /// 6. Zwroc response
-    /// Single entry chat completion (non-streaming).
+    /// `user = Some(_)` enforces model-level ACL and propagates user_id/role
+    /// into the flow dispatcher for per-flow ACL. `user = None` is reserved
+    /// for internal callers (addons, reverse mesh, translate) that bypass
+    /// ACL by design.
     ///
-    /// `user = Some(_)` egzekwuje model-level ACL i przekazuje user_id/role do
-    /// flow dispatcher (per-flow ACL). `user = None` to wewnetrzne wywolania
-    /// (addon, reverse mesh, translate) bez ACL.
-    ///
-    /// Pojedyncza sciezka dispatch:
-    /// 1. ACL check na modelu (jesli user.is_some()).
-    /// 2. Flow engine z user-aware ctx — jesli match, return.
-    /// 3. Audio bootstrap (legacy, przeniesione w R2d) -> direct dispatch.
+    /// Dispatch order:
+    /// 1. Model-level ACL when a user is attached.
+    /// 2. Flow engine with user-aware context — return on match.
+    /// 3. Audio bootstrap (legacy STT injection) and direct backend dispatch.
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,

@@ -264,21 +264,10 @@ impl FlowDispatcher {
     pub fn invalidate_cache(&self) {
         self.cache.invalidate_all();
     }
-
-    /// Lista typow node'ow zarejestrowanych w AdapterRegistry. Uzywane przez
-    /// snapshot test R0d (parytet z seed flow_node_templates) i przez
-    /// walidacje flow_json przy zapisie.
-    pub fn registered_node_types(&self) -> Vec<String> {
-        self.registry
-            .registered_types()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect()
-    }
 }
 
 #[cfg(test)]
-mod r0d_snapshot {
+mod flow_dispatch_regression {
     use super::*;
     use crate::config::RouterConfig;
     use crate::db::seed;
@@ -286,10 +275,11 @@ mod r0d_snapshot {
     use rusqlite::Connection;
     use std::collections::BTreeSet;
 
-    /// R0d: typy node'ow zarejestrowane w AdapterRegistry musza odpowiadac
-    /// dokladnie typom z seedowanych szablonow `flow_node_templates`.
-    /// Rozjazd oznacza ze GUI pokazuje element ktorego executor nie umie
-    /// wykonac, albo odwrotnie — adapter istnieje ale palette go nie eksponuje.
+    /// Adapter registry and the seeded `flow_node_templates` palette must list
+    /// the same set of node types — otherwise the GUI exposes a template the
+    /// executor cannot run, or an adapter exists with no way to drop it onto a
+    /// flow. The two sources are populated independently, so an integration
+    /// test is the only way to catch a drift.
     #[test]
     fn registered_adapters_match_seeded_node_templates() {
         let conn = Connection::open_in_memory().unwrap();
@@ -317,20 +307,23 @@ mod r0d_snapshot {
             ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
         );
         let dispatcher = FlowDispatcher::new(pool, service_manager, config);
-        let registered: BTreeSet<String> =
-            dispatcher.registered_node_types().into_iter().collect();
+        let registered: BTreeSet<String> = dispatcher
+            .registry()
+            .registered_types()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
 
         assert_eq!(
             seeded, registered,
-            "flow_node_templates seed != AdapterRegistry typy.\nseed: {:?}\nregistry: {:?}",
+            "flow_node_templates seed != AdapterRegistry types.\nseed: {:?}\nregistry: {:?}",
             seeded, registered
         );
     }
 
-    /// R0e: regression dla B1 — po fresh seed musi istniec domyslny aktywny
-    /// flow z service_type='chat' (uzywany przez routing/chat.rs przy
-    /// `try_dispatch(model, "chat", ctx)`). Wczesniej seed wpisywal 'llm'
-    /// i resolver nigdy nie znajdowal default flow.
+    /// Chat router dispatches with `service_type = "chat"`. A fresh seed must
+    /// produce an active default flow under that exact key — and no leftover
+    /// rows under the previous `"llm"` key after migration runs.
     #[test]
     fn seeded_default_flow_uses_chat_service_type() {
         let conn = Connection::open_in_memory().unwrap();
@@ -345,7 +338,7 @@ mod r0d_snapshot {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("musi istniec domyslny aktywny flow dla service_type='chat'");
+            .expect("expected an active default flow with service_type='chat'");
 
         assert_eq!(name, "Standardowy pipeline LLM");
         assert_eq!(status, "active");
@@ -360,7 +353,40 @@ mod r0d_snapshot {
             .unwrap();
         assert_eq!(
             llm_under_old_key, 0,
-            "stary klucz service_type='llm' nie powinien wiecej istniec po migracji 66"
+            "no flow row should remain under the legacy service_type='llm'"
+        );
+    }
+
+    /// Resolver step 2 (`model_registry.flow_id` lookup) used to crash on a
+    /// fresh database because `repository::get_model_by_name` queried columns
+    /// dropped in `services_schema_final`. With step 2 gone, an unknown model
+    /// name plus `service_type="chat"` must still land on the seeded default
+    /// chat pipeline — this is the live-fire test that direct DB checks
+    /// cannot replace.
+    #[test]
+    fn resolve_flow_returns_default_chat_flow_on_fresh_db() {
+        use crate::flow_engine::resolver;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        seed::seed_defaults(&conn).unwrap();
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+        let flow = resolver::resolve_flow(&pool, "any-unknown-model", "chat")
+            .expect("resolve_flow must not error on a fresh seeded db")
+            .expect("a default chat flow must be available after seeding");
+
+        assert_eq!(flow.name, "Standardowy pipeline LLM");
+        assert_eq!(flow.service_type.as_deref(), Some("chat"));
+        assert_eq!(flow.status, "active");
+        assert_eq!(flow.is_default, true);
+
+        let none_for_other_service =
+            resolver::resolve_flow(&pool, "any-unknown-model", "embedding").unwrap();
+        assert!(
+            none_for_other_service.is_none(),
+            "unknown service_type should yield None, not the chat default"
         );
     }
 }
