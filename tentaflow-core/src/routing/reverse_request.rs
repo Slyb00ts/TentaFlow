@@ -368,7 +368,7 @@ async fn handle_completion_stream(
     // route_chat_completion_stream gateuja tryb streaming wlasnie tym polem.
     chat_request.stream = true;
 
-    let route_result = match router.route_chat_completion_stream(chat_request).await {
+    let route_result = match router.route_chat_completion_stream(chat_request, None).await {
         Ok(r) => r,
         Err(e) => {
             let err_chunk = ModelStreamChunk {
@@ -544,7 +544,7 @@ pub async fn dispatch_reverse_request(
         ModelPayload::Completion(ref completion_payload) => {
             match build_chat_request(completion_payload) {
                 Ok(chat_request) => {
-                    match router.route_chat_completion(chat_request).await {
+                    match router.route_chat_completion(chat_request, None).await {
                         Ok(route_result) => {
                             let text = route_result.response.choices.first()
                                 .and_then(|c| c.message.content.as_ref())
@@ -770,7 +770,7 @@ pub async fn dispatch_reverse_stream_request(
     };
     chat_request.stream = true;
 
-    let route_result = match router.route_chat_completion_stream(chat_request).await {
+    let route_result = match router.route_chat_completion_stream(chat_request, None).await {
         Ok(result) => result,
         Err(e) => {
             send_stream_chunk_bytes(

@@ -38,13 +38,9 @@ use crate::flow_engine::types::FlowContext;
 use tentaflow_protocol::{RAGParams, RAGPayload, SearchMode};
 use tracing::warn;
 
-/// Buduje FlowContext z ChatCompletionRequest — wspolna logika dla streaming i non-streaming.
-pub(crate) fn build_flow_context(request: &ChatCompletionRequest, stream: bool) -> FlowContext {
-    build_flow_context_for_user(request, stream, None)
-}
-
-/// Wariant z user context — propaguje user_id+role do FlowContext zeby
-/// dispatcher mogl gateowac flow ACL.
+/// Buduje FlowContext z ChatCompletionRequest — propaguje user_id+role do
+/// FlowContext zeby dispatcher mogl gateowac flow ACL. Internal callers
+/// (addon/mesh/translate) podaja `user = None`.
 pub(crate) fn build_flow_context_for_user(
     request: &ChatCompletionRequest,
     stream: bool,

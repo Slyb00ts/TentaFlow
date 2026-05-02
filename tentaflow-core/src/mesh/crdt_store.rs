@@ -254,6 +254,11 @@ impl CrdtStore {
             }
 
             CrdtOperation::UpsertSetting { key, value, .. } => {
+                // Legacy key — usuniete w R0c. Stare peery moga jeszcze go propagowac;
+                // ignorujemy zamiast zapisywac dead state do lokalnej bazy.
+                if key == "flow_engine_enabled" {
+                    return Ok(());
+                }
                 // Re-szyfruj wartosc lokalnym master key jesli klucz jest wrazliwy
                 let store_value = self.encrypt_setting_for_storage(key, value);
                 conn.execute(
@@ -1180,7 +1185,7 @@ mod tests {
         let t1 = clock.tick();
 
         let op = CrdtOperation::UpsertSetting {
-            key: "flow_engine_enabled".into(),
+            key: "flow_debug_mode".into(),
             value: "true".into(),
             clock: t1,
         };
@@ -1198,7 +1203,7 @@ mod tests {
         let stored: String = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
-                params!["flow_engine_enabled"],
+                params!["flow_debug_mode"],
                 |row| row.get(0),
             )
             .unwrap();

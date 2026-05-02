@@ -37,7 +37,6 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         ("metrics_interval_ms", "1000"),
         ("health_check_interval_ms", "5000"),
         ("hf_token", ""),
-        ("flow_engine_enabled", "false"),
         ("flow_debug_mode", "false"),
         ("flow_default_timeout_ms", "120000"),
         ("speaker_confidence_high", "0.78"),
@@ -537,7 +536,7 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
         (
             "Standardowy pipeline LLM",
             "Prosty pipeline LLM z filtrem PII na odpowiedzi.",
-            "llm",
+            "chat",
             r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from":"t1","to":"l1"},{"from":"l1","to":"p1"},{"from":"p1","to":"o1"}]}"#,
             1,
         ),

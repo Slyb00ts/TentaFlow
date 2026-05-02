@@ -425,7 +425,7 @@ mod tests {
         assert!(SettingsCipher::should_encrypt("auth_token"));
         assert!(SettingsCipher::should_encrypt("db_password"));
         assert!(!SettingsCipher::should_encrypt("jwt_expiry_hours"));
-        assert!(!SettingsCipher::should_encrypt("flow_engine_enabled"));
+        assert!(!SettingsCipher::should_encrypt("flow_debug_mode"));
     }
 
     #[test]

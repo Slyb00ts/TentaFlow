@@ -33,6 +33,7 @@ impl Router {
     pub async fn route_chat_completion_stream(
         &self,
         mut request: ChatCompletionRequest,
+        user: Option<crate::routing::acl::UserContext>,
     ) -> Result<
         crate::routing::RouteResult<
             Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
@@ -43,10 +44,32 @@ impl Router {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
+        if let Some(ref u) = user {
+            if let Some(ref db) = self.db {
+                if !crate::routing::acl::check_access_safe(
+                    db,
+                    "model",
+                    &request.model,
+                    u.user_id,
+                    &u.role,
+                ) {
+                    tracing::warn!(
+                        user_id = u.user_id,
+                        model = %request.model,
+                        "ACL denied model access (stream)"
+                    );
+                    return Err(crate::error::CoreError::AllBackendsUnavailable {
+                        model_name: request.model.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
-            let ctx_stream = crate::routing::build_flow_context(&request, true);
+            let ctx_stream = crate::routing::build_flow_context_for_user(&request, true, user.clone());
             match dispatcher
                 .try_dispatch_streaming(&request.model, "chat", ctx_stream)
                 .await
@@ -74,7 +97,7 @@ impl Router {
                 }
             }
 
-            let ctx = crate::routing::build_flow_context(&request, true);
+            let ctx = crate::routing::build_flow_context_for_user(&request, true, user.clone());
             match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                 Ok(Some(result)) => {
                     let response = flow_result_to_chat_response(result, &request.model);

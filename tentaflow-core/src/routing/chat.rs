@@ -32,22 +32,23 @@ impl Router {
     /// 4. Wybierz backend z pool (load balancing)
     /// 5. Wyslij request do backendu/RAG
     /// 6. Zwroc response
-    /// Wariant streaming z user context — te same ACL reguly co non-stream.
-    pub async fn route_chat_completion_stream_for_user(
+    /// Single entry chat completion (non-streaming).
+    ///
+    /// `user = Some(_)` egzekwuje model-level ACL i przekazuje user_id/role do
+    /// flow dispatcher (per-flow ACL). `user = None` to wewnetrzne wywolania
+    /// (addon, reverse mesh, translate) bez ACL.
+    ///
+    /// Pojedyncza sciezka dispatch:
+    /// 1. ACL check na modelu (jesli user.is_some()).
+    /// 2. Flow engine z user-aware ctx — jesli match, return.
+    /// 3. Audio bootstrap (legacy, przeniesione w R2d) -> direct dispatch.
+    pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
         user: Option<crate::routing::acl::UserContext>,
-    ) -> Result<
-        crate::routing::RouteResult<
-            std::pin::Pin<
-                Box<
-                    dyn futures::Stream<
-                            Item = Result<crate::api::openai::types::ChatCompletionChunk>,
-                        > + Send,
-                >,
-            >,
-        >,
-    > {
+    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
+        let mut metrics = RequestMetrics::new();
+
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
                 if !crate::routing::acl::check_access_safe(
@@ -57,7 +58,11 @@ impl Router {
                     u.user_id,
                     &u.role,
                 ) {
-                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied model access (stream)");
+                    tracing::warn!(
+                        user_id = u.user_id,
+                        model = %request.model,
+                        "ACL denied model access"
+                    );
                     return Err(crate::error::CoreError::AllBackendsUnavailable {
                         model_name: request.model.clone(),
                     }
@@ -65,78 +70,10 @@ impl Router {
                 }
             }
         }
-        self.route_chat_completion_stream(request).await
-    }
-
-    /// Wariant z user context — sprawdza ACL przed wywolaniem backendu.
-    /// Admin zawsze przechodzi, zwykly user dostaje `AllBackendsUnavailable`
-    /// (maskujemy jako ten sam blad co 'model not found' zeby nie ujawniac
-    /// ktore modele istnieja ale sa zablokowane).
-    pub async fn route_chat_completion_for_user(
-        &self,
-        request: ChatCompletionRequest,
-        user: Option<crate::routing::acl::UserContext>,
-    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
-        // Najpierw sprobuj flow engine z user context (dispatcher sam sprawdzi
-        // ACL dla flow_id i albo wykona flow albo zwroci None — fallback na
-        // route_chat_completion ktorego potem wywolujemy z model-level ACL).
-        if let Some(ref u) = user {
-            if let Some(ref dispatcher) = self.flow_dispatcher {
-                let ctx =
-                    crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
-                if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await
-                {
-                    use crate::routing::chat::flow_result_to_chat_response;
-                    let response = flow_result_to_chat_response(result, &request.model);
-                    let metadata = crate::routing::RouteMetadata {
-                        served_by_node: hostname::get()
-                            .map(|h| h.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| "unknown".to_string()),
-                        backend_type: "flow_engine".to_string(),
-                        strategy_used: "direct".to_string(),
-                        fallbacks_tried: 0,
-                        hop_count: 0,
-                        latency_ms: None,
-                    };
-                    return Ok(crate::routing::RouteResult { response, metadata });
-                }
-            }
-        }
-        if let Some(ref u) = user {
-            let db = match &self.db {
-                Some(d) => d,
-                None => return self.route_chat_completion(request).await,
-            };
-            if !crate::routing::acl::check_access_safe(
-                db,
-                "model",
-                &request.model,
-                u.user_id,
-                &u.role,
-            ) {
-                tracing::warn!(
-                    user_id = u.user_id,
-                    model = %request.model,
-                    "ACL denied model access"
-                );
-                return Err(crate::error::CoreError::AllBackendsUnavailable {
-                    model_name: request.model.clone(),
-                }
-                .into());
-            }
-        }
-        self.route_chat_completion(request).await
-    }
-
-    pub async fn route_chat_completion(
-        &self,
-        request: ChatCompletionRequest,
-    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
-        let mut metrics = RequestMetrics::new();
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let ctx = crate::routing::build_flow_context(&request, false);
+            let ctx = crate::routing::build_flow_context_for_user(&request, false, user.clone());
 
             match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                 Ok(Some(result)) => {
@@ -2181,7 +2118,7 @@ impl Router {
             audio_input: None,
         };
 
-        match self.route_chat_completion(request).await {
+        match self.route_chat_completion(request, None).await {
             Ok(route_result) => {
                 let response = route_result.response;
                 let content = crate::routing::extract_response_text(&response);
