@@ -1060,17 +1060,16 @@ impl AddonManager {
     /// `teams-summary` ma pusty default target — admin musi recznie wskazac model
     /// (qwen/gpt-oss/etc) w Models. Jesli pusty, meeting summary handler zwraca
     /// "not configured" error zamiast generowac udawana odpowiedz.
-    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 6] = [
+    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 5] = [
         ("teams-stt", "whisper-1"),
         ("teams-tts", "tts-1"),
         ("teams-summary", ""),
         // Vision aliasy są puste przy starcie — wypełnia je auto_bind po
-        // pierwszym deployu odpowiedniego silnika (SCRFD → face, HSEmotion →
-        // emotion, MiVOLO → age/gender). Brak deployu = pipeline w
+        // pierwszym deployu odpowiedniego silnika (SCRFD → face,
+        // HSEmotion → emotion). Brak deployu = pipeline w
         // `reverse_request.rs::VideoFrame` skipuje inferencję bez błędu.
         ("teams-vision-face", ""),
         ("teams-vision-emotion", ""),
-        ("teams-vision-age", ""),
     ];
 
     /// Tworzy lub reaktywuje aliasy teams-stt / teams-tts i odswieza cache routera

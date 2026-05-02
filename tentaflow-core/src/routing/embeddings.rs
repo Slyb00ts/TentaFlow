@@ -92,26 +92,63 @@ impl Router {
                             Ok(response)
                         }
                         BackendHandle::MeshForward(node_id, svc) => {
-                            // Zdalny embedding serwis w mesh — iroh obsluguje relay multi-hop
-                            // transparentnie przez endpoint routing. Uzywamy tego samego
-                            // mechanizmu co dla bezposredniego peera.
                             debug!(
                                 target_node = %node_id,
                                 service = %svc,
                                 "MeshForward embeddings do zdalnej uslugi"
                             );
-                            let quic_client = this
-                                .service_manager
-                                .find_quic_client_for_model(svc)
+                            let input_texts = match &req.input {
+                                EmbeddingInput::Single(text) => vec![text.clone()],
+                                EmbeddingInput::Multiple(texts) => texts.clone(),
+                            };
+                            let text_count = input_texts.len();
+                            let request = ModelRequest {
+                                request_id: uuid::Uuid::new_v4().to_string(),
+                                payload: ModelPayload::Embeddings(EmbeddingsPayload {
+                                    model: svc.clone(),
+                                    input: input_texts,
+                                    normalize: true,
+                                }),
+                                stream: false,
+                                metadata: None,
+                                session_id: None,
+                            };
+                            let response = this
+                                .forward_model_request_to_mesh(node_id, request)
                                 .await
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Mesh embedding service '{}' on node {} not found or not connected",
-                                        svc, node_id
-                                    )
-                                })?;
-                            this.route_embeddings_quic(quic_client, req, svc.clone())
-                                .await
+                                .map_err(|e| anyhow::anyhow!("Mesh embeddings request failed: {}", e))?;
+                            match response.result {
+                                ModelResult::Embeddings(result) => {
+                                    let data = result
+                                        .embeddings
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(idx, embedding)| EmbeddingData {
+                                            object: "embedding".to_string(),
+                                            index: idx as u32,
+                                            embedding,
+                                        })
+                                        .collect();
+                                    let estimated_tokens = text_count * 50;
+                                    Ok(EmbeddingResponse {
+                                        object: "list".to_string(),
+                                        data,
+                                        model: svc.clone(),
+                                        usage: EmbeddingUsage {
+                                            prompt_tokens: estimated_tokens as u32,
+                                            total_tokens: estimated_tokens as u32,
+                                        },
+                                    })
+                                }
+                                ModelResult::Error(err) => Err(anyhow::anyhow!(
+                                    "Mesh embeddings error {:?}: {}",
+                                    err.error_type,
+                                    err.message
+                                )),
+                                _ => Err(anyhow::anyhow!(
+                                    "Mesh embeddings returned unexpected response type"
+                                )),
+                            }
                         }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla embeddings")),
                     }

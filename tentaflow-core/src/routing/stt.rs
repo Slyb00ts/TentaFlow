@@ -157,10 +157,7 @@ impl Router {
                             Ok(response)
                         }
                         BackendHandle::MeshForward(node_id, svc) => {
-                            // Mesh-remote STT — iroh transparentnie obsluguje relay multi-hop.
                             debug!(target_node = %node_id, service = %svc, "MeshForward STT");
-                            let quic_client = this.service_manager.get_quic_stt_client(svc).await
-                                .ok_or_else(|| anyhow::anyhow!("Mesh STT serwis '{}' na nodzie {} nie polaczony", svc, node_id))?;
                             let request_id = uuid::Uuid::new_v4().to_string();
                             let model_request = ModelRequest {
                                 request_id: request_id.clone(),
@@ -182,7 +179,7 @@ impl Router {
                                 metadata: None,
                                 session_id: None,
                             };
-                            let response = quic_client.send_request(model_request).await
+                            let response = this.forward_model_request_to_mesh(node_id, model_request).await
                                 .map_err(|e| anyhow::anyhow!("Mesh STT request failed: {}", e))?;
                             match response.result {
                                 ModelResult::Audio(audio_result) => match audio_result.data {

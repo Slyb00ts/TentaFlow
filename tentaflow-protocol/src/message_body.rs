@@ -11,6 +11,7 @@
 // =============================================================================
 
 use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 // =============================================================================
 // Pomocnicze typy (bootstrap — docelowo rozpisane per-archetype)
@@ -337,6 +338,28 @@ pub struct AuthMeResponse {
     pub user_id: [u8; 16],
     pub username: String,
     pub role: String,
+}
+
+// =============================================================================
+// Me / User preferences (preferowany jezyk dla TTS itd.)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MePreferencesGetRequest {}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MePreferencesGetResponse {
+    pub language: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MePreferencesUpdateRequest {
+    pub language: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MePreferencesUpdateResponse {
+    pub language: Option<String>,
 }
 
 // =============================================================================
@@ -1590,6 +1613,100 @@ pub struct NimContainerEntry {
 pub struct NimCatalogListResponse {
     pub containers: Vec<NimContainerEntry>,
     pub error: Option<String>,
+}
+
+// =============================================================================
+// vLLM deploy recommend (TP/PP/ctx_len/max_seqs/kv_dtype calculator).
+// f64 fields drop Eq; PartialEq only.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmGpuInfo {
+    pub index: u32,
+    pub name: String,
+    pub memory_gb: f64,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmRecommendRequest {
+    pub model: String,
+    pub gpus: Vec<DeployVllmGpuInfo>,
+    pub hf_token: Option<String>,
+    pub tensor_parallel: Option<u32>,
+    pub pipeline_parallel: Option<u32>,
+    pub max_model_len: Option<u64>,
+    pub max_num_seqs: Option<u64>,
+    pub kv_cache_dtype: Option<String>,
+    pub gpu_memory_utilization: Option<f64>,
+    pub quantization_override: Option<String>,
+    pub lock_max_model_len: Option<bool>,
+    pub lock_max_num_seqs: Option<bool>,
+    pub lock_tensor_parallel: Option<bool>,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmConfig {
+    pub tensor_parallel: u32,
+    pub pipeline_parallel: u32,
+    pub max_model_len: u64,
+    pub max_num_seqs: u64,
+    pub kv_cache_dtype: String,
+    pub gpu_memory_utilization: f64,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmModelSpecSummary {
+    pub model_type: String,
+    pub architectures: Vec<String>,
+    pub dtype: String,
+    pub quantization: Option<String>,
+    pub hidden_size: u64,
+    pub num_attention_heads: u64,
+    pub num_key_value_heads: u64,
+    pub num_hidden_layers: u64,
+    pub max_position_embeddings: u64,
+    pub has_vision: bool,
+    pub has_audio: bool,
+    pub estimated_params_billions: f64,
+    pub bytes_per_param: f64,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmVramEstimate {
+    pub model_weights_gb: f64,
+    pub kv_cache_gb: f64,
+    pub activations_gb: f64,
+    pub overhead_gb: f64,
+    pub total_gb: f64,
+    pub per_gpu_gb: f64,
+    pub fits_per_gpu: bool,
+    pub fits_total: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmGpuCompatibility {
+    pub used_tp: u32,
+    pub used_pp: u32,
+    pub uses_all_gpus: bool,
+    pub clean_partition: bool,
+    pub better_gpu_counts: Vec<u32>,
+    pub warning: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct DeployVllmRecommendResponse {
+    pub model_spec: DeployVllmModelSpecSummary,
+    pub vram_estimate: DeployVllmVramEstimate,
+    pub recommended: DeployVllmConfig,
+    pub max_supported_model_len: u64,
+    pub max_supported_num_seqs: u64,
+    pub recommended_vllm_args: String,
+    pub warnings: Vec<String>,
+    pub gpu_compatibility: DeployVllmGpuCompatibility,
+    pub applied: DeployVllmConfig,
+    pub auto_adjusted: Vec<String>,
+    pub at_limit: bool,
 }
 
 /// Request: deploy engine described by Service Manifest (Admin).
@@ -3084,6 +3201,12 @@ pub enum MessageBody {
     AuthMeRequest,
     AuthMeResponseBody(AuthMeResponse),
 
+    // ---- Me / User preferences ----
+    MePreferencesGetRequestBody(MePreferencesGetRequest),
+    MePreferencesGetResponseBody(MePreferencesGetResponse),
+    MePreferencesUpdateRequestBody(MePreferencesUpdateRequest),
+    MePreferencesUpdateResponseBody(MePreferencesUpdateResponse),
+
     // ---- Chat streaming (R-STREAM) ----
     ChatStreamRequestBody(ChatStreamRequest),
     ChatStreamChunkBody(ChatStreamChunk),
@@ -3361,6 +3484,8 @@ pub enum MessageBody {
     ModelAliasDeleteResponseBody(ModelAliasDeleteResponse),
     NimCatalogListRequest,
     NimCatalogListResponseBody(NimCatalogListResponse),
+    DeployVllmRecommendRequestBody(DeployVllmRecommendRequest),
+    DeployVllmRecommendResponseBody(DeployVllmRecommendResponse),
     // ServiceManifestDeployRequest/Response przeniesione do DeploymentPayload
     // (ReqStart/ResStart). Oszczędza 1 slot w 256-variant limicie rkyv.
 
