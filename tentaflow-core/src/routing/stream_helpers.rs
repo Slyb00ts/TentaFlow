@@ -73,6 +73,11 @@ where
                         None,
                         Some("stop".to_string()),
                     ))),
+                    StreamChunkType::Error(err) => Some(Err(anyhow::anyhow!(
+                        "stream error {:?}: {}",
+                        err.error_type,
+                        err.message
+                    ))),
                     _ => None,
                 },
                 Err(e) => Some(Err(anyhow::Error::from(e))),
@@ -126,7 +131,7 @@ fn make_chunk(
 mod tests {
     use super::*;
     use futures::stream;
-    use tentaflow_protocol::ModelStreamChunk;
+    use tentaflow_protocol::{ErrorInfo, ErrorType, ModelStreamChunk};
 
     fn text_chunk(text: &str) -> ModelStreamChunk {
         ModelStreamChunk {
@@ -171,5 +176,25 @@ mod tests {
 
         let done = collected[2].as_ref().unwrap();
         assert_eq!(done.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn quic_stream_surfaces_error_chunks() {
+        let input: Vec<std::result::Result<ModelStreamChunk, crate::error::CoreError>> =
+            vec![Ok(ModelStreamChunk {
+                request_id: "r".to_string(),
+                chunk: StreamChunkType::Error(ErrorInfo {
+                    error_type: ErrorType::InternalError,
+                    message: "remote failed".to_string(),
+                    details: None,
+                }),
+            })];
+        let src = stream::iter(input);
+
+        let converted = quic_stream_to_openai_chunks(src, "model-x".to_string());
+        let collected: Vec<_> = converted.collect().await;
+
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].as_ref().unwrap_err().to_string().contains("remote failed"));
     }
 }

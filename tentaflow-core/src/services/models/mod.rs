@@ -1,9 +1,7 @@
-// ============ File: api/dashboard/api_models.rs — alias + unified-models domain helpers shared with binary RPC handlers ============
-//
-// Krok N2 removed every REST handler that lived in this file. The chat picker
-// and Services tab now talk to `ModelListRequest` / `ServiceListRequest` over
-// binary WS. What remains is the alias domain logic + unified-models view used
-// by the binary handlers in `dispatch::handlers` (FAZA 2 surface).
+// =============================================================================
+// File: services/models/mod.rs
+// Opis: Alias domain logic + unified-models view dla binary RPC handlerów.
+// =============================================================================
 
 use std::sync::Arc;
 

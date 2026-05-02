@@ -32,7 +32,7 @@ inference-mlx-whisper = ["dep:libloading"]
 # Kokoro 82M TTS przez mlx-swift port. macOS/iOS only.
 inference-mlx-kokoro = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
-dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
+dashboard-api = []
 metrics-prometheus = ["dep:prometheus"]
 rdma-probe = []
 # Jedna flaga GPU per backend — wlacza akceleracje dla LLM (llama.cpp) i STT
@@ -149,11 +149,6 @@ regex = "1.12.3"
 
 # Multipart form data parsing
 multer = "3.1"
-
-# Dashboard API (optional)
-axum = { version = "0.8.9", optional = true }
-tower = { version = "0.5.3", optional = true }
-tower-http = { version = "0.6.8", features = ["cors", "fs"], optional = true }
 
 # Docker (optional)
 bollard = { version = "0.20.2", optional = true }

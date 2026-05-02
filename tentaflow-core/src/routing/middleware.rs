@@ -7,7 +7,6 @@
 use crate::error::Result;
 use crate::routing::router::Router;
 use crate::routing::service_manager::PoolStrategy;
-use crate::routing::transport_client::entry_to_backend_client;
 use crate::services::transport::Transport;
 
 use std::sync::atomic::Ordering;
@@ -97,24 +96,9 @@ impl Router {
             || self.service_manager.has_quic_embedding_service(name)
     }
 
-    /// Probuje rozwinac target aliasu na service_name'y. Gdy target jest
-    /// nazwa modelu HF (z dropdown w GUI), `model_pool` zna mapping
-    /// model->service. Pusty target ani nieznane nazwy nie sa rozwijane —
-    /// wraca lista jednoelementowa zeby kolejne kroki dispatch_with_fallback
-    /// mogly zachowac sie tak jak przed fixem.
+    /// Wraca target aliasu jako lista jednoelementowa. Pusty target trafia
+    /// do dalszej dispatch logiki bez zmian.
     fn expand_alias_target(&self, target: String) -> Vec<String> {
-        if target.is_empty() || self.is_known_service(&target) {
-            return vec![target];
-        }
-        if let Some(svcs) = self.service_manager.resolve_model_services(&target) {
-            if !svcs.is_empty() {
-                debug!(
-                    "resolve_route: alias target '{}' rozwiniety przez model_pool -> {:?}",
-                    target, svcs
-                );
-                return svcs;
-            }
-        }
         vec![target]
     }
 
@@ -124,8 +108,7 @@ impl Router {
     /// 1. Config aliasy (service_aliases)
     /// 2. Znany serwis (QUIC/HTTP/RAG/local)
     /// 3. Alias cache (DB model_aliases z fallback_targets + strategy)
-    /// 4. Model pool (round-robin pula serwisow)
-    /// 5. Oryginalna nazwa
+    /// 4. Oryginalna nazwa
     pub(crate) fn resolve_route(&self, model: &str) -> ResolvedRoute {
         // Snapshot-first lookup: when the supervisor snapshot already maps the
         // requested model name, skip the legacy fallback chain entirely. Phase 5+
@@ -189,22 +172,7 @@ impl Router {
             }
         }
 
-        // 4. Model pool
-        if let Some(service_name) = self.service_manager.select_service_for_model(model) {
-            let strategy = self
-                .service_manager
-                .model_pool
-                .get(model)
-                .map(|e| e.strategy)
-                .unwrap_or(PoolStrategy::FirstAvailable);
-            debug!("resolve_route: model pool {} -> {}", model, service_name);
-            return ResolvedRoute {
-                targets: vec![service_name],
-                strategy,
-            };
-        }
-
-        // 5. Oryginalna nazwa
+        // 4. Oryginalna nazwa
         ResolvedRoute {
             targets: vec![model.to_string()],
             strategy: PoolStrategy::FirstAvailable,
@@ -215,138 +183,70 @@ impl Router {
     pub(crate) fn get_backends(&self, target: &str) -> Vec<BackendHandle> {
         let mut backends = Vec::new();
 
-        // Snapshot-first path: derive handles from the supervisor snapshot.
-        // Embedded LLM services are dispatched through `LocalInferenceManager`
-        // (BackendHandle::LocalLlm). HttpDirect / ExternalHttp / SidecarQuic
-        // services map to existing handle variants and are looked up by service
-        // name from the legacy DashMaps in `ServiceManager` (populated at deploy
-        // commit time). The snapshot determines *whether* we route, the legacy
-        // stores carry the connection state.
-        let snap = self.service_manager.current_snapshot();
-        let candidates = snap.find_services_for_model(target);
-        if !candidates.is_empty() {
-            for entry in &candidates {
-                match entry.transport {
-                    Transport::Embedded => {
-                        let model_name = entry
-                            .models
-                            .iter()
-                            .find(|m| m.model_name == target)
-                            .map(|m| m.model_name.clone())
-                            .unwrap_or_else(|| target.to_string());
-                        if self
-                            .service_manager
-                            .has_local_inference_service(&model_name)
-                        {
-                            backends.push(BackendHandle::LocalLlm);
-                        } else if let Ok(guard) = crate::tts::shared_tts_manager().try_read() {
-                            if guard.has(&model_name) {
-                                backends.push(BackendHandle::LocalTts(model_name));
+        let Some(registry) = self.service_manager.mesh_services_registry.read().as_ref().cloned()
+        else {
+            return backends;
+        };
+        let local_node_id = registry.local().node_id.clone();
+        for svc in registry.visible_services() {
+            if !matches!(svc.status.as_str(), "running" | "degraded" | "ready") {
+                continue;
+            }
+            if !svc.models.iter().any(|m| m.model_name == target) {
+                continue;
+            }
+            if svc.node_id != local_node_id {
+                backends.push(BackendHandle::MeshForward(
+                    svc.node_id.clone(),
+                    target.to_string(),
+                ));
+                continue;
+            }
+            let transport = match Transport::from_db_tag(&svc.transport) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(service_id = svc.id, transport = %svc.transport, "invalid service transport: {}", e);
+                    continue;
+                }
+            };
+            match transport {
+                Transport::Embedded => match svc.category.as_str() {
+                    "tts" => {
+                        if let Ok(guard) = crate::tts::shared_tts_manager().try_read() {
+                            if guard.has(target) {
+                                backends.push(BackendHandle::LocalTts(target.to_string()));
                             }
                         }
                     }
-                    Transport::HttpDirect | Transport::ExternalHttp => {
-                        // Validate the snapshot entry can materialise a
-                        // BackendClient (catches misconfigured endpoints /
-                        // headers early). The legacy DashMap, populated at
-                        // deploy commit time, is what `select_http_backend`
-                        // actually queries during dispatch — Phase 8c collapses
-                        // both paths.
-                        if let Err(e) = entry_to_backend_client(entry) {
-                            warn!(
-                                "snapshot path: entry_to_backend_client for svc-{} failed: {}",
-                                entry.id, e
-                            );
-                            continue;
-                        }
-                        if self.service_manager.has_http_backends(target) {
-                            backends.push(BackendHandle::Http(target.to_string()));
+                    "stt" => {
+                        if self.local_stt.is_available_sync() {
+                            backends.push(BackendHandle::LocalStt);
                         }
                     }
-                    Transport::SidecarQuic => {
-                        if self.service_manager.has_quic_llm_service(target) {
-                            backends.push(BackendHandle::QuicLlm(target.to_string()));
+                    _ => {
+                        if self.service_manager.has_local_inference_service(target) {
+                            backends.push(BackendHandle::LocalLlm);
                         }
                     }
+                },
+                Transport::HttpDirect | Transport::ExternalHttp => {
+                    if svc.endpoint_url.is_some()
+                        || self.service_manager.find_http_backend_for_model(target).is_some()
+                    {
+                        backends.push(BackendHandle::Http(target.to_string()));
+                    }
                 }
-            }
-            if !backends.is_empty() {
-                return backends;
-            }
-        }
-
-        if self.service_manager.has_local_inference_service(target) {
-            backends.push(BackendHandle::LocalLlm);
-        }
-
-        if self.local_stt.is_available_sync() {
-            backends.push(BackendHandle::LocalStt);
-        }
-
-        if self.service_manager.has_quic_llm_service(target) {
-            backends.push(BackendHandle::QuicLlm(target.to_string()));
-        }
-
-        if self.service_manager.has_quic_stt_service(target) {
-            backends.push(BackendHandle::QuicStt(target.to_string()));
-        }
-
-        if self.service_manager.has_quic_tts_service(target) {
-            backends.push(BackendHandle::QuicTts(target.to_string()));
-        }
-
-        // Embedded TTS (Apple AVSpeech / Kokoro MLX / sherpa) sa
-        // zarejestrowane w `shared_tts_manager()`, NIE w `quic_tts_services`.
-        // Bez tego sprawdzenia router probowal MeshForward na wlasny node
-        // (filter `svc.node_id == local_node` skipuje go) i konczyl na
-        // 'TTS nie znaleziono backendow'. `try_read` non-blocking — write
-        // lock to tylko podczas register/unregister przy deploy.
-        if let Ok(guard) = crate::tts::shared_tts_manager().try_read() {
-            if guard.has(target) {
-                backends.push(BackendHandle::LocalTts(target.to_string()));
+                Transport::SidecarQuic => match svc.category.as_str() {
+                    "stt" => backends.push(BackendHandle::QuicStt(target.to_string())),
+                    "tts" => backends.push(BackendHandle::QuicTts(target.to_string())),
+                    "embeddings" | "embedding" => {
+                        backends.push(BackendHandle::QuicEmbedding(target.to_string()))
+                    }
+                    "rag" => backends.push(BackendHandle::Rag(target.to_string())),
+                    _ => backends.push(BackendHandle::QuicLlm(target.to_string())),
+                },
             }
         }
-
-        if self.service_manager.has_quic_embedding_service(target) {
-            backends.push(BackendHandle::QuicEmbedding(target.to_string()));
-        }
-
-        if self.service_manager.has_http_backends(target) {
-            backends.push(BackendHandle::Http(target.to_string()));
-        }
-
-        if self.service_manager.has_rag_service(target) {
-            backends.push(BackendHandle::Rag(target.to_string()));
-        }
-
-        // Mesh — szukaj na zdalnych nodach. KRYTYCZNE: pomijaj wlasny node,
-        // bo dla embedded STT/TTS (mlx-whisper, apple-tts, kokoro) ten sam
-        // serwis byl rejestrowany TYM ZE w mesh registry (zeby inne nody
-        // widzialy) PLUS jest dostepny lokalnie. Bez tego filtru dispatcher
-        // probuje MeshForward przez QUIC do siebie samego, dostaje
-        // 'Mesh STT serwis nie polaczony' bo nie ma quic clienta na
-        // wlasnym embedded silniku.
-        // Mesh forward — only remote nodes (filter local owner). Uses the V2
-        // services registry: local services live in `local()`, remote ones in
-        // `all_remote()`.
-        if let Some(reg) = self.service_manager.mesh_services_registry.read().as_ref() {
-            let local_owner = reg.local().node_id.clone();
-            for svc in reg.visible_services() {
-                if svc.node_id == local_owner {
-                    continue;
-                }
-                if svc.status != "running" {
-                    continue;
-                }
-                if svc.models.iter().any(|m| m.model_name == target) {
-                    backends.push(BackendHandle::MeshForward(
-                        svc.node_id.clone(),
-                        svc.display_name.clone(),
-                    ));
-                }
-            }
-        }
-
         backends
     }
 
@@ -753,6 +653,7 @@ mod middleware_tests {
 
     use crate::config::RouterConfig;
     use crate::routing::router::Router;
+    use crate::services::mesh_registry::MeshServicesRegistry;
     use crate::services::supervisor::{ModelEntry, ServiceEntry, ServicesSnapshot};
     use crate::services::transport::Transport;
     use crate::services_repo::services::{DeployMethod, ServiceStatus};
@@ -768,7 +669,56 @@ mod middleware_tests {
         let router = Arc::new(Router::new(RouterConfig::default(), Some(db)).expect("test router"));
         let (_tx, rx) = watch::channel(Arc::new(snap));
         router.service_manager().set_snapshot_rx(rx);
+        let registry = Arc::new(MeshServicesRegistry::new());
+        registry.replace_local(
+            "local".to_string(),
+            router
+                .service_manager()
+                .current_snapshot()
+                .services
+                .iter()
+                .map(service_entry_to_info)
+                .collect(),
+        );
         router
+            .service_manager()
+            .set_mesh_services_registry(registry);
+        router
+    }
+
+    fn service_entry_to_info(entry: &ServiceEntry) -> tentaflow_protocol::ServiceInfo {
+        tentaflow_protocol::ServiceInfo {
+            id: entry.id,
+            node_id: "local".to_string(),
+            engine_id: entry.engine_id.clone(),
+            category: entry.category.clone(),
+            display_name: entry.display_name.clone(),
+            deploy_method: entry.deploy_method.as_db_tag().to_string(),
+            transport: entry.transport.as_db_tag().to_string(),
+            status: entry.status.as_db_tag().to_string(),
+            pinned: entry.pinned,
+            paused: entry.paused,
+            runtime_pid: entry.runtime_pid.map(i64::from),
+            runtime_port: entry.runtime_port,
+            sidecar_quic_port: entry.sidecar_quic_port,
+            endpoint_url: entry.endpoint_url.clone(),
+            restart_count: 0,
+            health_last_err: None,
+            models: entry
+                .models
+                .iter()
+                .map(|m| tentaflow_protocol::ServiceModelEntry {
+                    model_name: m.model_name.clone(),
+                    display_name: m.display_name.clone(),
+                    capabilities: vec!["chat".to_string()],
+                    context_length: None,
+                    quantization: None,
+                    is_default: m.is_default,
+                })
+                .collect(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
     }
 
     fn fixture_entry(

@@ -9,7 +9,7 @@
 //   Submit → POST /api/services/deploy.
 // =============================================================================
 
-import { escapeHtml, escapeAttr, toast, apiPost } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
@@ -511,7 +511,10 @@ async function fetchVllmRecommendation(overrides = {}) {
     ...overrides,
   };
   try {
-    const resp = await apiPost('/api/deploy/vllm/recommend', body);
+    const wireResp = await ApiBinary.action('deployVllmRecommendRequest', body);
+    // Decoder pakuje cala odpowiedz w pole `json` (60+ pol w 4 zagniezdzonych
+    // structach — patrz tentaflow-protocol-wasm decode_message_body).
+    const resp = wireResp && wireResp.json ? JSON.parse(wireResp.json) : wireResp;
     if (resp && resp.model_spec && !cachedModelSpec) {
       // Cache field set wystarczajacy dla estimateKvGb. Backendy moga
       // raportowac kv_heads pod alternatywnymi nazwami — bierzemy pierwszy

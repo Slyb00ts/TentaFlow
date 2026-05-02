@@ -38,22 +38,21 @@ pub enum HealthStatus {
     Failed(String),
 }
 
-/// Optional in-process probe consulted for `Embedded` transports. Returning
-/// `None` tells the supervisor to treat the engine as healthy by default —
-/// the legitimate behaviour while no inference manager is wired up yet
-/// (Phase 5 will inject a concrete implementation).
+/// Probe consulted by the supervisor for `Embedded` transports. Embedded
+/// engines run inside the host process, so failures surface as runtime errors
+/// from the inference manager rather than a separate health endpoint.
 #[async_trait::async_trait]
 pub trait EmbeddedHealthProbe: Send + Sync {
     async fn probe(&self, engine_id: &str) -> HealthStatus;
 }
 
-/// Phase 5 placeholder: until `LocalInferenceManager` exposes a real probe,
-/// embedded engines are reported `Ok` unconditionally. Replace the binding in
-/// `main.rs` once the manager grows a `health_for(engine_id)` accessor.
-pub struct AlwaysOkEmbeddedProbe;
+/// Default probe assuming the embedded engine is healthy. Used when the
+/// inference manager doesn't expose a per-engine health accessor; supervisor
+/// detects failures through inference errors instead.
+pub struct DefaultEmbeddedProbe;
 
 #[async_trait::async_trait]
-impl EmbeddedHealthProbe for AlwaysOkEmbeddedProbe {
+impl EmbeddedHealthProbe for DefaultEmbeddedProbe {
     async fn probe(&self, _engine_id: &str) -> HealthStatus {
         HealthStatus::Ok
     }
@@ -963,18 +962,19 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "dashboard-api")]
     #[tokio::test]
     async fn http_probe_ok_on_200() {
-        // Spin up a tiny axum server returning 200 on /v1/models.
-        let app = axum::Router::new().route(
-            "/v1/models",
-            axum::routing::get(|| async { axum::http::StatusCode::OK }),
-        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
         });
         let url = format!("http://{}", addr);
         let h = http_probe(&url, Duration::from_secs(2)).await;

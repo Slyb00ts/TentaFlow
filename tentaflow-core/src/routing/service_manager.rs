@@ -10,11 +10,7 @@ use crate::config::RouterConfig;
 use crate::error::Result;
 use crate::routing::backend::BackendClient;
 
-// TODO: Przeniesc RAGClient i RAGEngineConfigCompat do crate::services::rag::client
 use crate::services::rag::client::{RAGClient, RAGEngineConfigCompat};
-// TODO: Przeniesc TTSClient i TTSConfigCompat do crate::services::tts::client
-use crate::services::tts::client::TTSClient;
-// TODO: Przeniesc SharedPromptRegistry i create_shared_registry do crate::prompt_registry
 use crate::prompt_registry::{create_shared_registry, SharedPromptRegistry};
 
 use std::collections::{HashMap, VecDeque};
@@ -309,37 +305,6 @@ impl PoolStrategy {
     }
 }
 
-/// Wpis puli serwisow obslugujacych dany model
-pub struct ModelPoolEntry {
-    pub service_names: Vec<String>,
-    pub strategy: PoolStrategy,
-    pub service_type: String,
-    counter: std::sync::atomic::AtomicUsize,
-}
-
-impl ModelPoolEntry {
-    pub fn new() -> Self {
-        Self {
-            service_names: Vec::new(),
-            strategy: PoolStrategy::RoundRobin,
-            service_type: "llm".to_string(),
-            counter: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// Wybierz nastepny serwis (round-robin)
-    pub fn next_service(&self) -> Option<&str> {
-        if self.service_names.is_empty() {
-            return None;
-        }
-        let idx = self
-            .counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.service_names.len();
-        Some(&self.service_names[idx])
-    }
-}
-
 // ============================================================================
 // SERVICE MANAGER
 // ============================================================================
@@ -355,13 +320,9 @@ pub struct ServiceManager {
     pub rag_services: dashmap::DashMap<String, Arc<RAGServiceHandle>>,
 
     /// TTS clients (HTTP, nie wymagaja polaczenia)
-    pub tts_clients: HashMap<String, Arc<TTSClient>>,
 
     /// Kategorie modeli LLM (dla KV Cache) - nazwa -> kategoria
     pub llm_model_categories: dashmap::DashMap<String, crate::config::LlmModelCategory>,
-
-    /// Pula serwisow per model: model_name -> ModelPoolEntry
-    pub model_pool: dashmap::DashMap<String, ModelPoolEntry>,
 
     /// Modele obslugiwane przez lokalna inferencje in-process (MLX, llama.cpp).
     /// DashMap<K, ()> zamiast HashSet — lock-free contains_key.
@@ -439,9 +400,7 @@ impl ServiceManager {
         Ok(Self {
             config,
             rag_services: dashmap::DashMap::new(),
-            tts_clients: HashMap::new(),
             llm_model_categories: dashmap::DashMap::new(),
-            model_pool: dashmap::DashMap::new(),
             local_inference_models: dashmap::DashMap::new(),
             callback_tx,
             callback_rx: Arc::new(tokio::sync::Mutex::new(callback_rx)),
@@ -590,11 +549,6 @@ impl ServiceManager {
         })
     }
 
-    /// Local HTTP TTS client by name (used by `tts/shared_tts_manager`).
-    pub fn get_tts_client(&self, service_name: &str) -> Option<Arc<TTSClient>> {
-        self.tts_clients.get(service_name).cloned()
-    }
-
     /// Pobierz callback receiver
     pub fn get_callback_rx(
         &self,
@@ -638,12 +592,6 @@ impl ServiceManager {
         self.snapshot_has_service(service_name, |c| {
             c.eq_ignore_ascii_case("embedding") || c.eq_ignore_ascii_case("embeddings")
         })
-    }
-
-    /// True when any TTS service hosts `service_name` (HTTP local TTS clients
-    /// or snapshot entries categorised as `tts`).
-    pub fn has_tts_service(&self, service_name: &str) -> bool {
-        self.tts_clients.contains_key(service_name) || self.has_quic_tts_service(service_name)
     }
 
     /// True when a TTS service hosts `service_name` (snapshot-driven).
@@ -760,26 +708,17 @@ impl ServiceManager {
         self.has_quic_stt_service(service_name)
     }
 
-    /// First TTS service name from the snapshot (preferred), then any local
-    /// HTTP TTS client name.
+    /// First TTS service name from the snapshot.
     pub fn get_first_tts_service_name(&self) -> Option<String> {
         let snap = self.current_snapshot();
-        if let Some(svc) = snap
+        let svc = snap
             .services
             .iter()
-            .find(|s| s.category.eq_ignore_ascii_case("tts"))
-        {
-            if let Some(m) = svc.models.first() {
-                return Some(m.model_name.clone());
-            }
-            return Some(svc.engine_id.clone());
+            .find(|s| s.category.eq_ignore_ascii_case("tts"))?;
+        if let Some(m) = svc.models.first() {
+            return Some(m.model_name.clone());
         }
-        self.tts_clients.keys().next().cloned()
-    }
-
-    /// First available HTTP TTS client (snapshot order).
-    pub fn get_first_tts_client(&self) -> Option<Arc<TTSClient>> {
-        self.tts_clients.values().next().cloned()
+        Some(svc.engine_id.clone())
     }
 
     /// First connected QUIC TTS client. Walks the snapshot for TTS services and
@@ -854,11 +793,6 @@ impl ServiceManager {
                 .unwrap_or_else(|| svc.engine_id.clone());
             status.insert(key, format!("{:?} ({})", svc.status, svc.category));
         }
-        for name in self.tts_clients.keys() {
-            status
-                .entry(name.clone())
-                .or_insert_with(|| "ready (TTS HTTP)".to_string());
-        }
         status
     }
 
@@ -867,92 +801,6 @@ impl ServiceManager {
     // `services::handles_cache::build_handle` on every snapshot diff, plants
     // it into `live_handles`, and spawns a per-handle reconnect loop.
 
-    // ========================================================================
-    // MODEL POOL - mapowanie model_name -> serwisy
-    // ========================================================================
-
-    /// Zwraca liste serwisow obslugujacych dany model
-    pub fn resolve_model_services(&self, model_name: &str) -> Option<Vec<String>> {
-        self.model_pool
-            .get(model_name)
-            .map(|e| e.service_names.clone())
-    }
-
-    /// Wybiera najlepszy serwis dla modelu (round-robin)
-    pub fn select_service_for_model(&self, model_name: &str) -> Option<String> {
-        self.model_pool
-            .get(model_name)
-            .and_then(|e| e.next_service().map(|s| s.to_string()))
-    }
-
-    /// Sprawdza czy model istnieje w puli
-    pub fn has_model(&self, model_name: &str) -> bool {
-        self.model_pool.contains_key(model_name)
-    }
-
-    /// Usuwa mapowanie serwisu z puli modelu
-    pub fn remove_model_mapping(&self, model_name: &str, service_name: &str) {
-        let remaining = if let Some(mut entry) = self.model_pool.get_mut(model_name) {
-            entry.service_names.retain(|s| s != service_name);
-            entry.service_names.len()
-        } else {
-            return;
-        };
-        if remaining == 0 {
-            self.model_pool.remove(model_name);
-            info!("ModelPool: '{}' -> usunieto (brak serwisow)", model_name);
-        } else {
-            info!(
-                "ModelPool: '{}' -> usunieto serwis '{}' (pozostalo: {})",
-                model_name, service_name, remaining
-            );
-        }
-    }
-
-    /// Zmienia strategie load-balancing dla modelu w puli
-    pub fn set_model_strategy(&self, model_name: &str, strategy: PoolStrategy) -> bool {
-        if let Some(mut entry) = self.model_pool.get_mut(model_name) {
-            entry.strategy = strategy;
-            info!(
-                "ModelPool: '{}' -> strategia zmieniona na {:?}",
-                model_name, strategy
-            );
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Ustawia liste serwisow dla modelu w puli (zastepuje istniejace)
-    pub fn set_model_services(&self, model_name: &str, service_names: Vec<String>) {
-        let mut entry = self
-            .model_pool
-            .entry(model_name.to_string())
-            .or_insert_with(ModelPoolEntry::new);
-        entry.service_names = service_names;
-        info!(
-            "ModelPool: '{}' -> ustawiono {} serwisow",
-            model_name,
-            entry.service_names.len()
-        );
-    }
-
-    /// Zwraca informacje o model_pool (do diagnostyki/API)
-    pub fn get_model_pool_info(&self) -> Vec<(String, Vec<String>, String, String)> {
-        self.model_pool
-            .iter()
-            .map(|kv| {
-                let name = kv.key().clone();
-                let entry = kv.value();
-                (
-                    name,
-                    entry.service_names.clone(),
-                    entry.strategy.to_string(),
-                    entry.service_type.clone(),
-                )
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]

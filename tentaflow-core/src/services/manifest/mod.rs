@@ -6,6 +6,7 @@
 // =============================================================================
 
 mod registry;
+pub mod runtime_validate;
 mod types;
 mod validate;
 

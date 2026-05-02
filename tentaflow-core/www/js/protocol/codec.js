@@ -179,6 +179,30 @@ export const encode = {
     );
   },
 
+  /** MessageBody::MePreferencesGetRequest (unit). */
+  mePreferencesGetRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMePreferencesGetRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MePreferencesUpdateRequest { language }. */
+  mePreferencesUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMePreferencesUpdateRequest(payload?.language ?? null);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ChatStreamRequest (simplified: 1 user message). */
   chatStreamRequest(correlationId, { modelId, userMessage }, sequence = 1) {
     assertReady();
@@ -2011,6 +2035,18 @@ export const encode = {
       String(payload.addonId ?? ''),
       Boolean(payload.enabled),
     );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::DeployVllmRecommendRequest — vLLM config recommend (rkyv passthrough). */
+  deployVllmRecommendRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeDeployVllmRecommendRequest(JSON.stringify(payload));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

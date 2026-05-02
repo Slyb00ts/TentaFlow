@@ -70,6 +70,19 @@ pub fn torch_home() -> PathBuf {
     models_root().join("torch")
 }
 
+/// Directory for vision ONNX models downloaded at deploy time.
+/// Layout: `<models_root>/vision/{yolov8-face,scrfd,hsemotion,...}.onnx`.
+/// Shared with Docker containers (mounted as /data/models/vision).
+pub fn vision_models_dir() -> PathBuf {
+    models_root().join("vision")
+}
+
+/// Directory for audio ONNX models downloaded at startup.
+/// Layout: `<models_root>/audio/{silero_vad,embedding}.onnx`.
+pub fn audio_models_dir() -> PathBuf {
+    models_root().join("audio")
+}
+
 /// Ensures the root and the torch subdir exist. HF creates its own `hub/`
 /// the first time a model is downloaded, so we do not pre-create it.
 pub fn ensure_models_dirs() -> std::io::Result<PathBuf> {
@@ -125,6 +138,8 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(home.join("data"))?;
     std::fs::create_dir_all(home.join("models"))?;
     std::fs::create_dir_all(home.join("models").join("torch"))?;
+    std::fs::create_dir_all(home.join("models").join("vision"))?;
+    std::fs::create_dir_all(home.join("models").join("audio"))?;
     std::fs::create_dir_all(cache_dir())?;
 
     let containers_parent = home.join("containers");
