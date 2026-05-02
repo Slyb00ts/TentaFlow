@@ -340,7 +340,9 @@ async fn run_server(args: Args) -> Result<()> {
             mesh_services_registry.clone(),
             live_handles,
         );
-        let supervisor = supervisor.with_embedded_probe(Arc::new(DefaultEmbeddedProbe));
+        let supervisor = supervisor
+            .with_embedded_probe(Arc::new(DefaultEmbeddedProbe))
+            .with_catalog_provider(router.catalog_provider().clone());
 
         // First tick is synchronous so the initial snapshot is non-empty
         // before the router goes online. Failures are logged but not fatal.

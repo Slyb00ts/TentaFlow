@@ -101,6 +101,7 @@ mod tests {
             service_type: None,
             flow_json: valid_json.to_string(),
             status: "active".to_string(),
+            published_model_name: None,
             created_at: String::new(),
             updated_at: String::new(),
         };

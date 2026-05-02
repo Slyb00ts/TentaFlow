@@ -37,6 +37,9 @@ pub struct ServiceHandles {
     state_sync_handle: Option<JoinHandle<()>>,
     /// Uchwyt do zadania przetwarzania komend UI
     cmd_handle: Option<JoinHandle<()>>,
+    /// Uchwyt do periodycznego rebuild katalogu — desktop nie ma supervisora
+    /// ktory na binary hostu zalatwialby to per-tick.
+    catalog_rebuild_handle: Option<JoinHandle<()>>,
 }
 
 /// Uruchamia wszystkie serwisy Core w tle
@@ -64,17 +67,22 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     // iroh EndpointId z MeshSecurity.public_key_hex().
     let _ = db::repository::delete_setting(&db, "node_id");
 
-    // Inicjalizacja routera
-    info!("Inicjalizacja routera...");
-    let router = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
-    router.start();
-    info!("Router uruchomiony");
-
     // Mesh services registry — agregator widokow `services` ze wszystkich zaufanych
-    // peerow. Pisze do niego pipeline mesh; czyta GUI/forwarding.
+    // peerow. Pisze do niego pipeline mesh; czyta GUI/forwarding. Tworzony przed
+    // routerem zeby `Router::start()` widzial pelny rejestr przy eager catalog
+    // rebuild — inaczej `/v1/models` byloby puste do pierwszej alias mutation.
     let mesh_services_registry = Arc::new(
         tentaflow_core::services::mesh_registry::MeshServicesRegistry::new(),
     );
+
+    // Inicjalizacja routera
+    info!("Inicjalizacja routera...");
+    let router = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
+    router
+        .service_manager()
+        .set_mesh_services_registry(mesh_services_registry.clone());
+    router.start();
+    info!("Router uruchomiony");
 
     // Port allocator dla services_runtime. Rezerwuje porty zajete przez aktywne
     // wiersze services_v2 zeby nie wydac ich rownoleglemu deployowi.
@@ -250,6 +258,34 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
 
     // Inference manager — juz obslugiwany przez restore_native_services() wyzej
 
+    // Periodyczny rebuild katalogu — desktop nie ma supervisora, ktory na
+    // binary hostu odswiezalby PublicModelCatalog po kazdym tick'u. Mesh
+    // peer announces aktualizuja `mesh_services_registry`, ale bez tego
+    // taska `/v1/models` i GUI patrzaly na snapshot ze startu az do
+    // pierwszej alias mutation. 5s = kompromis miedzy swiezoscia a kosztem
+    // (rebuild jest tani: jeden DB SELECT + walk registry).
+    let catalog_rebuild_handle = {
+        let router_for_catalog = router.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            // Pierwszy tick odpala sie natychmiast — zjedz go, eager rebuild
+            // w router.start() juz to zrobil.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        router_for_catalog.rebuild_catalog();
+                    }
+                    _ = shutdown_rx.changed() => {
+                        info!("Catalog rebuild loop zatrzymany");
+                        break;
+                    }
+                }
+            }
+        }))
+    };
+
     // Periodyczna synchronizacja stanu z Core do UI (co 3s)
     let state_sync_handle = {
         let state = state.clone();
@@ -301,6 +337,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     Ok(ServiceHandles {
         shutdown_tx,
         router: Some(router),
+        catalog_rebuild_handle,
         mesh_handles,
         state_sync_handle,
         cmd_handle,
@@ -333,6 +370,12 @@ pub async fn shutdown(handles: ServiceHandles) {
     if let Some(h) = handles.cmd_handle {
         if let Err(e) = h.await {
             error!("Blad zamykania przetwarzania komend: {}", e);
+        }
+    }
+
+    if let Some(h) = handles.catalog_rebuild_handle {
+        if let Err(e) = h.await {
+            error!("Blad zamykania catalog rebuild loop: {}", e);
         }
     }
 
@@ -827,6 +870,10 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
                     },
                     flow_json,
                     status: "draft",
+                    // Desktop UI does not yet expose the publish-as-model
+                    // toggle — flows reach the catalog through the binary
+                    // FlowCreate/Update handlers when this lands in GUI.
+                    published_model_name: None,
                 },
             )?;
         }

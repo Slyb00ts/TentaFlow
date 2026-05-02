@@ -134,6 +134,10 @@ pub struct DbFlow {
     pub service_type: Option<String>,
     pub flow_json: String,
     pub status: String,
+    /// When set, this flow is advertised as a model with this exact id by the
+    /// catalog (`/v1/models`, mesh `catalog.list`, GUI). Uniqueness is
+    /// enforced in domain logic against aliases and service model names.
+    pub published_model_name: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -268,6 +272,10 @@ pub struct FlowParams<'a> {
     pub service_type: Option<&'a str>,
     pub flow_json: &'a str,
     pub status: &'a str,
+    /// Catalog publish name. `None` keeps the flow off `/v1/models`;
+    /// `Some` advertises it as a model (validated against alias / flow
+    /// collisions in the handler before this struct is built).
+    pub published_model_name: Option<&'a str>,
 }
 
 /// Parametry tworzenia/aktualizacji szablonu wezla flow

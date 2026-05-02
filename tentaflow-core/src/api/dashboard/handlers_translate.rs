@@ -74,16 +74,18 @@ fn first_choice_text(resp: &crate::api::openai::types::ChatCompletionResponse) -
         .unwrap_or_default()
 }
 
-// Selects an LLM identifier. Prefers the first unified LLM from mesh registry;
-// falls back to the generic "default" that local_inference resolves at runtime.
+// Selects an LLM identifier. Prefers the first chat-capable entry advertised
+// by the public catalog; falls back to "default" so `local_inference` can
+// resolve a built-in engine at runtime when nothing is deployed yet.
 fn pick_llm_model(ctx: &HandlerContext) -> String {
-    let unified =
-        crate::services::models::collect_unified(&ctx.state.mesh_services_registry);
-    unified
-        .into_iter()
-        .find(|m| m.service_type.eq_ignore_ascii_case("llm"))
-        .map(|m| m.model_name)
-        .unwrap_or_else(|| "default".to_string())
+    use crate::services::catalog::ServiceSurface;
+    let snapshot = ctx.state.router.catalog_snapshot();
+    for entry in snapshot.advertised_entries() {
+        if entry.service_surfaces.contains(&ServiceSurface::Chat) {
+            return entry.id.clone();
+        }
+    }
+    "default".to_string()
 }
 
 fn current_user_id(ctx: &HandlerContext) -> Option<i64> {

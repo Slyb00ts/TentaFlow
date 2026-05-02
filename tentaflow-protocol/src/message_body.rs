@@ -488,6 +488,12 @@ pub struct FlowCreateRequest {
     pub name: String,
     pub description: Option<String>,
     pub graph_json: String,
+    /// When `Some`, expose this flow as a model with the given id through
+    /// the catalog (`/v1/models`, mesh `catalog.list`, GUI). The handler
+    /// validates the name against active aliases and other published flows
+    /// before writing — collisions return a domain error instead of being
+    /// silently accepted (D.19).
+    pub published_model_name: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -1339,6 +1345,11 @@ pub struct FlowUpdateRequest {
     pub flow_json: Option<String>,
     /// Raw status column ("active" | "draft" | "archived" ...).
     pub status: Option<String>,
+    /// Update or clear the catalog publish name. `Some(Some("..."))`
+    /// publishes / re-publishes; `Some(None)` un-publishes; `None` leaves
+    /// the existing value untouched. Validated against the catalog before
+    /// the row is written.
+    pub published_model_name: Option<Option<String>>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -1503,33 +1514,92 @@ pub struct NgcStatusResponse {
 // Models / aliases / catalog (FAZA 2 + FAZA 5 — REST -> binary)
 // =============================================================================
 
-/// Instance of a unified model on a specific mesh node.
+/// One node hosting a service model. Reused inside `CatalogEntryKind::ServiceModel`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct UnifiedModelInstance {
+pub struct CatalogModelInstance {
     pub node_id: String,
     pub node_hostname: Option<String>,
-    pub service_id: String,
+    pub service_id: i64,
     pub status: String,
     /// Engine serving the model (e.g. "llama-cpp", "vllm", "mlx", "whisper-rs").
     pub backend: Option<String>,
     /// Model weights size in MB when known.
     pub size_mb: Option<u64>,
-    /// Convenience flag mirroring "status is running/ready".
+    /// Convenience flag mirroring `status in ('running', 'ready')`.
     pub loaded: bool,
 }
 
-/// Unified model entry aggregating instances across mesh nodes.
+/// What a single catalog entry represents on the wire. Mirrors
+/// `services::catalog::CatalogEntryKind` from `tentaflow-core` but expresses
+/// enums as plain strings so that adding a new surface or modality on the
+/// service side does not require a protocol bump.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct UnifiedModel {
-    pub model_name: String,
-    pub service_type: String,
-    pub instances: Vec<UnifiedModelInstance>,
+pub enum CatalogEntryKindWire {
+    ServiceModel {
+        instances: Vec<CatalogModelInstance>,
+    },
+    Flow {
+        flow_id: i64,
+        published_name: String,
+    },
+    Alias {
+        target: String,
+        fallback_targets: Vec<String>,
+        /// "first_available" | "round_robin" — open string per D.11.
+        strategy: String,
+    },
 }
 
-/// Response for `ModelsUnifiedListRequest`.
+/// Diagnostic flag attached to an entry. Strings instead of typed enums for
+/// the same forward-compatibility reason as `CatalogEntryKindWire`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ModelsUnifiedListResponse {
-    pub models: Vec<UnifiedModel>,
+pub enum CatalogDiagnosticWire {
+    RemoteShadowed {
+        local_owner: String,
+    },
+    LocalOverride {
+        conflicting_remote_node: String,
+    },
+    IncompatibleAliasTargets {
+        alias: String,
+        /// Lower-snake-case modality names ("text", "image", "audio").
+        missing_modalities: Vec<String>,
+    },
+}
+
+/// One advertised model in the unified catalog. Surface and modality lists
+/// stay as strings so protocol can absorb new values without a schema bump.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntryWire {
+    pub id: String,
+    pub kind: CatalogEntryKindWire,
+    pub service_surfaces: Vec<String>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub diagnostic: Option<CatalogDiagnosticWire>,
+    /// `tentaflow-service` | `tentaflow-flow` | `tentaflow-alias`.
+    pub owned_by: String,
+}
+
+/// Catalog list request. The wire form lets callers narrow by surface and
+/// admin tooling opt into seeing entries hidden from `/v1/models`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct CatalogListRequest {
+    /// When set, return only entries whose `service_surfaces` contain the
+    /// given surface string (e.g. "chat", "stt"). `None` = no filter.
+    pub surface_filter: Option<String>,
+    /// When `true`, include entries blocked by RemoteShadowed / LocalOverride
+    /// diagnostics. Used by GUI admin views; the OpenAI `/v1/models` path
+    /// always passes `false`.
+    pub include_blocking_diagnostics: bool,
+}
+
+/// Catalog list response. `version` is monotonic and lets clients cheaply
+/// detect "anything changed since my last poll" without diffing entries.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct CatalogListResponse {
+    pub entries: Vec<CatalogEntryWire>,
+    pub version: u64,
 }
 
 /// Single model alias entry mapped from `DbModelAlias`.
@@ -3472,8 +3542,8 @@ pub enum MessageBody {
     DashboardMetricsResponse(DashboardSnapshot),
 
     // ---- Models / aliases / catalog -----
-    ModelsUnifiedListRequest,
-    ModelsUnifiedListResponseBody(ModelsUnifiedListResponse),
+    CatalogListRequestBody(CatalogListRequest),
+    CatalogListResponseBody(CatalogListResponse),
     ModelAliasListRequest,
     ModelAliasListResponseBody(ModelAliasListResponse),
     ModelAliasCreateRequestBody(ModelAliasCreateRequest),

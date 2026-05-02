@@ -214,6 +214,11 @@ pub struct Supervisor {
     /// by `(node_id, service_id)` so the supervisor can abort the right task
     /// when a row is removed from the snapshot. Sole producer.
     reconnect_tasks: Arc<Mutex<HashMap<(String, i64), JoinHandle<()>>>>,
+    /// Optional catalog provider; when set, every successful
+    /// `reconcile_handles` tick triggers a rebuild so deploy / undeploy /
+    /// peer announce/disconnect propagate to `/v1/models` without an
+    /// explicit alias mutation.
+    catalog_provider: Option<Arc<crate::services::catalog::CatalogProvider>>,
 }
 
 impl Supervisor {
@@ -246,6 +251,7 @@ impl Supervisor {
             mesh_registry,
             live_handles,
             reconnect_tasks: Arc::new(Mutex::new(HashMap::new())),
+            catalog_provider: None,
         };
         (supervisor, rx)
     }
@@ -254,6 +260,20 @@ impl Supervisor {
     /// the supervisor treats every embedded service as healthy.
     pub fn with_embedded_probe(mut self, probe: Arc<dyn EmbeddedHealthProbe>) -> Self {
         self.embedded_probe = Some(probe);
+        self
+    }
+
+    /// Inject the public catalog provider so the supervisor can rebuild it
+    /// after every reconcile tick. Without this hook the catalog only
+    /// refreshes on alias mutation / start-up, which means deploys and
+    /// remote announcements take an alias change to become visible on
+    /// `/v1/models`. Optional — the supervisor degrades gracefully if no
+    /// provider is attached (older tests / harnesses without the catalog).
+    pub fn with_catalog_provider(
+        mut self,
+        provider: Arc<crate::services::catalog::CatalogProvider>,
+    ) -> Self {
+        self.catalog_provider = Some(provider);
         self
     }
 
@@ -670,6 +690,17 @@ impl Supervisor {
                 let task = spawn_quic_reconnect_loop(qh);
                 let mut tasks = self.reconnect_tasks.lock().await;
                 tasks.insert((node_id, service_id), task);
+            }
+        }
+
+        // (5) Republish the unified catalog so `/v1/models`, mesh
+        // `catalog.list`, and the GUI see deploys / peer changes without
+        // waiting for an unrelated alias mutation. Cheap (one rebuild walks
+        // the registry + DB once); skipped when no provider is attached
+        // (test harnesses, supervisor-only fixtures).
+        if let Some(provider) = self.catalog_provider.as_ref() {
+            if let Err(e) = provider.rebuild(&self.mesh_registry, &self.db) {
+                tracing::warn!("supervisor: catalog rebuild failed: {}", e);
             }
         }
     }

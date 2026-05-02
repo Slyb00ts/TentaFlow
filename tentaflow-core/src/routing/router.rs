@@ -80,6 +80,12 @@ pub struct Router {
             >,
         >,
     >,
+
+    /// Unified catalog of advertised models — one source of truth for
+    /// `/v1/models`, mesh `catalog.list`, and the GUI. Rebuilt by
+    /// `rebuild_catalog()` whenever services, aliases, or flow publish
+    /// state changes; readers take a lock-free snapshot.
+    pub(crate) catalog_provider: Arc<crate::services::catalog::CatalogProvider>,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -325,6 +331,7 @@ impl Router {
             alias_cache,
             route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             services_snapshot_rx: Arc::new(parking_lot::RwLock::new(None)),
+            catalog_provider: Arc::new(crate::services::catalog::CatalogProvider::new()),
         };
 
         router.reload_alias_cache();
@@ -358,6 +365,12 @@ impl Router {
         // is wired the same way through `Router::set_mesh_manager` and the
         // dispatcher's `MeshForward` path.
         self.service_manager.set_reverse_router(self.clone());
+
+        // Eager catalog build — `set_mesh_services_registry` runs before
+        // `start()` so the registry is already wired here. Without this the
+        // first `/v1/models` call returns empty until the first deploy /
+        // alias mutation triggers a rebuild.
+        self.rebuild_catalog();
     }
 
     /// Wysyla sygnal shutdown do wszystkich komponentow routera.
@@ -492,10 +505,49 @@ impl Router {
         !snap.services.is_empty()
     }
 
-    /// Distinct model names exposed by the V2 services snapshot.
+    /// Public catalog snapshot. The router publishes one immutable snapshot
+    /// per rebuild; readers (`/v1/models`, mesh `catalog.list`, GUI) take it
+    /// lock-free and walk the slice. Aliases, published flows, and service
+    /// models all live here.
+    pub fn catalog_snapshot(&self) -> Arc<crate::services::catalog::CatalogSnapshot> {
+        self.catalog_provider.snapshot()
+    }
+
+    /// Shared handle to the catalog provider. The supervisor takes this
+    /// during boot so its `reconcile_handles` tick can call `rebuild()`
+    /// directly — keeps the catalog consistent with deploy / peer state
+    /// without forcing every mutation point to remember to refresh.
+    pub fn catalog_provider(&self) -> &Arc<crate::services::catalog::CatalogProvider> {
+        &self.catalog_provider
+    }
+
+    /// Rebuild the catalog from the current mesh registry plus the local DB
+    /// (aliases, published flows). Called after deploy / undeploy / alias
+    /// mutation / flow publish; idempotent and safe to call concurrently.
+    /// Returns the new snapshot version, or `None` when DB is not attached
+    /// (test harnesses).
+    pub fn rebuild_catalog(&self) -> Option<u64> {
+        let pool = self.db.as_ref()?;
+        let registry_arc = self.service_manager.mesh_services_registry.read();
+        let registry = registry_arc.as_ref()?.clone();
+        drop(registry_arc);
+        match self.catalog_provider.rebuild(&registry, pool) {
+            Ok(version) => Some(version),
+            Err(e) => {
+                tracing::warn!("Catalog rebuild failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Distinct model ids advertised on `/v1/models`. Filters out blocking
+    /// catalog diagnostics (RemoteShadowed / LocalOverride) so a hidden
+    /// remote does not show up as a queryable model. Non-blocking
+    /// diagnostics (IncompatibleAliasTargets) keep their entry — the alias
+    /// may still resolve fine for requests that match its primary.
     pub fn list_available_models(&self) -> Vec<String> {
-        let snap = self.service_manager.current_snapshot();
-        let mut models: Vec<String> = snap.models_by_name.keys().cloned().collect();
+        let snap = self.catalog_snapshot();
+        let mut models: Vec<String> = snap.advertised_entries().map(|e| e.id.clone()).collect();
         models.sort();
         models.dedup();
         models

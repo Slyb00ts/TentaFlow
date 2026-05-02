@@ -2,7 +2,7 @@
 // File: modules/services.js — Services screen with 3 tabs (tf-tabs underline)
 //   1) List     — deployed services table (binary serviceListRequest), 5s refresh
 //   2) Aliases  — model alias CRUD (binary modelAlias*Request), tf-window editor
-//   3) Models   — mesh-wide model aggregate (binary modelsUnifiedListRequest)
+//   3) Models   — mesh-wide model aggregate (binary catalogListRequest)
 //   "New service" opens Catalog (target picker → wizard). Aliases edit + delete
 //   confirmations use <tf-window>. Auto-refresh uses morphdom via /js/lib/patch.js
 //   so the table does not flicker. Multi-node aggregation lands in Krok N5;
@@ -85,7 +85,7 @@ async function loadAll() {
       ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
-      ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []),
       ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
       ManifestStore.init().catch(() => false),
     ]);
@@ -499,27 +499,31 @@ function renderAliasRow(a) {
 
 // ---- Models tab -----------------------------------------------------------
 
-// Dokleja modele z modelsUnifiedListRequest do odpowiednich nodow w meshNodes —
-// konieczne, bo /api/mesh/nodes nie zawsze ma modele lokalnego noda (peer_store
-// aktualizuje sie dopiero po heartbeat). Dedup po aliasie.
+// Catalog entries with kind=ServiceModel carry per-node `instances`. Walk
+// them and graft the model list onto the matching meshNodes row — peer
+// snapshots take a few heartbeats to fill node.models, this fills the gap.
 function mergeUnifiedModelsIntoNodes() {
   if (!Array.isArray(unifiedModels) || unifiedModels.length === 0) return;
   const byNode = new Map();
-  for (const m of unifiedModels) {
-    const alias = m.model_name || m.alias;
-    const kind = m.service_type || m.kind;
+  for (const entry of unifiedModels) {
+    const kindWrapper = entry && entry.kind;
+    if (!kindWrapper || kindWrapper.kind !== 'service_model') continue;
+    const alias = entry.id;
     if (!alias) continue;
-    const instances = Array.isArray(m.instances) ? m.instances : [];
+    const surfaces = Array.isArray(entry.serviceSurfaces) ? entry.serviceSurfaces : [];
+    const kindLabel = surfaces[0] || 'service';
+    const instances = Array.isArray(kindWrapper.instances) ? kindWrapper.instances : [];
     for (const inst of instances) {
-      const nid = inst.node_id;
+      const nid = inst.nodeId || inst.node_id;
       if (!nid) continue;
       if (!byNode.has(nid)) byNode.set(nid, []);
+      const status = inst.status || '';
       byNode.get(nid).push({
         alias,
-        kind,
-        backend: inst.backend || m.backend || '',
-        size_mb: inst.size_mb || m.size_mb || 0,
-        loaded: inst.status === 'running' || inst.status === 'ready',
+        kind: kindLabel,
+        backend: inst.backend || '',
+        size_mb: inst.sizeMb || inst.size_mb || 0,
+        loaded: status === 'running' || status === 'ready',
       });
     }
   }
