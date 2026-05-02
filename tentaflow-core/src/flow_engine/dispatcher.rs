@@ -5,7 +5,7 @@
 // =============================================================================
 
 use crate::config::RouterConfig;
-use crate::db::DbPool;
+use crate::db::{repository, DbPool};
 use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
 use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
 use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
@@ -186,6 +186,68 @@ impl FlowDispatcher {
                     "Timeout flow {} po {}s. Fallback na stary pipeline.",
                     flow_id, FLOW_TIMEOUT_SECS
                 );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Wykonaj konkretny flow po jego id, z pominieciem name → flow
+    /// resolwowania. Uzywane przez `ModelRuntimeExecutor` ktory dostaje
+    /// resolved `flow_id` z `CatalogSnapshot` i nie chce go po raz drugi
+    /// szukac po nazwie modelu (catalog moze sie zmienic miedzy resolve
+    /// a dispatch albo opublikowana nazwa moze pasowac do innego
+    /// domyslnego flow). ACL liczy `resource_type='flow'`.
+    pub async fn dispatch_by_flow_id(
+        &self,
+        flow_id: i64,
+        mut ctx: FlowContext,
+    ) -> Result<Option<FlowExecutionResult>> {
+        let pool = self.db.clone();
+        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, flow_id))
+            .await??;
+        let Some(flow) = flow_opt else {
+            return Ok(None);
+        };
+        if flow.status != "active" {
+            warn!(flow_id, status = %flow.status, "flow nieaktywny — pomijam");
+            return Ok(None);
+        }
+        if let Some(uid) = ctx.user_id {
+            let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
+            if !crate::routing::acl::check_access_safe(
+                &self.db,
+                "flow",
+                &flow_id.to_string(),
+                uid,
+                &role,
+            ) {
+                tracing::warn!(user_id = uid, flow_id, "ACL denied flow execution");
+                return Ok(None);
+            }
+        }
+
+        let parsed = match ParsedFlow::parse(&flow.flow_json) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                warn!(flow_id, "Niepoprawny flow_json: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
+        match timeout(
+            Duration::from_secs(FLOW_TIMEOUT_SECS),
+            executor.execute(&flow, &parsed, &mut ctx),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(e)) => {
+                warn!(flow_id, "Blad wykonania flow: {}", e);
+                Ok(None)
+            }
+            Err(_) => {
+                warn!(flow_id, "Timeout flow po {}s", FLOW_TIMEOUT_SECS);
                 Ok(None)
             }
         }

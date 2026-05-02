@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod mesh_registry;
 pub mod ports;
 pub mod registry;
+pub mod runtime;
 pub mod snapshot_builder;
 pub mod supervisor;
 pub mod transport;
