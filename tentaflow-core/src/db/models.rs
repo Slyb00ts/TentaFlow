@@ -68,22 +68,6 @@ pub struct DbPrompt {
     pub updated_at: String,
 }
 
-/// Wpis rejestru modeli AI
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbModelEntry {
-    pub id: i64,
-    pub model_name: String,
-    pub display_name: Option<String>,
-    pub service_type: String,
-    pub connection_type: String,
-    pub service_id: Option<i64>,
-    pub flow_id: Option<i64>,
-    pub is_public: bool,
-    pub is_active: bool,
-    pub config_json: String,
-    pub created_at: String,
-}
-
 /// Alias modelu (mapowanie nazwy na docelowy model)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbModelAlias {
@@ -273,33 +257,6 @@ pub struct UpdatePrompt<'a> {
     pub cache_priority: i64,
     pub is_active: bool,
     pub language: &'a str,
-}
-
-/// Parametry tworzenia wpisu rejestru modeli
-#[derive(Debug, Clone)]
-pub struct NewModelEntry<'a> {
-    pub model_name: &'a str,
-    pub display_name: Option<&'a str>,
-    pub service_type: &'a str,
-    pub connection_type: &'a str,
-    pub service_id: Option<i64>,
-    pub flow_id: Option<i64>,
-    pub is_public: bool,
-    pub config_json: &'a str,
-}
-
-/// Parametry aktualizacji wpisu rejestru modeli
-#[derive(Debug, Clone)]
-pub struct UpdateModelEntry<'a> {
-    pub id: i64,
-    pub display_name: Option<&'a str>,
-    pub service_type: &'a str,
-    pub connection_type: &'a str,
-    pub service_id: Option<i64>,
-    pub flow_id: Option<i64>,
-    pub is_public: bool,
-    pub is_active: bool,
-    pub config_json: &'a str,
 }
 
 /// Parametry tworzenia/aktualizacji flow

@@ -9,17 +9,17 @@ use crate::widgets;
 
 pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
     egui::CentralPanel::default().show(ctx, |ui| {
-        let modal_open = ui.memory_mut(|m| *m.data.get_temp_mut_or_default::<bool>(egui::Id::new("model_modal")));
-
-        let add_clicked = widgets::page_header_with_button(ui, "Modele", "+ Dodaj model");
-        if add_clicked {
-            ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("model_modal"), true));
-        }
+        ui.heading("Modele");
+        ui.separator();
+        ui.add_space(4.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let s = state.read().unwrap_or_else(|e| e.into_inner());
 
             // ── Models table ──
+            // Read-only listing pending PublicModelCatalog wire-up; backend feed
+            // is currently empty. Edit/create UI returns once the catalog API
+            // exposes mutation endpoints.
             widgets::section_header(ui, "Rejestr modeli");
 
             if s.models.is_empty() {
@@ -34,7 +34,6 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                     .column(egui_extras::Column::auto().at_least(60.0))
                     .column(egui_extras::Column::auto().at_least(60.0))
                     .column(egui_extras::Column::auto().at_least(60.0))
-                    .column(egui_extras::Column::auto().at_least(80.0))
                     .header(22.0, |mut header| {
                         header.col(|ui| { ui.strong("Nazwa"); });
                         header.col(|ui| { ui.strong("Display Name"); });
@@ -43,7 +42,6 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                         header.col(|ui| { ui.strong("Serwisy"); });
                         header.col(|ui| { ui.strong("Publiczny"); });
                         header.col(|ui| { ui.strong("Aktywny"); });
-                        header.col(|ui| { ui.strong("Akcje"); });
                     })
                     .body(|mut body| {
                         for model in &s.models {
@@ -72,17 +70,6 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                                         ("Nieaktywny", Color32::from_rgb(239, 68, 68))
                                     };
                                     widgets::badge(ui, text, color);
-                                });
-                                row.col(|ui| {
-                                    let model_id = model.id;
-                                    ui.horizontal(|ui| {
-                                        ui.small_button("\u{270F}").on_hover_text("Edytuj");
-                                        if ui.small_button("\u{2716}").on_hover_text("Usun").clicked() {
-                                            state.read().unwrap_or_else(|e| e.into_inner()).send_command(
-                                                UiCommand::DeleteModelEntry(model_id),
-                                            );
-                                        }
-                                    });
                                 });
                             });
                         }
@@ -235,46 +222,6 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 }
             }
         });
-
-        // ── Add modal ──
-        if modal_open {
-            let mut open = true;
-            egui::Window::new("Dodaj model")
-                .collapsible(false)
-                .resizable(false)
-                .default_width(400.0)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    let mut name: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("mdl_name")).clone());
-                    ui.label("Nazwa modelu lub URL HuggingFace:");
-                    ui.text_edit_singleline(&mut name);
-                    ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("mdl_name"), name));
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Dodaj").clicked() {
-                            let name_val: String = ui.memory(|m| m.data.get_temp(egui::Id::new("mdl_name")).unwrap_or_default());
-                            state.read().unwrap_or_else(|e| e.into_inner()).send_command(
-                                UiCommand::CreateModelEntry {
-                                    model_name: name_val,
-                                    display_name: String::new(),
-                                    service_type: String::from("Llm"),
-                                    connection_type: String::from("direct"),
-                                    is_public: false,
-                                    config_json: String::from("{}"),
-                                },
-                            );
-                            ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("model_modal"), false));
-                        }
-                        if ui.button("Anuluj").clicked() {
-                            ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("model_modal"), false));
-                        }
-                    });
-                });
-            if !open {
-                ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("model_modal"), false));
-            }
-        }
     });
 }
 

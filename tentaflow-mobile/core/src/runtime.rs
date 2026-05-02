@@ -136,7 +136,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     let services_snapshot_rx_for_router: Option<
         tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
     > = if let Some(port_allocator) = services_port_allocator.clone() {
-        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
+        use tentaflow_core::services::supervisor::{DefaultEmbeddedProbe, Supervisor};
         let services_runtime_cfg = config.services_runtime.clone();
         let live_handles = router.service_manager().live_handles.clone();
         let (supervisor, snapshot_rx) = Supervisor::new(
@@ -147,7 +147,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
             mesh_services_registry.clone(),
             live_handles,
         );
-        let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
+        let supervisor = supervisor.with_embedded_probe(Arc::new(DefaultEmbeddedProbe));
 
         if let Err(e) = supervisor.run_first_tick().await {
             tracing::warn!("services supervisor: first_tick failed: {}", e);
