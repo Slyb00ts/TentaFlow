@@ -45,7 +45,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Mesh & Network settings: `NetworkInterfacesList*`, `NetworkConfigGet*`,
 ///     `NetworkConfigUpdate*` — enumeracja IPv4 NIC hosta + perzistowane w DB
 ///     reguly bind/advertise dla iroh mesh (IPv4-only, zero v6).
-pub const SCHEMA_VERSION: u16 = 10;
+/// v11 changes (R1.0f, breaking — synchronous peer rollout required):
+///   - Replaced `ModelsUnifiedListRequest` / `ModelsUnifiedListResponse` (and
+///     their wire types `UnifiedModel`, `UnifiedModelInstance`) with
+///     `CatalogListRequest` / `CatalogListResponse` carrying the unified
+///     catalog (service models + published flows + aliases) plus diagnostic
+///     state per entry. Old peers cannot decode the new variants and vice
+///     versa — rollout has to happen on every peer at once.
+pub const SCHEMA_VERSION: u16 = 11;
 
 // =============================================================================
 // Message kind discriminants

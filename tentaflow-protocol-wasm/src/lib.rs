@@ -635,11 +635,18 @@ pub fn encode_mesh_node_network_config_request(
     .map_err(|e| JsError::new(&e))
 }
 
-// ---- Models unified + aliasy (FAZA 2) ----
+// ---- Catalog + aliasy ----
 
-#[wasm_bindgen(js_name = encodeModelsUnifiedListRequest)]
-pub fn encode_models_unified_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ModelsUnifiedListRequest).map_err(|e| JsError::new(&e))
+#[wasm_bindgen(js_name = encodeCatalogListRequest)]
+pub fn encode_catalog_list_request(
+    surface_filter: Option<String>,
+    include_blocking_diagnostics: bool,
+) -> Result<Vec<u8>, JsError> {
+    let body = MessageBody::CatalogListRequestBody(tentaflow_protocol::CatalogListRequest {
+        surface_filter,
+        include_blocking_diagnostics,
+    });
+    encode_body_inner(&body).map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeModelAliasListRequest)]
@@ -1340,17 +1347,23 @@ pub fn encode_flow_detail_request(flow_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::FlowDetailRequest { flow_id }).map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::FlowCreateRequest { name, description, graph_json }.
+/// MessageBody::FlowCreateRequest { name, description, graph_json,
+/// published_model_name? }. `published_model_name = None` keeps the flow
+/// private; passing a value publishes it on `/v1/models` after the
+/// catalog rebuild — collisions with aliases / existing flows are
+/// rejected by the handler before the row is written.
 #[wasm_bindgen(js_name = encodeFlowCreateRequest)]
 pub fn encode_flow_create_request(
     name: String,
     description: Option<String>,
     graph_json: String,
+    published_model_name: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::FlowCreateRequestBody(FlowCreateRequest {
         name,
         description,
         graph_json,
+        published_model_name,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -1368,7 +1381,10 @@ pub fn encode_flow_executions_list_request(flow_id: String) -> Result<Vec<u8>, J
         .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::FlowUpdateRequest — partial update flow.
+/// MessageBody::FlowUpdateRequest — partial update flow. Pass
+/// `publish_set=true, published_model_name=Some("foo")` to publish or
+/// `publish_set=true, published_model_name=None` to un-publish; leave
+/// `publish_set=false` to keep whatever the server has.
 #[wasm_bindgen(js_name = encodeFlowUpdateRequest)]
 pub fn encode_flow_update_request(
     flow_id: String,
@@ -1376,13 +1392,21 @@ pub fn encode_flow_update_request(
     description: Option<String>,
     flow_json: Option<String>,
     status: Option<String>,
+    publish_set: bool,
+    published_model_name: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
+    let published_model_name = if publish_set {
+        Some(published_model_name)
+    } else {
+        None
+    };
     encode_body_inner(&MessageBody::FlowUpdateRequestBody(FlowUpdateRequest {
         flow_id,
         name,
         description,
         flow_json,
         status,
+        published_model_name,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -1899,6 +1923,14 @@ pub fn encode_settings_update_batch(
 
 fn set(obj: &js_sys::Object, key: &str, value: JsValue) {
     let _ = js_sys::Reflect::set(obj, &key.into(), &value);
+}
+
+fn string_vec_to_js(values: Vec<String>) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for v in values {
+        arr.push(&JsValue::from(v));
+    }
+    arr
 }
 
 /// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
@@ -2455,6 +2487,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "description", d.into());
             }
             set(&obj, "graphJson", req.graph_json.into());
+            if let Some(p) = req.published_model_name {
+                set(&obj, "publishedModelName", p.into());
+            }
         }
         MessageBody::FlowCreateResponse { flow_id } => {
             set(&obj, "variant", "FlowCreateResponse".into());
@@ -2502,6 +2537,15 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             if let Some(s) = r.status {
                 set(&obj, "status", s.into());
+            }
+            // `Some(Some(name))` republishes, `Some(None)` un-publishes,
+            // `None` leaves the field untouched. Surface the distinction so
+            // JS callers can tell "no change" from "explicit clear".
+            if let Some(p) = r.published_model_name {
+                set(&obj, "publishSet", true.into());
+                if let Some(name) = p {
+                    set(&obj, "publishedModelName", name.into());
+                }
             }
         }
         MessageBody::FlowUpdateResponseBody(r) => {
@@ -3623,45 +3667,123 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "MeshNodeNetworkConfigResponse".into());
             set(&obj, "ok", r.ok.into());
         }
-        MessageBody::ModelsUnifiedListRequest => {
-            set(&obj, "variant", "ModelsUnifiedListRequest".into());
+        MessageBody::CatalogListRequestBody(r) => {
+            set(&obj, "variant", "CatalogListRequest".into());
+            if let Some(ref s) = r.surface_filter {
+                set(&obj, "surfaceFilter", s.clone().into());
+            }
+            set(
+                &obj,
+                "includeBlockingDiagnostics",
+                r.include_blocking_diagnostics.into(),
+            );
         }
-        MessageBody::ModelsUnifiedListResponseBody(resp) => {
-            set(&obj, "variant", "ModelsUnifiedListResponse".into());
+        MessageBody::CatalogListResponseBody(resp) => {
+            set(&obj, "variant", "CatalogListResponse".into());
+            set(&obj, "version", (resp.version as f64).into());
             let arr = js_sys::Array::new();
-            for m in resp.models {
+            for entry in resp.entries {
                 let item = js_sys::Object::new();
-                set(&item, "modelName", m.model_name.clone().into());
-                set(&item, "model_name", m.model_name.into());
-                set(&item, "serviceType", m.service_type.clone().into());
-                set(&item, "service_type", m.service_type.into());
-                let instances = js_sys::Array::new();
-                for i in m.instances {
-                    let inst = js_sys::Object::new();
-                    set(&inst, "nodeId", i.node_id.clone().into());
-                    set(&inst, "node_id", i.node_id.into());
-                    if let Some(ref h) = i.node_hostname {
-                        set(&inst, "nodeHostname", h.clone().into());
-                        set(&inst, "node_hostname", h.clone().into());
-                        set(&inst, "node_name", h.clone().into());
+                set(&item, "id", entry.id.clone().into());
+                set(&item, "ownedBy", entry.owned_by.into());
+                set(
+                    &item,
+                    "serviceSurfaces",
+                    string_vec_to_js(entry.service_surfaces).into(),
+                );
+                set(
+                    &item,
+                    "inputModalities",
+                    string_vec_to_js(entry.input_modalities).into(),
+                );
+                set(
+                    &item,
+                    "outputModalities",
+                    string_vec_to_js(entry.output_modalities).into(),
+                );
+
+                let kind = js_sys::Object::new();
+                match entry.kind {
+                    tentaflow_protocol::CatalogEntryKindWire::ServiceModel { instances } => {
+                        set(&kind, "kind", "service_model".into());
+                        let inst_arr = js_sys::Array::new();
+                        for i in instances {
+                            let inst = js_sys::Object::new();
+                            set(&inst, "nodeId", i.node_id.clone().into());
+                            if let Some(ref h) = i.node_hostname {
+                                set(&inst, "nodeHostname", h.clone().into());
+                            }
+                            set(&inst, "serviceId", (i.service_id as f64).into());
+                            set(&inst, "status", i.status.into());
+                            if let Some(b) = i.backend {
+                                set(&inst, "backend", b.into());
+                            }
+                            if let Some(s) = i.size_mb {
+                                set(&inst, "sizeMb", (s as f64).into());
+                            }
+                            set(&inst, "loaded", i.loaded.into());
+                            inst_arr.push(&inst.into());
+                        }
+                        set(&kind, "instances", inst_arr.into());
                     }
-                    set(&inst, "serviceId", i.service_id.clone().into());
-                    set(&inst, "service_id", i.service_id.into());
-                    set(&inst, "status", i.status.clone().into());
-                    if let Some(ref b) = i.backend {
-                        set(&inst, "backend", b.clone().into());
+                    tentaflow_protocol::CatalogEntryKindWire::Flow {
+                        flow_id,
+                        published_name,
+                    } => {
+                        set(&kind, "kind", "flow".into());
+                        set(&kind, "flowId", (flow_id as f64).into());
+                        set(&kind, "publishedName", published_name.into());
                     }
-                    if let Some(s) = i.size_mb {
-                        set(&inst, "sizeMb", (s as f64).into());
-                        set(&inst, "size_mb", (s as f64).into());
+                    tentaflow_protocol::CatalogEntryKindWire::Alias {
+                        target,
+                        fallback_targets,
+                        strategy,
+                    } => {
+                        set(&kind, "kind", "alias".into());
+                        set(&kind, "target", target.into());
+                        set(
+                            &kind,
+                            "fallbackTargets",
+                            string_vec_to_js(fallback_targets).into(),
+                        );
+                        set(&kind, "strategy", strategy.into());
                     }
-                    set(&inst, "loaded", i.loaded.into());
-                    instances.push(&inst.into());
                 }
-                set(&item, "instances", instances.into());
+                set(&item, "kind", kind.into());
+
+                if let Some(diag) = entry.diagnostic {
+                    let d = js_sys::Object::new();
+                    match diag {
+                        tentaflow_protocol::CatalogDiagnosticWire::RemoteShadowed {
+                            local_owner,
+                        } => {
+                            set(&d, "kind", "remote_shadowed".into());
+                            set(&d, "localOwner", local_owner.into());
+                        }
+                        tentaflow_protocol::CatalogDiagnosticWire::LocalOverride {
+                            conflicting_remote_node,
+                        } => {
+                            set(&d, "kind", "local_override".into());
+                            set(&d, "conflictingRemoteNode", conflicting_remote_node.into());
+                        }
+                        tentaflow_protocol::CatalogDiagnosticWire::IncompatibleAliasTargets {
+                            alias,
+                            missing_modalities,
+                        } => {
+                            set(&d, "kind", "incompatible_alias_targets".into());
+                            set(&d, "alias", alias.into());
+                            set(
+                                &d,
+                                "missingModalities",
+                                string_vec_to_js(missing_modalities).into(),
+                            );
+                        }
+                    }
+                    set(&item, "diagnostic", d.into());
+                }
                 arr.push(&item.into());
             }
-            set(&obj, "models", arr.into());
+            set(&obj, "entries", arr.into());
         }
         MessageBody::ModelAliasListRequest => {
             set(&obj, "variant", "ModelAliasListRequest".into());

@@ -792,6 +792,7 @@ mod tests {
             service_type: Some("chat".to_string()),
             flow_json: flow_json.to_string(),
             status: "active".to_string(),
+            published_model_name: None,
             created_at: "2025-01-01".to_string(),
             updated_at: "2025-01-01".to_string(),
         }

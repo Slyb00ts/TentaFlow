@@ -1,6 +1,9 @@
 // =============================================================================
 // File: services/models/mod.rs
-// Opis: Alias domain logic + unified-models view dla binary RPC handlerów.
+// Alias domain logic invoked from binary RPC handlers in `dispatch::handlers`.
+// The unified mesh-model view used to live here too — that role is now served
+// by `services::catalog::CatalogProvider`, which `/v1/models`, `catalog.list`,
+// and the GUI all share.
 // =============================================================================
 
 use std::sync::Arc;
@@ -8,40 +11,16 @@ use std::sync::Arc;
 use crate::db::models::DbModelAlias;
 use crate::db::{self, DbPool};
 use crate::mesh::iroh_manager::IrohMeshManager;
-use crate::services::mesh_registry::MeshServicesRegistry;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
-/// Aggregated unified-model view: single `model_name` × `service_type` row with
-/// every node instance hosting it. Built from `MeshServicesRegistry` snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifiedModelInfo {
-    pub model_name: String,
-    pub service_type: String,
-    pub instances: Vec<ModelInstance>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelInstance {
-    pub node_id: String,
-    pub node_name: String,
-    pub service_id: String,
-    pub status: String,
-    pub backend: Option<String>,
-    pub size_mb: Option<u64>,
-}
-
-// =============================================================================
-// Alias domain logic (called from binary handlers in `dispatch::handlers`).
-// =============================================================================
 
 /// All aliases stored in the local DB.
 pub fn list_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
     db::repository::list_model_aliases(pool)
 }
 
-/// Creates an alias. Validates that both `alias` and `target_model` are
-/// non-empty after trimming.
+/// Creates an alias. Rejects when `alias` or `target_model` is empty after
+/// trimming, or when the alias name would collide with a published flow or
+/// another existing alias.
 pub fn create_alias(
     pool: &DbPool,
     alias: &str,
@@ -52,11 +31,14 @@ pub fn create_alias(
     if alias.trim().is_empty() || target_model.trim().is_empty() {
         anyhow::bail!("alias and target_model must be non-empty");
     }
+    crate::services::catalog::guards::check_alias_collision(pool, alias, None)?;
     db::repository::create_model_alias(pool, alias, target_model, fallback_targets, strategy)
 }
 
 /// Updates an existing alias by id. Returns `Ok(false)` when the row does not
-/// exist so the caller can map it to a 404-style response.
+/// exist so the caller can map it to a 404-style response. Re-validates the
+/// chosen name against the catalog (published flows, other aliases) so that
+/// renaming an alias cannot smuggle in a collision.
 pub fn update_alias(
     pool: &DbPool,
     id: i64,
@@ -72,6 +54,7 @@ pub fn update_alias(
     if alias.trim().is_empty() || target_model.trim().is_empty() {
         anyhow::bail!("alias and target_model must be non-empty");
     }
+    crate::services::catalog::guards::check_alias_collision(pool, alias, Some(id))?;
     db::repository::update_model_alias(
         pool,
         id,
@@ -93,46 +76,16 @@ pub fn delete_alias(pool: &DbPool, id: i64) -> Result<bool> {
     Ok(true)
 }
 
-/// Distinct models advertised across the mesh, grouped by `(model_name,
-/// category)` with one `ModelInstance` per advertising node. Sourced from the
-/// V2 `MeshServicesRegistry` aggregator (local + remote snapshots).
-pub fn collect_unified(registry: &MeshServicesRegistry) -> Vec<UnifiedModelInfo> {
-    use std::collections::HashMap;
-
-    let mut by_key: HashMap<(String, String), Vec<ModelInstance>> = HashMap::new();
-    for svc in registry.visible_services() {
-        let loaded_status = svc.status.clone();
-        for model in &svc.models {
-            let key = (model.model_name.clone(), svc.category.clone());
-            by_key.entry(key).or_default().push(ModelInstance {
-                node_id: svc.node_id.clone(),
-                node_name: svc.display_name.clone(),
-                service_id: svc.id.to_string(),
-                status: loaded_status.clone(),
-                backend: Some(svc.engine_id.clone()),
-                size_mb: None,
-            });
-        }
-    }
-
-    by_key
-        .into_iter()
-        .map(|((model_name, service_type), instances)| UnifiedModelInfo {
-            model_name,
-            service_type,
-            instances,
-        })
-        .collect()
-}
-
-/// Reload local router alias cache and broadcast the latest alias snapshot to
-/// the mesh after a successful create/update/delete.
+/// Reload local router alias cache, rebuild the public catalog snapshot, and
+/// broadcast the latest alias snapshot to the mesh after a successful
+/// create/update/delete.
 pub fn broadcast_alias_mutation(
     pool: &DbPool,
     router: &Arc<crate::routing::router::Router>,
     quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) {
     router.reload_alias_cache();
+    router.rebuild_catalog();
     if let Some(qm) = quic_mesh {
         if let Ok(aliases) = db::repository::list_model_aliases(pool) {
             if let Ok(json) = serde_json::to_vec(&aliases) {

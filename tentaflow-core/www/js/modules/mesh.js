@@ -124,14 +124,14 @@ async function loadData() {
     const [nodesResp, pendingResp, unifiedResp] = await Promise.all([
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
       ApiBinary.list('meshPendingListRequest', { arrayKey: 'pending' }).catch(() => []),
-      ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []),
     ]);
     nodes = Array.isArray(nodesResp) ? nodesResp : [];
     pending = Array.isArray(pendingResp) ? pendingResp : [];
     unifiedModels = Array.isArray(unifiedResp) ? unifiedResp : [];
     // Merge: backend populuje node.models tylko co ~30s (ModelsSync broadcast).
-    // Lokalny service_registry jest swiezy od razu — sciagamy przez modelsUnifiedListRequest
-    // i dla kazdego noda dokladamy brakujace modele (dedup po aliasie).
+    // Local service registry is fresh immediately — pull catalogListRequest
+    // and graft missing models onto each node row (deduped by id).
     mergeUnifiedModelsIntoNodes();
     updateSubheader();
   } catch (err) {
@@ -233,18 +233,23 @@ function relayHostname(url) {
 
 function mergeUnifiedModelsIntoNodes() {
   if (!Array.isArray(unifiedModels) || unifiedModels.length === 0) return;
-  // Zbuduj mape node_id -> lista aliasow + service_type.
+  // Catalog entries: only ServiceModel carries node instances. Flow / Alias
+  // entries describe the local catalog and have nothing to graft onto a peer.
   const byNode = new Map();
-  for (const m of unifiedModels) {
-    const alias = m.model_name || m.alias;
-    const kind = m.service_type || m.kind;
+  for (const entry of unifiedModels) {
+    const kindWrapper = entry && entry.kind;
+    if (!kindWrapper || kindWrapper.kind !== 'service_model') continue;
+    const alias = entry.id;
     if (!alias) continue;
-    const instances = Array.isArray(m.instances) ? m.instances : [];
+    const surfaceList = Array.isArray(entry.serviceSurfaces) ? entry.serviceSurfaces : [];
+    const kindLabel = surfaceList[0] || 'service';
+    const instances = Array.isArray(kindWrapper.instances) ? kindWrapper.instances : [];
     for (const inst of instances) {
-      const nid = inst.node_id;
+      const nid = inst.nodeId || inst.node_id;
       if (!nid) continue;
       if (!byNode.has(nid)) byNode.set(nid, []);
-      byNode.get(nid).push({ alias, kind, loaded: inst.status === 'running' || inst.status === 'ready' });
+      const status = inst.status || '';
+      byNode.get(nid).push({ alias, kind: kindLabel, loaded: status === 'running' || status === 'ready' });
     }
   }
   for (const node of nodes) {

@@ -229,6 +229,32 @@ pub async fn deploy(
         ));
     }
 
+    // 1b. Reject before we start spawning processes if any of the model
+    // names this deploy will register collides with an active alias or a
+    // published flow. The catalog id space is shared (D.1); silently
+    // letting a deploy overwrite an existing publish would leave clients
+    // unable to tell which owner answers a chat request.
+    let planned_models = models_from_manifest(manifest, user_config);
+    for model in &planned_models {
+        if let Err(err) =
+            crate::services::catalog::guards::check_service_deploy_collision(db, &model.model_name)
+        {
+            if let Some(s) = &sink {
+                s.info(&format!("[prepare] aborting: {}", err));
+            }
+            with_tx(db, |tx| {
+                deployments_repo::mark_finished(
+                    tx,
+                    deployment_id,
+                    DeploymentStatus::Failed,
+                    Some(&err.to_string()),
+                )
+                .map_err(|e| DeployError::Database(format!("mark_finished: {}", e)))
+            })?;
+            return Err(DeployError::Manifest(err.to_string()));
+        }
+    }
+
     // 2. Pick strategy.
     let mut strategy: Box<dyn DeployStrategy> = match method {
         DeployMethod::NativeEmbedded => Box::new(embedded::EmbeddedDeploy::new(
@@ -864,6 +890,64 @@ mod tests {
             SmartProbeOutcome::ProcessExited(Some(137)) => {}
             other => panic!("expected ProcessExited(137), got {:?}", other),
         }
+    }
+
+    /// Catalog id space is shared across services / flows / aliases. A
+    /// deploy whose model name collides with an active alias must abort
+    /// before the strategy spawns anything — pre-fix the guard was only
+    /// callable from tests, so the deploy would have succeeded and the
+    /// catalog would publish two owners for the same id.
+    #[tokio::test]
+    async fn deploy_aborts_when_model_name_collides_with_alias() {
+        let db = open_db();
+        // Plant a colliding alias before the deploy. The dummy manifest's
+        // preset id is "preset-a", so that becomes the planned model name.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO model_aliases (alias, target_model, is_active) \
+                 VALUES (?1, ?2, 1)",
+                rusqlite::params!["preset-a", "some-target"],
+            )
+            .unwrap();
+        }
+
+        let ports = Arc::new(PortAllocator::new((46_700, 46_799), Default::default()).unwrap());
+        let manifest = dummy_manifest("emb-collide", NativeRuntime::Embedded);
+        let cfg = serde_json::json!({});
+        let result = deploy(
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            &ports,
+            &db,
+            None,
+            None,
+        )
+        .await;
+
+        match result {
+            Err(DeployError::Manifest(msg)) => {
+                assert!(
+                    msg.contains("preset-a") && msg.contains("alias"),
+                    "guard error should mention the colliding name and 'alias': {msg}"
+                );
+            }
+            other => panic!("expected DeployError::Manifest, got {:?}", other),
+        }
+
+        // Audit row was created and marked failed — paper trail must
+        // exist even when the deploy is rejected pre-strategy.
+        let conn = db.lock().unwrap();
+        let (status, error_text): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_text FROM deployments WHERE engine_id = 'emb-collide'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(error_text.unwrap().contains("preset-a"));
     }
 
     #[tokio::test]
