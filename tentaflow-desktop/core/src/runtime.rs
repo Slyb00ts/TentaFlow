@@ -380,29 +380,9 @@ fn sync_all_to_state(
         .collect();
     s.metrics.active_services = s.services.len() as u64;
 
-    // Models
-    if let Ok(models) = db::repository::list_model_entries(db, 0, 1000) {
-        s.models = models
-            .iter()
-            .map(|m| ui_state::ModelInfo {
-                id: m.id,
-                name: m.model_name.clone(),
-                display_name: m
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| m.model_name.clone()),
-                service_type: parse_service_type(&m.service_type),
-                strategy: m.connection_type.clone(),
-                service_count: if m.service_id.is_some() { 1 } else { 0 },
-                flow_id: m.flow_id.map(|id| id.to_string()),
-                is_public: m.is_public,
-                is_active: m.is_active,
-                loaded: false,
-                backend: m.connection_type.clone(),
-                tokens_per_second: 0.0,
-            })
-            .collect();
-    }
+    // Models — populated by PublicModelCatalog (work in progress); for now
+    // this view shows nothing until the catalog provider is wired up.
+    s.models = Vec::new();
 
     // Model Aliases
     if let Ok(aliases) = db::repository::list_model_aliases(db) {
@@ -793,37 +773,6 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         UiCommand::DeleteService(id) => {
             let conn = db.lock().map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
             services_v2_repo::delete(&conn, *id)?;
-        }
-
-        // --- Models ---
-        UiCommand::CreateModelEntry {
-            model_name,
-            display_name,
-            service_type,
-            connection_type,
-            is_public,
-            config_json,
-        } => {
-            db::repository::create_model_entry(
-                db,
-                &NewModelEntry {
-                    model_name,
-                    display_name: if display_name.is_empty() {
-                        None
-                    } else {
-                        Some(display_name)
-                    },
-                    service_type,
-                    connection_type,
-                    service_id: None,
-                    flow_id: None,
-                    is_public: *is_public,
-                    config_json,
-                },
-            )?;
-        }
-        UiCommand::DeleteModelEntry(id) => {
-            db::repository::delete_model_entry(db, *id)?;
         }
 
         // --- Model Aliases ---

@@ -38,9 +38,9 @@ use crate::flow_engine::types::FlowContext;
 use tentaflow_protocol::{RAGParams, RAGPayload, SearchMode};
 use tracing::warn;
 
-/// Buduje FlowContext z ChatCompletionRequest — propaguje user_id+role do
-/// FlowContext zeby dispatcher mogl gateowac flow ACL. Internal callers
-/// (addon/mesh/translate) podaja `user = None`.
+/// Builds a FlowContext from a ChatCompletionRequest. When a user is attached
+/// the dispatcher gates per-flow ACL on user_id/role; internal callers
+/// (addons, mesh, translate) pass `user = None`.
 pub(crate) fn build_flow_context_for_user(
     request: &ChatCompletionRequest,
     stream: bool,

@@ -1951,8 +1951,8 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
         66,
         "flows_service_type_llm_to_chat",
         "
-            -- B1 fix: routing/chat.rs uzywa service_type='chat' przy try_dispatch,
-            -- a seed wczesniej wpisywal 'llm'. Synchronizujemy istniejace wpisy.
+            -- Chat router dispatches with service_type='chat'; legacy seed value
+            -- 'llm' would never match a default flow lookup.
             UPDATE flows SET service_type = 'chat' WHERE service_type = 'llm';
         ",
     ),
@@ -1960,9 +1960,8 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
         67,
         "drop_flow_engine_enabled_setting",
         "
-            -- B3 fix: feature flag flow_engine_enabled usuniety. Dispatcher dziala
-            -- bezwarunkowo — flow uruchamia sie zawsze gdy istnieje pasujace
-            -- powiazanie modelu/service_type.
+            -- Feature flag retired: dispatcher always attempts to resolve a flow
+            -- whenever a model/service_type binding exists.
             DELETE FROM settings WHERE key = 'flow_engine_enabled';
         ",
     ),

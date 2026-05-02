@@ -462,10 +462,6 @@ pub enum UiCommand {
     CreateService { name: String, service_type: String, strategy: String, config_json: String },
     DeleteService(i64),
 
-    // --- Models ---
-    CreateModelEntry { model_name: String, display_name: String, service_type: String, connection_type: String, is_public: bool, config_json: String },
-    DeleteModelEntry(i64),
-
     // --- Model Aliases ---
     CreateModelAlias { alias: String, target_model: String },
     DeleteModelAlias(i64),
