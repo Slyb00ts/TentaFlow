@@ -281,7 +281,7 @@ async fn handle_chat_completions(
     if is_streaming {
         // === STREAMING MODE: SSE ===
         match router
-            .route_chat_completion_stream_for_user(request, user_ctx.clone())
+            .route_chat_completion_stream(request, user_ctx.clone())
             .await
         {
             Ok(route_result) => {
@@ -358,7 +358,7 @@ async fn handle_chat_completions(
     } else {
         // === NON-STREAMING MODE: JSON ===
         match router
-            .route_chat_completion_for_user(request, user_ctx)
+            .route_chat_completion(request, user_ctx)
             .await
         {
             Ok(route_result) => {
