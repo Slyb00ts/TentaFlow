@@ -63,6 +63,22 @@ fn db_err(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("database error: {}", e))
 }
 
+/// Map a flow write error: a UNIQUE constraint violation on the
+/// `published_model_name` index means two requests raced through the
+/// publish guard. Surface that as BadRequest so the client sees a useful
+/// message instead of the generic "database error" wrapper.
+fn flow_write_err(e: anyhow::Error) -> ProtocolError {
+    let text = e.to_string();
+    if text.contains("UNIQUE constraint failed: flows.published_model_name")
+        || text.contains("idx_flows_published_model_name")
+    {
+        return ProtocolError::bad_request(
+            "published_model_name already taken (concurrent publish — retry with a different name)",
+        );
+    }
+    db_err(e)
+}
+
 /// Loguje akcje do DB i jednoczesnie broadcastuje AuditEvent do wszystkich
 /// aktywnych WS klientow (Audit screen otrzymuje live update).
 fn audit(
@@ -754,6 +770,18 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 
     validate_flow_json_str(ctx, &payload.graph_json)?;
 
+    // Validate the catalog publish name against active aliases and other
+    // published flows before writing — guards/D.19 collision detection
+    // only happens here, not at the SQL layer.
+    if let Some(name) = payload.published_model_name.as_deref() {
+        crate::services::catalog::guards::check_flow_publish_collision(
+            &ctx.state.db,
+            name,
+            None,
+        )
+        .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
+    }
+
     let params = db::models::FlowParams {
         name: &payload.name,
         description: payload.description.as_deref(),
@@ -761,8 +789,10 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         service_type: None,
         flow_json: &payload.graph_json,
         status: "active",
+        published_model_name: payload.published_model_name.as_deref(),
     };
-    let id = repository::create_flow(&ctx.state.db, &params).map_err(db_err)?;
+    let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
+    ctx.state.router.rebuild_catalog();
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
@@ -801,6 +831,10 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         return Ok(MessageBody::FlowDeleteResponse { deleted: false });
     }
     repository::delete_flow(&ctx.state.db, flow_id).map_err(db_err)?;
+    // A deleted flow that was published as a model must drop out of the
+    // catalog immediately — without this the snapshot keeps it until the
+    // next alias mutation or supervisor tick.
+    ctx.state.router.rebuild_catalog();
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
@@ -898,6 +932,21 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .clone()
         .unwrap_or_else(|| existing.status.clone());
 
+    // Resolve the publish-name update: `Some(Some)` writes a new value,
+    // `Some(None)` clears it, `None` leaves the existing value alone.
+    let new_published = match &payload.published_model_name {
+        Some(value) => value.clone(),
+        None => existing.published_model_name.clone(),
+    };
+    if let Some(name) = new_published.as_deref() {
+        crate::services::catalog::guards::check_flow_publish_collision(
+            &ctx.state.db,
+            name,
+            Some(flow_id),
+        )
+        .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
+    }
+
     // Audyt + podpis snapshotu w flow_versions.
     let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let created_by = user_id_opt.map(|u| u.to_string());
@@ -909,6 +958,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         service_type: existing.service_type.as_deref(),
         flow_json: &new_flow_json,
         status: &new_status,
+        published_model_name: new_published.as_deref(),
     };
 
     match repository::update_flow_with_snapshot(
@@ -925,8 +975,9 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
                 "flow version conflict",
             ));
         }
-        Err(e) => return Err(db_err(e)),
+        Err(e) => return Err(flow_write_err(e)),
     }
+    ctx.state.router.rebuild_catalog();
 
     audit(
         ctx,
@@ -1121,6 +1172,8 @@ pub fn flow_version_restore(
 
     let flow_json = version.flow_json.as_deref().unwrap_or("");
     validate_flow_json_str(ctx, flow_json)?;
+    // Restoring an old version keeps whatever publish name the live flow
+    // currently advertises — old versions never tracked the catalog field.
     let params = db::models::FlowParams {
         name: &version.name,
         description: version.description.as_deref(),
@@ -1128,6 +1181,7 @@ pub fn flow_version_restore(
         service_type: existing.service_type.as_deref(),
         flow_json,
         status: version.status.as_deref().unwrap_or("draft"),
+        published_model_name: existing.published_model_name.as_deref(),
     };
 
     let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
@@ -2943,49 +2997,154 @@ fn db_alias_to_proto(a: crate::db::models::DbModelAlias) -> tentaflow_protocol::
     }
 }
 
-#[handler(variant = "ModelsUnifiedListRequest", since = (1, 0))]
+#[handler(variant = "CatalogListRequestBody", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn models_unified_list(
-    _req: &MessageBody,
+pub fn catalog_list(
+    req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let models = unified_from_service_registry(&ctx.state.mesh_services_registry);
-    Ok(MessageBody::ModelsUnifiedListResponseBody(
-        tentaflow_protocol::ModelsUnifiedListResponse { models },
+    let request = match req {
+        MessageBody::CatalogListRequestBody(r) => r,
+        // Defensive — the proc-macro only routes the right variant here, but
+        // an internal caller invoking `catalog_list` directly with the wrong
+        // body should get an error, not a crash.
+        other => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                format!(
+                    "catalog_list: unexpected MessageBody variant '{}'",
+                    crate::dispatch::variant_name_of(other)
+                ),
+            ));
+        }
+    };
+
+    let snapshot = ctx.state.router.catalog_snapshot();
+    let entries = catalog_snapshot_to_wire(&snapshot, request);
+    Ok(MessageBody::CatalogListResponseBody(
+        tentaflow_protocol::CatalogListResponse {
+            entries,
+            version: snapshot.version,
+        },
     ))
 }
 
-fn unified_from_service_registry(
-    registry: &std::sync::Arc<crate::services::mesh_registry::MeshServicesRegistry>,
-) -> Vec<tentaflow_protocol::UnifiedModel> {
-    crate::services::models::collect_unified(registry)
-        .into_iter()
-        .map(|m| tentaflow_protocol::UnifiedModel {
-            model_name: m.model_name,
-            service_type: m.service_type,
-            instances: m
-                .instances
-                .into_iter()
-                .map(|i| {
-                    let loaded = matches!(i.status.as_str(), "running" | "ready");
-                    tentaflow_protocol::UnifiedModelInstance {
-                        node_id: i.node_id,
-                        node_hostname: if i.node_name.is_empty() {
-                            None
-                        } else {
-                            Some(i.node_name)
-                        },
+fn catalog_snapshot_to_wire(
+    snapshot: &crate::services::catalog::CatalogSnapshot,
+    request: &tentaflow_protocol::CatalogListRequest,
+) -> Vec<tentaflow_protocol::CatalogEntryWire> {
+    use crate::services::catalog::{CatalogDiagnostic, CatalogEntryKind};
+    use tentaflow_protocol::{
+        CatalogDiagnosticWire, CatalogEntryKindWire, CatalogEntryWire, CatalogModelInstance,
+    };
+
+    let surface_filter_lower = request
+        .surface_filter
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    let mut out = Vec::with_capacity(snapshot.entries.len());
+    for entry in snapshot.entries.iter() {
+        if entry
+            .diagnostic
+            .as_ref()
+            .map(|d| d.is_blocking())
+            .unwrap_or(false)
+            && !request.include_blocking_diagnostics
+        {
+            continue;
+        }
+        if let Some(ref needed) = surface_filter_lower {
+            let matches = entry
+                .service_surfaces
+                .iter()
+                .any(|s| s.as_wire_str() == needed.as_str());
+            if !matches {
+                continue;
+            }
+        }
+
+        let owned_by = entry.owned_by().to_string();
+        let kind = match &entry.kind {
+            CatalogEntryKind::ServiceModel { instances } => CatalogEntryKindWire::ServiceModel {
+                instances: instances
+                    .iter()
+                    .map(|i| CatalogModelInstance {
+                        node_id: i.node_id.clone(),
+                        node_hostname: i.node_hostname.clone(),
                         service_id: i.service_id,
-                        status: i.status,
-                        backend: i.backend,
+                        status: i.status.clone(),
+                        backend: i.backend.clone(),
                         size_mb: i.size_mb,
-                        loaded,
-                    }
-                })
+                        loaded: i.loaded,
+                    })
+                    .collect(),
+            },
+            CatalogEntryKind::Flow {
+                flow_id,
+                published_name,
+            } => CatalogEntryKindWire::Flow {
+                flow_id: *flow_id,
+                published_name: published_name.clone(),
+            },
+            CatalogEntryKind::Alias {
+                target,
+                fallback_targets,
+                strategy,
+            } => CatalogEntryKindWire::Alias {
+                target: target.clone(),
+                fallback_targets: fallback_targets.clone(),
+                strategy: strategy.as_wire_str().to_string(),
+            },
+        };
+
+        let diagnostic = entry.diagnostic.as_ref().map(|d| match d {
+            CatalogDiagnostic::RemoteShadowed { local_owner } => {
+                CatalogDiagnosticWire::RemoteShadowed {
+                    local_owner: local_owner.clone(),
+                }
+            }
+            CatalogDiagnostic::LocalOverride {
+                conflicting_remote_node,
+            } => CatalogDiagnosticWire::LocalOverride {
+                conflicting_remote_node: conflicting_remote_node.clone(),
+            },
+            CatalogDiagnostic::IncompatibleAliasTargets {
+                alias,
+                missing_modalities,
+            } => CatalogDiagnosticWire::IncompatibleAliasTargets {
+                alias: alias.clone(),
+                missing_modalities: missing_modalities
+                    .iter()
+                    .map(|m| m.as_wire_str().to_string())
+                    .collect(),
+            },
+        });
+
+        out.push(CatalogEntryWire {
+            id: entry.id.clone(),
+            kind,
+            service_surfaces: entry
+                .service_surfaces
+                .iter()
+                .map(|s| s.as_wire_str().to_string())
                 .collect(),
-        })
-        .collect()
+            input_modalities: entry
+                .input_modalities
+                .iter()
+                .map(|m| m.as_wire_str().to_string())
+                .collect(),
+            output_modalities: entry
+                .output_modalities
+                .iter()
+                .map(|m| m.as_wire_str().to_string())
+                .collect(),
+            diagnostic,
+            owned_by,
+        });
+    }
+    out
 }
 
 #[handler(variant = "ModelAliasListRequest", since = (1, 0))]
@@ -3338,6 +3497,7 @@ pub async fn service_manifest_deploy(
     let mesh_services_registry_task = ctx.state.mesh_services_registry.clone();
     let live_handles_task = ctx.state.live_handles.clone();
     let service_manager_task = ctx.state.service_manager.clone();
+    let catalog_provider_task = ctx.state.router.catalog_provider().clone();
 
     tokio::spawn(async move {
         let start_ms = crate::deploy::log_bus::now_ms();
@@ -3364,36 +3524,48 @@ pub async fn service_manifest_deploy(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 crate::deploy::log_bus::close(&slug_task);
 
-                // Push delta — peers' MeshServicesRegistry pick up the freshly
-                // deployed service immediately instead of waiting for the
-                // 5-min anti-drift announce.
-                if let Some(qm) = quic_mesh_task {
-                    let service_id = outcome.endpoint.handle.id;
-                    match crate::services::snapshot_builder::build_one(
-                        &db_clone,
-                        service_id,
-                        &local_node_id_task,
-                    ) {
-                        Ok(Some(info)) => {
-                            mesh_services_registry_task.apply_local_change(
-                                &local_node_id_task,
-                                tentaflow_protocol::ServiceChange::Added(info.clone()),
-                            );
-                            if let Err(e) = live_handles_task.upsert_service_info(&info) {
-                                tracing::warn!(error = %e, service_id, "deploy runtime handle upsert failed");
+                // Local registry + live handles + catalog must update on
+                // every successful deploy, regardless of whether mesh is
+                // enabled. The mesh broadcast that follows is conditional —
+                // it only matters when peers are reachable. Pre-fix the
+                // entire block was nested inside `if let Some(qm)`, which
+                // meant `/v1/models` stayed stale until the next supervisor
+                // tick whenever mesh was disabled.
+                let service_id = outcome.endpoint.handle.id;
+                match crate::services::snapshot_builder::build_one(
+                    &db_clone,
+                    service_id,
+                    &local_node_id_task,
+                ) {
+                    Ok(Some(info)) => {
+                        mesh_services_registry_task.apply_local_change(
+                            &local_node_id_task,
+                            tentaflow_protocol::ServiceChange::Added(info.clone()),
+                        );
+                        if let Err(e) = live_handles_task.upsert_service_info(&info) {
+                            tracing::warn!(error = %e, service_id, "deploy runtime handle upsert failed");
+                        }
+                        if info.transport == "embedded" {
+                            for model in &info.models {
+                                service_manager_task
+                                    .register_local_inference_model(&model.model_name);
                             }
-                            if info.transport == "embedded" {
-                                for model in &info.models {
-                                    service_manager_task
-                                        .register_local_inference_model(&model.model_name);
-                                }
-                            }
+                        }
 
-                            let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
-                                from_node_id: local_node_id_task.clone(),
-                                change: tentaflow_protocol::ServiceChange::Added(info),
-                            };
-                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                        // Broadcast delta to peers — only when mesh is up.
+                        // Peers' `MeshServicesRegistry` pick the row up here
+                        // instead of waiting for the 5-min anti-drift announce.
+                        if let Some(qm) = quic_mesh_task {
+                            let payload =
+                                tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                    from_node_id: local_node_id_task.clone(),
+                                    change: tentaflow_protocol::ServiceChange::Added(
+                                        info,
+                                    ),
+                                };
+                            if let Ok(bytes) =
+                                rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                            {
                                 let _ = qm
                                     .broadcast_to_trusted(
                                         tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
@@ -3403,15 +3575,26 @@ pub async fn service_manifest_deploy(
                                     .await;
                             }
                         }
-                        Ok(None) => {
-                            tracing::warn!(
-                                service_id,
-                                "MeshServicesUpdate (Added): row missing right after deploy"
-                            );
+
+                        // Refresh the catalog so `/v1/models` and the GUI
+                        // see the freshly deployed service immediately.
+                        // Supervisor reconcile would also do this on its
+                        // next tick, but desktop has no supervisor and we
+                        // don't want a 1-second window of staleness.
+                        if let Err(e) = catalog_provider_task
+                            .rebuild(&mesh_services_registry_task, &db_clone)
+                        {
+                            tracing::warn!(error = %e, "post-deploy catalog rebuild failed");
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, service_id, "MeshServicesUpdate (Added): build_one failed");
-                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            service_id,
+                            "post-deploy snapshot: row missing right after deploy"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, service_id, "post-deploy snapshot: build_one failed");
                     }
                 }
             }
@@ -4906,6 +5089,11 @@ pub async fn service_delete(
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
     drop(conn);
+    // Service row gone — refresh the catalog so its model entries stop
+    // appearing on `/v1/models`. Supervisor reconcile would catch this on
+    // its next tick, but desktop has no supervisor and even on the binary
+    // a 1s lag here causes confusing GUI state.
+    ctx.state.router.rebuild_catalog();
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     audit(
@@ -5252,4 +5440,234 @@ pub async fn service_start(
             error,
         }),
     ))
+}
+
+#[cfg(test)]
+mod catalog_list_tests {
+    //! Coverage for the snapshot→wire mapping that backs the
+    //! `CatalogListRequest` handler. The full handler path needs a live
+    //! `HandlerContext`; these tests target `catalog_snapshot_to_wire`
+    //! directly so they can craft adversarial snapshots (every diagnostic
+    //! kind, every entry kind, surface filter, blocking opt-in) without
+    //! standing up a Router.
+    use super::catalog_snapshot_to_wire;
+    use crate::services::catalog::{
+        CatalogDiagnostic, CatalogEntry, CatalogEntryKind, CatalogSnapshot, InputModality,
+        ModelInstance, OutputModality, ServiceSurface, Strategy,
+    };
+    use std::sync::Arc;
+    use tentaflow_protocol::{
+        CatalogDiagnosticWire, CatalogEntryKindWire, CatalogListRequest,
+    };
+
+    fn snapshot_with(entries: Vec<CatalogEntry>) -> CatalogSnapshot {
+        CatalogSnapshot {
+            entries: Arc::from(entries.into_boxed_slice()),
+            version: 42,
+        }
+    }
+
+    fn service_entry(id: &str, surface: ServiceSurface) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            kind: CatalogEntryKind::ServiceModel {
+                instances: vec![ModelInstance {
+                    node_id: "node-a".into(),
+                    node_hostname: Some("host-a".into()),
+                    service_id: 7,
+                    status: "running".into(),
+                    backend: Some("llama-cpp".into()),
+                    size_mb: Some(2048),
+                    loaded: true,
+                }],
+            },
+            service_surfaces: vec![surface],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    fn alias_entry(id: &str, target: &str, fallbacks: Vec<&str>) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            kind: CatalogEntryKind::Alias {
+                target: target.to_string(),
+                fallback_targets: fallbacks.into_iter().map(String::from).collect(),
+                strategy: Strategy::RoundRobin,
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text, InputModality::Audio],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    fn flow_entry(id: &str, flow_id: i64) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            kind: CatalogEntryKind::Flow {
+                flow_id,
+                published_name: id.to_string(),
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![],
+            output_modalities: vec![],
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn maps_each_kind_into_its_wire_variant() {
+        let snap = snapshot_with(vec![
+            service_entry("llama-3", ServiceSurface::Chat),
+            flow_entry("chat-pl", 17),
+            alias_entry("rag-llm", "llama-3", vec!["bielik-11b"]),
+        ]);
+
+        let wire = catalog_snapshot_to_wire(
+            &snap,
+            &CatalogListRequest {
+                surface_filter: None,
+                include_blocking_diagnostics: false,
+            },
+        );
+
+        assert_eq!(wire.len(), 3);
+        let by_id: std::collections::HashMap<_, _> =
+            wire.iter().map(|w| (w.id.clone(), w)).collect();
+
+        let llama = by_id.get("llama-3").unwrap();
+        assert_eq!(llama.owned_by, "tentaflow-service");
+        match &llama.kind {
+            CatalogEntryKindWire::ServiceModel { instances } => {
+                assert_eq!(instances.len(), 1);
+                assert_eq!(instances[0].node_hostname.as_deref(), Some("host-a"));
+                assert_eq!(instances[0].service_id, 7);
+                assert!(instances[0].loaded);
+            }
+            other => panic!("expected ServiceModel, got {:?}", other),
+        }
+        assert_eq!(llama.service_surfaces, vec!["chat".to_string()]);
+        assert_eq!(llama.input_modalities, vec!["text".to_string()]);
+
+        let flow = by_id.get("chat-pl").unwrap();
+        assert_eq!(flow.owned_by, "tentaflow-flow");
+        assert!(matches!(flow.kind, CatalogEntryKindWire::Flow { flow_id: 17, .. }));
+
+        let alias = by_id.get("rag-llm").unwrap();
+        assert_eq!(alias.owned_by, "tentaflow-alias");
+        match &alias.kind {
+            CatalogEntryKindWire::Alias {
+                target,
+                fallback_targets,
+                strategy,
+            } => {
+                assert_eq!(target, "llama-3");
+                assert_eq!(fallback_targets, &vec!["bielik-11b".to_string()]);
+                // Strategy is round_robin (set in alias_entry helper).
+                assert_eq!(strategy, "round_robin");
+            }
+            other => panic!("expected Alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn surface_filter_drops_non_matching_entries() {
+        let snap = snapshot_with(vec![
+            service_entry("llama-3", ServiceSurface::Chat),
+            service_entry("whisper-large", ServiceSurface::Stt),
+            service_entry("xtts", ServiceSurface::Tts),
+        ]);
+
+        let wire = catalog_snapshot_to_wire(
+            &snap,
+            &CatalogListRequest {
+                surface_filter: Some("stt".into()),
+                include_blocking_diagnostics: false,
+            },
+        );
+        let ids: Vec<_> = wire.iter().map(|w| w.id.clone()).collect();
+        assert_eq!(ids, vec!["whisper-large".to_string()]);
+    }
+
+    #[test]
+    fn surface_filter_is_case_insensitive_and_trims() {
+        let snap = snapshot_with(vec![service_entry("xtts", ServiceSurface::Tts)]);
+        let wire = catalog_snapshot_to_wire(
+            &snap,
+            &CatalogListRequest {
+                surface_filter: Some("  TTS  ".into()),
+                include_blocking_diagnostics: false,
+            },
+        );
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].id, "xtts");
+    }
+
+    #[test]
+    fn blocking_diagnostics_hidden_unless_admin_opts_in() {
+        let mut shadowed = service_entry("dup-name", ServiceSurface::Chat);
+        shadowed.diagnostic = Some(CatalogDiagnostic::RemoteShadowed {
+            local_owner: "node-z".into(),
+        });
+        let snap = snapshot_with(vec![shadowed.clone(), service_entry("ok", ServiceSurface::Chat)]);
+
+        let hidden = catalog_snapshot_to_wire(
+            &snap,
+            &CatalogListRequest {
+                surface_filter: None,
+                include_blocking_diagnostics: false,
+            },
+        );
+        let ids: Vec<_> = hidden.iter().map(|w| w.id.clone()).collect();
+        assert_eq!(ids, vec!["ok".to_string()]);
+
+        let visible = catalog_snapshot_to_wire(
+            &snap,
+            &CatalogListRequest {
+                surface_filter: None,
+                include_blocking_diagnostics: true,
+            },
+        );
+        assert_eq!(visible.len(), 2);
+        let dup = visible.iter().find(|w| w.id == "dup-name").unwrap();
+        match &dup.diagnostic {
+            Some(CatalogDiagnosticWire::RemoteShadowed { local_owner }) => {
+                assert_eq!(local_owner, "node-z");
+            }
+            other => panic!("expected RemoteShadowed wire diagnostic, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_blocking_diagnostic_passes_through_with_modality_strings() {
+        let mut alias = alias_entry("chat-pl", "qwen-omni", vec!["bielik-11b"]);
+        alias.diagnostic = Some(CatalogDiagnostic::IncompatibleAliasTargets {
+            alias: "chat-pl".into(),
+            missing_modalities: vec![InputModality::Audio, InputModality::Image],
+        });
+
+        let wire = catalog_snapshot_to_wire(
+            &snapshot_with(vec![alias]),
+            &CatalogListRequest {
+                surface_filter: None,
+                include_blocking_diagnostics: false,
+            },
+        );
+        assert_eq!(wire.len(), 1, "non-blocking diagnostic must not hide entry");
+        match &wire[0].diagnostic {
+            Some(CatalogDiagnosticWire::IncompatibleAliasTargets {
+                alias,
+                missing_modalities,
+            }) => {
+                assert_eq!(alias, "chat-pl");
+                assert_eq!(
+                    missing_modalities,
+                    &vec!["audio".to_string(), "image".to_string()]
+                );
+            }
+            other => panic!("expected IncompatibleAliasTargets, got {:?}", other),
+        }
+    }
 }

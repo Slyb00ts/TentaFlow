@@ -1021,6 +1021,23 @@ export function encodeBrowserCaptureRequest(session_id, kind, full_page) {
 }
 
 /**
+ * @param {string | null | undefined} surface_filter
+ * @param {boolean} include_blocking_diagnostics
+ * @returns {Uint8Array}
+ */
+export function encodeCatalogListRequest(surface_filter, include_blocking_diagnostics) {
+    var ptr0 = isLikeNone(surface_filter) ? 0 : passStringToWasm0(surface_filter, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCatalogListRequest(ptr0, len0, include_blocking_diagnostics);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ChatStreamRequest — przyjmuje JSON string messages, parsuje
  * jako JsValue. Bootstrap accepts tylko `model_id` + jednoelementowa lista
  * user messages. Pelny messages[] input po integracji serde-wasm-bindgen (#36 ph.2).
@@ -1337,26 +1354,33 @@ export function encodeFastPathListRequest() {
 }
 
 /**
- * MessageBody::FlowCreateRequest { name, description, graph_json }.
+ * MessageBody::FlowCreateRequest { name, description, graph_json,
+ * published_model_name? }. `published_model_name = None` keeps the flow
+ * private; passing a value publishes it on `/v1/models` after the
+ * catalog rebuild — collisions with aliases / existing flows are
+ * rejected by the handler before the row is written.
  * @param {string} name
  * @param {string | null | undefined} description
  * @param {string} graph_json
+ * @param {string | null} [published_model_name]
  * @returns {Uint8Array}
  */
-export function encodeFlowCreateRequest(name, description, graph_json) {
+export function encodeFlowCreateRequest(name, description, graph_json, published_model_name) {
     const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     var ptr1 = isLikeNone(description) ? 0 : passStringToWasm0(description, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(graph_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeFlowCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    var ptr3 = isLikeNone(published_model_name) ? 0 : passStringToWasm0(published_model_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeFlowCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v4;
+    return v5;
 }
 
 /**
@@ -1439,15 +1463,20 @@ export function encodeFlowNodeTemplatesListRequest() {
 }
 
 /**
- * MessageBody::FlowUpdateRequest — partial update flow.
+ * MessageBody::FlowUpdateRequest — partial update flow. Pass
+ * `publish_set=true, published_model_name=Some("foo")` to publish or
+ * `publish_set=true, published_model_name=None` to un-publish; leave
+ * `publish_set=false` to keep whatever the server has.
  * @param {string} flow_id
- * @param {string | null} [name]
- * @param {string | null} [description]
- * @param {string | null} [flow_json]
- * @param {string | null} [status]
+ * @param {string | null | undefined} name
+ * @param {string | null | undefined} description
+ * @param {string | null | undefined} flow_json
+ * @param {string | null | undefined} status
+ * @param {boolean} publish_set
+ * @param {string | null} [published_model_name]
  * @returns {Uint8Array}
  */
-export function encodeFlowUpdateRequest(flow_id, name, description, flow_json, status) {
+export function encodeFlowUpdateRequest(flow_id, name, description, flow_json, status, publish_set, published_model_name) {
     const ptr0 = passStringToWasm0(flow_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     var ptr1 = isLikeNone(name) ? 0 : passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -1458,13 +1487,15 @@ export function encodeFlowUpdateRequest(flow_id, name, description, flow_json, s
     var len3 = WASM_VECTOR_LEN;
     var ptr4 = isLikeNone(status) ? 0 : passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len4 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeFlowUpdateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    var ptr5 = isLikeNone(published_model_name) ? 0 : passStringToWasm0(published_model_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeFlowUpdateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, publish_set, ptr5, len5);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v6;
+    return v7;
 }
 
 /**
@@ -2540,19 +2571,6 @@ export function encodeModelInstallRequest(model_id, source_repo) {
  */
 export function encodeModelListRequest() {
     const ret = wasm.encodeModelListRequest();
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
-}
-
-/**
- * @returns {Uint8Array}
- */
-export function encodeModelsUnifiedListRequest() {
-    const ret = wasm.encodeModelsUnifiedListRequest();
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

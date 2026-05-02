@@ -1168,7 +1168,10 @@ async fn handle_models_list(
     >,
     hyper::Error,
 > {
-    let models = router.list_available_models();
+    // Pull straight from the catalog so every advertised id keeps its
+    // kind-specific `owned_by` tag (`tentaflow-service` / `tentaflow-flow` /
+    // `tentaflow-alias`) instead of being flattened to a single string.
+    let snapshot = router.catalog_snapshot();
 
     #[derive(serde::Serialize)]
     struct ModelObject {
@@ -1184,15 +1187,16 @@ async fn handle_models_list(
         data: Vec<ModelObject>,
     }
 
-    let model_objects: Vec<ModelObject> = models
-        .into_iter()
-        .map(|id| ModelObject {
-            id,
+    let mut model_objects: Vec<ModelObject> = snapshot
+        .advertised_entries()
+        .map(|entry| ModelObject {
+            id: entry.id.clone(),
             object: "model".to_string(),
             created: 1686935002,
-            owned_by: "tentaflow-ai".to_string(),
+            owned_by: entry.owned_by().to_string(),
         })
         .collect();
+    model_objects.sort_by(|a, b| a.id.cmp(&b.id));
 
     let response = ModelsListResponse {
         object: "list".to_string(),

@@ -589,10 +589,19 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ModelsUnifiedListRequest — unikalne modele ze wszystkich nodow mesh. */
-  modelsUnifiedListRequest(correlationId, sequence = 1) {
+  /**
+   * MessageBody::CatalogListRequest — unified catalog (service models +
+   * published flows + aliases) used by `/v1/models`, mesh `catalog.list`,
+   * and the GUI. Pass `surfaceFilter` to narrow by service surface
+   * ("chat" | "stt" | …); set `includeBlockingDiagnostics` only when an
+   * admin view needs to see hidden RemoteShadowed / LocalOverride entries.
+   */
+  catalogListRequest(correlationId, sequence = 1, opts = {}) {
     assertReady();
-    const body = _wasm.encodeModelsUnifiedListRequest();
+    const surfaceFilter =
+      typeof opts.surfaceFilter === 'string' ? opts.surfaceFilter : undefined;
+    const includeBlocking = !!opts.includeBlockingDiagnostics;
+    const body = _wasm.encodeCatalogListRequest(surfaceFilter, includeBlocking);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -741,10 +750,24 @@ export const encode = {
     );
   },
 
-  /** MessageBody::FlowCreateRequest { name, description, graphJson } */
-  flowCreateRequest(correlationId, { name, description, graphJson }, sequence = 1) {
+  /**
+   * MessageBody::FlowCreateRequest { name, description, graphJson,
+   * publishedModelName? }. `publishedModelName` advertises the flow on
+   * `/v1/models` once the catalog rebuilds; the handler rejects names
+   * that collide with active aliases or other published flows.
+   */
+  flowCreateRequest(
+    correlationId,
+    { name, description, graphJson, publishedModelName },
+    sequence = 1,
+  ) {
     assertReady();
-    const body = _wasm.encodeFlowCreateRequest(name, description ?? null, graphJson);
+    const body = _wasm.encodeFlowCreateRequest(
+      name,
+      description ?? null,
+      graphJson,
+      publishedModelName ?? null,
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -777,15 +800,26 @@ export const encode = {
     );
   },
 
-  /** MessageBody::FlowUpdateRequest — partial update flow. */
+  /**
+   * MessageBody::FlowUpdateRequest — partial update flow.
+   * Pass `publishedModelName: "..."` to publish, `publishedModelName: null`
+   * to un-publish. Omit the key (or pass `undefined`) to keep the existing
+   * value untouched — `publishSet` is auto-derived from key presence.
+   */
   flowUpdateRequest(correlationId, payload, sequence = 1) {
     assertReady();
+    const publishSet = Object.prototype.hasOwnProperty.call(
+      payload,
+      'publishedModelName',
+    );
     const body = _wasm.encodeFlowUpdateRequest(
       String(payload.flowId),
       payload.name ?? null,
       payload.description ?? null,
       payload.flowJson ?? null,
       payload.status ?? null,
+      publishSet,
+      publishSet ? payload.publishedModelName ?? null : null,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

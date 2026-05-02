@@ -74,7 +74,7 @@ async function loadAll() {
     const [detailBody, nodes, unified] = await Promise.all([
       ApiBinary.one('clusterDetailRequest', { clusterId: currentClusterId }).catch(() => null),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
-      ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []),
     ]);
     if (detailBody && detailBody.cluster) {
       // Skleic ClusterInfo + members[] z osobnych pol odpowiedzi w jeden obiekt
@@ -581,14 +581,18 @@ async function saveRoutingSettings() {
 function renderSharedModels(members) {
   const memberIds = new Set(members.map(m => m.node_id));
   const uniq = new Map();
-  for (const m of unifiedModels) {
-    const alias = m.model_name || m.alias;
+  for (const entry of unifiedModels) {
+    const kindWrapper = entry && entry.kind;
+    if (!kindWrapper || kindWrapper.kind !== 'service_model') continue;
+    const alias = entry.id;
     if (!alias) continue;
-    const instances = Array.isArray(m.instances) ? m.instances : [];
-    const inCluster = instances.some(i => memberIds.has(i.node_id));
-    if (!inCluster) continue;
-    if (!uniq.has(alias)) uniq.set(alias, { alias, kind: m.service_type || m.kind, count: 0 });
-    uniq.get(alias).count += instances.filter(i => memberIds.has(i.node_id)).length;
+    const instances = Array.isArray(kindWrapper.instances) ? kindWrapper.instances : [];
+    const localInstances = instances.filter(i => memberIds.has(i.nodeId || i.node_id));
+    if (localInstances.length === 0) continue;
+    const surfaces = Array.isArray(entry.serviceSurfaces) ? entry.serviceSurfaces : [];
+    const kindLabel = surfaces[0] || 'service';
+    if (!uniq.has(alias)) uniq.set(alias, { alias, kind: kindLabel, count: 0 });
+    uniq.get(alias).count += localInstances.length;
   }
   const list = Array.from(uniq.values());
   if (list.length === 0) {

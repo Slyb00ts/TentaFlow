@@ -1965,5 +1965,19 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             DELETE FROM settings WHERE key = 'flow_engine_enabled';
         ",
     ),
+    (
+        68,
+        "flows_published_model_name",
+        "
+            -- A flow can be exposed as if it were a model. Clients (OpenAI API,
+            -- mesh, GUI) reach it by name; uniqueness against aliases and
+            -- service models is enforced in domain logic, not by SQL — multiple
+            -- flows may share `NULL` (unpublished).
+            ALTER TABLE flows ADD COLUMN published_model_name TEXT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_flows_published_model_name
+                ON flows(published_model_name)
+                WHERE published_model_name IS NOT NULL;
+        ",
+    ),
 ]
 }

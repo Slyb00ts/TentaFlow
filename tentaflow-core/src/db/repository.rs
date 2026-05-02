@@ -46,8 +46,9 @@ fn row_to_flow(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlow> {
         service_type: row.get(5)?,
         flow_json: row.get(6)?,
         status: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        published_model_name: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -933,7 +934,7 @@ pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClu
 
 // --- Flows ---
 
-const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, created_at, updated_at";
+const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at";
 
 pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>> {
     let conn = acquire(pool)?;
@@ -987,8 +988,17 @@ pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFl
 pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT INTO flows (name, description, is_default, service_type, flow_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![params.name, params.description, params.is_default, params.service_type, params.flow_json, params.status],
+        "INSERT INTO flows (name, description, is_default, service_type, flow_json, status, published_model_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            params.name,
+            params.description,
+            params.is_default,
+            params.service_type,
+            params.flow_json,
+            params.status,
+            params.published_model_name,
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1001,8 +1011,22 @@ pub fn update_flow(
 ) -> Result<()> {
     let conn = acquire(pool)?;
     let rows_affected = conn.execute(
-        "UPDATE flows SET name = ?2, description = ?3, is_default = ?4, service_type = ?5, flow_json = ?6, status = ?7, version = version + 1, updated_at = datetime('now') WHERE id = ?1 AND version = ?8",
-        rusqlite::params![id, params.name, params.description, params.is_default, params.service_type, params.flow_json, params.status, expected_version],
+        "UPDATE flows \
+         SET name = ?2, description = ?3, is_default = ?4, service_type = ?5, \
+             flow_json = ?6, status = ?7, published_model_name = ?8, \
+             version = version + 1, updated_at = datetime('now') \
+         WHERE id = ?1 AND version = ?9",
+        rusqlite::params![
+            id,
+            params.name,
+            params.description,
+            params.is_default,
+            params.service_type,
+            params.flow_json,
+            params.status,
+            params.published_model_name,
+            expected_version,
+        ],
     )?;
     if rows_affected == 0 {
         return Err(anyhow::anyhow!("CONFLICT"));

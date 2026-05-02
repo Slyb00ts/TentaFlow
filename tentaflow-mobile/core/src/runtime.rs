@@ -147,7 +147,9 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
             mesh_services_registry.clone(),
             live_handles,
         );
-        let supervisor = supervisor.with_embedded_probe(Arc::new(DefaultEmbeddedProbe));
+        let supervisor = supervisor
+            .with_embedded_probe(Arc::new(DefaultEmbeddedProbe))
+            .with_catalog_provider(router.catalog_provider().clone());
 
         if let Err(e) = supervisor.run_first_tick().await {
             tracing::warn!("services supervisor: first_tick failed: {}", e);
