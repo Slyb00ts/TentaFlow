@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{broadcast, RwLock as AsyncRwLock};
+use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -35,6 +35,15 @@ use crate::net::iroh::{
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
 pub type ForwardHandler = Arc<
     dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub type ForwardStreamHandler = Arc<
+    dyn Fn(
+            Vec<u8>,
+            mpsc::UnboundedSender<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
@@ -272,7 +281,8 @@ pub struct IrohMeshManager {
     shutdown: CancellationToken,
     local_node_id: RwLock<String>,
     next_connection_id: AtomicU64,
-    forward_handler: AsyncRwLock<Option<ForwardHandler>>,
+    forward_handler: Arc<AsyncRwLock<Option<ForwardHandler>>>,
+    forward_stream_handler: Arc<AsyncRwLock<Option<ForwardStreamHandler>>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
@@ -332,7 +342,8 @@ impl IrohMeshManager {
             shutdown: CancellationToken::new(),
             local_node_id: RwLock::new(local_id_hex),
             next_connection_id: AtomicU64::new(1),
-            forward_handler: AsyncRwLock::new(None),
+            forward_handler: Arc::new(AsyncRwLock::new(None)),
+            forward_stream_handler: Arc::new(AsyncRwLock::new(None)),
             command_waiters: DashMap::new(),
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
@@ -556,6 +567,8 @@ impl IrohMeshManager {
             connections: Arc::clone(&self.connections),
             event_tx: self.event_tx.clone(),
             security: Arc::clone(&self.security),
+            forward_handler: Arc::clone(&self.forward_handler),
+            forward_stream_handler: Arc::clone(&self.forward_stream_handler),
         }
     }
 
@@ -1192,6 +1205,58 @@ impl IrohMeshManager {
             .map_err(|_| anyhow::anyhow!("forward_request timeout (600s)"))?
     }
 
+    pub async fn forward_stream_request(
+        &self,
+        target_node_id: &str,
+        request_id: &str,
+        payload: Vec<u8>,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>>> + Send>>> {
+        let connection = self
+            .connections
+            .get(target_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
+
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        send.write_all(&[tentaflow_protocol::mesh::MESH_MSG_FORWARD_STREAM_REQ])
+            .await
+            .map_err(|e| anyhow::anyhow!("write disc: {e}"))?;
+        let id_bytes = request_id.as_bytes();
+        send.write_all(&(id_bytes.len() as u32).to_be_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("write id_len: {e}"))?;
+        send.write_all(id_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write id: {e}"))?;
+        send.write_all(&payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("write payload: {e}"))?;
+        send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+        let stream = async_stream::try_stream! {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                if len > MAX_MSG_BYTES {
+                    Err(anyhow::anyhow!("forward stream frame too large: {}", len))?;
+                }
+                let mut frame = vec![0u8; len];
+                recv.read_exact(&mut frame)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read stream frame: {e}"))?;
+                yield frame;
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
     /// Zwraca snapshot EndpointId wszystkich znanych polaczonych peerow.
     pub async fn connected_peer_ids(&self) -> Vec<String> {
         self.connected_peers().await
@@ -1200,6 +1265,10 @@ impl IrohMeshManager {
     /// Ustawia callback dla incoming forward requestow.
     pub async fn set_forward_handler(&self, handler: ForwardHandler) {
         *self.forward_handler.write().await = Some(handler);
+    }
+
+    pub async fn set_forward_stream_handler(&self, handler: ForwardStreamHandler) {
+        *self.forward_stream_handler.write().await = Some(handler);
     }
 
     /// Pobiera RTT do peera w mikrosekundach. iroh udostepnia `remote_info`
@@ -1476,9 +1545,78 @@ struct IrohMeshManagerRef {
     connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
     security: Arc<MeshSecurity>,
+    forward_handler: Arc<AsyncRwLock<Option<ForwardHandler>>>,
+    forward_stream_handler: Arc<AsyncRwLock<Option<ForwardStreamHandler>>>,
 }
 
 impl IrohMeshManagerRef {
+    async fn handle_mesh_bi(
+        &self,
+        remote_hex: String,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> Result<(), IrohStreamError> {
+        let mut disc = [0u8; 1];
+        recv.read_exact(&mut disc)
+            .await
+            .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+        if !self.security.is_trusted(&remote_hex) {
+            tracing::debug!(
+                target: "mesh::gate",
+                peer = %remote_hex,
+                frame_type = format!("0x{:02X}", disc[0]),
+                "iroh_mesh: rejected bidi frame from untrusted peer"
+            );
+            return Ok(());
+        }
+
+        let payload = read_forward_payload(&mut recv).await?;
+        match disc[0] {
+            x if x == tentaflow_protocol::mesh::MESH_MSG_FORWARD_REQ => {
+                let handler = self.forward_handler.read().await.clone();
+                let Some(handler) = handler else {
+                    return Ok(());
+                };
+                let response = handler(payload).await;
+                send.write_all(&response)
+                    .await
+                    .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                send.finish()
+                    .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+            }
+            x if x == tentaflow_protocol::mesh::MESH_MSG_FORWARD_STREAM_REQ => {
+                let handler = self.forward_stream_handler.read().await.clone();
+                let Some(handler) = handler else {
+                    return Ok(());
+                };
+                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let task = tokio::spawn(handler(payload, tx));
+                while let Some(frame) = rx.recv().await {
+                    if frame.len() > MAX_MSG_BYTES {
+                        return Err(IrohStreamError::FrameTooLarge(frame.len()));
+                    }
+                    send.write_all(&(frame.len() as u32).to_be_bytes())
+                        .await
+                        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                    send.write_all(&frame)
+                        .await
+                        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                }
+                let _ = task.await;
+                send.finish()
+                    .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+            }
+            other => {
+                warn!(
+                    peer = %remote_hex,
+                    "iroh_mesh: nieznany bidi discriminant 0x{:02X}",
+                    other
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_mesh_connection(
         &self,
         remote_hex: String,
@@ -1487,20 +1625,40 @@ impl IrohMeshManagerRef {
     ) {
         let close_reason: Option<String>;
         loop {
-            let recv = match connection.accept_uni().await {
-                Ok(r) => r,
-                Err(e) => {
-                    close_reason = Some(format!("{e}"));
-                    break;
+            tokio::select! {
+                uni = connection.accept_uni() => {
+                    let recv = match uni {
+                        Ok(r) => r,
+                        Err(e) => {
+                            close_reason = Some(format!("{e}"));
+                            break;
+                        }
+                    };
+                    let me = self.clone();
+                    let rhex = remote_hex.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = me.handle_mesh_uni(rhex, recv).await {
+                            debug!("mesh uni handler blad: {}", e);
+                        }
+                    });
                 }
-            };
-            let me = self.clone();
-            let rhex = remote_hex.clone();
-            tokio::spawn(async move {
-                if let Err(e) = me.handle_mesh_uni(rhex, recv).await {
-                    debug!("mesh uni handler blad: {}", e);
+                bi = connection.accept_bi() => {
+                    let (send, recv) = match bi {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            close_reason = Some(format!("{e}"));
+                            break;
+                        }
+                    };
+                    let me = self.clone();
+                    let rhex = remote_hex.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = me.handle_mesh_bi(rhex, send, recv).await {
+                            debug!("mesh bi handler blad: {}", e);
+                        }
+                    });
                 }
-            });
+            }
         }
         // Connection wymarl. Mapowanie usuwamy WYLACZNIE jesli nadal
         // wskazuje na nasz connection_id — gdy nowsze polaczenie
@@ -1721,6 +1879,31 @@ impl IrohMeshManagerRef {
         let _ = self.event_tx.send(event);
         Ok(())
     }
+}
+
+async fn read_forward_payload(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<Vec<u8>, IrohStreamError> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+    let id_len = u32::from_be_bytes(len_buf) as usize;
+    if id_len > 4096 {
+        return Err(IrohStreamError::FrameTooLarge(id_len));
+    }
+    let mut id_buf = vec![0u8; id_len];
+    recv.read_exact(&mut id_buf)
+        .await
+        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+    let payload = recv
+        .read_to_end(MAX_MSG_BYTES)
+        .await
+        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+    if payload.len() > MAX_MSG_BYTES {
+        return Err(IrohStreamError::FrameTooLarge(payload.len()));
+    }
+    Ok(payload)
 }
 
 /// Funkcja pomocnicza wywolywana przez accept loop przy pairing ALPN. Separacja

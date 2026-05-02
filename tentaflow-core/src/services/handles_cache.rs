@@ -97,6 +97,19 @@ impl LiveHandlesCache {
         }
     }
 
+    pub fn upsert_service_info(&self, svc: &ServiceInfo) -> Result<()> {
+        let handle = build_handle(svc)?;
+        let quic_inner = match &handle {
+            BackendHandle::Quic(h) => Some(h.clone()),
+            _ => None,
+        };
+        self.insert(svc.node_id.clone(), svc.id, handle);
+        if let Some(qh) = quic_inner {
+            spawn_quic_reconnect_loop(qh);
+        }
+        Ok(())
+    }
+
     pub fn get(&self, node_id: &str, service_id: i64) -> Option<BackendHandle> {
         self.handles
             .get(&(node_id.to_string(), service_id))

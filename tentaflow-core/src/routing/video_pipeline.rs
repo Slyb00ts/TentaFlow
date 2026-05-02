@@ -1,10 +1,12 @@
 // =============================================================================
 // Plik: routing/video_pipeline.rs
-// Opis: Pipeline rozpoznawania emocji + wieku + płci z klatki wideo uczestnika
-//       meetingu. Wywoływany przez handler `MeetingEventPayload::VideoFrame`
-//       w `reverse_request.rs`. Inferencja idzie przez `vision::registry`
-//       (SCRFD → HSEmotion → MiVOLO), wynik leci broadcastem jako
-//       `MeetingEventPayload::ParticipantAttributes`.
+// Opis: Pipeline rozpoznawania emocji z klatki wideo uczestnika meetingu.
+//       Wywoływany przez handler `MeetingEventPayload::VideoFrame` w
+//       `reverse_request.rs`. Inferencja idzie przez `vision::registry`
+//       (SCRFD → HSEmotion), wynik leci broadcastem jako
+//       `MeetingEventPayload::ParticipantAttributes`. Pola `age` i
+//       `gender_male_prob` w protokole pozostają (kompatybilność), ale ten
+//       pipeline emituje je jako `None`.
 // =============================================================================
 
 use std::collections::HashMap;
@@ -17,9 +19,7 @@ use tracing::{debug, warn};
 use tentaflow_protocol::{MeetingEventPayload, MeetingLiveEvent};
 
 use crate::db::DbPool;
-use crate::meeting::manager::{
-    DEFAULT_VISION_AGE_ALIAS, DEFAULT_VISION_EMOTION_ALIAS, DEFAULT_VISION_FACE_ALIAS,
-};
+use crate::meeting::manager::{DEFAULT_VISION_EMOTION_ALIAS, DEFAULT_VISION_FACE_ALIAS};
 use crate::vision::hsemotion::EMOTION_LABELS;
 
 /// Throttle: tylko jedna inferencja na 2 sekundy per uczestnik. Pipeline jest
@@ -34,8 +34,8 @@ const THROTTLE_MS: u128 = 2_000;
 const EMOTION_EWMA_NEW: f32 = 0.6;
 
 /// Padding dookoła bbox face crop'a. SCRFD zwraca ciasny bbox samej twarzy;
-/// HSEmotion i MiVOLO trenowane były na większych wycinkach (więcej
-/// kontekstu), więc dodajemy 20 % marginesu z każdej strony.
+/// HSEmotion był trenowany na większych wycinkach (więcej kontekstu),
+/// więc dodajemy 20 % marginesu z każdej strony.
 const FACE_CROP_PADDING: f32 = 0.20;
 
 /// Stan throttle + smoothing per uczestnik. Klucz: `participant_id` z eventu
@@ -133,13 +133,11 @@ pub fn maybe_spawn_inference(
         match result {
             Ok(Some(attrs)) => {
                 tracing::debug!(
-                    "ParticipantAttributes emit: participant_id={} name={:?} emotion={:?} conf={:?} age={:?} gender_male={:?}",
+                    "ParticipantAttributes emit: participant_id={} name={:?} emotion={:?} conf={:?}",
                     participant_id,
                     name,
                     attrs.emotion,
                     attrs.emotion_confidence,
-                    attrs.age,
-                    attrs.gender_male_prob,
                 );
                 let live_event = MeetingLiveEvent {
                     meeting_key,
@@ -150,8 +148,8 @@ pub fn maybe_spawn_inference(
                         ts_ms,
                         emotion: attrs.emotion,
                         emotion_confidence: attrs.emotion_confidence,
-                        age: attrs.age,
-                        gender_male_prob: attrs.gender_male_prob,
+                        age: None,
+                        gender_male_prob: None,
                     },
                 };
                 crate::dispatch::meeting_live_broadcast::publish(live_event);
@@ -169,12 +167,12 @@ pub fn maybe_spawn_inference(
     });
 }
 
-/// Wynik z inferencji w formacie 1:1 do wariantu `ParticipantAttributes`.
+/// Wynik inferencji emotion. Pola `age`/`gender_male_prob` w protokole
+/// `ParticipantAttributes` pozostają (kompat) ale ten pipeline ich nie
+/// produkuje — builder wypełnia je `None`.
 struct InferAttrs {
     emotion: Option<String>,
     emotion_confidence: Option<f32>,
-    age: Option<f32>,
-    gender_male_prob: Option<f32>,
 }
 
 /// Rozwiązuje alias do nazwy serwisu (czyli klucza w `vision::registry`).
@@ -194,7 +192,7 @@ fn resolve_vision_alias(pool: &DbPool, alias: &'static str) -> anyhow::Result<Op
     }
 }
 
-/// Pełen cykl: dekoduj JPEG → SCRFD → crop → HSEmotion + MiVOLO.
+/// Pełen cykl: dekoduj JPEG → SCRFD → crop → HSEmotion.
 /// Brak twarzy w klatce → wciąż emitujemy `Some` z polami `None`, żeby GUI
 /// mogło wyczyścić stare badge'a (uczestnik odwrócił głowę).
 /// Zwraca `Ok(None)` tylko gdy face alias pusty (cały pipeline skip).
@@ -208,9 +206,8 @@ async fn run_inference(
         None => return Ok(None),
     };
     let emotion_service = resolve_vision_alias(pool, DEFAULT_VISION_EMOTION_ALIAS)?;
-    let age_service = resolve_vision_alias(pool, DEFAULT_VISION_AGE_ALIAS)?;
 
-    // Cały blok inferencji (decode JPEG + 3 modele tract) jest CPU-bound.
+    // Cały blok inferencji (decode JPEG + 2 modele tract) jest CPU-bound.
     // Bez `spawn_blocking` zablokowałby tokio worker thread przez ~50–200 ms,
     // psując latency innych async tasks (chat streaming, mesh heartbeat).
     let jpeg_owned = jpeg.to_vec();
@@ -221,7 +218,6 @@ async fn run_inference(
             &jpeg_owned,
             &face_service,
             emotion_service.as_deref(),
-            age_service.as_deref(),
         )
     })
     .await
@@ -231,14 +227,13 @@ async fn run_inference(
 }
 
 /// Synchroniczny rdzeń inferencji — tract pracuje synchronicznie, więc
-/// cała ścieżka: image::load_from_memory → SCRFD → crop → HSEmotion +
-/// MiVOLO musi siedzieć w spawn_blocking po stronie wywołującego.
+/// cała ścieżka: image::load_from_memory → SCRFD → crop → HSEmotion musi
+/// siedzieć w spawn_blocking po stronie wywołującego.
 fn run_inference_blocking(
     participant_id: &str,
     jpeg: &[u8],
     face_service: &str,
     emotion_service: Option<&str>,
-    age_service: Option<&str>,
 ) -> anyhow::Result<InferAttrs> {
     use image::ImageReader;
     use std::io::Cursor;
@@ -275,8 +270,6 @@ fn run_inference_blocking(
         return Ok(InferAttrs {
             emotion: None,
             emotion_confidence: None,
-            age: None,
-            gender_male_prob: None,
         });
     };
 
@@ -296,8 +289,6 @@ fn run_inference_blocking(
         return Ok(InferAttrs {
             emotion: None,
             emotion_confidence: None,
-            age: None,
-            gender_male_prob: None,
         });
     }
     let crop_w = cx2 - cx1;
@@ -339,26 +330,9 @@ fn run_inference_blocking(
         None => (None, None),
     };
 
-    // Age + gender: MiVOLO zwraca oba.
-    let (age, gender_male_prob) = match age_service {
-        Some(svc) => match crate::vision::get_age_gender(svc) {
-            Some(engine) => match engine.predict(&crop, crop_w, crop_h) {
-                Ok(ag) => (Some(ag.age_years), Some(ag.gender_male_prob)),
-                Err(e) => {
-                    warn!("video_pipeline: MiVOLO predict: {}", e);
-                    (None, None)
-                }
-            },
-            None => (None, None),
-        },
-        None => (None, None),
-    };
-
     Ok(InferAttrs {
         emotion: emotion_label,
         emotion_confidence: emotion_conf,
-        age,
-        gender_male_prob,
     })
 }
 

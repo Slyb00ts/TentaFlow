@@ -1,12 +1,13 @@
 // =============================================================================
 // Plik: vision/mod.rs
-// Opis: Silniki vision (detekcja twarzy, wiek/plec, emocje) wkompilowane
-//       w binarke. Backend: tract-onnx (pure Rust ONNX runtime), bez ABI hell
-//       i bez Cargo features — kompiluje sie na linux/macos/windows/ios/android.
+// Opis: Silniki vision (detekcja twarzy, emocje, pose) wkompilowane w binarke.
+//       Backend: tract-onnx (pure Rust ONNX runtime), bez ABI hell i bez Cargo
+//       features — kompiluje sie na linux/macos/windows/ios/android.
 //
-//       Kazdy silnik implementuje wlasciwy trait (FaceDetector / AgeGender /
-//       EmotionClassifier). Dispatcher (`load`) bierze engine_id i sciezke
-//       do ONNX (z `crate::vision_models::*_path()`) i zwraca Box<dyn>.
+//       Kazdy silnik implementuje wlasciwy trait (FaceDetector /
+//       EmotionClassifier / PoseEstimator). Dispatcher (`load_engine`) bierze
+//       engine_id i sciezke do ONNX (z `crate::vision_models::*_path()`)
+//       i zwraca Box<dyn>.
 //
 //       Inference: bezstanowe; sesja tract'a (TypedRunnableModel) trzymana
 //       w `Arc` pod `OnceLock`-iem zeby lazy init i zero kosztu re-loadu
@@ -16,9 +17,7 @@
 pub mod nms;
 pub mod preprocessing;
 
-pub mod emonet;
 pub mod hsemotion;
-pub mod mivolo;
 pub mod movenet;
 pub mod scrfd;
 pub mod yolo_pose;
@@ -43,21 +42,13 @@ pub struct FaceDetection {
     pub keypoints: Option<[(f32, f32); 5]>,
 }
 
-/// Wynik MiVOLO / GoogLeNet age+gender. `age` w latach (regresja),
-/// `gender` jako prob mezczyzny [0..1] (1=mezczyzna, 0=kobieta).
-#[derive(Debug, Clone)]
-pub struct AgeGender {
-    pub age_years: f32,
-    pub gender_male_prob: f32,
-}
-
-/// Wynik HSEmotion / EmoNet. 8 emocji + valence/arousal (continuous).
+/// Wynik HSEmotion. 8 emocji + valence/arousal (continuous).
 #[derive(Debug, Clone)]
 pub struct EmotionResult {
     pub label: String,
     pub probabilities: Vec<(String, f32)>,
-    /// Valence/arousal — zwracane przez EmoNet (continuous affect space).
-    /// HSEmotion nie ma tego wyjscia → None.
+    /// Valence/arousal — continuous affect space. HSEmotion nie ma tego
+    /// wyjscia → None.
     pub valence: Option<f32>,
     pub arousal: Option<f32>,
 }
@@ -85,13 +76,7 @@ pub trait FaceDetector: Send + Sync {
     fn detect(&self, image_rgb: &[u8], width: u32, height: u32) -> Result<Vec<FaceDetection>>;
 }
 
-/// Klasyfikator wieku i plci — MiVOLO (placeholder GoogLeNet).
-pub trait AgeGenderEngine: Send + Sync {
-    /// `face_crop_rgb` — wycieta i wyrownana twarz (zalecany 224x224 RGB).
-    fn predict(&self, face_crop_rgb: &[u8], width: u32, height: u32) -> Result<AgeGender>;
-}
-
-/// Klasyfikator emocji — HSEmotion / EmoNet.
+/// Klasyfikator emocji — HSEmotion.
 pub trait EmotionClassifier: Send + Sync {
     fn classify(&self, face_crop_rgb: &[u8], width: u32, height: u32) -> Result<EmotionResult>;
 }
@@ -105,9 +90,7 @@ pub trait PoseEstimator: Send + Sync {
 pub enum VisionEngineKind {
     Yolov8Face,
     Scrfd,
-    Mivolo,
     Hsemotion,
-    Emonet,
     Yolov8nPose,
     MovenetLightning,
 }
@@ -117,9 +100,7 @@ impl VisionEngineKind {
         match id {
             "yolov8-face" => Some(Self::Yolov8Face),
             "scrfd" => Some(Self::Scrfd),
-            "mivolo" => Some(Self::Mivolo),
             "hsemotion" => Some(Self::Hsemotion),
-            "emonet" => Some(Self::Emonet),
             "yolov8n-pose" | "yolov8-pose" => Some(Self::Yolov8nPose),
             "movenet-lightning" => Some(Self::MovenetLightning),
             _ => None,
@@ -130,9 +111,7 @@ impl VisionEngineKind {
         match self {
             Self::Yolov8Face => "yolov8-face",
             Self::Scrfd => "scrfd",
-            Self::Mivolo => "mivolo",
             Self::Hsemotion => "hsemotion",
-            Self::Emonet => "emonet",
             Self::Yolov8nPose => "yolov8n-pose",
             Self::MovenetLightning => "movenet-lightning",
         }
@@ -142,9 +121,7 @@ impl VisionEngineKind {
         match id {
             "yolov8n-face" => Some(Self::Yolov8Face),
             "scrfd-2-5g-kps" => Some(Self::Scrfd),
-            "mivolo-v2-imdb" => Some(Self::Mivolo),
             "hsemotion-enet-b0" => Some(Self::Hsemotion),
-            "emonet-8" => Some(Self::Emonet),
             "yolov8n-pose-coco" => Some(Self::Yolov8nPose),
             "movenet-lightning-singlepose" => Some(Self::MovenetLightning),
             _ => Self::from_id(id),
@@ -156,23 +133,16 @@ impl VisionEngineKind {
 /// matchuje per-kind przy zapytaniu.
 pub enum LoadedEngine {
     FaceDetector(Arc<dyn FaceDetector>),
-    AgeGender(Arc<dyn AgeGenderEngine>),
     Emotion(Arc<dyn EmotionClassifier>),
     Pose(Arc<dyn PoseEstimator>),
-    /// Stub — load() przeszedl walidacje ONNX'a ale silnik nie ma jeszcze
-    /// pelnej implementacji `detect/predict/classify`. Zwracany dla
-    /// EmoNet (brak ONNX) jako placeholder.
-    Stub,
 }
 
 impl Clone for LoadedEngine {
     fn clone(&self) -> Self {
         match self {
             LoadedEngine::FaceDetector(e) => LoadedEngine::FaceDetector(Arc::clone(e)),
-            LoadedEngine::AgeGender(e) => LoadedEngine::AgeGender(Arc::clone(e)),
             LoadedEngine::Emotion(e) => LoadedEngine::Emotion(Arc::clone(e)),
             LoadedEngine::Pose(e) => LoadedEngine::Pose(Arc::clone(e)),
-            LoadedEngine::Stub => LoadedEngine::Stub,
         }
     }
 }
@@ -198,21 +168,13 @@ pub fn unregister_engine(service_name: &str) -> bool {
 }
 
 /// Zwraca clone Arc-a do FaceDetectora pod `service_name`. Inne traity
-/// (`AgeGender`, `Emotion`) maja wlasne gettery — Rust nie pozwala na
+/// (`Emotion`, `Pose`) maja wlasne gettery — Rust nie pozwala na
 /// `dyn Trait` downcast, wiec rozdzielamy. None gdy klucz nie istnieje
 /// albo jego LoadedEngine jest innego typu.
 pub fn get_face_detector(service_name: &str) -> Option<Arc<dyn FaceDetector>> {
     let guard = registry().read();
     match guard.get(service_name)? {
         LoadedEngine::FaceDetector(d) => Some(Arc::clone(d)),
-        _ => None,
-    }
-}
-
-pub fn get_age_gender(service_name: &str) -> Option<Arc<dyn AgeGenderEngine>> {
-    let guard = registry().read();
-    match guard.get(service_name)? {
-        LoadedEngine::AgeGender(e) => Some(Arc::clone(e)),
         _ => None,
     }
 }
@@ -245,19 +207,9 @@ pub fn load_engine(kind: VisionEngineKind, model_path: &Path) -> Result<LoadedEn
             let e = yolov8_face::load(model_path)?;
             Ok(LoadedEngine::FaceDetector(Arc::new(e)))
         }
-        VisionEngineKind::Mivolo => {
-            let e = mivolo::load(model_path)?;
-            Ok(LoadedEngine::AgeGender(Arc::new(e)))
-        }
         VisionEngineKind::Hsemotion => {
             let e = hsemotion::load(model_path)?;
             Ok(LoadedEngine::Emotion(Arc::new(e)))
-        }
-        VisionEngineKind::Emonet => {
-            // emonet::load() zwraca Err gdy ONNX brak — propagujemy to
-            // bo bez modelu deploy nie powinien tworzyc serwisu.
-            let _ = emonet::load(model_path)?;
-            Ok(LoadedEngine::Stub)
         }
         VisionEngineKind::Yolov8nPose => {
             let e = yolo_pose::load(model_path)?;
@@ -276,21 +228,18 @@ pub fn model_path_for(kind: VisionEngineKind) -> Option<std::path::PathBuf> {
     match kind {
         VisionEngineKind::Yolov8Face => crate::vision_models::yolov8_face_path(),
         VisionEngineKind::Scrfd => crate::vision_models::scrfd_path(),
-        VisionEngineKind::Mivolo => crate::vision_models::mivolo_age_path(),
         VisionEngineKind::Hsemotion => crate::vision_models::hsemotion_path(),
-        VisionEngineKind::Emonet => crate::vision_models::emonet_path(),
         VisionEngineKind::Yolov8nPose => crate::vision_models::yolov8n_pose_path(),
         VisionEngineKind::MovenetLightning => crate::vision_models::movenet_lightning_path(),
     }
 }
 
 /// Wynik inference w jednolitym formacie — uzywany przez dispatch handler,
-/// niezalezne od ktorego silnika (FaceDetector / AgeGender / Emotion).
+/// niezalezne od ktorego silnika (FaceDetector / Emotion / Pose).
 #[derive(Debug, Clone)]
 pub enum InferOutput {
     Faces(Vec<FaceDetection>),
     Poses(Vec<PoseDetection>),
-    AgeGender(AgeGender),
     Emotion(EmotionResult),
 }
 
@@ -315,14 +264,7 @@ pub fn infer(service_name: &str, image_rgb: &[u8], width: u32, height: u32) -> R
         LoadedEngine::FaceDetector(d) => {
             Ok(InferOutput::Faces(d.detect(image_rgb, width, height)?))
         }
-        LoadedEngine::AgeGender(e) => {
-            Ok(InferOutput::AgeGender(e.predict(image_rgb, width, height)?))
-        }
         LoadedEngine::Emotion(e) => Ok(InferOutput::Emotion(e.classify(image_rgb, width, height)?)),
         LoadedEngine::Pose(e) => Ok(InferOutput::Poses(e.estimate(image_rgb, width, height)?)),
-        LoadedEngine::Stub => Err(anyhow!(
-            "vision: silnik '{}' jest stubem (brak modelu lub niewpiety inference)",
-            service_name
-        )),
     }
 }

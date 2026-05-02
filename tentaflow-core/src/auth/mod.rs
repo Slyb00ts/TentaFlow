@@ -5,3 +5,5 @@
 
 #[cfg(feature = "dashboard-api")]
 pub mod sso;
+
+pub mod rate_limit;

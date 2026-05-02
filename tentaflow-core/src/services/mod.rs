@@ -4,8 +4,10 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
-pub mod embeddings;
 pub mod manifest;
+pub mod model_download;
+pub mod models;
+pub mod nim;
 pub mod portainer;
 pub mod rag;
 pub mod teams_bot_bootstrap;
@@ -23,6 +25,5 @@ pub mod snapshot_builder;
 pub mod supervisor;
 pub mod transport;
 
-pub use embeddings::{EmbeddingsClient, EmbeddingsEngineConfigCompat};
 pub use rag::{RAGClient, RAGEngineConfigCompat};
 pub use tts::{SynthesizeCallback, TTSBufferingProcessor, TTSClient, TTSConfigCompat};

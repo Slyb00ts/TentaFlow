@@ -724,6 +724,129 @@ fn build_chat_request(
     })
 }
 
+pub async fn dispatch_reverse_stream_request(
+    router: &Router,
+    request: tentaflow_protocol::ModelRequest,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
+    use futures::StreamExt;
+    use tentaflow_protocol::{ErrorInfo, ErrorType, ModelPayload, ModelStreamChunk, StreamChunkType};
+
+    let request_id = request.request_id.clone();
+    let completion_payload = match &request.payload {
+        ModelPayload::Completion(p) => p,
+        _ => {
+            send_stream_chunk_bytes(
+                &tx,
+                ModelStreamChunk {
+                    request_id,
+                    chunk: StreamChunkType::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: "stream forward supports completion payloads".to_string(),
+                        details: None,
+                    }),
+                },
+            );
+            return;
+        }
+    };
+
+    let mut chat_request = match build_chat_request(completion_payload) {
+        Ok(req) => req,
+        Err(e) => {
+            send_stream_chunk_bytes(
+                &tx,
+                ModelStreamChunk {
+                    request_id,
+                    chunk: StreamChunkType::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: e,
+                        details: None,
+                    }),
+                },
+            );
+            return;
+        }
+    };
+    chat_request.stream = true;
+
+    let route_result = match router.route_chat_completion_stream(chat_request).await {
+        Ok(result) => result,
+        Err(e) => {
+            send_stream_chunk_bytes(
+                &tx,
+                ModelStreamChunk {
+                    request_id,
+                    chunk: StreamChunkType::Error(ErrorInfo {
+                        error_type: ErrorType::InternalError,
+                        message: format!("route_chat_completion_stream: {}", e),
+                        details: None,
+                    }),
+                },
+            );
+            return;
+        }
+    };
+
+    let mut stream = route_result.response;
+    let mut errored = false;
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chat_chunk) => {
+                if let Some(choice) = chat_chunk.choices.into_iter().next() {
+                    if let Some(text) = choice.delta.content {
+                        if !text.is_empty() {
+                            send_stream_chunk_bytes(
+                                &tx,
+                                ModelStreamChunk {
+                                    request_id: request_id.clone(),
+                                    chunk: StreamChunkType::TextDelta(text),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                errored = true;
+                send_stream_chunk_bytes(
+                    &tx,
+                    ModelStreamChunk {
+                        request_id: request_id.clone(),
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!("Completion stream blad: {}", e),
+                            details: None,
+                        }),
+                    },
+                );
+                break;
+            }
+        }
+    }
+
+    if !errored {
+        send_stream_chunk_bytes(
+            &tx,
+            ModelStreamChunk {
+                request_id,
+                chunk: StreamChunkType::Done {
+                    final_metrics: None,
+                },
+            },
+        );
+    }
+}
+
+fn send_stream_chunk_bytes(
+    tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    chunk: tentaflow_protocol::ModelStreamChunk,
+) {
+    if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk) {
+        let _ = tx.send(bytes.into_vec());
+    }
+}
+
 /// Tworzy ModelResponse z bledem.
 fn make_error_response(request_id: String, message: &str) -> tentaflow_protocol::ModelResponse {
     use tentaflow_protocol::*;

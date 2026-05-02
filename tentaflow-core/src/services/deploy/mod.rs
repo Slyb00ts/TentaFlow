@@ -97,6 +97,36 @@ impl LogSink {
     pub fn info(&self, line: &str) {
         self.emit("info", line);
     }
+
+    /// Emits a phase boundary (e.g. "downloading-vision", "starting",
+    /// "health-check"). Frontend uses `phase` to switch the step indicator;
+    /// `line` is the human-readable label.
+    pub fn phase(&self, phase: &str, line: &str) {
+        let _ = deployments_repo::append_log_line(&self.db, &self.slug, line);
+        let _ = self.sender.send(BusMessage::Line(LogLine {
+            deploy_id: self.slug.clone(),
+            kind: "phase".to_string(),
+            line: line.to_string(),
+            phase: phase.to_string(),
+            progress_pct: 0,
+            ts_ms: now_ms(),
+        }));
+    }
+
+    /// Emits a progress update within a phase. `pct` clamped to 0..=100.
+    /// Frontend ties this update to the most recent `phase()` call so a
+    /// multi-step deploy can drive multiple progress bars.
+    pub fn progress(&self, phase: &str, pct: u8, line: &str) {
+        let _ = deployments_repo::append_log_line(&self.db, &self.slug, line);
+        let _ = self.sender.send(BusMessage::Line(LogLine {
+            deploy_id: self.slug.clone(),
+            kind: "progress".to_string(),
+            line: line.to_string(),
+            phase: phase.to_string(),
+            progress_pct: pct.min(100) as u32,
+            ts_ms: now_ms(),
+        }));
+    }
 }
 
 // ----- Public types ---------------------------------------------------------

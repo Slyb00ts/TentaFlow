@@ -13,7 +13,6 @@ use crate::middleware::ResponseMiddleware;
 use crate::routing::backend::BackendClient;
 use crate::routing::service_manager::ServiceManager;
 use crate::services::rag::RAGClient;
-use crate::services::tts::TTSClient;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -397,22 +396,6 @@ impl Router {
         self.service_manager
             .get_quic_embedding_client(service_name)
             .await
-    }
-
-    /// Pobierz TTS client po nazwie serwisu
-    #[allow(dead_code)]
-    pub(crate) fn get_tts_client(&self, service_name: &str) -> Option<Arc<TTSClient>> {
-        self.service_manager.get_tts_client(service_name)
-    }
-
-    /// Pobierz TTS client po nazwie modelu (publiczne dla QUIC server).
-    pub async fn get_tts_client_by_model(&self, model: &str) -> Option<TTSClient> {
-        if let Some(client) = self.service_manager.get_tts_client(model) {
-            return Some((*client).clone());
-        }
-        self.service_manager
-            .get_first_tts_client()
-            .map(|c| (*c).clone())
     }
 
     /// Pobierz callback receiver dla RAG

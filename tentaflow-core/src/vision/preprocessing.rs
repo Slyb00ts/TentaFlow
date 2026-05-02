@@ -82,7 +82,7 @@ pub fn rgb_to_nchw_scrfd(img: &RgbImage) -> Vec<f32> {
 }
 
 /// Wariant ImageNet: mean=[0.485, 0.456, 0.406] * 255, std=[0.229, 0.224, 0.225] * 255.
-/// Uzywany przez wiele klasyfikatorow (MiVOLO/GoogLeNet, HSEmotion).
+/// Uzywany przez HSEmotion.
 pub fn rgb_to_nchw_imagenet(img: &RgbImage) -> Vec<f32> {
     rgb_to_nchw_normalized(
         img,

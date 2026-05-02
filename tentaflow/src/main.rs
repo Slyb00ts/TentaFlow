@@ -137,6 +137,11 @@ async fn run_server(args: Args) -> Result<()> {
         return Err(anyhow::anyhow!("ensure_app_dirs: {}", e));
     }
 
+    // Audio modele (Silero VAD, WeSpeaker embedding) pobierane w tle.
+    // Aplikacja startuje natychmiast; STT/diarization audio dostępne po
+    // ukończeniu (zwykle <30s na pierwszym uruchomieniu, instant na kolejnych).
+    tokio::spawn(tentaflow_core::audio_models::bootstrap());
+
     let db_path: PathBuf = args
         .db_path
         .clone()
@@ -324,7 +329,7 @@ async fn run_server(args: Args) -> Result<()> {
     let services_snapshot_rx_for_router: Option<
         tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
     > = if let Some(port_allocator) = services_port_allocator.clone() {
-        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
+        use tentaflow_core::services::supervisor::{DefaultEmbeddedProbe, Supervisor};
         let services_runtime_cfg = config.services_runtime.clone();
         let live_handles = router.service_manager().live_handles.clone();
         let (supervisor, snapshot_rx) = Supervisor::new(
@@ -335,7 +340,7 @@ async fn run_server(args: Args) -> Result<()> {
             mesh_services_registry.clone(),
             live_handles,
         );
-        let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
+        let supervisor = supervisor.with_embedded_probe(Arc::new(DefaultEmbeddedProbe));
 
         // First tick is synchronous so the initial snapshot is non-empty
         // before the router goes online. Failures are logged but not fatal.
@@ -478,6 +483,42 @@ async fn run_server(args: Args) -> Result<()> {
                                     .unwrap_or_default()
                             })
                         })).await;
+
+                        let router_for_stream_forward = router.clone();
+                        mesh_mgr.set_forward_stream_handler(std::sync::Arc::new(
+                            move |payload: Vec<u8>, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>| {
+                                let router = router_for_stream_forward.clone();
+                                Box::pin(async move {
+                                    use tentaflow_protocol::*;
+                                    let request: ModelRequest = match rkyv::access::<ArchivedModelRequest, rkyv::rancor::Error>(&payload)
+                                        .and_then(|archived| rkyv::deserialize::<ModelRequest, rkyv::rancor::Error>(archived))
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            tracing::error!("Forward stream handler: blad deserializacji ModelRequest: {}", e);
+                                            let chunk = ModelStreamChunk {
+                                                request_id: String::new(),
+                                                chunk: StreamChunkType::Error(ErrorInfo {
+                                                    error_type: ErrorType::InternalError,
+                                                    message: format!("Forward stream deserialize: {}", e),
+                                                    details: None,
+                                                }),
+                                            };
+                                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk) {
+                                                let _ = tx.send(bytes.into_vec());
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    tentaflow_core::routing::reverse_request::dispatch_reverse_stream_request(
+                                        &router,
+                                        request,
+                                        tx,
+                                    )
+                                    .await;
+                                })
+                            },
+                        )).await;
 
                         // Obsluga przychodzacych alias sync od zdalnych nodow
                         let router_for_alias = router.clone();

@@ -324,29 +324,39 @@ impl Router {
                             }
                         }
                     }
+                    BackendHandle::MeshForward(node_id, target_model_name) => {
+                        match self
+                            .route_to_mesh_llm_stream(
+                                node_id.clone(),
+                                target_model_name.clone(),
+                                request.clone(),
+                            )
+                            .await
+                        {
+                            Ok(stream) => {
+                                let metadata = crate::routing::RouteMetadata {
+                                    served_by_node: node_id.clone(),
+                                    backend_type: "mesh_forward_stream".to_string(),
+                                    strategy_used: route.strategy.to_string(),
+                                    fallbacks_tried: 0,
+                                    hop_count: 1,
+                                    latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                                };
+                                return Ok(crate::routing::RouteResult {
+                                    response: stream,
+                                    metadata,
+                                });
+                            }
+                            Err(e) => {
+                                debug!("MeshForward LLM stream error: {}", e);
+                                continue;
+                            }
+                        }
+                    }
                     BackendHandle::Http(_) => {
                         break;
                     }
                     _ => continue,
-                }
-            }
-        }
-
-        // MemoryGuard: zapewnij ze backend jest zaladowany. Dla services z
-        // lazy-loading (vllm-metal cold po restarcie, llama.cpp swap z MLX)
-        // ten call moze trwac od ~1s (proces zyje) do ~30s (fresh spawn +
-        // model load z HF cache). Pinned services sa zawsze warm.
-        let guard = crate::memory::guard_global();
-        if let Some(service_names) = self.service_manager.resolve_model_services(&model_name) {
-            for sn in &service_names {
-                match guard.ensure_loaded(sn).await {
-                    Ok(_) => {
-                        debug!(service = %sn, "MemoryGuard: ensure_loaded OK przed dispatch");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(service = %sn, error = %e, "MemoryGuard: ensure_loaded nieudane, probuje kolejny");
-                    }
                 }
             }
         }
@@ -483,6 +493,76 @@ impl Router {
             response: Box::pin(stream),
             metadata,
         })
+    }
+
+    pub(crate) async fn route_to_mesh_llm_stream(
+        &self,
+        target_node_id: String,
+        target_model_name: String,
+        request: ChatCompletionRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
+        let protocol_messages = crate::routing::openai_messages_to_protocol(&request.messages);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let model_request = ModelRequest {
+            request_id: request_id.clone(),
+            payload: ModelPayload::Completion(CompletionPayload {
+                model: target_model_name.clone(),
+                prompt: None,
+                messages: protocol_messages,
+                temperature: request.temperature,
+                max_tokens: request.max_tokens,
+                top_p: request.top_p,
+                stop: request.stop.clone(),
+                presence_penalty: request.presence_penalty,
+                frequency_penalty: request.frequency_penalty,
+                tts_options: None,
+                memory_options: None,
+                audio_input: None,
+                prefix_cache_id: None,
+                prefix_text: None,
+            }),
+            stream: true,
+            metadata: None,
+            session_id: None,
+        };
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
+            .map_err(|e| anyhow::anyhow!("mesh stream serialize ModelRequest: {}", e))?
+            .into_vec();
+        let mesh = self
+            .mesh_manager
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("mesh transport not available"))?;
+        let frame_stream = mesh
+            .forward_stream_request(&target_node_id, &request_id, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("mesh forward stream request: {}", e))?;
+        let backend_url = format!("mesh://{}", target_node_id);
+        let protocol_stream = frame_stream.map(move |frame_result| {
+            let frame = frame_result.map_err(|e| CoreError::NetworkError {
+                message: format!("mesh stream read: {}", e),
+                source: e,
+            })?;
+            let archived =
+                rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&frame).map_err(
+                    |e| CoreError::BackendError {
+                        backend_url: backend_url.clone(),
+                        message: format!("mesh stream access ModelStreamChunk: {}", e),
+                        source: None,
+                    },
+                )?;
+            rkyv::deserialize::<ModelStreamChunk, rkyv::rancor::Error>(archived).map_err(|e| {
+                CoreError::BackendError {
+                    backend_url: backend_url.clone(),
+                    message: format!("mesh stream deserialize ModelStreamChunk: {}", e),
+                    source: None,
+                }
+            })
+        });
+        Ok(crate::routing::stream_helpers::quic_stream_to_openai_chunks(
+            protocol_stream,
+            target_model_name,
+        ))
     }
 
     /// Routuje request do RAG engine (STREAMING MODE).

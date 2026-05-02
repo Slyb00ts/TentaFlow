@@ -1,7 +1,7 @@
 // =============================================================================
-// Plik: api/dashboard/api_nim.rs
-// Opis: REST API dla katalogu NVIDIA NIM — autentykacja NGC, pobieranie listy
-//       kontenerow NIM z cache'owaniem w pamieci.
+// File: services/nim/mod.rs
+// Opis: Klient katalogu NVIDIA NIM — autentykacja NGC, pobieranie kontenerow
+//       z https://integrate.api.nvidia.com + walidacja dostepnosci na nvcr.io.
 // =============================================================================
 
 use crate::db::{self, DbPool};

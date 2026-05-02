@@ -1228,6 +1228,24 @@ export function encodeDashboardMetricsRequest() {
 }
 
 /**
+ * MessageBody::DeployVllmRecommendRequest. Plynnie przyjmuje JSON
+ * (pelne struct DeployVllmRecommendRequest serializowane przez GUI).
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeDeployVllmRecommendRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeDeployVllmRecommendRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @param {string} engine_id
  * @param {string} status
  * @param {boolean} only_mine
@@ -1830,6 +1848,37 @@ export function encodeIamUpdateUserRequest(user_id, display_name, email, is_acti
     var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v4;
+}
+
+/**
+ * MessageBody::MePreferencesGetRequest (unit variant).
+ * @returns {Uint8Array}
+ */
+export function encodeMePreferencesGetRequest() {
+    const ret = wasm.encodeMePreferencesGetRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::MePreferencesUpdateRequest { language }.
+ * @param {string | null} [language]
+ * @returns {Uint8Array}
+ */
+export function encodeMePreferencesUpdateRequest(language) {
+    var ptr0 = isLikeNone(language) ? 0 : passStringToWasm0(language, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMePreferencesUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**

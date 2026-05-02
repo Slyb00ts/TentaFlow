@@ -4,7 +4,7 @@
 //              with tabs: Settings, Visibility, Permissions, OAuth, Linked
 //              accounts, Logs, Tools. Admin-only tabs hidden for non-admins.
 //              Detail opened via AddonsScreen.showDetail(addonId). Install ZIP
-//              goes through REST /api/addons/install (legacy).
+//              goes through binary AddonInstallRequest.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -396,14 +396,18 @@ async function onInstallZip() {
       return;
     }
     try {
-      const form = new FormData();
-      form.append('file', f);
-      const res = await fetch('/api/addons/install', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${ApiBinary.getJwt()}` },
-        body: form,
+      // Wczytaj plik jako Uint8Array — binary message niesie surowe bajty bez multipart parsowania.
+      const buf = await f.arrayBuffer();
+      const result = await ApiBinary.action('addonInstallRequest', {
+        filename: f.name,
+        content: new Uint8Array(buf),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!result.ok) {
+        throw new Error(result.error || 'install_failed');
+      }
+      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+        console.warn('[addons] install warnings:', result.warnings);
+      }
       toast(I18n.t('common.saved'), 'success');
       win.close(true);
       await loadList();

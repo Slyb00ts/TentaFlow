@@ -22,6 +22,10 @@ web-sys = { version = "0.3", features = ["Storage", "Window", "WebTransport", "W
 rkyv = { version = "0.8.12", features = ["unaligned"] }
 bytecheck = "0.8"
 
+# serde + json — for browser-side payload encoding into rkyv types
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Ed25519 identity (node keypair) — generowany w browser i persistowany w localStorage
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["rand_core"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }

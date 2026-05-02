@@ -1,8 +1,7 @@
 // =============================================================================
-// Plik: api/dashboard/api_services_manifest.rs
-// Opis: Logika domenowa manifestu silnikow — walidacja trybu deploymentu i
-//       przygotowanie akceptacji zadania. Po migracji FAZA 5 dostepna wylacznie
-//       przez binary dispatch (ServiceManifestDeployRequest), REST usuniety.
+// File: services/manifest/runtime_validate.rs
+// Opis: Runtime validation deploy targetu (engine_id + deploy_method)
+//       wywolywana z binary handlera ServiceManifestDeployRequest.
 // =============================================================================
 
 use crate::services::manifest::registry as manifest_registry;

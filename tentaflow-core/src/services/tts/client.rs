@@ -6,10 +6,6 @@
 
 use crate::error::{CoreError, Result};
 
-// TODO: Przeniesc TTSRequest z protocols::openai::types do Core
-//       lub dodac zaleznosc na crate z protokolami.
-//       Aktualnie import: crate::protocols::openai::types::TTSRequest
-//       Docelowo: crate::protocols::openai::types::TTSRequest (po migracji protokolow)
 use crate::api::openai::types::TTSRequest;
 
 use reqwest::Client;
@@ -17,7 +13,6 @@ use std::time::Duration;
 use tracing::debug;
 
 /// Konfiguracja TTS (compatibility type dla starego API)
-/// TODO: Zastapic bezposrednim uzyciem ConnectionType::OpenAIApi
 #[derive(Clone)]
 pub struct TTSConfigCompat {
     pub url: String,

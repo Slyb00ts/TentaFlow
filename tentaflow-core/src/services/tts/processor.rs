@@ -165,7 +165,7 @@ fn clean_text_for_tts(text: &str) -> String {
     let phonetic_fixes: &[(&str, &str)] = &[
         ("dzisiaj", "dzisaj"),
         ("dzisiejszy", "dzisejszy"),
-        ("ze", "ze"), // TODO: znalezc lepsza wymowe
+        ("ze", "ze"),
         ("sie", "sie"),
     ];
 

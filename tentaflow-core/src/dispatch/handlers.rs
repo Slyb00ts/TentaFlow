@@ -170,6 +170,16 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         return Err(ProtocolError::bad_request("username and password required"));
     }
 
+    // Per-username rate limit (10/min). Per-IP wymaga remote_addr w HandlerContext —
+    // follow-up. Tutaj blokujemy brute-force na konkretnego usera.
+    if !crate::auth::rate_limit::LOGIN_RATE_LIMITER.check_and_record(&payload.username, 10) {
+        tracing::warn!("Rate limit logowania (binary): username={}", payload.username);
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::RateLimited,
+            "too many login attempts, retry in a minute",
+        ));
+    }
+
     let user = repository::get_user_account_by_username(&ctx.state.db, &payload.username)
         .map_err(db_err)?
         .ok_or_else(|| {
@@ -249,6 +259,55 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
             "user".into()
         },
     }))
+}
+
+// =============================================================================
+// Me / User preferences — preferowany jezyk (TTS itd.)
+// =============================================================================
+
+#[handler(variant = "MePreferencesGetRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn me_preferences_get(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let user_id_bytes = require_user_id(ctx)?;
+    let user_id = user_id_to_i64(&user_id_bytes)
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let language = repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+    Ok(MessageBody::MePreferencesGetResponseBody(
+        tentaflow_protocol::MePreferencesGetResponse { language },
+    ))
+}
+
+#[handler(variant = "MePreferencesUpdateRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn me_preferences_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MePreferencesUpdateRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected MePreferencesUpdateRequest")),
+    };
+    let user_id_bytes = require_user_id(ctx)?;
+    let user_id = user_id_to_i64(&user_id_bytes)
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    if repository::set_user_preferred_language(
+        &ctx.state.db,
+        user_id,
+        payload.language.as_deref(),
+    )
+    .is_err()
+    {
+        return Err(ProtocolError::bad_request("unsupported language code"));
+    }
+    let language = repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+    Ok(MessageBody::MePreferencesUpdateResponseBody(
+        tentaflow_protocol::MePreferencesUpdateResponse { language },
+    ))
 }
 
 // =============================================================================
@@ -377,19 +436,6 @@ pub fn model_list_request(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    // Source the model list from the unified services pipeline. Each row in
-    // `model_registry` carries the model name + the service it is hosted on;
-    // status/category come from the joined `services` row.
-    let conn = ctx
-        .state
-        .db
-        .lock()
-        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-    let rows = crate::services_repo::models::list_alive(&conn).map_err(db_err)?;
-    drop(conn);
-
-    let local_node_id = ctx.state.local_node_id.as_ref().to_string();
-
     let user_acl = match &ctx.session {
         crate::dispatch::SessionAuth::UserSession { user_id, role, .. } => {
             let role_str = role.clone().unwrap_or_else(|| "user".to_string());
@@ -404,7 +450,10 @@ pub fn model_list_request(
         _ => None,
     };
 
-    let mut models: Vec<ModelSummary> = rows
+    let models: Vec<ModelSummary> = ctx
+        .state
+        .mesh_services_registry
+        .unique_models()
         .into_iter()
         .filter(|m| match &user_acl {
             Some((uid, role)) => crate::routing::acl::check_access_safe(
@@ -421,8 +470,7 @@ pub fn model_list_request(
                 .display_name
                 .clone()
                 .unwrap_or_else(|| m.model_name.clone());
-            let capabilities = parse_capabilities_array(&m.capabilities);
-            let category = capability_to_category(&m.capabilities);
+            let category = capability_list_to_category(&m.capabilities, &m.category);
             ModelSummary {
                 id: m.model_name.clone(),
                 model_name: m.model_name,
@@ -430,70 +478,28 @@ pub fn model_list_request(
                 category,
                 engine_id: m.engine_id,
                 service_id: m.service_id,
-                node_id: local_node_id.clone(),
+                node_id: m.node_id,
                 availability: m.status,
                 transport: m.transport,
                 endpoint_url: m.endpoint_url,
-                capabilities,
-                context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
+                capabilities: m.capabilities,
+                context_length: m.context_length,
                 quantization: m.quantization,
                 is_default: m.is_default,
             }
         })
         .collect();
 
-    // Merge model entries advertised by other mesh nodes (krok N3b). Each
-    // peer's `ServiceInfo` rolls up its own model rows; we flatten back into
-    // the legacy `ModelSummary` view the GUI expects, tagging every row with
-    // the owning node so the GUI can group / filter by host.
-    for (_peer_node_id, snapshot) in ctx.state.mesh_services_registry.all_remote() {
-        for svc in snapshot {
-            for entry in &svc.models {
-                let display_name = entry
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| entry.model_name.clone());
-                let category = match entry.capabilities.first().map(String::as_str) {
-                    Some("chat") => "llm".to_string(),
-                    Some(other) => other.to_string(),
-                    None => "llm".to_string(),
-                };
-                models.push(ModelSummary {
-                    id: entry.model_name.clone(),
-                    model_name: entry.model_name.clone(),
-                    display_name,
-                    category,
-                    engine_id: svc.engine_id.clone(),
-                    service_id: svc.id,
-                    node_id: svc.node_id.clone(),
-                    availability: svc.status.clone(),
-                    transport: svc.transport.clone(),
-                    endpoint_url: svc.endpoint_url.clone(),
-                    capabilities: entry.capabilities.clone(),
-                    context_length: entry.context_length,
-                    quantization: entry.quantization.clone(),
-                    is_default: entry.is_default,
-                });
-            }
-        }
-    }
-
     Ok(MessageBody::ModelListResponse { models })
 }
 
-/// Parses the JSON-encoded capabilities array from `model_registry.capabilities`.
-/// Defaults to an empty vector on malformed input — never fails.
-fn parse_capabilities_array(capabilities_json: &str) -> Vec<String> {
-    let value: serde_json::Value =
-        serde_json::from_str(capabilities_json).unwrap_or(serde_json::Value::Null);
-    value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+fn capability_list_to_category(capabilities: &[String], service_category: &str) -> String {
+    match capabilities.first().map(String::as_str) {
+        Some("chat") => "llm".to_string(),
+        Some(other) => other.to_string(),
+        None if service_category.is_empty() => "llm".to_string(),
+        None => service_category.to_string(),
+    }
 }
 
 /// Maps the JSON-encoded capabilities array (e.g. `["chat"]`) onto a coarse
@@ -2202,11 +2208,11 @@ pub fn pii_rule_list(
     ))
 }
 
-/// Vision inference: face detection / age+gender / emotion. Caller dostaje
+/// Vision inference: face detection / pose / emotion. Caller dostaje
 /// `service_name` z deploy handler runtime=embedded i przekazuje obrazek
 /// jako encoded JPEG/PNG/WEBP albo raw RGB. Wynik to inner-enum
-/// VisionInferResult (Faces / AgeGender / Emotion) zaleznie od typu
-/// silnika ktory wisi pod `service_name` w `vision::registry`.
+/// VisionInferResult (Faces / Poses / Emotion) zaleznie od typu silnika
+/// ktory wisi pod `service_name` w `vision::registry`.
 #[handler(variant = "VisionInferRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -2286,12 +2292,6 @@ pub fn vision_infer(
                 })
                 .collect(),
         ),
-        crate::vision::InferOutput::AgeGender(ag) => {
-            tentaflow_protocol::VisionInferResult::AgeGender {
-                age_years: ag.age_years,
-                gender_male_prob: ag.gender_male_prob,
-            }
-        }
         crate::vision::InferOutput::Emotion(em) => tentaflow_protocol::VisionInferResult::Emotion {
             label: em.label,
             probabilities: em.probabilities,
@@ -2950,18 +2950,7 @@ pub fn models_unified_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let mut models = unified_from_service_registry(&ctx.state.mesh_services_registry);
-    merge_peer_store_models(
-        &mut models,
-        &ctx.state.mesh_peer_store,
-        ctx.state.local_node_id.as_ref(),
-    );
-    merge_service_manager_models(
-        &mut models,
-        &ctx.state.service_manager,
-        &ctx.state.db,
-        ctx.state.local_node_id.as_ref(),
-    );
+    let models = unified_from_service_registry(&ctx.state.mesh_services_registry);
     Ok(MessageBody::ModelsUnifiedListResponseBody(
         tentaflow_protocol::ModelsUnifiedListResponse { models },
     ))
@@ -2970,7 +2959,7 @@ pub fn models_unified_list(
 fn unified_from_service_registry(
     registry: &std::sync::Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Vec<tentaflow_protocol::UnifiedModel> {
-    crate::api::dashboard::api_models::collect_unified(registry)
+    crate::services::models::collect_unified(registry)
         .into_iter()
         .map(|m| tentaflow_protocol::UnifiedModel {
             model_name: m.model_name,
@@ -2999,186 +2988,6 @@ fn unified_from_service_registry(
         .collect()
 }
 
-// Supplement the unified list with models cached in peer_store (populated by
-// ModelsSync broadcasts from remote nodes plus the local heartbeat task).
-// This covers the ~30s window before the first ModelsSync fires and any
-// peers whose services haven't been announced through service_registry yet.
-fn merge_peer_store_models(
-    models: &mut Vec<tentaflow_protocol::UnifiedModel>,
-    peer_store: &crate::mesh::peer_store::MeshPeerStore,
-    local_node_id: &str,
-) {
-    use std::collections::HashSet;
-    let peers = peer_store.list();
-    if peers.is_empty() {
-        return;
-    }
-
-    let mut present: HashSet<(String, String, String)> = HashSet::new();
-    for m in models.iter() {
-        for inst in m.instances.iter() {
-            present.insert((
-                m.model_name.clone(),
-                m.service_type.clone(),
-                inst.node_id.clone(),
-            ));
-        }
-    }
-
-    for peer in peers.iter() {
-        for pm in peer.models.iter() {
-            if pm.alias.is_empty() {
-                continue;
-            }
-            let key = (pm.alias.clone(), pm.kind.clone(), peer.node_id.clone());
-            if present.contains(&key) {
-                continue;
-            }
-            let hostname = if peer.hostname.is_empty() {
-                None
-            } else {
-                Some(peer.hostname.clone())
-            };
-            let service_id = if peer.node_id == local_node_id {
-                format!("local-{}-{}", pm.kind, pm.alias)
-            } else {
-                format!("peer-{}-{}", &peer.node_id, pm.alias)
-            };
-            let size_mb = if pm.size_mb > 0 {
-                Some(pm.size_mb)
-            } else {
-                None
-            };
-            let backend = if pm.backend.is_empty() {
-                None
-            } else {
-                Some(pm.backend.clone())
-            };
-            let instance = tentaflow_protocol::UnifiedModelInstance {
-                node_id: peer.node_id.clone(),
-                node_hostname: hostname,
-                service_id,
-                status: if pm.loaded {
-                    "running".to_string()
-                } else {
-                    "stopped".to_string()
-                },
-                backend,
-                size_mb,
-                loaded: pm.loaded,
-            };
-
-            let group = models
-                .iter_mut()
-                .find(|m| m.model_name == pm.alias && m.service_type == pm.kind);
-            match group {
-                Some(g) => g.instances.push(instance),
-                None => models.push(tentaflow_protocol::UnifiedModel {
-                    model_name: pm.alias.clone(),
-                    service_type: pm.kind.clone(),
-                    instances: vec![instance],
-                }),
-            }
-            present.insert(key);
-        }
-    }
-}
-
-// Third fallback source for the unified models list: ServiceManager.model_pool.
-// The pool is populated from DB in Router::new() independently of mesh state,
-// so it survives mesh startup races (e.g. when register_native_service_in_mesh
-// runs before the mesh manager is attached). Each pool entry maps a model name
-// to one or more DB-backed services; we resolve size/backend/status by looking
-// up the underlying DbService and the model file on disk.
-fn merge_service_manager_models(
-    models: &mut Vec<tentaflow_protocol::UnifiedModel>,
-    service_manager: &crate::routing::service_manager::ServiceManager,
-    db: &crate::db::DbPool,
-    local_node_id: &str,
-) {
-    let pool_entries = service_manager.get_model_pool_info();
-    if pool_entries.is_empty() {
-        return;
-    }
-
-    // Cache DB services by name so we avoid repeated queries.
-    let db_services: std::collections::HashMap<String, crate::db::models::DbService> =
-        match crate::db::repository::list_services(db) {
-            Ok(list) => list.into_iter().map(|s| (s.name.clone(), s)).collect(),
-            Err(_) => std::collections::HashMap::new(),
-        };
-
-    use std::collections::HashSet;
-    let mut present: HashSet<(String, String, String)> = HashSet::new();
-    for m in models.iter() {
-        for inst in m.instances.iter() {
-            present.insert((
-                m.model_name.clone(),
-                m.service_type.clone(),
-                inst.node_id.clone(),
-            ));
-        }
-    }
-
-    for (model_name, service_names, _strategy, service_type) in pool_entries {
-        let key = (
-            model_name.clone(),
-            service_type.clone(),
-            local_node_id.to_string(),
-        );
-        if present.contains(&key) {
-            continue;
-        }
-
-        // Resolve backend / size / status from the underlying DB service.
-        // We use the first mapped service; pool entries for a single model
-        // share backend and point at the same model file. If no DB service
-        // matches, the pool entry is stale (service deleted) — skip it.
-        let svc = match service_names.iter().find_map(|name| db_services.get(name)) {
-            Some(s) => s,
-            None => continue,
-        };
-        let cfg: serde_json::Value =
-            serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
-        let backend = cfg
-            .get("engine")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        let size_mb = cfg
-            .get("model_path")
-            .and_then(|v| v.as_str())
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len() / (1024 * 1024));
-        let loaded = svc.status == "running";
-        let status = if loaded { "running" } else { "stopped" }.to_string();
-
-        let service_id = format!("pool-{}-{}", service_type, model_name);
-        let instance = tentaflow_protocol::UnifiedModelInstance {
-            node_id: local_node_id.to_string(),
-            node_hostname: None,
-            service_id,
-            status,
-            backend,
-            size_mb,
-            loaded,
-        };
-
-        let group = models
-            .iter_mut()
-            .find(|m| m.model_name == model_name && m.service_type == service_type);
-        match group {
-            Some(g) => g.instances.push(instance),
-            None => models.push(tentaflow_protocol::UnifiedModel {
-                model_name: model_name.clone(),
-                service_type: service_type.clone(),
-                instances: vec![instance],
-            }),
-        }
-        present.insert(key);
-    }
-}
-
 #[handler(variant = "ModelAliasListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -3186,7 +2995,7 @@ pub fn model_alias_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let items = crate::api::dashboard::api_models::list_aliases(&ctx.state.db).map_err(db_err)?;
+    let items = crate::services::models::list_aliases(&ctx.state.db).map_err(db_err)?;
     let aliases = items.into_iter().map(db_alias_to_proto).collect();
     Ok(MessageBody::ModelAliasListResponseBody(
         tentaflow_protocol::ModelAliasListResponse { aliases },
@@ -3209,7 +3018,7 @@ pub fn model_alias_create(
         }
     };
 
-    let id = crate::api::dashboard::api_models::create_alias(
+    let id = crate::services::models::create_alias(
         &ctx.state.db,
         &payload.alias,
         &payload.target_model,
@@ -3218,7 +3027,7 @@ pub fn model_alias_create(
     )
     .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
 
-    crate::api::dashboard::api_models::broadcast_alias_mutation(
+    crate::services::models::broadcast_alias_mutation(
         &ctx.state.db,
         &ctx.state.router,
         &ctx.state.quic_mesh,
@@ -3254,7 +3063,7 @@ pub fn model_alias_update(
         }
     };
 
-    let updated = crate::api::dashboard::api_models::update_alias(
+    let updated = crate::services::models::update_alias(
         &ctx.state.db,
         payload.id,
         &payload.alias,
@@ -3272,7 +3081,7 @@ pub fn model_alias_update(
         )));
     }
 
-    crate::api::dashboard::api_models::broadcast_alias_mutation(
+    crate::services::models::broadcast_alias_mutation(
         &ctx.state.db,
         &ctx.state.router,
         &ctx.state.quic_mesh,
@@ -3309,7 +3118,7 @@ pub fn model_alias_delete(
     };
 
     let deleted =
-        crate::api::dashboard::api_models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
+        crate::services::models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
 
     if !deleted {
         return Err(ProtocolError::not_found(format!(
@@ -3318,7 +3127,7 @@ pub fn model_alias_delete(
         )));
     }
 
-    crate::api::dashboard::api_models::broadcast_alias_mutation(
+    crate::services::models::broadcast_alias_mutation(
         &ctx.state.db,
         &ctx.state.router,
         &ctx.state.quic_mesh,
@@ -3350,7 +3159,7 @@ pub async fn nim_catalog_list(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let result =
-        crate::api::dashboard::api_nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
+        crate::services::nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
             .await
             .map_err(|e| ProtocolError::internal(format!("nim catalog: {}", e)))?;
 
@@ -3459,7 +3268,7 @@ pub async fn service_manifest_deploy(
         ));
     }
 
-    use crate::api::dashboard::api_services_manifest::{
+    use crate::services::manifest::runtime_validate::{
         validate_deploy_target, DeployValidationError,
     };
     validate_deploy_target(&payload.engine_id, &payload.deploy_method).map_err(
@@ -3526,6 +3335,9 @@ pub async fn service_manifest_deploy(
     let log_sender_task = log_sender.clone();
     let local_node_id_task = ctx.state.local_node_id.to_string();
     let quic_mesh_task = ctx.state.quic_mesh.clone();
+    let mesh_services_registry_task = ctx.state.mesh_services_registry.clone();
+    let live_handles_task = ctx.state.live_handles.clone();
+    let service_manager_task = ctx.state.service_manager.clone();
 
     tokio::spawn(async move {
         let start_ms = crate::deploy::log_bus::now_ms();
@@ -3563,6 +3375,20 @@ pub async fn service_manifest_deploy(
                         &local_node_id_task,
                     ) {
                         Ok(Some(info)) => {
+                            mesh_services_registry_task.apply_local_change(
+                                &local_node_id_task,
+                                tentaflow_protocol::ServiceChange::Added(info.clone()),
+                            );
+                            if let Err(e) = live_handles_task.upsert_service_info(&info) {
+                                tracing::warn!(error = %e, service_id, "deploy runtime handle upsert failed");
+                            }
+                            if info.transport == "embedded" {
+                                for model in &info.models {
+                                    service_manager_task
+                                        .register_local_inference_model(&model.model_name);
+                                }
+                            }
+
                             let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
                                 from_node_id: local_node_id_task.clone(),
                                 change: tentaflow_protocol::ServiceChange::Added(info),
@@ -3646,6 +3472,197 @@ fn resolve_deploy_method(
             other
         )),
     }
+}
+
+// =============================================================================
+// vLLM deploy recommend — TP/PP/ctx/seqs/kv_dtype calculator (Admin only).
+// Reads HF config.json, runs auto-fit + VRAM estimator from vram_calculator.
+// =============================================================================
+
+#[handler(variant = "DeployVllmRecommendRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn deploy_vllm_recommend(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use crate::deploy::vram_calculator::{
+        analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
+        fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
+        parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
+    };
+
+    let payload = match req {
+        MessageBody::DeployVllmRecommendRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected DeployVllmRecommendRequest",
+            ))
+        }
+    };
+
+    if payload.model.trim().is_empty() {
+        return Err(ProtocolError::bad_request("model wymagany"));
+    }
+    if payload.gpus.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "co najmniej jeden GPU wymagany",
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| ProtocolError::internal(format!("reqwest client: {e}")))?;
+
+    let config_json =
+        fetch_hf_config(&client, &payload.model, payload.hf_token.as_deref())
+            .await
+            .map_err(|e| {
+                ProtocolError::not_found(format!(
+                    "Nie udalo sie pobrac config.json z HF: {e}. Sprawdz nazwe modelu i ewentualnie HF token (gated repo)."
+                ))
+            })?;
+
+    let spec = parse_hf_config_with_override(
+        &config_json,
+        &payload.model,
+        payload.quantization_override.as_deref(),
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+
+    let gpu_count = payload.gpus.len() as u32;
+    let gpu_memory_gb = payload
+        .gpus
+        .iter()
+        .map(|g| g.memory_gb)
+        .fold(f64::INFINITY, f64::min);
+
+    let kv_dtype = payload
+        .kv_cache_dtype
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let gpu_mem_util = payload.gpu_memory_utilization.unwrap_or(0.9);
+
+    let lock_ctx = payload.lock_max_model_len.unwrap_or(false);
+    let lock_seqs = payload.lock_max_num_seqs.unwrap_or(false);
+    let lock_tp = payload.lock_tensor_parallel.unwrap_or(false);
+
+    let fit = auto_fit_config(
+        &spec,
+        &AutoFitRequest {
+            gpu_count,
+            gpu_memory_gb_each: gpu_memory_gb,
+            kv_cache_dtype: kv_dtype.clone(),
+            gpu_memory_utilization: gpu_mem_util,
+            requested_max_model_len: payload.max_model_len,
+            requested_max_num_seqs: payload.max_num_seqs,
+            requested_tensor_parallel: payload.tensor_parallel,
+            requested_pipeline_parallel: payload.pipeline_parallel,
+            lock_max_model_len: lock_ctx,
+            lock_max_num_seqs: lock_seqs,
+            lock_tensor_parallel: lock_tp,
+        },
+    );
+
+    let AutoFitOutcome {
+        applied: applied_input,
+        auto_adjusted,
+        at_limit,
+        error: fit_error,
+    } = fit;
+
+    if let Some(err) = fit_error {
+        return Err(ProtocolError::new(
+            tentaflow_protocol::ProtocolErrorCode::BadRequest,
+            err,
+        ));
+    }
+
+    let estimate = estimate_vllm_vram(&spec, &applied_input);
+    let max_supported_model_len = max_context_for_budget(&spec, &applied_input);
+    let max_supported_num_seqs = max_concurrent_seqs_for_budget(&spec, &applied_input);
+    let recommended_vllm_args = build_vllm_args_string(&spec, &applied_input);
+
+    let estimated_params = spec.estimated_params() as f64 / 1_000_000_000.0;
+    let bytes_per_param = spec.bytes_per_param();
+
+    let mut warnings = estimate.warnings.clone();
+    let gpu_compat = analyze_gpu_compatibility(&spec, gpu_count);
+    if let Some(w) = &gpu_compat.warning {
+        warnings.push(w.clone());
+    }
+
+    let model_spec = tentaflow_protocol::DeployVllmModelSpecSummary {
+        model_type: spec.model_type.clone(),
+        architectures: spec.architectures.clone(),
+        dtype: spec.dtype.clone(),
+        quantization: spec.quantization.clone(),
+        hidden_size: spec.hidden_size,
+        num_attention_heads: spec.num_attention_heads,
+        num_key_value_heads: spec.num_key_value_heads,
+        num_hidden_layers: spec.num_hidden_layers,
+        max_position_embeddings: spec.max_position_embeddings,
+        has_vision: spec.has_vision,
+        has_audio: spec.has_audio,
+        estimated_params_billions: estimated_params,
+        bytes_per_param,
+    };
+
+    let vram_estimate = tentaflow_protocol::DeployVllmVramEstimate {
+        model_weights_gb: estimate.model_weights_gb,
+        kv_cache_gb: estimate.kv_cache_gb,
+        activations_gb: estimate.activations_gb,
+        overhead_gb: estimate.overhead_gb,
+        total_gb: estimate.total_gb,
+        per_gpu_gb: estimate.per_gpu_gb,
+        fits_per_gpu: estimate.fits_per_gpu,
+        fits_total: estimate.fits_total,
+        warnings: estimate.warnings.clone(),
+    };
+
+    let recommended = tentaflow_protocol::DeployVllmConfig {
+        tensor_parallel: applied_input.tensor_parallel,
+        pipeline_parallel: applied_input.pipeline_parallel,
+        max_model_len: applied_input.max_model_len,
+        max_num_seqs: applied_input.max_num_seqs,
+        kv_cache_dtype: applied_input.kv_cache_dtype.clone(),
+        gpu_memory_utilization: applied_input.gpu_memory_utilization,
+    };
+
+    let applied = tentaflow_protocol::DeployVllmConfig {
+        tensor_parallel: applied_input.tensor_parallel,
+        pipeline_parallel: applied_input.pipeline_parallel,
+        max_model_len: applied_input.max_model_len,
+        max_num_seqs: applied_input.max_num_seqs,
+        kv_cache_dtype: applied_input.kv_cache_dtype,
+        gpu_memory_utilization: applied_input.gpu_memory_utilization,
+    };
+
+    let gpu_compatibility = tentaflow_protocol::DeployVllmGpuCompatibility {
+        used_tp: gpu_compat.used_tp,
+        used_pp: gpu_compat.used_pp,
+        uses_all_gpus: gpu_compat.uses_all_gpus,
+        clean_partition: gpu_compat.clean_partition,
+        better_gpu_counts: gpu_compat.better_gpu_counts,
+        warning: gpu_compat.warning,
+    };
+
+    Ok(MessageBody::DeployVllmRecommendResponseBody(
+        tentaflow_protocol::DeployVllmRecommendResponse {
+            model_spec,
+            vram_estimate,
+            recommended,
+            max_supported_model_len,
+            max_supported_num_seqs,
+            recommended_vllm_args,
+            warnings,
+            gpu_compatibility,
+            applied,
+            auto_adjusted,
+            at_limit,
+        },
+    ))
 }
 
 // =============================================================================

@@ -5,64 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Serwis AI z bazy danych
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbService {
-    pub id: i64,
-    pub name: String,
-    pub service_type: String,
-    pub strategy: String,
-    pub model_category: Option<String>,
-    pub status: String,
-    pub config_json: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub service_uuid: Option<String>,
-    pub node_id: Option<String>,
-    /// MemoryGuard pinning — true = zawsze warm, nie evict, autostart on boot.
-    #[serde(default)]
-    pub pinned: bool,
-    /// MemoryGuard pause — true = nie startuj autostart, request odrzucany.
-    #[serde(default)]
-    pub paused: bool,
-    /// Szacowana pamiec VRAM/RAM modelu w MB (NULL = uzyj heurystyki).
-    #[serde(default)]
-    pub vram_estimate_mb: Option<u64>,
-    /// Sha256 of the container source tree captured at deploy time.
-    /// Compared against the compile-time manifest hash to flag updates.
-    /// NULL for rows created before migration 56.
-    #[serde(default)]
-    pub deployed_source_hash: Option<String>,
-}
-
-/// Backend serwisu
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbServiceBackend {
-    pub id: i64,
-    pub service_id: i64,
-    pub connection_type: String,
-    pub config_json: String,
-    pub max_concurrent: i64,
-    pub timeout_ms: i64,
-    pub weight: i64,
-    pub model_name_override: Option<String>,
-    pub health_check_path: Option<String>,
-    pub is_active: bool,
-}
-
-/// Parametry tworzenia nowego backendu
-#[derive(Debug, Clone)]
-pub struct NewBackend<'a> {
-    pub service_id: i64,
-    pub connection_type: &'a str,
-    pub config_json: &'a str,
-    pub max_concurrent: i64,
-    pub timeout_ms: i64,
-    pub weight: i64,
-    pub model_name_override: Option<&'a str>,
-    pub health_check_path: Option<&'a str>,
-}
-
 /// Klucz API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbApiKey {
@@ -77,14 +19,6 @@ pub struct DbApiKey {
     /// Migracja 51 — nullable. None = legacy admin-equivalent.
     #[serde(default)]
     pub owner_user_id: Option<i64>,
-}
-
-/// Alias serwisu
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbServiceAlias {
-    pub id: i64,
-    pub alias: String,
-    pub target_service_id: i64,
 }
 
 /// Ustawienie

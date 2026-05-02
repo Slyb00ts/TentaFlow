@@ -195,15 +195,12 @@ impl Router {
                             Ok(backend.chat_completion(req).await?)
                         }
                         BackendHandle::MeshForward(node_id, svc) => {
-                            // Iroh obsluguje multi-hop routing przez relay automatycznie —
-                            // wywolanie `route_to_quic_llm` z nazwa uslugi dziala tak samo
-                            // jak dla direct peera.
                             debug!(
                                 target_node = %node_id,
                                 service = %svc,
                                 "MeshForward — wysylam chat request do zdalnej uslugi mesh"
                             );
-                            this.route_to_quic_llm(svc.clone(), req, None, None).await
+                            this.route_to_mesh_llm(node_id.clone(), svc.clone(), req).await
                         }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
                     }
@@ -546,7 +543,6 @@ impl Router {
             }
         };
 
-        // TODO: pobierac progi z ustawien DB (speaker_confidence_high, speaker_confidence_medium)
         let speaker_operation = AudioOperation::SpeakerIdentifyWithConfidence {
             audio_data: audio_data.to_vec(),
             high_threshold: Some(0.78),
@@ -971,6 +967,110 @@ impl Router {
         }
     }
 
+    pub(crate) async fn forward_model_request_to_mesh(
+        &self,
+        target_node_id: &str,
+        model_request: ModelRequest,
+    ) -> Result<ModelResponse> {
+        let request_id = model_request.request_id.clone();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
+            .map_err(|e| anyhow::anyhow!("mesh forward serialize ModelRequest: {}", e))?
+            .into_vec();
+        let mesh = self
+            .mesh_manager
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("mesh transport not available"))?;
+        let response_bytes = mesh
+            .forward_request(target_node_id, &request_id, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("mesh forward request: {}", e))?;
+        let archived =
+            rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
+                .map_err(|e| anyhow::anyhow!("mesh forward access ModelResponse: {}", e))?;
+        rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived)
+            .map_err(|e| anyhow::anyhow!("mesh forward deserialize ModelResponse: {}", e).into())
+    }
+
+    pub(crate) async fn route_to_mesh_llm(
+        &self,
+        target_node_id: String,
+        target_model_name: String,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse> {
+        let protocol_messages = crate::routing::openai_messages_to_protocol(&request.messages);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let model_request = ModelRequest {
+            request_id,
+            payload: ModelPayload::Completion(CompletionPayload {
+                model: target_model_name,
+                prompt: None,
+                messages: protocol_messages,
+                temperature: request.temperature,
+                max_tokens: request.max_tokens,
+                top_p: request.top_p,
+                stop: request.stop.clone(),
+                presence_penalty: request.presence_penalty,
+                frequency_penalty: request.frequency_penalty,
+                tts_options: None,
+                memory_options: None,
+                audio_input: None,
+                prefix_cache_id: None,
+                prefix_text: None,
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+        let model_response = self
+            .forward_model_request_to_mesh(&target_node_id, model_request)
+            .await?;
+        match model_response.result {
+            ModelResult::Completion(completion_result) => {
+                let cleaned_text = self.response_middleware.clean_text(&completion_result.text)?;
+                let message = Message {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Text(cleaned_text)),
+                    reasoning_content: completion_result.reasoning_content,
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                Ok(ChatCompletionResponse {
+                    id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                    object: "chat.completion".to_string(),
+                    created: chrono::Utc::now().timestamp() as u64,
+                    model: completion_result.model,
+                    choices: vec![Choice {
+                        index: 0,
+                        message,
+                        finish_reason: completion_result.finish_reason.or(Some("stop".to_string())),
+                        logprobs: None,
+                    }],
+                    usage: Some(Usage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                    }),
+                    system_fingerprint: None,
+                    transcribed_text: completion_result.transcribed_text,
+                    speaker_id: completion_result.speaker_id,
+                    speaker_name: completion_result.speaker_name,
+                    speaker_confidence: None,
+                    detected_intent: completion_result.detected_intent,
+                    detected_tools: None,
+                })
+            }
+            ModelResult::Error(err) => Err(anyhow::anyhow!(
+                "mesh LLM error {:?}: {}",
+                err.error_type,
+                err.message
+            )
+            .into()),
+            _ => Err(anyhow::anyhow!("mesh LLM returned unexpected response type").into()),
+        }
+    }
+
     /// Startuje task obslugujacy callback requests od RAG engines.
     pub(crate) fn spawn_callback_handler(&self) {
         let callback_rx = self.get_callback_rx();
@@ -1286,8 +1386,6 @@ impl Router {
             }
 
             ModelPayload::Audio(audio_payload) => {
-                // TODO: Przenies obsluge audio callbacks (STT, Speaker operations) z oryginalnego kodu
-                // Pelna implementacja w stt.rs
                 match audio_payload.operation {
                     AudioOperation::TTS { .. } => {
                         warn!("AudioTTS callback not yet implemented");

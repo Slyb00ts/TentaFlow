@@ -11,6 +11,8 @@
 //   await I18n.setLanguage('fr');
 // =============================================================================
 
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+
 const STORAGE_KEY = 'tentaflow_lang';
 const DEFAULT_LANG = 'en';
 
@@ -113,24 +115,16 @@ function t(path, vars = null) {
 }
 
 // Próbuje pobrać zapisaną w backendzie preferencję języka. Best-effort:
-// brak sesji (401) jest cichy, błędy sieciowe nie blokują startu UI.
+// brak sesji jest cichy, błędy sieciowe nie blokują startu UI.
 //
-// Pre-check JWT w localStorage zanim odpalimy fetch — wczesniej kazdy
-// niezalogowany user dostawal 401 w DevTools Network/Console (nie da
-// sie tego stlumic z poziomu fetch po stronie JS, bo browser zawsze
-// loguje 4xx). Skip = brak nawet requestu zanim user sie zaloguje.
+// Pre-check JWT w localStorage zanim odpalimy request — niezalogowany user
+// nie powinien w ogole strzelac do backendu o preferencje.
 async function syncFromBackend() {
   try {
     if (typeof localStorage !== 'undefined' && !localStorage.getItem('tentaflow_jwt')) {
       return;
     }
-    const res = await fetch('/api/me/preferences', { credentials: 'include' });
-    if (res.status === 401) return;
-    if (!res.ok) {
-      console.warn('[i18n] syncFromBackend HTTP', res.status);
-      return;
-    }
-    const data = await res.json();
+    const data = await ApiBinary.one('mePreferencesGetRequest');
     if (data && typeof data.language === 'string'
         && SUPPORTED_LANGS.some((l) => l.code === data.language)
         && data.language !== currentLang) {
@@ -138,20 +132,14 @@ async function syncFromBackend() {
       applyDataI18n();
     }
   } catch (err) {
-    console.warn('[i18n] syncFromBackend network error', err);
+    console.warn('[i18n] syncFromBackend error', err);
   }
 }
 
-// Zapisuje wybór języka po stronie backendu. Zwraca status żeby caller
-// mógł odróżnić błąd HTTP (toast) od network error (cichy log).
+// Zapisuje wybór języka po stronie backendu. ApiBinary.action rzuca przy
+// bledzie protokolu — caller dostaje sciezke success/throw bez statusow HTTP.
 async function syncToBackend(lang) {
-  const res = await fetch('/api/me/preferences', {
-    method: 'PUT',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ language: lang }),
-  });
-  return res;
+  return await ApiBinary.action('mePreferencesUpdateRequest', { language: lang });
 }
 
 async function init() {
@@ -168,19 +156,15 @@ async function setLanguage(lang) {
   }
   await loadTranslations(lang);
   applyDataI18n();
-  // Backend sync best-effort — network error nie powinien blokować UI,
-  // więc rzucamy tylko gdy backend odpowiedział statusem 4xx/5xx.
+  // Backend sync best-effort — protokolowy blad (np. unsupported language code,
+  // brak sesji) re-throw zeby UI mogl pokazac toast; transport/network swallow.
   try {
-    const res = await syncToBackend(lang);
-    if (!res.ok && res.status !== 401) {
-      console.warn('[i18n] syncToBackend HTTP', res.status);
-      throw new Error(`HTTP ${res.status}`);
-    }
+    await syncToBackend(lang);
   } catch (err) {
-    if (err && err.message && err.message.startsWith('HTTP ')) {
+    if (err && typeof err.code === 'number') {
       throw err;
     }
-    console.warn('[i18n] syncToBackend network error', err);
+    console.warn('[i18n] syncToBackend transport error', err);
   }
   for (const listener of listeners) {
     try {

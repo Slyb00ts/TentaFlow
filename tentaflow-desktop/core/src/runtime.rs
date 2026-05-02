@@ -19,6 +19,7 @@ use tentaflow_core::mesh::pipeline::{
 use tentaflow_core::mesh::security::MeshSecurity;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
+use tentaflow_core::services_repo::services as services_v2_repo;
 use tentaflow_ui::state::{self as ui_state, SharedAppState, UiCommand};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -69,19 +70,53 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     router.start();
     info!("Router uruchomiony");
 
-    // Zaladuj serwisy QUIC z bazy danych (metoda w Core — wspolna dla Router.New, Desktop, Mobile)
-    router.load_db_services();
+    // Mesh services registry — agregator widokow `services` ze wszystkich zaufanych
+    // peerow. Pisze do niego pipeline mesh; czyta GUI/forwarding.
+    let mesh_services_registry = Arc::new(
+        tentaflow_core::services::mesh_registry::MeshServicesRegistry::new(),
+    );
 
-    // Ladowanie master key z pliku i inicjalizacja SettingsCipher (potrzebne
-    // dla restore_native_services, ktore deszyfruje sekrety w configu).
+    // Port allocator dla services_runtime. Rezerwuje porty zajete przez aktywne
+    // wiersze services_v2 zeby nie wydac ich rownoleglemu deployowi.
+    let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
+        use std::collections::HashSet;
+        use tentaflow_core::services::ports::PortAllocator;
+        use tentaflow_core::services_repo::services as services_v2_repo;
+
+        let services_runtime_cfg = config.services_runtime.clone();
+        let mut excluded: HashSet<u16> = HashSet::new();
+        if let Ok(conn) = db.lock() {
+            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
+                for row in rows {
+                    if let Some(p) = row.runtime_port {
+                        excluded.insert(p);
+                    }
+                    if let Some(p) = row.sidecar_quic_port {
+                        excluded.insert(p);
+                    }
+                }
+            }
+        }
+
+        match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
+            Ok(allocator) => Some(Arc::new(allocator)),
+            Err(e) => {
+                tracing::warn!(
+                    "Port allocator disabled: invalid port_range {:?}: {}",
+                    services_runtime_cfg.port_range,
+                    e
+                );
+                None
+            }
+        }
+    };
+
+    // Ladowanie master key z pliku i inicjalizacja SettingsCipher.
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
         .expect("Nie udalo sie zaladowac master key z pliku");
     let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
         &file_master_key,
     ));
-
-    // Przywroc natywne serwisy (in-process MLX/llama.cpp) z bazy
-    router.restore_native_services(&settings_cipher).await;
 
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
@@ -168,6 +203,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
             Some(db.clone()),
             settings_cipher.clone(),
             mesh_security.clone(),
+            mesh_services_registry.clone(),
         )
         .await
         {
@@ -208,6 +244,8 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
         local_node_id,
         mesh_security_for_server,
         mesh_relay_health_for_server,
+        services_port_allocator.clone(),
+        mesh_services_registry.clone(),
     )?;
 
     // Inference manager — juz obslugiwany przez restore_native_services() wyzej
@@ -321,34 +359,26 @@ fn sync_all_to_state(
     s.metrics.total_requests = total;
 
     // Services
-    if let Ok(services) = db::repository::list_services_with_backends(db) {
-        s.services = services
-            .iter()
-            .map(|(svc, backends)| {
-                let backend_names: Vec<String> = backends
-                    .iter()
-                    .map(|b| {
-                        b.model_name_override
-                            .clone()
-                            .unwrap_or_else(|| b.connection_type.clone())
-                    })
-                    .collect();
-                ui_state::ServiceInfo {
-                    id: svc.id,
-                    name: svc.name.clone(),
-                    service_type: parse_service_type(&svc.service_type),
-                    status: parse_service_status(&svc.status),
-                    quic_status: ui_state::QuicStatus::Disconnected,
-                    quic_address: String::new(),
-                    backends: backend_names,
-                    strategy: svc.strategy.clone(),
-                    avg_latency_ms: 0.0,
-                    created_at: Some(svc.created_at.clone()),
-                }
-            })
-            .collect();
-        s.metrics.active_services = s.services.len() as u64;
-    }
+    let services_rows = match db.lock() {
+        Ok(conn) => services_v2_repo::list_all(&conn).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    s.services = services_rows
+        .iter()
+        .map(|svc| ui_state::ServiceInfo {
+            id: svc.id,
+            name: svc.engine_id.clone(),
+            service_type: parse_service_type(&svc.category),
+            status: parse_service_status(svc.status.as_db_tag()),
+            quic_status: ui_state::QuicStatus::Disconnected,
+            quic_address: String::new(),
+            backends: vec![svc.transport.as_db_tag().to_string()],
+            strategy: svc.deploy_method.as_db_tag().to_string(),
+            avg_latency_ms: 0.0,
+            created_at: Some(svc.created_at.clone()),
+        })
+        .collect();
+    s.metrics.active_services = s.services.len() as u64;
 
     // Models
     if let Ok(models) = db::repository::list_model_entries(db, 0, 1000) {
@@ -737,13 +767,32 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         UiCommand::CreateService {
             name,
             service_type,
-            strategy,
+            strategy: _,
             config_json,
         } => {
-            db::repository::create_service(db, name, service_type, strategy, None, config_json)?;
+            // The legacy `strategy` field has no analogue in the migration-64 schema;
+            // it is silently dropped. Desktop GUI feature parity is tracked separately.
+            let new_service = services_v2_repo::NewService {
+                engine_id: name.clone(),
+                category: service_type.clone(),
+                display_name: name.clone(),
+                deploy_method: services_v2_repo::DeployMethod::NativeEmbedded,
+                transport: tentaflow_core::services::transport::Transport::Embedded,
+                status: services_v2_repo::ServiceStatus::Starting,
+                pinned: false,
+                paused: false,
+                runtime_pid: None,
+                runtime_port: None,
+                sidecar_quic_port: None,
+                endpoint_url: None,
+                config_json: config_json.clone(),
+            };
+            let conn = db.lock().map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
+            services_v2_repo::insert(&conn, &new_service)?;
         }
         UiCommand::DeleteService(id) => {
-            db::repository::delete_service(db, *id)?;
+            let conn = db.lock().map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
+            services_v2_repo::delete(&conn, *id)?;
         }
 
         // --- Models ---

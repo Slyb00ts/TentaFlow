@@ -265,7 +265,7 @@ fn xor_with_binding(stored: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Weryfikuje ze plik ma ograniczone uprawnienia (0600 na Unix; TODO ACL na Windows).
+/// Weryfikuje ze plik ma ograniczone uprawnienia (0600 na Unix; Windows ACL nie weryfikowane).
 fn verify_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

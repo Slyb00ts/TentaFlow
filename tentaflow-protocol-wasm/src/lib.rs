@@ -32,8 +32,10 @@ use tentaflow_protocol::{
         AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
         ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
-        ClusterUpdateRequest, FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
-        FlowVersionListRequest, FlowVersionRestoreRequest, MeshConnectRequest,
+        ClusterUpdateRequest, DeployVllmRecommendRequest,
+        FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
+        FlowVersionListRequest, FlowVersionRestoreRequest, MePreferencesGetRequest,
+        MePreferencesUpdateRequest, MeshConnectRequest,
         MeshNodeCommandRequest, MeshNodeNetworkConfigRequest, MeshPairInitRequest,
         MeshPairingConfirmRequest, MeshPairingRejectRequest, MeshPairingStartRequest,
         MeshTrustRetrustRequest, MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest,
@@ -295,6 +297,26 @@ pub fn encode_auth_login_request(username: String, password: String) -> Result<V
 #[wasm_bindgen(js_name = encodeAuthMeRequest)]
 pub fn encode_auth_me_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AuthMeRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::MePreferencesGetRequest (unit variant).
+#[wasm_bindgen(js_name = encodeMePreferencesGetRequest)]
+pub fn encode_me_preferences_get_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MePreferencesGetRequestBody(
+        MePreferencesGetRequest {},
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::MePreferencesUpdateRequest { language }.
+#[wasm_bindgen(js_name = encodeMePreferencesUpdateRequest)]
+pub fn encode_me_preferences_update_request(
+    language: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MePreferencesUpdateRequestBody(
+        MePreferencesUpdateRequest { language },
+    ))
+    .map_err(|e| JsError::new(&e))
 }
 
 /// MessageBody::ChatStreamRequest — przyjmuje JSON string messages, parsuje
@@ -2163,6 +2185,30 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             );
             set(&obj, "username", resp.username.into());
             set(&obj, "role", resp.role.into());
+        }
+        MessageBody::MePreferencesGetRequestBody(_) => {
+            set(&obj, "variant", "MePreferencesGetRequest".into());
+        }
+        MessageBody::MePreferencesGetResponseBody(resp) => {
+            set(&obj, "variant", "MePreferencesGetResponse".into());
+            match resp.language {
+                Some(s) => set(&obj, "language", s.into()),
+                None => set(&obj, "language", JsValue::NULL),
+            }
+        }
+        MessageBody::MePreferencesUpdateRequestBody(req) => {
+            set(&obj, "variant", "MePreferencesUpdateRequest".into());
+            match req.language {
+                Some(s) => set(&obj, "language", s.into()),
+                None => set(&obj, "language", JsValue::NULL),
+            }
+        }
+        MessageBody::MePreferencesUpdateResponseBody(resp) => {
+            set(&obj, "variant", "MePreferencesUpdateResponse".into());
+            match resp.language {
+                Some(s) => set(&obj, "language", s.into()),
+                None => set(&obj, "language", JsValue::NULL),
+            }
         }
         MessageBody::ChatStreamRequestBody(req) => {
             set(&obj, "variant", "ChatStreamRequest".into());
@@ -4482,6 +4528,19 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ProfilingBody(payload) => {
             profiling_payload_fill_obj(&obj, &payload);
         }
+        MessageBody::DeployVllmRecommendRequestBody(_) => {
+            // Request nigdy nie wraca do GUI jako odpowiedz — wystarczy variant tag.
+            set(&obj, "variant", "DeployVllmRecommendRequest".into());
+        }
+        MessageBody::DeployVllmRecommendResponseBody(payload) => {
+            set(&obj, "variant", "DeployVllmRecommendResponse".into());
+            // Cala odpowiedz ma 60+ pol w 4 zagniezdzonych structach — zamiast
+            // recznie kopiowac kazdy field, serializujemy do JSON i zwracamy
+            // jako pojedynczy string. GUI robi JSON.parse() na polu `json`.
+            let json = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{}".to_string());
+            set(&obj, "json", json.into());
+        }
     }
     Ok(obj.into())
 }
@@ -5781,6 +5840,16 @@ pub fn encode_addon_install_request(
         content,
     }))
     .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::DeployVllmRecommendRequest. Plynnie przyjmuje JSON
+/// (pelne struct DeployVllmRecommendRequest serializowane przez GUI).
+#[wasm_bindgen(js_name = encodeDeployVllmRecommendRequest)]
+pub fn encode_deploy_vllm_recommend_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    let payload: DeployVllmRecommendRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
+    encode_body_inner(&MessageBody::DeployVllmRecommendRequestBody(payload))
+        .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeAddonUninstallRequest)]
