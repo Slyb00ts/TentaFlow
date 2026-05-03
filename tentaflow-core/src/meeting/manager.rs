@@ -88,7 +88,7 @@ pub const DEFAULT_FLOW_ALIAS: &str = "teams-flow";
 pub const DEFAULT_LLM_ALIAS: &str = "teams-llm";
 /// Aliasy vision dla sesji meeting bota — face detection (SCRFD/YOLOv8-Face)
 /// i emotion classifier (HSEmotion). Pipeline per-uczestnik w
-/// `routing/reverse_request.rs::VideoFrame` rozwiązuje te aliasy do
+/// `mesh/inference_proxy.rs::VideoFrame` rozwiązuje te aliasy do
 /// `service_name` zarejestrowanego w `vision::registry`. Pusty target =
 /// pipeline pomija inferencję (debug log), nie panikuje.
 pub const DEFAULT_VISION_FACE_ALIAS: &str = "teams-vision-face";
