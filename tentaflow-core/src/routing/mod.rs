@@ -8,8 +8,6 @@ pub mod chat;
 pub mod chat_template;
 pub mod embeddings;
 pub mod live_metrics;
-pub mod local_stt;
-pub mod meeting_transcript;
 pub mod middleware;
 pub mod router;
 pub mod stream_helpers;
