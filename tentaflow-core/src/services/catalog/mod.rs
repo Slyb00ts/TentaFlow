@@ -33,8 +33,9 @@ pub enum ServiceSurface {
 
 impl ServiceSurface {
     /// Best-effort inference from a manifest's `engine.category`. Returns
-    /// `None` for categories that have no surface mapping yet (will be
-    /// populated when manifests get explicit `service_surfaces` in R2g).
+    /// `None` for categories that have no surface mapping yet — fall
+    /// back path used when a manifest does not declare `service_surfaces`
+    /// explicitly.
     pub fn from_manifest_category(category: &str) -> Option<Self> {
         match category {
             "llm" => Some(Self::Chat),
@@ -57,7 +58,6 @@ impl ServiceSurface {
             "stt" => Some(Self::Stt),
             "tts" => Some(Self::Tts),
             "embedding" | "embeddings" => Some(Self::Embeddings),
-            "rag" => Some(Self::Chat),
             "rerank" | "reranker" => Some(Self::Rerank),
             "image-gen" | "image_gen" => Some(Self::ImageGen),
             "documents" => Some(Self::Documents),
@@ -82,6 +82,24 @@ impl ServiceSurface {
             Self::Agents => "agents",
         }
     }
+
+    /// Reverse of `as_wire_str`. Returns `None` for unknown strings rather
+    /// than mapping them to a default — manifest validation already
+    /// guarantees the vocabulary, so anything unexpected is a logic error
+    /// upstream and must not be silently coerced.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "chat" => Some(Self::Chat),
+            "embeddings" => Some(Self::Embeddings),
+            "stt" => Some(Self::Stt),
+            "tts" => Some(Self::Tts),
+            "rerank" => Some(Self::Rerank),
+            "image_gen" => Some(Self::ImageGen),
+            "documents" => Some(Self::Documents),
+            "agents" => Some(Self::Agents),
+            _ => None,
+        }
+    }
 }
 
 impl InputModality {
@@ -91,6 +109,18 @@ impl InputModality {
             Self::Text => "text",
             Self::Image => "image",
             Self::Audio => "audio",
+        }
+    }
+
+    /// Reverse of `as_wire_str`. Unknown values return `None`; manifest
+    /// validation already rejects them, but the catalog accepts only what
+    /// it can map so an out-of-band string can never sneak past as `Text`.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "text" => Some(Self::Text),
+            "image" => Some(Self::Image),
+            "audio" => Some(Self::Audio),
+            _ => None,
         }
     }
 }
@@ -103,6 +133,17 @@ impl OutputModality {
             Self::Audio => "audio",
             Self::Embedding => "embedding",
             Self::Image => "image",
+        }
+    }
+
+    /// Reverse of `as_wire_str`. See `InputModality::from_wire_str`.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "text" => Some(Self::Text),
+            "audio" => Some(Self::Audio),
+            "embedding" => Some(Self::Embedding),
+            "image" => Some(Self::Image),
+            _ => None,
         }
     }
 }
@@ -135,6 +176,14 @@ pub enum OutputModality {
 
 /// One node hosting a model. The catalog aggregates instances across the mesh
 /// so `/v1/models` shows a single id even when several nodes serve it.
+///
+/// Per-instance `input_modalities` carries the effective input modality
+/// list resolved from the *originating* service's manifest. Two instances
+/// of the same `model_name` served by different engines can disagree on
+/// modalities, so dispatch must filter instances by the request modality
+/// before dispatching — otherwise an audio request can be sent to a
+/// text-only instance just because some other peer happens to expose the
+/// same model name as audio-capable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInstance {
     pub node_id: String,
@@ -144,6 +193,10 @@ pub struct ModelInstance {
     pub backend: Option<String>,
     pub size_mb: Option<u64>,
     pub loaded: bool,
+    #[serde(default)]
+    pub input_modalities: Vec<InputModality>,
+    #[serde(default)]
+    pub output_modalities: Vec<OutputModality>,
 }
 
 /// Strategy used to pick among an alias's primary + fallback targets at

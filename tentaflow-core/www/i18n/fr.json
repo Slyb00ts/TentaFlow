@@ -245,6 +245,7 @@
     "alias_active": "Actif",
     "alias_inactive": "Inactif",
     "alias_required": "Nom et cible requis",
+    "alias_fallback_parse_failed": "Impossible de lire les fallbacks existants (format invalide). Rechargez la page ou ajoutez à nouveau les fallbacks avant d'enregistrer.",
     "alias_created": "Alias créé",
     "alias_updated": "Alias mis à jour",
     "alias_deleted": "Alias « {name} » supprimé",
@@ -524,10 +525,6 @@
       "reranker": {
         "name": "Reranker",
         "desc": "Reranking des résultats de recherche. Cross-encoder pour un scoring précis des documents."
-      },
-      "rag": {
-        "name": "RAG Engine",
-        "desc": "Retrieval-Augmented Generation. Recherche dans la base de connaissances et génération de réponses."
       },
       "tools": {
         "name": "Tools",
@@ -912,7 +909,6 @@
     "categories": {
       "trigger": "Déclencheurs",
       "service": "Services IA",
-      "rag": "RAG",
       "transform": "Transformations",
       "logic": "Logique",
       "filter": "Filtres",
@@ -978,7 +974,6 @@
     "node_names": {
       "trigger": "Trigger",
       "llm": "Appel LLM",
-      "rag": "Recherche RAG",
       "stt": "Parole vers texte",
       "tts": "Texte vers parole",
       "embeddings": "Embeddings",
@@ -998,7 +993,6 @@
     "node_descriptions": {
       "trigger": "Point d'entrée du flow (HTTP, QUIC, webhook)",
       "llm": "Appel LLM — envoie le prompt et renvoie la réponse",
-      "rag": "Recherche dans la base de connaissances — renvoie le contexte pour le LLM",
       "stt": "Transcription de la parole vers texte",
       "tts": "Synthèse de texte vers parole",
       "embeddings": "Génération d'embeddings de texte",
@@ -1061,7 +1055,7 @@
     "status_archived": "Archivé",
     "status_draft": "Brouillon",
     "list_title": "Flux",
-    "subtitle": "Graphe DAG exécuté par flow_engine — LLM, embeddings, TTS, RAG.",
+    "subtitle": "Graphe DAG exécuté par flow_engine — LLM, embeddings, TTS.",
     "empty_title": "Aucun flux",
     "empty_desc": "Crée ton premier flux pour définir un graphe de traitement.",
     "new_flow_btn": "Nouveau flux",

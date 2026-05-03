@@ -69,7 +69,7 @@ pub struct AddonManifest {
     /// Slowa kluczowe addona (PL+EN) do semantic retrieval
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// Kategoria addona (np. "communication", "rag", "storage", "ai")
+    /// Kategoria addona (np. "communication", "storage", "ai")
     pub category: Option<String>,
     /// Identyfikator ikony sprite (np. "meeting") z pola `[addon].icon`.
     pub icon: Option<String>,

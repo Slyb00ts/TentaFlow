@@ -2,7 +2,7 @@
 // Plik: flow_engine/adapters/mod.rs
 // Opis: Modul adapterow wezlow Flow Engine - most miedzy DAG a serwisami
 //       routera. Kazdy adapter implementuje trait NodeAdapter i deleguje
-//       wykonanie do odpowiedniego backendu (LLM, RAG, STT, TTS itd.).
+//       wykonanie do odpowiedniego backendu (LLM, STT, TTS itd.).
 // =============================================================================
 
 pub mod condition;
@@ -12,7 +12,6 @@ pub mod llm;
 pub mod memory;
 pub mod output;
 pub mod pii_filter;
-pub mod rag;
 pub mod session_context;
 pub mod speaker_context;
 pub mod stt;
@@ -44,7 +43,7 @@ pub trait NodeAdapter: Send + Sync {
         ctx: &mut FlowContext,
     ) -> impl std::future::Future<Output = Result<Value>> + Send;
 
-    /// Nazwa typu wezla ktory ten adapter obsluguje (np. "llm", "rag")
+    /// Nazwa typu wezla ktory ten adapter obsluguje (np. "llm", "stt")
     fn node_type(&self) -> &'static str;
 
     /// Czy adapter wspiera streaming (domyslnie nie)

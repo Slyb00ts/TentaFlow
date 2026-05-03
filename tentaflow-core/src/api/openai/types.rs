@@ -17,68 +17,6 @@ use serde::{Deserialize, Serialize};
 // CHAT COMPLETIONS - TEXT & VISION
 // =============================================================================
 
-/// RAG-specific options dla requestow do modeli RAG.
-///
-/// Opcjonalne pole w ChatCompletionRequest ktore klient moze wypelnic
-/// gdy wybiera model RAG (np. "tentaflow-rag-standard").
-///
-/// Parametry:
-/// - `top_k`: Ile maksymalnie dokumentow zwrocic (domyslnie 5)
-/// - `min_similarity`: Prog podobienstwa 0.0-1.0 (domyslnie 0.7)
-/// - `use_reranking`: Czy uzyc cross-encoder reranking (domyslnie false)
-/// - `requires_llm`: Czy odpowiedz wymaga przetworzenia przez LLM (domyslnie true)
-/// - `requires_audio`: Czy wygenerowac audio output/TTS (domyslnie false)
-/// - `search_modes`: Lista silnikow wyszukiwania (domyslnie [VectorSearch, FullTextSearch])
-/// - `llm_model`: Model LLM do uzycia gdy requires_llm=true (domyslnie "gpt-4-turbo")
-/// - `tts_model`: Model TTS do uzycia gdy requires_audio=true (domyslnie "tts-1")
-/// - `tts_voice`: Glos TTS do uzycia gdy requires_audio=true (domyslnie "alloy")
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RAGOptions {
-    /// Ile maksymalnie dokumentow/chunkow zwrocic (domyslnie 5)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
-
-    /// Prog minimalnego podobienstwa 0.0-1.0 (domyslnie 0.7)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_similarity: Option<f32>,
-
-    /// Czy uzyc cross-encoder reranking (domyslnie false)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub use_reranking: Option<bool>,
-
-    /// Czy odpowiedz wymaga przetworzenia przez LLM (domyslnie true)
-    /// - true: RAG zwraca prompt dla LLM, Router streamuje przez LLM
-    /// - false: RAG zwraca finalna odpowiedz bezposrednio
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requires_llm: Option<bool>,
-
-    /// Czy wygenerowac audio output przez TTS (domyslnie false)
-    /// MUSI byc false gdy requires_llm=false
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requires_audio: Option<bool>,
-
-    /// Lista silnikow wyszukiwania do uzycia
-    /// Mozliwe wartosci: "FullTextSearch", "VectorSearch", "HiRAG", "GSW"
-    /// Domyslnie: ["VectorSearch", "FullTextSearch"]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub search_modes: Option<Vec<String>>,
-
-    /// Model LLM do uzycia gdy requires_llm=true (domyslnie "gpt-4-turbo")
-    /// Uzywany przez Router do przetworzenia context_text z RAG
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_model: Option<String>,
-
-    /// Model TTS do uzycia gdy requires_audio=true (domyslnie "tts-1")
-    /// Uzywany przez Router do konwersji tekstu na audio
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tts_model: Option<String>,
-
-    /// Glos TTS do uzycia gdy requires_audio=true (domyslnie "alloy")
-    /// Mozliwe wartosci: "alloy", "echo", "fable", "onyx", "nova", "shimmer"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tts_voice: Option<String>,
-}
-
 /// Memory-specific options dla integracji z TentaFlow.Memory.
 ///
 /// Opcjonalne pole w ChatCompletionRequest ktore klient moze wypelnic
@@ -181,11 +119,6 @@ pub struct ChatCompletionRequest {
     /// Liczba completion choices do wygenerowania (n)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
-
-    /// RAG-specific options (dla modeli RAG jak "tentaflow-rag-*")
-    /// Pole niestandardowe - ignorowane przez standardowe modele LLM
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rag_options: Option<RAGOptions>,
 
     /// Memory-specific options dla integracji z TentaFlow.Memory
     /// Pole niestandardowe - uzywane gdy wlaczona pamiec kontekstowa
@@ -644,6 +577,36 @@ pub struct TTSRequest {
 // AUDIO STT (SPEECH-TO-TEXT, WHISPER)
 // =============================================================================
 
+/// R2d (D.3): pierwszorzedne opcje STT — speaker identification, diarization,
+/// per-segment timestamps, format wyjscia. Ten typ jest source of truth dla
+/// `SttRuntime`; `TranscriptionRequest.options` przenosi je razem z klasycznym
+/// requestem OpenAI-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SttRequestOptions {
+    /// Czy probowac dopasowac mowcow do bazy (Memory.persons / `voice_samples`).
+    /// Domyslnie false zeby zachowac OpenAI-compatible zachowanie dla klientow
+    /// nieswiadomych speaker logiki.
+    #[serde(default)]
+    pub speaker_identification: bool,
+
+    /// Czy uruchomic diarization (oddzielenie wielu mowcow w jednym audio).
+    /// Wynik trafia do `TranscriptionResponse.speakers` jako lista
+    /// `SpeakerSegment` z timestampami i etykietami.
+    #[serde(default)]
+    pub diarization: bool,
+
+    /// Granularnosc timestampow: "segment" (default) lub "word" — odpowiada
+    /// OpenAI `timestamp_granularities[]` w multiparcie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamps: Option<String>,
+
+    /// Format wyjsciowy: "json", "text", "srt", "verbose_json", "vtt".
+    /// `verbose_json` jest jedyny ktory ma prawo zwracac `segments` i
+    /// `speakers`; pozostale formaty pomijaja oba pola.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+}
+
 /// Request do /v1/audio/transcriptions
 ///
 /// To jest multipart/form-data request, wiec serializacja bedzie
@@ -690,6 +653,13 @@ pub struct TranscriptionRequest {
     /// Maksymalny compression_ratio dla segmentu
     /// Segmenty z compression_ratio > threshold zostana odfiltrowane
     pub compression_ratio_threshold: Option<f32>,
+
+    /// R2d: opcje pierwszorzedne (D.3). Domyslne wartosci zachowuja
+    /// OpenAI-compatible zachowanie (brak speaker ID, brak diarization).
+    /// Klasyczne `response_format` / `timestamp_granularities` zostaja dla
+    /// kompatybilnosci wstecznej; `options.response_format` /
+    /// `options.timestamps` maja pierwszenstwo gdy ustawione.
+    pub options: SttRequestOptions,
 }
 
 /// Response z /v1/audio/transcriptions
@@ -710,6 +680,41 @@ pub struct TranscriptionResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<TranscriptionSegment>>,
+
+    /// R2d (D.3): pierwszorzedne segmenty mowcow z diarization. Wypelniane
+    /// gdy request mial `options.diarization=true`. Niezalezne od `segments`
+    /// bo agregacja odbywa sie na granicach mowcow, nie na granicach
+    /// segmentow whisper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speakers: Option<Vec<SpeakerSegment>>,
+}
+
+/// R2d (D.3): segment przypisany jednemu mowcy. Zwracany w polu
+/// `TranscriptionResponse.speakers` gdy `options.diarization=true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerSegment {
+    /// Czas startu segmentu w sekundach.
+    pub start: f32,
+
+    /// Czas konca segmentu w sekundach.
+    pub end: f32,
+
+    /// Tekst wypowiedziany przez tego mowce w tym segmencie.
+    pub text: String,
+
+    /// Etykieta mowcy. Anonimowy mowca: "SPEAKER_00", "SPEAKER_01", ...
+    /// Rozpoznany z bazy: nazwa osoby (np. "Jan Kowalski") gdy
+    /// `options.speaker_identification=true` i similarity >= threshold.
+    pub speaker_label: String,
+
+    /// ID rozpoznanego mowcy z bazy persons (None gdy anonimowy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_id: Option<String>,
+
+    /// Similarity score 0.0-1.0 z bazy mowcow (None gdy nie probowalismy
+    /// dopasowac albo brak dopasowania).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f32>,
 }
 
 /// Segment w transkrypcji (verbose_json)

@@ -94,7 +94,7 @@ impl Router {
             let voice_c = voice.clone();
             let format_c = format.to_string();
             let language_c = language.clone();
-            self.dispatch_with_fallback(model, 0, |handle| {
+            self.dispatch_with_fallback(model, 0, Some(crate::services::catalog::InputModality::Text), |handle| {
                 let this = this.clone();
                 let model_c = model_c.clone();
                 let input_c = input_c.clone();

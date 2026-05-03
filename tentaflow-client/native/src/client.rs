@@ -4,7 +4,7 @@
 //
 // CEL:
 // Klient QUIC do komunikacji z TentaFlow.Router przez protokół QUIC z TLS.
-// Obsługuje wszystkie typy requestów (Embeddings, Completion, RAG, TTS, STT)
+// Obsługuje wszystkie typy requestów (Embeddings, Completion, TTS, STT)
 // oraz automatyczny reconnect po utracie połączenia.
 //
 // JAK DZIAŁA:
@@ -163,49 +163,6 @@ pub struct ChatCompletionOptions {
     pub stream: bool,
     /// Audio input - jeśli podane, Router przetworzy przez STT
     pub audio_input: Option<Vec<u8>>,
-}
-
-/// Dokument zawierający dany chunk.
-#[derive(Debug, Clone)]
-pub struct ChunkDocumentData {
-    /// Identyfikator dokumentu
-    pub doc_id: String,
-    /// Metadane dokumentu (key-value pairs)
-    pub metadata: Vec<(String, String)>,
-}
-
-/// Pojedynczy chunk z wyników RAG.
-#[derive(Debug, Clone)]
-pub struct RagChunkData {
-    /// Identyfikator chunka
-    pub chunk_id: String,
-    /// Treść chunka
-    pub chunk_text: String,
-    /// Plik źródłowy
-    pub source_file: String,
-    /// Typ źródła (pdf, docx, txt, etc.)
-    pub source_type: String,
-    /// Score podobieństwa (0.0-1.0)
-    pub similarity_score: f32,
-    /// Pozycja w rankingu (1 = najlepszy)
-    pub rank: u32,
-    /// Indeks chunka w dokumencie
-    pub chunk_index: u32,
-    /// Lista dokumentów zawierających ten chunk
-    pub documents: Vec<ChunkDocumentData>,
-}
-
-/// Pełny wynik zapytania RAG.
-#[derive(Debug, Clone)]
-pub struct RagResponseData {
-    /// Tekst odpowiedzi lub kontekst
-    pub response: String,
-    /// Liczba znalezionych chunków
-    pub chunks_found: u32,
-    /// Czy wymaga dalszego przetwarzania LLM
-    pub requires_llm: bool,
-    /// Szczegółowe informacje o chunkach
-    pub chunks: Vec<RagChunkData>,
 }
 
 /// Segment transkrypcji z metrykami jakości (dla verbose_json).
@@ -1444,152 +1401,6 @@ impl TentaFlowClient {
         }
     }
 
-    /// Wysyła request RAG z pełną kontrolą wszystkich parametrów.
-    ///
-    /// # Parametry
-    /// - `query`: Zapytanie użytkownika
-    /// - `top_k`: Maksymalna liczba wyników
-    /// - `min_similarity`: Minimalny próg podobieństwa (0.0-1.0)
-    /// - `search_modes`: Tryby wyszukiwania (None = VectorSearch)
-    /// - `use_reranking`: Czy użyć rerankingu (None = false)
-    /// - `requires_llm`: Czy przetworzyć przez LLM (None = false)
-    /// - `requires_audio`: Czy wygenerować audio (None = false)
-    ///
-    /// # Zwraca
-    /// - RagResponseData z pełnymi informacjami o chunkach
-    pub async fn rag(
-        &self,
-        query: &str,
-        top_k: u32,
-        min_similarity: f32,
-        search_modes: Option<Vec<SearchMode>>,
-        use_reranking: Option<bool>,
-        requires_llm: Option<bool>,
-        requires_audio: Option<bool>,
-    ) -> Result<RagResponseData> {
-        let modes = search_modes.unwrap_or_else(|| vec![SearchMode::VectorSearch]);
-
-        let request = ModelRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            payload: ModelPayload::RAG(RAGPayload {
-                query: query.to_string(),
-                context: None,
-                params: RAGParams {
-                    top_k,
-                    min_similarity,
-                    use_reranking,
-                },
-                requires_llm_processing: requires_llm.unwrap_or(false),
-                requires_audio_output: requires_audio.unwrap_or(false),
-                search_modes: modes,
-            }),
-            stream: false,
-            metadata: None,
-            session_id: None,
-        };
-
-        let response = self.send_request(request).await?;
-
-        match response.result {
-            ModelResult::RAG(result) => {
-                let chunks: Vec<RagChunkData> = result.metadata.into_iter().map(|m| {
-                    // Konwertuj dokumenty z Protocol na client
-                    let documents: Vec<ChunkDocumentData> = m.documents.into_iter().map(|d| {
-                        ChunkDocumentData {
-                            doc_id: d.doc_id,
-                            metadata: d.metadata,
-                        }
-                    }).collect();
-
-                    RagChunkData {
-                        chunk_id: m.chunk_id,
-                        chunk_text: m.chunk_text,
-                        source_file: m.source_file,
-                        source_type: m.source_type,
-                        similarity_score: m.similarity_score,
-                        rank: m.rank,
-                        chunk_index: m.chunk_index,
-                        documents,
-                    }
-                }).collect();
-
-                let chunks_count = chunks.len() as u32;
-
-                Ok(RagResponseData {
-                    response: result.context_text,
-                    chunks_found: chunks_count,
-                    requires_llm: result.requires_llm_processing,
-                    chunks,
-                })
-            }
-            ModelResult::Error(e) => anyhow::bail!("RAG error: {}", e.message),
-            _ => anyhow::bail!("Unexpected response type"),
-        }
-    }
-
-    /// Dodaje dokument do RAG (indeksowanie).
-    ///
-    /// # Parametry
-    /// - `document_id`: Unikalny ID dokumentu
-    /// - `content`: Treść dokumentu (tekst lub plik binarny)
-    /// - `metadata`: Metadata dokumentu (key-value pairs)
-    /// - `index_flags`: Lista indeksów do użycia (puste = wszystkie)
-    ///
-    /// # Zwraca
-    /// - (chunk_count, vector_count, indexed_in) - statystyki indeksowania
-    pub async fn ingest_document(
-        &self,
-        document_id: &str,
-        content: DocumentContent,
-        metadata: Vec<(String, String)>,
-        index_flags: Vec<String>,
-    ) -> Result<IngestResponse> {
-        let request = IngestRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            document_id: document_id.to_string(),
-            content,
-            metadata,
-            index_flags,
-        };
-
-        let response = self.send_ingest_request(request).await?;
-        Ok(response)
-    }
-
-    /// Dodaje dokument tekstowy do RAG.
-    pub async fn ingest_text(
-        &self,
-        document_id: &str,
-        text: &str,
-        metadata: Vec<(String, String)>,
-    ) -> Result<IngestResponse> {
-        self.ingest_document(
-            document_id,
-            DocumentContent::Text(text.to_string()),
-            metadata,
-            vec![],
-        ).await
-    }
-
-    /// Dodaje plik binarny do RAG.
-    pub async fn ingest_file(
-        &self,
-        document_id: &str,
-        filename: &str,
-        data: Vec<u8>,
-        metadata: Vec<(String, String)>,
-    ) -> Result<IngestResponse> {
-        self.ingest_document(
-            document_id,
-            DocumentContent::FileData(FileDataContent {
-                data,
-                filename: filename.to_string(),
-            }),
-            metadata,
-            vec![],
-        ).await
-    }
-
     /// Wysyła ModelRequest i odbiera ModelResponse.
     ///
     /// Używa get_connection() więc automatycznie próbuje reconnect jeśli potrzebne.
@@ -1626,66 +1437,6 @@ impl TentaFlowClient {
 
         let response: ModelResponse = rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived)
             .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
-
-        Ok(response)
-    }
-
-    /// Wysyła IngestRequest i odbiera IngestResponse.
-    ///
-    /// Używa MESSAGE_TYPE_INGEST_REQUEST (0x02) jako bajtu dyskryminatora.
-    /// Używa get_connection() więc automatycznie próbuje reconnect jeśli potrzebne.
-    async fn send_ingest_request(&self, request: IngestRequest) -> Result<IngestResponse> {
-        // Pobierz połączenie (z auto-reconnect)
-        let conn = self.get_connection().await?;
-
-        // Otwórz strumień bidirektionalny
-        let (mut send, mut recv) = conn.open_bi().await?;
-
-        // Serialize request with rkyv
-        let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
-            .map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?;
-
-        // Debug: pokaż pierwsze bajty serializacji
-        let preview_len = std::cmp::min(32, request_bytes.len());
-        info!(
-            "Serialized IngestRequest: {} bytes, first {}: {:02X?}",
-            request_bytes.len(),
-            preview_len,
-            &request_bytes[..preview_len]
-        );
-
-        // Prepend message type discriminator
-        let mut payload = Vec::with_capacity(1 + request_bytes.len());
-        payload.push(MESSAGE_TYPE_INGEST_REQUEST);
-        payload.extend_from_slice(&request_bytes);
-
-        debug!("Sending ingest request: {} bytes", payload.len());
-
-        // Send request
-        send.write_all(&payload).await?;
-        send.finish()?;
-
-        // Receive response (IngestResponse może być do 100MB dla dużych dokumentów)
-        let response_bytes = recv.read_to_end(100 * 1024 * 1024).await?;
-
-        debug!("Received ingest response: {} bytes", response_bytes.len());
-
-        if response_bytes.is_empty() {
-            anyhow::bail!("Empty response from server");
-        }
-
-        // Deserialize response
-        let archived = rkyv::access::<ArchivedIngestResponse, rkyv::rancor::Error>(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
-
-        let response: IngestResponse = rkyv::deserialize::<IngestResponse, rkyv::rancor::Error>(archived)
-            .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))?;
-
-        // Check for error status
-        if response.status == IngestionStatus::Error {
-            let error_msg = response.error.clone().unwrap_or_else(|| "Unknown error".to_string());
-            anyhow::bail!("Ingest error: {}", error_msg);
-        }
 
         Ok(response)
     }
@@ -2091,45 +1842,3 @@ fn parse_endpoint_id(url: &str) -> Result<EndpointId> {
     EndpointId::from_bytes(&arr).map_err(|e| anyhow::anyhow!("niepoprawny EndpointId: {e}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ingest_request_roundtrip() {
-        // Create IngestRequest exactly as the client does
-        let request = IngestRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            document_id: "test-doc-123".to_string(),
-            content: DocumentContent::Text("Test document content for RAG".to_string()),
-            metadata: vec![
-                ("source".to_string(), "test".to_string()),
-            ],
-            index_flags: vec![],
-        };
-
-        // Serialize with rkyv (same as send_ingest_request)
-        let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
-            .expect("Failed to serialize IngestRequest");
-
-        println!("Client test: serialized {} bytes", request_bytes.len());
-        println!("First 40 bytes: {:02X?}", &request_bytes[..std::cmp::min(40, request_bytes.len())]);
-
-        // Deserialize with access (same as Router does)
-        let archived = rkyv::access::<ArchivedIngestRequest, rkyv::rancor::Error>(&request_bytes)
-            .expect("Failed to access ArchivedIngestRequest");
-
-        // Verify
-        assert_eq!(archived.request_id.as_str(), request.request_id);
-        assert_eq!(archived.document_id.as_str(), request.document_id);
-
-        // Full deserialize
-        let deserialized: IngestRequest = rkyv::deserialize::<IngestRequest, rkyv::rancor::Error>(archived)
-            .expect("Failed to deserialize IngestRequest");
-
-        assert_eq!(deserialized.request_id, request.request_id);
-        assert_eq!(deserialized.metadata.len(), 1);
-
-        println!("Client roundtrip test: SUCCESS!");
-    }
-}

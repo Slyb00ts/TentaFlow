@@ -1,8 +1,4 @@
-// =============================================================================
-// File: types.rs
-// Description: Serde types used to deserialize service manifests from TOML.
-// They model the schema described in tentaflow-containers/_schema/SCHEMA.md.
-// =============================================================================
+// ============ File: types.rs — service manifest TOML deserialisation types ============
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +40,21 @@ pub struct Engine {
     pub default_port: u16,
     pub api: ApiKind,
     pub version: String,
+    /// Optional explicit override of the catalog surface vocabulary
+    /// (`["chat"]`, `["stt"]`, ...). When `None` the surfaces are
+    /// derived from `category` via `Category::default_service_surfaces`.
+    /// An explicit empty list is invalid — use `None` to mean "default".
+    #[serde(default)]
+    pub service_surfaces: Option<Vec<String>>,
+    /// Optional input modality list (`["text", "image", "audio"]`).
+    /// `None` falls through to category defaults; explicit empty list
+    /// is rejected by validation.
+    #[serde(default)]
+    pub input_modalities: Option<Vec<String>>,
+    /// Optional output modality list (`["text", "audio", "embedding",
+    /// "image"]`). Same fallback rules as the input list.
+    #[serde(default)]
+    pub output_modalities: Option<Vec<String>>,
 }
 
 /// Engine category aligned with the `tentaflow-containers/` directory layout.
@@ -62,6 +73,113 @@ pub enum Category {
     Model3dGen,
     Agents,
     Tools,
+}
+
+// Wire-string allow-lists live in `vocabulary.rs` so build.rs can `include!`
+// the same source. Re-export here keeps existing call sites unchanged.
+pub use super::vocabulary::{
+    VALID_INPUT_MODALITIES, VALID_OUTPUT_MODALITIES, VALID_SERVICE_SURFACES,
+};
+
+impl Category {
+    /// Surface(s) implied by this category when the manifest does not
+    /// declare `service_surfaces` explicitly. Categories without a
+    /// catalog presence (`VideoGen`, `MusicGen`, `Model3dGen`, `Tools`)
+    /// return an empty slice; callers treat that as "no public catalog
+    /// entry" rather than "match all".
+    pub fn default_service_surfaces(self) -> &'static [&'static str] {
+        match self {
+            Self::Llm => &["chat"],
+            Self::Stt => &["stt"],
+            Self::Tts => &["tts"],
+            Self::Embeddings => &["embeddings"],
+            Self::Reranker => &["rerank"],
+            Self::Vision => &["chat"],
+            Self::ImageGen => &["image_gen"],
+            Self::Agents => &["agents"],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools => &[],
+        }
+    }
+
+    /// Default input modality vocabulary. Vision adds Image, STT adds
+    /// Audio; everything else defaults to text-in.
+    pub fn default_input_modalities(self) -> &'static [&'static str] {
+        match self {
+            Self::Llm | Self::Tts | Self::Embeddings | Self::Reranker | Self::ImageGen => {
+                &["text"]
+            }
+            Self::Stt => &["audio"],
+            Self::Vision => &["text", "image"],
+            Self::Agents => &["text"],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools => &[],
+        }
+    }
+
+    /// Default output modality vocabulary. STT/Reranker emit text;
+    /// TTS emits audio; embeddings/image-gen emit their typed payload.
+    pub fn default_output_modalities(self) -> &'static [&'static str] {
+        match self {
+            Self::Llm | Self::Stt | Self::Reranker | Self::Vision | Self::Agents => &["text"],
+            Self::Tts => &["audio"],
+            Self::Embeddings => &["embedding"],
+            Self::ImageGen => &["image"],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools => &[],
+        }
+    }
+}
+
+impl Engine {
+    /// Resolve the surfaces this engine advertises after applying the
+    /// preset > engine > category fallback chain. The argument is the
+    /// optional preset that the deploy is targeting; pass `None` for
+    /// engine-only views.
+    pub fn effective_service_surfaces(&self, preset: Option<&ModelPreset>) -> Vec<String> {
+        if let Some(p) = preset {
+            if let Some(list) = p.service_surfaces.as_ref() {
+                return list.clone();
+            }
+        }
+        if let Some(list) = self.service_surfaces.as_ref() {
+            return list.clone();
+        }
+        self.category
+            .default_service_surfaces()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    pub fn effective_input_modalities(&self, preset: Option<&ModelPreset>) -> Vec<String> {
+        if let Some(p) = preset {
+            if let Some(list) = p.input_modalities.as_ref() {
+                return list.clone();
+            }
+        }
+        if let Some(list) = self.input_modalities.as_ref() {
+            return list.clone();
+        }
+        self.category
+            .default_input_modalities()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    pub fn effective_output_modalities(&self, preset: Option<&ModelPreset>) -> Vec<String> {
+        if let Some(p) = preset {
+            if let Some(list) = p.output_modalities.as_ref() {
+                return list.clone();
+            }
+        }
+        if let Some(list) = self.output_modalities.as_ref() {
+            return list.clone();
+        }
+        self.category
+            .default_output_modalities()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
 }
 
 /// API family exposed by the engine.
@@ -201,6 +319,12 @@ pub enum TargetOs {
 }
 
 /// `[[model_preset]]` section with a recommended model entry.
+///
+/// The three modality overrides take priority over the engine-level
+/// fields when present. This lets a preset declare extra capabilities
+/// the base engine does not advertise (e.g. an omni preset of an LLM
+/// engine declaring `input_modalities = ["text", "audio"]`). Empty
+/// lists are rejected the same way as on `Engine`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPreset {
     pub id: String,
@@ -210,4 +334,10 @@ pub struct ModelPreset {
     pub quantization: Option<String>,
     #[serde(default)]
     pub recommended: bool,
+    #[serde(default)]
+    pub service_surfaces: Option<Vec<String>>,
+    #[serde(default)]
+    pub input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    pub output_modalities: Option<Vec<String>>,
 }

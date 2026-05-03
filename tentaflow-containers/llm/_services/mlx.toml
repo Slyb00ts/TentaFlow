@@ -25,16 +25,9 @@ repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
 quantization = "int4"
 recommended = true
 
-# Bielik 4.5B Instruct + RAG fine-tune (vqstudio) — polski model, dobre
-# wyniki dla rozmow PL i RAG context. 4-bit MLX — startowo dobry rozmiar
-# dla iPhone 15 Pro / iPad Pro / Mac z >=16 GB unified memory.
-[[model_preset]]
-id = "bielik-4-5b-instruct-rag-mlx-4bit"
-display_name = "Bielik 4.5B Instruct RAG (MLX 4-bit)"
-repo = "vqstudio/Bielik-4.5B-v3.0-Instruct-RAG-0.8-MLX-4bit"
-quantization = "int4"
-
-# Bielik 4.5B Instruct (bez RAG fine-tune) — czysta rozmowa po polsku.
+# Bielik 4.5B Instruct (vqstudio) — polski model, czysta rozmowa po polsku.
+# 4-bit MLX — startowo dobry rozmiar dla iPhone 15 Pro / iPad Pro / Mac
+# z >=16 GB unified memory.
 [[model_preset]]
 id = "bielik-4-5b-instruct-mlx-4bit"
 display_name = "Bielik 4.5B Instruct (MLX 4-bit)"

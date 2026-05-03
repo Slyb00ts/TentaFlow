@@ -240,7 +240,7 @@ mod tests {
                     "wynik": "zagniezdony",
                     "score": 0.95
                 },
-                "meta": {"source": "rag"}
+                "meta": {"source": "test"}
             }),
             execution_log: vec![],
             total_latency_ms: 50,

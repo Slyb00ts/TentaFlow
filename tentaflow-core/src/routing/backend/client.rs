@@ -895,7 +895,6 @@ impl BackendClient {
             tools: None,
             tool_choice: None,
             response_format: None,
-            rag_options: None,
             memory_options: None,
             audio_input: None,
         };

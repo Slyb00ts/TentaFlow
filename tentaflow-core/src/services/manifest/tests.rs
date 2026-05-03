@@ -32,6 +32,9 @@ fn make_engine(id: &str, category: Category) -> Engine {
         resource_kind: None,
         requires_model: None,
         gpu_supported: None,
+        service_surfaces: None,
+        input_modalities: None,
+        output_modalities: None,
     }
 }
 
@@ -913,5 +916,217 @@ fn loaded_manifest_has_required_non_empty_categories() {
             cats.contains(&required),
             "Brak wymaganej kategorii {required:?} w {cats:?}"
         );
+    }
+}
+
+// =============================================================================
+// Three-axis capability schema. Tests target the validation rules and the
+// preset > engine > category fallback chain so that a manifest typo or a
+// missing category default fails CI rather than silently mis-tagging an
+// entry in the public catalog.
+// =============================================================================
+
+mod capability_axes {
+    use super::super::types::*;
+    use super::super::validate::{validate_engine, ValidationError};
+    use super::make_engine;
+
+    /// External deploy is the simplest valid deploy section — every
+    /// capability test cares about the engine/preset fields, not the
+    /// deploy plumbing, so we factor a minimal external deploy out
+    /// here to keep the cases focused.
+    fn external_deploy() -> DeploySection {
+        DeploySection {
+            docker: None,
+            native: None,
+            external: Some(ExternalDeploy {
+                platforms: vec![TargetOs::Linux],
+                detection_binary: "test".into(),
+                detection_endpoint: "http://localhost".into(),
+                detection_health_path: "/health".into(),
+            }),
+        }
+    }
+
+    fn manifest_with_engine(mut engine: Engine) -> ServiceManifest {
+        engine.id = "test-eng".into();
+        ServiceManifest {
+            engine,
+            deploy: external_deploy(),
+            model_presets: vec![],
+            docker_source_hash: String::new(),
+            native_source_hash: String::new(),
+        }
+    }
+
+    fn manifest_with_preset(preset: ModelPreset) -> ServiceManifest {
+        let mut engine = make_engine("test-eng", Category::Llm);
+        engine.id = "test-eng".into();
+        ServiceManifest {
+            engine,
+            deploy: external_deploy(),
+            model_presets: vec![preset],
+            docker_source_hash: String::new(),
+            native_source_hash: String::new(),
+        }
+    }
+
+    fn empty_preset() -> ModelPreset {
+        ModelPreset {
+            id: "preset".into(),
+            display_name: "Preset".into(),
+            repo: "x/y".into(),
+            quantization: None,
+            recommended: false,
+            service_surfaces: None,
+            input_modalities: None,
+            output_modalities: None,
+        }
+    }
+
+    /// An unknown surface string is rejected with a typed error
+    /// carrying the offending value and the allowed vocabulary. This is
+    /// the only thing standing between a typo (`"chats"` instead of
+    /// `"chat"`) and a silently-invisible catalog entry.
+    #[test]
+    fn unknown_service_surface_rejected() {
+        let mut engine = make_engine("test-eng", Category::Llm);
+        engine.service_surfaces = Some(vec!["chats".into()]);
+        let manifest = manifest_with_engine(engine);
+        let errors = validate_engine(&manifest, None).unwrap_err();
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::UnknownEnumValue { field, value, .. }
+                    if *field == "engine.service_surfaces" && value == "chats"
+            )
+        });
+        assert!(found, "expected UnknownEnumValue, got: {errors:?}");
+    }
+
+    /// `Some([])` — an explicit empty list — is rejected so a reader
+    /// cannot confuse it with the `None` fallback path.
+    #[test]
+    fn empty_modality_list_rejected() {
+        let mut engine = make_engine("test-eng", Category::Llm);
+        engine.input_modalities = Some(vec![]);
+        let manifest = manifest_with_engine(engine);
+        let errors = validate_engine(&manifest, None).unwrap_err();
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::EmptyEnumList { field, .. }
+                    if *field == "engine.input_modalities"
+            )
+        });
+        assert!(found, "expected EmptyEnumList, got: {errors:?}");
+    }
+
+    /// Validation collects per-preset errors with a distinct field
+    /// name so an operator can locate the offending preset.
+    #[test]
+    fn preset_level_errors_carry_preset_field_label() {
+        let mut preset = empty_preset();
+        preset.output_modalities = Some(vec!["bogus".into()]);
+        let manifest = manifest_with_preset(preset);
+        let errors = validate_engine(&manifest, None).unwrap_err();
+        let labelled = errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::UnknownEnumValue { field, .. }
+                    if *field == "model_preset.output_modalities"
+            )
+        });
+        assert!(
+            labelled,
+            "preset error must label its field as `model_preset.*`, got {errors:?}"
+        );
+    }
+
+    /// Preset value wins over engine value when both are set.
+    #[test]
+    fn preset_overrides_engine() {
+        let mut engine = make_engine("test-eng", Category::Llm);
+        engine.input_modalities = Some(vec!["text".into()]);
+        let mut preset = empty_preset();
+        preset.input_modalities = Some(vec!["text".into(), "audio".into()]);
+
+        let resolved = engine.effective_input_modalities(Some(&preset));
+        assert_eq!(resolved, vec!["text".to_string(), "audio".to_string()]);
+    }
+
+    /// With no preset and no engine override, the category supplies
+    /// the default — the contract that build.rs and the catalog rely
+    /// on for unannotated manifests.
+    #[test]
+    fn category_default_used_when_engine_and_preset_silent() {
+        let engine = make_engine("test-eng", Category::Stt);
+        let resolved = engine.effective_input_modalities(None);
+        assert_eq!(resolved, vec!["audio".to_string()]);
+    }
+
+    /// Engine value wins when present, even when the preset is
+    /// configured but does not override this axis. Mirror test for
+    /// surfaces.
+    #[test]
+    fn engine_overrides_category_when_preset_does_not_override() {
+        let mut engine = make_engine("test-eng", Category::Llm);
+        engine.service_surfaces = Some(vec!["agents".into()]);
+        let preset = empty_preset(); // no surfaces override
+        let resolved = engine.effective_service_surfaces(Some(&preset));
+        assert_eq!(resolved, vec!["agents".to_string()]);
+    }
+
+    /// Every variant from the catalog enums must round-trip through
+    /// `as_wire_str()` into the corresponding `VALID_*` slice.
+    /// Adding a `ServiceSurface::Search` variant without extending
+    /// `VALID_SERVICE_SURFACES` would silently start rejecting any
+    /// manifest that declares the new value — this test catches the
+    /// drift at compile-test time.
+    #[test]
+    fn valid_slices_cover_every_catalog_enum_variant() {
+        use crate::services::catalog::{InputModality, OutputModality, ServiceSurface};
+
+        let surfaces = [
+            ServiceSurface::Chat,
+            ServiceSurface::Embeddings,
+            ServiceSurface::Stt,
+            ServiceSurface::Tts,
+            ServiceSurface::Rerank,
+            ServiceSurface::ImageGen,
+            ServiceSurface::Documents,
+            ServiceSurface::Agents,
+        ];
+        for s in surfaces {
+            assert!(
+                VALID_SERVICE_SURFACES.contains(&s.as_wire_str()),
+                "surface variant {:?} ({}) missing from VALID_SERVICE_SURFACES",
+                s,
+                s.as_wire_str()
+            );
+        }
+
+        let inputs = [InputModality::Text, InputModality::Image, InputModality::Audio];
+        for m in inputs {
+            assert!(
+                VALID_INPUT_MODALITIES.contains(&m.as_wire_str()),
+                "input modality {:?} missing from VALID_INPUT_MODALITIES",
+                m
+            );
+        }
+
+        let outputs = [
+            OutputModality::Text,
+            OutputModality::Audio,
+            OutputModality::Embedding,
+            OutputModality::Image,
+        ];
+        for m in outputs {
+            assert!(
+                VALID_OUTPUT_MODALITIES.contains(&m.as_wire_str()),
+                "output modality {:?} missing from VALID_OUTPUT_MODALITIES",
+                m
+            );
+        }
     }
 }

@@ -147,7 +147,6 @@ Use endpoint/service categories:
 - `stt`
 - `tts`
 - `embeddings`
-- `rag`
 - `documents`
 - `agents`
 
@@ -156,7 +155,6 @@ Fix default seed:
 - default LLM chat flow must be `service_type = "chat"`, not `"llm"`
 - TTS flow should use `tts`
 - STT flow should use `stt`
-- RAG flow should use `rag`
 - teams/agent flow should use `agents` or a published `flow_model`
 
 Important: migrate `flows.service_type`, not `flow_model_bindings.service_type`,
@@ -197,7 +195,7 @@ Responsibilities:
 - execute HTTP backends
 - execute QUIC sidecars
 - execute remote mesh forwarding
-- handle direct STT/TTS/embeddings/chat/RAG/document ingest
+- handle direct STT/TTS/embeddings/chat
 - preserve multimodal message parts
 - enforce mesh hop limit
 - produce route/runtime metadata
@@ -236,7 +234,6 @@ Refactor these adapters:
 - `stt`
 - `tts`
 - `embeddings`
-- `rag` where applicable
 
 After refactor:
 
@@ -316,8 +313,6 @@ Seed examples:
 
 - `Default Chat`: `trigger -> llm -> output`
 - `Safe Chat`: `trigger -> llm -> pii_filter -> output`
-- `RAG Chat`: `trigger -> rag -> llm -> output`
-- `RAG Audio`: `trigger -> rag -> llm -> tts -> output`
 
 Direct embeddings/STT/TTS do not need DB flow unless user explicitly builds
 orchestration.

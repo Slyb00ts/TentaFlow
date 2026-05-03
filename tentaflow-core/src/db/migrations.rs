@@ -7,6 +7,16 @@ use anyhow::Result;
 use rusqlite::Connection;
 use tracing::info;
 
+/// Migracje moga byc:
+/// - `Sql` — zwykly batch SQL wykonany przez `execute_batch`
+/// - `Rust` — funkcja, ktora dostaje `&Connection` w transakcji. Uzywana
+///   gdy logika nie da sie zapisac jako pure SQL (np. row-by-row JSON
+///   serializacja po stronie Rust).
+pub enum MigrationStep {
+    Sql(&'static str),
+    Rust(fn(&Connection) -> Result<()>),
+}
+
 /// Uruchamia migracje bazy danych.
 pub fn run(conn: &Connection) -> Result<()> {
     // Utworz tabele migracji
@@ -26,13 +36,14 @@ pub fn run(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
-    let migrations = get_migrations();
-
-    for (version, name, sql) in migrations {
-        if *version > current_version {
+    for (version, name, step) in get_migrations() {
+        if version > current_version {
             info!("Migracja {}: {}", version, name);
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(sql)?;
+            match step {
+                MigrationStep::Sql(sql) => tx.execute_batch(sql)?,
+                MigrationStep::Rust(f) => f(&tx)?,
+            }
             tx.execute(
                 "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
                 rusqlite::params![version, name],
@@ -44,8 +55,130 @@ pub fn run(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
-    &[(
+/// Removes the legacy `'rag'` value from any live CHECK constraint on the
+/// `services` and `model_registry` tables. SQLite cannot ALTER a CHECK in
+/// place, so the migration recreates each table when (a) it has a
+/// `service_type` column, and (b) the table-level SQL still references
+/// `'rag'`. Existing rows with `service_type='rag'` are reassigned to
+/// `'llm'` before the table is rebuilt — RAG path was deleted, surviving
+/// rows must land on a still-valid type. Idempotent: when the constraint
+/// is already RAG-free (e.g. the V2 services schema with no `service_type`
+/// column at all), the migration is a no-op.
+fn migrate_drop_rag_from_service_type(tx: &Connection) -> Result<()> {
+    /// Returns true when `table` exists, has a `service_type` column, and
+    /// the table-level SQL still mentions `'rag'`. The checks together
+    /// prove we're looking at a legacy schema that needs rebuilding.
+    fn legacy_table_has_rag(tx: &Connection, table: &str) -> Result<bool> {
+        let table_sql: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                rusqlite::params![table],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None);
+        let Some(sql) = table_sql else { return Ok(false) };
+        if !sql.contains("'rag'") {
+            return Ok(false);
+        }
+        // Verify the table actually has the `service_type` column.
+        let pragma_sql = format!("PRAGMA table_info({})", table);
+        let mut stmt = tx.prepare(&pragma_sql)?;
+        let has_col = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.map(|n| n == "service_type").unwrap_or(false));
+        Ok(has_col)
+    }
+
+    for table in ["services", "model_registry"] {
+        if !legacy_table_has_rag(tx, table)? {
+            continue;
+        }
+
+        // Reassign any surviving 'rag' rows to 'llm' so the new constraint
+        // accepts them when we copy data into the rebuilt table.
+        tx.execute(
+            &format!("UPDATE {} SET service_type = 'llm' WHERE service_type = 'rag'", table),
+            [],
+        )?;
+
+        // Pull the live CREATE TABLE statement and rewrite the CHECK list
+        // by stripping the `'rag'` token. Then rebuild the table
+        // (CREATE NEW → INSERT → DROP OLD → RENAME) inside the same
+        // transaction. SQLite tolerates this dance for non-FK targets;
+        // both tables have no inbound FKs in the legacy schema.
+        let original_sql: String = tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            rusqlite::params![table],
+            |row| row.get(0),
+        )?;
+        let new_table = format!("{}_norag", table);
+        let new_sql = original_sql
+            .replacen(table, &new_table, 1)
+            // Strip `'rag'` from any CHECK list, tolerating both leading
+            // and trailing comma placements.
+            .replace("'rag',", "")
+            .replace(",'rag'", "")
+            .replace("'rag'", "");
+        tx.execute_batch(&format!(
+            "PRAGMA foreign_keys=OFF;\n{};\nINSERT INTO {} SELECT * FROM {};\nDROP TABLE {};\nALTER TABLE {} RENAME TO {};\nPRAGMA foreign_keys=ON;",
+            new_sql, new_table, table, table, new_table, table,
+        ))?;
+    }
+    Ok(())
+}
+
+/// Czysci `model_aliases.fallback_targets` ze wszystkiego co nie jest
+/// poprawnym JSON array.
+///
+/// CLAUDE.md §9 — JSON-only w calym storage. Migracja **nie interpretuje**
+/// wartosci innego formatu (nawet "wyglada na CSV"); zamiast tego ustawia
+/// taki rzad na NULL i loguje warn, zostawiajac adminowi obowiazek
+/// odtworzenia fallbackow recznie. Lepiej stracic legacy dane niz wpuscic
+/// CSV-interpretator z powrotem do kodu.
+///
+/// Idempotentna: wartosci ktore parsuja sie jako `Vec<String>` zostaja
+/// nietkniete; NULL i empty string normalizujemy do NULL.
+fn migrate_69_alias_fallback_csv_to_json(tx: &Connection) -> Result<()> {
+    let mut stmt = tx.prepare("SELECT id, fallback_targets FROM model_aliases")?;
+    let rows: Vec<(i64, Option<String>)> = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (id, raw) in rows {
+        let Some(value) = raw else { continue };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            // Pusty string nie pasuje semantyce "lista fallbackow" —
+            // znormalizuj do NULL.
+            tx.execute(
+                "UPDATE model_aliases SET fallback_targets = NULL WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            continue;
+        }
+        // Valid JSON `Vec<String>` zostaje nietkniete (idempotency).
+        if serde_json::from_str::<Vec<String>>(trimmed).is_ok() {
+            continue;
+        }
+        // Wszystko inne (legacy, garbage, malformed JSON) → NULL + warn.
+        // Zadnej interpretacji formatu, zadnego "best effort" parsera.
+        tracing::warn!(
+            alias_id = id,
+            raw = %trimmed,
+            "fallback_targets nie jest poprawnym JSON array — czyszcze do NULL \
+             (admin musi odtworzyc fallbacki recznie przez GUI)"
+        );
+        tx.execute(
+            "UPDATE model_aliases SET fallback_targets = NULL WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+    }
+    Ok(())
+}
+
+fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
+    let sql: &[(i64, &'static str, &'static str)] = &[(
         1,
         "initial_schema",
         "
@@ -1979,5 +2112,264 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
                 WHERE published_model_name IS NOT NULL;
         ",
     ),
-]
+]; // koniec listy SQL
+
+    let mut all: Vec<(i64, &'static str, MigrationStep)> = sql
+        .iter()
+        .map(|(v, n, s)| (*v, *n, MigrationStep::Sql(*s)))
+        .collect();
+
+    // Migracja 69 jest po stronie Rust — pure-SQL `REPLACE(',', '","')`
+    // nie eskapowal cudzyslowow ani backslashy w wartosciach CSV, wiec
+    // wartosci typu `foo"bar` produkowaly invalid JSON ktory provider
+    // cisho dawal jako pusta liste. Rust idzie przez `serde_json::to_string`.
+    all.push((
+        69,
+        "model_aliases_fallback_targets_csv_to_json",
+        MigrationStep::Rust(migrate_69_alias_fallback_csv_to_json),
+    ));
+    // Re-run dla DB ktore zarejestrowaly poprzednia (pure-SQL) migracje 69
+    // i moga zawierac niepoprawne wartosci (np. `["foo"bar"]` — bez
+    // escape'u). Funkcja jest idempotentna: walidne JSON zostaja, reszta
+    // leci na NULL z warn.
+    all.push((
+        70,
+        "model_aliases_fallback_targets_wipe_invalid",
+        MigrationStep::Rust(migrate_69_alias_fallback_csv_to_json),
+    ));
+    all.push((
+        71,
+        "drop_rag_from_service_type_constraint",
+        MigrationStep::Rust(migrate_drop_rag_from_service_type),
+    ));
+    all
+}
+
+#[cfg(test)]
+mod migration_69_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Setup: schema applied through migration 68; we then directly
+    /// insert legacy CSV rows and run only migration 69 to validate the
+    /// Rust converter handles every edge case the SQL version mishandled.
+    fn db_with_legacy_rows() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        // Apply only the SQL migrations 1..=68 so we can inject legacy
+        // CSV directly and then trigger the Rust converter on top.
+        conn.execute_batch(
+            "CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        for (version, name, step) in get_migrations() {
+            if version > 68 {
+                break;
+            }
+            if let MigrationStep::Sql(sql) = step {
+                let tx = conn.unchecked_transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.execute(
+                    "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                    rusqlite::params![version, name],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+        }
+        conn
+    }
+
+    fn read_fallback(conn: &Connection, alias: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT fallback_targets FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![alias],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    }
+
+    /// Legacy CSV-shaped values are GARBAGE per CLAUDE.md §9 — migration
+    /// must wipe them to NULL with a warn, NOT interpret them as a list.
+    /// Admins reconstruct fallbacks manually through the GUI after upgrade.
+    #[test]
+    fn legacy_csv_values_get_wiped_to_null() {
+        let conn = db_with_legacy_rows();
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, fallback_targets) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["a", "primary", "fb-1,fb-2,fb-3"],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_69_alias_fallback_csv_to_json(&tx).unwrap();
+        tx.commit().unwrap();
+        assert!(read_fallback(&conn, "a").is_none());
+    }
+
+    /// Malformed JSON-looking values produced by the previous buggy SQL
+    /// migration also get wiped — same data-loss policy. Better to lose
+    /// the legacy value than to ship a CSV-tolerant interpreter.
+    #[test]
+    fn malformed_json_gets_wiped_to_null() {
+        let conn = db_with_legacy_rows();
+        let broken = r#"["foo"bar","baz"]"#;
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, fallback_targets) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["broken", "primary", broken],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_69_alias_fallback_csv_to_json(&tx).unwrap();
+        tx.commit().unwrap();
+        assert!(read_fallback(&conn, "broken").is_none());
+    }
+
+    /// Already-JSON values stay untouched (idempotency).
+    #[test]
+    fn leaves_existing_json_alone() {
+        let conn = db_with_legacy_rows();
+        let already = r#"["already","json"]"#;
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, fallback_targets) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["b", "primary", already],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_69_alias_fallback_csv_to_json(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(read_fallback(&conn, "b").as_deref(), Some(already));
+    }
+
+    /// Empty / whitespace-only / NULL-trimming-to-empty values normalise
+    /// to NULL so the row reads cleanly downstream.
+    #[test]
+    fn normalises_empty_values_to_null() {
+        let conn = db_with_legacy_rows();
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, fallback_targets) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["empty", "primary", ""],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, fallback_targets) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["spaces", "primary", "   "],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_69_alias_fallback_csv_to_json(&tx).unwrap();
+        tx.commit().unwrap();
+        assert!(read_fallback(&conn, "empty").is_none());
+        assert!(read_fallback(&conn, "spaces").is_none());
+    }
+}
+
+#[cfg(test)]
+mod migration_drop_rag_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Build a synthetic legacy schema so we can prove the migration
+    /// rewrites the constraint and reassigns surviving rows. Reproduces a
+    /// plausible historical shape (services.service_type with 'rag' in
+    /// the CHECK list) without touching the real migration history.
+    fn legacy_services_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                service_type TEXT NOT NULL CHECK(service_type IN ('llm','embedding','rag','vision','stt','tts','memory'))
+            );
+             CREATE TABLE model_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name TEXT NOT NULL UNIQUE,
+                service_type TEXT NOT NULL CHECK(service_type IN ('llm','embedding','stt','tts','rag','memory'))
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn rag_rows_get_reassigned_to_llm() {
+        let conn = legacy_services_db();
+        conn.execute(
+            "INSERT INTO services (name, service_type) VALUES ('legacy-rag', 'rag')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO model_registry (model_name, service_type) VALUES ('legacy-rag-model', 'rag')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_drop_rag_from_service_type(&tx).unwrap();
+        tx.commit().unwrap();
+        let svc_type: String = conn
+            .query_row(
+                "SELECT service_type FROM services WHERE name='legacy-rag'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let model_type: String = conn
+            .query_row(
+                "SELECT service_type FROM model_registry WHERE model_name='legacy-rag-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(svc_type, "llm");
+        assert_eq!(model_type, "llm");
+    }
+
+    #[test]
+    fn new_constraint_rejects_rag_inserts() {
+        let conn = legacy_services_db();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_drop_rag_from_service_type(&tx).unwrap();
+        tx.commit().unwrap();
+        let svc_err = conn.execute(
+            "INSERT INTO services (name, service_type) VALUES ('post-migration-rag', 'rag')",
+            [],
+        );
+        assert!(svc_err.is_err(), "rebuilt services CHECK must reject 'rag'");
+        let model_err = conn.execute(
+            "INSERT INTO model_registry (model_name, service_type) VALUES ('post-migration-rag', 'rag')",
+            [],
+        );
+        assert!(model_err.is_err(), "rebuilt model_registry CHECK must reject 'rag'");
+    }
+
+    #[test]
+    fn no_op_when_table_already_rag_free() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                service_type TEXT NOT NULL CHECK(service_type IN ('llm','embedding'))
+            );",
+        )
+        .unwrap();
+        let original_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='services'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_drop_rag_from_service_type(&tx).unwrap();
+        tx.commit().unwrap();
+        let after_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='services'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_sql, after_sql);
+    }
 }

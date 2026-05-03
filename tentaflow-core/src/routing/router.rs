@@ -12,18 +12,16 @@ use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::middleware::ResponseMiddleware;
 use crate::routing::backend::BackendClient;
 use crate::routing::service_manager::ServiceManager;
-use crate::services::rag::RAGClient;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tentaflow_protocol::*;
-use tokio::sync::mpsc;
 use tracing::info;
 
 /// Router zarzadzajacy routing requestow do backendow.
 ///
 /// Trzyma mape serwisow i backend clients (pre-alokowane).
-/// Zunifikowana architektura obsluguje wszystkie typy serwisow: LLM, Embedding, RAG, Vision, STT, TTS.
+/// Zunifikowana architektura obsluguje wszystkie typy serwisow: LLM, Embedding, Vision, STT, TTS.
 ///
 /// **ARCHITEKTURA NON-BLOCKING:**
 /// - Router::new() zwraca NATYCHMIAST (synchronicznie)
@@ -62,9 +60,13 @@ pub struct Router {
     pub(crate) mesh_manager:
         Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
 
-    /// Cache aliasow modeli z DB (alias -> DbModelAlias)
+    /// Cache aliasow modeli z DB (alias -> CachedAlias). Wartosci maja
+    /// pre-parsed `fallback_targets` (CLAUDE.md §9 — JSON), zeby parser
+    /// odpalal sie raz przy reload zamiast per dispatch w hot path.
     pub(crate) alias_cache: Arc<
-        parking_lot::RwLock<std::collections::HashMap<String, crate::db::models::DbModelAlias>>,
+        parking_lot::RwLock<
+            std::collections::HashMap<String, crate::routing::middleware::CachedAlias>,
+        >,
     >,
 
     /// Globalny counter do round-robin w middleware routing
@@ -86,6 +88,23 @@ pub struct Router {
     /// `rebuild_catalog()` whenever services, aliases, or flow publish
     /// state changes; readers take a lock-free snapshot.
     pub(crate) catalog_provider: Arc<crate::services::catalog::CatalogProvider>,
+
+    /// R1.5e: unified runtime executor. Owns alias resolver + strategy
+    /// state; konsumowany przez nowe ścieżki (LlmAdapter cutover w R2a,
+    /// chat handler cutover w R3a). Arc<RwLock<...>> bo Router derives
+    /// Clone, a RwLock samo przez się nie jest Clone — Arc dzieli ten sam
+    /// slot miedzy klonami zeby executor wspolny dla wszystkich call sites.
+    pub(crate) executor: Arc<
+        parking_lot::RwLock<
+            Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
+        >,
+    >,
+
+    /// R2d (Codex M1): SttRuntime wpiety przez `Router::start` po
+    /// `Arc::new(router)` zeby trzymal `Weak<Router>` (anty-cykl).
+    /// `None` w testach DB-less.
+    pub(crate) stt_runtime:
+        Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -271,7 +290,7 @@ impl Router {
     ///
     /// **ARCHITEKTURA NON-BLOCKING:**
     /// - Zwraca NATYCHMIAST (nie czeka na polaczenia QUIC)
-    /// - Polaczenia QUIC (RAG, Embeddings) sa uruchamiane w background taskach
+    /// - Polaczenia QUIC (Embeddings) sa uruchamiane w background taskach
     /// - Auto-reconnect dziala w tle bez blokowania requestow
     /// - Serwisy niedostepne zwracaja blad natychmiast (nie czekaja)
     pub fn new(config: RouterConfig, db: Option<DbPool>) -> Result<Self> {
@@ -293,12 +312,29 @@ impl Router {
         ));
 
         // === KROK 4: INICJALIZUJ FLOW DISPATCHER ===
+        // R2a: Adapter LLM potrzebuje executor'a, ktory powstaje DOPIERO po
+        // FlowDispatcher (cykl: executor->dispatcher->adapter->executor).
+        // Tworzymy pusty slot teraz; Router::new wpisze executor po
+        // konstrukcji dispatcher'a.
+        let executor_slot: Arc<
+            parking_lot::RwLock<
+                Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
+            >,
+        > = Arc::new(parking_lot::RwLock::new(None));
+        // Codex M1 round 2: SttRuntime slot — wspolny dla `Router.stt_runtime`
+        // i `SttNodeAdapter`, zeby flow STT node szedl ta sama sciezka co
+        // handler `/v1/audio/transcriptions` (D.3 single owner).
+        let stt_runtime_slot: Arc<
+            parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>,
+        > = Arc::new(parking_lot::RwLock::new(None));
         let db_clone = db.clone();
         let flow_dispatcher = db.map(|pool| {
             Arc::new(FlowDispatcher::new(
                 pool,
                 service_manager.clone(),
                 config.clone(),
+                executor_slot.clone(),
+                stt_runtime_slot.clone(),
             ))
         });
 
@@ -318,25 +354,75 @@ impl Router {
 
         let router = Self {
             config,
-            service_manager,
+            service_manager: service_manager.clone(),
             response_middleware,
             pending_voice_samples: Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            flow_dispatcher,
+            flow_dispatcher: flow_dispatcher.clone(),
             db: db_clone,
-            local_inference,
+            local_inference: local_inference.clone(),
             local_stt,
             mesh_manager: Arc::new(parking_lot::RwLock::new(None)),
             alias_cache,
             route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             services_snapshot_rx: Arc::new(parking_lot::RwLock::new(None)),
             catalog_provider: Arc::new(crate::services::catalog::CatalogProvider::new()),
+            executor: executor_slot.clone(),
+            stt_runtime: stt_runtime_slot,
         };
+
+        // R1.5e: zbuduj ModelRuntimeExecutor i wpiec do routera. Wymaga
+        // catalog_provider (juz utworzonego), local_inference, opcjonalnie
+        // flow_dispatcher. Resolver (`AliasResolver`) konsumuje
+        // `LiveHandlesCache` z service_manager — to jest ten sam cache co
+        // dispatcher uzywa do hydratacji `Local` candidates.
+        {
+            use crate::services::runtime::executor::ModelRuntimeExecutor;
+            use crate::services::runtime::resolver::AliasResolver;
+            // Codex H2: zamiast capture'owac local_node_id w `Router::new`
+            // (registry jeszcze None) — przekazujemy provider closure ktora
+            // dynamicznie czyta `local().node_id` z ServiceManager.
+            // mesh_services_registry przy kazdym resolve. Inaczej kazdy
+            // lokalny ModelInstance trafia w MeshForward → fallback.
+            let local_node_id =
+                crate::services::runtime::resolver::local_node_id_provider_for_router(
+                    &service_manager,
+                );
+            let resolver = Arc::new(AliasResolver::new(
+                service_manager.live_handles.clone(),
+                local_node_id,
+            ));
+            let executor = Arc::new(ModelRuntimeExecutor::new(
+                router.catalog_provider.clone(),
+                resolver,
+                flow_dispatcher.clone(),
+                local_inference.clone(),
+                Vec::new(),
+            ));
+            *executor_slot.write() = Some(executor);
+        }
 
         router.reload_alias_cache();
 
         Ok(router)
+    }
+
+    /// R1.5e: udostepnia ModelRuntimeExecutor (gotowy do uzycia po
+    /// `Router::new`). Zwraca `None` tylko w testach ktore konstruuja
+    /// Router minimalnym konstruktorem omijajacym init.
+    pub fn executor(
+        &self,
+    ) -> Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>> {
+        self.executor.read().clone()
+    }
+
+    /// Codex M1: udostepnia SttRuntime (single owner STT path zgodnie z
+    /// D.3). Zwraca `None` tylko jesli `Router::start` jeszcze nie
+    /// odpalono albo Router byl konstruowany w trybie test'owym
+    /// pomijajacym init.
+    pub fn stt_runtime(&self) -> Option<Arc<crate::services::stt::SttRuntime>> {
+        self.stt_runtime.read().clone()
     }
 
     // ========================================================================
@@ -355,16 +441,40 @@ impl Router {
         self.flow_dispatcher.as_ref()
     }
 
-    pub fn start(&self) {
-        info!("Router: Starting callback handler...");
-        self.spawn_callback_handler();
-        info!("Router: Callback handler started");
+    pub fn start(self: &Arc<Self>) {
         // QUIC service connection tasks are owned by the supervisor (krok N7.2):
         // it spawns reconnect loops directly per `BackendHandle::Quic` planted
         // into `live_handles`. The reverse router for incoming container streams
         // is wired the same way through `Router::set_mesh_manager` and the
         // dispatcher's `MeshForward` path.
-        self.service_manager.set_reverse_router(self.clone());
+        self.service_manager.set_reverse_router((**self).clone());
+
+        // Codex M1: wpięcie SttRuntime — trzyma `Weak<Router>` (anty-cykl).
+        // Handler `/v1/audio/transcriptions` woła przez `router.stt_runtime()`
+        // zamiast bezposrednio Router::route_audio_transcription, zeby
+        // SttRuntime byl single owner STT path (D.3).
+        *self.stt_runtime.write() = Some(Arc::new(
+            crate::services::stt::SttRuntime::new(self),
+        ));
+
+        // R3e (F10): subscribe na mutacje mesh registry. Wczesniej peer
+        // announce/remove/update aktualizowal registry, ale `/v1/models` /
+        // GUI catalog widzialy zmiany dopiero po nastepnym ticku supervisora
+        // (1-5s opoznienia). Z observerem rebuild leci natychmiast po
+        // mutacji w sub-second.
+        //
+        // Trzymamy `Weak<Router>` zeby uniknac cyklu: callback → Router →
+        // ServiceManager → MeshServicesRegistry → callback. Z `Weak`
+        // upgrade zawodzi po shutdown'cie i callback bezglosnie no-op'uje
+        // zamiast przedluzac zywotnosc routera.
+        if let Some(registry) = self.service_manager.mesh_services_registry.read().clone() {
+            let weak_self = Arc::downgrade(self);
+            registry.set_on_change(Some(Arc::new(move || {
+                if let Some(router) = weak_self.upgrade() {
+                    router.rebuild_catalog();
+                }
+            })));
+        }
 
         // Eager catalog build — `set_mesh_services_registry` runs before
         // `start()` so the registry is already wired here. Without this the
@@ -394,12 +504,6 @@ impl Router {
             })
     }
 
-    /// Pobierz RAG client (async - sprawdza czy polaczony)
-    #[allow(dead_code)]
-    pub(crate) async fn get_rag_client(&self, service_name: &str) -> Option<Arc<RAGClient>> {
-        self.service_manager.get_rag_client(service_name).await
-    }
-
     /// Pobierz QUIC embedding client (async - sprawdza czy polaczony)
     #[allow(dead_code)]
     pub(crate) async fn get_quic_embedding_client(
@@ -411,13 +515,6 @@ impl Router {
             .await
     }
 
-    /// Pobierz callback receiver dla RAG
-    pub(crate) fn get_callback_rx(
-        &self,
-    ) -> Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(ModelRequest, mpsc::Sender<ModelResponse>)>>>
-    {
-        self.service_manager.get_callback_rx()
-    }
 
     /// Pobierz status wszystkich serwisow (do diagnostyki/health check)
     pub async fn get_service_status(&self) -> std::collections::HashMap<String, String> {

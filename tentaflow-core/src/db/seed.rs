@@ -61,7 +61,6 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_tts_cleaning_rules(&tx)?;
     seed_prompts(&tx)?;
     seed_default_flows(&tx)?;
-    seed_model_aliases(&tx)?;
 
     // Seed user_accounts — domyslny admin z hashem argon2
     seed_user_accounts(&tx)?;
@@ -197,14 +196,6 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Wywołanie modelu językowego",
             r#"{"model":"","prompt_id":"","system_prompt":"","temperature":0.7,"max_tokens":4096,"stream":true}"#,
             "brain",
-        ),
-        (
-            "rag",
-            "service",
-            "RAG",
-            "Wyszukiwanie w bazie wiedzy",
-            r#"{"collection":"","top_k":5,"min_score":0.7}"#,
-            "search",
         ),
         (
             "stt",
@@ -532,6 +523,17 @@ N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie un
 
 /// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
+    // R3d (plan v7): zestaw default flows do wystawienia z fresh DB.
+    // - "Standardowy pipeline LLM" (Safe Chat) — z filtrem PII, default=1
+    // - "Default Chat" — bez PII, opt-in dla scenariuszy ktore nie chca filtru
+    // - "Standardowy pipeline TTS" — czyszczenie tekstu + TTS, default=1
+    // - "Audio Chat" — STT (z diarization) → LLM → output, dla `audio_input`
+    //   requestow (D.18: graph z STT na trigger -> input_modalities=[Audio]
+    //   auto-inferred przez catalog provider)
+    // - "teams-flow" — flow dla teams-bot (non-default)
+    //
+    // RAG flows usuniete razem z RAG path; nowa implementacja RAG bedzie
+    // miala wlasne default flows.
     let flows: &[(&str, &str, &str, &str, i64)] = &[
         (
             "Standardowy pipeline LLM",
@@ -541,11 +543,25 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
             1,
         ),
         (
+            "Default Chat",
+            "Najprostszy chat pipeline: trigger -> LLM -> output. Bez PII.",
+            "chat",
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{}}],"edges":[{"from":"t1","to":"l1"},{"from":"l1","to":"o1"}]}"#,
+            0,
+        ),
+        (
             "Standardowy pipeline TTS",
             "Prosty pipeline syntezy mowy: czyszczenie tekstu i TTS.",
             "tts",
             r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"c1","type":"tts_clean","position":{"x":200,"y":0},"config":{}},{"id":"s1","type":"tts","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from":"t1","to":"c1"},{"from":"c1","to":"s1"},{"from":"s1","to":"o1"}]}"#,
             1,
+        ),
+        (
+            "Audio Chat",
+            "Voice conversation: STT (z diarization) -> LLM -> output. Wlaczany dla audio_input.",
+            "chat",
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from":"t1","to":"s1"},{"from":"s1","to":"l1"},{"from":"l1","to":"o1"}]}"#,
+            0,
         ),
         (
             "teams-flow",
@@ -572,29 +588,6 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
         ])?;
         if affected > 0 {
             debug!("Utworzono domyslny flow: {}", name);
-        }
-    }
-
-    Ok(())
-}
-
-/// Seeduje domyslne aliasy modeli dla pipeline RAG.
-/// Domyslne aliasy — INSERT OR IGNORE nie nadpisze istniejacych wpisow.
-fn seed_model_aliases(conn: &Connection) -> Result<()> {
-    let aliases: &[(&str, &str)] = &[
-        ("rag-embeddings", "embeddings-gemma"),
-        ("rag-summarization", "bielik-11b"),
-        ("rag-generation", "bielik-11b"),
-        ("rag-reranker", "jina-reranker-v3"),
-    ];
-
-    let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO model_aliases (alias, target_model, is_active) VALUES (?1, ?2, 1)",
-    )?;
-    for (alias, target) in aliases {
-        let affected = stmt.execute(rusqlite::params![alias, target])?;
-        if affected == 0 {
-            debug!("Alias modelu '{}' juz istnieje, pominieto", alias);
         }
     }
 
@@ -691,7 +684,7 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 3, "oczekiwane 3 domyslne flows, jest {}", total);
+        assert_eq!(total, 5, "oczekiwane 5 domyslnych flows, jest {}", total);
 
         let names: Vec<String> = conn
             .prepare("SELECT name FROM flows ORDER BY name")
@@ -703,6 +696,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "Audio Chat".to_string(),
+                "Default Chat".to_string(),
                 "Standardowy pipeline LLM".to_string(),
                 "Standardowy pipeline TTS".to_string(),
                 "teams-flow".to_string(),
@@ -733,7 +728,10 @@ mod tests {
             &["trigger", "llm", "pii_filter", "output"],
             3,
         );
-        assert_eq!(st, "llm");
+        // R0a: service_type "llm" zostalo przemianowane na "chat" (chat
+        // router dispatchuje z service_type='chat'); seed odzwierciedla
+        // ten kontrakt.
+        assert_eq!(st, "chat");
         assert_eq!(def, 1);
 
         let (st, def) = assert_dag(
@@ -743,6 +741,18 @@ mod tests {
         );
         assert_eq!(st, "tts");
         assert_eq!(def, 1);
+
+        let (st, def) = assert_dag("Default Chat", &["trigger", "llm", "output"], 2);
+        assert_eq!(st, "chat");
+        assert_eq!(def, 0, "Default Chat nie jest default w db (Standardowy pipeline LLM jest)");
+
+        let (st, def) = assert_dag(
+            "Audio Chat",
+            &["trigger", "stt", "llm", "output"],
+            3,
+        );
+        assert_eq!(st, "chat");
+        assert_eq!(def, 0, "Audio Chat jest opt-in (wymaga audio_input)");
 
         let (st, _) = assert_dag("teams-flow", &["trigger", "llm", "pii_filter", "output"], 3);
         assert_eq!(st, "agents");
@@ -806,7 +816,6 @@ mod tests {
         use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
         use crate::flow_engine::adapters::output::OutputNodeAdapter;
         use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
-        use crate::flow_engine::adapters::rag::RagNodeAdapter;
         use crate::flow_engine::adapters::session_context::SessionContextAdapter;
         use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
         use crate::flow_engine::adapters::stt::SttNodeAdapter;
@@ -826,9 +835,20 @@ mod tests {
         );
 
         let mut registry = AdapterRegistry::new();
-        registry.register(LlmNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(RagNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(SttNodeAdapter::new(sm.clone(), config.clone()));
+        // R2a: w teście walidacji adapter LLM dostaje pusty executor slot —
+        // adapter wywoluje legacy mini-router gdy slot jest None, co
+        // pasuje do scenariusza testu (sprawdzamy tylko walidacje
+        // flow_json + adapter port metadata, nie dispatch).
+        let executor_slot: crate::flow_engine::dispatcher::ExecutorSlot =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let stt_runtime_slot: crate::flow_engine::dispatcher::SttRuntimeSlot =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        registry.register(LlmNodeAdapter::new(
+            sm.clone(),
+            config.clone(),
+            executor_slot,
+        ));
+        registry.register(SttNodeAdapter::new(stt_runtime_slot));
         registry.register(TtsNodeAdapter::new(sm.clone(), config.clone()));
         registry.register(EmbeddingsNodeAdapter::new(sm.clone(), config.clone()));
         registry.register(MemoryNodeAdapter::new(sm.clone(), config.clone()));

@@ -39,7 +39,6 @@ pub enum ServiceKind {
     Llm,
     Tts,
     Stt,
-    Rag,
     Embedding,
     Vision,
     Router,
@@ -171,7 +170,6 @@ impl Theme {
             ServiceKind::Llm => Color32::from_rgb(99, 102, 241),       // indigo
             ServiceKind::Tts => Color32::from_rgb(168, 85, 247),       // purple
             ServiceKind::Stt => Color32::from_rgb(236, 72, 153),       // pink
-            ServiceKind::Rag => Color32::from_rgb(14, 165, 233),       // sky
             ServiceKind::Embedding => Color32::from_rgb(20, 184, 166), // teal
             ServiceKind::Vision => Color32::from_rgb(245, 158, 11),    // amber
             ServiceKind::Router => Color32::from_rgb(34, 197, 94),     // green

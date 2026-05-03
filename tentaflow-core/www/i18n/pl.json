@@ -225,12 +225,19 @@
     "confirm_delete_title": "Usuń serwis",
     "confirm_delete_body": "Usunąć \"{name}\" z {node}?",
     "status": {
-      "running": "Uruchomiony",
-      "starting": "Startuje",
-      "degraded": "Pogorszony",
-      "failed": "Błąd",
+      "none": "Brak",
+      "connected": "Połączony",
+      "connecting": "Łączenie",
+      "disconnected": "Rozłączony",
+      "config_error": "Błąd konfiguracji",
+      "ready": "Gotowy",
+      "running": "Działa",
+      "starting": "Uruchamia się",
       "stopped": "Zatrzymany",
-      "paused": "Wstrzymany"
+      "degraded": "Pogorszony",
+      "failed": "Awaria",
+      "error": "Błąd",
+      "on_demand": "Na żądanie"
     },
     "tooltip_pin_off": "Trzymaj zawsze w pamięci",
     "tooltip_pin_on": "Trzymany zawsze w pamięci — kliknij, aby wyłączyć",
@@ -267,6 +274,7 @@
     "alias_active": "Aktywny",
     "alias_inactive": "Nieaktywny",
     "alias_required": "Nazwa i target są wymagane",
+    "alias_fallback_parse_failed": "Nie udało się odczytać dotychczasowych fallbacków (niezgodny format). Odśwież stronę albo dodaj fallbacki ponownie zanim zapiszesz.",
     "alias_created": "Alias utworzony",
     "alias_updated": "Alias zaktualizowany",
     "alias_deleted": "Alias „{name}” usunięty",
@@ -303,21 +311,6 @@
     "update_retry": "Ponów",
     "update_close": "Zamknij",
     "update_managed_externally": "Zarządzany zewnętrznie",
-    "status": {
-      "none": "Brak",
-      "connected": "Połączony",
-      "connecting": "Łączenie",
-      "disconnected": "Rozłączony",
-      "config_error": "Błąd konfiguracji",
-      "ready": "Gotowy",
-      "running": "Działa",
-      "starting": "Uruchamia się",
-      "stopped": "Zatrzymany",
-      "degraded": "Pogorszony",
-      "failed": "Awaria",
-      "error": "Błąd",
-      "on_demand": "Na żądanie"
-    },
     "deploy": {
       "title": "Wdróż nowy serwis",
       "engine": "Silnik",
@@ -634,10 +627,6 @@
       "reranker": {
         "name": "Reranker",
         "desc": "Rerankowanie wyników wyszukiwania. Cross-encoder dla precyzyjnego scoringu dokumentów."
-      },
-      "rag": {
-        "name": "RAG Engine",
-        "desc": "Retrieval-Augmented Generation. Wyszukiwanie i generowanie odpowiedzi."
       },
       "tools": {
         "name": "Tools",
@@ -1022,7 +1011,6 @@
     "categories": {
       "trigger": "Wyzwalacze",
       "service": "Serwisy AI",
-      "rag": "RAG",
       "transform": "Transformacje",
       "logic": "Logika",
       "filter": "Filtry",
@@ -1088,7 +1076,6 @@
     "node_names": {
       "trigger": "Trigger",
       "llm": "Wywołanie LLM",
-      "rag": "Wyszukiwanie RAG",
       "stt": "Mowa na tekst",
       "tts": "Tekst na mowę",
       "embeddings": "Embeddingi",
@@ -1108,7 +1095,6 @@
     "node_descriptions": {
       "trigger": "Punkt wejścia flow (HTTP, QUIC, webhook)",
       "llm": "Wywołanie modelu językowego - wysyła prompt i zwraca odpowiedź",
-      "rag": "Wyszukiwanie w bazie wiedzy - zwraca kontekst do LLM",
       "stt": "Transkrypcja mowy na tekst",
       "tts": "Synteza tekstu na mowę",
       "embeddings": "Generowanie embeddingów tekstu",
@@ -1171,7 +1157,7 @@
     "status_archived": "Archiwum",
     "status_draft": "Draft",
     "list_title": "Przepływy",
-    "subtitle": "Graf DAG wykonywany przez flow_engine — LLM, embeddings, TTS, RAG.",
+    "subtitle": "Graf DAG wykonywany przez flow_engine — LLM, embeddings, TTS.",
     "empty_title": "Brak przepływów",
     "empty_desc": "Utwórz pierwszy przepływ, aby zdefiniować graf przetwarzania.",
     "new_flow_btn": "Nowy flow",

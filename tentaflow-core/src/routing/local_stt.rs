@@ -144,6 +144,7 @@ impl LocalSttHandler {
             language: Some(result.language),
             duration: Some(result.duration_seconds as f32),
             segments,
+            speakers: None,
         })
     }
 }

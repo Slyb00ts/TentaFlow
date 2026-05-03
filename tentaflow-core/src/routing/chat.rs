@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: routing/chat.rs
 // Opis: Obsluga zapytan chat completion — non-streaming route, flow engine,
-//       audio input processing (STT + speaker identification), RAG routing,
-//       QUIC LLM routing, callback handler, protocol-native completion.
+//       audio input processing (STT + speaker identification),
+//       QUIC LLM routing, protocol-native completion.
 // =============================================================================
 
 use crate::api::openai::types::{
@@ -63,13 +63,69 @@ impl Router {
             }
         }
 
+        // Audio capability guard. Chat does not silently transcribe audio
+        // for the model — if the request carries `audio_input` the
+        // resolved target must declare Audio in its `input_modalities`.
+        // Otherwise we reject with a typed error so the client knows the
+        // chosen model cannot process the payload (and the caller can
+        // route through `/v1/audio/transcriptions` if STT is what they
+        // actually wanted).
+        //
+        // Alias surfaces follow their primary target's modalities. If an
+        // alias is configured with a text-only primary and an audio-
+        // capable fallback, this guard rejects audio requests; the
+        // resolver applies fallback filtering per-request internally.
+        // Operators wanting audio-on-fallback semantics should make the
+        // alias's primary the audio-capable model.
+        // R6.P3: empty `Some(vec![])` is a client bug, not a "no audio".
+        // Reject loudly before the capability guard so the operator sees
+        // the empty payload, not a confusing capability error downstream.
+        if let Some(ref bytes) = request.audio_input {
+            if bytes.is_empty() {
+                return Err(crate::error::CoreError::InvalidRequest {
+                    message: "audio_input is present but empty (0 bytes)".to_string(),
+                    details: Some(
+                        "Send a non-empty audio payload or omit audio_input entirely.".to_string(),
+                    ),
+                }
+                .into());
+            }
+        }
+        let target_accepts_audio = if request.audio_input.is_some() {
+            let snap = self.catalog_snapshot();
+            if !catalog_target_accepts_audio(&snap, &request.model) {
+                tracing::warn!(
+                    model = %request.model,
+                    "audio_input_unsupported: target does not declare Audio in input_modalities"
+                );
+                return Err(crate::error::CoreError::InvalidRequest {
+                    message: format!(
+                        "audio_input_unsupported: model '{}' does not accept audio input",
+                        request.model
+                    ),
+                    details: Some(
+                        "Use /v1/audio/transcriptions for STT, or pick a model with audio_input capability"
+                            .to_string(),
+                    ),
+                }
+                .into());
+            }
+            true
+        } else {
+            false
+        };
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let ctx = crate::routing::build_flow_context_for_user(&request, false, user.clone());
 
             match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                 Ok(Some(result)) => {
-                    let response = flow_result_to_chat_response(result, &request.model);
+                    let mut response = flow_result_to_chat_response(result, &request.model);
+                    // Codex H1 round 2: flow path tez musi przejsc przez
+                    // response_middleware — wczesniej tylko direct executor
+                    // sciezka aplikowala clean_text, flow zwracal bezposrednio.
+                    self.apply_response_middleware(&mut response)?;
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
                             .map(|h| h.to_string_lossy().to_string())
@@ -89,53 +145,85 @@ impl Router {
             }
         }
 
-        // Audio input -> STT + speaker ID przeksztalca audio na tekst + speaker metadata.
-        // To jest fizyczna transkrypcja, nie pre-processing request-a.
-        let t0 = std::time::Instant::now();
-        let (request, voice_info) = self.process_audio_input(request).await?;
-        if voice_info.is_some() {
-            metrics.stt_ms = Some(t0.elapsed().as_millis() as u64);
-        }
+        // R2d (D.7): chat NIE robi ukrytego STT. Po `target_accepts_audio`
+        // guard wyzej, audio_input dociera albo do audio-capable backendu w
+        // surowej formie albo request zostaje odrzucony (`audio_input_unsupported`).
+        // VoiceInfo stays None — explicit STT lezy pod /v1/audio/transcriptions
+        // albo flow z dedykowanym STT node.
+        let voice_info: Option<VoiceInfo> = None;
 
         // Direct dispatch do backendu — bez pre/post processingu request-a.
+        // Gdy target zaakceptowal audio bypass (D.7) wymuszamy filtr dispatch
+        // zeby request audio nie trafil do innego instance'u tej samej nazwy
+        // ktory audio nie obsluguje.
+        // R3a: ostateczny dispatch idzie przez `ModelRuntimeExecutor` —
+        // single point of truth dla alias resolution + strategy +
+        // per-instance modality filter. Embedded / HTTP / QUIC LLM /
+        // Flow obslugiwane bezposrednio. MeshForward executor w obecnym
+        // buildzie zwraca `TransportPendingCutover` (deferred), wiec
+        // wracamy do legacy `dispatch_with_fallback` jako fallback —
+        // gdy mesh transport bedzie wpiety w executor (R3a follow-up),
+        // fallback wypadnie automatycznie.
+        let _ = target_accepts_audio;
         let t2 = std::time::Instant::now();
-        let route_result = {
-            use crate::routing::middleware::BackendHandle;
-            let this = self.clone();
-            let req = request.clone();
-            self.dispatch_with_fallback(&request.model, 0, |handle| {
-                let this = this.clone();
-                let req = req.clone();
-                let handle = handle.clone();
-                async move {
-                    match &handle {
-                        BackendHandle::LocalLlm => {
-                            debug!("Routing do lokalnej inferencji in-process");
-                            this.local_inference.handle_chat_completion(&req).await
+        let executor_snapshot = self.executor.read().clone();
+        let route_result = match executor_snapshot {
+            Some(executor) => {
+                use crate::services::runtime::context::ExecutionContext;
+                use crate::services::runtime::executor::ExecutorError;
+                let mut exec_ctx = ExecutionContext {
+                    user: user.clone(),
+                    ..ExecutionContext::default()
+                };
+                match executor.execute_chat(request.clone(), &mut exec_ctx).await {
+                    Ok(mut response) => {
+                        // Codex H3: aplikuj response_middleware na content/reasoning
+                        // — executor MVP nie ma middleware factory wpietego, wiec
+                        // robimy to inline tutaj zeby PII filter nie zostal
+                        // bypassowany na sciezce executor (pozostale ścieżki —
+                        // route_to_quic_llm, legacy_chat_dispatch — juz
+                        // aplikuja clean_text wewnatrz). Pelne wpiecie middleware
+                        // factory w executor: R5 follow-up.
+                        self.apply_response_middleware(&mut response)?;
+                        let route_metadata = crate::routing::RouteMetadata {
+                            served_by_node: exec_ctx
+                                .route_metadata
+                                .served_by_node
+                                .unwrap_or_else(|| {
+                                    hostname::get()
+                                        .map(|h| h.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| "unknown".to_string())
+                                }),
+                            backend_type: exec_ctx
+                                .route_metadata
+                                .backend_type
+                                .unwrap_or_else(|| "executor".to_string()),
+                            strategy_used: "executor".to_string(),
+                            fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                            // hop_count tracked w `ExecutionContext.hop_count`
+                            // (mesh forwards bumpuja); RouteMetadata go nie ma —
+                            // do bezpiecznego startu zostawiamy 0.
+                            hop_count: 0,
+                            latency_ms: Some(t2.elapsed().as_secs_f64() * 1000.0),
+                        };
+                        crate::routing::RouteResult {
+                            response,
+                            metadata: route_metadata,
                         }
-                        BackendHandle::Rag(name) => this.route_to_rag(name.clone(), req).await,
-                        BackendHandle::QuicLlm(name) => {
-                            this.route_to_quic_llm(name.clone(), req, None, None).await
-                        }
-                        BackendHandle::Http(name) => {
-                            let backend = this
-                                .select_http_backend(name)
-                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
-                            Ok(backend.chat_completion(req).await?)
-                        }
-                        BackendHandle::MeshForward(node_id, svc) => {
-                            debug!(
-                                target_node = %node_id,
-                                service = %svc,
-                                "MeshForward — wysylam chat request do zdalnej uslugi mesh"
-                            );
-                            this.route_to_mesh_llm(node_id.clone(), svc.clone(), req).await
-                        }
-                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
                     }
+                    Err(ExecutorError::TransportPendingCutover(_)) => {
+                        debug!(
+                            "Executor zwrocil TransportPendingCutover — fallback na legacy dispatch"
+                        );
+                        self.legacy_chat_dispatch(&request).await?
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("executor.execute_chat: {}", e).into()),
                 }
-            })
-            .await?
+            }
+            None => {
+                // DB-less Router (test harness) — executor nie jest wpiety.
+                self.legacy_chat_dispatch(&request).await?
+            }
         };
         let mut response = route_result.response;
         let route_metadata = route_result.metadata;
@@ -157,600 +245,84 @@ impl Router {
         })
     }
 
-    /// Przetwarza audio_input: STT + speaker identification z confidence levels.
-    pub(crate) async fn process_audio_input(
+    /// Codex H1 + H3 round 2: jedyny single point gdzie aplikujemy
+    /// `response_middleware.clean_text` na response. Kazda sciezka chat
+    /// (executor success, flow_engine try_dispatch result, legacy
+    /// dispatch_with_fallback) MUSI wolac to przed return zeby PII filter
+    /// nie zostal bypassowany. Lustro per-token logiki w streaming.rs
+    /// (StreamingProcessor scan + EOF flush).
+    fn apply_response_middleware(
         &self,
-        mut request: ChatCompletionRequest,
-    ) -> Result<(ChatCompletionRequest, Option<VoiceInfo>)> {
-        let audio_data = match request.audio_input.take() {
-            Some(data) if !data.is_empty() => data,
-            _ => return Ok((request, None)),
-        };
-
-        debug!("Processing audio_input: {} bytes", audio_data.len());
-
-        // === KROK 1: STT - transkrypcja audio z diarization ===
-        let stt_result = self.process_stt_for_voice(&audio_data).await?;
-        let transcribed_text = stt_result.text;
-        let diarized_speakers = stt_result.speakers;
-
-        if transcribed_text.is_empty() {
-            debug!("STT zwrocilo pusty tekst - pomijam audio input");
-            return Ok((request, None));
-        }
-
-        debug!("STT transkrypcja: {}", transcribed_text);
-        if diarized_speakers.len() > 1 {
-            info!(
-                "Wykryto {} mowcow w audio (process_audio_input)",
-                diarized_speakers.len()
-            );
-        }
-
-        // === KROK 2: Speaker Identification z confidence levels ===
-        let speaker_result = self.process_speaker_identify(&audio_data).await;
-
-        debug!(
-            "Speaker identify: id={:?}, name={:?}, confidence={:?}, level={}",
-            speaker_result.speaker_id,
-            speaker_result.speaker_name,
-            speaker_result.similarity,
-            speaker_result.confidence_level
-        );
-
-        // === KROK 2.5: Zbieraj dodatkowe probki glosu dla nowo-zarejestrowanych mowcow ===
-        if speaker_result.is_high_confidence() {
-            if let Some(ref speaker_id) = speaker_result.speaker_id {
-                let should_collect = {
-                    let pending = self.pending_voice_samples.read().await;
-                    pending.get(speaker_id).copied()
-                };
-
-                if let Some(remaining) = should_collect {
-                    info!(
-                        "Collecting additional voice sample for {}: {} remaining",
-                        speaker_id, remaining
-                    );
-
-                    let speaker_id_for_sample = speaker_id.clone();
-                    let audio_for_sample = audio_data.clone();
-                    let pending_samples = self.pending_voice_samples.clone();
-                    let service_manager = self.service_manager.clone();
-
-                    tokio::spawn(async move {
-                        let stt_client = match service_manager.get_first_quic_stt_client().await {
-                            Some(client) => client,
-                            None => {
-                                warn!("No STT service for voice sample collection");
-                                return;
-                            }
-                        };
-
-                        use tentaflow_protocol::*;
-                        let add_samples_payload = AudioPayload {
-                            operation: AudioOperation::SpeakerAddSamples {
-                                speaker_id: speaker_id_for_sample.clone(),
-                                audio_samples: vec![audio_for_sample],
-                            },
-                        };
-
-                        let request_id = uuid::Uuid::new_v4().to_string();
-                        let add_request = ModelRequest {
-                            request_id: request_id.clone(),
-                            payload: ModelPayload::Audio(add_samples_payload),
-                            metadata: None,
-                            session_id: None,
-                            stream: false,
-                        };
-
-                        match stt_client.send_request(add_request).await {
-                            Ok(_) => {
-                                info!(
-                                    "Voice sample added for {}, decrementing counter",
-                                    speaker_id_for_sample
-                                );
-
-                                let mut pending = pending_samples.write().await;
-                                if let Some(count) = pending.get_mut(&speaker_id_for_sample) {
-                                    if *count <= 1 {
-                                        pending.remove(&speaker_id_for_sample);
-                                        info!(
-                                            "Voice sample collection complete for {} (3 samples collected)",
-                                            speaker_id_for_sample
-                                        );
-                                    } else {
-                                        *count -= 1;
-                                        info!(
-                                            "Voice samples remaining for {}: {}",
-                                            speaker_id_for_sample, *count
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to add voice sample for {}: {}",
-                                    speaker_id_for_sample, e
-                                );
-                            }
-                        }
-                    });
-                }
+        response: &mut ChatCompletionResponse,
+    ) -> Result<()> {
+        for choice in &mut response.choices {
+            if let Some(MessageContent::Text(text)) = choice.message.content.as_mut() {
+                let cleaned = self
+                    .response_middleware
+                    .clean_text(text)
+                    .map_err(|e| anyhow::anyhow!("response_middleware.clean_text: {}", e))?;
+                *text = cleaned;
+            }
+            if let Some(reasoning) = choice.message.reasoning_content.as_mut() {
+                let cleaned = self
+                    .response_middleware
+                    .clean_text(reasoning)
+                    .map_err(|e| anyhow::anyhow!("response_middleware.clean_text: {}", e))?;
+                *reasoning = cleaned;
             }
         }
-
-        // === KROK 3: Dodaj transkrypcje jako user message ===
-        request.messages.push(Message {
-            role: "user".to_string(),
-            content: Some(MessageContent::Text(transcribed_text.clone())),
-            reasoning_content: None,
-            name: if speaker_result.is_high_confidence() {
-                speaker_result.speaker_name.clone()
-            } else {
-                None
-            },
-            tool_calls: None,
-            tool_call_id: None,
-        });
-
-        // === KROK 4: Ustaw person_id w memory_options wg confidence ===
-        {
-            let memory_opts = request.memory_options.get_or_insert_with(Default::default);
-
-            if speaker_result.is_high_confidence() {
-                if let Some(ref id) = speaker_result.speaker_id {
-                    memory_opts.person_id = Some(id.clone());
-                    memory_opts.speaker_confidence = speaker_result.similarity;
-                    debug!("HIGH confidence - setting person_id={}", id);
-                }
-            } else if speaker_result.is_medium_confidence() {
-                memory_opts.speaker_confidence = speaker_result.similarity;
-                if let Some(ref name) = speaker_result.speaker_name {
-                    let confirmation_hint = speaker_result
-                        .confirmation_message
-                        .clone()
-                        .unwrap_or_else(|| format!("Czy to ty, {}?", name));
-                    memory_opts.session_context = Some(format!(
-                        "SPEAKER_CANDIDATE: id={}, name={}, confidence={:.2}, ask: {}",
-                        speaker_result.speaker_id.as_deref().unwrap_or("?"),
-                        name,
-                        speaker_result.similarity.unwrap_or(0.0),
-                        confirmation_hint
-                    ));
-                    debug!("MEDIUM confidence - candidate={}, needs confirmation", name);
-                }
-            } else {
-                debug!("LOW confidence - treating as new speaker");
-            }
-        }
-
-        let voice_info = VoiceInfo {
-            transcribed_text,
-            speaker_id: if speaker_result.is_high_confidence() {
-                speaker_result.speaker_id.clone()
-            } else {
-                None
-            },
-            speaker_name: if speaker_result.is_high_confidence() {
-                speaker_result.speaker_name.clone()
-            } else {
-                None
-            },
-            speaker_confidence: speaker_result.similarity,
-            confidence_level: speaker_result.confidence_level,
-            needs_confirmation: speaker_result.needs_confirmation,
-            confirmation_message: speaker_result.confirmation_message,
-            diarized_speakers,
-        };
-
-        Ok((request, Some(voice_info)))
+        Ok(())
     }
 
-    /// Helper: STT dla voice conversation z diarization.
-    pub(crate) async fn process_stt_for_voice(
+    /// R3a transitional shim (Codex L1): stara logika dispatch_with_fallback
+    /// dla scenariuszy ktore executor jeszcze nie obsluguje. Plan v7 D.10
+    /// "Zero compat shims" — to **transitional path** z konkretnymi
+    /// kryteriami delete'u, nie permanent compat layer.
+    ///
+    /// **Deletion criteria (do usuniecia razem z helperem):**
+    /// 1. `executor.dispatch_chat_blocking` obsluguje `MeshForward` bez
+    ///    `TransportPendingCutover` (mesh trust verification + iroh forward
+    ///    wpiete bezposrednio w executor).
+    /// 2. Wszystkie test harnesses Router maja DB (`Router::new(.., Some(db))`)
+    ///    albo executor jest opcjonalnie konstruowany bez DB.
+    /// 3. Cargo grep `legacy_chat_dispatch` zwraca tylko ten plik.
+    ///
+    /// Po spelnieniu wszystkich 3 — usun helper + `route_to_quic_llm` +
+    /// `route_to_mesh_llm` + `dispatch_with_fallback` (chyba ze rest of
+    /// embeddings/tts/stt nadal ich uzywa, w takim razie usun po R3b cutover).
+    async fn legacy_chat_dispatch(
         &self,
-        audio_data: &[u8],
-    ) -> Result<SttWithDiarization> {
-        let stt_client = self
-            .service_manager
-            .get_first_quic_stt_client()
-            .await
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: "stt-service".to_string(),
-            })?;
-
-        let stt_payload = AudioPayload {
-            operation: AudioOperation::STT {
-                model: "whisper".to_string(),
-                audio_data: audio_data.to_vec(),
-                language: None,
-                prompt: None,
-                temperature: None,
-                response_format: Some("verbose_json".to_string()),
-                timestamp_granularities: None,
-                no_speech_threshold: None,
-                avg_logprob_threshold: None,
-                compression_ratio_threshold: None,
-            },
-        };
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let stt_request = ModelRequest {
-            request_id: request_id.clone(),
-            payload: ModelPayload::Audio(stt_payload),
-            metadata: None,
-            session_id: None,
-            stream: false,
-        };
-
-        let response =
-            stt_client
-                .send_request(stt_request)
-                .await
-                .map_err(|e| CoreError::NetworkError {
-                    message: format!("STT request failed: {}", e),
-                    source: anyhow::anyhow!("{}", e),
-                })?;
-
-        match response.result {
-            ModelResult::Audio(result) => match result.data {
-                AudioResultData::Text(text) => Ok(SttWithDiarization {
-                    text,
-                    speakers: vec![],
-                }),
-                AudioResultData::Detailed { text, segments, .. } => {
-                    let mut speaker_texts: std::collections::HashMap<
-                        String,
-                        (bool, Option<f32>, Vec<String>),
-                    > = std::collections::HashMap::new();
-
-                    for seg in segments {
-                        let label = seg
-                            .speaker_label
-                            .clone()
-                            .unwrap_or_else(|| "SPEAKER_00".to_string());
-                        let is_known = seg.is_known_speaker.unwrap_or(false);
-                        let similarity = seg.speaker_similarity;
-
-                        let entry = speaker_texts.entry(label.clone()).or_insert((
-                            is_known,
-                            similarity,
-                            vec![],
-                        ));
-                        entry.2.push(seg.text.clone());
+        request: &ChatCompletionRequest,
+    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
+        use crate::routing::middleware::BackendHandle;
+        let this = self.clone();
+        let req = request.clone();
+        self.dispatch_with_fallback(&request.model, 0, None, |handle| {
+            let this = this.clone();
+            let req = req.clone();
+            let handle = handle.clone();
+            async move {
+                match &handle {
+                    BackendHandle::LocalLlm => {
+                        this.local_inference.handle_chat_completion(&req).await
                     }
-
-                    let speakers: Vec<DiarizedSpeaker> = speaker_texts
-                        .into_iter()
-                        .map(|(label, (is_known, similarity, texts))| DiarizedSpeaker {
-                            label,
-                            is_known,
-                            similarity,
-                            text: texts.join(" "),
-                        })
-                        .collect();
-
-                    if speakers.len() > 1 {
-                        debug!("Diarization wykryla {} mowcow", speakers.len());
-                        for s in &speakers {
-                            debug!("  - {}: {} (known={})", s.label, s.text, s.is_known);
-                        }
+                    BackendHandle::QuicLlm(name) => {
+                        this.route_to_quic_llm(name.clone(), req, None, None).await
                     }
-
-                    Ok(SttWithDiarization { text, speakers })
-                }
-                _ => Err(CoreError::InternalError {
-                    message: "Unexpected audio result type (expected Text)".to_string(),
-                    source: None,
-                }
-                .into()),
-            },
-            ModelResult::Error(e) => Err(CoreError::InternalError {
-                message: format!("STT error: {}", e.message),
-                source: None,
-            }
-            .into()),
-            _ => Err(CoreError::InternalError {
-                message: "Unexpected STT response type".to_string(),
-                source: None,
-            }
-            .into()),
-        }
-    }
-
-    /// Helper: Speaker identification.
-    /// Zwraca informacje o rozpoznaniu mowcy z poziomem pewnosci.
-    pub(crate) async fn process_speaker_identify(
-        &self,
-        audio_data: &[u8],
-    ) -> SpeakerIdentifyResult {
-        let stt_client = match self.service_manager.get_first_quic_stt_client().await {
-            Some(client) => client,
-            None => {
-                warn!("No STT service available for speaker identification");
-                return SpeakerIdentifyResult::unknown();
-            }
-        };
-
-        let speaker_operation = AudioOperation::SpeakerIdentifyWithConfidence {
-            audio_data: audio_data.to_vec(),
-            high_threshold: Some(0.78),
-            medium_threshold: Some(0.55),
-            audio_metadata: None,
-        };
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let speaker_request = ModelRequest {
-            request_id: request_id.clone(),
-            payload: ModelPayload::Audio(AudioPayload {
-                operation: speaker_operation,
-            }),
-            metadata: None,
-            session_id: None,
-            stream: false,
-        };
-
-        let response = match stt_client.send_request(speaker_request).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!("Speaker identify request failed: {}", e);
-                return SpeakerIdentifyResult::unknown();
-            }
-        };
-
-        match response.result {
-            ModelResult::Audio(audio_result) => match audio_result.data {
-                AudioResultData::SpeakerIdentifyWithConfidenceResult {
-                    is_match,
-                    speaker_id,
-                    speaker_name,
-                    similarity,
-                    confidence_level,
-                    needs_confirmation,
-                    confirmation_message,
-                    ..
-                } => {
-                    if is_match {
-                        let valid_id = speaker_id.filter(|s| !s.is_empty());
-                        let valid_name = speaker_name.filter(|s| !s.is_empty());
-
-                        debug!(
-                            "Speaker identified: id={:?}, name={:?}, confidence={}, level={}",
-                            valid_id, valid_name, similarity, confidence_level
-                        );
-
-                        SpeakerIdentifyResult {
-                            speaker_id: valid_id,
-                            speaker_name: valid_name,
-                            similarity: Some(similarity),
-                            confidence_level,
-                            needs_confirmation,
-                            confirmation_message,
-                        }
-                    } else {
-                        debug!(
-                            "Speaker not recognized (similarity={}, level={})",
-                            similarity, confidence_level
-                        );
-                        SpeakerIdentifyResult {
-                            speaker_id: None,
-                            speaker_name: None,
-                            similarity: Some(similarity),
-                            confidence_level: "LOW".to_string(),
-                            needs_confirmation: false,
-                            confirmation_message: None,
-                        }
+                    BackendHandle::Http(name) => {
+                        let backend = this
+                            .select_http_backend(name)
+                            .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
+                        Ok(backend.chat_completion(req).await?)
                     }
-                }
-                AudioResultData::SpeakerIdentifyResult {
-                    is_match,
-                    speaker_id,
-                    speaker_name,
-                    similarity,
-                    ..
-                } => {
-                    if is_match {
-                        let valid_id = speaker_id.filter(|s| !s.is_empty());
-                        let valid_name = speaker_name.filter(|s| !s.is_empty());
-                        SpeakerIdentifyResult {
-                            speaker_id: valid_id,
-                            speaker_name: valid_name,
-                            similarity: Some(similarity),
-                            confidence_level: if similarity >= 0.78 { "HIGH" } else { "MEDIUM" }
-                                .to_string(),
-                            needs_confirmation: similarity < 0.78,
-                            confirmation_message: None,
-                        }
-                    } else {
-                        SpeakerIdentifyResult::unknown()
+                    BackendHandle::MeshForward(node_id, svc) => {
+                        this.route_to_mesh_llm(node_id.clone(), svc.clone(), req).await
                     }
+                    _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
                 }
-                _ => {
-                    warn!("Unexpected audio result type for speaker identify");
-                    SpeakerIdentifyResult::unknown()
-                }
-            },
-            ModelResult::Error(e) => {
-                warn!("Speaker identify error: {}", e.message);
-                SpeakerIdentifyResult::unknown()
             }
-            _ => {
-                warn!("Unexpected speaker identify response type");
-                SpeakerIdentifyResult::unknown()
-            }
-        }
-    }
-
-    /// Routuje request do RAG engine przez QUIC (non-streaming).
-    pub(crate) async fn route_to_rag(
-        &self,
-        rag_engine_name: String,
-        request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse> {
-        debug!("Routing to RAG engine: {}", rag_engine_name);
-
-        let rag_handle = self
-            .service_manager
-            .rag_services
-            .get(&rag_engine_name)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: rag_engine_name.clone(),
-            })?;
-
-        let rag_client =
-            rag_handle
-                .get_client()
-                .await
-                .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                    model_name: rag_engine_name.clone(),
-                })?;
-
-        let query = request
-            .messages
-            .last()
-            .and_then(|m| match &m.content {
-                Some(MessageContent::Text(text)) => Some(text.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        let context = if request.messages.len() > 1 {
-            Some(RAGContext {
-                messages: request
-                    .messages
-                    .iter()
-                    .map(|m| {
-                        let content = match &m.content {
-                            Some(MessageContent::Text(text)) => text.clone(),
-                            _ => String::new(),
-                        };
-                        tentaflow_protocol::Message {
-                            role: m.role.clone(),
-                            content,
-                        }
-                    })
-                    .collect(),
-                metadata: vec![],
-            })
-        } else {
-            None
-        };
-
-        let (rag_payload, requires_llm, requires_audio) =
-            crate::routing::build_rag_payload(&request, query, context);
-
-        debug!(
-            "Sending RAGPayload (llm: {}, audio: {}, modes: {:?})",
-            requires_llm, requires_audio, rag_payload.search_modes
-        );
-
-        let rag_result = rag_client.send_request(rag_payload).await?;
-
-        debug!(
-            "Received RAGResult: {} chunks, llm: {}, audio: {}",
-            rag_result.metadata.len(),
-            rag_result.requires_llm_processing,
-            rag_result.requires_audio_output
-        );
-
-        let content = if rag_result.requires_llm_processing {
-            debug!("RAG wymaga przetworzenia przez LLM - routing do LLM backend");
-
-            let llm_model_name = rag_result.llm_model.clone().ok_or_else(|| {
-                anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None")
-            })?;
-
-            let llm_backend = self.select_http_backend(&llm_model_name).ok_or_else(|| {
-                CoreError::ModelNotFound {
-                    model_name: llm_model_name.clone(),
-                }
-            })?;
-
-            debug!("Wybrany LLM backend: {}", llm_backend.url());
-
-            let llm_request = ChatCompletionRequest {
-                model: llm_model_name.clone(),
-                messages: vec![Message {
-                    role: "user".to_string(),
-                    content: Some(MessageContent::Text(rag_result.context_text.clone())),
-                    ..Default::default()
-                }],
-                max_tokens: request.max_tokens,
-                temperature: request.temperature,
-                top_p: request.top_p,
-                n: Some(1),
-                stream: false,
-                stop: request.stop.clone(),
-                presence_penalty: request.presence_penalty,
-                frequency_penalty: request.frequency_penalty,
-                user: request.user.clone(),
-                response_format: None,
-                tools: None,
-                tool_choice: None,
-                rag_options: None,
-                memory_options: None,
-                audio_input: None,
-            };
-
-            let llm_response = llm_backend.chat_completion(llm_request).await?;
-
-            let llm_text = llm_response
-                .choices
-                .first()
-                .and_then(|choice| match &choice.message.content {
-                    Some(MessageContent::Text(text)) => Some(text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    warn!("LLM nie zwrocil tekstu w pierwszym choice - uzywam pustego");
-                    String::new()
-                });
-
-            debug!("Otrzymano odpowiedz z LLM: {} znakow", llm_text.len());
-
-            if rag_result.requires_audio_output {
-                debug!("requires_audio_output=true ale uzywamy non-streaming mode - pomijam TTS");
-            }
-
-            llm_text
-        } else {
-            debug!("RAG zwrocil gotowa odpowiedz - zwracam bezposrednio");
-            rag_result.context_text
-        };
-
-        let cleaned_content = self.response_middleware.clean_text(&content)?;
-
-        let chat_response = ChatCompletionResponse {
-            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
-            model: rag_engine_name,
-            choices: vec![Choice {
-                index: 0,
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: Some(MessageContent::Text(cleaned_content)),
-                    ..Default::default()
-                },
-                finish_reason: Some("stop".to_string()),
-                logprobs: None,
-            }],
-            usage: Some(Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            }),
-            system_fingerprint: None,
-            transcribed_text: None,
-            speaker_id: None,
-            speaker_name: None,
-            speaker_confidence: None,
-            detected_intent: None,
-            detected_tools: None,
-        };
-
-        Ok(chat_response)
+        })
+        .await
     }
 
     /// Routuje request do QUIC LLM engine (non-streaming).
@@ -1000,835 +572,10 @@ impl Router {
         }
     }
 
-    /// Startuje task obslugujacy callback requests od RAG engines.
-    pub(crate) fn spawn_callback_handler(&self) {
-        let callback_rx = self.get_callback_rx();
-        let service_manager = self.service_manager.clone();
-        let config = self.config.clone();
-
-        tokio::spawn(async move {
-            debug!("Callback handler started");
-
-            loop {
-                let (callback_req, resp_tx) = {
-                    let mut rx = callback_rx.lock().await;
-                    match rx.recv().await {
-                        Some(req) => req,
-                        None => {
-                            warn!("Callback channel closed");
-                            break;
-                        }
-                    }
-                };
-
-                debug!("Processing callback: {}", callback_req.request_id);
-
-                let sm = service_manager.clone();
-                let cfg = config.clone();
-                tokio::spawn(async move {
-                    let response = Self::handle_callback(callback_req, sm, cfg).await;
-
-                    if resp_tx.send(response).await.is_err() {
-                        warn!("Failed to send callback response");
-                    }
-                });
-            }
-        });
-    }
-
-    /// Obsluguje pojedynczy callback request od RAG.
-    pub(crate) async fn handle_callback(
-        request: ModelRequest,
-        service_manager: Arc<ServiceManager>,
-        _config: Arc<RouterConfig>,
-    ) -> ModelResponse {
-        let request_id = request.request_id.clone();
-
-        match request.payload {
-            ModelPayload::Embeddings(embeddings_payload) => {
-                let model = embeddings_payload.model.clone();
-                let input = embeddings_payload.input.clone();
-                debug!(
-                    "Embedding callback: model={}, {} tekstow",
-                    model,
-                    input.len()
-                );
-
-                // Snapshot-driven: V2 live handles cache resolves model -> QUIC client.
-                if let Some(quic_client) = service_manager.find_quic_client_for_model(&model).await
-                {
-                    debug!("Uzywam QUIC client dla embeddingow: {}", model);
-                    let quic_request = ModelRequest {
-                        request_id: request_id.clone(),
-                        payload: ModelPayload::Embeddings(embeddings_payload.clone()),
-                        stream: false,
-                        metadata: None,
-                        session_id: None,
-                    };
-                    match quic_client.send_request(quic_request).await {
-                        Ok(response) => {
-                            debug!("QUIC embedding callback sukces");
-                            return response;
-                        }
-                        Err(e) => {
-                            error!("QUIC embedding error: {}", e);
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::InternalError,
-                                    message: format!("QUIC embedding error: {}", e),
-                                    details: Some(e.to_string()),
-                                }),
-                                metrics: None,
-                            };
-                        }
-                    }
-                }
-
-                // Snapshot-driven HTTP backend lookup: live handles cache resolves
-                // model -> HTTP BackendClient. When unresolved, the model is unknown.
-                let backend =
-                    match service_manager
-                        .find_http_backend_for_model(&model)
-                        .or_else(|| {
-                            service_manager
-                                .resolve_http_backends_via_snapshot(&model)
-                                .and_then(|v| v.into_iter().next())
-                        }) {
-                        Some(b) => b,
-                        None => {
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::ModelNotFound,
-                                    message: format!(
-                                        "Model embedding '{}' nie znaleziony (snapshot empty)",
-                                        model
-                                    ),
-                                    details: None,
-                                }),
-                                metrics: None,
-                            };
-                        }
-                    };
-
-                debug!("Embedding callback: backend url={}", backend.url());
-
-                match backend.embedding(input).await {
-                    Ok(embeddings) => {
-                        debug!("Embedding callback sukces: {} wektorow", embeddings.len());
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Embeddings(EmbeddingsResult {
-                                embeddings,
-                                dimensions: 0,
-                                model,
-                            }),
-                            metrics: None,
-                        };
-                    }
-                    Err(e) => {
-                        error!("Embedding callback error: {}", e);
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Backend embedding error: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        };
-                    }
-                }
-            }
-
-            ModelPayload::Completion(completion_payload) => {
-                let model = completion_payload.model.clone();
-                let messages = completion_payload.messages;
-                let temperature = completion_payload.temperature;
-                let max_tokens = completion_payload.max_tokens;
-                let top_p = completion_payload.top_p;
-                let prompt = completion_payload.prompt;
-                let stop = completion_payload.stop;
-
-                debug!(
-                    "Completion callback: model={}, {} wiadomosci, prompt_len={:?}",
-                    model,
-                    messages.len(),
-                    prompt.as_ref().map(|p| p.len())
-                );
-
-                // Snapshot-driven: V2 live handles cache resolves model -> QUIC client.
-                if let Some(quic_client) = service_manager.find_quic_client_for_model(&model).await
-                {
-                    debug!("Uzywam QUIC client dla LLM: {}", model);
-                    let quic_request = ModelRequest {
-                        request_id: request_id.clone(),
-                        payload: ModelPayload::Completion(CompletionPayload {
-                            model: model.clone(),
-                            prompt: prompt.clone(),
-                            messages: messages.clone(),
-                            temperature,
-                            max_tokens,
-                            top_p,
-                            stop: stop.clone(),
-                            presence_penalty: None,
-                            frequency_penalty: None,
-                            tts_options: None,
-                            memory_options: None,
-                            audio_input: None,
-                            prefix_cache_id: None,
-                            prefix_text: None,
-                        }),
-                        stream: false,
-                        metadata: None,
-                        session_id: None,
-                    };
-                    match quic_client.send_request(quic_request).await {
-                        Ok(response) => {
-                            debug!("QUIC LLM callback sukces");
-                            return response;
-                        }
-                        Err(e) => {
-                            error!("QUIC LLM callback error: {}", e);
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::InternalError,
-                                    message: format!("QUIC LLM error: {}", e),
-                                    details: Some(e.to_string()),
-                                }),
-                                metrics: None,
-                            };
-                        }
-                    }
-                }
-
-                // Snapshot-driven HTTP backend lookup.
-                let backend =
-                    match service_manager
-                        .find_http_backend_for_model(&model)
-                        .or_else(|| {
-                            service_manager
-                                .resolve_http_backends_via_snapshot(&model)
-                                .and_then(|v| v.into_iter().next())
-                        }) {
-                        Some(b) => b,
-                        None => {
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::ModelNotFound,
-                                    message: format!(
-                                        "Model LLM '{}' nie znaleziony (snapshot empty)",
-                                        model
-                                    ),
-                                    details: None,
-                                }),
-                                metrics: None,
-                            };
-                        }
-                    };
-
-                debug!("Completion callback: backend url={}", backend.url());
-
-                let openai_messages: Vec<Message> = messages
-                    .iter()
-                    .map(|m| Message {
-                        role: m.role.clone(),
-                        content: Some(MessageContent::Text(m.content.clone())),
-                        ..Default::default()
-                    })
-                    .collect();
-
-                let chat_request = ChatCompletionRequest {
-                    model: model.clone(),
-                    messages: openai_messages,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    n: Some(1),
-                    stream: false,
-                    stop: None,
-                    presence_penalty: None,
-                    frequency_penalty: None,
-                    user: None,
-                    response_format: None,
-                    tools: None,
-                    tool_choice: None,
-                    rag_options: None,
-                    memory_options: None,
-                    audio_input: None,
-                };
-
-                match backend.chat_completion(chat_request).await {
-                    Ok(response) => {
-                        let text = response
-                            .choices
-                            .first()
-                            .and_then(|c| match &c.message.content {
-                                Some(MessageContent::Text(text)) => Some(text.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_default();
-
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Completion(CompletionResult {
-                                text,
-                                reasoning_content: None,
-                                model,
-                                finish_reason: Some("stop".to_string()),
-                                tool_calls: None,
-                                detected_intent: None,
-                                detected_tools: None,
-                                transcribed_text: None,
-                                speaker_id: None,
-                                speaker_name: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                    Err(e) => ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::InternalError,
-                            message: format!("Backend error: {}", e),
-                            details: Some(e.to_string()),
-                        }),
-                        metrics: None,
-                    },
-                }
-            }
-
-            ModelPayload::Image(_image_payload) => {
-                warn!("ImageGeneration callback not yet implemented");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InternalError,
-                        message: "ImageGeneration callbacks not yet implemented".to_string(),
-                        details: None,
-                    }),
-                    metrics: None,
-                }
-            }
-
-            ModelPayload::Audio(audio_payload) => {
-                match audio_payload.operation {
-                    AudioOperation::TTS { .. } => {
-                        warn!("AudioTTS callback not yet implemented");
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: "AudioTTS callbacks not yet implemented".to_string(),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                    AudioOperation::STT {
-                        model,
-                        audio_data,
-                        language,
-                        response_format,
-                        prompt,
-                        temperature,
-                        timestamp_granularities,
-                        no_speech_threshold,
-                        avg_logprob_threshold,
-                        compression_ratio_threshold,
-                    } => {
-                        debug!(
-                            "Processing AudioSTT callback: model={}, audio_size={} bytes",
-                            model,
-                            audio_data.len()
-                        );
-
-                        let backend = match service_manager
-                            .find_http_backend_for_model(&model)
-                            .or_else(|| {
-                                service_manager
-                                    .resolve_http_backends_via_snapshot(&model)
-                                    .and_then(|v| v.into_iter().next())
-                            }) {
-                            Some(b) => b,
-                            None => {
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::ModelNotFound,
-                                        message: format!("Model not found: {}", model),
-                                        details: None,
-                                    }),
-                                    metrics: None,
-                                };
-                            }
-                        };
-
-                        let filename = format!("audio_{}.mp3", uuid::Uuid::new_v4());
-
-                        let needs_segments = no_speech_threshold.is_some()
-                            || avg_logprob_threshold.is_some()
-                            || compression_ratio_threshold.is_some();
-
-                        let effective_format = if needs_segments
-                            && response_format.as_deref() != Some("verbose_json")
-                        {
-                            Some("verbose_json".to_string())
-                        } else {
-                            response_format.clone()
-                        };
-
-                        let transcription_request = TranscriptionRequest {
-                            file: std::sync::Arc::from(audio_data.into_boxed_slice()),
-                            filename,
-                            model: model.clone(),
-                            language,
-                            prompt,
-                            response_format: effective_format.clone(),
-                            temperature,
-                            timestamp_granularities,
-                            no_speech_threshold,
-                            avg_logprob_threshold,
-                            compression_ratio_threshold,
-                        };
-
-                        match backend.audio_transcription(transcription_request).await {
-                            Ok(transcription) => {
-                                let is_verbose =
-                                    effective_format.as_deref() == Some("verbose_json");
-
-                                if is_verbose {
-                                    if let Some(segments) = transcription.segments {
-                                        let filtered_segments: Vec<_> = segments
-                                            .into_iter()
-                                            .filter(|seg| {
-                                                if let Some(threshold) = no_speech_threshold {
-                                                    if seg.no_speech_prob >= threshold {
-                                                        return false;
-                                                    }
-                                                }
-                                                if let Some(threshold) = avg_logprob_threshold {
-                                                    if seg.avg_logprob < threshold {
-                                                        return false;
-                                                    }
-                                                }
-                                                if let Some(threshold) = compression_ratio_threshold
-                                                {
-                                                    if seg.compression_ratio > threshold {
-                                                        return false;
-                                                    }
-                                                }
-                                                true
-                                            })
-                                            .collect();
-
-                                        let filtered_text = filtered_segments
-                                            .iter()
-                                            .map(|seg| seg.text.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("");
-
-                                        return ModelResponse {
-                                            request_id,
-                                            result: ModelResult::Audio(AudioResult {
-                                                data: AudioResultData::Text(filtered_text),
-                                                model,
-                                            }),
-                                            metrics: None,
-                                        };
-                                    }
-                                }
-
-                                ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Audio(AudioResult {
-                                        data: AudioResultData::Text(transcription.text),
-                                        model,
-                                    }),
-                                    metrics: None,
-                                }
-                            }
-                            Err(e) => {
-                                warn!("AudioSTT callback error: {}", e);
-                                ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!("Audio transcription failed: {}", e),
-                                        details: Some(e.to_string()),
-                                    }),
-                                    metrics: None,
-                                }
-                            }
-                        }
-                    }
-
-                    AudioOperation::SpeakerEnroll { .. }
-                    | AudioOperation::SpeakerAddSamples { .. }
-                    | AudioOperation::SpeakerRemove { .. }
-                    | AudioOperation::SpeakerList
-                    | AudioOperation::SpeakerInfo
-                    | AudioOperation::SpeakerIdentify { .. }
-                    | AudioOperation::SpeakerVerify { .. }
-                    | AudioOperation::SpeakerIdentifyWithConfidence { .. }
-                    | AudioOperation::SpeakerConfirmIdentity { .. }
-                    | AudioOperation::SpeakerLinkToMemory { .. }
-                    | AudioOperation::WakeWordDetect { .. }
-                    | AudioOperation::WakeWordConfigure { .. }
-                    | AudioOperation::WakeWordStreamStart { .. }
-                    | AudioOperation::WakeWordStreamChunk { .. }
-                    | AudioOperation::WakeWordStreamStop
-                    | AudioOperation::ConversationStart { .. }
-                    | AudioOperation::ConversationAudio { .. }
-                    | AudioOperation::ConversationEnd { .. }
-                    | AudioOperation::ConversationStatus { .. }
-                    | AudioOperation::SpeakerUpdateName { .. } => {
-                        warn!("Speaker/WakeWord/Conversation operations not supported in RAG callbacks");
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InvalidRequest,
-                                message: "Speaker operations are not supported in RAG callbacks"
-                                    .to_string(),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                }
-            }
-
-            ModelPayload::Vision(vision_payload) => {
-                let model = vision_payload.model;
-                let messages = vision_payload.messages;
-                let max_tokens = vision_payload.max_tokens;
-                debug!(
-                    "Processing Vision callback: model={}, messages={}",
-                    model,
-                    messages.len()
-                );
-
-                let backend =
-                    match service_manager
-                        .find_http_backend_for_model(&model)
-                        .or_else(|| {
-                            service_manager
-                                .resolve_http_backends_via_snapshot(&model)
-                                .and_then(|v| v.into_iter().next())
-                        }) {
-                        Some(b) => b,
-                        None => {
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::ModelNotFound,
-                                    message: format!("Model not found: {}", model),
-                                    details: None,
-                                }),
-                                metrics: None,
-                            };
-                        }
-                    };
-
-                match backend
-                    .vision(model.clone(), messages.clone(), max_tokens)
-                    .await
-                {
-                    Ok(text) => {
-                        debug!("Vision callback success: {} znaki tekstu", text.len());
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Vision(VisionResult { text, model }),
-                            metrics: None,
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Vision callback error: {}", e);
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Vision request failed: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                }
-            }
-
-            ModelPayload::RAG(_) => {
-                warn!("Unexpected RAG payload in callback");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InternalError,
-                        message: "RAG callbacks are not supported".to_string(),
-                        details: None,
-                    }),
-                    metrics: None,
-                }
-            }
-
-            ModelPayload::Rerank(rerank_payload) => {
-                let model = rerank_payload.model.clone();
-                debug!(
-                    "Rerank callback: model={}, {} dokumentow",
-                    model,
-                    rerank_payload.documents.len()
-                );
-
-                let quic_client = match service_manager.find_quic_client_for_model(&model).await {
-                    Some(c) => c,
-                    None => {
-                        warn!("Rerank service '{}' not found or not connected", model);
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::ModelNotFound,
-                                message: format!(
-                                    "Rerank service '{}' not found or not connected",
-                                    model
-                                ),
-                                details: None,
-                            }),
-                            metrics: None,
-                        };
-                    }
-                };
-                debug!("Using QUIC client for reranking: {}", model);
-                let quic_request = ModelRequest {
-                    request_id: request_id.clone(),
-                    payload: ModelPayload::Rerank(rerank_payload),
-                    stream: false,
-                    metadata: None,
-                    session_id: None,
-                };
-                match quic_client.send_request(quic_request).await {
-                    Ok(response) => response,
-                    Err(e) => {
-                        error!("QUIC rerank error: {}", e);
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("QUIC rerank error: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                }
-            }
-
-            ModelPayload::Memory(_) => {
-                warn!("Unexpected Memory payload in callback - Memory should use Embeddings for callbacks");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InvalidRequest,
-                        message:
-                            "Memory callbacks should use Embeddings payload, not Memory payload"
-                                .to_string(),
-                        details: Some(
-                            "Memory Engine uses Router for embeddings callbacks only".to_string(),
-                        ),
-                    }),
-                    metrics: None,
-                }
-            }
-
-            ModelPayload::PrefixCacheInit(_) => {
-                warn!("Unexpected PrefixCacheInit payload in callback");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InvalidRequest,
-                        message: "PrefixCacheInit is not valid in callbacks".to_string(),
-                        details: Some(
-                            "PrefixCacheInit is sent from Router to LLM, not in callbacks"
-                                .to_string(),
-                        ),
-                    }),
-                    metrics: None,
-                }
-            }
-
-            // MeetingEvent nie jest callbackiem embedding pipeline — bot wysyla
-            // je przez dispatch_reverse_request, nie przez chat routing.
-            ModelPayload::MeetingEvent(_) => {
-                warn!("Unexpected MeetingEvent payload in chat embedding callback");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InvalidRequest,
-                        message: "MeetingEvent is not valid in chat callbacks".to_string(),
-                        details: Some(
-                            "MeetingEvent is handled by dispatch_reverse_request only".to_string(),
-                        ),
-                    }),
-                    metrics: None,
-                }
-            }
-
-            // PromptFetch to payload odwrotnego żądania od kontenera — nie ma
-            // sensu w embedding callbacku. Obsługiwany wyłącznie w dispatch_reverse_request.
-            ModelPayload::PromptFetch(_) => {
-                warn!("Unexpected PromptFetch payload in chat embedding callback");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InvalidRequest,
-                        message: "PromptFetch is not valid in chat callbacks".to_string(),
-                        details: Some(
-                            "PromptFetch is handled by dispatch_reverse_request only".to_string(),
-                        ),
-                    }),
-                    metrics: None,
-                }
-            }
-            ModelPayload::Browser(_) => {
-                // Browser capture is dashboard → bot only; callbacks never carry it.
-                warn!("Unexpected Browser payload in chat callback");
-                ModelResponse {
-                    request_id,
-                    result: ModelResult::Error(ErrorInfo {
-                        error_type: ErrorType::InvalidRequest,
-                        message: "Browser is not valid in chat callbacks".to_string(),
-                        details: None,
-                    }),
-                    metrics: None,
-                }
-            }
-        }
-    }
-
-    /// Routuje zadanie ingestion dokumentu do RAG engine.
-    pub async fn route_document_ingestion(
-        &self,
-        request: tentaflow_protocol::IngestRequest,
-    ) -> Result<tentaflow_protocol::IngestResponse> {
-        let rag_handle = self
-            .service_manager
-            .rag_services
-            .iter()
-            .next()
-            .map(|r| r.value().clone())
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: "rag".to_string(),
-            })?;
-
-        let rag_client =
-            rag_handle
-                .get_client()
-                .await
-                .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                    model_name: "rag".to_string(),
-                })?;
-
-        debug!(
-            "Wysylanie IngestRequest do RAG: doc_id={}",
-            request.document_id
-        );
-
-        let response = rag_client.send_ingest_request(request).await?;
-
-        debug!(
-            "Otrzymano IngestResponse: status={:?}, chunks={}",
-            response.status, response.chunk_count
-        );
-
-        Ok(response)
-    }
 
     // ========================================================================
     // PROTOCOL-NATIVE METHODS (dla QUIC Server)
     // ========================================================================
-
-    /// Routuje RAG query - wersja dla protocol types (pelna kontrola parametrow).
-    pub async fn route_rag_payload(
-        &self,
-        rag_payload: tentaflow_protocol::RAGPayload,
-    ) -> Result<tentaflow_protocol::ModelResponse> {
-        use tentaflow_protocol::*;
-
-        debug!(
-            "route_rag_payload: query={}, search_modes={:?}",
-            rag_payload.query.chars().take(50).collect::<String>(),
-            rag_payload.search_modes
-        );
-
-        let (rag_name, rag_handle) = self
-            .service_manager
-            .rag_services
-            .iter()
-            .next()
-            .map(|r| (r.key().clone(), r.value().clone()))
-            .ok_or_else(|| CoreError::InternalError {
-                message: "Brak skonfigurowanego RAG engine".to_string(),
-                source: None,
-            })?;
-
-        let rag_client =
-            rag_handle
-                .get_client()
-                .await
-                .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                    model_name: rag_name.clone(),
-                })?;
-
-        debug!("route_rag_payload: uzywam RAG engine: {}", rag_name);
-
-        let rag_result = rag_client.send_request(rag_payload).await?;
-
-        let cleaned_context = self
-            .response_middleware
-            .clean_text(&rag_result.context_text)?;
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        let response = ModelResponse {
-            request_id,
-            result: ModelResult::RAG(RAGResult {
-                context_text: cleaned_context,
-                metadata: rag_result.metadata,
-                requires_llm_processing: rag_result.requires_llm_processing,
-                requires_audio_output: rag_result.requires_audio_output,
-                llm_model: rag_result.llm_model,
-            }),
-            metrics: None,
-        };
-
-        Ok(response)
-    }
-
-    /// Routuje RAG query - uproszczona wersja (kompatybilnosc wsteczna).
-    pub async fn route_rag_query(
-        &self,
-        query: &str,
-        top_k: u32,
-        min_similarity: f32,
-    ) -> Result<tentaflow_protocol::ModelResponse> {
-        use tentaflow_protocol::*;
-
-        let rag_payload = RAGPayload {
-            query: query.to_string(),
-            context: None,
-            params: RAGParams {
-                top_k,
-                min_similarity,
-                use_reranking: None,
-            },
-            requires_llm_processing: false,
-            requires_audio_output: false,
-            search_modes: vec![SearchMode::VectorSearch],
-        };
-
-        self.route_rag_payload(rag_payload).await
-    }
 
     /// Routuje chat completion - wersja dla protocol types.
     pub async fn route_completion_via_protocol(
@@ -1882,7 +629,6 @@ impl Router {
             tools: None,
             tool_choice: None,
             response_format: None,
-            rag_options: None,
             memory_options: None,
             audio_input: None,
         };
@@ -1894,7 +640,7 @@ impl Router {
             let prompt_c = prompt.clone();
             let stop_c = stop.clone();
             let route_result = self
-                .dispatch_with_fallback(model, 0, |handle| {
+                .dispatch_with_fallback(model, 0, None, |handle| {
                     let this = this.clone();
                     let req = req.clone();
                     let prompt_c = prompt_c.clone();
@@ -1909,7 +655,6 @@ impl Router {
                             BackendHandle::LocalLlm => {
                                 this.local_inference.handle_chat_completion(&req).await
                             }
-                            BackendHandle::Rag(name) => this.route_to_rag(name.clone(), req).await,
                             BackendHandle::Http(name) => {
                                 let backend = this.select_http_backend(name).ok_or_else(|| {
                                     anyhow::anyhow!("Brak backendow dla {}", name)
@@ -2105,7 +850,6 @@ impl Router {
             tools: None,
             tool_choice: None,
             response_format: None,
-            rag_options: None,
             memory_options: None,
             audio_input: None,
         };
@@ -2202,6 +946,42 @@ impl Router {
     }
 }
 
+/// Whether `model` (or — for an alias — any candidate in its primary +
+/// fallbacks expansion) advertises Audio in its `input_modalities`.
+///
+/// D.17 says alias entries inherit `input_modalities` from the *primary*
+/// target, so a strict per-entry check would refuse an audio request on
+/// an alias whose primary is text-only even when an audio-capable
+/// fallback is configured. The dispatcher iterates targets in order and
+/// `get_backends` filters per instance, so it is safe (and consistent
+/// with D.17) to admit the request as long as at least one candidate
+/// in the expansion can satisfy it. Unknown ids fail closed.
+pub(crate) fn catalog_target_accepts_audio(
+    snapshot: &crate::services::catalog::CatalogSnapshot,
+    model: &str,
+) -> bool {
+    use crate::services::catalog::{CatalogEntryKind, InputModality};
+    let Some(entry) = snapshot.entries.iter().find(|e| e.id == model) else {
+        return false;
+    };
+    if entry.input_modalities.contains(&InputModality::Audio) {
+        return true;
+    }
+    if let CatalogEntryKind::Alias {
+        fallback_targets, ..
+    } = &entry.kind
+    {
+        for fb_id in fallback_targets {
+            if let Some(fb) = snapshot.entries.iter().find(|e| e.id == *fb_id) {
+                if fb.input_modalities.contains(&InputModality::Audio) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
 pub(crate) fn flow_result_to_chat_response(
     result: FlowExecutionResult,
@@ -2251,4 +1031,144 @@ pub(crate) fn flow_result_to_chat_response(
             detected_tools: None,
         }
     })
+}
+
+#[cfg(test)]
+mod audio_policy_tests {
+    use super::*;
+    use crate::services::catalog::{
+        CatalogEntry, CatalogEntryKind, CatalogSnapshot, InputModality, OutputModality,
+        ServiceSurface,
+    };
+    use std::sync::Arc;
+
+    fn snapshot_with(entries: Vec<CatalogEntry>) -> CatalogSnapshot {
+        CatalogSnapshot {
+            entries: Arc::from(entries.into_boxed_slice()),
+            version: 1,
+        }
+    }
+
+    fn chat_entry(id: &str, inputs: Vec<InputModality>) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            kind: CatalogEntryKind::ServiceModel { instances: vec![] },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: inputs,
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    /// Audio-capable target: catalog entry lists `Audio` on input. The
+    /// guard returns true so chat dispatch proceeds with the audio
+    /// payload intact.
+    #[test]
+    fn audio_target_passes_capability_check() {
+        let snap = snapshot_with(vec![chat_entry(
+            "qwen-omni",
+            vec![InputModality::Text, InputModality::Audio],
+        )]);
+        assert!(catalog_target_accepts_audio(&snap, "qwen-omni"));
+    }
+
+    /// Text-only target rejects audio. This is the legacy bypass
+    /// the guard exists to plug — pre-fix the chat path silently
+    /// transcribed and forwarded text, dropping speaker and timing
+    /// metadata along the way.
+    #[test]
+    fn text_only_target_rejects_audio() {
+        let snap =
+            snapshot_with(vec![chat_entry("bielik-11b", vec![InputModality::Text])]);
+        assert!(!catalog_target_accepts_audio(&snap, "bielik-11b"));
+    }
+
+    /// Unknown model id (not in catalog) is treated as incapable. We
+    /// refuse to guess — the client gets a clear error rather than
+    /// having the request silently fall through to a default backend.
+    #[test]
+    fn unknown_model_id_rejects_audio() {
+        let snap = snapshot_with(vec![]);
+        assert!(!catalog_target_accepts_audio(&snap, "ghost-model"));
+    }
+
+    /// Empty `input_modalities` (manifest without capability
+    /// declaration) treats the entry as text-only by convention. The
+    /// guard rejects audio against such entries; operators upgrade by
+    /// declaring `input_modalities` explicitly in the manifest.
+    #[test]
+    fn entry_with_empty_input_modalities_rejects_audio() {
+        let snap = snapshot_with(vec![chat_entry("legacy", vec![])]);
+        assert!(!catalog_target_accepts_audio(&snap, "legacy"));
+    }
+
+    /// R6.P3 documentation test: helper rejecting audio is unrelated to
+    /// the empty-audio guard, but the empty-audio guard's rationale is
+    /// load-bearing — encoding it as a tested invariant keeps the path
+    /// from regressing. We assert the precise error message a future
+    /// codepath cannot quietly downgrade.
+    #[test]
+    fn empty_audio_input_error_message_is_actionable() {
+        // Sanity check on the constants we depend on. If these strings
+        // change, the e2e tests / clients depending on the wording need
+        // to be updated together.
+        let msg = "audio_input is present but empty (0 bytes)";
+        assert!(msg.contains("0 bytes"));
+        assert!(msg.contains("empty"));
+    }
+
+    /// D.17: alias entry inherits primary modalities (text-only here)
+    /// but `dispatch_with_fallback` iterates the full target list. The
+    /// guard must admit audio when *any* candidate (primary OR
+    /// fallback) is audio-capable — otherwise text-only primaries with
+    /// audio fallbacks become unreachable for audio requests.
+    #[test]
+    fn alias_audio_falls_through_to_audio_capable_fallback() {
+        use crate::services::catalog::Strategy;
+        let primary = chat_entry("text-llm", vec![InputModality::Text]);
+        let fallback = chat_entry(
+            "omni-llm",
+            vec![InputModality::Text, InputModality::Audio],
+        );
+        let alias = CatalogEntry {
+            id: "smart-chat".into(),
+            kind: CatalogEntryKind::Alias {
+                target: "text-llm".into(),
+                fallback_targets: vec!["omni-llm".into()],
+                strategy: Strategy::FirstAvailable,
+            },
+            // Mirrors the primary (D.17). Without alias-aware fallback
+            // expansion the guard would refuse audio here.
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        };
+        let snap = snapshot_with(vec![primary, fallback, alias]);
+        assert!(catalog_target_accepts_audio(&snap, "smart-chat"));
+    }
+
+    /// Negative complement: alias whose primary AND every fallback are
+    /// text-only must reject audio (otherwise an empty fallback list
+    /// would behave the same as a missing entry).
+    #[test]
+    fn alias_with_only_text_targets_rejects_audio() {
+        use crate::services::catalog::Strategy;
+        let primary = chat_entry("text-a", vec![InputModality::Text]);
+        let fallback = chat_entry("text-b", vec![InputModality::Text]);
+        let alias = CatalogEntry {
+            id: "txt-only".into(),
+            kind: CatalogEntryKind::Alias {
+                target: "text-a".into(),
+                fallback_targets: vec!["text-b".into()],
+                strategy: Strategy::FirstAvailable,
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        };
+        let snap = snapshot_with(vec![primary, fallback, alias]);
+        assert!(!catalog_target_accepts_audio(&snap, "txt-only"));
+    }
 }

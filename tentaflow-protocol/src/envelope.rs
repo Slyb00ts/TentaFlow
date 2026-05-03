@@ -52,7 +52,23 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///     catalog (service models + published flows + aliases) plus diagnostic
 ///     state per entry. Old peers cannot decode the new variants and vice
 ///     versa — rollout has to happen on every peer at once.
-pub const SCHEMA_VERSION: u16 = 11;
+/// v12 changes (R2 RAG eradication + R2d STT redesign, breaking — synchronous
+///     peer rollout required):
+///   - Removed: `ModelPayload::RAG`, `ModelResult::RAG`, `RAGPayload`,
+///     `RAGResult`, `RAGContext`, `RAGParams`, `RAGResponse`, `RAGChunkMetadata`,
+///     `ChunkDocument`, `SearchMode`, `IngestRequest`, `IngestResponse`,
+///     `IngestMetrics`, `IngestionStatus`, `DocumentContent`, `FileDataContent`,
+///     `MeshRequest::RAG` variant, `MESSAGE_TYPE_RAG_REQUEST`,
+///     `MESSAGE_TYPE_INGEST_REQUEST`. Old peers wysylajac requesty RAG/Ingest
+///     dostaja decode error.
+///   - Added (D.3): `SttRequestOptions { speaker_identification, diarization,
+///     timestamps, response_format }` w `TranscriptionRequest` (multipart,
+///     nie-rkyv) i `SpeakerSegment { start, end, text, speaker_label,
+///     speaker_id, similarity }` w `TranscriptionResponse.speakers` (JSON).
+///     Pole `speakers` jest `Option` z `skip_serializing_if` zeby starsi
+///     klienci nie crashowali — ale brak guarantee dla TranscriptionRequest
+///     jezeli ktokolwiek deserialize'owalby przez rkyv (REST multipart only).
+pub const SCHEMA_VERSION: u16 = 12;
 
 // =============================================================================
 // Message kind discriminants

@@ -300,6 +300,9 @@ mod tests {
                 default_port: 0,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
+                service_surfaces: None,
+                input_modalities: None,
+                output_modalities: None,
             },
             deploy: DeploySection {
                 docker: None,

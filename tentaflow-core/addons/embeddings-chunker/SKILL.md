@@ -27,7 +27,6 @@ Split text into chunks and generate embeddings for each. Returns an array of {ch
 
 When to use:
 - User wants to index a long document for vector search
-- Preparing text for RAG pipeline
 - Splitting and embedding a document in one step
 
 TOON examples:

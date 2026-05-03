@@ -48,8 +48,7 @@ function spriteRaw(id) {
 function iconForCategory(category) {
   switch ((category || '').toLowerCase()) {
     case 'communication': return 'i-meeting';
-    case 'rag':
-    case 'storage': return 'i-rag-db';
+    case 'storage': return 'i-database';
     case 'filter': return 'i-shield';
     case 'transform': return 'i-transform';
     default: return 'i-puzzle';

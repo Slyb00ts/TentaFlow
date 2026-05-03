@@ -9,7 +9,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeName, getNodeDescription } from '/js/modules/flows-builder/node-i18n.js';
 
-const CATEGORY_ORDER = ['trigger', 'service', 'rag', 'transform', 'logic', 'filter', 'output', 'other'];
+const CATEGORY_ORDER = ['trigger', 'service', 'memory', 'transform', 'logic', 'filter', 'output', 'other'];
 
 function categoryLabel(cat) {
   return I18n.t(`flows_palette.categories.${cat}`);
@@ -20,9 +20,9 @@ const TYPE_ICON = {
   trigger: 'bolt', start: 'bolt',
   llm: 'chip', embeddings: 'sparkle', reranker: 'sparkle',
   stt: 'mic', tts: 'speaker',
-  rag: 'rag-db', memory: 'rag-db',
-  conversation_history: 'rag-db', session_context: 'rag-db',
-  speaker_context: 'rag-db', memory_analyzer: 'sparkle',
+  memory: 'database',
+  conversation_history: 'database', session_context: 'database',
+  speaker_context: 'database', memory_analyzer: 'sparkle',
   condition: 'branch', switch: 'branch',
   template: 'code', transform: 'transform', router: 'transform',
   pii_filter: 'shield', tts_clean: 'shield',
@@ -32,7 +32,7 @@ const TYPE_ICON = {
 const TYPE_VAR = {
   trigger: '--node-trigger', start: '--node-start',
   llm: '--node-llm', stt: '--node-stt', tts: '--node-tts',
-  rag: '--node-rag', memory: '--node-memory',
+  memory: '--node-memory',
   embeddings: '--node-embeddings', reranker: '--node-reranker',
   condition: '--node-condition', switch: '--node-switch',
   template: '--node-template', transform: '--node-transform',
@@ -51,7 +51,7 @@ function catFor(tpl) {
   const t = tpl.node_type;
   if (t === 'trigger' || t === 'start') return 'trigger';
   if (['llm','stt','tts','embeddings','reranker'].includes(t)) return 'service';
-  if (['rag','memory','conversation_history','session_context','speaker_context','memory_analyzer'].includes(t)) return 'rag';
+  if (['memory','conversation_history','session_context','speaker_context','memory_analyzer'].includes(t)) return 'memory';
   if (['condition','switch'].includes(t)) return 'logic';
   if (['template','transform','router'].includes(t)) return 'transform';
   if (['pii_filter','tts_clean'].includes(t)) return 'filter';

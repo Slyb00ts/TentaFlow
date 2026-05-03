@@ -20,7 +20,7 @@ const REGEX_SIZE_LIMIT: usize = 1_000_000;
 /// Aplikuje wszystkie aktywne reguly PII na tekscie wejsciowym node'a i
 /// zwraca output JSON z przefiltrowanym tekstem. Modyfikuje rowniez
 /// `ctx.input` oraz ostatnia wiadomosc user w `ctx.messages`, zeby kolejne
-/// wezly LLM/RAG widzialy juz przefiltrowany tekst.
+/// wezly LLM widzialy juz przefiltrowany tekst.
 pub async fn apply_pii_filter(
     db: &DbPool,
     node: &FlowNode,

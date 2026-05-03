@@ -2,7 +2,7 @@
 // Plik: flow_engine/executor_async.rs
 // Opis: Asynchroniczny executor flow DAG - parsuje definicje, sortuje
 //       topologicznie i wykonuje wezly przez AdapterRegistry. Zastepuje
-//       synchroniczny FlowEngine dla wezlow serwisowych (LLM, RAG, STT itd.).
+//       synchroniczny FlowEngine dla wezlow serwisowych (LLM, STT itd.).
 // =============================================================================
 
 use super::adapters::{AdapterChunkStream, AdapterRegistry};
@@ -534,7 +534,7 @@ impl FlowExecutorAsync {
 
     /// Wykonuje pojedynczy wezel - typy wewnetrzne (trigger, condition, template,
     /// output, router, pii_filter, tts_clean) obsluguje bezposrednio,
-    /// typy serwisowe (llm, rag, stt, tts, embeddings, memory) deleguje do adapterow.
+    /// typy serwisowe (llm, stt, tts, embeddings, memory) deleguje do adapterow.
     async fn execute_node(
         &self,
         node: &FlowNode,
@@ -1118,8 +1118,8 @@ mod tests {
         let db = create_test_db();
         let mut registry = AdapterRegistry::new();
         registry.register(MockAdapter {
-            node_type_name: "rag",
-            response: serde_json::json!({"text": "Wynik RAG", "tokens": {"prompt": 5, "completion": 10}}),
+            node_type_name: "aux",
+            response: serde_json::json!({"text": "Wynik AUX", "tokens": {"prompt": 5, "completion": 10}}),
         });
         registry.register(MockAdapter {
             node_type_name: "llm",
@@ -1131,16 +1131,16 @@ mod tests {
         let flow_json = r#"{
             "nodes": [
                 {"id": "t1", "type": "trigger", "config": {}},
-                {"id": "cond", "type": "condition", "config": {"field": "input", "operator": "contains", "value": "rag"}},
-                {"id": "rag_node", "type": "rag", "config": {}},
+                {"id": "cond", "type": "condition", "config": {"field": "input", "operator": "contains", "value": "aux"}},
+                {"id": "aux_node", "type": "aux", "config": {}},
                 {"id": "llm_node", "type": "llm", "config": {}},
-                {"id": "out", "type": "output", "config": {"input_from": "rag_node"}}
+                {"id": "out", "type": "output", "config": {"input_from": "aux_node"}}
             ],
             "edges": [
                 {"from": "t1", "to": "cond"},
-                {"from": "cond", "to": "rag_node", "condition": "true"},
+                {"from": "cond", "to": "aux_node", "condition": "true"},
                 {"from": "cond", "to": "llm_node", "condition": "false"},
-                {"from": "rag_node", "to": "out"},
+                {"from": "aux_node", "to": "out"},
                 {"from": "llm_node", "to": "out"}
             ]
         }"#;
@@ -1158,7 +1158,7 @@ mod tests {
         let mut ctx = FlowContext::new(
             "req-003".to_string(),
             "bielik-11b".to_string(),
-            "Uzyj rag do odpowiedzi".to_string(),
+            "Uzyj aux do odpowiedzi".to_string(),
         );
 
         let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
@@ -1172,11 +1172,11 @@ mod tests {
             .iter()
             .find(|s| s.node_id == "llm_node");
         assert!(skipped.is_none(), "llm_node powinien byc pominiety");
-        let rag_step = exec_result
+        let aux_step = exec_result
             .execution_log
             .iter()
-            .find(|s| s.node_id == "rag_node");
-        assert!(rag_step.is_some(), "rag_node powinien sie wykonac");
+            .find(|s| s.node_id == "aux_node");
+        assert!(aux_step.is_some(), "aux_node powinien sie wykonac");
     }
 
     #[tokio::test]
@@ -1184,8 +1184,8 @@ mod tests {
         let db = create_test_db();
         let mut registry = AdapterRegistry::new();
         registry.register(MockAdapter {
-            node_type_name: "rag",
-            response: serde_json::json!({"text": "Wynik RAG"}),
+            node_type_name: "aux",
+            response: serde_json::json!({"text": "Wynik AUX"}),
         });
         registry.register(MockAdapter {
             node_type_name: "llm",
@@ -1197,16 +1197,16 @@ mod tests {
         let flow_json = r#"{
             "nodes": [
                 {"id": "t1", "type": "trigger", "config": {}},
-                {"id": "cond", "type": "condition", "config": {"field": "input", "operator": "contains", "value": "rag"}},
-                {"id": "rag_node", "type": "rag", "config": {}},
+                {"id": "cond", "type": "condition", "config": {"field": "input", "operator": "contains", "value": "aux"}},
+                {"id": "aux_node", "type": "aux", "config": {}},
                 {"id": "llm_node", "type": "llm", "config": {}},
                 {"id": "out", "type": "output", "config": {}}
             ],
             "edges": [
                 {"from": "t1", "to": "cond"},
-                {"from": "cond", "to": "rag_node", "condition": "true"},
+                {"from": "cond", "to": "aux_node", "condition": "true"},
                 {"from": "cond", "to": "llm_node", "condition": "false"},
-                {"from": "rag_node", "to": "out"},
+                {"from": "aux_node", "to": "out"},
                 {"from": "llm_node", "to": "out"}
             ]
         }"#;
@@ -1232,11 +1232,11 @@ mod tests {
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
-        let rag_step = exec_result
+        let aux_step = exec_result
             .execution_log
             .iter()
-            .find(|s| s.node_id == "rag_node");
-        assert!(rag_step.is_none(), "rag_node powinien byc pominiety");
+            .find(|s| s.node_id == "aux_node");
+        assert!(aux_step.is_none(), "aux_node powinien byc pominiety");
         let llm_step = exec_result
             .execution_log
             .iter()
@@ -1351,9 +1351,9 @@ mod tests {
         let db = create_test_db();
         let mut registry = AdapterRegistry::new();
         registry.register(MockAdapter {
-            node_type_name: "rag",
+            node_type_name: "aux",
             response: serde_json::json!({
-                "text": "Kontekst RAG",
+                "text": "Kontekst AUX",
                 "tokens": {"prompt": 15, "completion": 25}
             }),
         });
@@ -1370,13 +1370,13 @@ mod tests {
         let flow_json = r#"{
             "nodes": [
                 {"id": "t1", "type": "trigger", "config": {}},
-                {"id": "rag1", "type": "rag", "config": {}},
+                {"id": "aux1", "type": "aux", "config": {}},
                 {"id": "llm1", "type": "llm", "config": {}},
                 {"id": "out", "type": "output", "config": {}}
             ],
             "edges": [
-                {"from": "t1", "to": "rag1"},
-                {"from": "rag1", "to": "llm1"},
+                {"from": "t1", "to": "aux1"},
+                {"from": "aux1", "to": "llm1"},
                 {"from": "llm1", "to": "out"}
             ]
         }"#;
@@ -1693,9 +1693,9 @@ mod tests {
             node_type_name: "llm",
             chunks: vec![],
         });
-        // 'rag' to node nie-passthrough — nie moze lezec za producentem na stream
+        // 'aux' to node nie-passthrough — nie moze lezec za producentem na stream
         registry.register(MockAdapter {
-            node_type_name: "rag",
+            node_type_name: "aux",
             response: serde_json::json!({"text": "x"}),
         });
         let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
@@ -1703,12 +1703,12 @@ mod tests {
         let flow_json = r#"{
             "nodes": [
                 {"id": "llm1", "type": "llm", "config": {}},
-                {"id": "rag1", "type": "rag", "config": {}},
+                {"id": "aux1", "type": "aux", "config": {}},
                 {"id": "out", "type": "output", "config": {}}
             ],
             "edges": [
-                {"from": "llm1", "to": "rag1", "from_port": "stream", "to_port": "in"},
-                {"from": "rag1", "to": "out"}
+                {"from": "llm1", "to": "aux1", "from_port": "stream", "to_port": "in"},
+                {"from": "aux1", "to": "out"}
             ]
         }"#;
 

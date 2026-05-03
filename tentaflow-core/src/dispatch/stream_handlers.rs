@@ -76,7 +76,6 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             tools: None,
             tool_choice: None,
             n: None,
-            rag_options: None,
             memory_options: None,
             audio_input: None,
         };

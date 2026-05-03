@@ -718,7 +718,6 @@ fn build_chat_request(
         tools: None,
         tool_choice: None,
         n: None,
-        rag_options: None,
         memory_options: None,
         audio_input: None,
     })

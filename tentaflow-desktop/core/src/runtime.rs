@@ -646,7 +646,6 @@ fn parse_service_type(s: &str) -> ui_state::ServiceType {
         "llm" => ui_state::ServiceType::Llm,
         "tts" => ui_state::ServiceType::Tts,
         "stt" => ui_state::ServiceType::Stt,
-        "rag" => ui_state::ServiceType::Rag,
         "embedding" => ui_state::ServiceType::Embedding,
         "vision" => ui_state::ServiceType::Vision,
         "router" => ui_state::ServiceType::Router,
@@ -823,7 +822,13 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
             alias,
             target_model,
         } => {
-            db::repository::create_model_alias(db, alias, target_model, None, None)?;
+            db::repository::create_model_alias_with_chain_check(
+                db,
+                alias,
+                target_model,
+                None,
+                None,
+            )?;
         }
         UiCommand::DeleteModelAlias(id) => {
             db::repository::delete_model_alias(db, *id)?;

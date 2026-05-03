@@ -13,7 +13,6 @@ use crate::flow_engine::adapters::llm::LlmNodeAdapter;
 use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
 use crate::flow_engine::adapters::output::OutputNodeAdapter;
 use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
-use crate::flow_engine::adapters::rag::RagNodeAdapter;
 use crate::flow_engine::adapters::session_context::SessionContextAdapter;
 use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
 use crate::flow_engine::adapters::stt::SttNodeAdapter;
@@ -40,16 +39,39 @@ pub struct FlowDispatcher {
     registry: Arc<AdapterRegistry>,
 }
 
+/// Slot na `ModelRuntimeExecutor` wpinany przez `Router::new` po
+/// konstrukcji dispatcher'a (rozwiazanie cyklu Router↔FlowDispatcher
+/// w R2a). Adaptery konsumuja go leniwie: lockuja, klonuja Arc, dispatchuja.
+pub type ExecutorSlot = Arc<
+    parking_lot::RwLock<
+        Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
+    >,
+>;
+
+/// Codex M1 round 2: ten sam pattern co `ExecutorSlot` ale dla SttRuntime.
+/// SttRuntime trzyma `Weak<Router>`, wiec moze byc skonstruowany dopiero w
+/// `Router::start` po `Arc::new(router)`. Slot przekazujemy do FlowDispatcher
+/// zeby `SttNodeAdapter` mial dostep do tej samej instancji co handler
+/// `/v1/audio/transcriptions` — jedna sciezka STT, zero rownoleglych
+/// dispatch implementacji.
+pub type SttRuntimeSlot =
+    Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>;
+
 impl FlowDispatcher {
     pub fn new(
         db: DbPool,
         service_manager: Arc<ServiceManager>,
         config: Arc<RouterConfig>,
+        executor_slot: ExecutorSlot,
+        stt_runtime_slot: SttRuntimeSlot,
     ) -> Self {
         let mut registry = AdapterRegistry::new();
-        registry.register(LlmNodeAdapter::new(service_manager.clone(), config.clone()));
-        registry.register(RagNodeAdapter::new(service_manager.clone(), config.clone()));
-        registry.register(SttNodeAdapter::new(service_manager.clone(), config.clone()));
+        registry.register(LlmNodeAdapter::new(
+            service_manager.clone(),
+            config.clone(),
+            executor_slot.clone(),
+        ));
+        registry.register(SttNodeAdapter::new(stt_runtime_slot));
         registry.register(TtsNodeAdapter::new(service_manager.clone(), config.clone()));
         registry.register(EmbeddingsNodeAdapter::new(
             service_manager.clone(),
@@ -368,7 +390,17 @@ mod flow_dispatch_regression {
         let service_manager = std::sync::Arc::new(
             ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
         );
-        let dispatcher = FlowDispatcher::new(pool, service_manager, config);
+        let executor_slot: ExecutorSlot =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let stt_runtime_slot: SttRuntimeSlot =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let dispatcher = FlowDispatcher::new(
+            pool,
+            service_manager,
+            config,
+            executor_slot,
+            stt_runtime_slot,
+        );
         let registered: BTreeSet<String> = dispatcher
             .registry()
             .registered_types()

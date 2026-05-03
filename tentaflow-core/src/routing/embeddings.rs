@@ -58,7 +58,7 @@ impl Router {
             use crate::routing::middleware::BackendHandle;
             let this = self.clone();
             let req = request.clone();
-            self.dispatch_with_fallback(&request.model, 0, |handle| {
+            self.dispatch_with_fallback(&request.model, 0, None, |handle| {
                 let this = this.clone();
                 let req = req.clone();
                 let handle = handle.clone();

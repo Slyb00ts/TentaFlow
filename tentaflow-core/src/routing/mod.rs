@@ -35,8 +35,6 @@ pub use router::{
 
 use crate::api::openai::types::{ChatCompletionRequest, ChatCompletionResponse, MessageContent};
 use crate::flow_engine::types::FlowContext;
-use tentaflow_protocol::{RAGParams, RAGPayload, SearchMode};
-use tracing::warn;
 
 /// Builds a FlowContext from a ChatCompletionRequest. When a user is attached
 /// the dispatcher gates per-flow ACL on user_id/role; internal callers
@@ -102,70 +100,14 @@ fn build_flow_context_inner(request: &ChatCompletionRequest, stream: bool) -> Fl
             .memory_options
             .as_ref()
             .and_then(|o| o.speaker_name.clone()),
+        // R4.B: when the chat audio policy guard admits a request to a
+        // flow (audio chat → flow with STT node), the audio bytes must
+        // reach the flow context — otherwise the STT adapter looks at
+        // an empty `ctx.audio_input`, returns an empty transcript, and
+        // the flow happily proceeds with a blank input.
+        audio_input: request.audio_input.clone(),
         ..Default::default()
     }
-}
-
-/// Buduje RAGPayload z parametrow RAG w ChatCompletionRequest.
-/// Zwraca (RAGPayload, requires_llm, requires_audio) lub None jesli brak rag_options.
-pub(crate) fn build_rag_payload(
-    request: &ChatCompletionRequest,
-    query: String,
-    context: Option<tentaflow_protocol::RAGContext>,
-) -> (RAGPayload, bool, bool) {
-    let rag_opts = request.rag_options.as_ref();
-
-    let top_k = rag_opts.and_then(|opts| opts.top_k).unwrap_or(5);
-    let min_similarity = rag_opts.and_then(|opts| opts.min_similarity).unwrap_or(0.7);
-    let use_reranking = rag_opts.and_then(|opts| opts.use_reranking);
-    let requires_llm = rag_opts.and_then(|opts| opts.requires_llm).unwrap_or(true);
-    let requires_audio = if !requires_llm {
-        false
-    } else {
-        rag_opts
-            .and_then(|opts| opts.requires_audio)
-            .unwrap_or(false)
-    };
-
-    let search_modes = if let Some(modes_str) = rag_opts.and_then(|opts| opts.search_modes.as_ref())
-    {
-        let modes: Vec<_> = modes_str
-            .iter()
-            .filter_map(|s| match s.as_str() {
-                "FullTextSearch" => Some(SearchMode::FullTextSearch),
-                "VectorSearch" => Some(SearchMode::VectorSearch),
-                "HiRAG" => Some(SearchMode::HiRAG),
-                "GSW" => Some(SearchMode::GSW),
-                _ => {
-                    warn!("Nieznany search mode: '{}' - pomijam", s);
-                    None
-                }
-            })
-            .collect();
-        if modes.is_empty() {
-            warn!("search_modes jest puste - uzywam domyslnej kombinacji");
-            vec![SearchMode::VectorSearch, SearchMode::FullTextSearch]
-        } else {
-            modes
-        }
-    } else {
-        vec![SearchMode::VectorSearch, SearchMode::FullTextSearch]
-    };
-
-    let rag_payload = RAGPayload {
-        query,
-        context,
-        params: RAGParams {
-            top_k,
-            min_similarity,
-            use_reranking,
-        },
-        requires_llm_processing: requires_llm,
-        requires_audio_output: requires_audio,
-        search_modes,
-    };
-
-    (rag_payload, requires_llm, requires_audio)
 }
 
 /// Konwertuje OpenAI messages na protocol messages (rola + tekst).
@@ -196,6 +138,62 @@ pub(crate) fn openai_messages_to_protocol(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod build_flow_context_tests {
+    use super::*;
+    use crate::api::openai::types::Message;
+
+    fn make_request(audio: Option<Vec<u8>>, content: Option<MessageContent>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: false,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            memory_options: None,
+            audio_input: audio,
+        }
+    }
+
+    /// R4.B: chat audio policy admits audio chat → flow with STT, so the
+    /// audio bytes must travel from `ChatCompletionRequest.audio_input`
+    /// into `FlowContext.audio_input`. Pre-fix the field was always
+    /// `None`, the STT adapter saw empty data and emitted an empty
+    /// transcript without raising an error.
+    #[test]
+    fn chat_audio_input_propagates_to_flow_context() {
+        let request = make_request(Some(vec![1, 2, 3, 4]), None);
+        let ctx = build_flow_context_inner(&request, false);
+        assert_eq!(ctx.audio_input.as_deref(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    /// Negative complement: text chat (no audio_input) yields a
+    /// FlowContext with `audio_input = None`. STT adapter on such a
+    /// flow legitimately produces an empty transcript.
+    #[test]
+    fn text_chat_yields_no_flow_audio() {
+        let request = make_request(None, Some(MessageContent::Text("hello".into())));
+        let ctx = build_flow_context_inner(&request, false);
+        assert!(ctx.audio_input.is_none());
+    }
 }
 
 /// Wyciaga tekst z pierwszego choice w ChatCompletionResponse.

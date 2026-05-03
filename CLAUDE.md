@@ -367,7 +367,9 @@ musi mieć adapter.
 | `pii_filter` | `PiiFilterNodeAdapter` | `["full"]` | `adapters/pii_filter.rs` (reguły z `pii_rules`) |
 | `tts_clean` | `TtsCleanNodeAdapter` | `["full"]` | `adapters/tts_clean.rs` (reguły z `tts_cleaning_rules`) |
 | `llm` | `LlmNodeAdapter` | `["stream", "full"]` | `adapters/llm.rs` — real streaming |
-| `rag`, `stt`, `tts`, `embeddings`, `memory`, `conversation_history`, `session_context`, `speaker_context` | odpowiednie `*NodeAdapter` | `["full"]` | `adapters/*.rs` |
+| `stt`, `tts`, `embeddings`, `memory`, `conversation_history`, `session_context`, `speaker_context` | odpowiednie `*NodeAdapter` | `["full"]` | `adapters/*.rs` |
+
+> Path RAG zostal w calosci usuniety; nowa implementacja RAG bedzie zaprojektowana od zera.
 
 Logika `trigger`/`output`/`condition`/`pii_filter`/`tts_clean` żyje w modułach adapterów
 jako `pub fn build_*` / `apply_*` — executor_async woła je dla szybkiej ścieżki
@@ -446,6 +448,18 @@ Project components live under `tentaflow-core/www/js/components/` — currently:
 - Code review rejects any diff that renders a custom tab strip, custom toggle, custom select dropdown, custom modal, etc., when a `tf-*` component exists. "Slight visual difference" is not justification — change the component's CSS variant.
 
 **Why:** one-off UI primitives drift in look, accessibility, animation timing, and keyboard behavior. Users notice inconsistency. Components centralize the fixes.
+
+### 9. No CSV — always JSON for serialized lists
+
+**NEVER** persist or serialize a list-shaped value as CSV (`"a,b,c"`). Use JSON arrays (`["a","b","c"]`) — every layer (DB column, GUI form payload, wire protocol, config file).
+
+**Why:** A real bug we hit: `model_aliases.fallback_targets` was written as CSV by the GUI (`services.js`) and parsed as JSON by the Rust catalog provider via `serde_json::from_str(...).unwrap_or_default()`. Every CSV row silently parsed to an empty list — DB-backed alias fallbacks were invisible to the catalog despite the GUI showing them. CSV gets you ad-hoc parsers per layer, comma collisions in real values, and silent `unwrap_or_default` failures that mask the drift.
+
+**Rules:**
+- New list field → JSON array on every layer. `serde_json` in Rust, `JSON.parse` / `JSON.stringify` in JS.
+- Code review rejects `.split(',')` and `.join(',')` on list-shaped fields. The ONLY allowed `split(',')` is parsing third-party text formats produced by tools we don't own (`vm_stat`, `iostat`, `/proc/net/dev`). Anything in our own storage / wire / GUI is JSON.
+- Existing CSV fields are migration debt: when you touch one, migrate it to JSON in the same commit (writer + reader + DB migration if needed).
+- **Migrations don't get to interpret CSV either.** Legacy CSV in our storage is wiped to NULL with a loud warn. Admins reconstruct the data manually. A CSV-tolerant repair path becomes a permanent CSV interpreter the moment someone forgets to remove it.
 
 ### Enforcement
 - Code review (human or `code-reviewer` agent) rejects any diff violating these rules.
