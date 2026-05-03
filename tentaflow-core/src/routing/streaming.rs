@@ -233,7 +233,7 @@ impl Router {
     /// memory integration, PII filtering w strumieniu, memory store po zakonczeniu.
     pub async fn route_chat_completion_stream(
         &self,
-        mut request: ChatCompletionRequest,
+        request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
     ) -> Result<
         crate::routing::RouteResult<

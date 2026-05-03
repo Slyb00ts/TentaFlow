@@ -15,7 +15,6 @@ use crate::services::runtime::quic_handle::ServiceManager;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tentaflow_protocol::*;
 use tracing::info;
 
 /// Router zarzadzajacy routing requestow do backendow.
@@ -30,19 +29,11 @@ use tracing::info;
 /// - Serwisy niedostepne zwracaja blad natychmiast
 #[derive(Clone)]
 pub struct Router {
-    /// Konfiguracja routera
-    pub(crate) config: Arc<RouterConfig>,
-
     /// Service Manager - zarzadza wszystkimi serwisami asynchronicznie
     pub(crate) service_manager: Arc<ServiceManager>,
 
     /// Response middleware dla filtrowania PII
     pub(crate) response_middleware: Arc<ResponseMiddleware>,
-
-    /// Mowcy potrzebujacy dodatkowych sampli glosu (speaker_id -> remaining_samples)
-    /// Po enrollment zbieramy 3 dodatkowe probki zeby wzmocnic model glosu
-    pub(crate) pending_voice_samples:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, u8>>>,
 
     /// Flow Engine dispatcher - opcjonalny, aktywny gdy DB jest dostepna
     pub(crate) flow_dispatcher: Option<Arc<FlowDispatcher>>,
@@ -353,12 +344,8 @@ impl Router {
         let alias_cache = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
         let router = Self {
-            config,
             service_manager: service_manager.clone(),
             response_middleware,
-            pending_voice_samples: Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
             flow_dispatcher: flow_dispatcher.clone(),
             db: db_clone,
             local_inference: local_inference.clone(),
