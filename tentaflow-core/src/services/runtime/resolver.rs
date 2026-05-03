@@ -119,7 +119,7 @@ impl AliasResolver {
 /// callerze) — provider obsluguje to bezpiecznie zwracajac pusty string,
 /// supervisor natychmiast przepisze snapshot i kolejne wywolania widza pelen id.
 pub fn local_node_id_provider_for_router(
-    sm: &Arc<crate::routing::service_manager::ServiceManager>,
+    sm: &Arc<crate::services::runtime::quic_handle::ServiceManager>,
 ) -> LocalNodeIdProvider {
     let sm = Arc::clone(sm);
     Arc::new(move || {

@@ -8,7 +8,7 @@
 
 use crate::config::RouterConfig;
 use crate::error::Result;
-use crate::routing::backend::BackendClient;
+use crate::services::backend::BackendClient;
 
 use crate::prompt_registry::{create_shared_registry, SharedPromptRegistry};
 
@@ -535,7 +535,7 @@ impl ServiceManager {
         &self,
         model_name: &str,
     ) -> Option<Vec<Arc<BackendClient>>> {
-        use crate::routing::transport_client::entry_to_backend_client;
+        use crate::services::runtime::transport_client::entry_to_backend_client;
         use crate::services::transport::Transport;
 
         let snap = self.current_snapshot();

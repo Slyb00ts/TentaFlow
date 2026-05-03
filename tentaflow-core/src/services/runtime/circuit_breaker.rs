@@ -1,5 +1,5 @@
 // =============================================================================
-// Plik: routing/loadbalancer/circuit_breaker.rs
+// Plik: services/runtime/circuit_breaker.rs
 // Opis: Implementacja wzorca Circuit Breaker dla ochrony przed kaskadowymi
 //       awariami backendow. Kazdy backend ma wlasny circuit breaker monitorujacy
 //       bledy i automatycznie przelaczajacy sie miedzy stanami:

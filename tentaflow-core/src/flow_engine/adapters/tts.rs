@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::config::RouterConfig;
 use crate::flow_engine::adapters::NodeAdapter;
 use crate::flow_engine::types::FlowContext;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use tentaflow_protocol::*;
 
 /// Adapter wezla TTS - synteza mowy z tekstu
@@ -190,7 +190,7 @@ impl NodeAdapter for TtsNodeAdapter {
 mod tests {
     use super::*;
     use crate::config::RouterConfig;
-    use crate::routing::service_manager::ServiceManager;
+    use crate::services::runtime::quic_handle::ServiceManager;
 
     fn make_adapter() -> TtsNodeAdapter {
         let config = Arc::new(RouterConfig::default());

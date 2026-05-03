@@ -1,5 +1,5 @@
 // =============================================================================
-// Plik: routing/backend/client.rs
+// Plik: services/backend/client.rs
 // Opis: HTTP client dla komunikacji z backendami LLM (OpenAI, Azure OpenAI,
 //       NVIDIA NIM, lokalne modele). Obsluguje chat completions (streaming
 //       i non-streaming), embeddings, audio transcription (Whisper), vision.
@@ -7,7 +7,7 @@
 
 use crate::config::ServiceBackend;
 use crate::error::{CoreError, Result};
-use crate::routing::loadbalancer::{CircuitBreaker, CircuitBreakerConfig};
+use crate::services::runtime::{CircuitBreaker, CircuitBreakerConfig};
 
 // TODO: typy OpenAI API nie sa jeszcze przeniesione do Core
 // Po przeniesieniu modulu protocols::openai::types zamien na:

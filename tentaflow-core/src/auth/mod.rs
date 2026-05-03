@@ -1,9 +1,11 @@
 // =============================================================================
 // Plik: auth/mod.rs
-// Opis: Modul autentykacji — SSO/OIDC i zarzadzanie uzytkownikami.
+// Opis: Modul autentykacji i autoryzacji — ACL, SSO/OIDC, rate limiting.
 // =============================================================================
 
+pub mod acl;
+pub mod rate_limit;
 #[cfg(feature = "dashboard-api")]
 pub mod sso;
 
-pub mod rate_limit;
+pub use acl::UserContext;

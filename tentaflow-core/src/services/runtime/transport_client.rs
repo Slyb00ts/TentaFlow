@@ -1,4 +1,4 @@
-// ============ File: transport_client.rs — Transport-aware client glue for snapshot-driven routing ============
+// ============ File: services/runtime/transport_client.rs — Transport-aware client glue for snapshot-driven routing ============
 //
 // Builds a legacy `ServiceBackend` (and a ready-to-use `BackendClient`) from a
 // `ServiceEntry` materialised by the supervisor snapshot. Phase 8b-1 wires the
@@ -13,7 +13,7 @@ use rand::RngExt;
 
 use crate::config::{ConnectionType, ServiceBackend};
 use crate::net::quic::QuicClient;
-use crate::routing::backend::client::BackendClient;
+use crate::services::backend::client::BackendClient;
 use crate::services::handles_cache::BackendHandle;
 use crate::services::supervisor::ServiceEntry;
 use crate::services::transport::Transport;
@@ -508,7 +508,7 @@ mod tests {
             skip_tls_verify: true,
             direct_addrs: Vec::new(),
         };
-        let qh = Arc::new(crate::routing::service_manager::QuicServiceHandle::new(
+        let qh = Arc::new(crate::services::runtime::quic_handle::QuicServiceHandle::new(
             qcfg,
         ));
         let h = BackendHandle::Quic(qh);
@@ -536,7 +536,7 @@ mod tests {
             skip_tls_verify: true,
             direct_addrs: Vec::new(),
         };
-        let qh = Arc::new(crate::routing::service_manager::QuicServiceHandle::new(
+        let qh = Arc::new(crate::services::runtime::quic_handle::QuicServiceHandle::new(
             qcfg,
         ));
         let h = BackendHandle::Quic(qh);

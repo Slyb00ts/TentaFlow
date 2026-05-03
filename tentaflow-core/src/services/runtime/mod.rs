@@ -5,13 +5,17 @@
 // to the right transport (local handle / mesh forward / flow).
 // =============================================================================
 
+pub mod circuit_breaker;
 pub mod context;
 pub mod executor;
 pub mod middleware;
+pub mod quic_handle;
 pub mod resolver;
 pub mod strategy;
 pub mod target;
+pub mod transport_client;
 
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use context::{ContextLimitError, ExecutionContext, RouteMetadata};
 pub use executor::{ExecutorError, ModelRuntimeExecutor};
 pub use middleware::{

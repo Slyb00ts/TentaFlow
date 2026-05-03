@@ -12,6 +12,7 @@ pub mod llamacpp;
 #[cfg(feature = "inference-mlx")]
 pub mod mlx_swift_bridge;
 
+pub mod local;
 pub mod model_manager;
 
 use async_trait::async_trait;

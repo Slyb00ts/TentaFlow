@@ -8,7 +8,7 @@ use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use std::sync::Arc;
 
 use crate::routing::router::Router;

@@ -15,6 +15,7 @@ pub mod tts;
 
 // Unified services refactor (Phase 1 — additive, runs alongside legacy code).
 pub mod auto_detect;
+pub mod backend;
 pub mod catalog;
 pub mod deploy;
 pub mod handles_cache;

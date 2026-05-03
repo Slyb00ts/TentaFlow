@@ -13,6 +13,7 @@ pub mod frame_policy;
 pub mod gossip;
 #[cfg(all(feature = "rdma-probe", target_os = "linux"))]
 pub mod ibverbs_ffi;
+pub mod inference_proxy;
 pub mod iroh_manager;
 pub mod liveness;
 #[cfg(target_os = "macos")]

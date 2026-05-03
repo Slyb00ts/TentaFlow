@@ -6,7 +6,7 @@
 // strategies pass it by value into nested dispatches.
 // =============================================================================
 
-use crate::routing::acl::UserContext;
+use crate::auth::acl::UserContext;
 
 /// Hard ceilings — anything deeper trips the guard rather than risk an
 /// infinite chain. `MAX_HOP_COUNT` mirrors the legacy `MAX_HOPS` in

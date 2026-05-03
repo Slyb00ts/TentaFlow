@@ -265,7 +265,7 @@ mod tests {
     fn validate_rejects_stream_port_on_tts_node() {
         use crate::config::RouterConfig;
         use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-        use crate::routing::service_manager::ServiceManager;
+        use crate::services::runtime::quic_handle::ServiceManager;
         use std::sync::Arc;
 
         let config = Arc::new(RouterConfig::default());
