@@ -425,8 +425,12 @@ impl Router {
         // Handler `/v1/audio/transcriptions` woła przez `router.stt_runtime()`
         // zamiast bezposrednio Router::route_audio_transcription, zeby
         // SttRuntime byl single owner STT path (D.3).
+        // Codex R5f Blocker fix: SttRuntime ma teraz owned dispatch
+        // (bezposrednio przez SttManager). Pre-R5f trzymal Weak<Router>
+        // i loopowal przez `Router.route_audio_transcription` ktore po
+        // R3b.6 cutover stalo sie stub'em — STT byl wylaczony.
         *self.stt_runtime.write() = Some(Arc::new(
-            crate::services::stt::SttRuntime::new(self),
+            crate::services::stt::SttRuntime::new(),
         ));
 
         // R3e (F10): subscribe na mutacje mesh registry. Wczesniej peer
