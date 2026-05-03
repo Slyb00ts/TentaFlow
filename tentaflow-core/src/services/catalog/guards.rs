@@ -168,6 +168,16 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_test_alias(pool: &DbPool, alias: &str, target: &str) -> i64 {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, is_active) VALUES (?1, ?2, 1)",
+            rusqlite::params![alias, target],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
     #[test]
     fn empty_name_is_rejected_everywhere() {
         let pool = fresh_db();
@@ -185,9 +195,9 @@ mod tests {
     #[test]
     fn alias_collides_with_existing_alias() {
         let pool = fresh_db();
-        // 'rag-embeddings' is seeded by seed_model_aliases.
-        match check_alias_collision(&pool, "rag-embeddings", None) {
-            Err(GuardError::AliasVsAlias { name }) => assert_eq!(name, "rag-embeddings"),
+        seed_test_alias(&pool, "test-alias", "embeddings-gemma");
+        match check_alias_collision(&pool, "test-alias", None) {
+            Err(GuardError::AliasVsAlias { name }) => assert_eq!(name, "test-alias"),
             other => panic!("expected AliasVsAlias, got {:?}", other),
         }
     }
@@ -195,17 +205,9 @@ mod tests {
     #[test]
     fn alias_update_excludes_self() {
         let pool = fresh_db();
-        let alias_id = {
-            let conn = pool.lock().unwrap();
-            conn.query_row(
-                "SELECT id FROM model_aliases WHERE alias = 'rag-embeddings'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-        };
+        let alias_id = seed_test_alias(&pool, "test-alias", "embeddings-gemma");
         // Updating the same row to keep its name must be allowed.
-        check_alias_collision(&pool, "rag-embeddings", Some(alias_id)).unwrap();
+        check_alias_collision(&pool, "test-alias", Some(alias_id)).unwrap();
     }
 
     #[test]
@@ -221,8 +223,9 @@ mod tests {
     #[test]
     fn flow_publish_collides_with_alias() {
         let pool = fresh_db();
-        match check_flow_publish_collision(&pool, "rag-embeddings", None) {
-            Err(GuardError::FlowVsAlias { name }) => assert_eq!(name, "rag-embeddings"),
+        seed_test_alias(&pool, "test-alias", "embeddings-gemma");
+        match check_flow_publish_collision(&pool, "test-alias", None) {
+            Err(GuardError::FlowVsAlias { name }) => assert_eq!(name, "test-alias"),
             other => panic!("expected FlowVsAlias, got {:?}", other),
         }
     }
@@ -247,8 +250,9 @@ mod tests {
     #[test]
     fn service_deploy_collides_with_alias_then_flow() {
         let pool = fresh_db();
-        // First: collides with seeded alias.
-        match check_service_deploy_collision(&pool, "rag-embeddings") {
+        seed_test_alias(&pool, "test-alias", "embeddings-gemma");
+        // First: collides with the seeded alias.
+        match check_service_deploy_collision(&pool, "test-alias") {
             Err(GuardError::ServiceVsAlias { .. }) => (),
             other => panic!("expected ServiceVsAlias, got {:?}", other),
         }

@@ -38,7 +38,7 @@ Two ALPN protocols handle all communication:
 
 | ALPN | Direction | Purpose |
 |------|-----------|---------|
-| `tentaflow` | SDK client &rarr; node | AI requests: chat, embeddings, TTS, STT, RAG, memory |
+| `tentaflow` | SDK client &rarr; node | AI requests: chat, embeddings, TTS, STT, memory |
 | `tentaflow-mesh` | node &harr; node | Heartbeat, CRDT sync, service discovery, forwarding, management |
 
 ### AI Services
@@ -46,7 +46,6 @@ Two ALPN protocols handle all communication:
 - **LLM Inference** — llama.cpp (CPU/GPU), Apple MLX (Metal-accelerated), vLLM, SGLang, Ollama
 - **Embeddings** — local embedding models served per-node
 - **TTS / STT** — text-to-speech and speech-to-text pipelines
-- **RAG** — document ingestion, chunking, retrieval
 - **Memory** — fact extraction, summarization, contextual recall
 
 ### Dashboard & API
@@ -110,7 +109,7 @@ A fine-tuned **Qwen 3.5-0.8B** model that acts as the routing brain:
 │   │ Node A  │◄════════════════════►│ Node B  │               │
 │   │ (Linux) │    (QUIC, encrypted) │ (Linux) │               │
 │   │ LLM x2  │                      │ STT     │               │
-│   │ TTS     │                      │ RAG     │               │
+│   │ TTS     │                      │ Memory  │               │
 │   └────┬────┘                      └────┬────┘               │
 │        │                                │                    │
 │        │ tentaflow-mesh                 │ tentaflow-mesh     │
@@ -266,7 +265,7 @@ var response = await client.ChatCompletionAsync(new ChatRequest
 var embeddings = await client.EmbeddingsAsync("Document text here");
 ```
 
-Supported operations: ChatCompletion, Embeddings, RAG, TTS, STT, Ingest, Memory.
+Supported operations: ChatCompletion, Embeddings, TTS, STT, Memory.
 
 ## License
 

@@ -78,21 +78,60 @@ pub enum ResolveError {
     AliasPrimaryMissing { alias: String, primary: String },
 }
 
+/// Provider lokalnego node_id. Resolver woła go per resolve żeby zawsze
+/// mieć aktualny id z mesh registry — wczesniejsza wersja capture'owala
+/// node_id w `Router::new`, gdy registry byl jeszcze `None` ⇒ resolver
+/// dostawal `""` i kazdy lokalny ModelInstance trafial w MeshForward
+/// (codex H2). Closure boxed jako `Send + Sync + 'static` zeby executor
+/// mogl byc trzymany w Arc i wolany z dowolnego watka.
+pub type LocalNodeIdProvider = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// Stateless component — every call into `resolve` walks the supplied
 /// snapshot. Holds a clone of `LiveHandlesCache` so it can hydrate
 /// `Local` candidates without going through the executor.
 pub struct AliasResolver {
     handles: Arc<LiveHandlesCache>,
-    local_node_id: String,
+    local_node_id: LocalNodeIdProvider,
 }
 
 impl AliasResolver {
-    pub fn new(handles: Arc<LiveHandlesCache>, local_node_id: String) -> Self {
+    pub fn new(handles: Arc<LiveHandlesCache>, local_node_id: LocalNodeIdProvider) -> Self {
         Self {
             handles,
             local_node_id,
         }
     }
+
+    /// Convenience constructor dla testow ktore podaja staly node_id.
+    #[cfg(test)]
+    pub fn new_with_static_id(handles: Arc<LiveHandlesCache>, local_node_id: String) -> Self {
+        Self {
+            handles,
+            local_node_id: Arc::new(move || local_node_id.clone()),
+        }
+    }
+}
+
+/// Helper dla `Router::new` (R1.5e). Zwraca closure ktora przy kazdym wywolaniu
+/// odczytuje aktualny `local().node_id` z `ServiceManager.mesh_services_registry`.
+/// W momencie konstrukcji executor'a registry moze byc jeszcze None (Router::new
+/// jest sekwencyjny, ale `set_mesh_services_registry` woła sie dopiero w
+/// callerze) — provider obsluguje to bezpiecznie zwracajac pusty string,
+/// supervisor natychmiast przepisze snapshot i kolejne wywolania widza pelen id.
+pub fn local_node_id_provider_for_router(
+    sm: &Arc<crate::routing::service_manager::ServiceManager>,
+) -> LocalNodeIdProvider {
+    let sm = Arc::clone(sm);
+    Arc::new(move || {
+        let registry = sm.mesh_services_registry.read();
+        registry
+            .as_ref()
+            .map(|r| r.local().node_id.clone())
+            .unwrap_or_default()
+    })
+}
+
+impl AliasResolver {
 
     /// Walk the catalog from `req.requested_model`, expand aliases, drop
     /// candidates whose surface/modalities don't satisfy the request, and
@@ -254,8 +293,9 @@ impl AliasResolver {
         instances: &[ModelInstance],
         out: &mut Vec<ResolvedExecutionTarget>,
     ) {
+        let local_id = (self.local_node_id)();
         for inst in instances {
-            if inst.node_id == self.local_node_id {
+            if inst.node_id == local_id {
                 if let Some(handle) = self.handles.get(&inst.node_id, inst.service_id) {
                     out.push(ResolvedExecutionTarget::Local {
                         model_name: model_name.to_string(),
@@ -356,6 +396,8 @@ mod tests {
                     backend: Some("emb".into()),
                     size_mb: None,
                     loaded: true,
+                    input_modalities: input.clone(),
+                    output_modalities: output.clone(),
                 }],
             },
             service_surfaces: surfaces,
@@ -384,7 +426,7 @@ mod tests {
     }
 
     fn resolver_for(local: &str) -> AliasResolver {
-        AliasResolver::new(Arc::new(LiveHandlesCache::new()), local.to_string())
+        AliasResolver::new_with_static_id(Arc::new(LiveHandlesCache::new()), local.to_string())
     }
 
     fn chat_request<'a>(model: &'a str) -> ResolveRequest<'a> {

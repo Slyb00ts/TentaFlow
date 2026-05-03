@@ -332,66 +332,6 @@ internal static partial class NativeMethods
     internal static partial void tentaflow_free_speaker_verify(SpeakerVerifyResultNative result);
 
     // =========================================================================
-    // RAG
-    // =========================================================================
-
-    /// <summary>
-    /// Wysyła zapytanie RAG z pełną kontrolą parametrów.
-    /// searchModesFlags: 0x01=FTS, 0x02=Vector, 0x04=HiRAG, 0x08=GSW, 0=domyślnie Vector
-    /// useReranking/requiresLlm/requiresAudio: -1=None, 0=false, 1=true
-    /// </summary>
-    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial RagResultNative tentaflow_rag(
-        nint client,
-        string query,
-        uint topK,
-        float minSimilarity,
-        uint searchModesFlags,
-        int useReranking,
-        int requiresLlm,
-        int requiresAudio);
-
-    /// <summary>
-    /// Zwalnia pamięć wyniku RAG.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    internal static partial void tentaflow_free_rag(RagResultNative result);
-
-    // =========================================================================
-    // INGEST (Indeksowanie dokumentów)
-    // =========================================================================
-
-    /// <summary>
-    /// Dodaje dokument tekstowy do RAG.
-    /// </summary>
-    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial IngestResultNative tentaflow_ingest_text(
-        nint client,
-        string documentId,
-        string text,
-        nint metadata,
-        nuint metadataCount);
-
-    /// <summary>
-    /// Dodaje plik do RAG.
-    /// </summary>
-    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial IngestResultNative tentaflow_ingest_file(
-        nint client,
-        string documentId,
-        string filename,
-        nint data,
-        nuint dataLen,
-        nint metadata,
-        nuint metadataCount);
-
-    /// <summary>
-    /// Zwalnia pamięć wyniku ingest.
-    /// </summary>
-    [LibraryImport(LibraryName)]
-    internal static partial void tentaflow_free_ingest(IngestResultNative result);
-
-    // =========================================================================
     // CONVERSATION SESSIONS
     // =========================================================================
 
@@ -616,17 +556,6 @@ internal struct SttResultNative
 }
 
 /// <summary>
-/// Dokument zawierający chunk (layout C-compatible).
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-internal struct ChunkDocumentNative
-{
-    public nint DocId;
-    public nint Metadata;       // Wskaźnik do tablicy KeyValuePairNative
-    public uint MetadataCount;
-}
-
-/// <summary>
 /// Para klucz-wartość dla metadanych (layout C-compatible).
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
@@ -634,54 +563,6 @@ internal struct KeyValuePairNative
 {
     public nint Key;
     public nint Value;
-}
-
-/// <summary>
-/// Informacje o pojedynczym chunka RAG (layout C-compatible).
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-internal struct RagChunkInfoNative
-{
-    public nint ChunkId;
-    public nint ChunkText;
-    public nint SourceFile;
-    public nint SourceType;
-    public float SimilarityScore;
-    public uint Rank;
-    public uint ChunkIndex;
-    public nint Documents;      // Wskaźnik do tablicy ChunkDocumentNative
-    public uint DocumentsCount;
-}
-
-/// <summary>
-/// Wynik RAG (layout C-compatible).
-/// Uwaga: RequiresLlm przechowywany jako byte (0 = false, 1 = true) dla uniknięcia problemów z marshallingiem.
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-internal struct RagResultNative
-{
-    public nint Response;
-    public uint ChunksFound;
-    public byte RequiresLlmByte;
-    public nint Chunks;        // Wskaźnik do tablicy RagChunkInfoNative
-    public uint ChunksCount;   // Liczba elementów w tablicy
-    public nint Error;
-
-    public bool RequiresLlm => RequiresLlmByte != 0;
-}
-
-/// <summary>
-/// Wynik ingest (layout C-compatible).
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-internal struct IngestResultNative
-{
-    public nint DocumentId;
-    public uint Status;
-    public uint ChunkCount;
-    public uint VectorCount;
-    public uint TotalMs;
-    public nint Error;
 }
 
 /// <summary>

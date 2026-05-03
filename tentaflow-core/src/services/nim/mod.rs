@@ -352,7 +352,7 @@ fn extra_nim_containers() -> Vec<NimContainer> {
         NimContainer {
             name: "nvidia/nemo-retriever-reranking".into(),
             display_name: "NeMo Retriever Reranking".into(),
-            description: "NVIDIA NeMo reranking model for RAG pipelines".into(),
+            description: "NVIDIA NeMo reranking model for retrieval pipelines".into(),
             image: "nvcr.io/nim/nvidia/nemo-retriever-reranking".into(),
             latest_tag: "latest".into(),
             publisher: "nvidia".into(),

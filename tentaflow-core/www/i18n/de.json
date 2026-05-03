@@ -245,6 +245,7 @@
     "alias_active": "Aktiv",
     "alias_inactive": "Inaktiv",
     "alias_required": "Name und Ziel sind erforderlich",
+    "alias_fallback_parse_failed": "Vorhandene Fallbacks konnten nicht gelesen werden (ungültiges Format). Bitte Seite neu laden oder Fallbacks erneut hinzufügen, bevor Sie speichern.",
     "alias_created": "Alias erstellt",
     "alias_updated": "Alias aktualisiert",
     "alias_deleted": "Alias „{name}\" gelöscht",
@@ -524,10 +525,6 @@
       "reranker": {
         "name": "Reranker",
         "desc": "Reranking von Suchergebnissen. Cross-Encoder für präzises Dokument-Scoring."
-      },
-      "rag": {
-        "name": "RAG Engine",
-        "desc": "Retrieval-Augmented Generation. Suche in Wissensdatenbanken und Antwortgenerierung."
       },
       "tools": {
         "name": "Tools",
@@ -912,7 +909,6 @@
     "categories": {
       "trigger": "Trigger",
       "service": "AI-Services",
-      "rag": "RAG",
       "transform": "Transformation",
       "logic": "Logik",
       "filter": "Filter",
@@ -978,7 +974,6 @@
     "node_names": {
       "trigger": "Trigger",
       "llm": "LLM-Aufruf",
-      "rag": "RAG-Suche",
       "stt": "Sprache zu Text",
       "tts": "Text zu Sprache",
       "embeddings": "Embeddings",
@@ -998,7 +993,6 @@
     "node_descriptions": {
       "trigger": "Flow-Einstiegspunkt (HTTP, QUIC, Webhook)",
       "llm": "LLM-Aufruf — sendet Prompt und gibt Antwort zurück",
-      "rag": "Wissensdatenbank-Suche — gibt Kontext für LLM zurück",
       "stt": "Transkription von Sprache zu Text",
       "tts": "Synthese von Text zu Sprache",
       "embeddings": "Generierung von Text-Embeddings",
@@ -1061,7 +1055,7 @@
     "status_archived": "Archiviert",
     "status_draft": "Entwurf",
     "list_title": "Flows",
-    "subtitle": "DAG-Graph ausgeführt von flow_engine — LLM, Embeddings, TTS, RAG.",
+    "subtitle": "DAG-Graph ausgeführt von flow_engine — LLM, Embeddings, TTS.",
     "empty_title": "Keine Flows",
     "empty_desc": "Erstelle deinen ersten Flow, um einen Verarbeitungsgraphen zu definieren.",
     "new_flow_btn": "Neuer Flow",

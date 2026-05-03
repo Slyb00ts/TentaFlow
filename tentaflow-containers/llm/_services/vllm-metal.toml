@@ -31,14 +31,7 @@ repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
 quantization = "int4"
 recommended = true
 
-# Bielik 4.5B Instruct + RAG (vqstudio) w MLX 4-bit — polski model.
-[[model_preset]]
-id = "bielik-4-5b-instruct-rag-mlx-4bit"
-display_name = "Bielik 4.5B Instruct RAG (MLX 4-bit)"
-repo = "vqstudio/Bielik-4.5B-v3.0-Instruct-RAG-0.8-MLX-4bit"
-quantization = "int4"
-
-# Bielik 4.5B Instruct bez RAG fine-tune.
+# Bielik 4.5B Instruct (vqstudio) w MLX 4-bit — polski model.
 [[model_preset]]
 id = "bielik-4-5b-instruct-mlx-4bit"
 display_name = "Bielik 4.5B Instruct (MLX 4-bit)"

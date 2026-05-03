@@ -191,22 +191,75 @@ fn build_capabilities_index(entries: &[CatalogEntry]) -> HashMap<String, EntryCa
 fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEntry> {
     let local = registry.local();
     let local_node_id = local.node_id.clone();
+    let manifests = crate::services::manifest::registry();
 
     // (model_name) → instances grouped with their local/remote tag
     let mut by_name: HashMap<String, Vec<(bool, ModelInstance)>> = HashMap::new();
     // model_name → set of surfaces seen (HashSet so duplicates from many
     // peers serving the same `engine.category` collapse in O(n)).
     let mut surfaces_by_name: HashMap<String, HashSet<ServiceSurface>> = HashMap::new();
+    // model_name → modality sets unioned across every service that exposes
+    // the model. Same model id served by two engines that disagree on
+    // modalities is rare but tolerated — the catalog reports the union so
+    // routing won't reject a request that one of them can satisfy.
+    let mut inputs_by_name: HashMap<String, HashSet<InputModality>> = HashMap::new();
+    let mut outputs_by_name: HashMap<String, HashSet<OutputModality>> = HashMap::new();
 
     for svc in registry.visible_services() {
         let is_local = svc.node_id == local_node_id;
+        let manifest = manifests.by_id(&svc.engine_id);
         for model in &svc.models {
-            if let Some(s) = ServiceSurface::from_manifest_category(&svc.category) {
-                surfaces_by_name
-                    .entry(model.model_name.clone())
-                    .or_default()
-                    .insert(s);
+            // Resolve this service's effective capabilities. Surfaces and
+            // modalities all share the same preset > engine > category
+            // fallback chain, so we compute them once per (svc, model)
+            // pair and use them for both per-instance metadata and the
+            // entry-level union below.
+            let mut svc_surfaces: HashSet<ServiceSurface> = HashSet::new();
+            let mut svc_inputs: HashSet<InputModality> = HashSet::new();
+            let mut svc_outputs: HashSet<OutputModality> = HashSet::new();
+            if let Some(m) = manifest {
+                let preset = m
+                    .model_presets
+                    .iter()
+                    .find(|p| p.id == model.model_name);
+                for s in m.engine.effective_service_surfaces(preset) {
+                    if let Some(v) = ServiceSurface::from_wire_str(&s) {
+                        svc_surfaces.insert(v);
+                    }
+                }
+                for s in m.engine.effective_input_modalities(preset) {
+                    if let Some(v) = InputModality::from_wire_str(&s) {
+                        svc_inputs.insert(v);
+                    }
+                }
+                for s in m.engine.effective_output_modalities(preset) {
+                    if let Some(v) = OutputModality::from_wire_str(&s) {
+                        svc_outputs.insert(v);
+                    }
+                }
+            } else if let Some(s) = ServiceSurface::from_manifest_category(&svc.category) {
+                svc_surfaces.insert(s);
             }
+
+            // Entry-level union — keeps `/v1/models` and the catalog
+            // overview showing the full set across instances.
+            surfaces_by_name
+                .entry(model.model_name.clone())
+                .or_default()
+                .extend(svc_surfaces.iter().copied());
+            inputs_by_name
+                .entry(model.model_name.clone())
+                .or_default()
+                .extend(svc_inputs.iter().copied());
+            outputs_by_name
+                .entry(model.model_name.clone())
+                .or_default()
+                .extend(svc_outputs.iter().copied());
+
+            let mut instance_inputs: Vec<InputModality> = svc_inputs.into_iter().collect();
+            instance_inputs.sort_by_key(|v| *v as u8);
+            let mut instance_outputs: Vec<OutputModality> = svc_outputs.into_iter().collect();
+            instance_outputs.sort_by_key(|v| *v as u8);
             let instance = ModelInstance {
                 node_id: svc.node_id.clone(),
                 // Display name carries the human-readable peer label (e.g.
@@ -218,6 +271,8 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
                 backend: Some(svc.engine_id.clone()),
                 size_mb: None,
                 loaded: matches!(svc.status.as_str(), "running" | "ready"),
+                input_modalities: instance_inputs,
+                output_modalities: instance_outputs,
             };
             by_name
                 .entry(model.model_name.clone())
@@ -239,16 +294,25 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             .collect();
         surfaces.sort_by_key(|s| *s as u8);
 
+        let mut inputs: Vec<InputModality> = inputs_by_name
+            .remove(&model_name)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        inputs.sort_by_key(|v| *v as u8);
+        let mut outputs: Vec<OutputModality> = outputs_by_name
+            .remove(&model_name)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        outputs.sort_by_key(|v| *v as u8);
+
         out.push(CatalogEntry {
             id: model_name,
             kind: CatalogEntryKind::ServiceModel { instances },
             service_surfaces: surfaces,
-            // Modalities from manifests come once R2g normalises engine TOMLs;
-            // until then service models advertise their surface but not their
-            // modality detail. Resolver treats empty modalities as
-            // "unspecified — no constraint" (D.17).
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
+            input_modalities: inputs,
+            output_modalities: outputs,
             diagnostic: None,
         });
     }
@@ -331,7 +395,6 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "embeddings",
     "llm",
     "chat",
-    "rag",
     "memory",
     "conversation_history",
 ];
@@ -358,7 +421,7 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
 /// - `tts` / `voice_output` / `speech` → `Audio` on output
 /// - `image_gen` / `image_generation` → `Image` on output
 /// - `embeddings` → `Embedding` on output
-/// - `llm` / `chat` / `rag` / `memory` / `conversation_history` → text I/O
+/// - `llm` / `chat` / `memory` / `conversation_history` → text I/O
 /// Anything else (passthrough, control, transform) leaves modalities
 /// empty so the resolver treats them as "no declared constraint" (D.17).
 fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModality>) {
@@ -396,7 +459,7 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
             "embeddings" => {
                 outputs.insert(OutputModality::Embedding);
             }
-            "llm" | "chat" | "rag" | "memory" | "conversation_history" => {
+            "llm" | "chat" | "memory" | "conversation_history" => {
                 // Default chat-like output shape.
                 has_text_output = true;
             }
@@ -636,23 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_contains_seeded_aliases() {
-        let provider = CatalogProvider::new();
-        let registry = MeshServicesRegistry::new();
-        let pool = fresh_db();
-        provider.rebuild(&registry, &pool).unwrap();
-        let snap = provider.snapshot();
-
-        // Aliases seeded by seed_model_aliases (rag-embeddings, rag-summarization, ...).
-        let alias_count = snap
-            .entries
-            .iter()
-            .filter(|e| matches!(e.kind, CatalogEntryKind::Alias { .. }))
-            .count();
-        assert!(alias_count >= 4, "expected seeded aliases, got {}", alias_count);
-    }
-
-    #[test]
     fn published_flow_appears_in_catalog() {
         let pool = fresh_db();
         // Mark the seeded LLM flow as published under "chat-pl".
@@ -732,6 +778,16 @@ mod tests {
     fn alias_colliding_with_service_model_marks_service_with_diagnostic() {
         use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
         let pool = fresh_db();
+        // Seed an alias to collide with the local service model below.
+        {
+            let conn = pool.lock().unwrap();
+            conn.execute(
+                "INSERT INTO model_aliases (alias, target_model, is_active) \
+                 VALUES ('test-alias', 'embeddings-gemma', 1)",
+                [],
+            )
+            .unwrap();
+        }
         let registry = MeshServicesRegistry::new();
         let local_node = "node-test".to_string();
         registry.replace_local(
@@ -754,8 +810,8 @@ mod tests {
                 restart_count: 0,
                 health_last_err: None,
                 models: vec![ServiceModelEntry {
-                    // Same name as a seeded alias.
-                    model_name: "rag-embeddings".into(),
+                    // Same name as the seeded alias above.
+                    model_name: "test-alias".into(),
                     display_name: None,
                     capabilities: vec![],
                     context_length: None,
@@ -774,7 +830,7 @@ mod tests {
         let entries: Vec<&CatalogEntry> = snap
             .entries
             .iter()
-            .filter(|e| e.id == "rag-embeddings")
+            .filter(|e| e.id == "test-alias")
             .collect();
         assert_eq!(entries.len(), 1, "alias must be dropped on collision");
         let survivor = entries[0];
@@ -785,12 +841,146 @@ mod tests {
         match &survivor.diagnostic {
             Some(CatalogDiagnostic::RemoteShadowed { local_owner }) => {
                 assert!(
-                    local_owner.contains("rag-embeddings"),
+                    local_owner.contains("test-alias"),
                     "diagnostic should mention the colliding alias name, got: {local_owner}"
                 );
             }
             other => panic!("expected RemoteShadowed, got {:?}", other),
         }
+    }
+
+    /// P1.2: a service whose engine_id matches a real manifest must have
+    /// its `input_modalities` and `output_modalities` populated from the
+    /// manifest registry (preset > engine > category fallback). Whisper
+    /// is a Stt-category engine without explicit modality overrides, so
+    /// the catalog entry must end up with Audio in / Text out.
+    #[test]
+    fn service_model_modalities_are_populated_from_manifest() {
+        use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
+        let pool = fresh_db();
+        let registry = MeshServicesRegistry::new();
+        let local_node = "node-test".to_string();
+        registry.replace_local(
+            local_node.clone(),
+            vec![ServiceInfo {
+                id: 1,
+                node_id: local_node,
+                engine_id: "whisper".into(),
+                category: "stt".into(),
+                display_name: "stt-host".into(),
+                deploy_method: "native_python_bundle".into(),
+                transport: "sidecar_quic".into(),
+                status: "running".into(),
+                pinned: false,
+                paused: false,
+                runtime_pid: None,
+                runtime_port: None,
+                sidecar_quic_port: None,
+                endpoint_url: None,
+                restart_count: 0,
+                health_last_err: None,
+                models: vec![ServiceModelEntry {
+                    model_name: "whisper-base".into(),
+                    display_name: None,
+                    capabilities: vec![],
+                    context_length: None,
+                    quantization: None,
+                    is_default: true,
+                }],
+                created_at: String::new(),
+                updated_at: String::new(),
+            }],
+        );
+
+        let provider = CatalogProvider::new();
+        provider.rebuild(&registry, &pool).unwrap();
+        let snap = provider.snapshot();
+        let entry = snap
+            .entries
+            .iter()
+            .find(|e| e.id == "whisper-base")
+            .expect("whisper-base entry must exist");
+        assert_eq!(entry.input_modalities, vec![InputModality::Audio]);
+        assert_eq!(entry.output_modalities, vec![OutputModality::Text]);
+    }
+
+    /// R3.P1a: when the same `model_name` is exposed by two services with
+    /// disagreeing capabilities (whisper STT vs. llama-cpp LLM both
+    /// happen to advertise model id "shared"), the entry-level fields
+    /// must report the union (so `/v1/models` is honest about every
+    /// modality the mesh can satisfy) AND every `ModelInstance` must
+    /// carry the originating service's modalities only — otherwise
+    /// dispatch could send audio to the text-only instance.
+    #[test]
+    fn multi_service_collision_unions_modalities_per_instance_differs() {
+        use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
+        let pool = fresh_db();
+        let registry = MeshServicesRegistry::new();
+        let local_node = "node-test".to_string();
+        let make_service = |id: i64, engine: &str, category: &str, transport: &str| ServiceInfo {
+            id,
+            node_id: local_node.clone(),
+            engine_id: engine.into(),
+            category: category.into(),
+            display_name: "host".into(),
+            deploy_method: "native_embedded".into(),
+            transport: transport.into(),
+            status: "running".into(),
+            pinned: false,
+            paused: false,
+            runtime_pid: None,
+            runtime_port: None,
+            sidecar_quic_port: None,
+            endpoint_url: None,
+            restart_count: 0,
+            health_last_err: None,
+            models: vec![ServiceModelEntry {
+                model_name: "shared".into(),
+                display_name: None,
+                capabilities: vec![],
+                context_length: None,
+                quantization: None,
+                is_default: true,
+            }],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        registry.replace_local(
+            local_node.clone(),
+            vec![
+                make_service(1, "llama-cpp", "llm", "embedded"),
+                make_service(2, "whisper", "stt", "sidecar_quic"),
+            ],
+        );
+
+        let provider = CatalogProvider::new();
+        provider.rebuild(&registry, &pool).unwrap();
+        let snap = provider.snapshot();
+        let entry = snap
+            .entries
+            .iter()
+            .find(|e| e.id == "shared")
+            .expect("shared entry must exist");
+
+        // Entry-level union: covers both LLM (Text) and STT (Audio) inputs.
+        assert!(entry.input_modalities.contains(&InputModality::Text));
+        assert!(entry.input_modalities.contains(&InputModality::Audio));
+
+        // Per-instance: each service carries only its own modality set.
+        let CatalogEntryKind::ServiceModel { instances } = &entry.kind else {
+            panic!("expected ServiceModel kind, got {:?}", entry.kind);
+        };
+        assert_eq!(instances.len(), 2);
+        let llama = instances
+            .iter()
+            .find(|i| i.backend.as_deref() == Some("llama-cpp"))
+            .expect("llama-cpp instance");
+        assert_eq!(llama.input_modalities, vec![InputModality::Text]);
+        let whisper = instances
+            .iter()
+            .find(|i| i.backend.as_deref() == Some("whisper"))
+            .expect("whisper instance");
+        assert_eq!(whisper.input_modalities, vec![InputModality::Audio]);
     }
 
     /// Codex P2 review fix: a draft flow that already claims a publish
@@ -825,12 +1015,18 @@ mod tests {
     #[test]
     fn alias_colliding_with_published_flow_marks_flow_with_diagnostic() {
         let pool = fresh_db();
-        // Make the seeded LLM flow publish under the same name as a
-        // seeded alias so they collide on the catalog id space.
+        // Seed an alias and publish the LLM flow under the same id so they
+        // collide on the catalog id space.
         {
             let conn = pool.lock().unwrap();
             conn.execute(
-                "UPDATE flows SET published_model_name = 'rag-embeddings' \
+                "INSERT INTO model_aliases (alias, target_model, is_active) \
+                 VALUES ('test-alias', 'embeddings-gemma', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE flows SET published_model_name = 'test-alias' \
                  WHERE name = 'Standardowy pipeline LLM'",
                 [],
             )
@@ -845,12 +1041,12 @@ mod tests {
         let collisions: Vec<&CatalogEntry> = snap
             .entries
             .iter()
-            .filter(|e| e.id == "rag-embeddings")
+            .filter(|e| e.id == "test-alias")
             .collect();
         assert_eq!(
             collisions.len(),
             1,
-            "exactly one entry should claim 'rag-embeddings'; alias must be dropped"
+            "exactly one entry should claim 'test-alias'; alias must be dropped"
         );
         let survivor = collisions[0];
         assert!(matches!(survivor.kind, CatalogEntryKind::Flow { .. }));

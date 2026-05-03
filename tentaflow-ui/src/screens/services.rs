@@ -124,7 +124,6 @@ fn svc_type_color(st: &ServiceType) -> Color32 {
         ServiceType::Llm => Color32::from_rgb(99, 102, 241),
         ServiceType::Tts => Color32::from_rgb(168, 85, 247),
         ServiceType::Stt => Color32::from_rgb(236, 72, 153),
-        ServiceType::Rag => Color32::from_rgb(14, 165, 233),
         ServiceType::Embedding => Color32::from_rgb(20, 184, 166),
         ServiceType::Vision => Color32::from_rgb(245, 158, 11),
         ServiceType::Router => Color32::from_rgb(34, 197, 94),

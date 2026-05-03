@@ -1,42 +1,32 @@
 // =============================================================================
 // Plik: flow_engine/adapters/stt.rs
 // Opis: Adapter wezla STT (Speech-to-Text) - deleguje transkrypcje audio
-//       do backendu STT przez QUIC lub OpenAI API.
+//       przez SttRuntime (single owner STT path, D.3).
 // =============================================================================
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::config::RouterConfig;
+use crate::api::openai::types::{SpeakerSegment, SttRequestOptions, TranscriptionRequest};
 use crate::flow_engine::adapters::NodeAdapter;
+use crate::flow_engine::dispatcher::SttRuntimeSlot;
 use crate::flow_engine::types::FlowContext;
-use crate::routing::service_manager::ServiceManager;
-use tentaflow_protocol::*;
 
-/// Adapter wezla STT - transkrypcja audio na tekst
+/// Adapter wezla STT - transkrypcja audio na tekst.
+///
+/// Codex M1 round 2 + L1' round 3: jedyna sciezka to delegacja przez
+/// SttRuntime (ten sam owned-STT path co handler `/v1/audio/transcriptions`).
+/// Direct QUIC/HTTP fallback usuniety calkowicie. Bez `service_manager` /
+/// `config` — adapter potrzebuje wylacznie slotu z runtime.
 pub struct SttNodeAdapter {
-    service_manager: Arc<ServiceManager>,
-    /// Trzymany dla zachowania sygnatury konstruktora (callerzy migruja
-    /// w kroku N7.3); aliasy modeli pochodza z DB, nie z config.toml.
-    #[allow(dead_code)]
-    config: Arc<RouterConfig>,
+    stt_runtime: SttRuntimeSlot,
 }
 
 impl SttNodeAdapter {
-    pub fn new(service_manager: Arc<ServiceManager>, config: Arc<RouterConfig>) -> Self {
-        Self {
-            service_manager,
-            config,
-        }
-    }
-
-    /// Rozwiazuje alias modelu na nazwe kanoniczna. Config-driven aliasy
-    /// zostaly skasowane (krok N7.1a); DB `service_aliases` jest rozwiazywany
-    /// przez middleware route resolver przed wejsciem do flow.
-    fn resolve_model_alias(&self, model: &str) -> String {
-        model.to_string()
+    pub fn new(stt_runtime: SttRuntimeSlot) -> Self {
+        Self { stt_runtime }
     }
 }
 
@@ -45,9 +35,8 @@ impl NodeAdapter for SttNodeAdapter {
         let model_name = node_config
             .get("model")
             .and_then(|v| v.as_str())
-            .unwrap_or("whisper");
-
-        let model_name = self.resolve_model_alias(model_name);
+            .unwrap_or("whisper")
+            .to_string();
 
         let language = node_config
             .get("language")
@@ -59,129 +48,100 @@ impl NodeAdapter for SttNodeAdapter {
             "STT adapter: transkrypcja audio"
         );
 
-        // Pobierz dane audio z kontekstu flow.
+        // Codex M2' round 3: `resolve_audio_data` zwraca `Some(_)` zawsze
+        // gdy caller jawnie podpial sciezke audio (ctx.audio_input lub
+        // audio_variable z ctx.variables) — nawet gdy bytes sa puste.
+        // Pusty `Some(_)` przechodzi do guard'u ponizej zeby blad
+        // sygnalizowal sie jak najwczesniej; legalny "no-op flow bez
+        // audio" daje `None`.
         let audio_data = self.resolve_audio_data(node_config, ctx);
-
-        match audio_data {
-            Some(data) if !data.is_empty() => {
-                // Sprobuj QUIC STT
-                if self.service_manager.has_quic_stt_service(&model_name) {
-                    if let Some(quic_client) =
-                        self.service_manager.get_quic_stt_client(&model_name).await
-                    {
-                        debug!("STT adapter: uzywam QUIC backend: {}", model_name);
-
-                        let request_id = uuid::Uuid::new_v4().to_string();
-                        let model_request = ModelRequest {
-                            request_id: request_id.clone(),
-                            payload: ModelPayload::Audio(AudioPayload {
-                                operation: AudioOperation::STT {
-                                    model: model_name.clone(),
-                                    audio_data: data,
-                                    language: language.clone(),
-                                    response_format: None,
-                                    prompt: None,
-                                    temperature: None,
-                                    timestamp_granularities: None,
-                                    no_speech_threshold: None,
-                                    avg_logprob_threshold: None,
-                                    compression_ratio_threshold: None,
-                                },
-                            }),
-                            stream: false,
-                            metadata: None,
-                            session_id: None,
-                        };
-
-                        match quic_client.send_request(model_request).await {
-                            Ok(response) => {
-                                match response.result {
-                                    ModelResult::Audio(audio_result) => match audio_result.data {
-                                        AudioResultData::Text(text) => {
-                                            debug!(
-                                                "STT adapter: transkrypcja OK, {} znakow",
-                                                text.len()
-                                            );
-                                            return Ok(serde_json::json!({
-                                                "text": text,
-                                                "language": language.unwrap_or_else(|| "pl".to_string()),
-                                                "duration": 0,
-                                            }));
-                                        }
-                                        AudioResultData::Detailed {
-                                            text,
-                                            language: lang,
-                                            duration,
-                                            ..
-                                        } => {
-                                            debug!("STT adapter: transkrypcja OK (detailed), {} znakow", text.len());
-                                            return Ok(serde_json::json!({
-                                                "text": text,
-                                                "language": lang,
-                                                "duration": duration,
-                                            }));
-                                        }
-                                        _ => {
-                                            warn!("STT adapter: nieoczekiwany typ wyniku audio");
-                                        }
-                                    },
-                                    ModelResult::Error(err) => {
-                                        bail!(
-                                            "STT adapter QUIC error: {:?} - {}",
-                                            err.error_type,
-                                            err.message
-                                        );
-                                    }
-                                    _ => {
-                                        warn!("STT adapter: nieoczekiwany typ wyniku");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                bail!("STT adapter: QUIC request failed: {}", e);
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "STT adapter: QUIC serwis '{}' nie jest polaczony",
-                            model_name
-                        );
-                    }
-                }
-
-                // STT-over-HTTP path itself is not yet implemented — this branch
-                // only logs that a backend was discoverable so an operator can
-                // see the routing decision.
-                let backend_opt = self
-                    .service_manager
-                    .find_http_backend_for_model(&model_name)
-                    .or_else(|| {
-                        self.service_manager
-                            .resolve_http_backends_via_snapshot(&model_name)
-                            .and_then(|v| v.into_iter().next())
-                    });
-                if let Some(backend) = backend_opt {
-                    debug!(
-                        "STT adapter: HTTP backend dostepny ({}), HTTP transcription path not implemented yet",
-                        backend.url()
-                    );
-                }
-
+        if let Some(ref data) = audio_data {
+            if data.is_empty() {
                 bail!(
-                    "STT adapter: brak dostepnego backendu STT dla modelu '{}'",
+                    "STT adapter: ctx.audio_input dostarczyl 0 bajtow dla modelu '{}' \
+                     — caller zglosil sciezke audio bez payloadu",
                     model_name
                 );
             }
-            _ => {
-                // Brak danych audio - zwroc pusty wynik
-                debug!("STT adapter: brak danych audio w kontekscie");
-                Ok(serde_json::json!({
-                    "text": "",
-                    "language": language.unwrap_or_else(|| "pl".to_string()),
-                    "duration": 0,
-                }))
-            }
         }
+
+        let Some(data) = audio_data else {
+            // Brak danych audio — legalny no-op (flow z opcjonalnym STT node).
+            debug!("STT adapter: brak danych audio w kontekscie");
+            return Ok(serde_json::json!({
+                "text": "",
+                "language": language.unwrap_or_else(|| "pl".to_string()),
+                "duration": 0,
+                "speakers": Value::Null,
+            }));
+        };
+
+        // Codex M1 round 2: deleguj przez SttRuntime — ten sam owned-STT
+        // path co handler `/v1/audio/transcriptions`. Slot jest pusty
+        // tylko podczas Router::new (przed Router::start); wszystkie
+        // realne dispatch sciezki wpinaja runtime przed pierwszym
+        // executem flow.
+        let runtime = self.stt_runtime.read().clone().ok_or_else(|| {
+            anyhow!(
+                "STT adapter: SttRuntime nie wpiety (Router::start nie wywolany?) \
+                 dla modelu '{}'",
+                model_name
+            )
+        })?;
+
+        debug!("STT adapter: deleguje przez SttRuntime ({})", model_name);
+
+        // Codex M3' round 3: mapuj node_config na SttRequestOptions zeby
+        // diarization / speaker_identification / timestamps z seedowanego
+        // flow ("Audio Chat") faktycznie trafialy do runtime'u zamiast
+        // byc cicho dropowane.
+        let options = parse_stt_options(node_config);
+
+        let request = TranscriptionRequest {
+            file: Arc::from(data.into_boxed_slice()),
+            filename: "flow-audio.wav".to_string(),
+            model: model_name.clone(),
+            language: language.clone(),
+            prompt: node_config
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            response_format: options.response_format.clone(),
+            temperature: node_config
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32),
+            timestamp_granularities: options
+                .timestamps
+                .as_ref()
+                .map(|t| vec![t.clone()]),
+            no_speech_threshold: None,
+            avg_logprob_threshold: None,
+            compression_ratio_threshold: None,
+            options,
+        };
+
+        let response = runtime
+            .transcribe(request)
+            .await
+            .map_err(|e| anyhow!("STT adapter: SttRuntime transcribe failed: {}", e))?;
+
+        debug!(
+            "STT adapter: transkrypcja OK, {} znakow",
+            response.text.len()
+        );
+
+        let resolved_lang = response
+            .language
+            .or(language)
+            .unwrap_or_else(|| "pl".to_string());
+
+        Ok(serde_json::json!({
+            "text": response.text,
+            "language": resolved_lang,
+            "duration": response.duration.unwrap_or(0.0),
+            "speakers": response.speakers.map(speakers_to_json).unwrap_or(Value::Null),
+        }))
     }
 
     fn node_type(&self) -> &'static str {
@@ -190,7 +150,9 @@ impl NodeAdapter for SttNodeAdapter {
 }
 
 impl SttNodeAdapter {
-    /// Pobiera dane audio z kontekstu flow.
+    /// Pobiera dane audio z kontekstu flow. Zwraca `Some(_)` gdy caller
+    /// jawnie wskazal sciezke audio (nawet pusta — guard adapter'a
+    /// odrzuci pusty payload). `None` znaczy "brak audio" (legalny no-op).
     fn resolve_audio_data(&self, node_config: &Value, ctx: &FlowContext) -> Option<Vec<u8>> {
         if let Some(audio_var) = node_config.get("audio_variable").and_then(|v| v.as_str()) {
             if let Some(val) = ctx.variables.get(audio_var) {
@@ -202,6 +164,14 @@ impl SttNodeAdapter {
                     }
                 }
             }
+        }
+
+        // ChatCompletionRequest.audio_input zostaje skopiowane do
+        // FlowContext.audio_input przez build_flow_context_inner (R4.B).
+        // To jest naturalna sciezka dla audio chat → flow z STT, omija
+        // base64-w-stringu w `ctx.variables`.
+        if let Some(bytes) = &ctx.audio_input {
+            return Some(bytes.clone());
         }
 
         if let Some(val) = ctx.variables.get("audio_input") {
@@ -228,4 +198,43 @@ impl SttNodeAdapter {
 
         None
     }
+}
+
+fn parse_stt_options(node_config: &Value) -> SttRequestOptions {
+    let bool_field = |key: &str| {
+        node_config
+            .get(key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let str_field = |key: &str| {
+        node_config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    SttRequestOptions {
+        speaker_identification: bool_field("speaker_identification"),
+        diarization: bool_field("diarization"),
+        timestamps: str_field("timestamps"),
+        response_format: str_field("response_format"),
+    }
+}
+
+fn speakers_to_json(speakers: Vec<SpeakerSegment>) -> Value {
+    Value::Array(
+        speakers
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "start": s.start,
+                    "end": s.end,
+                    "text": s.text,
+                    "speaker_label": s.speaker_label,
+                    "speaker_id": s.speaker_id,
+                    "similarity": s.similarity,
+                })
+            })
+            .collect(),
+    )
 }

@@ -11,7 +11,15 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use tentaflow_protocol::{ServiceChange, ServiceInfo};
+
+/// R3e (F10): callback wywolywany po kazdej mutacji registry. Router
+/// rejestruje tu `rebuild_catalog` zeby peer announce/remove/update odswiezyl
+/// publiczny katalog w sub-second zamiast czekac na nastepny tick supervisora.
+/// `Send + Sync + 'static` bo mutacje moga lecieć z dowolnego watka mesh
+/// pipeline'u.
+pub type RegistryChangeCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Snapshot kept per remote node: the last full vector of `ServiceInfo`
 /// received and the wallclock instant we received it. `last_seen_at` is used
@@ -64,6 +72,10 @@ pub struct MeshServicesRegistry {
     local: ArcSwap<LocalNodeSnapshot>,
     /// Per-peer snapshots adwertyzowane przez zaufane nody.
     remote: Arc<DashMap<String, RemoteNodeSnapshot>>,
+    /// R3e (F10): callback observer wywolywany po kazdej mutacji. Router
+    /// subskrybuje tu `rebuild_catalog` przy `Router::start` zeby peer
+    /// announce/remove/update odswiezyl publiczny katalog natychmiast.
+    on_change: RwLock<Option<RegistryChangeCallback>>,
 }
 
 impl Default for MeshServicesRegistry {
@@ -77,6 +89,23 @@ impl MeshServicesRegistry {
         Self {
             local: ArcSwap::from_pointee(LocalNodeSnapshot::default()),
             remote: Arc::new(DashMap::new()),
+            on_change: RwLock::new(None),
+        }
+    }
+
+    /// Rejestruje callback wywolywany po kazdej mutacji. Idempotentne — kolejny
+    /// `set_on_change` nadpisuje poprzedni; czysci ustawiajac `None`.
+    pub fn set_on_change(&self, callback: Option<RegistryChangeCallback>) {
+        *self.on_change.write() = callback;
+    }
+
+    /// Wywoluje observer, jesli zarejestrowany. Wszystkie mutator-y wolaja
+    /// po zmianie. Zostaje cichy gdy callback panicuje — supervisor `tick`
+    /// i tak odswiezy katalog w `<5s`.
+    fn notify_change(&self) {
+        let cb = self.on_change.read().clone();
+        if let Some(cb) = cb {
+            cb();
         }
     }
 
@@ -90,6 +119,7 @@ impl MeshServicesRegistry {
     pub fn replace_local(&self, node_id: String, services: Vec<ServiceInfo>) {
         self.local
             .store(Arc::new(LocalNodeSnapshot { node_id, services }));
+        self.notify_change();
     }
 
     /// Inkrementalna zmiana lokalnego snapshotu (po deploy, pause, delete itp.).
@@ -117,6 +147,7 @@ impl MeshServicesRegistry {
             node_id: current.node_id.clone(),
             services,
         }));
+        self.notify_change();
     }
 
     /// Snapshot lokalnego node'a. Read-only; lock-free dzieki ArcSwap.
@@ -138,6 +169,7 @@ impl MeshServicesRegistry {
                 last_seen_at: Instant::now(),
             },
         );
+        self.notify_change();
     }
 
     /// Apply an incremental change to `node_id`'s snapshot. If `node_id`
@@ -193,6 +225,7 @@ impl MeshServicesRegistry {
                 }
             }
         }
+        self.notify_change();
     }
 
     /// Drop everything we know about `node_id`. Called from the
@@ -200,6 +233,7 @@ impl MeshServicesRegistry {
     /// aggregate immediately instead of lingering until a stale-timer fires.
     pub fn remove_node(&self, node_id: &str) {
         self.remote.remove(node_id);
+        self.notify_change();
     }
 
     /// Snapshot of all remote nodes' services. Used by the GUI aggregate
@@ -572,5 +606,55 @@ mod tests {
         assert_eq!(s_remote.display_name, "rem-6");
         assert!(reg.find_service("local", 999).is_none());
         assert!(reg.find_service("ghost", 1).is_none());
+    }
+
+    /// R3e (F10): kazda mutacja registry wywoluje on_change callback.
+    /// Router subskrybuje tu `rebuild_catalog`; dla testu uzywamy
+    /// `AtomicUsize` zeby policzyc wywolania.
+    #[test]
+    fn on_change_fires_for_each_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reg = Arc::new(MeshServicesRegistry::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_cb = counter.clone();
+        reg.set_on_change(Some(Arc::new(move || {
+            counter_for_cb.fetch_add(1, Ordering::SeqCst);
+        })));
+
+        // Mutator 1: replace_local
+        reg.replace_local("local".into(), vec![svc(1, "local", "s1")]);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Mutator 2: apply_local_change (Added)
+        reg.apply_local_change("local", ServiceChange::Added(svc(2, "local", "s2")));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        // Mutator 3: replace_node (peer announce / get response)
+        reg.replace_node("peerA".into(), vec![svc(10, "peerA", "remote-1")]);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+        // Mutator 4: apply_change (peer update)
+        reg.apply_change(
+            "peerA".into(),
+            ServiceChange::Added(svc(11, "peerA", "remote-2")),
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
+
+        // Mutator 5: remove_node (peer disconnect)
+        reg.remove_node("peerA");
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
+    }
+
+    /// Bez observera registry pracuje normalnie — observer to opt-in.
+    #[test]
+    fn on_change_unset_is_noop() {
+        let reg = MeshServicesRegistry::new();
+        reg.set_on_change(None);
+        // Te wszystkie mutator-y nie powinny panicowac przy braku callback.
+        reg.replace_local("local".into(), vec![svc(1, "local", "s1")]);
+        reg.replace_node("peerA".into(), vec![svc(10, "peerA", "remote-1")]);
+        reg.remove_node("peerA");
+        // Sanity — registry mial dzialac jak zwykle.
+        assert_eq!(reg.local().services.len(), 1);
     }
 }

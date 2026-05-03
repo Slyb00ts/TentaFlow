@@ -1,16 +1,17 @@
 [package]
 name = "tentaflow-protocol"
-version = "0.1.0"
+# v0.2.0 (Codex M2): bump po breaking wire change w R2 (RAGPayload/IngestRequest
+# delete, SchemaVersion 11→12). Patrz `envelope.rs::SCHEMA_VERSION` v12 changes.
+version = "0.2.0"
 edition = "2021"
 authors = ["TentaFlow"]
-description = "Wspólne typy protokołu QUIC+rkyv dla Router i RAG"
+description = "Wspólne typy protokołu QUIC+rkyv dla TentaFlow"
 
 [dependencies]
 # Zero-copy serialization
 rkyv = { version = "0.8.12", features = ["unaligned"] }
 bytecheck = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_with = { version = "3.16.0", features = ["base64"] }
 
 [dev-dependencies]
 serde_json = "1.0"

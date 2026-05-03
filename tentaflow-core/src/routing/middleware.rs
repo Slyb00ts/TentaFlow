@@ -7,6 +7,7 @@
 use crate::error::Result;
 use crate::routing::router::Router;
 use crate::routing::service_manager::PoolStrategy;
+use crate::services::catalog::InputModality;
 use crate::services::transport::Transport;
 
 use std::sync::atomic::Ordering;
@@ -40,7 +41,6 @@ pub enum BackendHandle {
     QuicTts(String),
     QuicEmbedding(String),
     Http(String),
-    Rag(String),
     MeshForward(String, String),
 }
 
@@ -56,7 +56,6 @@ impl BackendHandle {
             BackendHandle::QuicTts(_) => "quic_tts",
             BackendHandle::QuicEmbedding(_) => "quic_embedding",
             BackendHandle::Http(_) => "http",
-            BackendHandle::Rag(_) => "rag",
             BackendHandle::MeshForward(_, _) => "mesh_forward",
         }
     }
@@ -83,13 +82,98 @@ pub struct RouteResult<T> {
 // IMPL ROUTER — middleware routing
 // ============================================================================
 
+/// Pre-parsed alias entry kept in the routing cache. `DbModelAlias` retains
+/// the raw `fallback_targets` JSON string; we keep that for backwards
+/// compatibility on the wire (mesh sync uses `DbModelAlias`) but the hot
+/// dispatch path reads the parsed list to avoid serde-on-every-route.
+#[derive(Clone, Debug)]
+pub struct CachedAlias {
+    pub alias: String,
+    pub target_model: String,
+    pub fallback_targets: Vec<String>,
+    pub strategy: Option<String>,
+}
+
+impl CachedAlias {
+    /// Build the cache entry from a DB row, parsing JSON `fallback_targets`
+    /// once and warning loudly on malformed input.
+    pub fn from_db(row: &crate::db::models::DbModelAlias) -> Self {
+        Self {
+            alias: row.alias.clone(),
+            target_model: row.target_model.clone(),
+            fallback_targets: parse_alias_fallback_targets(
+                row.fallback_targets.as_deref(),
+                &row.alias,
+            ),
+            strategy: row.strategy.clone(),
+        }
+    }
+}
+
+/// `model_aliases.fallback_targets` is canonical JSON (CLAUDE.md §9). Returns
+/// the parsed list, dropping empty entries; logs a warn when the value is
+/// neither empty nor valid JSON so an operator notices a writer regression
+/// instead of silently losing fallback targets.
+fn parse_alias_fallback_targets(raw: Option<&str>, alias_name: &str) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<String>>(trimmed) {
+        Ok(parsed) => parsed
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(e) => {
+            warn!(
+                alias = %alias_name,
+                raw = %trimmed,
+                "fallback_targets nie jest poprawnym JSON array — pomijam: {}",
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// True iff the manifest declared (or fell back to) `required` for the
+/// `(svc, model_name)` pair.
+///
+/// Fail-closed policy: when the service's `engine_id` has no registered
+/// manifest, only `Text` is admitted. `Audio` / `Image` need explicit
+/// manifest support — otherwise a legacy text-only service co-hosting
+/// the same `model_name` as a real audio engine would silently absorb
+/// audio dispatch (the entry-level union admitted the request, then
+/// per-instance filter passed it through on a best-effort assumption).
+/// The legacy text path stays permissive because every pre-R2 service
+/// implicitly handled text and most still ship without a manifest.
+fn service_accepts_input(
+    manifests: &crate::services::manifest::ManifestRegistry,
+    svc: &tentaflow_protocol::ServiceInfo,
+    model_name: &str,
+    required: InputModality,
+) -> bool {
+    let Some(m) = manifests.by_id(&svc.engine_id) else {
+        return matches!(required, InputModality::Text);
+    };
+    let preset = m.model_presets.iter().find(|p| p.id == model_name);
+    let wire = required.as_wire_str();
+    m.engine
+        .effective_input_modalities(preset)
+        .iter()
+        .any(|s| s == wire)
+}
+
 impl Router {
     /// Czy `name` jest znanym serwisem (po service_name) w jakimkolwiek
     /// rejestrze backendow.
     fn is_known_service(&self, name: &str) -> bool {
         self.service_manager.has_quic_llm_service(name)
             || self.service_manager.has_http_backends(name)
-            || self.service_manager.has_rag_service(name)
             || self.service_manager.has_local_inference_service(name)
             || self.service_manager.has_quic_stt_service(name)
             || self.service_manager.has_quic_tts_service(name)
@@ -106,7 +190,7 @@ impl Router {
     ///
     /// Kolejnosc:
     /// 1. Config aliasy (service_aliases)
-    /// 2. Znany serwis (QUIC/HTTP/RAG/local)
+    /// 2. Znany serwis (QUIC/HTTP/local)
     /// 3. Alias cache (DB model_aliases z fallback_targets + strategy)
     /// 4. Oryginalna nazwa
     pub(crate) fn resolve_route(&self, model: &str) -> ResolvedRoute {
@@ -136,16 +220,9 @@ impl Router {
         // 3. Alias cache (DB)
         {
             let cache = self.alias_cache.read();
-            if let Some(db_alias) = cache.get(model) {
-                let mut raw_targets = vec![db_alias.target_model.clone()];
-                if let Some(ref fallbacks) = db_alias.fallback_targets {
-                    for fb in fallbacks.split(',') {
-                        let fb = fb.trim();
-                        if !fb.is_empty() {
-                            raw_targets.push(fb.to_string());
-                        }
-                    }
-                }
+            if let Some(cached) = cache.get(model) {
+                let mut raw_targets = vec![cached.target_model.clone()];
+                raw_targets.extend(cached.fallback_targets.iter().cloned());
                 // GUI w modalu aliasu wypelnia dropdown nazwami modeli HF
                 // (z `collect_local_models`/mesh services), nie service_name'ami.
                 // Backendy HTTP/QUIC sa rejestrowane pod service_name (patrz
@@ -159,7 +236,7 @@ impl Router {
                     .into_iter()
                     .flat_map(|t| self.expand_alias_target(t))
                     .collect();
-                let strategy = db_alias
+                let strategy = cached
                     .strategy
                     .as_deref()
                     .map(PoolStrategy::parse)
@@ -180,13 +257,24 @@ impl Router {
     }
 
     /// Zwraca liste dostepnych backendow dla danego targetu.
-    pub(crate) fn get_backends(&self, target: &str) -> Vec<BackendHandle> {
+    ///
+    /// `required_input` filtruje serwisy ktorych `effective_input_modalities`
+    /// nie obejmuje danej modalnosci. Sluzy zapobiezeniu sytuacji gdzie ten
+    /// sam `model_name` jest serwowany przez peera audio-capable i przez
+    /// peera text-only, a zaufany guard na poziomie wpisu kataloga (union)
+    /// dopuscilby request audio do tego drugiego instance'u.
+    pub(crate) fn get_backends(
+        &self,
+        target: &str,
+        required_input: Option<InputModality>,
+    ) -> Vec<BackendHandle> {
         let mut backends = Vec::new();
 
         let Some(registry) = self.service_manager.mesh_services_registry.read().as_ref().cloned()
         else {
             return backends;
         };
+        let manifests = crate::services::manifest::registry();
         let local_node_id = registry.local().node_id.clone();
         for svc in registry.visible_services() {
             if !matches!(svc.status.as_str(), "running" | "degraded" | "ready") {
@@ -194,6 +282,11 @@ impl Router {
             }
             if !svc.models.iter().any(|m| m.model_name == target) {
                 continue;
+            }
+            if let Some(req) = required_input {
+                if !service_accepts_input(manifests, &svc, target, req) {
+                    continue;
+                }
             }
             if svc.node_id != local_node_id {
                 backends.push(BackendHandle::MeshForward(
@@ -242,7 +335,6 @@ impl Router {
                     "embeddings" | "embedding" => {
                         backends.push(BackendHandle::QuicEmbedding(target.to_string()))
                     }
-                    "rag" => backends.push(BackendHandle::Rag(target.to_string())),
                     _ => backends.push(BackendHandle::QuicLlm(target.to_string())),
                 },
             }
@@ -282,6 +374,7 @@ impl Router {
         &self,
         model: &str,
         hop_count: u32,
+        required_input: Option<InputModality>,
         call_fn: F,
     ) -> Result<RouteResult<T>>
     where
@@ -298,7 +391,7 @@ impl Router {
             .unwrap_or_else(|_| "unknown".to_string());
 
         for target in &route.targets {
-            let backends = self.get_backends(target);
+            let backends = self.get_backends(target, required_input);
             if backends.is_empty() {
                 fallbacks_tried += 1;
                 debug!("dispatch_with_fallback: brak backendow dla '{}'", target);
@@ -349,19 +442,22 @@ impl Router {
             .unwrap_or_else(|| anyhow::anyhow!("Brak dostepnych backendow dla modelu '{}'", model)))
     }
 
-    /// Aktualizuje alias cache z zewnetrznych danych (np. sync z peera mesh)
+    /// Aktualizuje alias cache z zewnetrznych danych (np. sync z peera mesh).
+    /// fallback_targets jest parsowany RAZ tutaj (CachedAlias::from_db); hot
+    /// path resolve_route czyta tylko gotowy `Vec<String>`.
     pub fn update_alias_cache_from_sync(&self, aliases: Vec<crate::db::models::DbModelAlias>) {
         let mut cache = self.alias_cache.write();
         cache.clear();
         for alias in aliases {
             if alias.is_active {
-                cache.insert(alias.alias.clone(), alias);
+                cache.insert(alias.alias.clone(), CachedAlias::from_db(&alias));
             }
         }
         tracing::debug!("Alias cache zaktualizowany z sync: {} wpisow", cache.len());
     }
 
-    /// Laduje alias cache z bazy danych
+    /// Laduje alias cache z bazy danych. Patrz `update_alias_cache_from_sync`
+    /// na temat pre-parsowania.
     pub(crate) fn reload_alias_cache(&self) {
         let db = match &self.db {
             Some(db) => db,
@@ -374,7 +470,7 @@ impl Router {
                 cache.clear();
                 for alias in aliases {
                     if alias.is_active {
-                        cache.insert(alias.alias.clone(), alias);
+                        cache.insert(alias.alias.clone(), CachedAlias::from_db(&alias));
                     }
                 }
                 debug!("Alias cache przeladowany: {} wpisow", cache.len());
@@ -389,7 +485,6 @@ impl Router {
 #[cfg(test)]
 mod middleware_tests {
     use super::*;
-    use crate::db::models::DbModelAlias;
     use crate::routing::service_manager::PoolStrategy;
 
     // ========================================================================
@@ -421,7 +516,6 @@ mod middleware_tests {
             BackendHandle::QuicTts("q3".to_string()),
             BackendHandle::QuicEmbedding("q4".to_string()),
             BackendHandle::Http("h1".to_string()),
-            BackendHandle::Rag("r1".to_string()),
             BackendHandle::MeshForward("n1".to_string(), "s1".to_string()),
         ];
 
@@ -447,111 +541,42 @@ mod middleware_tests {
     // ========================================================================
 
     #[test]
-    fn resolved_route_from_alias_with_fallbacks() {
-        // Arrange — symuluje logike resolve_route dla aliasu z DB
-        let alias = DbModelAlias {
-            id: 1,
-            alias: "gpt-4".to_string(),
-            target_model: "model-a".to_string(),
-            is_active: true,
-            fallback_targets: Some("model-b,model-c".to_string()),
-            strategy: Some("round_robin".to_string()),
-        };
-
-        // Act — ta logika odpowiada resolve_route krok 3
-        let mut targets = vec![alias.target_model.clone()];
-        if let Some(ref ft) = alias.fallback_targets {
-            targets.extend(
-                ft.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
-        }
-        let strategy = PoolStrategy::parse(alias.strategy.as_deref().unwrap_or("first_available"));
-
-        // Assert
-        assert_eq!(targets, vec!["model-a", "model-b", "model-c"]);
-        assert!(matches!(strategy, PoolStrategy::RoundRobin));
+    fn parse_alias_fallback_targets_json_array() {
+        let parsed =
+            super::parse_alias_fallback_targets(Some(r#"["model-b","model-c"]"#), "gpt-4");
+        assert_eq!(parsed, vec!["model-b".to_string(), "model-c".to_string()]);
     }
 
     #[test]
-    fn resolved_route_from_alias_empty_fallbacks() {
-        // Arrange
-        let alias = DbModelAlias {
-            id: 1,
-            alias: "test".to_string(),
-            target_model: "model-a".to_string(),
-            is_active: true,
-            fallback_targets: Some("".to_string()),
-            strategy: None,
-        };
-
-        // Act
-        let mut targets = vec![alias.target_model.clone()];
-        if let Some(ref ft) = alias.fallback_targets {
-            targets.extend(
-                ft.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
-        }
-
-        // Assert — puste fallbacks nie dodaja elementow
-        assert_eq!(targets, vec!["model-a"]);
+    fn parse_alias_fallback_targets_handles_empty_and_none() {
+        assert!(super::parse_alias_fallback_targets(None, "x").is_empty());
+        assert!(super::parse_alias_fallback_targets(Some(""), "x").is_empty());
+        assert!(super::parse_alias_fallback_targets(Some("  "), "x").is_empty());
+        // empty JSON array is also a no-op
+        assert!(super::parse_alias_fallback_targets(Some("[]"), "x").is_empty());
     }
 
     #[test]
-    fn resolved_route_from_alias_no_fallbacks_field() {
-        // Arrange
-        let alias = DbModelAlias {
-            id: 2,
-            alias: "prosty".to_string(),
-            target_model: "jedyny".to_string(),
-            is_active: true,
-            fallback_targets: None,
-            strategy: None,
-        };
-
-        // Act
-        let mut targets = vec![alias.target_model.clone()];
-        if let Some(ref ft) = alias.fallback_targets {
-            targets.extend(
-                ft.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
-        }
-        let strategy = PoolStrategy::parse(alias.strategy.as_deref().unwrap_or("first_available"));
-
-        // Assert
-        assert_eq!(targets, vec!["jedyny"]);
-        assert!(matches!(strategy, PoolStrategy::FirstAvailable));
+    fn parse_alias_fallback_targets_trims_inner_whitespace() {
+        let parsed = super::parse_alias_fallback_targets(
+            Some(r#"["  fb-1 ", " fb-2","fb-3"]"#),
+            "spaces",
+        );
+        assert_eq!(parsed, vec!["fb-1", "fb-2", "fb-3"]);
     }
 
+    /// Legacy CSV writers were the bug that motivated CLAUDE.md §9.
+    /// `parse_alias_fallback_targets` deliberately fails closed (returns
+    /// empty + warn) instead of falling back to CSV — so a stale writer
+    /// is loud, not silently corrupted.
     #[test]
-    fn resolved_route_fallbacks_with_whitespace() {
-        // Arrange — fallbacki z bialymi znakami
-        let alias = DbModelAlias {
-            id: 3,
-            alias: "spaces".to_string(),
-            target_model: "main".to_string(),
-            is_active: true,
-            fallback_targets: Some(" fb-1 , fb-2 , fb-3 ".to_string()),
-            strategy: Some("least_loaded".to_string()),
-        };
-
-        // Act
-        let mut targets = vec![alias.target_model.clone()];
-        if let Some(ref ft) = alias.fallback_targets {
-            targets.extend(
-                ft.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
-        }
-
-        // Assert — trim powinien usunac biale znaki
-        assert_eq!(targets, vec!["main", "fb-1", "fb-2", "fb-3"]);
+    fn parse_alias_fallback_targets_rejects_csv_legacy_format() {
+        let parsed = super::parse_alias_fallback_targets(Some("model-b,model-c"), "legacy-csv");
+        assert!(
+            parsed.is_empty(),
+            "CSV must NOT be silently accepted; got {:?}",
+            parsed
+        );
     }
 
     // ========================================================================
@@ -834,7 +859,7 @@ mod middleware_tests {
             .register_local_inference_model("qwen-mini");
 
         // Act
-        let backends = router.get_backends("qwen-mini");
+        let backends = router.get_backends("qwen-mini", None);
 
         // Assert — snapshot path zwraca LocalLlm.
         assert!(
@@ -844,5 +869,65 @@ mod middleware_tests {
             "expected LocalLlm in {:?}",
             backends.iter().map(|b| b.type_name()).collect::<Vec<_>>()
         );
+    }
+
+    /// R4.A fail-closed: a service whose `engine_id` has no registered
+    /// manifest must NOT be admitted for audio dispatch. The earlier
+    /// permissive behavior allowed a legacy text-only sibling that
+    /// happened to expose the same `model_name` as a real audio engine
+    /// to silently swallow audio requests.
+    #[test]
+    fn service_accepts_input_fail_closed_for_audio_without_manifest() {
+        use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
+        let manifests = crate::services::manifest::registry();
+        let svc = ServiceInfo {
+            id: 99,
+            node_id: "n".into(),
+            engine_id: "ghost-engine".into(), // not a registered manifest id
+            category: "llm".into(),
+            display_name: "ghost".into(),
+            deploy_method: "native_embedded".into(),
+            transport: "embedded".into(),
+            status: "running".into(),
+            pinned: false,
+            paused: false,
+            runtime_pid: None,
+            runtime_port: None,
+            sidecar_quic_port: None,
+            endpoint_url: None,
+            restart_count: 0,
+            health_last_err: None,
+            models: vec![ServiceModelEntry {
+                model_name: "shared".into(),
+                display_name: None,
+                capabilities: vec![],
+                context_length: None,
+                quantization: None,
+                is_default: true,
+            }],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        // Audio + Image require explicit manifest support; Text stays
+        // permissive so legacy services without a manifest can still
+        // serve text dispatch.
+        assert!(!service_accepts_input(
+            manifests,
+            &svc,
+            "shared",
+            InputModality::Audio
+        ));
+        assert!(!service_accepts_input(
+            manifests,
+            &svc,
+            "shared",
+            InputModality::Image
+        ));
+        assert!(service_accepts_input(
+            manifests,
+            &svc,
+            "shared",
+            InputModality::Text
+        ));
     }
 }

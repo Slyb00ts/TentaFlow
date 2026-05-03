@@ -13,35 +13,29 @@ Format: `{"input": "pełna konwersacja", "output": "strukturalne podsumowanie"}`
 Symulacja rozmowy user↔assistant w formacie:
 
 ```
-USER: Hej, potrzebuję pomocy z konfiguracją RAG pipeline
-ASSISTANT: Jasne! Jakie masz wymagania? Jaki vector store chcesz użyć?
-USER: Myślałem o FAISS, ale nie wiem jaki chunk size
-ASSISTANT: Dla dokumentów technicznych polecam chunk_size=512 z overlap=64...
-USER: Zrobiłem jak mówiłeś ale retrieval zwraca duplikaty
-ASSISTANT: To znany problem. Dodaj deduplication na etapie...
-USER: Ok to działa, ale wyniki są słabe — zwraca nieistotne fragmenty
-ASSISTANT: Spróbuj dodać reranking z cross-encoder...
+USER: Hej, potrzebuję pomocy z konfiguracją CI w GitHub Actions
+ASSISTANT: Jasne! Jaki masz stack? Node, Python, Rust?
+USER: Rust. Chce odpalac cargo test na PR.
+ASSISTANT: Uzyj actions-rs/toolchain + cache rejestru. Pokaze przyklad workflow...
+USER: Zrobilem. Build dziala ale jest wolny — 8 minut na PR.
+ASSISTANT: Dodaj sccache albo cargo-chef do warstw cache w jobie.
+USER: Dodalem sccache, teraz 3 minuty. Dzieki!
 ```
 
 ## FORMAT OUTPUT (podsumowania)
 
 ```
-TEMAT: Konfiguracja RAG pipeline z FAISS
+TEMAT: Konfiguracja CI dla projektu Rust w GitHub Actions
 USTALENIA:
-- Vector store: FAISS
-- Chunk size: 512 z overlap 64
-- Dodana deduplication po retrieval
-- Dodany reranking z cross-encoder
+- Workflow odpala cargo test na kazdym PR
+- Cache: actions-rs/toolchain + sccache
+- Time-to-green: 3 minuty po dodaniu sccache (z 8 min)
 PROBLEMY_ZGŁOSZONE:
-- Retrieval zwracał duplikaty → rozwiązane deduplication
-- Wyniki nieistotne → rozwiązane rerankingiem
+- Build wolny (8 min) → rozwiazane sccache
 FEEDBACK_UŻYTKOWNIKA:
-- "Zrobiłem jak mówiłeś ale retrieval zwraca duplikaty" (negatywny)
-- "Ok to działa" (pozytywny po fix)
-- "wyniki są słabe" (negatywny)
-ACTION_ITEMS:
-- Monitorować jakość retrieval po zmianach
-DECYZJE: FAISS jako vector store, chunk_size=512, reranking enabled
+- "Dodalem sccache, teraz 3 minuty. Dzieki!" (pozytywny)
+ACTION_ITEMS: brak
+DECYZJE: sccache jako cache build dla CI
 ```
 
 Kluczowe sekcje:
@@ -66,7 +60,6 @@ Kluczowe sekcje:
 - Konfiguracja monitoringu (Grafana, Prometheus, alerting)
 
 ### Techniczne (AI/ML):
-- Konfiguracja RAG pipeline (vector store, chunking, embedding)
 - Fine-tuning modelu (hiperparametry, dane, ewaluacja)
 - Prompt engineering (system prompt, few-shot, chain-of-thought)
 - Deployment modelu (GGUF, quantization, inference server)
@@ -79,7 +72,7 @@ Kluczowe sekcje:
 - Rozwiązywanie problemu klienta (support)
 - Onboarding nowego pracownika
 
-### Z RAG (dokument + rozmowa):
+### Z dokumentem w kontekście:
 - User wkleja fragment dokumentu → pyta o szczegóły
 - User uploaduje raport → prosi o analizę
 - User cytuje mail → prosi o odpowiedź

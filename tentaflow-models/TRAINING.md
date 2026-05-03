@@ -32,7 +32,6 @@ python3 scripts/download_models.py
 ./scripts/generate.sh memory 30         # memory wszystkie podtypy (round-robin)
 ./scripts/generate.sh memory documents 20
 ./scripts/generate.sh memory conversations 20
-./scripts/generate.sh memory rag 20
 ./scripts/generate.sh memory transcripts 20
 ./scripts/generate.sh memory summaries 20
 ./scripts/generate.sh memory extract 20
@@ -115,7 +114,6 @@ python3 scripts/benchmark.py --models all                 # WSZYSTKO
 | Toolcalling | `<\|tools\|>` | auto z addonów | 30 | TOON lub #UNAVAILABLE/#MISSING |
 | Memory docs | `<\|memory\|>` | `memory_documents.md` | 20 | Wyciąganie faktów z dokumentów |
 | Memory conv | `<\|memory\|>` | `memory_conversations.md` | 15 | Podsumowanie rozmów |
-| Memory rag | `<\|memory\|>` | `memory_rag.md` | 15 | Rozmowy z dokumentami |
 | Memory trans | `<\|memory\|>` | `memory_transcripts.md` | 10 | Transkrypcje spotkań |
 | Memory sum | `<\|summary\|>` | `memory_summaries.md` | 15 | Hierarchiczne L1/L2/TOP |
 | Memory extract | `<\|extract\|>` | `memory_extract.md` | 15 | Wyciąganie pól z dokumentów |
@@ -136,7 +134,6 @@ tentaflow-models/
 │   └── memory/                      # Memory (6 podtypów)
 │       ├── documents.jsonl
 │       ├── conversations.jsonl
-│       ├── rag.jsonl
 │       ├── transcripts.jsonl
 │       ├── summaries.jsonl
 │       └── extract.jsonl

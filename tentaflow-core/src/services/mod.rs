@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: services/mod.rs
-// Opis: Klienci serwisow zewnetrznych — RAG, TTS, embeddingi.
+// Opis: Klienci serwisow zewnetrznych — TTS, embeddingi.
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
@@ -9,7 +9,7 @@ pub mod model_download;
 pub mod models;
 pub mod nim;
 pub mod portainer;
-pub mod rag;
+pub mod stt;
 pub mod teams_bot_bootstrap;
 pub mod tts;
 
@@ -27,5 +27,4 @@ pub mod snapshot_builder;
 pub mod supervisor;
 pub mod transport;
 
-pub use rag::{RAGClient, RAGEngineConfigCompat};
 pub use tts::{SynthesizeCallback, TTSBufferingProcessor, TTSClient, TTSConfigCompat};
