@@ -15,7 +15,6 @@ use crate::routing::router::{
     RequestMetrics, Router, VoiceInfo,
 };
 
-use tentaflow_protocol::*;
 use tracing::{debug, error, info, warn};
 
 impl Router {
@@ -148,38 +147,25 @@ impl Router {
         // albo flow z dedykowanym STT node.
         let voice_info: Option<VoiceInfo> = None;
 
-        // Direct dispatch do backendu — bez pre/post processingu request-a.
-        // Gdy target zaakceptowal audio bypass (D.7) wymuszamy filtr dispatch
-        // zeby request audio nie trafil do innego instance'u tej samej nazwy
-        // ktory audio nie obsluguje.
-        // R3a: ostateczny dispatch idzie przez `ModelRuntimeExecutor` —
-        // single point of truth dla alias resolution + strategy +
-        // per-instance modality filter. Embedded / HTTP / QUIC LLM /
-        // Flow obslugiwane bezposrednio. MeshForward executor w obecnym
-        // buildzie zwraca `TransportPendingCutover` (deferred), wiec
-        // wracamy do legacy `dispatch_with_fallback` jako fallback —
-        // gdy mesh transport bedzie wpiety w executor (R3a follow-up),
-        // fallback wypadnie automatycznie.
+        // Single dispatch path — `ModelRuntimeExecutor.execute_chat`.
+        // Resolver + strategy + per-instance modality filter handle
+        // Embedded / HTTP / QUIC / Mesh / Flow targets. Legacy
+        // `BackendHandle` dispatch is gone after R3b.8.
         let _ = target_accepts_audio;
         let t2 = std::time::Instant::now();
         let executor_snapshot = self.executor.read().clone();
         let route_result = match executor_snapshot {
             Some(executor) => {
                 use crate::services::runtime::context::ExecutionContext;
-                use crate::services::runtime::executor::ExecutorError;
                 let mut exec_ctx = ExecutionContext {
                     user: user.clone(),
                     ..ExecutionContext::default()
                 };
                 match executor.execute_chat(request.clone(), &mut exec_ctx).await {
                     Ok(mut response) => {
-                        // Codex H3: aplikuj response_middleware na content/reasoning
-                        // — executor MVP nie ma middleware factory wpietego, wiec
-                        // robimy to inline tutaj zeby PII filter nie zostal
-                        // bypassowany na sciezce executor (pozostale ścieżki —
-                        // route_to_quic_llm, legacy_chat_dispatch — juz
-                        // aplikuja clean_text wewnatrz). Pelne wpiecie middleware
-                        // factory w executor: R5 follow-up.
+                        // Apply PII filter on content/reasoning — the executor
+                        // is middleware-agnostic in MVP, so the caller
+                        // gates here.
                         self.apply_response_middleware(&mut response)?;
                         let route_metadata = crate::routing::RouteMetadata {
                             served_by_node: exec_ctx
@@ -196,9 +182,6 @@ impl Router {
                                 .unwrap_or_else(|| "executor".to_string()),
                             strategy_used: "executor".to_string(),
                             fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
-                            // hop_count tracked w `ExecutionContext.hop_count`
-                            // (mesh forwards bumpuja); RouteMetadata go nie ma —
-                            // do bezpiecznego startu zostawiamy 0.
                             hop_count: 0,
                             latency_ms: Some(t2.elapsed().as_secs_f64() * 1000.0),
                         };
@@ -207,18 +190,15 @@ impl Router {
                             metadata: route_metadata,
                         }
                     }
-                    Err(ExecutorError::TransportPendingCutover(_)) => {
-                        debug!(
-                            "Executor zwrocil TransportPendingCutover — fallback na legacy dispatch"
-                        );
-                        self.legacy_chat_dispatch(&request).await?
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("executor.execute_chat: {}", e).into()),
+                    Err(e) => return Err(executor_err_to_core(e, &request.model).into()),
                 }
             }
             None => {
-                // DB-less Router (test harness) — executor nie jest wpiety.
-                self.legacy_chat_dispatch(&request).await?
+                return Err(crate::error::CoreError::InternalError {
+                    message: "router executor not wired (Router::new precondition)".to_string(),
+                    source: None,
+                }
+                .into());
             }
         };
         let mut response = route_result.response;
@@ -270,480 +250,7 @@ impl Router {
         Ok(())
     }
 
-    /// R3a transitional shim (Codex L1): stara logika dispatch_with_fallback
-    /// dla scenariuszy ktore executor jeszcze nie obsluguje. Plan v7 D.10
-    /// "Zero compat shims" — to **transitional path** z konkretnymi
-    /// kryteriami delete'u, nie permanent compat layer.
-    ///
-    /// **Deletion criteria (do usuniecia razem z helperem):**
-    /// 1. `executor.dispatch_chat_blocking` obsluguje `MeshForward` bez
-    ///    `TransportPendingCutover` (mesh trust verification + iroh forward
-    ///    wpiete bezposrednio w executor).
-    /// 2. Wszystkie test harnesses Router maja DB (`Router::new(.., Some(db))`)
-    ///    albo executor jest opcjonalnie konstruowany bez DB.
-    /// 3. Cargo grep `legacy_chat_dispatch` zwraca tylko ten plik.
-    ///
-    /// Po spelnieniu wszystkich 3 — usun helper + `route_to_quic_llm` +
-    /// `route_to_mesh_llm` + `dispatch_with_fallback` (chyba ze rest of
-    /// embeddings/tts/stt nadal ich uzywa, w takim razie usun po R3b cutover).
-    async fn legacy_chat_dispatch(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
-        use crate::routing::middleware::BackendHandle;
-        let this = self.clone();
-        let req = request.clone();
-        self.dispatch_with_fallback(&request.model, 0, None, |handle| {
-            let this = this.clone();
-            let req = req.clone();
-            let handle = handle.clone();
-            async move {
-                match &handle {
-                    BackendHandle::LocalLlm => {
-                        this.local_inference.handle_chat_completion(&req).await
-                    }
-                    BackendHandle::QuicLlm(name) => {
-                        this.route_to_quic_llm(name.clone(), req, None, None).await
-                    }
-                    BackendHandle::Http(name) => {
-                        let backend = this
-                            .select_http_backend(name)
-                            .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
-                        Ok(backend.chat_completion(req).await?)
-                    }
-                    BackendHandle::MeshForward(node_id, svc) => {
-                        this.route_to_mesh_llm(node_id.clone(), svc.clone(), req).await
-                    }
-                    _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
-                }
-            }
-        })
-        .await
-    }
 
-    /// Routuje request do QUIC LLM engine (non-streaming).
-    pub(crate) async fn route_to_quic_llm(
-        &self,
-        llm_name: String,
-        request: ChatCompletionRequest,
-        prompt_override: Option<String>,
-        stop_override: Option<Vec<String>>,
-    ) -> Result<ChatCompletionResponse> {
-        use tentaflow_protocol::*;
-
-        debug!(
-            "Routing to QUIC LLM: {}, prompt_override={:?}",
-            llm_name,
-            prompt_override.as_ref().map(|p| p.len())
-        );
-
-        let quic_client = self
-            .service_manager
-            .get_quic_llm_client(&llm_name)
-            .await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: llm_name.clone(),
-            })?;
-
-        let protocol_messages = crate::routing::openai_messages_to_protocol(&request.messages);
-
-        let stop_tokens = stop_override.or(request.stop.clone());
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let model_request = ModelRequest {
-            request_id: request_id.clone(),
-            payload: ModelPayload::Completion(CompletionPayload {
-                model: request.model.clone(),
-                prompt: prompt_override,
-                messages: protocol_messages,
-                temperature: request.temperature,
-                max_tokens: request.max_tokens,
-                top_p: request.top_p,
-                stop: stop_tokens,
-                presence_penalty: request.presence_penalty,
-                frequency_penalty: request.frequency_penalty,
-                tts_options: None,
-                memory_options: None,
-                audio_input: None,
-                prefix_cache_id: None,
-                prefix_text: None,
-            }),
-            stream: false,
-            metadata: None,
-            session_id: None,
-        };
-
-        debug!("Wysylam request do QUIC LLM: {}", llm_name);
-
-        let model_response = quic_client.send_request(model_request).await?;
-
-        match model_response.result {
-            ModelResult::Completion(completion_result) => {
-                let cleaned_text = self
-                    .response_middleware
-                    .clean_text(&completion_result.text)?;
-                let cleaned_reasoning = if let Some(ref rc) = completion_result.reasoning_content {
-                    Some(self.response_middleware.clean_text(rc)?)
-                } else {
-                    None
-                };
-
-                let chat_response = ChatCompletionResponse {
-                    id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                    object: "chat.completion".to_string(),
-                    created: chrono::Utc::now().timestamp() as u64,
-                    model: llm_name,
-                    choices: vec![Choice {
-                        index: 0,
-                        message: crate::api::openai::types::Message {
-                            role: "assistant".to_string(),
-                            content: Some(crate::api::openai::types::MessageContent::Text(
-                                cleaned_text,
-                            )),
-                            reasoning_content: cleaned_reasoning,
-                            ..Default::default()
-                        },
-                        finish_reason: completion_result.finish_reason,
-                        logprobs: None,
-                    }],
-                    usage: model_response.metrics.map(|m| {
-                        if let Some(DetailedMetrics::Completion {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens,
-                        }) = m.detailed
-                        {
-                            Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens,
-                            }
-                        } else {
-                            Usage {
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                total_tokens: 0,
-                            }
-                        }
-                    }),
-                    system_fingerprint: None,
-                    transcribed_text: None,
-                    speaker_id: None,
-                    speaker_name: None,
-                    speaker_confidence: None,
-                    detected_intent: None,
-                    detected_tools: None,
-                };
-
-                debug!(
-                    "QUIC LLM response received: {} chars",
-                    chat_response
-                        .choices
-                        .first()
-                        .map(|c| {
-                            match &c.message.content {
-                                Some(crate::api::openai::types::MessageContent::Text(t)) => t.len(),
-                                _ => 0,
-                            }
-                        })
-                        .unwrap_or(0)
-                );
-
-                Ok(chat_response)
-            }
-            ModelResult::Error(error_info) => Err(CoreError::InternalError {
-                message: format!("QUIC LLM error: {}", error_info.message),
-                source: None,
-            }
-            .into()),
-            _ => Err(CoreError::InternalError {
-                message: "Unexpected response type from QUIC LLM".to_string(),
-                source: None,
-            }
-            .into()),
-        }
-    }
-
-    pub(crate) async fn forward_model_request_to_mesh(
-        &self,
-        target_node_id: &str,
-        model_request: ModelRequest,
-    ) -> Result<ModelResponse> {
-        let request_id = model_request.request_id.clone();
-        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
-            .map_err(|e| anyhow::anyhow!("mesh forward serialize ModelRequest: {}", e))?
-            .into_vec();
-        let mesh = self
-            .mesh_manager
-            .read()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("mesh transport not available"))?;
-        let response_bytes = mesh
-            .forward_request(target_node_id, &request_id, payload)
-            .await
-            .map_err(|e| anyhow::anyhow!("mesh forward request: {}", e))?;
-        let archived =
-            rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
-                .map_err(|e| anyhow::anyhow!("mesh forward access ModelResponse: {}", e))?;
-        rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived)
-            .map_err(|e| anyhow::anyhow!("mesh forward deserialize ModelResponse: {}", e).into())
-    }
-
-    pub(crate) async fn route_to_mesh_llm(
-        &self,
-        target_node_id: String,
-        target_model_name: String,
-        request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse> {
-        let protocol_messages = crate::routing::openai_messages_to_protocol(&request.messages);
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let model_request = ModelRequest {
-            request_id,
-            payload: ModelPayload::Completion(CompletionPayload {
-                model: target_model_name,
-                prompt: None,
-                messages: protocol_messages,
-                temperature: request.temperature,
-                max_tokens: request.max_tokens,
-                top_p: request.top_p,
-                stop: request.stop.clone(),
-                presence_penalty: request.presence_penalty,
-                frequency_penalty: request.frequency_penalty,
-                tts_options: None,
-                memory_options: None,
-                audio_input: None,
-                prefix_cache_id: None,
-                prefix_text: None,
-            }),
-            stream: false,
-            metadata: None,
-            session_id: None,
-        };
-        let model_response = self
-            .forward_model_request_to_mesh(&target_node_id, model_request)
-            .await?;
-        match model_response.result {
-            ModelResult::Completion(completion_result) => {
-                let cleaned_text = self.response_middleware.clean_text(&completion_result.text)?;
-                let message = Message {
-                    role: "assistant".to_string(),
-                    content: Some(MessageContent::Text(cleaned_text)),
-                    reasoning_content: completion_result.reasoning_content,
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                };
-                Ok(ChatCompletionResponse {
-                    id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                    object: "chat.completion".to_string(),
-                    created: chrono::Utc::now().timestamp() as u64,
-                    model: completion_result.model,
-                    choices: vec![Choice {
-                        index: 0,
-                        message,
-                        finish_reason: completion_result.finish_reason.or(Some("stop".to_string())),
-                        logprobs: None,
-                    }],
-                    usage: Some(Usage {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                    }),
-                    system_fingerprint: None,
-                    transcribed_text: completion_result.transcribed_text,
-                    speaker_id: completion_result.speaker_id,
-                    speaker_name: completion_result.speaker_name,
-                    speaker_confidence: None,
-                    detected_intent: completion_result.detected_intent,
-                    detected_tools: None,
-                })
-            }
-            ModelResult::Error(err) => Err(anyhow::anyhow!(
-                "mesh LLM error {:?}: {}",
-                err.error_type,
-                err.message
-            )
-            .into()),
-            _ => Err(anyhow::anyhow!("mesh LLM returned unexpected response type").into()),
-        }
-    }
-
-
-    // ========================================================================
-    // PROTOCOL-NATIVE METHODS (dla QUIC Server)
-    // ========================================================================
-
-    /// Routuje chat completion - wersja dla protocol types.
-    pub async fn route_completion_via_protocol(
-        &self,
-        model: &str,
-        messages: Vec<tentaflow_protocol::Message>,
-        temperature: Option<f32>,
-        max_tokens: Option<u32>,
-        prompt: Option<String>,
-        stop: Option<Vec<String>>,
-    ) -> Result<tentaflow_protocol::ModelResponse> {
-        use tentaflow_protocol::*;
-
-        let route = self.resolve_route(model);
-        let model_name = route
-            .targets
-            .first()
-            .cloned()
-            .unwrap_or_else(|| model.to_string());
-
-        debug!(
-            "route_completion_via_protocol: model={}, messages={}, prompt_len={:?}",
-            model_name,
-            messages.len(),
-            prompt.as_ref().map(|p| p.len())
-        );
-
-        let start_time = std::time::Instant::now();
-
-        let openai_messages: Vec<crate::api::openai::types::Message> = messages
-            .iter()
-            .map(|m| crate::api::openai::types::Message {
-                role: m.role.clone(),
-                content: Some(MessageContent::Text(m.content.clone())),
-                ..Default::default()
-            })
-            .collect();
-
-        let request = ChatCompletionRequest {
-            model: model_name.clone(),
-            messages: openai_messages,
-            temperature,
-            max_tokens,
-            top_p: None,
-            n: None,
-            stream: false,
-            stop: stop.clone(),
-            presence_penalty: None,
-            frequency_penalty: None,
-            user: None,
-            tools: None,
-            tool_choice: None,
-            response_format: None,
-            memory_options: None,
-            audio_input: None,
-        };
-
-        let response = {
-            use crate::routing::middleware::BackendHandle;
-            let this = self.clone();
-            let req = request.clone();
-            let prompt_c = prompt.clone();
-            let stop_c = stop.clone();
-            let route_result = self
-                .dispatch_with_fallback(model, 0, None, |handle| {
-                    let this = this.clone();
-                    let req = req.clone();
-                    let prompt_c = prompt_c.clone();
-                    let stop_c = stop_c.clone();
-                    let handle = handle.clone();
-                    async move {
-                        match &handle {
-                            BackendHandle::QuicLlm(name) => {
-                                this.route_to_quic_llm(name.clone(), req, prompt_c, stop_c)
-                                    .await
-                            }
-                            BackendHandle::LocalLlm => {
-                                this.local_inference.handle_chat_completion(&req).await
-                            }
-                            BackendHandle::Http(name) => {
-                                let backend = this.select_http_backend(name).ok_or_else(|| {
-                                    anyhow::anyhow!("Brak backendow dla {}", name)
-                                })?;
-                                Ok(backend.chat_completion(req).await?)
-                            }
-                            _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla completion")),
-                        }
-                    }
-                })
-                .await?;
-            route_result.response
-        };
-
-        let content = crate::routing::extract_response_text(&response);
-
-        let reasoning_content = response
-            .choices
-            .first()
-            .and_then(|c| c.message.reasoning_content.clone());
-
-        let tool_calls = response
-            .choices
-            .first()
-            .and_then(|c| c.message.tool_calls.as_ref())
-            .map(|tcs| {
-                tcs.iter()
-                    .map(|tc| ToolCallResult {
-                        id: tc.id.clone(),
-                        tool_type: tc.tool_type.clone(),
-                        function_name: tc.function.name.clone(),
-                        arguments: tc.function.arguments.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            });
-
-        let cleaned_content = self.response_middleware.clean_text(&content)?;
-
-        let cleaned_reasoning = if let Some(ref rc) = reasoning_content {
-            Some(self.response_middleware.clean_text(rc)?)
-        } else {
-            None
-        };
-
-        let finish_reason = response
-            .choices
-            .first()
-            .and_then(|c| c.finish_reason.clone());
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        let latency_ms = start_time.elapsed().as_millis() as u64;
-        let metrics = response.usage.map(|usage| {
-            let tokens_per_sec = if latency_ms > 0 && usage.completion_tokens > 0 {
-                Some((usage.completion_tokens as f32 / latency_ms as f32) * 1000.0)
-            } else {
-                None
-            };
-            ModelMetrics {
-                model_name: response.model.clone(),
-                latency_ms,
-                time_to_first_token_ms: None,
-                tokens_processed: Some(usage.total_tokens as usize),
-                throughput_tokens_per_sec: tokens_per_sec,
-                detailed: Some(DetailedMetrics::Completion {
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    total_tokens: usage.total_tokens,
-                }),
-            }
-        });
-
-        let model_response = ModelResponse {
-            request_id,
-            result: ModelResult::Completion(CompletionResult {
-                text: cleaned_content,
-                reasoning_content: cleaned_reasoning,
-                model: model_name,
-                finish_reason,
-                tool_calls,
-                detected_intent: None,
-                detected_tools: None,
-                transcribed_text: None,
-                speaker_id: None,
-                speaker_name: None,
-            }),
-            metrics,
-        };
-
-        Ok(model_response)
-    }
-
-    /// Routuje request Memory przez QUIC do Memory Engine.
     pub async fn route_memory_via_quic(
         &self,
         payload: &tentaflow_protocol::MemoryPayload,
@@ -1166,5 +673,50 @@ mod audio_policy_tests {
         };
         let snap = snapshot_with(vec![primary, fallback, alias]);
         assert!(!catalog_target_accepts_audio(&snap, "txt-only"));
+    }
+}
+
+/// Map executor errors onto typed `CoreError` variants so the OpenAI
+/// HTTP layer can serve a precise status code (404 / 400 / 503) instead
+/// of a catch-all 500. Codex R3b.8: chat/stream had been flattening
+/// every executor error to `InternalError`; mirror of `embeddings.rs`
+/// + `tts.rs` mappers so all four surfaces map errors consistently.
+pub(crate) fn executor_err_to_core(
+    err: crate::services::runtime::executor::ExecutorError,
+    model: &str,
+) -> crate::error::CoreError {
+    use crate::services::runtime::executor::ExecutorError;
+    use crate::services::runtime::resolver::ResolveError;
+    match err {
+        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
+            crate::error::CoreError::ModelNotFound { model_name: m }
+        }
+        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
+            crate::error::CoreError::InvalidRequest {
+                message: format!(
+                    "model '{}' has no candidate matching requested capabilities",
+                    requested
+                ),
+                details: None,
+            }
+        }
+        ExecutorError::Resolve(other) => crate::error::CoreError::InternalError {
+            message: format!("alias resolution: {}", other),
+            source: None,
+        },
+        ExecutorError::AllCandidatesFailed { .. }
+        | ExecutorError::TransportPendingCutover(_) => {
+            crate::error::CoreError::AllBackendsUnavailable {
+                model_name: model.to_string(),
+            }
+        }
+        ExecutorError::FlowDispatcherUnavailable
+        | ExecutorError::FlowEmptyResult { .. }
+        | ExecutorError::Internal(_)
+        | ExecutorError::SttRuntimeUnavailable
+        | ExecutorError::SttBackend(_) => crate::error::CoreError::InternalError {
+            message: format!("executor: {}", err),
+            source: None,
+        },
     }
 }

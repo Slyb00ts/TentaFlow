@@ -153,19 +153,14 @@ impl Router {
             }
         }
 
-        // Legacy mesh-only fallback. Disappears together with
-        // `BackendHandle::MeshForward` after R3b.7 wires mesh transport
-        // into the executor.
-        match self.legacy_tts_mesh_dispatch(&cleaned_request).await {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                self.log_tts_dispatch_diagnostics(&tts_model);
-                Err(CoreError::ModelNotFound {
-                    model_name: format!("TTS no backend found for model '{}'", tts_model),
-                }
-                .into())
-            }
+        // Executor not wired (DB-less router). After R3b.8 the legacy
+        // mesh fallback is gone — without an executor we surface a typed
+        // error instead of doing duplicate dispatch.
+        self.log_tts_dispatch_diagnostics(&tts_model);
+        Err(CoreError::AllBackendsUnavailable {
+            model_name: tts_model,
         }
+        .into())
     }
 
     /// User-facing diagnostic for "no TTS backend" failures. Inspects the
@@ -208,110 +203,6 @@ impl Router {
         }
     }
 
-    /// Mesh-only legacy fallback for `synthesize_speech`. Disappears in
-    /// R3b.7. Other backends (Embedded/Http/Quic) are already routed
-    /// through the executor — only `BackendHandle::MeshForward` remains
-    /// here to preserve cross-node TTS fallback during the cutover.
-    async fn legacy_tts_mesh_dispatch(
-        &self,
-        request: &crate::api::openai::types::TTSRequest,
-    ) -> Result<crate::routing::RouteResult<TtsBytes>> {
-        use crate::routing::middleware::BackendHandle;
-        use tentaflow_protocol::*;
-
-        let this = self.clone();
-        let req = request.clone();
-        let request_format = request
-            .response_format
-            .clone()
-            .unwrap_or_else(|| "wav".to_string());
-        let required_input = Some(crate::services::catalog::InputModality::Text);
-        let inner_result = self.dispatch_with_fallback(&request.model, 0, required_input, |handle| {
-            let this = this.clone();
-            let req = req.clone();
-            let handle = handle.clone();
-            async move {
-                let BackendHandle::MeshForward(node_id, svc) = &handle else {
-                    return Err(anyhow::anyhow!(
-                        "TTS legacy fallback: only MeshForward is handled here \
-                         (executor owns Local/HTTP/QUIC)"
-                    ));
-                };
-                debug!(target_node = %node_id, service = %svc, "MeshForward TTS");
-                let format = req
-                    .response_format
-                    .clone()
-                    .unwrap_or_else(|| "wav".to_string());
-                let model_request = ModelRequest {
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                    payload: ModelPayload::Audio(AudioPayload {
-                        operation: AudioOperation::TTS {
-                            model: req.model.clone(),
-                            input: req.input.clone(),
-                            voice: req.voice.clone(),
-                            format: Some(format),
-                            speed: req.speed,
-                            language: req.language.clone(),
-                        },
-                    }),
-                    stream: false,
-                    metadata: None,
-                    session_id: None,
-                };
-                let response = this
-                    .forward_model_request_to_mesh(node_id, model_request)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Mesh TTS request failed: {}", e))?;
-                match response.result {
-                    ModelResult::Audio(audio_result) => match audio_result.data {
-                        AudioResultData::Audio(bytes) => Ok(bytes),
-                        _ => Err(anyhow::anyhow!(
-                            "Mesh TTS returned non-audio result"
-                        )),
-                    },
-                    ModelResult::Error(err) => Err(anyhow::anyhow!(
-                        "Mesh TTS error {:?}: {}",
-                        err.error_type,
-                        err.message
-                    )),
-                    _ => Err(anyhow::anyhow!(
-                        "Mesh TTS returned unexpected response type"
-                    )),
-                }
-            }
-        })
-        .await;
-
-        // Wrap mesh-forward audio bytes into TtsBytes. Mesh peer echoes
-        // bytes verbatim — we trust the requested format because the
-        // remote TTS engine accepted it.
-        match inner_result {
-            Ok(rr) => Ok(crate::routing::RouteResult {
-                response: TtsBytes {
-                    bytes: rr.response,
-                    format: request_format,
-                },
-                metadata: rr.metadata,
-            }),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Streamujaca synteza mowy. Pierwsza iteracja: wywoluje pelne
-    /// `synthesize_speech` a nastepnie tnie wynikowy bufor PCM na chunki po
-    /// `TTS_STREAM_CHUNK_BYTES` bajtow. Zysk wzgledem blocking variant:
-    /// klient (np. teams-bot) wpycha probki do mikrofonu jednoczesnie z
-    /// transmisja kolejnych chunkow zamiast czekac na pelny WAV przed
-    /// odtwarzaniem — eliminuje dodatkowy "first-byte" stall na sieci/
-    /// deserializacji duzej ramki.
-    ///
-    /// Pelny end-to-end streaming (callback bezposrednio z silnika TTS,
-    /// np. sherpa `create_with_callback`) wymaga refaktoru `TtsEngine`
-    /// trait i osobnego dispatch path — to zostaje na nastepna iteracje.
-    ///
-    /// `chunk_sink` dostaje raw PCM bajty (bez WAV headera). Caller
-    /// powinien zazadac `format = "pcm"` w `TTSRequest` zeby uniknac
-    /// stripowania headera w pierwszym chunku.
     pub async fn synthesize_speech_stream<F>(
         &self,
         request: &crate::api::openai::types::TTSRequest,

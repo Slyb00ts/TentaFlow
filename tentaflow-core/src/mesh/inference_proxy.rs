@@ -171,48 +171,74 @@ pub async fn dispatch_reverse_request(
         ModelPayload::Completion(ref completion_payload) => {
             match build_chat_request(completion_payload) {
                 Ok(chat_request) => {
-                    match router.route_chat_completion(chat_request, None).await {
-                        Ok(route_result) => {
-                            let text = route_result.response.choices.first()
-                                .and_then(|c| c.message.content.as_ref())
-                                .map(|c| match c {
-                                    crate::api::openai::types::MessageContent::Text(t) => t.clone(),
-                                    crate::api::openai::types::MessageContent::Parts(parts) => {
-                                        parts.iter().filter_map(|p| {
-                                            if let crate::api::openai::types::ContentPart::Text { text } = p {
-                                                Some(text.as_str())
-                                            } else {
-                                                None
-                                            }
-                                        }).collect::<Vec<_>>().join("")
+                    // Codex R3b.8 round 2 H1: dispatch through executor
+                    // directly with `hop_count = MAX_HOP_COUNT` so a peer
+                    // cannot push us into A→B→A bouncing. `route_chat_completion`
+                    // would build a fresh `ExecutionContext` with hop=0,
+                    // which loses the cross-mesh hop boundary.
+                    let executor_snapshot = router.executor().clone();
+                    let Some(executor) = executor_snapshot else {
+                        return make_error_response(
+                            request_id,
+                            "router executor not wired for mesh-reverse chat",
+                        );
+                    };
+                    let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
+                        hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
+                        ..crate::services::runtime::context::ExecutionContext::default()
+                    };
+                    let chat_response = match executor
+                        .execute_chat(chat_request, &mut exec_ctx)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return make_error_response(
+                                request_id,
+                                &format!("Blad chat completion: {}", e),
+                            );
+                        }
+                    };
+                    let text = chat_response
+                        .choices
+                        .first()
+                        .and_then(|c| c.message.content.as_ref())
+                        .map(|c| match c {
+                            crate::api::openai::types::MessageContent::Text(t) => t.clone(),
+                            crate::api::openai::types::MessageContent::Parts(parts) => parts
+                                .iter()
+                                .filter_map(|p| {
+                                    if let crate::api::openai::types::ContentPart::Text { text } =
+                                        p
+                                    {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
                                     }
                                 })
-                                .unwrap_or_default();
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        })
+                        .unwrap_or_default();
 
-                            ModelResponse {
-                                request_id,
-                                result: ModelResult::Completion(CompletionResult {
-                                    text,
-                                    reasoning_content: None,
-                                    model: route_result.response.model,
-                                    finish_reason: route_result
-                                        .response
-                                        .choices
-                                        .first()
-                                        .and_then(|c| c.finish_reason.clone()),
-                                    tool_calls: None,
-                                    detected_intent: None,
-                                    detected_tools: None,
-                                    transcribed_text: None,
-                                    speaker_id: None,
-                                    speaker_name: None,
-                                }),
-                                metrics: None,
-                            }
-                        }
-                        Err(e) => {
-                            make_error_response(request_id, &format!("Blad chat completion: {}", e))
-                        }
+                    ModelResponse {
+                        request_id,
+                        result: ModelResult::Completion(CompletionResult {
+                            text,
+                            reasoning_content: None,
+                            model: chat_response.model,
+                            finish_reason: chat_response
+                                .choices
+                                .first()
+                                .and_then(|c| c.finish_reason.clone()),
+                            tool_calls: None,
+                            detected_intent: None,
+                            detected_tools: None,
+                            transcribed_text: None,
+                            speaker_id: None,
+                            speaker_name: None,
+                        }),
+                        metrics: None,
                     }
                 }
                 Err(e) => make_error_response(request_id, &e),
@@ -316,7 +342,7 @@ fn build_chat_request(
 ) -> Result<crate::api::openai::types::ChatCompletionRequest, String> {
     use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 
-    let messages: Vec<Message> = payload
+    let mut messages: Vec<Message> = payload
         .messages
         .iter()
         .map(|m| Message {
@@ -326,8 +352,23 @@ fn build_chat_request(
         })
         .collect();
 
+    // Codex R3b.8 round 2 M2: prompt-only `CompletionPayload` (legacy
+    // peers that still send `prompt: Some(_)` with empty `messages`).
+    // Pre-cutover `route_completion_via_protocol` accepted both shapes;
+    // now we synthesise a single `user`-role message from the prompt so
+    // the executor receives chat-shaped input.
     if messages.is_empty() {
-        return Err("Brak wiadomosci w CompletionPayload".to_string());
+        if let Some(prompt) = payload.prompt.as_ref().filter(|p| !p.is_empty()) {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(prompt.clone())),
+                ..Default::default()
+            });
+        } else {
+            return Err(
+                "CompletionPayload has neither messages nor prompt".to_string(),
+            );
+        }
     }
 
     Ok(ChatCompletionRequest {
@@ -782,8 +823,9 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_request_empty_messages_returns_error() {
-        // Brak wiadomosci — powinno zwrocic blad
+    fn build_chat_request_empty_messages_and_no_prompt_returns_error() {
+        // Codex R3b.8 round 2 M2: prompt-only fallback synthesises a
+        // user-role message; only when both are missing do we reject.
         let payload = CompletionPayload {
             model: "gpt-4".to_string(),
             prompt: None,
@@ -803,7 +845,37 @@ mod tests {
 
         let result = build_chat_request(&payload);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Brak wiadomosci"));
+        assert!(result.unwrap_err().to_lowercase().contains("neither"));
+    }
+
+    #[test]
+    fn build_chat_request_prompt_only_synthesises_user_message() {
+        let payload = CompletionPayload {
+            model: "gpt-4".to_string(),
+            prompt: Some("Hello, world".to_string()),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            tts_options: None,
+            memory_options: None,
+            audio_input: None,
+            prefix_cache_id: None,
+            prefix_text: None,
+        };
+
+        let req = build_chat_request(&payload).expect("prompt-only should synthesise");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        match &req.messages[0].content {
+            Some(crate::api::openai::types::MessageContent::Text(t)) => {
+                assert_eq!(t, "Hello, world");
+            }
+            other => panic!("expected Text content, got {other:?}"),
+        }
     }
 
     #[test]

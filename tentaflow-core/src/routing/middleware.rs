@@ -1,64 +1,28 @@
 // =============================================================================
 // Plik: routing/middleware.rs
-// Opis: Typy i logika middleware routingu — resolve aliasow, odkrywanie backendow,
-//       strategia wyboru, dispatch z fallbackami. Fundament nowego unified routing.
+// Opis: Typy routingu i alias cache. Pre-R3b.8 plik trzymał także
+//       `BackendHandle` enum + `dispatch_with_fallback` + per-handle
+//       backend dispatch — to wszystko zniknęło razem z R3b.8 cutover na
+//       `ModelRuntimeExecutor`. Tu zostają tylko struktury wspólne dla
+//       routing path (RouteResult / RouteMetadata / ResolvedRoute) i
+//       alias cache reload.
 // =============================================================================
 
-use crate::error::Result;
 use crate::routing::router::Router;
 use crate::services::runtime::quic_handle::PoolStrategy;
-use crate::services::catalog::InputModality;
-use crate::services::transport::Transport;
 
-use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
-
-/// Maksymalna liczba hopow mesh (zapobiega petlom)
-const MAX_HOPS: u32 = 3;
 
 // ============================================================================
 // TYPY
 // ============================================================================
 
-/// Rozwiazana trasa — lista targetow i strategia wyboru
+/// Rozwiazana trasa — lista targetow i strategia wyboru. Po R3b.8 używane
+/// głównie do logging / metrics, executor ma własny resolver
+/// (`AliasResolver`).
 pub struct ResolvedRoute {
     pub targets: Vec<String>,
     pub strategy: PoolStrategy,
-}
-
-/// Uchwyt do konkretnego backendu — jednoznacznie identyfikuje typ i lokalizacje
-#[derive(Clone)]
-pub enum BackendHandle {
-    LocalLlm,
-    LocalStt,
-    /// In-process TTS (Apple AVSpeech, Kokoro MLX, sherpa-onnx) zarejestrowany
-    /// w `crate::tts::shared_tts_manager()`. Klucz = service_name z deploy
-    /// handlera (np. `apple-tts-native`). Dispatcher woła `synthesize` na
-    /// silniku przez spawn_blocking + manager.read().
-    LocalTts(String),
-    QuicLlm(String),
-    QuicStt(String),
-    QuicTts(String),
-    QuicEmbedding(String),
-    Http(String),
-    MeshForward(String, String),
-}
-
-impl BackendHandle {
-    /// Zwraca nazwe typu backendu (do metadanych)
-    fn type_name(&self) -> &'static str {
-        match self {
-            BackendHandle::LocalLlm => "local_llm",
-            BackendHandle::LocalStt => "local_stt",
-            BackendHandle::LocalTts(_) => "local_tts",
-            BackendHandle::QuicLlm(_) => "quic_llm",
-            BackendHandle::QuicStt(_) => "quic_stt",
-            BackendHandle::QuicTts(_) => "quic_tts",
-            BackendHandle::QuicEmbedding(_) => "quic_embedding",
-            BackendHandle::Http(_) => "http",
-            BackendHandle::MeshForward(_, _) => "mesh_forward",
-        }
-    }
 }
 
 /// Metadane trasy — serializowane do headera X-TentaFlow-Route
@@ -79,7 +43,7 @@ pub struct RouteResult<T> {
 }
 
 // ============================================================================
-// IMPL ROUTER — middleware routing
+// ALIAS CACHE
 // ============================================================================
 
 /// Pre-parsed alias entry kept in the routing cache. `DbModelAlias` retains
@@ -140,37 +104,14 @@ fn parse_alias_fallback_targets(raw: Option<&str>, alias_name: &str) -> Vec<Stri
     }
 }
 
-/// True iff the manifest declared (or fell back to) `required` for the
-/// `(svc, model_name)` pair.
-///
-/// Fail-closed policy: when the service's `engine_id` has no registered
-/// manifest, only `Text` is admitted. `Audio` / `Image` need explicit
-/// manifest support — otherwise a legacy text-only service co-hosting
-/// the same `model_name` as a real audio engine would silently absorb
-/// audio dispatch (the entry-level union admitted the request, then
-/// per-instance filter passed it through on a best-effort assumption).
-/// The legacy text path stays permissive because every pre-R2 service
-/// implicitly handled text and most still ship without a manifest.
-fn service_accepts_input(
-    manifests: &crate::services::manifest::ManifestRegistry,
-    svc: &tentaflow_protocol::ServiceInfo,
-    model_name: &str,
-    required: InputModality,
-) -> bool {
-    let Some(m) = manifests.by_id(&svc.engine_id) else {
-        return matches!(required, InputModality::Text);
-    };
-    let preset = m.model_presets.iter().find(|p| p.id == model_name);
-    let wire = required.as_wire_str();
-    m.engine
-        .effective_input_modalities(preset)
-        .iter()
-        .any(|s| s == wire)
-}
+// ============================================================================
+// IMPL ROUTER — alias resolution + cache
+// ============================================================================
 
 impl Router {
     /// Czy `name` jest znanym serwisem (po service_name) w jakimkolwiek
-    /// rejestrze backendow.
+    /// rejestrze backendow. Used by `resolve_route` to short-circuit when
+    /// the requested name is already a service id.
     fn is_known_service(&self, name: &str) -> bool {
         self.service_manager.has_quic_llm_service(name)
             || self.service_manager.has_http_backends(name)
@@ -186,18 +127,10 @@ impl Router {
         vec![target]
     }
 
-    /// Rozwiazuje nazwe modelu na liste targetow i strategie.
-    ///
-    /// Kolejnosc:
-    /// 1. Config aliasy (service_aliases)
-    /// 2. Znany serwis (QUIC/HTTP/local)
-    /// 3. Alias cache (DB model_aliases z fallback_targets + strategy)
-    /// 4. Oryginalna nazwa
+    /// Rozwiazuje nazwe modelu na liste targetow i strategie. Po R3b.8
+    /// używane już tylko do logging / metrics — executor ma własny
+    /// resolver (`AliasResolver`) z modality-aware filtering.
     pub(crate) fn resolve_route(&self, model: &str) -> ResolvedRoute {
-        // Snapshot-first lookup: when the supervisor snapshot already maps the
-        // requested model name, skip the legacy fallback chain entirely. Phase 5+
-        // deploy commits register the service into the snapshot, so this is the
-        // authoritative path on fresh installs.
         let snap = self.service_manager.current_snapshot();
         if snap.models_by_name.contains_key(model)
             || snap.services.iter().any(|s| s.engine_id == model)
@@ -209,7 +142,6 @@ impl Router {
             };
         }
 
-        // 2. Znany serwis
         if self.is_known_service(model) {
             return ResolvedRoute {
                 targets: vec![model.to_string()],
@@ -217,21 +149,11 @@ impl Router {
             };
         }
 
-        // 3. Alias cache (DB)
         {
             let cache = self.alias_cache.read();
             if let Some(cached) = cache.get(model) {
                 let mut raw_targets = vec![cached.target_model.clone()];
                 raw_targets.extend(cached.fallback_targets.iter().cloned());
-                // GUI w modalu aliasu wypelnia dropdown nazwami modeli HF
-                // (z `collect_local_models`/mesh services), nie service_name'ami.
-                // Backendy HTTP/QUIC sa rejestrowane pod service_name (patrz
-                // `register_dynamic_http_backend`), a mapping HF->service zyje
-                // w `model_pool`. Bez ekspansji `get_backends(<model HF>)`
-                // zwraca pustke i caller dostaje ModelNotFound. Rozwijamy
-                // tylko gdy target nie jest ani znanym serwisem ani pusty —
-                // jesli cos rozwinelo sie przez model_pool, podstawiamy
-                // service_name'y.
                 let targets: Vec<String> = raw_targets
                     .into_iter()
                     .flat_map(|t| self.expand_alias_target(t))
@@ -249,202 +171,16 @@ impl Router {
             }
         }
 
-        // 4. Oryginalna nazwa
         ResolvedRoute {
             targets: vec![model.to_string()],
             strategy: PoolStrategy::FirstAvailable,
         }
     }
 
-    /// Zwraca liste dostepnych backendow dla danego targetu.
-    ///
-    /// `required_input` filtruje serwisy ktorych `effective_input_modalities`
-    /// nie obejmuje danej modalnosci. Sluzy zapobiezeniu sytuacji gdzie ten
-    /// sam `model_name` jest serwowany przez peera audio-capable i przez
-    /// peera text-only, a zaufany guard na poziomie wpisu kataloga (union)
-    /// dopuscilby request audio do tego drugiego instance'u.
-    pub(crate) fn get_backends(
-        &self,
-        target: &str,
-        required_input: Option<InputModality>,
-    ) -> Vec<BackendHandle> {
-        let mut backends = Vec::new();
-
-        let Some(registry) = self.service_manager.mesh_services_registry.read().as_ref().cloned()
-        else {
-            return backends;
-        };
-        let manifests = crate::services::manifest::registry();
-        let local_node_id = registry.local().node_id.clone();
-        for svc in registry.visible_services() {
-            if !matches!(svc.status.as_str(), "running" | "degraded" | "ready") {
-                continue;
-            }
-            if !svc.models.iter().any(|m| m.model_name == target) {
-                continue;
-            }
-            if let Some(req) = required_input {
-                if !service_accepts_input(manifests, &svc, target, req) {
-                    continue;
-                }
-            }
-            if svc.node_id != local_node_id {
-                backends.push(BackendHandle::MeshForward(
-                    svc.node_id.clone(),
-                    target.to_string(),
-                ));
-                continue;
-            }
-            let transport = match Transport::from_db_tag(&svc.transport) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(service_id = svc.id, transport = %svc.transport, "invalid service transport: {}", e);
-                    continue;
-                }
-            };
-            match transport {
-                Transport::Embedded => match svc.category.as_str() {
-                    "tts" => {
-                        if let Ok(guard) = crate::tts::shared_tts_manager().try_read() {
-                            if guard.has(target) {
-                                backends.push(BackendHandle::LocalTts(target.to_string()));
-                            }
-                        }
-                    }
-                    "stt" => {
-                        if self.local_stt.is_available_sync() {
-                            backends.push(BackendHandle::LocalStt);
-                        }
-                    }
-                    _ => {
-                        if self.service_manager.has_local_inference_service(target) {
-                            backends.push(BackendHandle::LocalLlm);
-                        }
-                    }
-                },
-                Transport::HttpDirect | Transport::ExternalHttp => {
-                    if svc.endpoint_url.is_some()
-                        || self.service_manager.find_http_backend_for_model(target).is_some()
-                    {
-                        backends.push(BackendHandle::Http(target.to_string()));
-                    }
-                }
-                Transport::SidecarQuic => match svc.category.as_str() {
-                    "stt" => backends.push(BackendHandle::QuicStt(target.to_string())),
-                    "tts" => backends.push(BackendHandle::QuicTts(target.to_string())),
-                    "embeddings" | "embedding" => {
-                        backends.push(BackendHandle::QuicEmbedding(target.to_string()))
-                    }
-                    _ => backends.push(BackendHandle::QuicLlm(target.to_string())),
-                },
-            }
-        }
-        backends
-    }
-
-    /// Sortuje backendy wedlug strategii
-    pub(crate) fn apply_strategy<'a>(
-        &self,
-        backends: &'a [BackendHandle],
-        strategy: &PoolStrategy,
-    ) -> Vec<&'a BackendHandle> {
-        if backends.is_empty() {
-            return Vec::new();
-        }
-
-        match strategy {
-            PoolStrategy::FirstAvailable => backends.iter().collect(),
-            PoolStrategy::RoundRobin | PoolStrategy::LeastLoaded => {
-                let len = backends.len();
-                let idx = self.route_counter.fetch_add(1, Ordering::Relaxed) % len;
-                let mut result: Vec<&BackendHandle> = Vec::with_capacity(len);
-                for i in 0..len {
-                    result.push(&backends[(idx + i) % len]);
-                }
-                result
-            }
-        }
-    }
-
-    /// Dispatch z fallbackami — iteruje po targetach i backendach.
-    ///
-    /// `call_fn` dostaje BackendHandle i zwraca Future z wynikiem.
-    /// Probuje kazdy backend po kolei, loguje bledy i przechodzi dalej.
-    pub(crate) async fn dispatch_with_fallback<F, Fut, T>(
-        &self,
-        model: &str,
-        hop_count: u32,
-        required_input: Option<InputModality>,
-        call_fn: F,
-    ) -> Result<RouteResult<T>>
-    where
-        F: Fn(&BackendHandle) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        let route = self.resolve_route(model);
-        let start = std::time::Instant::now();
-        let mut fallbacks_tried: u32 = 0;
-        let mut last_error: Option<anyhow::Error> = None;
-
-        let node_name = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-
-        for target in &route.targets {
-            let backends = self.get_backends(target, required_input);
-            if backends.is_empty() {
-                fallbacks_tried += 1;
-                debug!("dispatch_with_fallback: brak backendow dla '{}'", target);
-                continue;
-            }
-
-            let ordered = self.apply_strategy(&backends, &route.strategy);
-
-            for handle in ordered {
-                // Ogranicz hop count dla mesh
-                if let BackendHandle::MeshForward(_, _) = handle {
-                    if hop_count >= MAX_HOPS {
-                        debug!(
-                            "dispatch_with_fallback: pomijam mesh forward (hop_count={})",
-                            hop_count
-                        );
-                        continue;
-                    }
-                }
-
-                match call_fn(handle).await {
-                    Ok(response) => {
-                        let metadata = RouteMetadata {
-                            served_by_node: node_name,
-                            backend_type: handle.type_name().to_string(),
-                            strategy_used: route.strategy.to_string(),
-                            fallbacks_tried,
-                            hop_count,
-                            latency_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
-                        };
-                        return Ok(RouteResult { response, metadata });
-                    }
-                    Err(e) => {
-                        debug!(
-                            "dispatch_with_fallback: backend {:?} zwrocil blad: {}",
-                            handle.type_name(),
-                            e
-                        );
-                        last_error = Some(e);
-                    }
-                }
-            }
-
-            fallbacks_tried += 1;
-        }
-
-        Err(last_error
-            .unwrap_or_else(|| anyhow::anyhow!("Brak dostepnych backendow dla modelu '{}'", model)))
-    }
-
-    /// Aktualizuje alias cache z zewnetrznych danych (np. sync z peera mesh).
-    /// fallback_targets jest parsowany RAZ tutaj (CachedAlias::from_db); hot
-    /// path resolve_route czyta tylko gotowy `Vec<String>`.
+    /// Mesh sync handler — replaces the in-memory alias cache after the
+    /// supervisor pushes a fresh `model_aliases` snapshot. Each entry is
+    /// pre-parsed via `CachedAlias::from_db` so the hot dispatch path
+    /// avoids serde-on-every-route.
     pub fn update_alias_cache_from_sync(&self, aliases: Vec<crate::db::models::DbModelAlias>) {
         let mut cache = self.alias_cache.write();
         cache.clear();
@@ -485,449 +221,55 @@ impl Router {
 #[cfg(test)]
 mod middleware_tests {
     use super::*;
-    use crate::services::runtime::quic_handle::PoolStrategy;
 
     // ========================================================================
-    // Testy BackendHandle
-    // ========================================================================
-
-    #[test]
-    fn backend_handle_clone_mesh_forward() {
-        // Arrange
-        let handle = BackendHandle::MeshForward("node-1".to_string(), "svc-llm".to_string());
-
-        // Act
-        let cloned = handle.clone();
-
-        // Assert
-        assert!(
-            matches!(cloned, BackendHandle::MeshForward(ref n, ref s) if n == "node-1" && s == "svc-llm")
-        );
-    }
-
-    #[test]
-    fn backend_handle_clone_all_variants() {
-        // Sprawdza ze Clone dziala dla kazdego wariantu
-        let variants: Vec<BackendHandle> = vec![
-            BackendHandle::LocalLlm,
-            BackendHandle::LocalStt,
-            BackendHandle::QuicLlm("q1".to_string()),
-            BackendHandle::QuicStt("q2".to_string()),
-            BackendHandle::QuicTts("q3".to_string()),
-            BackendHandle::QuicEmbedding("q4".to_string()),
-            BackendHandle::Http("h1".to_string()),
-            BackendHandle::MeshForward("n1".to_string(), "s1".to_string()),
-        ];
-
-        for v in &variants {
-            let _cloned = v.clone();
-        }
-    }
-
-    #[test]
-    fn backend_handle_type_name() {
-        assert_eq!(BackendHandle::LocalLlm.type_name(), "local_llm");
-        assert_eq!(BackendHandle::LocalStt.type_name(), "local_stt");
-        assert_eq!(BackendHandle::QuicLlm("x".into()).type_name(), "quic_llm");
-        assert_eq!(BackendHandle::Http("x".into()).type_name(), "http");
-        assert_eq!(
-            BackendHandle::MeshForward("n".into(), "s".into()).type_name(),
-            "mesh_forward"
-        );
-    }
-
-    // ========================================================================
-    // Testy ResolvedRoute — parsowanie aliasow z fallbackami
+    // parse_alias_fallback_targets — JSON list parsing
     // ========================================================================
 
     #[test]
     fn parse_alias_fallback_targets_json_array() {
-        let parsed =
-            super::parse_alias_fallback_targets(Some(r#"["model-b","model-c"]"#), "gpt-4");
-        assert_eq!(parsed, vec!["model-b".to_string(), "model-c".to_string()]);
+        let raw = Some(r#"["a","b","c"]"#);
+        let parsed = parse_alias_fallback_targets(raw, "alias-a");
+        assert_eq!(parsed, vec!["a", "b", "c"]);
     }
 
     #[test]
     fn parse_alias_fallback_targets_handles_empty_and_none() {
-        assert!(super::parse_alias_fallback_targets(None, "x").is_empty());
-        assert!(super::parse_alias_fallback_targets(Some(""), "x").is_empty());
-        assert!(super::parse_alias_fallback_targets(Some("  "), "x").is_empty());
-        // empty JSON array is also a no-op
-        assert!(super::parse_alias_fallback_targets(Some("[]"), "x").is_empty());
+        assert!(parse_alias_fallback_targets(None, "alias-none").is_empty());
+        assert!(parse_alias_fallback_targets(Some(""), "alias-empty").is_empty());
+        assert!(parse_alias_fallback_targets(Some("   "), "alias-ws").is_empty());
+        assert!(parse_alias_fallback_targets(Some("[]"), "alias-empty-arr").is_empty());
     }
 
     #[test]
     fn parse_alias_fallback_targets_trims_inner_whitespace() {
-        let parsed = super::parse_alias_fallback_targets(
-            Some(r#"["  fb-1 ", " fb-2","fb-3"]"#),
-            "spaces",
-        );
-        assert_eq!(parsed, vec!["fb-1", "fb-2", "fb-3"]);
+        let raw = Some(r#"["  a  ", "b", ""]"#);
+        let parsed = parse_alias_fallback_targets(raw, "alias-trim");
+        assert_eq!(parsed, vec!["a", "b"]);
     }
 
-    /// Legacy CSV writers were the bug that motivated CLAUDE.md §9.
-    /// `parse_alias_fallback_targets` deliberately fails closed (returns
-    /// empty + warn) instead of falling back to CSV — so a stale writer
-    /// is loud, not silently corrupted.
+    /// CLAUDE.md §9: CSV legacy format must reject (writer / reader sync
+    /// regressions used to silently turn `"a,b,c"` into a single-element
+    /// `Vec<String>` containing the comma string).
     #[test]
     fn parse_alias_fallback_targets_rejects_csv_legacy_format() {
-        let parsed = super::parse_alias_fallback_targets(Some("model-b,model-c"), "legacy-csv");
-        assert!(
-            parsed.is_empty(),
-            "CSV must NOT be silently accepted; got {:?}",
-            parsed
-        );
+        let parsed = parse_alias_fallback_targets(Some("a,b,c"), "alias-csv");
+        assert!(parsed.is_empty(), "CSV format must not be parsed as JSON");
     }
-
-    // ========================================================================
-    // Testy RouteMetadata
-    // ========================================================================
 
     #[test]
     fn route_metadata_serializes_to_json() {
-        // Arrange
-        let meta = RouteMetadata {
-            served_by_node: "node-1".to_string(),
-            backend_type: "quic_llm".to_string(),
-            strategy_used: "round_robin".to_string(),
-            fallbacks_tried: 2,
-            hop_count: 1,
-            latency_ms: Some(42.5),
+        let m = RouteMetadata {
+            served_by_node: "node-1".into(),
+            backend_type: "http".into(),
+            strategy_used: "first_available".into(),
+            fallbacks_tried: 1,
+            hop_count: 0,
+            latency_ms: Some(12.34),
         };
-
-        // Act
-        let json = serde_json::to_string(&meta).expect("Serializacja nie powiodla sie");
-
-        // Assert — kluczowe pola sa obecne w JSON
+        let json = serde_json::to_string(&m).expect("serialize");
         assert!(json.contains("\"served_by_node\":\"node-1\""));
-        assert!(json.contains("\"fallbacks_tried\":2"));
-        assert!(json.contains("\"hop_count\":1"));
-    }
-
-    // ========================================================================
-    // Testy apply_strategy — logika pure (bez pelnego Routera)
-    // ========================================================================
-
-    #[test]
-    fn strategy_first_available_preserves_order() {
-        // Arrange
-        let backends = vec![
-            BackendHandle::QuicLlm("svc1".to_string()),
-            BackendHandle::Http("svc2".to_string()),
-            BackendHandle::LocalLlm,
-        ];
-
-        // Act — FirstAvailable powinno zachowac oryginalny porzadek
-        // Testujemy logike match bez Routera
-        let result: Vec<usize> = match PoolStrategy::FirstAvailable {
-            PoolStrategy::FirstAvailable => (0..backends.len()).collect(),
-            _ => unreachable!(),
-        };
-
-        // Assert
-        assert_eq!(result, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn strategy_round_robin_rotates() {
-        // Arrange — symulacja logiki round-robin z apply_strategy
-        let len = 3;
-        let counter_val = 5usize; // 5 % 3 = 2
-
-        // Act — logika z apply_strategy
-        let idx = counter_val % len;
-        let result: Vec<usize> = (0..len).map(|i| (idx + i) % len).collect();
-
-        // Assert — zaczynamy od indeksu 2
-        assert_eq!(result, vec![2, 0, 1]);
-    }
-
-    #[test]
-    fn strategy_round_robin_wraps_around() {
-        // Arrange
-        let len = 4;
-        let counter_val = 7usize; // 7 % 4 = 3
-
-        // Act
-        let idx = counter_val % len;
-        let result: Vec<usize> = (0..len).map(|i| (idx + i) % len).collect();
-
-        // Assert
-        assert_eq!(result, vec![3, 0, 1, 2]);
-    }
-
-    #[test]
-    fn strategy_empty_backends_returns_empty() {
-        // Arrange
-        let backends: Vec<BackendHandle> = vec![];
-
-        // Act — logika z apply_strategy: jesli puste, zwraca pusty vec
-        let result: Vec<&BackendHandle> = if backends.is_empty() {
-            Vec::new()
-        } else {
-            backends.iter().collect()
-        };
-
-        // Assert
-        assert!(result.is_empty());
-    }
-
-    // ========================================================================
-    // Snapshot-first resolve_route / get_backends
-    // ========================================================================
-
-    use crate::config::RouterConfig;
-    use crate::routing::router::Router;
-    use crate::services::mesh_registry::MeshServicesRegistry;
-    use crate::services::supervisor::{ModelEntry, ServiceEntry, ServicesSnapshot};
-    use crate::services::transport::Transport;
-    use crate::services_repo::services::{DeployMethod, ServiceStatus};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::watch;
-
-    fn make_router_with_snapshot(snap: ServicesSnapshot) -> Arc<Router> {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for test DB");
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
-        let db = crate::db::init(&path).expect("test DB init");
-        let router = Arc::new(Router::new(RouterConfig::default(), Some(db)).expect("test router"));
-        let (_tx, rx) = watch::channel(Arc::new(snap));
-        router.service_manager().set_snapshot_rx(rx);
-        let registry = Arc::new(MeshServicesRegistry::new());
-        registry.replace_local(
-            "local".to_string(),
-            router
-                .service_manager()
-                .current_snapshot()
-                .services
-                .iter()
-                .map(service_entry_to_info)
-                .collect(),
-        );
-        router
-            .service_manager()
-            .set_mesh_services_registry(registry);
-        router
-    }
-
-    fn service_entry_to_info(entry: &ServiceEntry) -> tentaflow_protocol::ServiceInfo {
-        tentaflow_protocol::ServiceInfo {
-            id: entry.id,
-            node_id: "local".to_string(),
-            engine_id: entry.engine_id.clone(),
-            category: entry.category.clone(),
-            display_name: entry.display_name.clone(),
-            deploy_method: entry.deploy_method.as_db_tag().to_string(),
-            transport: entry.transport.as_db_tag().to_string(),
-            status: entry.status.as_db_tag().to_string(),
-            pinned: entry.pinned,
-            paused: entry.paused,
-            runtime_pid: entry.runtime_pid.map(i64::from),
-            runtime_port: entry.runtime_port,
-            sidecar_quic_port: entry.sidecar_quic_port,
-            endpoint_url: entry.endpoint_url.clone(),
-            restart_count: 0,
-            health_last_err: None,
-            models: entry
-                .models
-                .iter()
-                .map(|m| tentaflow_protocol::ServiceModelEntry {
-                    model_name: m.model_name.clone(),
-                    display_name: m.display_name.clone(),
-                    capabilities: vec!["chat".to_string()],
-                    context_length: None,
-                    quantization: None,
-                    is_default: m.is_default,
-                })
-                .collect(),
-            created_at: String::new(),
-            updated_at: String::new(),
-        }
-    }
-
-    fn fixture_entry(
-        id: i64,
-        engine_id: &str,
-        transport: Transport,
-        models: Vec<&str>,
-    ) -> ServiceEntry {
-        ServiceEntry {
-            id,
-            engine_id: engine_id.into(),
-            category: "llm".into(),
-            display_name: engine_id.into(),
-            deploy_method: DeployMethod::NativePythonBundle,
-            transport,
-            status: ServiceStatus::Running,
-            pinned: false,
-            paused: false,
-            endpoint_url: Some("http://127.0.0.1:5099".into()),
-            runtime_pid: None,
-            runtime_port: Some(5099),
-            sidecar_quic_port: Some(5100),
-            models: models
-                .into_iter()
-                .enumerate()
-                .map(|(i, name)| ModelEntry {
-                    id: (id * 100) + i as i64,
-                    model_name: name.into(),
-                    display_name: None,
-                    is_default: i == 0,
-                })
-                .collect(),
-            timeout_ms: 30_000,
-            max_concurrent: 16,
-            weight: 100,
-            model_name_override: None,
-            extra_config: HashMap::new(),
-        }
-    }
-
-    fn build_snapshot(services: Vec<ServiceEntry>) -> ServicesSnapshot {
-        let mut models_by_name = HashMap::new();
-        let mut services_by_id = HashMap::new();
-        for (idx, svc) in services.iter().enumerate() {
-            services_by_id.insert(svc.id, idx);
-            for m in &svc.models {
-                models_by_name.insert(m.model_name.clone(), svc.id);
-            }
-        }
-        ServicesSnapshot {
-            services,
-            models_by_name,
-            services_by_id,
-            generated_at_unix_ms: 0,
-        }
-    }
-
-    #[test]
-    fn resolve_route_uses_snapshot_first() {
-        // Arrange — snapshot zna model X. Ani config aliasy, ani legacy stores
-        // nie znaja modelu — gdyby snapshot path nie dzialal, weszlibysmy w
-        // krok 5 (oryginalna nazwa).
-        let svc = fixture_entry(1, "vllm", Transport::HttpDirect, vec!["llama-x"]);
-        let router = make_router_with_snapshot(build_snapshot(vec![svc]));
-
-        // Act
-        let route = router.resolve_route("llama-x");
-
-        // Assert
-        assert_eq!(route.targets, vec!["llama-x".to_string()]);
-        assert!(matches!(route.strategy, PoolStrategy::FirstAvailable));
-    }
-
-    #[test]
-    fn resolve_route_falls_back_when_snapshot_empty() {
-        // Arrange — pusty snapshot, brak aliasow, brak serwisow legacy.
-        // Powinien zlapac sie krok 5: oryginalna nazwa.
-        let router = make_router_with_snapshot(ServicesSnapshot::default());
-
-        // Act
-        let route = router.resolve_route("unknown-model");
-
-        // Assert — krok 5 zwraca oryginalna nazwe ze strategia FirstAvailable.
-        assert_eq!(route.targets, vec!["unknown-model".to_string()]);
-        assert!(matches!(route.strategy, PoolStrategy::FirstAvailable));
-    }
-
-    #[test]
-    fn resolve_route_snapshot_matches_engine_id() {
-        // Arrange — niektore deploy'e (ollama, vllm) lapia request po engine_id
-        // a nie po nazwie modelu. find_services_for_model wspiera oba klucze;
-        // resolve_route podpiera te sama heurystyke.
-        let svc = fixture_entry(2, "ollama", Transport::ExternalHttp, vec!["llama3.1:8b"]);
-        let router = make_router_with_snapshot(build_snapshot(vec![svc]));
-
-        // Act
-        let route = router.resolve_route("ollama");
-
-        // Assert
-        assert_eq!(route.targets, vec!["ollama".to_string()]);
-    }
-
-    #[test]
-    fn get_backends_snapshot_embedded_yields_local_llm() {
-        // Arrange — snapshot ma embedded service; legacy local_inference_models
-        // tez musi byc populated (tak robi register_local_inference_model przy
-        // deploy commit), bo BackendHandle::LocalLlm idzie przez
-        // LocalInferenceManager.
-        let svc = fixture_entry(3, "llama-cpp", Transport::Embedded, vec!["qwen-mini"]);
-        let router = make_router_with_snapshot(build_snapshot(vec![svc]));
-        router
-            .service_manager()
-            .register_local_inference_model("qwen-mini");
-
-        // Act
-        let backends = router.get_backends("qwen-mini", None);
-
-        // Assert — snapshot path zwraca LocalLlm.
-        assert!(
-            backends
-                .iter()
-                .any(|b| matches!(b, BackendHandle::LocalLlm)),
-            "expected LocalLlm in {:?}",
-            backends.iter().map(|b| b.type_name()).collect::<Vec<_>>()
-        );
-    }
-
-    /// R4.A fail-closed: a service whose `engine_id` has no registered
-    /// manifest must NOT be admitted for audio dispatch. The earlier
-    /// permissive behavior allowed a legacy text-only sibling that
-    /// happened to expose the same `model_name` as a real audio engine
-    /// to silently swallow audio requests.
-    #[test]
-    fn service_accepts_input_fail_closed_for_audio_without_manifest() {
-        use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
-        let manifests = crate::services::manifest::registry();
-        let svc = ServiceInfo {
-            id: 99,
-            node_id: "n".into(),
-            engine_id: "ghost-engine".into(), // not a registered manifest id
-            category: "llm".into(),
-            display_name: "ghost".into(),
-            deploy_method: "native_embedded".into(),
-            transport: "embedded".into(),
-            status: "running".into(),
-            pinned: false,
-            paused: false,
-            runtime_pid: None,
-            runtime_port: None,
-            sidecar_quic_port: None,
-            endpoint_url: None,
-            restart_count: 0,
-            health_last_err: None,
-            models: vec![ServiceModelEntry {
-                model_name: "shared".into(),
-                display_name: None,
-                capabilities: vec![],
-                context_length: None,
-                quantization: None,
-                is_default: true,
-            }],
-            created_at: String::new(),
-            updated_at: String::new(),
-        };
-        // Audio + Image require explicit manifest support; Text stays
-        // permissive so legacy services without a manifest can still
-        // serve text dispatch.
-        assert!(!service_accepts_input(
-            manifests,
-            &svc,
-            "shared",
-            InputModality::Audio
-        ));
-        assert!(!service_accepts_input(
-            manifests,
-            &svc,
-            "shared",
-            InputModality::Image
-        ));
-        assert!(service_accepts_input(
-            manifests,
-            &svc,
-            "shared",
-            InputModality::Text
-        ));
+        assert!(json.contains("\"backend_type\":\"http\""));
+        assert!(json.contains("\"latency_ms\":12.34"));
     }
 }
