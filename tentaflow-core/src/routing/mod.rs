@@ -20,7 +20,7 @@ pub mod tts;
 pub mod video_pipeline;
 
 // Re-eksporty publicznych typow
-pub use middleware::{BackendHandle, ResolvedRoute, RouteMetadata, RouteResult};
+pub use middleware::{ResolvedRoute, RouteMetadata, RouteResult};
 pub use router::{
     BackendMetric, DiarizedSpeaker, RequestMetrics, Router, RouterMetrics, SpeakerIdentifyResult,
     SttWithDiarization, VoiceInfo,
