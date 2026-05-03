@@ -2,7 +2,7 @@
 // Plik: routing/video_pipeline.rs
 // Opis: Pipeline rozpoznawania emocji z klatki wideo uczestnika meetingu.
 //       Wywoływany przez handler `MeetingEventPayload::VideoFrame` w
-//       `reverse_request.rs`. Inferencja idzie przez `vision::registry`
+//       `mesh/inference_proxy.rs`. Inferencja idzie przez `vision::registry`
 //       (SCRFD → HSEmotion), wynik leci broadcastem jako
 //       `MeetingEventPayload::ParticipantAttributes`. Pola `age` i
 //       `gender_male_prob` w protokole pozostają (kompatybilność), ale ten

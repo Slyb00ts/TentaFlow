@@ -1,5 +1,5 @@
 // =============================================================================
-// Plik: routing/acl.rs
+// Plik: auth/acl.rs
 // Opis: Helper do sprawdzania ACL (resource_permissions) przed wykonaniem
 //       operacji routingowej. Wolany przez chat/embedding/tts handlery gdy
 //       maja user context (z HandlerContext). Priorytet:

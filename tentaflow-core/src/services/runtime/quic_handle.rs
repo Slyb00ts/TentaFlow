@@ -1,5 +1,5 @@
 // =============================================================================
-// Plik: routing/service_manager.rs
+// Plik: services/runtime/quic_handle.rs
 // Opis: Asynchroniczny manager polaczen serwisow. Zarzadza cyklem zycia
 //       polaczen QUIC (Embeddings, LLM, TTS, STT, Memory) oraz
 //       backendami HTTP. Zapewnia rownolegle nawiazywanie polaczen,

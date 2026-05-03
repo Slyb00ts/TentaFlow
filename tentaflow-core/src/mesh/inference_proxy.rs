@@ -1,5 +1,5 @@
 // =============================================================================
-// Plik: routing/reverse_request.rs
+// Plik: mesh/inference_proxy.rs
 // Opis: Obsluga odwrotnych QUIC requestow od kontenerow. Kontenery moga
 //       otwierac strumienie bi-directional na istniejacym polaczeniu, aby
 //       wyslac ModelRequest do routera (np. sidecar wola STT/TTS).
