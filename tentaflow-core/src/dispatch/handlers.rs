@@ -5479,6 +5479,8 @@ mod catalog_list_tests {
                     backend: Some("llama-cpp".into()),
                     size_mb: Some(2048),
                     loaded: true,
+                    input_modalities: vec![InputModality::Text],
+                    output_modalities: vec![OutputModality::Text],
                 }],
             },
             service_surfaces: vec![surface],

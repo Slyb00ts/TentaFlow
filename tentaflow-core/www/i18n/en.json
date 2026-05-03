@@ -267,6 +267,7 @@
     "alias_active": "Active",
     "alias_inactive": "Inactive",
     "alias_required": "Name and target are required",
+    "alias_fallback_parse_failed": "Could not read existing fallbacks (invalid format). Refresh the page or re-add fallbacks before saving.",
     "alias_created": "Alias created",
     "alias_updated": "Alias updated",
     "alias_deleted": "Alias \"{name}\" deleted",
@@ -634,10 +635,6 @@
       "reranker": {
         "name": "Reranker",
         "desc": "Search results reranking. Cross-encoder for precise document scoring."
-      },
-      "rag": {
-        "name": "RAG Engine",
-        "desc": "Retrieval-Augmented Generation. Knowledge base search and generation."
       },
       "tools": {
         "name": "Tools",
@@ -1022,7 +1019,6 @@
     "categories": {
       "trigger": "Triggers",
       "service": "AI Services",
-      "rag": "RAG",
       "transform": "Transform",
       "logic": "Logic",
       "filter": "Filters",
@@ -1088,7 +1084,6 @@
     "node_names": {
       "trigger": "Trigger",
       "llm": "LLM Call",
-      "rag": "RAG Search",
       "stt": "Speech to Text",
       "tts": "Text to Speech",
       "embeddings": "Embeddings",
@@ -1108,7 +1103,6 @@
     "node_descriptions": {
       "trigger": "Flow entry point (HTTP, QUIC, webhook)",
       "llm": "LLM call - sends prompt and returns response",
-      "rag": "Knowledge base search - returns context for LLM",
       "stt": "Speech to Text transcription",
       "tts": "Text to Speech synthesis",
       "embeddings": "Text embeddings generation",
@@ -1171,7 +1165,7 @@
     "status_archived": "Archived",
     "status_draft": "Draft",
     "list_title": "Flows",
-    "subtitle": "DAG graph executed by flow_engine — LLM, embeddings, TTS, RAG.",
+    "subtitle": "DAG graph executed by flow_engine — LLM, embeddings, TTS.",
     "empty_title": "No flows",
     "empty_desc": "Create your first flow to define a processing graph.",
     "new_flow_btn": "New flow",

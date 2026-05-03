@@ -245,6 +245,7 @@
     "alias_active": "Activo",
     "alias_inactive": "Inactivo",
     "alias_required": "Nombre y objetivo son requeridos",
+    "alias_fallback_parse_failed": "No se pudieron leer los fallbacks existentes (formato inválido). Recarga la página o vuelve a añadir los fallbacks antes de guardar.",
     "alias_created": "Alias creado",
     "alias_updated": "Alias actualizado",
     "alias_deleted": "Alias «{name}» eliminado",
@@ -524,10 +525,6 @@
       "reranker": {
         "name": "Reranker",
         "desc": "Reranking de resultados de búsqueda. Cross-encoder para puntuación precisa de documentos."
-      },
-      "rag": {
-        "name": "RAG Engine",
-        "desc": "Retrieval-Augmented Generation. Búsqueda en base de conocimiento y generación de respuestas."
       },
       "tools": {
         "name": "Tools",
@@ -912,7 +909,6 @@
     "categories": {
       "trigger": "Disparadores",
       "service": "Servicios IA",
-      "rag": "RAG",
       "transform": "Transformaciones",
       "logic": "Lógica",
       "filter": "Filtros",
@@ -978,7 +974,6 @@
     "node_names": {
       "trigger": "Trigger",
       "llm": "Llamada LLM",
-      "rag": "Búsqueda RAG",
       "stt": "Voz a texto",
       "tts": "Texto a voz",
       "embeddings": "Embeddings",
@@ -998,7 +993,6 @@
     "node_descriptions": {
       "trigger": "Punto de entrada del flow (HTTP, QUIC, webhook)",
       "llm": "Llamada LLM - envía el prompt y devuelve la respuesta",
-      "rag": "Búsqueda en base de conocimiento - devuelve contexto para el LLM",
       "stt": "Transcripción de voz a texto",
       "tts": "Síntesis de texto a voz",
       "embeddings": "Generación de embeddings de texto",
@@ -1061,7 +1055,7 @@
     "status_archived": "Archivado",
     "status_draft": "Borrador",
     "list_title": "Flujos",
-    "subtitle": "Grafo DAG ejecutado por flow_engine — LLM, embeddings, TTS, RAG.",
+    "subtitle": "Grafo DAG ejecutado por flow_engine — LLM, embeddings, TTS.",
     "empty_title": "Sin flujos",
     "empty_desc": "Crea tu primer flujo para definir un grafo de procesamiento.",
     "new_flow_btn": "Nuevo flujo",

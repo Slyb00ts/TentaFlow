@@ -25,13 +25,23 @@ pub struct LlmNodeAdapter {
     /// w kroku N7.3); aliasy modeli pochodza z DB, nie z config.toml.
     #[allow(dead_code)]
     config: Arc<RouterConfig>,
+    /// R2a: shared slot na unified runtime executor. None tylko w testach
+    /// ktore omijaja `Router::new`. Adapter lockuje slot, klonuje `Arc`,
+    /// uzywa — single point of dispatch dla LLM (alias resolution +
+    /// strategy + per-instance modality filter).
+    executor_slot: crate::flow_engine::dispatcher::ExecutorSlot,
 }
 
 impl LlmNodeAdapter {
-    pub fn new(service_manager: Arc<ServiceManager>, config: Arc<RouterConfig>) -> Self {
+    pub fn new(
+        service_manager: Arc<ServiceManager>,
+        config: Arc<RouterConfig>,
+        executor_slot: crate::flow_engine::dispatcher::ExecutorSlot,
+    ) -> Self {
         Self {
             service_manager,
             config,
+            executor_slot,
         }
     }
 
@@ -72,16 +82,25 @@ impl LlmNodeAdapter {
             .map(|t| t as u32);
 
         let messages = if use_messages_context && !ctx.messages.is_empty() {
-            // Konwertuj ctx.messages na Vec<Message>
+            // The `content` field may arrive as a plain string (legacy
+            // text message) or as an array of typed fragments
+            // (`MessageContent::Parts` — vision / future multimodal).
+            // Deserialise the whole value through serde so Parts land
+            // as `MessageContent::Parts` instead of being collapsed to
+            // empty text by an `as_str()` shortcut.
             let mut msgs: Vec<Message> = ctx
                 .messages
                 .iter()
                 .filter_map(|v| {
                     let role = v.get("role")?.as_str()?.to_string();
-                    let content = v.get("content")?.as_str()?.to_string();
+                    let raw_content = v.get("content").cloned().unwrap_or(serde_json::Value::Null);
+                    let content = match raw_content {
+                        serde_json::Value::Null => None,
+                        other => serde_json::from_value::<MessageContent>(other).ok(),
+                    };
                     Some(Message {
                         role,
-                        content: Some(MessageContent::Text(content)),
+                        content,
                         name: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -144,12 +163,7 @@ impl LlmNodeAdapter {
                 });
             }
 
-            // Jesli poprzedni wezel to RAG - polacz kontekst z oryginalnym pytaniem
-            let input_text = if let Some(rag_context) = self.detect_rag_context(node_config, ctx) {
-                format!("Kontekst:\n{}\n\nPytanie: {}", rag_context, ctx.input)
-            } else {
-                self.resolve_input_text(node_config, ctx)
-            };
+            let input_text = self.resolve_input_text(node_config, ctx);
 
             msgs.push(Message {
                 role: "user".to_string(),
@@ -178,32 +192,8 @@ impl LlmNodeAdapter {
             tools: None,
             tool_choice: None,
             n: None,
-            rag_options: None,
             memory_options: None,
             audio_input: None,
-        }
-    }
-
-    /// Wykrywa kontekst RAG z poprzedniego wezla
-    fn detect_rag_context(&self, node_config: &Value, ctx: &FlowContext) -> Option<String> {
-        let prev_result =
-            if let Some(input_from) = node_config.get("input_from").and_then(|v| v.as_str()) {
-                ctx.node_results.get(input_from)
-            } else if let Some(last_log) = ctx.execution_log.last() {
-                ctx.node_results.get(&last_log.node_id)
-            } else {
-                None
-            };
-
-        let prev = prev_result?;
-
-        // Jesli wynik zawiera "context" i "sources" - to RAG output
-        if prev.get("context").is_some() && prev.get("sources").is_some() {
-            prev.get("context")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
         }
     }
 
@@ -246,6 +236,84 @@ impl NodeAdapter for LlmNodeAdapter {
             "LLM adapter: wywolanie serwisu"
         );
 
+        // R2a: jednolity dispatch przez `ModelRuntimeExecutor` — alias
+        // resolution + strategy + per-instance modality filter w jednym
+        // miejscu (`services/runtime/executor.rs`). Embedded / HTTP /
+        // QUIC LLM idzie przez executor; legacy mini-router zostaje na
+        // wypadek braku executor'a w testach (DB-less Router).
+        //
+        // Snapshot Arc przed `.await` zeby trzymanie guard'a parking_lot
+        // nie przeszlo przez yield point — inaczej future nie jest Send.
+        let executor_snapshot = self.executor_slot.read().clone();
+        if let Some(executor) = executor_snapshot {
+            use crate::services::runtime::context::ExecutionContext;
+            let mut exec_ctx = ExecutionContext::default();
+            match executor.execute_chat(request.clone(), &mut exec_ctx).await {
+                Ok(response) => {
+                    // Codex H1 round 2: aplikuj PII filter na content
+                    // PRZED zwroceniem do flow context. Direct executor
+                    // path w `chat::route_chat_completion` robi to
+                    // przez `apply_response_middleware`; flow path tutaj
+                    // ma wlasna sciezke (executor → adapter → flow ctx)
+                    // i tez musi czyscic. Reuse `ResponseMiddleware` z
+                    // ServiceManager — adapter trzyma Arc<ServiceManager>.
+                    let raw_content = response
+                        .choices
+                        .first()
+                        .and_then(|c| c.message.content.as_ref())
+                        .map(|c| match c {
+                            MessageContent::Text(text) => text.clone(),
+                            MessageContent::Parts(parts) => parts
+                                .iter()
+                                .filter_map(|p| {
+                                    if let crate::api::openai::types::ContentPart::Text {
+                                        text,
+                                    } = p
+                                    {
+                                        Some(text.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        })
+                        .unwrap_or_default();
+                    // ServiceManager nie wystawia handle do ResponseMiddleware;
+                    // tworzymy lekka instancje per-call (no state, only enabled
+                    // flag z RouterConfig). To samo co Router::new robi przy
+                    // konstrukcji `response_middleware`.
+                    let rm = crate::middleware::ResponseMiddleware::new(
+                        self.config.middleware.response_filtering_enabled,
+                    );
+                    let content = rm.clean_text(&raw_content)?;
+                    let tokens_prompt = response
+                        .usage
+                        .as_ref()
+                        .map(|u| u.prompt_tokens as i64)
+                        .unwrap_or(0);
+                    let tokens_completion = response
+                        .usage
+                        .as_ref()
+                        .map(|u| u.completion_tokens as i64)
+                        .unwrap_or(0);
+                    return Ok(serde_json::json!({
+                        "content": content,
+                        "tokens": { "prompt": tokens_prompt, "completion": tokens_completion },
+                        "model": model_name,
+                        "text": content,
+                    }));
+                }
+                Err(e) => {
+                    warn!(
+                        model = %model_name,
+                        "LLM adapter: executor dispatch failed: {} — fallback na legacy path",
+                        e
+                    );
+                }
+            }
+        }
+
         let resolved_quic_client = self
             .service_manager
             .find_quic_client_for_model(&model_name)
@@ -256,14 +324,25 @@ impl NodeAdapter for LlmNodeAdapter {
                 {
                     let request_id = uuid::Uuid::new_v4().to_string();
 
-                    // Konwertuj messages do formatu protocol
+                    // Convert messages to the wire protocol. The QUIC
+                    // `protocol::Message.content` is a plain `String`,
+                    // so multimodal Parts cannot ride through it as
+                    // typed payload — extract every text fragment and
+                    // log a warning when a non-text part is dropped so
+                    // an operator can spot the silent capability loss.
+                    // A typed multimodal protocol slot is the correct
+                    // long-term fix; until that lands the QUIC path is
+                    // explicitly text-only.
                     let protocol_messages: Vec<tentaflow_protocol::Message> = request
                         .messages
                         .iter()
                         .map(|m| {
                             let content = match &m.content {
                                 Some(MessageContent::Text(text)) => text.clone(),
-                                _ => String::new(),
+                                Some(MessageContent::Parts(parts)) => {
+                                    extract_text_parts_with_warning(&m.role, parts)
+                                }
+                                None => String::new(),
                             };
                             tentaflow_protocol::Message {
                                 role: m.role.clone(),
@@ -430,13 +509,19 @@ impl NodeAdapter for LlmNodeAdapter {
         if let Some(quic_client) = resolved_quic_client {
             {
                 {
+                    // See `extract_text_parts_with_warning` rationale on
+                    // the blocking path — same QUIC text-only constraint
+                    // applies for streaming dispatch.
                     let protocol_messages: Vec<tentaflow_protocol::Message> = request
                         .messages
                         .iter()
                         .map(|m| {
                             let content = match &m.content {
                                 Some(MessageContent::Text(text)) => text.clone(),
-                                _ => String::new(),
+                                Some(MessageContent::Parts(parts)) => {
+                                    extract_text_parts_with_warning(&m.role, parts)
+                                }
+                                None => String::new(),
                             };
                             tentaflow_protocol::Message {
                                 role: m.role.clone(),
@@ -517,5 +602,118 @@ impl NodeAdapter for LlmNodeAdapter {
 
     fn supported_output_ports(&self) -> &'static [&'static str] {
         &["stream", "full"]
+    }
+}
+
+/// Extract every text fragment from a `MessageContent::Parts` list and
+/// concatenate them; emit a `tracing::warn!` whenever a non-text part
+/// (image URL, future audio) is dropped so the downgrade is visible in
+/// production logs. The QUIC wire protocol carries `String` content
+/// only, so a richer wire shape requires extending
+/// `tentaflow_protocol::Message` — until that lands this helper is the
+/// honest path: keep the prompt readable, surface the loss.
+fn extract_text_parts_with_warning(
+    role: &str,
+    parts: &[crate::api::openai::types::ContentPart],
+) -> String {
+    let mut text = String::new();
+    let mut dropped = 0usize;
+    for part in parts {
+        match part {
+            crate::api::openai::types::ContentPart::Text { text: t } => {
+                if !text.is_empty() && !text.ends_with(char::is_whitespace) {
+                    text.push(' ');
+                }
+                text.push_str(t);
+            }
+            crate::api::openai::types::ContentPart::ImageUrl { .. } => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            role = role,
+            dropped_parts = dropped,
+            "QUIC dispatch is text-only; non-text MessageContent::Parts \
+             fragments dropped — extend tentaflow_protocol::Message to \
+             carry typed multimodal payloads"
+        );
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::openai::types::{ContentPart, ImageUrl, MessageContent};
+    use serde_json::json;
+
+    /// `MessageContent` is `#[serde(untagged)]`; a JSON value carrying an
+    /// array of typed parts must deserialise into `Parts`, not collapse
+    /// into the empty `as_str()` fallback the old build_request used.
+    #[test]
+    fn message_content_parts_deserialise_round_trip() {
+        let raw = json!([
+            { "type": "text", "text": "hello" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,XXX" } }
+        ]);
+        let decoded: MessageContent =
+            serde_json::from_value(raw).expect("Parts payload must deserialise");
+        match decoded {
+            MessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], ContentPart::Text { text } if text == "hello"));
+                assert!(matches!(&parts[1], ContentPart::ImageUrl { .. }));
+            }
+            other => panic!("expected Parts, got {:?}", other),
+        }
+    }
+
+    /// QUIC wire is text-only. The extractor walks Parts, joins text
+    /// fragments with whitespace, and silently drops every non-text
+    /// part — but emits a tracing warn (asserted indirectly by the
+    /// `dropped > 0` branch). The visible behaviour is: text in,
+    /// image-url out, single concatenated string returned.
+    #[test]
+    fn extract_text_parts_concatenates_text_and_drops_images() {
+        let parts = vec![
+            ContentPart::Text { text: "Look at this".into() },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,X".into(),
+                    detail: None,
+                },
+            },
+            ContentPart::Text { text: "carefully.".into() },
+        ];
+        let extracted = extract_text_parts_with_warning("user", &parts);
+        assert_eq!(extracted, "Look at this carefully.");
+    }
+
+    /// All-text Parts produce no warning and the full prompt — used to
+    /// confirm the helper is a no-op when there is nothing to drop.
+    #[test]
+    fn extract_text_parts_passes_text_only_through_unchanged() {
+        let parts = vec![
+            ContentPart::Text { text: "First.".into() },
+            ContentPart::Text { text: "Second.".into() },
+        ];
+        let extracted = extract_text_parts_with_warning("system", &parts);
+        assert_eq!(extracted, "First. Second.");
+    }
+
+    /// Image-only Parts collapse to empty string after the warning —
+    /// caller will end up sending a no-content message, which is the
+    /// honest text-only behaviour for QUIC. Asserts we never panic on
+    /// pure-image input.
+    #[test]
+    fn extract_text_parts_image_only_returns_empty_string() {
+        let parts = vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,X".into(),
+                detail: Some("low".into()),
+            },
+        }];
+        let extracted = extract_text_parts_with_warning("user", &parts);
+        assert!(extracted.is_empty());
     }
 }

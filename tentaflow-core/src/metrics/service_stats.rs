@@ -10,7 +10,7 @@ use serde::Serialize;
 pub struct ServiceStats {
     /// Nazwa serwisu (np. "bielik-11b-llm")
     pub service_name: String,
-    /// Typ serwisu (np. "LLM", "Embedding", "STT", "TTS", "RAG")
+    /// Typ serwisu (np. "LLM", "Embedding", "STT", "TTS")
     pub service_type: String,
     /// Status polaczenia: "connected", "disconnected", "error"
     pub status: String,

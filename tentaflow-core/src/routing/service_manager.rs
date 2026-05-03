@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: routing/service_manager.rs
 // Opis: Asynchroniczny manager polaczen serwisow. Zarzadza cyklem zycia
-//       polaczen QUIC (RAG, Embeddings, LLM, TTS, STT, Memory) oraz
+//       polaczen QUIC (Embeddings, LLM, TTS, STT, Memory) oraz
 //       backendami HTTP. Zapewnia rownolegle nawiazywanie polaczen,
 //       background reconnect i lock-free odczyt stanu serwisow.
 // =============================================================================
@@ -10,7 +10,6 @@ use crate::config::RouterConfig;
 use crate::error::Result;
 use crate::routing::backend::BackendClient;
 
-use crate::services::rag::client::{RAGClient, RAGEngineConfigCompat};
 use crate::prompt_registry::{create_shared_registry, SharedPromptRegistry};
 
 use std::collections::{HashMap, VecDeque};
@@ -121,7 +120,7 @@ impl Default for ConversationCache {
 // TYPY STANOW SERWISOW
 // ============================================================================
 
-/// Stan polaczenia serwisu QUIC (RAG, Embeddings)
+/// Stan polaczenia serwisu QUIC (Embeddings, TTS itp.)
 #[derive(Debug, Clone)]
 pub enum QuicServiceState {
     /// Trwa laczenie (background task dziala)
@@ -137,56 +136,6 @@ pub enum QuicServiceState {
 impl QuicServiceState {
     pub fn is_available(&self) -> bool {
         matches!(self, QuicServiceState::Connected)
-    }
-}
-
-/// Wrapper dla RAG client z stanem
-pub struct RAGServiceHandle {
-    pub state: RwLock<QuicServiceState>,
-    pub client: RwLock<Option<Arc<RAGClient>>>,
-    pub config: RAGEngineConfigCompat,
-    /// Sygnal shutdown per serwis
-    shutdown_tx: watch::Sender<bool>,
-    pub shutdown_rx: watch::Receiver<bool>,
-}
-
-impl RAGServiceHandle {
-    pub fn new(config: RAGEngineConfigCompat) -> Self {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        Self {
-            state: RwLock::new(QuicServiceState::Connecting),
-            client: RwLock::new(None),
-            config,
-            shutdown_tx,
-            shutdown_rx,
-        }
-    }
-
-    /// Wyslij sygnal shutdown do tego serwisu
-    pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
-    }
-
-    /// Sprawdz czy serwis jest dostepny (non-blocking read)
-    pub async fn is_available(&self) -> bool {
-        self.state.read().await.is_available()
-    }
-
-    /// Pobierz klienta jesli dostepny (non-blocking read)
-    pub async fn get_client(&self) -> Option<Arc<RAGClient>> {
-        self.client.read().await.clone()
-    }
-
-    /// Ustaw stan connected z klientem
-    pub async fn set_connected(&self, client: Arc<RAGClient>) {
-        *self.client.write().await = Some(client);
-        *self.state.write().await = QuicServiceState::Connected;
-    }
-
-    /// Ustaw stan disconnected
-    pub async fn set_disconnected(&self, reason: String) {
-        *self.client.write().await = None;
-        *self.state.write().await = QuicServiceState::Disconnected { reason };
     }
 }
 
@@ -314,11 +263,6 @@ pub struct ServiceManager {
     /// Konfiguracja
     pub config: Arc<RouterConfig>,
 
-    /// RAG services. RAG has callback-style ingest/query semantics that don't
-    /// fit `BackendHandle` (krok N7.4 retains the legacy DashMap on purpose);
-    /// supervisor is free to ignore it.
-    pub rag_services: dashmap::DashMap<String, Arc<RAGServiceHandle>>,
-
     /// TTS clients (HTTP, nie wymagaja polaczenia)
 
     /// Kategorie modeli LLM (dla KV Cache) - nazwa -> kategoria
@@ -327,20 +271,6 @@ pub struct ServiceManager {
     /// Modele obslugiwane przez lokalna inferencje in-process (MLX, llama.cpp).
     /// DashMap<K, ()> zamiast HashSet — lock-free contains_key.
     pub local_inference_models: dashmap::DashMap<String, ()>,
-
-    /// Callback channel dla RAG
-    callback_tx: mpsc::UnboundedSender<(
-        tentaflow_protocol::ModelRequest,
-        mpsc::Sender<tentaflow_protocol::ModelResponse>,
-    )>,
-    callback_rx: Arc<
-        tokio::sync::Mutex<
-            mpsc::UnboundedReceiver<(
-                tentaflow_protocol::ModelRequest,
-                mpsc::Sender<tentaflow_protocol::ModelResponse>,
-            )>,
-        >,
-    >,
 
     /// Shutdown signal
     shutdown_tx: watch::Sender<bool>,
@@ -384,7 +314,6 @@ impl ServiceManager {
     /// Tworzy ServiceManager i NATYCHMIAST zwraca.
     /// Wszystkie polaczenia QUIC sa uruchamiane w background taskach.
     pub fn new(config: Arc<RouterConfig>, db_pool: Option<crate::db::DbPool>) -> Result<Self> {
-        let (callback_tx, callback_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let prompt_registry = create_shared_registry(db_pool);
@@ -399,11 +328,8 @@ impl ServiceManager {
 
         Ok(Self {
             config,
-            rag_services: dashmap::DashMap::new(),
             llm_model_categories: dashmap::DashMap::new(),
             local_inference_models: dashmap::DashMap::new(),
-            callback_tx,
-            callback_rx: Arc::new(tokio::sync::Mutex::new(callback_rx)),
             shutdown_tx,
             shutdown_rx,
             prompt_registry,
@@ -495,17 +421,6 @@ impl ServiceManager {
         }
     }
 
-    /// RAG client by service name. RAG handles are indexed in the legacy
-    /// `rag_services` DashMap because RAG follows a different lifecycle (ingest
-    /// callbacks) than the unified `BackendHandle` model.
-    pub async fn get_rag_client(&self, service_name: &str) -> Option<Arc<RAGClient>> {
-        let handle = self
-            .rag_services
-            .get(service_name)
-            .map(|r| r.value().clone())?;
-        handle.get_client().await
-    }
-
     /// QUIC Embedding client by model — resolved via live handles cache.
     pub async fn get_quic_embedding_client(
         &self,
@@ -549,20 +464,6 @@ impl ServiceManager {
         })
     }
 
-    /// Pobierz callback receiver
-    pub fn get_callback_rx(
-        &self,
-    ) -> Arc<
-        tokio::sync::Mutex<
-            mpsc::UnboundedReceiver<(
-                tentaflow_protocol::ModelRequest,
-                mpsc::Sender<tentaflow_protocol::ModelResponse>,
-            )>,
-        >,
-    > {
-        self.callback_rx.clone()
-    }
-
     /// Wires the router used for reverse requests from sidecar containers.
     pub fn set_reverse_router(&self, router: crate::routing::Router) {
         *self.reverse_router.write() = Some(router);
@@ -581,11 +482,6 @@ impl ServiceManager {
     // ========================================================================
     // ADDITIONAL ACCESSORS (for Router compatibility)
     // ========================================================================
-
-    /// True when a RAG service hosts `service_name` in the V2 snapshot.
-    pub fn has_rag_service(&self, service_name: &str) -> bool {
-        self.snapshot_has_service(service_name, |c| c.eq_ignore_ascii_case("rag"))
-    }
 
     /// True when an embedding service backs `service_name` (snapshot-driven).
     pub fn has_quic_embedding_service(&self, service_name: &str) -> bool {

@@ -16,7 +16,7 @@ GUARD NIE jest tutaj — guard jest ZAWSZE osobno, hardcoded.
 |------|-------|
 | `TEXT` | Pytanie o wiedzę, small talk, definicje — przekaż do domyślnego LLM. ZAWSZE samodzielne. |
 | `TOOLS` | Trzeba ZROBIĆ coś w zewnętrznym systemie — wysłać, sprawdzić, uruchomić, utworzyć, usunąć |
-| `MODEL` | Trzeba specyficznego modelu AI — generowanie kodu, obrazu, analiza medyczna, RAG |
+| `MODEL` | Trzeba specyficznego modelu AI — generowanie kodu, obrazu, analiza medyczna |
 | `MEMORY` | User podaje fakt, decyzję, preferencję — trzeba zapamiętać |
 | `FEEDBACK` | User ocenia odpowiedź AI — korekta, potwierdzenie, narzekanie, pochwała |
 | `RECALL` | Odpowiedź wymaga kontekstu z pamięci (prawie zawsze oprócz TEXT) |
@@ -29,7 +29,7 @@ GUARD NIE jest tutaj — guard jest ZAWSZE osobno, hardcoded.
 2. `RECALL` — z prawie wszystkim (potrzeba kontekstu)
 3. `FEEDBACK` + `MEMORY` — często razem (korekta = zapamiętaj poprawkę)
 4. `EXTRACT` — może łączyć z `MEMORY` (wyciągnij i zapamiętaj) lub `RECALL`
-5. `MODEL` — gdy zadanie wymaga specyficznego modelu (kod, obraz, RAG, medycyna)
+5. `MODEL` — gdy zadanie wymaga specyficznego modelu (kod, obraz, medycyna)
 6. `PLAN` — gdy zadanie ma wiele ZALEŻNYCH kroków (znajdź → wyciągnij → wyślij)
 7. `TOOLS` oznacza DOWOLNE narzędzie — router nie wie jakie, wie tylko że trzeba coś ZROBIĆ
 8. `MODEL` vs `TEXT` — TEXT to prosta odpowiedź domyślnym LLM, MODEL to gdy potrzeba konkretnego modelu
@@ -76,7 +76,7 @@ Model musi rozpoznawać TOOLS dla SETEK różnych scenariuszy, nie tylko "wyśli
 
 **Sieć i bezpieczeństwo:** firewall (pfSense, FortiGate, OPNsense), VPN (WireGuard, OpenVPN), SSH, proxy, certyfikaty SSL, skanowanie portów, IDS/IPS
 
-**AI/ML:** trenowanie modeli, inference, embeddingi, RAG, fine-tuning, prompt engineering, ewaluacja, dataset management, model deployment
+**AI/ML:** trenowanie modeli, inference, embeddingi, fine-tuning, prompt engineering, ewaluacja, dataset management, model deployment
 
 **Observability:** logi (ELK, Loki, Splunk), tracing (Jaeger, Zipkin), APM, error tracking (Sentry, Bugsnag), uptime monitoring
 

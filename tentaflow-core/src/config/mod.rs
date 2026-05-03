@@ -443,7 +443,7 @@ pub enum ConnectionType {
         tts_config: Option<TTSParameters>,
     },
 
-    /// QUIC connection (dla TentaFlow.RAG, TentaFlow.Embeddings, TentaFlow.TTS)
+    /// QUIC connection (dla TentaFlow.Embeddings, TentaFlow.TTS)
     QUIC {
         /// QUIC URL (quic://host:port)
         quic_url: String,

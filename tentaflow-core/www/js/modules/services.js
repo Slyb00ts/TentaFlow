@@ -477,8 +477,35 @@ function renderAliasesTab() {
   `;
 }
 
+// fallback_targets na wire/DB to JSON array string (CLAUDE.md §9 — "No CSV").
+// Migracja 69 konwertuje stare CSV-zapisy do JSON juz po stronie backendu,
+// wiec klient parsuje wylacznie JSON. Zwraca `{ok, values}`:
+//   - `ok=true` + values=[...]  — udane parsowanie (puste `[]` = ok+empty)
+//   - `ok=true` + values=[]      — `null` / pusty string / "[]"
+//   - `ok=false` + values=[]    — non-empty wartosc ktora NIE jest valid JSON
+//     array (np. CSV ze stale taba). Wpis jest interpretowany jako "brak",
+//     ale wywolujacy moze pokazac UI error przed zapisaniem null.
+function parseFallbackTargets(raw) {
+  if (raw === null || raw === undefined) return { ok: true, values: [] };
+  const trimmed = String(raw).trim();
+  if (!trimmed) return { ok: true, values: [] };
+  if (!trimmed.startsWith('[')) return { ok: false, values: [] };
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return {
+        ok: true,
+        values: parsed.map((s) => String(s).trim()).filter(Boolean),
+      };
+    }
+    return { ok: false, values: [] };
+  } catch (_e) {
+    return { ok: false, values: [] };
+  }
+}
+
 function renderAliasRow(a) {
-  const fallbacks = (a.fallback_targets || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const fallbacks = parseFallbackTargets(a.fallback_targets).values;
   const activeBadge = a.is_active
     ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.alias_active'))}</span>`
     : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.alias_inactive'))}</span>`;
@@ -625,23 +652,27 @@ function renderModelRow(m) {
 
 // ---- Alias modal ----------------------------------------------------------
 
-function buildTargetOptionList(excludeAliasName) {
-  // Modele ze wszystkich nodow — identyfikator to alias modelu (techniczna nazwa).
+function buildTargetOptionList(_excludeAliasName) {
+  // Plan v7 D.17: alias resolves to dokladnie jedna warstwa — service
+  // model albo published flow + fallbacks. Domain validation w
+  // `services::models` odrzuca alias-of-alias przy zapisie, wiec picker
+  // celowo NIE pokazuje innych aliasow. Pokazujemy:
+  //   1) service models (modelListRequest)
+  //   2) published flows (catalogListRequest entries z kind=flow)
   const models = collectUniqueModels().map((m) => ({
     value: m.alias,
     label: m.alias + (m.backend ? ` · ${m.backend}` : '') + (m.kind ? ` (${m.kind})` : ''),
   }));
-  // Inne aliasy — alias moze wskazywac na inny alias (chain routing), ale nie na siebie.
-  const aliasTargets = (aliases || [])
-    .filter((a) => a.alias && a.alias !== excludeAliasName)
-    .map((a) => ({
-      value: a.alias,
-      label: `${a.alias} (alias)`,
+  const flows = (Array.isArray(unifiedModels) ? unifiedModels : [])
+    .filter((e) => e && e.kind && e.kind.kind === 'flow' && typeof e.id === 'string')
+    .map((e) => ({
+      value: e.id,
+      label: `${e.id} (flow)`,
     }));
   const seen = new Set();
   const out = [];
-  for (const t of [...models, ...aliasTargets]) {
-    if (seen.has(t.value)) continue;
+  for (const t of [...models, ...flows]) {
+    if (!t.value || seen.has(t.value)) continue;
     seen.add(t.value);
     out.push(t);
   }
@@ -652,12 +683,16 @@ function openAliasModal(alias) {
   const isEdit = !!alias;
   const targets = buildTargetOptionList(alias?.alias);
 
-  // Stan wybranych fallback targets (backend zwraca CSV string).
-  let selectedFallbacks = [];
-  if (isEdit && alias.fallback_targets) {
-    selectedFallbacks = alias.fallback_targets
-      .split(',').map((s) => s.trim()).filter(Boolean);
-  }
+  // fallback_targets jest JSON-array stringiem (per CLAUDE.md "No CSV").
+  // `parseFallbackTargets` zwraca `{ok, values}` zeby rozroznic walidne
+  // puste `[]` od non-empty wartosci ktorej parser nie zrozumial (np.
+  // CSV ze stale taba). `ok=false` blokuje save z UI errorem zeby
+  // przypadkowo nie wymazac istniejacych fallbackow w bazie.
+  const fallbackParse = isEdit
+    ? parseFallbackTargets(alias.fallback_targets)
+    : { ok: true, values: [] };
+  const selectedFallbacks = fallbackParse.values;
+  const fallbackParseFailed = !fallbackParse.ok;
 
   // Strategia w API: lowercase_snake (first_available | round_robin | least_loaded).
   const currentStrategy = (alias?.strategy || 'round_robin').toLowerCase();
@@ -812,11 +847,27 @@ function openAliasModal(alias) {
     const name = (nameInput?.value || '').trim();
     const target = (targetSelect?.value || '').trim();
     const strategy = (strategySelect?.value || 'round_robin').toLowerCase();
-    const fallback = selectedFallbacks.join(',');
+    // Backend kanonicznie trzyma fallback_targets jako JSON array string
+    // (patrz "No CSV — always JSON" w CLAUDE.md). Pusta lista zapisuje
+    // sie jako null zeby nie zaciemniac DB pustym '[]'.
+    const fallback = selectedFallbacks.length > 0 ? JSON.stringify(selectedFallbacks) : null;
 
     if (!name || !target) {
       if (errEl) {
         errEl.textContent = I18n.t('services.alias_required');
+        errEl.hidden = false;
+      }
+      return;
+    }
+
+    // R7.P3: `parseFallbackTargets` zwraca `ok=false` tylko gdy backend
+    // dal cos non-empty czego nie umielismy zinterpretowac (np. CSV ze
+    // stale taba). Walidne puste `[]` jest semantycznie OK — user moze
+    // celowo skasowac wszystkie fallbacki. Blokujemy save tylko dla
+    // ok=false zeby nie wymazac niewidocznych dla nas wartosci.
+    if (fallbackParseFailed && selectedFallbacks.length === 0) {
+      if (errEl) {
+        errEl.textContent = I18n.t('services.alias_fallback_parse_failed');
         errEl.hidden = false;
       }
       return;
@@ -993,7 +1044,6 @@ function typeChipClass(t) {
     case 'embeddings': return 'mesh-read';
     case 'stt':
     case 'tts': return 'deploy';
-    case 'rag': return 'mesh-admin';
     case 'agent':
     case 'tool': return 'mesh-admin';
     default: return 'license';

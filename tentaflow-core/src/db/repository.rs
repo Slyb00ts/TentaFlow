@@ -621,7 +621,12 @@ pub fn resolve_model_alias(pool: &DbPool, alias: &str) -> Result<Option<DbModelA
     Ok(result)
 }
 
-pub fn create_model_alias(
+/// Raw insert into `model_aliases` — bypasses chain check, JSON validation,
+/// alias-name collision. Available **only** in test builds so product code
+/// physically cannot reach it. Tests use it to seed known-CSV / known-empty
+/// rows that drive the migration / chain-guard tests.
+#[cfg(test)]
+fn create_model_alias_unchecked(
     pool: &DbPool,
     alias: &str,
     target_model: &str,
@@ -636,7 +641,9 @@ pub fn create_model_alias(
     Ok(conn.last_insert_rowid())
 }
 
-pub fn update_model_alias(
+/// Raw update with the same constraints as `create_model_alias_unchecked`.
+#[cfg(test)]
+fn update_model_alias_unchecked(
     pool: &DbPool,
     id: i64,
     alias: &str,
@@ -653,6 +660,191 @@ pub fn update_model_alias(
     Ok(())
 }
 
+/// Returns names that should be checked for alias-chain conflicts when
+/// inserting / updating an alias row: the target model + every parsed
+/// fallback. `fallback_targets` must be JSON (CLAUDE.md §9); a malformed
+/// value is rejected loudly so a stale writer cannot bypass the chain
+/// guard by smuggling in a non-parseable string.
+fn collect_chain_candidates(
+    target_model: &str,
+    fallback_targets: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut out = vec![target_model.trim().to_string()];
+    if let Some(raw) = fallback_targets {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let parsed: Vec<String> = serde_json::from_str(trimmed)
+                .map_err(|e| anyhow::anyhow!("fallback_targets must be JSON array: {}", e))?;
+            out.extend(
+                parsed
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// SQLite-side helper used by every chain-aware path below. Returns true
+/// when `name` matches an *active* alias other than `exclude_id` (so an
+/// update does not flag itself when name is unchanged).
+fn alias_is_active_within_tx(
+    tx: &rusqlite::Connection,
+    name: &str,
+    exclude_id: Option<i64>,
+) -> Result<bool> {
+    let exists: Option<bool> = match exclude_id {
+        Some(id) => tx
+            .query_row(
+                "SELECT 1 FROM model_aliases WHERE alias = ?1 AND is_active = 1 AND id != ?2",
+                rusqlite::params![name, id],
+                |_| Ok(true),
+            )
+            .optional()?,
+        None => tx
+            .query_row(
+                "SELECT 1 FROM model_aliases WHERE alias = ?1 AND is_active = 1",
+                rusqlite::params![name],
+                |_| Ok(true),
+            )
+            .optional()?,
+    };
+    Ok(exists.unwrap_or(false))
+}
+
+/// Inverse direction of the chain check: scans every other active alias
+/// and asks whether `name` already appears as their `target_model` or
+/// inside their `fallback_targets`. Catches the case where someone
+/// registers `child → real-model` first and then makes `real-model`
+/// itself an active alias — without this scan the second insert passes
+/// the outbound check (its target/fallbacks are real models) but the
+/// runtime sees an active two-step chain.
+fn alias_is_inbound_target_within_tx(
+    tx: &rusqlite::Connection,
+    name: &str,
+    exclude_id: Option<i64>,
+) -> Result<bool> {
+    let mut stmt = tx.prepare(
+        "SELECT id, target_model, fallback_targets FROM model_aliases WHERE is_active = 1",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, target, fallbacks) = row?;
+        if Some(id) == exclude_id {
+            continue;
+        }
+        if target.trim() == name {
+            return Ok(true);
+        }
+        if let Some(raw) = fallbacks {
+            // `collect_chain_candidates` requires a target argument; we only
+            // care about the parsed fallback list here so call serde directly.
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
+                if parsed.iter().any(|s| s.trim() == name) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Atomic create — chain check + insert under a single transaction so two
+/// concurrent admin writes cannot pass the validation independently and
+/// then jointly create an alias chain.
+pub fn create_model_alias_with_chain_check(
+    pool: &DbPool,
+    alias: &str,
+    target_model: &str,
+    fallback_targets: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<i64> {
+    let candidates = collect_chain_candidates(target_model, fallback_targets)?;
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    for name in &candidates {
+        if name.is_empty() {
+            continue;
+        }
+        if alias_is_active_within_tx(&tx, name, None)? {
+            anyhow::bail!(
+                "'{}' is itself an active alias; aliases of aliases are not supported",
+                name
+            );
+        }
+    }
+    if alias_is_inbound_target_within_tx(&tx, alias, None)? {
+        anyhow::bail!(
+            "alias '{}' is already used as a target/fallback by another active alias; \
+             registering it would create a chain",
+            alias
+        );
+    }
+    tx.execute(
+        "INSERT INTO model_aliases (alias, target_model, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![alias, target_model, fallback_targets, strategy.unwrap_or("first_available")],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Atomic update — same rationale as the create variant.
+pub fn update_model_alias_with_chain_check(
+    pool: &DbPool,
+    id: i64,
+    alias: &str,
+    target_model: &str,
+    is_active: bool,
+    fallback_targets: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<()> {
+    // Inactive rows cannot route, so they cannot create a chain. Skip the
+    // check to keep operator workflows around "park then archive" simple.
+    let candidates = if is_active {
+        collect_chain_candidates(target_model, fallback_targets)?
+    } else {
+        Vec::new()
+    };
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    for name in &candidates {
+        if name.is_empty() {
+            continue;
+        }
+        if alias_is_active_within_tx(&tx, name, Some(id))? {
+            anyhow::bail!(
+                "'{}' is itself an active alias; aliases of aliases are not supported",
+                name
+            );
+        }
+    }
+    if is_active && alias_is_inbound_target_within_tx(&tx, alias, Some(id))? {
+        anyhow::bail!(
+            "alias '{}' is already used as a target/fallback by another active alias; \
+             activating this row would create a chain",
+            alias
+        );
+    }
+    tx.execute(
+        "UPDATE model_aliases SET alias = ?2, target_model = ?3, is_active = ?4, fallback_targets = ?5, strategy = ?6 WHERE id = ?1",
+        rusqlite::params![id, alias, target_model, is_active, fallback_targets, strategy.unwrap_or("first_available")],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -664,6 +856,11 @@ pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
 
 /// Tworzy alias jesli nie istnieje, lub reaktywuje istniejacy (bez zmiany target_model).
 /// Uzywane przez cykl zycia addonow do automatycznego zarzadzania aliasami.
+///
+/// Reaktywacja musi sprawdzic chain — istniejacy nieaktywny rekord moze
+/// wskazywac target ktory w miedzyczasie stal sie aliasem; wlaczenie
+/// `is_active = 1` bez kontroli stworzyloby chain. Caly check + write
+/// idzie pod jedna transakcja.
 pub fn create_or_reactivate_model_alias(
     pool: &DbPool,
     alias: &str,
@@ -671,33 +868,97 @@ pub fn create_or_reactivate_model_alias(
     strategy: &str,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    // Jesli alias juz istnieje — reaktywuj go (zachowuj target_model ustawiony przez uzytkownika)
-    let existing: Option<i64> = conn
-        .prepare("SELECT id FROM model_aliases WHERE alias = ?1")?
-        .query_row(rusqlite::params![alias], |row| row.get(0))
+    let tx = conn.unchecked_transaction()?;
+    let existing: Option<(i64, String, Option<String>)> = tx
+        .query_row(
+            "SELECT id, target_model, fallback_targets FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![alias],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .optional()?;
 
-    if let Some(id) = existing {
-        conn.execute(
+    let (target_for_check, fallbacks_for_check, action_id): (String, Option<String>, Option<i64>) =
+        match &existing {
+            Some((id, target, fallbacks)) => (target.clone(), fallbacks.clone(), Some(*id)),
+            None => (default_target_model.to_string(), None, None),
+        };
+    for name in collect_chain_candidates(&target_for_check, fallbacks_for_check.as_deref())? {
+        if name.is_empty() {
+            continue;
+        }
+        if alias_is_active_within_tx(&tx, &name, action_id)? {
+            anyhow::bail!(
+                "'{}' is itself an active alias; aliases of aliases are not supported",
+                name
+            );
+        }
+    }
+    if alias_is_inbound_target_within_tx(&tx, alias, action_id)? {
+        anyhow::bail!(
+            "alias '{}' is already used as a target/fallback by another active alias; \
+             registering or reactivating it would create a chain",
+            alias
+        );
+    }
+
+    if let Some(id) = action_id {
+        tx.execute(
             "UPDATE model_aliases SET is_active = 1 WHERE id = ?1",
             rusqlite::params![id],
         )?;
     } else {
-        conn.execute(
+        tx.execute(
             "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, 1, ?3)",
             rusqlite::params![alias, default_target_model, strategy],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
 /// Ustawia flage is_active aliasu po nazwie.
+///
+/// Reactivation (`is_active = true`) wymaga kontroli chainu po tych samych
+/// regulach co create/update — nie wystarczy przewinac flage skoro target
+/// rekordu mogl stac sie aliasem od czasu deaktywacji. Deactivation jest
+/// bezpieczna bezwarunkowo — nieaktywny rzad nie routuje.
 pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    if is_active {
+        let existing: Option<(i64, String, Option<String>)> = tx
+            .query_row(
+                "SELECT id, target_model, fallback_targets FROM model_aliases WHERE alias = ?1",
+                rusqlite::params![alias],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((id, target, fallbacks)) = existing {
+            for name in collect_chain_candidates(&target, fallbacks.as_deref())? {
+                if name.is_empty() {
+                    continue;
+                }
+                if alias_is_active_within_tx(&tx, &name, Some(id))? {
+                    anyhow::bail!(
+                        "'{}' is itself an active alias; aliases of aliases are not supported",
+                        name
+                    );
+                }
+            }
+            if alias_is_inbound_target_within_tx(&tx, alias, Some(id))? {
+                anyhow::bail!(
+                    "alias '{}' is already used as a target/fallback by another active alias; \
+                     activating this row would create a chain",
+                    alias
+                );
+            }
+        }
+    }
+    tx.execute(
         "UPDATE model_aliases SET is_active = ?1 WHERE alias = ?2",
         rusqlite::params![is_active, alias],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -6455,11 +6716,11 @@ mod alias_resolve_tests {
     fn resolve_alias_exists() {
         // Arrange
         let db = create_test_db();
-        create_model_alias(
+        create_model_alias_unchecked(
             &db,
             "gpt-4",
             "bielik-11b",
-            Some("mistral-7b,llama-8b"),
+            Some(r#"["mistral-7b","llama-8b"]"#),
             Some("round_robin"),
         )
         .expect("Nie udalo sie utworzyc aliasu");
@@ -6472,9 +6733,10 @@ mod alias_resolve_tests {
         assert_eq!(alias.alias, "gpt-4");
         assert_eq!(alias.target_model, "bielik-11b");
         assert!(alias.is_active);
+        // fallback_targets canonical wire/DB format = JSON array string.
         assert_eq!(
             alias.fallback_targets.as_deref(),
-            Some("mistral-7b,llama-8b")
+            Some(r#"["mistral-7b","llama-8b"]"#)
         );
         assert_eq!(alias.strategy.as_deref(), Some("round_robin"));
     }
@@ -6495,10 +6757,10 @@ mod alias_resolve_tests {
     fn resolve_alias_inactive() {
         // Arrange
         let db = create_test_db();
-        let id = create_model_alias(&db, "stary-alias", "model-x", None, None)
+        let id = create_model_alias_unchecked(&db, "stary-alias", "model-x", None, None)
             .expect("Nie udalo sie utworzyc aliasu");
         // Dezaktywuj alias
-        update_model_alias(&db, id, "stary-alias", "model-x", false, None, None)
+        update_model_alias_unchecked(&db, id, "stary-alias", "model-x", false, None, None)
             .expect("Nie udalo sie zaktualizowac aliasu");
 
         // Act
@@ -6512,7 +6774,7 @@ mod alias_resolve_tests {
     fn resolve_alias_default_strategy() {
         // Arrange — bez podania strategii, powinna byc domyslna
         let db = create_test_db();
-        create_model_alias(&db, "test-alias", "target-model", None, None)
+        create_model_alias_unchecked(&db, "test-alias", "target-model", None, None)
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
@@ -6528,7 +6790,7 @@ mod alias_resolve_tests {
     fn resolve_alias_no_fallbacks() {
         // Arrange
         let db = create_test_db();
-        create_model_alias(&db, "simple", "jedyny-model", None, Some("least_loaded"))
+        create_model_alias_unchecked(&db, "simple", "jedyny-model", None, Some("least_loaded"))
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
@@ -6626,7 +6888,7 @@ mod alias_resolve_tests {
 
         // Uzytkownik zmienia target_model na inny
         let alias = resolve_model_alias(&db, "teams-stt").unwrap().unwrap();
-        update_model_alias(
+        update_model_alias_unchecked(
             &db,
             alias.id,
             "teams-stt",

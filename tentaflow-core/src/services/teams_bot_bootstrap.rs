@@ -49,11 +49,13 @@ fn ensure_default_wake_words(pool: &DbPool) -> Result<()> {
 }
 
 fn ensure_alias(pool: &DbPool, alias: &str) -> Result<()> {
-    if repository::resolve_model_alias(pool, alias)?.is_some() {
-        return Ok(());
-    }
-    // `target_model` zostaje pusty — zostanie uzupełniony ręcznie w UI.
-    repository::create_model_alias(pool, alias, "", None, Some("first_available"))?;
+    // R7.P2: musimy obsluzyc rowniez wpisy *nieaktywne* — `resolve_model_alias`
+    // zwraca tylko aktywne, wiec wczesniejszy `is_some()` + INSERT walil sie
+    // o `alias TEXT UNIQUE` przy reaktywacji bota po deaktywacji.
+    // `create_or_reactivate_model_alias` robi atomicznie: jak istnieje (active
+    // lub inactive) → reactivate (z chain-checkiem); inaczej → INSERT.
+    // `target_model` zostaje pusty — zostanie uzupelniony recznie w UI.
+    repository::create_or_reactivate_model_alias(pool, alias, "", "first_available")?;
     Ok(())
 }
 
@@ -203,7 +205,7 @@ mod tests {
         let pool = setup_pool();
 
         // User już ręcznie ustawił alias na konkretny model.
-        repository::create_model_alias(
+        repository::create_model_alias_with_chain_check(
             &pool,
             "teams-summarization",
             "custom-model",

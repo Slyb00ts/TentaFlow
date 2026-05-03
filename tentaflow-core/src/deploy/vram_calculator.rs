@@ -697,7 +697,7 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
 
     // 3. Heurystyka domyslnych wartosci.
     // Default policy gdy user nic nie lockuje: prefer maksymalny kontekst dla
-    // single-user dev setup (long system prompts, RAG, code analysis). Throughput
+    // single-user dev setup (long system prompts, code analysis). Throughput
     // (batchowanie wielu requestow) traktujemy jako wybor manualny - zeby zwiekszyc
     // num_seqs user musi go ustawic explicit albo zlockowac.
     let absolute_ctx_ceiling: u64 = 1_048_576;

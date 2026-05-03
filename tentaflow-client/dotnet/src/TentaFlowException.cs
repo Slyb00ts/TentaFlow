@@ -9,7 +9,6 @@
 // TYPOWE PRZYCZYNY:
 // - Błąd połączenia z Router (timeout, certyfikaty)
 // - Błąd modelu (model niedostępny, błąd inference)
-// - Błąd RAG (brak wyników, błąd indeksowania)
 // - Błąd argumentów (null, puste kolekcje)
 //
 // ============================================================================

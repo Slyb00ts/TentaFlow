@@ -28,8 +28,6 @@ bool RUN_EMBEDDINGS = true;          // Test embeddingów
 bool RUN_COMPLETION = true;          // Test chat completion (basic + streaming)
 bool RUN_TTS = true;                 // Test Text-to-Speech (basic + LLM + streaming)
 bool RUN_STT = true;                 // Test Speech-to-Text (basic + with options)
-bool RUN_RAG = true;                 // Test RAG (basic + TTS + engine comparison)
-bool RUN_INGESTION = true;           // Test ingestion (text + files)
 bool RUN_TOOLS = true;               // Test tools/function calling (Bielik 1.5B)
 bool RUN_MEMORY = true;              // Test Memory (session-based conversation)
 bool RUN_CONVERSATION = true;        // Test Conversation Sessions (voice assistant modes)
@@ -62,8 +60,6 @@ Console.WriteLine($"  Embeddings:  {(RUN_EMBEDDINGS ? "✓" : "✗")}");
 Console.WriteLine($"  Completion:  {(RUN_COMPLETION ? "✓" : "✗")}");
 Console.WriteLine($"  TTS:         {(RUN_TTS ? "✓" : "✗")}");
 Console.WriteLine($"  STT:         {(RUN_STT ? "✓" : "✗")}");
-Console.WriteLine($"  RAG:         {(RUN_RAG ? "✓" : "✗")}");
-Console.WriteLine($"  Ingestion:   {(RUN_INGESTION ? "✓" : "✗")}");
 Console.WriteLine($"  Tools:       {(RUN_TOOLS ? "✓" : "✗")}");
 Console.WriteLine($"  Memory:      {(RUN_MEMORY ? "✓" : "✗")}");
 Console.WriteLine($"  Conversation:{(RUN_CONVERSATION ? "✓" : "✗")}");
@@ -149,34 +145,6 @@ try
         }
     }
 
-    // === RAG ===
-    if (RUN_RAG)
-    {
-        RagTests.RunBasic(client);
-        if (RUN_TTS)
-        {
-            RagTests.RunWithTts(client);
-        }
-    }
-
-    // === INGESTION ===
-    if (RUN_INGESTION)
-    {
-        var exampleFilesDir = IngestionTests.FindExampleFilesDir();
-
-        IngestionTests.RunText(client);
-        IngestionTests.RunFileTxt(client, exampleFilesDir);
-        IngestionTests.RunFilePdf(client, exampleFilesDir);
-        IngestionTests.RunFileDocx(client, exampleFilesDir);
-
-        // RAG Search po Ingestion
-        if (RUN_RAG)
-        {
-            RagTests.RunSearchAfterIngestion(client);
-            RagTests.RunEngineComparison(client);
-        }
-    }
-
     // === TOOLS ===
     if (RUN_TOOLS)
     {
@@ -222,22 +190,9 @@ try
         Console.WriteLine("║    dotnet_stream_tts_test.wav     - Streaming + TTS          ║");
         Console.WriteLine("║    dotnet_streaming_tts_chunks.wav - Streaming chunks        ║");
     }
-    if (RUN_RAG && RUN_TTS)
-    {
-        Console.WriteLine("║    dotnet_rag_tts_test.wav        - RAG + TTS                ║");
-    }
     if (RUN_MEMORY && RUN_TTS)
     {
         Console.WriteLine("║    dotnet_memory_tts_test.wav     - Memory + TTS             ║");
-    }
-    if (RUN_INGESTION)
-    {
-        Console.WriteLine("╠══════════════════════════════════════════════════════════════╣");
-        Console.WriteLine("║  Dokumenty zindeksowane w RAG:                               ║");
-        Console.WriteLine("║    - Tekst testowy (TentaFlow.AI description)                  ║");
-        Console.WriteLine("║    - maile.txt (korespondencja email)                        ║");
-        Console.WriteLine("║    - pdf.pdf                                                 ║");
-        Console.WriteLine("║    - wymagania.docx                                          ║");
     }
     Console.WriteLine("╚══════════════════════════════════════════════════════════════╝");
 }

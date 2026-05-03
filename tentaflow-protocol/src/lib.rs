@@ -1,11 +1,11 @@
 // ============================================================================
-// TENTAFLOW PROTOCOL - Wspólne typy dla Router ↔ RAG
+// TENTAFLOW PROTOCOL - Wspólne typy protokołu QUIC + rkyv
 // ============================================================================
 //
 // CEL:
-// Definicje typów protokołu QUIC + rkyv używanych w komunikacji między
-// TentaFlow.Router a TentaFlow.RAG. Typy są serializowane używając rkyv
-// (zero-copy) dla maksymalnej wydajności.
+// Definicje typów protokołu QUIC + rkyv używanych w komunikacji wewnątrz
+// klastra TentaFlow. Typy są serializowane używając rkyv (zero-copy) dla
+// maksymalnej wydajności.
 //
 // KLUCZOWE KONCEPCJE:
 // - rkyv: Zero-copy deserialization (10x szybsze niż serde)

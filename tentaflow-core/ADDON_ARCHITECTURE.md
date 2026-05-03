@@ -6,7 +6,7 @@ Mam teraz pełny obraz istniejącej architektury. Przygotowuję plan.
 
 ## Podsumowanie
 
-System addonow oparty o Wasmtime, rozszerzajacy TentaFlow.AI o pluginy trzecich stron (np. Teams bot, RAG connectors, integracje). Addony dzialaja w sandboxie WASM, komunikuja sie z Core przez host functions, maja deklaratywne UI i sa synchronizowane przez mesh CRDT. System obejmuje pelne zarzadzanie uzytkownikami/grupami z uprawnieniami per addon per zasob, SSO (OIDC), event bus, flow builder integration i audit logging.
+System addonow oparty o Wasmtime, rozszerzajacy TentaFlow.AI o pluginy trzecich stron (np. Teams bot, integracje). Addony dzialaja w sandboxie WASM, komunikuja sie z Core przez host functions, maja deklaratywne UI i sa synchronizowane przez mesh CRDT. System obejmuje pelne zarzadzanie uzytkownikami/grupami z uprawnieniami per addon per zasob, SSO (OIDC), event bus, flow builder integration i audit logging.
 
 ## Analiza istniejacego kodu
 
@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS addon_declared_permissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     addon_id TEXT NOT NULL REFERENCES addons(addon_id) ON DELETE CASCADE,
     permission_type TEXT NOT NULL CHECK(permission_type IN (
-        'llm', 'llm_model', 'embeddings', 'rag',
+        'llm', 'llm_model', 'embeddings',
         'storage', 'http', 'events', 'ui',
         'audio_capture', 'audio_play', 'tts', 'stt',
         'camera', 'notifications', 'background',
@@ -869,7 +869,6 @@ pub enum PermissionResult { Granted, Denied, NotConfigured }
 | `llm` | `*` | Dostep do generowania tekstu (dowolny model) |
 | `llm_model` | `bielik-*` | Dostep do konkretnych modeli (glob pattern) |
 | `embeddings` | `*` | Dostep do embeddingow |
-| `rag` | `*` | Dostep do RAG |
 | `storage` | `*` | Sandboxed key-value store |
 | `http` | `*.microsoft.com` | HTTP requesty (pattern na domeny) |
 | `events` | `message_received` | Subskrypcja konkretnych eventow |

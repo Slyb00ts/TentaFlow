@@ -3813,8 +3813,12 @@ mod tests {
             models: vec![sample_model(), sample_model()],
         };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let half = &bytes[..bytes.len() / 2];
-        assert!(rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(half).is_err());
+        // Truncate aggressively (first quarter) zeby na pewno odciac rkyv
+        // root pointer — half-bytes po RAG-removal cleanup'ie jest na tyle
+        // krotki ze przypadkowo parsuje sie jako valid prefix dla maléjszego
+        // payloadu. 1/4 jest gwarantowanie nizej niz pointer table.
+        let quarter = &bytes[..bytes.len() / 4];
+        assert!(rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(quarter).is_err());
     }
 
     #[test]

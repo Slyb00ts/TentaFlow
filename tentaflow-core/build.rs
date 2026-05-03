@@ -566,6 +566,7 @@ fn pack_container_contexts(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", transport_dir.display());
     println!("cargo:rerun-if-changed={}", voice_dir.display());
     println!("cargo:rerun-if-changed={}", vendor_dir.display());
+    println!("cargo:rerun-if-changed=src/services/manifest/vocabulary.rs");
 
     let bundle_path = out_dir.join("container_bundle.tar.gz");
 
@@ -653,6 +654,15 @@ mod services_manifest_build {
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,
+        /// Three independent capability axes (D.12). Each is `None` when
+        /// the manifest defers to category defaults; an explicit empty
+        /// list is invalid and rejected by validation.
+        #[serde(default)]
+        pub service_surfaces: Option<Vec<String>>,
+        #[serde(default)]
+        pub input_modalities: Option<Vec<String>>,
+        #[serde(default)]
+        pub output_modalities: Option<Vec<String>>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -778,7 +788,22 @@ mod services_manifest_build {
         pub quantization: Option<String>,
         #[serde(default)]
         pub recommended: bool,
+        /// Per-preset overrides for the three capability axes. Same
+        /// semantics as on `Engine` — `None` falls through to engine
+        /// then category defaults; explicit empty list is rejected.
+        #[serde(default)]
+        pub service_surfaces: Option<Vec<String>>,
+        #[serde(default)]
+        pub input_modalities: Option<Vec<String>>,
+        #[serde(default)]
+        pub output_modalities: Option<Vec<String>>,
     }
+
+    // Single source of truth for the three wire-string allow-lists is
+    // `src/services/manifest/vocabulary.rs`; we `include!` it so build-time
+    // validation cannot drift from runtime validation. The included file
+    // declares `pub const VALID_*` items at module scope.
+    include!("src/services/manifest/vocabulary.rs");
 
     /// Whitelist regex `^[a-z0-9][a-z0-9_-]{0,63}$` dla engine.id.
     /// MUSI byc identyczna z `validate_engine_id` w runtime.
@@ -941,10 +966,87 @@ mod services_manifest_build {
             }
         }
 
+        // Capability axes (service_surfaces / input_modalities / output_modalities).
+        // Each is Option<Vec<String>>; empty list is invalid, unknown values are
+        // rejected. Mirrors `validate_engine` in src/services/manifest/validate.rs.
+        validate_enum_list(
+            "engine.service_surfaces",
+            eid,
+            manifest.engine.service_surfaces.as_deref(),
+            VALID_SERVICE_SURFACES,
+            &mut errors,
+        );
+        validate_enum_list(
+            "engine.input_modalities",
+            eid,
+            manifest.engine.input_modalities.as_deref(),
+            VALID_INPUT_MODALITIES,
+            &mut errors,
+        );
+        validate_enum_list(
+            "engine.output_modalities",
+            eid,
+            manifest.engine.output_modalities.as_deref(),
+            VALID_OUTPUT_MODALITIES,
+            &mut errors,
+        );
+        for preset in &manifest.model_presets {
+            validate_enum_list(
+                "model_preset.service_surfaces",
+                eid,
+                preset.service_surfaces.as_deref(),
+                VALID_SERVICE_SURFACES,
+                &mut errors,
+            );
+            validate_enum_list(
+                "model_preset.input_modalities",
+                eid,
+                preset.input_modalities.as_deref(),
+                VALID_INPUT_MODALITIES,
+                &mut errors,
+            );
+            validate_enum_list(
+                "model_preset.output_modalities",
+                eid,
+                preset.output_modalities.as_deref(),
+                VALID_OUTPUT_MODALITIES,
+                &mut errors,
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn validate_enum_list(
+        field: &str,
+        engine_id: &str,
+        value: Option<&[String]>,
+        allowed: &[&str],
+        errors: &mut Vec<String>,
+    ) {
+        let Some(list) = value else {
+            return;
+        };
+        if list.is_empty() {
+            errors.push(format!(
+                "engine '{}': {} jest pusta lista — uzyj braku pola, \
+                 zeby fallback do category default",
+                engine_id, field
+            ));
+            return;
+        }
+        for v in list {
+            if !allowed.iter().any(|a| *a == v.as_str()) {
+                errors.push(format!(
+                    "engine '{}': {} zawiera nieznana wartosc '{}' \
+                     (dozwolone: {:?})",
+                    engine_id, field, v, allowed
+                ));
+            }
         }
     }
 

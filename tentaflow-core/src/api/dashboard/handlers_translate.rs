@@ -224,7 +224,6 @@ text, with no explanations, quotes, preface or meta-commentary.",
         tools: None,
         tool_choice: None,
         n: None,
-        rag_options: None,
         memory_options: None,
         audio_input: None,
     };

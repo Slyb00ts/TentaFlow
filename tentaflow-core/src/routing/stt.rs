@@ -39,6 +39,26 @@ impl Router {
                 }
             }
         }
+        // Codex M1: deleguj przez SttRuntime (D.3 single owner). MVP
+        // SttRuntime trzyma `Weak<Router>` i wraca tu na `route_audio_transcription`,
+        // ale fakt ze sciezka idzie przez SttRuntime daje nam pierwszorzedne
+        // miejsce na pelne owned-stt + diarization w R4.
+        if let Some(stt_runtime) = self.stt_runtime() {
+            let response = stt_runtime.transcribe(request).await?;
+            return Ok(crate::routing::RouteResult {
+                response,
+                metadata: crate::routing::RouteMetadata {
+                    served_by_node: hostname::get()
+                        .map(|h| h.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| "unknown".to_string()),
+                    backend_type: "stt_runtime".to_string(),
+                    strategy_used: "direct".to_string(),
+                    fallbacks_tried: 0,
+                    hop_count: 0,
+                    latency_ms: None,
+                },
+            });
+        }
         self.route_audio_transcription(request).await
     }
 
@@ -48,6 +68,19 @@ impl Router {
     ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
         use crate::routing::middleware::BackendHandle;
         use tentaflow_protocol::*;
+
+        // R6.P3: empty file is a client bug — surface immediately rather
+        // than dispatch to a backend that will fail or return empty
+        // transcription. Mirrors the chat audio guard.
+        if request.file.is_empty() {
+            return Err(crate::error::CoreError::InvalidRequest {
+                message: "transcription file is empty (0 bytes)".to_string(),
+                details: Some(
+                    "Send a non-empty audio file in the multipart `file` field.".to_string(),
+                ),
+            }
+            .into());
+        }
 
         debug!(
             "Routing audio transcription dla modelu: {}, plik: {}, rozmiar: {} bajtow",
@@ -59,7 +92,7 @@ impl Router {
         let route_result = {
             let this = self.clone();
             let req = request.clone();
-            self.dispatch_with_fallback(&request.model, 0, |handle| {
+            self.dispatch_with_fallback(&request.model, 0, Some(crate::services::catalog::InputModality::Audio), |handle| {
                 let this = this.clone();
                 let req = req.clone();
                 let handle = handle.clone();
@@ -110,6 +143,7 @@ impl Router {
                                                 language: None,
                                                 duration: None,
                                                 segments: None,
+                                                speakers: None,
                                             })
                                         }
                                         AudioResultData::Detailed { text, segments, language, duration, filtered_segments_count: _ } => {
@@ -137,6 +171,7 @@ impl Router {
                                                 language: Some(language),
                                                 duration: Some(duration),
                                                 segments: Some(openai_segments),
+                                                speakers: None,
                                             })
                                         }
                                         _ => Err(anyhow::anyhow!("QUIC STT zwrocil nieoczekiwany typ wyniku")),
@@ -189,6 +224,7 @@ impl Router {
                                         language: None,
                                         duration: None,
                                         segments: None,
+                                        speakers: None,
                                     }),
                                     _ => Err(anyhow::anyhow!("Mesh STT zwrocil nieoczekiwany typ wyniku")),
                                 },
@@ -310,6 +346,7 @@ impl Router {
                     no_speech_threshold: *no_speech_threshold,
                     avg_logprob_threshold: *avg_logprob_threshold,
                     compression_ratio_threshold: *compression_ratio_threshold,
+                    options: crate::api::openai::types::SttRequestOptions::default(),
                 };
 
                 match self.route_audio_transcription(request).await {

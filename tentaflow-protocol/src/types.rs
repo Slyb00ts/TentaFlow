@@ -8,87 +8,28 @@
 // - Image (generation, editing)
 // - Audio (TTS, STT)
 // - Vision (image understanding)
-// - RAG (retrieval augmented generation)
 //
 // Używa rkyv dla zero-copy serialization (ultra-fast, ~10x faster than serde)
 // Obsługuje zarówno streaming jak i non-streaming responses
 //
 // ARCHITEKTURA:
 // - Client → Router: ModelRequest (wszystkie typy operacji)
-// - Router → RAG: ModelRequest(RAGPayload)
 // - Router → Embeddings Engine: ModelRequest(EmbeddingsPayload)
 // - Router → LLM: ModelRequest(CompletionPayload)
-// - RAG → Router: ModelRequest (callbacks dla embeddings, LLM)
 // - Router → Client: ModelResponse lub ModelStreamChunk
 //
 // ============================================================================
 
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use serde_with::{base64::Base64, serde_as};
 
 // ============================================================================
 // SHARED TYPES - Used across multiple model types
 // ============================================================================
 
-/// Tryb wyszukiwania w RAG Engine.
-///
-/// Client może wybrać jeden lub więcej trybów (Vec<SearchMode>).
-/// RAG wykonuje wyszukiwanie we wszystkich wybranych silnikach i scala wyniki.
-///
-/// Tryby:
-/// - `FullTextSearch`: Wyszukiwanie pełnotekstowe Tantivy (BM25) - dobre dla keyword search
-/// - `VectorSearch`: Wyszukiwanie wektorowe HNSW - dobre dla semantic similarity
-/// - `HiRAG`: Hierarchical RAG z knowledge graph - dobre dla złożonych zapytań
-/// - `GSW`: Graph Semantic Workspace - dobre dla reasoning i kontekstu episodycznego
-///
-/// Przykład kombinacji:
-/// ```rust
-/// // Hybrid search: FTS + Vector
-/// search_modes: vec![SearchMode::FullTextSearch, SearchMode::VectorSearch]
-///
-/// // Full power: wszystkie silniki
-/// search_modes: vec![
-///     SearchMode::FullTextSearch,
-///     SearchMode::VectorSearch,
-///     SearchMode::HiRAG,
-///     SearchMode::GSW,
-/// ]
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub enum SearchMode {
-    /// Wyszukiwanie pełnotekstowe (Tantivy BM25)
-    FullTextSearch,
-
-    /// Wyszukiwanie wektorowe (HNSW + embeddings)
-    VectorSearch,
-
-    /// Hierarchical RAG (knowledge graph + multi-level retrieval)
-    HiRAG,
-
-    /// Graph Semantic Workspace (episodic memory + reasoning)
-    GSW,
-}
-
-/// Kontekst dla RAG request (historia konwersacji, metadata sesji).
-///
-/// Opcjonalny - wysyłany gdy klient ma kontekst do przekazania (np. multi-turn conversation).
-///
-/// Pola:
-/// - `messages`: Historia konwersacji (poprzednie wiadomości user/assistant)
-/// - `metadata`: Dodatkowy kontekst (user_id, session_id, preferences, etc.)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct RAGContext {
-    /// Historia konwersacji (poprzednie wiadomości)
-    pub messages: Vec<Message>,
-
-    /// Metadata sesji (key-value pairs: user_id, session_id, language, etc.)
-    pub metadata: Vec<(String, String)>,
-}
-
 /// Pojedyncza wiadomość w konwersacji.
 ///
-/// Używana w historii konwersacji (RAGContext) oraz w callback requests do LLM.
+/// Używana w `CompletionPayload` (chat history).
 ///
 /// Pola:
 /// - `role`: Rola nadawcy ("system" | "user" | "assistant")
@@ -100,171 +41,6 @@ pub struct Message {
 
     /// Treść wiadomości (tekst)
     pub content: String,
-}
-
-/// Parametry biznesowe RAG pipeline.
-///
-/// WAŻNE: Zawiera TYLKO parametry biznesowe (top_k, similarity, reranking).
-/// NIE zawiera nazw modeli - modele są konfigurowane w plikach config RAG/Router.
-///
-/// Dlaczego bez nazw modeli?
-/// - Modele są częścią infrastruktury, nie API
-/// - RAG używa modeli z własnej konfiguracji (config.toml)
-/// - Dla callback do Router: RAG wysyła model name z config RAG
-/// - Client nie powinien wybierać modeli bezpośrednio (bezpieczeństwo + consistency)
-///
-/// Parametry:
-/// - `top_k`: Ile maksymalnie dokumentów zwrócić (typowo 3-10)
-/// - `min_similarity`: Próg podobieństwa (0.0-1.0, zwykle >0.7 dla quality)
-/// - `use_reranking`: Czy użyć cross-encoder reranking dla lepszej jakości (opcjonalne)
-///
-/// Przykład:
-/// ```rust
-/// let params = RAGParams {
-///     top_k: 5,
-///     min_similarity: 0.7,
-///     use_reranking: Some(true),  // Włącz reranking dla lepszej jakości
-/// };
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct RAGParams {
-    /// Ile maksymalnie dokumentów/chunków zwrócić (typowo 3-10)
-    /// Większe top_k = więcej kontekstu ale większy koszt LLM
-    pub top_k: u32,
-
-    /// Próg minimalnego podobieństwa (0.0-1.0, cosine similarity)
-    /// Typowo >0.7 dla wysokiej jakości, >0.6 dla szerszego pokrycia
-    pub min_similarity: f32,
-
-    /// Czy użyć cross-encoder reranking przed zwróceniem wyników
-    /// - Some(true): Przeranguj wyniki (lepsza jakość, wolniejsze)
-    /// - Some(false) lub None: Bez rerankingu (szybsze)
-    pub use_reranking: Option<bool>,
-}
-
-/// Response od RAG Engine do Router.
-///
-/// WAŻNE: RAG NIE streamuje i NIE decyduje o przetwarzaniu LLM/TTS.
-/// RAG zwraca tylko kontekst tekstowy i metadata. Router decyduje co dalej na podstawie flag.
-///
-/// Dwa przypadki użycia:
-/// 1. requires_llm_processing = false: `context_text` to finalna odpowiedź (zwróć user bezpośrednio)
-/// 2. requires_llm_processing = true: `context_text` to prompt dla LLM (Router streamuje przez LLM)
-///
-/// Pola:
-/// - `request_id`: UUID z requestu (correlation)
-/// - `context_text`: Kontekst tekstowy (albo finalna odpowiedź, albo prompt dla LLM)
-/// - `metadata`: Szczegółowe informacje o znalezionych chunkach (sources, scores, content)
-/// - `requires_llm_processing`: PASS-THROUGH z requestu (RAG nie zmienia)
-/// - `requires_audio_output`: PASS-THROUGH z requestu (RAG nie zmienia)
-///
-/// Przykład 1 (bez LLM):
-/// ```rust
-/// RAGResponse {
-///     context_text: "Znaleziono 3 dokumenty o Project X: doc1.pdf, doc2.docx, doc3.txt",
-///     requires_llm_processing: false,  // Router zwraca to bezpośrednio user
-///     ...
-/// }
-/// ```
-///
-/// Przykład 2 (z LLM):
-/// ```rust
-/// RAGResponse {
-///     context_text: "Context: [chunk1 content] [chunk2 content] Question: What is Project X?",
-///     requires_llm_processing: true,  // Router wysyła to do LLM i streamuje
-///     ...
-/// }
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct RAGResponse {
-    /// UUID requestu (z RAGRequest, dla korelacji)
-    pub request_id: String,
-
-    /// Kontekst tekstowy:
-    /// - Jeśli requires_llm_processing=false: finalna odpowiedź dla user
-    /// - Jeśli requires_llm_processing=true: prompt dla LLM (zawiera znalezione chunki + query)
-    pub context_text: String,
-
-    /// Szczegółowe metadata o znalezionych chunkach (sources, scores, content, etc.)
-    pub metadata: Vec<RAGChunkMetadata>,
-
-    /// PASS-THROUGH z RAGRequest: Czy Router powinien przetworzyć przez LLM
-    /// RAG NIGDY nie zmienia tej wartości - tylko przekazuje z requestu
-    pub requires_llm_processing: bool,
-
-    /// PASS-THROUGH z RAGRequest: Czy Router powinien wygenerować audio (TTS)
-    /// RAG NIGDY nie zmienia tej wartości - tylko przekazuje z requestu
-    pub requires_audio_output: bool,
-
-    /// Nazwa modelu LLM do użycia przez Router dla final generation (jeśli requires_llm_processing=true)
-    /// RAG pobiera to ze swojego config.models.generation_model
-    /// Przykład: "gpt-oss-20b", "claude-3-5-sonnet"
-    pub llm_model: Option<String>,
-}
-
-/// Metadata pojedynczego chunka znalezionego przez RAG.
-///
-/// Zawiera wszystkie informacje o znalezionym fragmencie dokumentu:
-/// - Skąd pochodzi (source_file, source_type)
-/// - Jak dobrze pasuje (similarity_score, rank)
-/// - Co zawiera (chunk_text, chunk_index)
-/// - Dodatkowe dane (doc_metadata)
-///
-/// Pola:
-/// - `doc_id`: Identyfikator dokumentu źródłowego
-/// - `chunk_id`: Identyfikator chunka w dokumencie
-/// - `chunk_index`: Pozycja chunka w dokumencie (0-indexed)
-/// - `chunk_text`: Treść chunka (może być skrócona dla wyświetlenia)
-/// - `similarity_score`: Score podobieństwa (0.0-1.0, cosine similarity)
-/// - `rank`: Pozycja w rankingu (1 = najlepszy)
-/// - `source_file`: Ścieżka do pliku źródłowego (np. "/docs/project_x.pdf")
-/// - `source_type`: Typ źródła ("pdf" | "docx" | "txt" | "url" | etc.)
-/// - `documents`: Lista dokumentów zawierających ten chunk (zawsze >= 1)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct RAGChunkMetadata {
-    /// Identyfikator chunka
-    pub chunk_id: String,
-
-    /// Pozycja chunka w dokumencie (0-indexed)
-    pub chunk_index: u32,
-
-    /// Treść chunka (pełna lub skrócona)
-    pub chunk_text: String,
-
-    /// Score podobieństwa do query (0.0-1.0, cosine similarity)
-    pub similarity_score: f32,
-
-    /// Pozycja w rankingu wyników (1 = najlepszy)
-    pub rank: u32,
-
-    /// Ścieżka do pliku źródłowego lub URL
-    pub source_file: String,
-
-    /// Typ źródła (pdf, docx, txt, url, etc.)
-    pub source_type: String,
-
-    /// Lista dokumentów zawierających ten chunk.
-    /// Zawsze co najmniej 1 element.
-    /// Jeśli ten sam plik jest przypisany do wielu dokumentów biznesowych,
-    /// każdy ma własny doc_id i metadane.
-    pub documents: Vec<ChunkDocument>,
-}
-
-/// Dokument zawierający dany chunk.
-///
-/// Jeden chunk może należeć do wielu dokumentów (przez aliasy/soft links).
-/// Każdy dokument ma własny doc_id i metadane.
-///
-/// Przykład: Ten sam załącznik PDF przypisany do "Umowy A" i "Umowy B":
-/// - doc_id: "attach_umowa_a", metadata: {parent: "Umowa A"}
-/// - doc_id: "attach_umowa_b", metadata: {parent: "Umowa B"}
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct ChunkDocument {
-    /// Identyfikator dokumentu
-    pub doc_id: String,
-
-    /// Metadane specyficzne dla tego dokumentu
-    pub metadata: Vec<(String, String)>,
 }
 
 /// Message dla vision request (może zawierać tekst + obrazy).
@@ -288,40 +64,6 @@ pub enum VisionContentPart {
 }
 
 // ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-impl Default for RAGParams {
-    fn default() -> Self {
-        Self {
-            top_k: 5,
-            min_similarity: 0.7,
-            use_reranking: None,
-        }
-    }
-}
-
-impl RAGParams {
-    /// Tworzy parametry RAG dla wysokiej jakości (z reranking).
-    pub fn high_quality() -> Self {
-        Self {
-            top_k: 10,
-            min_similarity: 0.6,
-            use_reranking: Some(true),
-        }
-    }
-
-    /// Tworzy parametry RAG dla szybkości.
-    pub fn fast() -> Self {
-        Self {
-            top_k: 3,
-            min_similarity: 0.75,
-            use_reranking: Some(false),
-        }
-    }
-}
-
-// ============================================================================
 // QUIC MESSAGE TYPE DISCRIMINATORS
 // ============================================================================
 
@@ -330,15 +72,6 @@ impl RAGParams {
 /// Każda wiadomość QUIC zaczyna się od jednego bajtu określającego typ:
 /// - Pierwszy bajt to MESSAGE_TYPE_*
 /// - Pozostałe bajty to zserializowane dane (rkyv)
-///
-/// Przykład wysyłania RAGRequest:
-/// ```rust
-/// let mut bytes = vec![MESSAGE_TYPE_RAG_REQUEST];
-/// bytes.extend_from_slice(&rkyv::to_bytes::<rkyv::rancor::Error>(&request)?);
-/// stream.write_all(&bytes).await?;
-/// ```
-pub const MESSAGE_TYPE_RAG_REQUEST: u8 = 0x01;
-pub const MESSAGE_TYPE_INGEST_REQUEST: u8 = 0x02;
 pub const MESSAGE_TYPE_CANCEL_REQUEST: u8 = 0x03;
 
 // ============================================================================
@@ -411,210 +144,6 @@ pub enum CancellationStatus {
     AlreadyCompleted,
 }
 
-// ============================================================================
-// DOCUMENT INGESTION: Router → RAG (Document Upload/Management)
-// ============================================================================
-
-/// Request do zaindeksowania dokumentu w RAG.
-///
-/// Wysyłany z Router do RAG gdy klient uploaduje dokument przez HTTP API.
-/// Router konwertuje multipart/form-data lub JSON na ten typ i wysyła przez QUIC.
-///
-/// Pola:
-/// - `request_id`: UUID v4 generowane przez Router (dla korelacji)
-/// - `document_id`: Unikalny ID dokumentu (podawany przez klienta lub generowany)
-/// - `content`: Treść dokumentu (text, file data)
-/// - `metadata`: Dodatkowe metadata (title, author, tags, etc.)
-/// - `index_flags`: Które indeksy utworzyć (FTS, Vector, Graph, HiRAG, Metadata)
-///
-/// Przykład:
-/// ```rust
-/// let request = IngestRequest {
-///     request_id: uuid::Uuid::new_v4().to_string(),
-///     document_id: "doc_12345".to_string(),
-///     content: DocumentContent::FileData {
-///         data: pdf_bytes,
-///         filename: "raport.pdf".to_string(),
-///     },
-///     metadata: vec![("title".to_string(), "Raport Q4".to_string())],
-///     index_flags: vec!["fts".to_string(), "vector".to_string(), "metadata".to_string()],
-/// };
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct IngestRequest {
-    /// UUID v4 requestu (generowane przez Router)
-    pub request_id: String,
-
-    /// Unikalny ID dokumentu (np. "doc_12345", UUID, hash)
-    pub document_id: String,
-
-    /// Treść dokumentu do zaindeksowania
-    pub content: DocumentContent,
-
-    /// Metadata dokumentu (key-value pairs: title, author, tags, etc.)
-    pub metadata: Vec<(String, String)>,
-
-    /// Lista indeksów do utworzenia (fts, vector, graph, hirag, metadata)
-    /// Jeśli puste, RAG użyje wszystkich dostępnych indeksów
-    pub index_flags: Vec<String>,
-}
-
-/// Dane binarne pliku dla DocumentContent.
-///
-/// Używa base64 encoding dla serde (JSON API) i raw bytes dla rkyv (QUIC).
-#[serde_as]
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeDeserialize, SerdeSerialize)]
-pub struct FileDataContent {
-    /// Surowe bajty pliku (base64 w JSON, raw bytes w QUIC)
-    #[serde_as(as = "Base64")]
-    pub data: Vec<u8>,
-    /// Nazwa pliku z rozszerzeniem (np. "dokument.pdf")
-    pub filename: String,
-}
-
-/// Treść dokumentu do zaindeksowania.
-///
-/// Obsługuje różne źródła treści:
-/// - Text: Bezpośredni tekst (np. z JSON API)
-/// - FileData: Surowe bajty pliku + nazwa (np. z multipart/form-data upload)
-///
-/// UWAGA: FilePath nie jest wspierana w protokole QUIC (tylko Text i FileData)
-/// bo Router otrzymuje dane od klienta przez HTTP, nie ścieżki do plików.
-///
-/// Format JSON dla FileData używa base64 encoding:
-/// ```json
-/// {
-///   "FileData": {
-///     "data": "SGVsbG8gd29ybGQh",  // base64
-///     "filename": "test.txt"
-///   }
-/// }
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeDeserialize, SerdeSerialize)]
-pub enum DocumentContent {
-    /// Czysty tekst (dla JSON API)
-    Text(String),
-
-    /// Dane binarne pliku z nazwą (dla multipart upload)
-    /// - data: Surowe bajty pliku (base64 w JSON, raw w QUIC)
-    /// - filename: Nazwa pliku z rozszerzeniem (do detekcji MIME type)
-    FileData(FileDataContent),
-}
-
-/// Response po zaindeksowaniu dokumentu.
-///
-/// Zawiera:
-/// - Potwierdzenie ID dokumentu
-/// - Statystyki (liczba chunków, wektorów)
-/// - Które indeksy zostały utworzone
-/// - Metryki wydajności (czasy przetwarzania)
-///
-/// Przykład:
-/// ```rust
-/// let response = IngestResponse {
-///     request_id: "uuid-123".to_string(),
-///     document_id: "doc_12345".to_string(),
-///     status: IngestionStatus::Success,
-///     chunk_count: 42,
-///     vector_count: 42,
-///     indexed_in: vec!["fts".to_string(), "vector".to_string(), "metadata".to_string()],
-///     metrics: IngestMetrics {
-///         file_processing_ms: 1523,
-///         chunking_ms: 234,
-///         embedding_ms: 876,
-///         fts_indexing_ms: 45,
-///         vector_indexing_ms: 123,
-///         graph_indexing_ms: 0,
-///         total_ms: 2801,
-///         embedding_tokens_per_sec: Some(1250.5),
-///     },
-///     error: None,
-/// };
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct IngestResponse {
-    /// UUID requestu (correlation z IngestRequest)
-    pub request_id: String,
-
-    /// ID zaindeksowanego dokumentu
-    pub document_id: String,
-
-    /// Status operacji (Success, Duplicate, Error)
-    pub status: IngestionStatus,
-
-    /// Liczba chunków utworzonych
-    pub chunk_count: u32,
-
-    /// Liczba wektorów utworzonych
-    pub vector_count: u32,
-
-    /// Które indeksy zostały utworzone (fts, vector, graph, hirag, metadata)
-    pub indexed_in: Vec<String>,
-
-    /// Metryki wydajności operacji
-    pub metrics: IngestMetrics,
-
-    /// Komunikat błędu (jeśli status=Error)
-    pub error: Option<String>,
-}
-
-/// Status operacji ingestion.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
-pub enum IngestionStatus {
-    /// Sukces - dokument zaindeksowany
-    Success,
-
-    /// Duplikat - dokument z taką zawartością już istnieje (pominięto)
-    Duplicate,
-
-    /// Zaktualizowano - dokument z tym ID istniał i został zaktualizowany
-    Updated,
-
-    /// Dowiązanie - dokument z taką zawartością już istnieje pod innym ID,
-    /// utworzono alias/referencję zamiast re-indeksowania
-    LinkedToDuplicate,
-
-    /// Błąd - operacja się nie powiodła
-    Error,
-}
-
-/// Metryki operacji ingestion.
-///
-/// Zawiera czasy wszystkich faz przetwarzania dokumentu:
-/// - file_processing_ms: Ekstrakcja tekstu z pliku (PDF/Office/OCR/STT)
-/// - chunking_ms: Semantyczne dzielenie na fragmenty
-/// - embedding_ms: Generowanie embeddingów
-/// - fts_indexing_ms: Indeksowanie full-text search (Tantivy)
-/// - vector_indexing_ms: Indeksowanie wektorowe (HNSW)
-/// - graph_indexing_ms: Indeksowanie grafowe (GSW)
-/// - total_ms: Całkowity czas operacji
-/// - embedding_tokens_per_sec: Przepustowość embeddingów (jeśli applicable)
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct IngestMetrics {
-    /// Czas przetwarzania pliku (PDF/Office/OCR/STT) w ms
-    pub file_processing_ms: u64,
-
-    /// Czas chunkowania w ms
-    pub chunking_ms: u64,
-
-    /// Czas generowania embeddingów w ms
-    pub embedding_ms: u64,
-
-    /// Czas indeksowania FTS w ms
-    pub fts_indexing_ms: u64,
-
-    /// Czas indeksowania wektorów w ms
-    pub vector_indexing_ms: u64,
-
-    /// Czas indeksowania grafu w ms
-    pub graph_indexing_ms: u64,
-
-    /// Całkowity czas operacji w ms
-    pub total_ms: u64,
-
-    /// Tokeny na sekundę (dla embeddingów)
-    pub embedding_tokens_per_sec: Option<f32>,
-}
 
 // ============================================================================
 // UNIFIED MODEL PROTOCOL - Universal Format dla wszystkich modeli
@@ -626,7 +155,6 @@ pub struct IngestMetrics {
 // - Image (generation, editing)
 // - Audio (TTS, STT, music)
 // - Vision (image understanding)
-// - RAG (retrieval augmented generation)
 //
 // Wspiera tryb streaming i non-streaming dla wszystkich typów.
 //
@@ -636,10 +164,8 @@ pub struct IngestMetrics {
 ///
 /// Używany dla:
 /// - Client → Router (główne API)
-/// - Router → RAG (retrieval requests)
 /// - Router → Embeddings Engine (embedding requests)
 /// - Router → LLM (completion requests)
-/// - RAG → Router (callback requests)
 ///
 /// # Przykład użycia - Embeddings:
 /// ```rust
@@ -713,9 +239,6 @@ pub enum ModelPayload {
 
     /// Vision - rozumienie obrazów
     Vision(VisionPayload),
-
-    /// RAG - retrieval augmented generation
-    RAG(RAGPayload),
 
     /// Rerank - rerankowanie dokumentów względem zapytania (cross-encoder)
     Rerank(RerankPayload),
@@ -1749,46 +1272,6 @@ pub struct VisionPayload {
 }
 
 // ============================================================================
-// RAG PAYLOAD
-// ============================================================================
-
-/// Payload dla RAG request (Retrieval Augmented Generation).
-///
-/// To jest specjalny workflow który łączy retrieval z generation.
-///
-/// # Przykład:
-/// ```rust
-/// let payload = RAGPayload {
-///     query: "What is Project X?".to_string(),
-///     context: None,
-///     params: RAGParams::default(),
-///     requires_llm_processing: true,
-///     requires_audio_output: false,
-///     search_modes: vec![SearchMode::VectorSearch, SearchMode::HiRAG],
-/// };
-/// ```
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct RAGPayload {
-    /// Zapytanie użytkownika
-    pub query: String,
-
-    /// Opcjonalny kontekst (historia konwersacji)
-    pub context: Option<RAGContext>,
-
-    /// Parametry retrieval (top_k, min_similarity, reranking)
-    pub params: RAGParams,
-
-    /// Czy wymaga przetworzenia przez LLM po retrieval
-    pub requires_llm_processing: bool,
-
-    /// Czy wygenerować audio output (TTS)
-    pub requires_audio_output: bool,
-
-    /// Tryby wyszukiwania (FTS, Vector, HiRAG, GSW)
-    pub search_modes: Vec<SearchMode>,
-}
-
-// ============================================================================
 // MEMORY PAYLOAD
 // ============================================================================
 
@@ -2072,9 +1555,6 @@ pub enum ModelResult {
 
     /// Vision result
     Vision(VisionResult),
-
-    /// RAG result
-    RAG(RAGResult),
 
     /// Rerank result
     Rerank(RerankResult),
@@ -2963,25 +2443,6 @@ pub struct VisionResult {
     pub model: String,
 }
 
-/// Result dla RAG.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-pub struct RAGResult {
-    /// Kontekst tekstowy lub finalna odpowiedź
-    pub context_text: String,
-
-    /// Metadata o znalezionych chunkach
-    pub metadata: Vec<RAGChunkMetadata>,
-
-    /// Czy wymaga dalszego przetworzenia przez LLM (pass-through z RAGPayload)
-    pub requires_llm_processing: bool,
-
-    /// Czy wygenerować audio output (TTS) (pass-through z RAGPayload)
-    pub requires_audio_output: bool,
-
-    /// Nazwa modelu LLM do użycia (jeśli requires_llm_processing=true)
-    pub llm_model: Option<String>,
-}
-
 // ============================================================================
 // MEMORY RESULT
 // ============================================================================
@@ -3291,11 +2752,10 @@ pub struct ModelStreamChunk {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub enum StreamChunkType {
     /// Metadata (wysyłane jako pierwsze, opcjonalne)
-    /// Np. dla RAG: lista źródeł dokumentów
     /// Np. dla completion: info o modelu, parametrach
     Metadata(ModelMetadata),
 
-    /// Text delta (dla completion, vision, RAG)
+    /// Text delta (dla completion, vision)
     /// Kolejne fragmenty generowanego tekstu (content)
     TextDelta(String),
 
@@ -3374,7 +2834,6 @@ pub struct ModelMetadata {
     pub model_name: String,
 
     /// Dodatkowe metadata (key-value pairs)
-    /// Np. dla RAG: lista źródeł
     /// Np. dla completion: parametry (temperature, max_tokens)
     pub details: Vec<(String, String)>,
 }
@@ -3427,13 +2886,6 @@ pub enum DetailedMetrics {
 
     /// Metryki dla audio
     Audio { audio_duration_sec: Option<f32> },
-
-    /// Metryki dla RAG
-    RAG {
-        retrieval_ms: u64,
-        reranking_ms: Option<u64>,
-        chunks_found: u32,
-    },
 }
 
 /// Error information.
@@ -3616,95 +3068,8 @@ pub struct RegistryAuth {
     pub password: String,
 }
 
-#[cfg(test)]
-mod ingest_tests {
-    use super::*;
-
-    #[test]
-    fn test_ingest_serialization() {
-        let request = IngestRequest {
-            request_id: "test-uuid".to_string(),
-            document_id: "doc-123".to_string(),
-            content: DocumentContent::Text("Hello world".to_string()),
-            metadata: vec![],
-            index_flags: vec![],
-        };
-
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).unwrap();
-        println!("Serialized {} bytes", bytes.len());
-        println!(
-            "First 50 bytes: {:02X?}",
-            &bytes[..std::cmp::min(50, bytes.len())]
-        );
-
-        // Check if it looks like ASCII text (which would be wrong for rkyv)
-        let ascii_count = bytes
-            .iter()
-            .take(50)
-            .filter(|&&b| b >= 0x20 && b < 0x7f)
-            .count();
-        println!(
-            "ASCII printable chars in first 50 bytes: {}/50",
-            ascii_count
-        );
-
-        // If more than 90% is printable ASCII, something is wrong
-        assert!(
-            ascii_count < 45,
-            "Data looks like ASCII text, not rkyv binary!"
-        );
-    }
-
-    #[test]
-    fn test_ingest_roundtrip() {
-        // Create IngestRequest similar to what Client sends
-        let request = IngestRequest {
-            request_id: "f5e832ea-81a3-4b84-a944-e70a2359f5e8".to_string(),
-            document_id: "test-doc-12345678901234567890123456789012".to_string(),
-            content: DocumentContent::Text(
-                "TentaFlow.AI to zaawansowana platforma sztucznej inteligencji.".to_string(),
-            ),
-            metadata: vec![
-                ("source".to_string(), "test".to_string()),
-                ("type".to_string(), "description".to_string()),
-            ],
-            index_flags: vec![],
-        };
-
-        // Serialize
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).unwrap();
-        println!("Roundtrip test: serialized {} bytes", bytes.len());
-        println!(
-            "First 40 bytes: {:02X?}",
-            &bytes[..std::cmp::min(40, bytes.len())]
-        );
-
-        // Deserialize using access (same as Router does)
-        let archived = rkyv::access::<ArchivedIngestRequest, rkyv::rancor::Error>(&bytes)
-            .expect("Failed to access ArchivedIngestRequest");
-
-        // Verify fields
-        assert_eq!(
-            archived.request_id.as_str(),
-            "f5e832ea-81a3-4b84-a944-e70a2359f5e8"
-        );
-        assert_eq!(
-            archived.document_id.as_str(),
-            "test-doc-12345678901234567890123456789012"
-        );
-
-        // Full deserialize
-        let deserialized: IngestRequest =
-            rkyv::deserialize::<IngestRequest, rkyv::rancor::Error>(archived)
-                .expect("Failed to deserialize IngestRequest");
-
-        assert_eq!(deserialized.request_id, request.request_id);
-        assert_eq!(deserialized.document_id, request.document_id);
-        assert_eq!(deserialized.metadata.len(), 2);
-
-        println!("Roundtrip test: SUCCESS!");
-    }
-}
+// ingest_tests usuniete razem z RAG/Ingest path (RAG total eradication).
+// Nowa implementacja RAG bedzie miala wlasne testy serializacji.
 
 #[cfg(test)]
 mod meeting_event_tests {
