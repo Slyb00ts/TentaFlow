@@ -95,9 +95,6 @@ impl Router {
         &self,
         request: TranscriptionRequest,
     ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
-        use crate::routing::middleware::BackendHandle;
-        use tentaflow_protocol::*;
-
         // R6.P3: empty file is a client bug — surface immediately rather
         // than dispatch to a backend that will fail or return empty
         // transcription. Mirrors the chat audio guard.
@@ -111,164 +108,14 @@ impl Router {
             .into());
         }
 
-        debug!(
-            "Routing audio transcription dla modelu: {}, plik: {}, rozmiar: {} bajtow",
-            request.model,
-            request.filename,
-            request.file.len()
-        );
-
-        let route_result = {
-            let this = self.clone();
-            let req = request.clone();
-            self.dispatch_with_fallback(&request.model, 0, Some(crate::services::catalog::InputModality::Audio), |handle| {
-                let this = this.clone();
-                let req = req.clone();
-                let handle = handle.clone();
-                async move {
-                    match &handle {
-                        BackendHandle::LocalStt => {
-                            debug!("Probuje lokalne STT (Whisper in-process)");
-                            this.local_stt.transcribe(&req).await
-                        }
-                        BackendHandle::QuicStt(name) => {
-                            let quic_client = this.service_manager.get_quic_stt_client(name).await
-                                .ok_or_else(|| anyhow::anyhow!("QUIC STT service {} nie polaczony", name))?;
-
-                            debug!("Using QUIC STT backend: {}", name);
-                            let request_id = uuid::Uuid::new_v4().to_string();
-                            let model_request = ModelRequest {
-                                request_id: request_id.clone(),
-                                payload: ModelPayload::Audio(AudioPayload {
-                                    operation: AudioOperation::STT {
-                                        model: name.clone(),
-                                        audio_data: req.file.as_ref().to_vec(),
-                                        language: req.language.clone(),
-                                        response_format: req.response_format.clone(),
-                                        prompt: req.prompt.clone(),
-                                        temperature: req.temperature,
-                                        timestamp_granularities: req.timestamp_granularities.clone(),
-                                        no_speech_threshold: None,
-                                        avg_logprob_threshold: None,
-                                        compression_ratio_threshold: None,
-                                    },
-                                }),
-                                stream: false,
-                                metadata: None,
-                                session_id: None,
-                            };
-
-                            let response = quic_client.send_request(model_request).await
-                                .map_err(|e| anyhow::anyhow!("QUIC STT request failed: {}", e))?;
-
-                            match response.result {
-                                ModelResult::Audio(audio_result) => {
-                                    match audio_result.data {
-                                        AudioResultData::Text(text) => {
-                                            debug!("QUIC STT success: {} chars", text.len());
-                                            Ok(TranscriptionResponse {
-                                                text,
-                                                task: Some("transcribe".to_string()),
-                                                language: None,
-                                                duration: None,
-                                                segments: None,
-                                                speakers: None,
-                                            })
-                                        }
-                                        AudioResultData::Detailed { text, segments, language, duration, filtered_segments_count: _ } => {
-                                            debug!("QUIC STT success (detailed): {} chars, {} segments", text.len(), segments.len());
-                                            let openai_segments: Vec<crate::api::openai::types::TranscriptionSegment> = segments.iter()
-                                                .map(|seg| crate::api::openai::types::TranscriptionSegment {
-                                                    id: seg.id,
-                                                    seek: seg.seek,
-                                                    start: seg.start,
-                                                    end: seg.end,
-                                                    text: seg.text.clone(),
-                                                    tokens: seg.tokens.clone().unwrap_or_default(),
-                                                    temperature: seg.temperature,
-                                                    avg_logprob: seg.avg_logprob,
-                                                    compression_ratio: seg.compression_ratio,
-                                                    no_speech_prob: seg.no_speech_prob,
-                                                    speaker_label: seg.speaker_label.clone(),
-                                                    speaker_similarity: seg.speaker_similarity,
-                                                    is_known_speaker: seg.is_known_speaker,
-                                                })
-                                                .collect();
-                                            Ok(TranscriptionResponse {
-                                                text,
-                                                task: Some("transcribe".to_string()),
-                                                language: Some(language),
-                                                duration: Some(duration),
-                                                segments: Some(openai_segments),
-                                                speakers: None,
-                                            })
-                                        }
-                                        _ => Err(anyhow::anyhow!("QUIC STT zwrocil nieoczekiwany typ wyniku")),
-                                    }
-                                }
-                                ModelResult::Error(err) => {
-                                    Err(anyhow::anyhow!("QUIC STT error: {}", err.message))
-                                }
-                                _ => Err(anyhow::anyhow!("QUIC STT zwrocil nieoczekiwany typ odpowiedzi")),
-                            }
-                        }
-                        BackendHandle::Http(name) => {
-                            let backend = this.select_http_backend(name)
-                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
-                            debug!("Wybrany backend dla audio transcription: {}", backend.url());
-                            let response = backend.audio_transcription(req).await?;
-                            debug!("Audio transcription zakonczona: {} znakow tekstu", response.text.len());
-                            Ok(response)
-                        }
-                        BackendHandle::MeshForward(node_id, svc) => {
-                            debug!(target_node = %node_id, service = %svc, "MeshForward STT");
-                            let request_id = uuid::Uuid::new_v4().to_string();
-                            let model_request = ModelRequest {
-                                request_id: request_id.clone(),
-                                payload: ModelPayload::Audio(AudioPayload {
-                                    operation: AudioOperation::STT {
-                                        model: svc.clone(),
-                                        audio_data: req.file.as_ref().to_vec(),
-                                        language: req.language.clone(),
-                                        response_format: req.response_format.clone(),
-                                        prompt: req.prompt.clone(),
-                                        temperature: req.temperature,
-                                        timestamp_granularities: req.timestamp_granularities.clone(),
-                                        no_speech_threshold: None,
-                                        avg_logprob_threshold: None,
-                                        compression_ratio_threshold: None,
-                                    },
-                                }),
-                                stream: false,
-                                metadata: None,
-                                session_id: None,
-                            };
-                            let response = this.forward_model_request_to_mesh(node_id, model_request).await
-                                .map_err(|e| anyhow::anyhow!("Mesh STT request failed: {}", e))?;
-                            match response.result {
-                                ModelResult::Audio(audio_result) => match audio_result.data {
-                                    AudioResultData::Text(text) => Ok(TranscriptionResponse {
-                                        text,
-                                        task: Some("transcribe".to_string()),
-                                        language: None,
-                                        duration: None,
-                                        segments: None,
-                                        speakers: None,
-                                    }),
-                                    _ => Err(anyhow::anyhow!("Mesh STT zwrocil nieoczekiwany typ wyniku")),
-                                },
-                                ModelResult::Error(err) => Err(anyhow::anyhow!("Mesh STT error: {}", err.message)),
-                                _ => Err(anyhow::anyhow!("Mesh STT zwrocil nieoczekiwany typ odpowiedzi")),
-                            }
-                        }
-                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla STT")),
-                    }
-                }
-            }).await?
-        };
-
-        Ok(route_result)
+        // After R3b.8 the legacy `BackendHandle` STT dispatch is gone.
+        // Surface a typed error when the executor (and therefore SttRuntime)
+        // is not wired — DB-less router or `Router::start` not run.
+        let model_name = request.model.clone();
+        let _ = request;
+        Err(crate::error::CoreError::AllBackendsUnavailable { model_name }.into())
     }
+
 
     /// Routuje audio request przez protocol-native interface.
     ///
