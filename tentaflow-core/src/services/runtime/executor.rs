@@ -20,7 +20,9 @@ use std::pin::Pin;
 use futures::Stream;
 
 use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingData,
+    EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, TTSRequest,
+    TranscriptionRequest, TranscriptionResponse,
 };
 use crate::error::Result as CoreResult;
 use crate::flow_engine::dispatcher::FlowDispatcher;
@@ -65,6 +67,16 @@ pub enum ExecutorError {
     FlowDispatcherUnavailable,
     #[error("flow engine returned no result for model='{model}'")]
     FlowEmptyResult { model: String },
+    /// `SttRuntime` is not wired yet (DB-less router / `Router::start`
+    /// has not run). The caller should fall back to the legacy STT path.
+    #[error("STT runtime is not wired yet")]
+    SttRuntimeUnavailable,
+    /// Real STT dispatch error from the runtime (engine failure, alias
+    /// missing, etc.). The caller should NOT re-dispatch — surface this
+    /// directly. Mirrors the chat/embeddings/TTS pattern of returning
+    /// typed errors so HTTP layer maps them onto the right status code.
+    #[error("STT backend error: {0}")]
+    SttBackend(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -74,8 +86,19 @@ impl ExecutorError {
     /// this error? `true` for config-level failures that the next
     /// candidate cannot fix. Transient transport failures (HTTP 5xx,
     /// QUIC reconnect) keep iterating.
+    ///
+    /// `TransportPendingCutover` is **not** classified as abort — see
+    /// `defer_transport_pending_cutover` for the dispatch loop's special
+    /// handling. The variant must reach the caller so chat.rs/embeddings.rs
+    /// can route through the legacy dispatch path, but only after every
+    /// later candidate (HTTP/Local) has been tried.
     fn aborts_fallback_chain(&self) -> bool {
-        matches!(self, Self::FlowDispatcherUnavailable)
+        matches!(
+            self,
+            Self::FlowDispatcherUnavailable
+                | Self::SttRuntimeUnavailable
+                | Self::SttBackend(_)
+        )
     }
 }
 
@@ -88,6 +111,23 @@ pub struct ModelRuntimeExecutor {
     resolver: Arc<AliasResolver>,
     flow_dispatcher: Option<Arc<FlowDispatcher>>,
     local_inference: Arc<crate::inference::local::LocalInferenceHandler>,
+    /// SttRuntime slot — same `Arc<RwLock<Option<...>>>` as `Router.stt_runtime`
+    /// and `FlowDispatcher`'s SttRuntimeSlot. Shared instance so the
+    /// `/v1/audio/transcriptions` handler, the flow STT adapter, and
+    /// `executor.execute_stt` all dispatch through the same owner (D.3
+    /// single STT path). `None` until `Router::start` plants the runtime.
+    stt_runtime: Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
+    /// Mesh transport slot — same `Arc<RwLock<Option<...>>>` as
+    /// `Router.mesh_manager`. Wired by `Router::start` once the iroh
+    /// endpoint is up. Used by R3b.7 to dispatch `MeshForward` candidates
+    /// directly through the executor instead of returning
+    /// `TransportPendingCutover` and falling back to legacy router code.
+    /// `None` for DB-less / no-mesh routers; the dispatcher returns
+    /// `TransportPendingCutover` so the caller can pick the next
+    /// candidate or take the legacy fallback.
+    mesh_manager: Arc<
+        parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
+    >,
     middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     /// Per-alias round-robin state keyed by alias name. `DashMap` so we
     /// can mutate per-key without serialising the whole map.
@@ -100,6 +140,10 @@ impl ModelRuntimeExecutor {
         resolver: Arc<AliasResolver>,
         flow_dispatcher: Option<Arc<FlowDispatcher>>,
         local_inference: Arc<crate::inference::local::LocalInferenceHandler>,
+        stt_runtime: Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
+        mesh_manager: Arc<
+            parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
+        >,
         middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     ) -> Self {
         Self {
@@ -107,6 +151,8 @@ impl ModelRuntimeExecutor {
             resolver,
             flow_dispatcher,
             local_inference,
+            stt_runtime,
+            mesh_manager,
             middleware,
             strategy_state: Arc::new(dashmap::DashMap::new()),
         }
@@ -140,6 +186,7 @@ impl ModelRuntimeExecutor {
         let mut last_err: Option<String> = None;
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
 
         for target in ranked {
             attempts += 1;
@@ -158,6 +205,13 @@ impl ModelRuntimeExecutor {
                     // an aggregated `AllCandidatesFailed`.
                     return Err(e);
                 }
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    // Codex R3b.1 round 2 M1: don't short-circuit — later
+                    // candidates (HTTP/Local) might serve the request.
+                    // Remember the cutover so we can surface it iff every
+                    // other candidate fails.
+                    deferred_cutover.get_or_insert(kind);
+                }
                 Err(e) => {
                     tracing::warn!(
                         target_kind = target.telemetry_tag(),
@@ -167,6 +221,10 @@ impl ModelRuntimeExecutor {
                     last_err = Some(e.to_string());
                 }
             }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
         }
 
         Err(ExecutorError::AllCandidatesFailed {
@@ -209,6 +267,7 @@ impl ModelRuntimeExecutor {
         let mut last_err: Option<String> = None;
         let mut attempts = 0usize;
         let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
 
         for target in ranked {
             attempts += 1;
@@ -221,6 +280,9 @@ impl ModelRuntimeExecutor {
                     return Ok(stream);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
                 Err(e) => {
                     tracing::warn!(
                         target_kind = target.telemetry_tag(),
@@ -230,6 +292,10 @@ impl ModelRuntimeExecutor {
                     last_err = Some(e.to_string());
                 }
             }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
         }
 
         Err(ExecutorError::AllCandidatesFailed {
@@ -247,7 +313,7 @@ impl ModelRuntimeExecutor {
         &self,
         target: &ResolvedExecutionTarget,
         mut request: ChatCompletionRequest,
-        _ctx: &mut ExecutionContext,
+        ctx: &mut ExecutionContext,
     ) -> Result<ExecutorChunkStream, ExecutorError> {
         use crate::api::openai::types::{ChunkChoice, Delta};
         use futures::StreamExt;
@@ -416,8 +482,91 @@ impl ModelRuntimeExecutor {
                     Ok(Box::pin(stream))
                 }
             },
-            ResolvedExecutionTarget::MeshForward { .. } => {
-                Err(ExecutorError::TransportPendingCutover("mesh_forward_stream"))
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                ctx.enter_hop().map_err(|e| {
+                    ExecutorError::Internal(format!("mesh forward stream hop limit: {}", e))
+                })?;
+                let mesh = self.mesh_manager.read().clone().ok_or_else(|| {
+                    ExecutorError::TransportPendingCutover("mesh_forward_stream")
+                })?;
+                let protocol_messages =
+                    crate::routing::openai_messages_to_protocol(&request.messages);
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let target_model = model_name.clone();
+                let model_request = ModelRequest {
+                    request_id: request_id.clone(),
+                    payload: ModelPayload::Completion(CompletionPayload {
+                        model: target_model.clone(),
+                        prompt: None,
+                        messages: protocol_messages,
+                        temperature: request.temperature,
+                        max_tokens: request.max_tokens,
+                        top_p: request.top_p,
+                        stop: request.stop.clone(),
+                        presence_penalty: request.presence_penalty,
+                        frequency_penalty: request.frequency_penalty,
+                        tts_options: None,
+                        memory_options: None,
+                        audio_input: None,
+                        prefix_cache_id: None,
+                        prefix_text: None,
+                    }),
+                    stream: true,
+                    metadata: None,
+                    session_id: None,
+                };
+                let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
+                    .map_err(|e| {
+                        ExecutorError::Internal(format!(
+                            "mesh stream serialize ModelRequest: {}",
+                            e
+                        ))
+                    })?
+                    .into_vec();
+                let frame_stream = mesh
+                    .forward_stream_request(node_id, &request_id, payload)
+                    .await
+                    .map_err(|e| {
+                        ExecutorError::Internal(format!(
+                            "mesh forward stream request: {}",
+                            e
+                        ))
+                    })?;
+                let backend_url = format!("mesh://{}", node_id);
+                let protocol_stream = frame_stream.map(move |frame_result| {
+                    let frame = frame_result.map_err(|e| {
+                        crate::error::CoreError::NetworkError {
+                            message: format!("mesh stream read: {}", e),
+                            source: e,
+                        }
+                    })?;
+                    let archived = rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(
+                        &frame,
+                    )
+                    .map_err(|e| crate::error::CoreError::BackendError {
+                        backend_url: backend_url.clone(),
+                        message: format!("mesh stream access ModelStreamChunk: {}", e),
+                        source: None,
+                    })?;
+                    rkyv::deserialize::<ModelStreamChunk, rkyv::rancor::Error>(archived).map_err(
+                        |e| crate::error::CoreError::BackendError {
+                            backend_url: backend_url.clone(),
+                            message: format!(
+                                "mesh stream deserialize ModelStreamChunk: {}",
+                                e
+                            ),
+                            source: None,
+                        },
+                    )
+                });
+                Ok(crate::routing::stream_helpers::quic_stream_to_openai_chunks(
+                    protocol_stream,
+                    target_model,
+                ))
             }
             ResolvedExecutionTarget::Flow { .. } => {
                 Err(ExecutorError::TransportPendingCutover("flow_stream"))
@@ -522,14 +671,90 @@ impl ModelRuntimeExecutor {
                     Self::dispatch_chat_quic(handle, request).await
                 }
             },
-            ResolvedExecutionTarget::MeshForward { .. } => {
-                // Forwarding to a peer requires verifying the destination
-                // is in our trusted-keys set before dialling — adding
-                // mesh transport here without that check would let a
-                // tampered catalog snapshot redirect requests to any
-                // node id. Wire trust verification together with the
-                // transport plumbing.
-                Err(ExecutorError::TransportPendingCutover("mesh_forward"))
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                use tentaflow_protocol::*;
+                let protocol_messages =
+                    crate::routing::openai_messages_to_protocol(&request.messages);
+                let model_request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload: ModelPayload::Completion(CompletionPayload {
+                        model: model_name.clone(),
+                        prompt: None,
+                        messages: protocol_messages,
+                        temperature: request.temperature,
+                        max_tokens: request.max_tokens,
+                        top_p: request.top_p,
+                        stop: request.stop.clone(),
+                        presence_penalty: request.presence_penalty,
+                        frequency_penalty: request.frequency_penalty,
+                        tts_options: None,
+                        memory_options: None,
+                        audio_input: None,
+                        prefix_cache_id: None,
+                        prefix_text: None,
+                    }),
+                    stream: false,
+                    metadata: None,
+                    session_id: None,
+                };
+                let response = self
+                    .forward_via_mesh(node_id, model_request, ctx)
+                    .await?;
+                match response.result {
+                    ModelResult::Completion(completion) => Ok(ChatCompletionResponse {
+                        id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                        object: "chat.completion".to_string(),
+                        created: chrono::Utc::now().timestamp() as u64,
+                        model: request.model.clone(),
+                        choices: vec![crate::api::openai::types::Choice {
+                            index: 0,
+                            message: crate::api::openai::types::Message {
+                                role: "assistant".to_string(),
+                                content: Some(crate::api::openai::types::MessageContent::Text(
+                                    completion.text,
+                                )),
+                                reasoning_content: completion.reasoning_content,
+                                ..Default::default()
+                            },
+                            finish_reason: completion.finish_reason,
+                            logprobs: None,
+                        }],
+                        usage: response.metrics.and_then(|m| {
+                            if let Some(DetailedMetrics::Completion {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens,
+                            }) = m.detailed
+                            {
+                                Some(crate::api::openai::types::Usage {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                })
+                            } else {
+                                None
+                            }
+                        }),
+                        system_fingerprint: None,
+                        transcribed_text: None,
+                        speaker_id: None,
+                        speaker_name: None,
+                        speaker_confidence: None,
+                        detected_intent: None,
+                        detected_tools: None,
+                    }),
+                    ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+                        "mesh chat error: {}",
+                        err.message
+                    ))),
+                    _ => Err(ExecutorError::Internal(
+                        "mesh chat returned unexpected result type".into(),
+                    )),
+                }
             }
             ResolvedExecutionTarget::Flow {
                 flow_id,
@@ -576,6 +801,74 @@ impl ModelRuntimeExecutor {
                 ))
             }
         }
+    }
+
+    /// R3b.7 — shared mesh forwarding for chat / embeddings / TTS / STT.
+    /// Bumps `ctx.hop_count` (rejecting loops at `MAX_HOP_COUNT`),
+    /// requires the mesh manager slot to be wired (DB-less router or
+    /// `--no-mesh` returns `TransportPendingCutover` so the caller can
+    /// pick the next candidate or take the legacy fallback), and trusts
+    /// the mesh manager's pre-existing peer authentication (only trusted
+    /// peers ever land in `IrohMeshManager.connections`).
+    async fn forward_via_mesh(
+        &self,
+        target_node_id: &str,
+        mut model_request: tentaflow_protocol::ModelRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<tentaflow_protocol::ModelResponse, ExecutorError> {
+        use tentaflow_protocol::*;
+
+        ctx.enter_hop().map_err(|e| {
+            ExecutorError::Internal(format!("mesh forward hop limit: {}", e))
+        })?;
+
+        let mesh = self.mesh_manager.read().clone().ok_or_else(|| {
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        })?;
+
+        // Codex R3b.7 H1 (defense in depth): re-verify trust on the
+        // executor side too. Underlying transport already checks but a
+        // misconfigured slot or peer registered before trust gating
+        // would slip through.
+        if !mesh.is_trusted(target_node_id) {
+            return Err(ExecutorError::Internal(format!(
+                "mesh forward target '{}' is not trusted",
+                target_node_id
+            )));
+        }
+
+        // Codex R3b.7 H2: carry hop count across the mesh boundary so
+        // peers can refuse re-forwarding past `MAX_HOP_COUNT`. Without
+        // this an A→B→A cycle resets to 0 on every node and loops
+        // until the underlying QUIC connection breaks.
+        let hop_kv = (
+            crate::services::runtime::context::MESH_HOP_HEADER.to_string(),
+            ctx.hop_count.to_string(),
+        );
+        match model_request.metadata.as_mut() {
+            Some(meta) => meta.push(hop_kv),
+            None => model_request.metadata = Some(vec![hop_kv]),
+        }
+
+        let request_id = model_request.request_id.clone();
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
+            .map_err(|e| {
+                ExecutorError::Internal(format!("mesh forward serialize: {}", e))
+            })?
+            .into_vec();
+        let response_bytes = mesh
+            .forward_request(target_node_id, &request_id, payload)
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("mesh forward request: {}", e)))?;
+        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(
+            &response_bytes,
+        )
+        .map_err(|e| {
+            ExecutorError::Internal(format!("mesh forward access ModelResponse: {}", e))
+        })?;
+        rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived).map_err(|e| {
+            ExecutorError::Internal(format!("mesh forward deserialize ModelResponse: {}", e))
+        })
     }
 
     /// QUIC sidecar dispatch (R2a). Wczesniej zwracalo
@@ -687,6 +980,753 @@ impl ModelRuntimeExecutor {
     pub fn middleware_factories(&self) -> &[Arc<dyn StreamMiddlewareFactory>] {
         &self.middleware
     }
+
+    // =========================================================================
+    // R3b.1 — Embeddings dispatch
+    // =========================================================================
+
+    /// Embeddings dispatch — mirrors `execute_chat`. Resolves the requested
+    /// model through the catalog with `ServiceSurface::Embeddings`, ranks
+    /// candidates per alias strategy, dispatches to the first that succeeds.
+    /// `MeshForward` returns `TransportPendingCutover` until R3b.7 wires the
+    /// mesh transport into the executor.
+    ///
+    /// **ACL is the caller's responsibility** — mirror of `execute_chat`.
+    pub async fn execute_embeddings(
+        &self,
+        request: EmbeddingRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<EmbeddingResponse, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            // OpenAI `/v1/embeddings` is text-in / vector-out. Constrain the
+            // resolver so an image-only embedding service (e.g. CLIP-vision)
+            // cannot match a plain text request — keeps the same `Embeddings`
+            // surface but filters by modality.
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::Embeddings,
+                required_input_modalities: &[InputModality::Text],
+                required_output_modalities: &[OutputModality::Embedding],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_embeddings_blocking(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "embeddings dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target embeddings dispatch. Embedded backends route through
+    /// `LocalInferenceHandler::handle_embeddings` — engines that don't
+    /// implement embeddings (the trait default is `bail!`) surface their
+    /// own error rather than this dispatcher hard-rejecting them.
+    async fn dispatch_embeddings_blocking(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: EmbeddingRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<EmbeddingResponse, ExecutorError> {
+        use tentaflow_protocol::*;
+
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded { .. } => self
+                    .local_inference
+                    .handle_embeddings(&request)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                BackendHandle::Http(client) => client
+                    .embeddings_request(request)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                BackendHandle::Quic(handle) => {
+                    let quic_client = handle.get_client().await.ok_or_else(|| {
+                        ExecutorError::Internal(format!(
+                            "QUIC client not connected for service '{}'",
+                            handle.config.name
+                        ))
+                    })?;
+
+                    let input_texts = match &request.input {
+                        EmbeddingInput::Single(text) => vec![text.clone()],
+                        EmbeddingInput::Multiple(texts) => texts.clone(),
+                    };
+                    let text_count = input_texts.len();
+                    // Strip well-known router-side prefixes so the engine
+                    // sees the bare model name. Mirror of legacy
+                    // `routing/embeddings.rs::route_embeddings_quic`.
+                    let engine_model_name = request
+                        .model
+                        .strip_prefix("tentaflow-embeddings-")
+                        .or_else(|| request.model.strip_prefix("embeddings-"))
+                        .unwrap_or(&request.model)
+                        .to_string();
+
+                    let model_request = ModelRequest {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        payload: ModelPayload::Embeddings(EmbeddingsPayload {
+                            model: engine_model_name,
+                            input: input_texts,
+                            normalize: true,
+                        }),
+                        stream: false,
+                        metadata: None,
+                        session_id: None,
+                    };
+
+                    let response = quic_client
+                        .send_request(model_request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("QUIC embeddings: {}", e)))?;
+
+                    match response.result {
+                        ModelResult::Embeddings(result) => {
+                            let data = result
+                                .embeddings
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, embedding)| EmbeddingData {
+                                    object: "embedding".to_string(),
+                                    index: idx as u32,
+                                    embedding,
+                                })
+                                .collect();
+                            // Heuristic token count — embeddings backends do not
+                            // return usage stats over the wire; mirror of the
+                            // legacy routing/embeddings.rs estimate.
+                            let estimated = (text_count * 50) as u32;
+                            Ok(EmbeddingResponse {
+                                object: "list".to_string(),
+                                data,
+                                model: request.model.clone(),
+                                usage: EmbeddingUsage {
+                                    prompt_tokens: estimated,
+                                    total_tokens: estimated,
+                                },
+                            })
+                        }
+                        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+                            "QUIC embeddings error: {}",
+                            err.message
+                        ))),
+                        _ => Err(ExecutorError::Internal(
+                            "QUIC embeddings returned unexpected result type".into(),
+                        )),
+                    }
+                }
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let input_texts = match &request.input {
+                    EmbeddingInput::Single(text) => vec![text.clone()],
+                    EmbeddingInput::Multiple(texts) => texts.clone(),
+                };
+                let text_count = input_texts.len();
+                let model_request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload: ModelPayload::Embeddings(EmbeddingsPayload {
+                        model: model_name.clone(),
+                        input: input_texts,
+                        normalize: true,
+                    }),
+                    stream: false,
+                    metadata: None,
+                    session_id: None,
+                };
+                let response = self
+                    .forward_via_mesh(node_id, model_request, ctx)
+                    .await?;
+                match response.result {
+                    ModelResult::Embeddings(result) => {
+                        // Codex R3b.7 M2: cardinality guard. Peer that
+                        // returns fewer/more vectors than the input batch
+                        // size is a wire contract violation — surface it
+                        // instead of silently mis-aligning vectors with
+                        // their input texts.
+                        if result.embeddings.len() != text_count {
+                            return Err(ExecutorError::Internal(format!(
+                                "mesh embeddings returned {} vectors for {} input(s) — cardinality mismatch",
+                                result.embeddings.len(),
+                                text_count
+                            )));
+                        }
+                        let data = result
+                            .embeddings
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, embedding)| EmbeddingData {
+                                object: "embedding".to_string(),
+                                index: idx as u32,
+                                embedding,
+                            })
+                            .collect();
+                        let estimated = (text_count * 50) as u32;
+                        Ok(EmbeddingResponse {
+                            object: "list".to_string(),
+                            data,
+                            model: request.model.clone(),
+                            usage: EmbeddingUsage {
+                                prompt_tokens: estimated,
+                                total_tokens: estimated,
+                            },
+                        })
+                    }
+                    ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+                        "mesh embeddings error: {}",
+                        err.message
+                    ))),
+                    _ => Err(ExecutorError::Internal(
+                        "mesh embeddings returned unexpected result type".into(),
+                    )),
+                }
+            }
+            ResolvedExecutionTarget::Flow {
+                flow_id,
+                published_name,
+            } => {
+                // Catalog can advertise embedding-surface flows
+                // (`EmbeddingsNodeAdapter` is registered) so this branch must
+                // execute the flow, not refuse it. Caller convention: flow
+                // output's `embedding` (single) or `embeddings` (batched)
+                // key carries the vector payload. Anything else → reject
+                // with Internal so the operator notices a mis-shaped flow
+                // instead of getting an empty embedding.
+                let dispatcher = self
+                    .flow_dispatcher
+                    .as_ref()
+                    .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+                ctx.enter_flow(*flow_id).map_err(|e| {
+                    ExecutorError::Internal(format!("flow recursion limit: {}", e))
+                })?;
+                // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
+                // Without this `dispatch_by_flow_id` sees `user_id = None`
+                // and skips the per-flow ACL check.
+                let flow_ctx = embeddings_request_to_flow_ctx(&request, ctx.user.clone());
+                let dispatch_result = dispatcher
+                    .dispatch_by_flow_id(*flow_id, flow_ctx)
+                    .await;
+                ctx.leave_flow();
+                let result = dispatch_result
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
+                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
+                        model: published_name.clone(),
+                    })?;
+                let expected_count = match &request.input {
+                    EmbeddingInput::Single(_) => 1,
+                    EmbeddingInput::Multiple(texts) => texts.len(),
+                };
+                flow_result_to_embedding_response(result, &request, expected_count)
+            }
+        }
+    }
+
+    // =========================================================================
+    // R3b.3 — TTS dispatch
+    // =========================================================================
+
+    /// TTS dispatch — mirrors `execute_chat`/`execute_embeddings`. Resolves
+    /// the requested model with `ServiceSurface::Tts`, requires text input
+    /// and audio output. Returns the audio bytes alongside the actual
+    /// container/codec produced by the backend so the HTTP layer can set
+    /// `Content-Type` correctly. Embedded engines synthesise PCM samples
+    /// and the executor packs them as WAV; HTTP backends honour
+    /// `request.response_format`; QUIC backends echo whatever the upstream
+    /// returns and reuse the request format as the wire-side hint.
+    ///
+    /// **ACL is the caller's responsibility.**
+    pub async fn execute_tts(
+        &self,
+        request: TTSRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<TtsExecutionResult, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::Tts,
+                required_input_modalities: &[InputModality::Text],
+                required_output_modalities: &[OutputModality::Audio],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_tts_blocking(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(result) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    return Ok(result);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "tts dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target TTS dispatch.
+    /// - `Local::Embedded` → `crate::tts::shared_tts_manager()` synthesize
+    ///   on a blocking task (FFI calls into Apple AVSpeech / Kokoro / sherpa
+    ///   are sync). Result wrapped in WAV PCM16.
+    /// - `Local::Http(client)` → OpenAI-compatible POST `/v1/audio/speech`.
+    /// - `Local::Quic(handle)` → `ModelRequest::Audio(TTS{...})`.
+    /// - `MeshForward` → `TransportPendingCutover` (R3b.7).
+    /// - `Flow` → `Internal` — no surface for TTS-as-flow yet.
+    async fn dispatch_tts_blocking(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: TTSRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<TtsExecutionResult, ExecutorError> {
+        use tentaflow_protocol::*;
+
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded {
+                    engine_id,
+                    model_name,
+                    ..
+                } => {
+                    // Codex R3b.3 H2: embedded engines always emit WAV
+                    // (PCM samples packed locally). Reject mismatched
+                    // requested format up-front so the caller learns the
+                    // unsupported codec instead of getting WAV bytes
+                    // labeled as MP3.
+                    if let Some(req_fmt) = &request.response_format {
+                        let normalized = req_fmt.to_ascii_lowercase();
+                        if !matches!(normalized.as_str(), "wav" | "pcm") {
+                            return Err(ExecutorError::Internal(format!(
+                                "embedded TTS engine '{}' only emits WAV/PCM; \
+                                 requested '{}' is not supported here",
+                                engine_id, req_fmt
+                            )));
+                        }
+                    }
+                    // Codex R3b.3 H1: lookup by `engine_id` (manifest engine.id,
+                    // e.g. "apple-tts") — `model_name` like "zosia-pl" is the
+                    // voice preset and would miss the manager registration.
+                    let engine_id_owned = engine_id.clone();
+                    let model_name_owned = model_name.clone();
+                    let text = request.input.clone();
+                    let speed = request.speed.unwrap_or(1.0);
+                    let res = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<(Vec<f32>, u32)> {
+                            let mgr = crate::tts::shared_tts_manager();
+                            let guard = mgr.blocking_read();
+                            // Some embedded engines (apple-tts) honour
+                            // per-voice presets through `speaker_id`; pre-R3b
+                            // legacy passes 0 and lets the engine decide. We
+                            // mirror that — voice/preset selection by name
+                            // happens inside the engine via `engine_id`.
+                            let _ = model_name_owned;
+                            let out = guard.synthesize(
+                                &engine_id_owned,
+                                crate::tts::SynthesizeParams {
+                                    text,
+                                    speaker_id: 0,
+                                    speed,
+                                },
+                            )?;
+                            Ok((out.samples, out.sample_rate))
+                        },
+                    )
+                    .await
+                    .map_err(|e| ExecutorError::Internal(format!("embedded TTS join: {e}")))?
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                    let (samples, sr) = res;
+                    Ok(TtsExecutionResult {
+                        bytes: samples_to_wav_pcm16(&samples, sr),
+                        format: "wav".to_string(),
+                    })
+                }
+                BackendHandle::Http(client) => {
+                    let bytes = client
+                        .audio_speech(&request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                    let format = request
+                        .response_format
+                        .clone()
+                        .unwrap_or_else(|| "wav".to_string());
+                    Ok(TtsExecutionResult { bytes, format })
+                }
+                BackendHandle::Quic(handle) => {
+                    let quic_client = handle.get_client().await.ok_or_else(|| {
+                        ExecutorError::Internal(format!(
+                            "QUIC client not connected for service '{}'",
+                            handle.config.name
+                        ))
+                    })?;
+                    let format = request.response_format.clone().unwrap_or_else(|| "wav".into());
+                    let speed = request.speed.unwrap_or(1.0);
+                    let model_request = ModelRequest {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        payload: ModelPayload::Audio(AudioPayload {
+                            operation: AudioOperation::TTS {
+                                model: request.model.clone(),
+                                input: request.input.clone(),
+                                voice: request.voice.clone(),
+                                format: Some(format.clone()),
+                                speed: Some(speed),
+                                language: request.language.clone(),
+                            },
+                        }),
+                        stream: false,
+                        metadata: None,
+                        session_id: None,
+                    };
+                    let response = quic_client
+                        .send_request(model_request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("QUIC TTS: {}", e)))?;
+                    match response.result {
+                        ModelResult::Audio(audio_result) => match audio_result.data {
+                            AudioResultData::Audio(bytes) => {
+                                Ok(TtsExecutionResult { bytes, format })
+                            }
+                            _ => Err(ExecutorError::Internal(
+                                "QUIC TTS returned non-audio result".into(),
+                            )),
+                        },
+                        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+                            "QUIC TTS error: {}",
+                            err.message
+                        ))),
+                        _ => Err(ExecutorError::Internal(
+                            "QUIC TTS returned unexpected result type".into(),
+                        )),
+                    }
+                }
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let format = request.response_format.clone().unwrap_or_else(|| "wav".into());
+                let model_request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload: ModelPayload::Audio(AudioPayload {
+                        operation: AudioOperation::TTS {
+                            model: model_name.clone(),
+                            input: request.input.clone(),
+                            voice: request.voice.clone(),
+                            format: Some(format.clone()),
+                            speed: request.speed,
+                            language: request.language.clone(),
+                        },
+                    }),
+                    stream: false,
+                    metadata: None,
+                    session_id: None,
+                };
+                let response = self
+                    .forward_via_mesh(node_id, model_request, ctx)
+                    .await?;
+                match response.result {
+                    ModelResult::Audio(audio_result) => match audio_result.data {
+                        AudioResultData::Audio(bytes) => {
+                            Ok(TtsExecutionResult { bytes, format })
+                        }
+                        _ => Err(ExecutorError::Internal(
+                            "mesh TTS returned non-audio result".into(),
+                        )),
+                    },
+                    ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+                        "mesh TTS error: {}",
+                        err.message
+                    ))),
+                    _ => Err(ExecutorError::Internal(
+                        "mesh TTS returned unexpected result type".into(),
+                    )),
+                }
+            }
+            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
+                "TTS via flow not supported yet".into(),
+            )),
+        }
+    }
+
+    // =========================================================================
+    // R3b.5 — STT dispatch (thin delegate to SttRuntime)
+    // =========================================================================
+
+    /// STT delegate. The executor does **not** own STT dispatch logic — it
+    /// hands off to `SttRuntime` (D.3 single-owner). Resolver/strategy
+    /// would not add value for MVP because each node runs at most one STT
+    /// engine; the SttRuntime already encapsulates QUIC/HTTP/embedded
+    /// fallback and per-engine speaker pipeline. When a future iteration
+    /// needs multi-instance STT routing (e.g. picking between whisper-cpp
+    /// and parakeet), the dispatch can move into the resolver and this
+    /// method can grow into a full `dispatch_stt_blocking` like the
+    /// other surfaces.
+    ///
+    /// **ACL is the caller's responsibility** — mirror of the other
+    /// `execute_*` entry points.
+    ///
+    /// Codex R3b.5+6 H1/M2: failure modes are split into typed variants
+    /// so the caller can distinguish "executor not ready, retry through
+    /// the legacy path" (`SttRuntimeUnavailable`) from "real STT error,
+    /// surface to the user" (`SttBackend(SttBackendError)`). Without this
+    /// split the legacy fallback runs the same expensive transcription
+    /// twice on transient backend errors.
+    pub async fn execute_stt(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<TranscriptionResponse, ExecutorError> {
+        let runtime = self.stt_runtime.read().clone().ok_or_else(|| {
+            ExecutorError::SttRuntimeUnavailable
+        })?;
+        runtime
+            .transcribe(request)
+            .await
+            .map_err(|e| ExecutorError::SttBackend(e.to_string()))
+    }
+}
+
+/// TTS execution outcome with the actual audio container so callers can set
+/// the right `Content-Type`. Embedded TTS always emits WAV; HTTP/QUIC
+/// backends honour the requested format and reflect it back here.
+#[derive(Debug, Clone)]
+pub struct TtsExecutionResult {
+    pub bytes: Vec<u8>,
+    pub format: String,
+}
+
+/// Pack `Vec<f32>` PCM samples (range -1.0..=1.0) into a WAV/PCM16 byte
+/// buffer with a 44-byte RIFF header. Used by embedded TTS engines whose
+/// output is normalised float — callers expecting raw bytes from the
+/// `/v1/audio/speech` surface get a self-describing container.
+fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let pcm16: Vec<i16> = samples
+        .iter()
+        .map(|f| (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+        .collect();
+    let data_bytes: Vec<u8> = pcm16.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let data_len = data_bytes.len() as u32;
+    let chunk_size = 36 + data_len;
+    let byte_rate = sample_rate * 2;
+    let mut buf = Vec::with_capacity(44 + data_bytes.len());
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&chunk_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    buf.extend_from_slice(&data_bytes);
+    buf
+}
+
+/// Build a `FlowContext` for an embeddings request. Propagates `user_id` /
+/// `user_role` from the executor context so the dispatcher's per-flow ACL
+/// fires identically to chat dispatch.
+fn embeddings_request_to_flow_ctx(
+    request: &EmbeddingRequest,
+    user: Option<crate::auth::acl::UserContext>,
+) -> crate::flow_engine::types::FlowContext {
+    let input_text = match &request.input {
+        EmbeddingInput::Single(text) => text.clone(),
+        EmbeddingInput::Multiple(texts) => texts.join("\n"),
+    };
+    let mut ctx = crate::flow_engine::types::FlowContext {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        model: request.model.clone(),
+        input: input_text,
+        stream: false,
+        service_type: "embeddings".to_string(),
+        original_request: serde_json::to_value(request).ok(),
+        ..Default::default()
+    };
+    if let Some(u) = user {
+        ctx.user_id = Some(u.user_id);
+        ctx.user_role = Some(u.role);
+    }
+    ctx
+}
+
+/// Convert a flow's terminal output into an `EmbeddingResponse`. Flow author
+/// is expected to surface either `Vec<f32>` (single input) or `Vec<Vec<f32>>`
+/// (batched) under the `embedding`/`embeddings` key. Cardinality is checked
+/// against `expected_count` so a batched request that comes back with one
+/// vector is rejected — silent collapse would let a flow misconfig hide
+/// behind an OK response.
+fn flow_result_to_embedding_response(
+    result: crate::flow_engine::types::FlowExecutionResult,
+    request: &EmbeddingRequest,
+    expected_count: usize,
+) -> Result<EmbeddingResponse, ExecutorError> {
+    let extract = |v: &serde_json::Value| -> Option<Vec<Vec<f32>>> {
+        // Try [[f32]] first, then [f32] wrapped in a single batch. Reject
+        // any non-finite floats — NaN/Inf vectors break downstream cosine
+        // similarity and other consumers without a clear error.
+        let parse_finite = |n: &serde_json::Value| -> Option<f32> {
+            let f = n.as_f64()? as f32;
+            if f.is_finite() {
+                Some(f)
+            } else {
+                None
+            }
+        };
+        if let Some(arr) = v.as_array() {
+            if arr.iter().all(|x| x.is_array()) {
+                let mut out = Vec::with_capacity(arr.len());
+                for row in arr {
+                    let inner = row.as_array()?;
+                    let mut floats = Vec::with_capacity(inner.len());
+                    for n in inner {
+                        floats.push(parse_finite(n)?);
+                    }
+                    out.push(floats);
+                }
+                return Some(out);
+            }
+            if arr.iter().all(|x| x.is_number()) {
+                let mut floats = Vec::with_capacity(arr.len());
+                for n in arr {
+                    floats.push(parse_finite(n)?);
+                }
+                return Some(vec![floats]);
+            }
+        }
+        None
+    };
+    let embeddings = result
+        .output
+        .get("embedding")
+        .and_then(extract)
+        .or_else(|| result.output.get("embeddings").and_then(extract))
+        .ok_or_else(|| {
+            ExecutorError::Internal(
+                "flow output missing `embedding`/`embeddings` field with vector payload".into(),
+            )
+        })?;
+
+    if embeddings.len() != expected_count {
+        return Err(ExecutorError::Internal(format!(
+            "flow returned {} embedding(s) for {} input(s) — cardinality mismatch",
+            embeddings.len(),
+            expected_count
+        )));
+    }
+
+    let data = embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(idx, embedding)| EmbeddingData {
+            object: "embedding".to_string(),
+            index: idx as u32,
+            embedding,
+        })
+        .collect();
+    let prompt_tokens = result.prompt_tokens.max(0) as u32;
+    let total_tokens = result.total_tokens.max(prompt_tokens as i64) as u32;
+    Ok(EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model: request.model.clone(),
+        usage: EmbeddingUsage {
+            prompt_tokens,
+            total_tokens,
+        },
+    })
 }
 
 fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
@@ -712,7 +1752,17 @@ mod tests {
     #[test]
     fn fallback_chain_abort_classification_is_stable() {
         assert!(ExecutorError::FlowDispatcherUnavailable.aborts_fallback_chain());
+        // Codex R3b.1 round 2 M1: TransportPendingCutover does NOT abort —
+        // we keep iterating later candidates (HTTP/Local may save the
+        // request). The cutover error is preserved separately by the
+        // dispatch loop and surfaced only if every other candidate fails.
         assert!(!ExecutorError::TransportPendingCutover("x").aborts_fallback_chain());
+        // Codex R3b.5+6 H1: SttBackend errors must NOT trigger legacy
+        // fallback — that would re-dispatch the same expensive request.
+        assert!(ExecutorError::SttBackend("x".into()).aborts_fallback_chain());
+        // Codex R3b.5+6 M2: SttRuntimeUnavailable is the **only** STT
+        // failure where the caller may try the legacy path.
+        assert!(ExecutorError::SttRuntimeUnavailable.aborts_fallback_chain());
         assert!(
             !ExecutorError::AllCandidatesFailed {
                 target_kind: "x",
@@ -728,6 +1778,280 @@ mod tests {
             !ExecutorError::FlowEmptyResult { model: "m".into() }
                 .aborts_fallback_chain()
         );
+    }
+
+    // R3b.1: `dispatch_embeddings_blocking` per-target tests. Branches without
+    // network IO (Embedded / MeshForward / Flow) are testable directly; Http
+    // and Quic happy paths land in caller-level integration tests w R3b.2.
+
+    fn make_request(model: &str) -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: model.to_string(),
+            input: EmbeddingInput::Single("hello".into()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        }
+    }
+
+    fn dummy_executor() -> ModelRuntimeExecutor {
+        use crate::services::handles_cache::LiveHandlesCache;
+        use crate::services::runtime::resolver::AliasResolver;
+        let catalog = Arc::new(crate::services::catalog::CatalogProvider::new());
+        let handles = Arc::new(LiveHandlesCache::new());
+        let resolver = Arc::new(AliasResolver::new_with_static_id(
+            handles,
+            "local-node".to_string(),
+        ));
+        let local_inference = Arc::new(
+            crate::inference::local::LocalInferenceHandler::new(
+                crate::inference::shared_inference_manager(),
+            ),
+        );
+        let stt_slot = Arc::new(parking_lot::RwLock::new(None));
+        let mesh_slot = Arc::new(parking_lot::RwLock::new(None));
+        ModelRuntimeExecutor::new(
+            catalog,
+            resolver,
+            None,
+            local_inference,
+            stt_slot,
+            mesh_slot,
+            Vec::new(),
+        )
+    }
+
+    /// Embedded branch routes through `LocalInferenceHandler::handle_embeddings`
+    /// (Codex R3b.1 fix #2). Without a loaded model the handler bails with a
+    /// "no model loaded" error — surfaced as `ExecutorError::Internal`. We
+    /// don't assert the message text (handler comment is Polish, may change),
+    /// only the typed variant.
+    #[tokio::test]
+    async fn embeddings_embedded_routes_through_local_inference() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            model_name: "qwen-emb".into(),
+            handle: BackendHandle::Embedded {
+                model_name: "qwen-emb".into(),
+                node_id: "local".into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_embeddings_blocking(&target, make_request("qwen-emb"), &mut ctx)
+            .await
+            .expect_err("no model loaded → handler bails");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn embeddings_mesh_forward_returns_pending_cutover() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::MeshForward {
+            node_id: "peer".into(),
+            service_id: 1,
+            model_name: "qwen-emb".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_embeddings_blocking(&target, make_request("qwen-emb"), &mut ctx)
+            .await
+            .expect_err("mesh_forward branch should be pending cutover");
+        assert!(matches!(
+            err,
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        ));
+    }
+
+    /// Flow embeddings without a registered FlowDispatcher must surface the
+    /// typed `FlowDispatcherUnavailable` error so the caller knows the
+    /// router was constructed DB-less, not that the flow itself failed.
+    #[tokio::test]
+    async fn embeddings_flow_without_dispatcher_returns_typed_error() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: 1,
+            published_name: "embed-flow".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_embeddings_blocking(&target, make_request("any"), &mut ctx)
+            .await
+            .expect_err("flow without dispatcher should be a typed error");
+        assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    /// `flow_result_to_embedding_response` accepts both shapes the catalog
+    /// promises a flow can emit: a single `[f32]` (one input, single vector)
+    /// and a `[[f32]]` batch.
+    fn flow_result(output: serde_json::Value) -> crate::flow_engine::types::FlowExecutionResult {
+        crate::flow_engine::types::FlowExecutionResult {
+            status: "ok".into(),
+            output,
+            execution_log: vec![],
+            total_latency_ms: 0,
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }
+    }
+
+    fn batch_request(model: &str, count: usize) -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: model.to_string(),
+            input: EmbeddingInput::Multiple(
+                (0..count).map(|i| format!("text-{i}")).collect(),
+            ),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn flow_result_extracts_single_embedding_for_single_input() {
+        let request = make_request("any");
+        let single = flow_result(serde_json::json!({ "embedding": [0.1, 0.2, 0.3] }));
+        let resp = flow_result_to_embedding_response(single, &request, 1).expect("single ok");
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].embedding.len(), 3);
+    }
+
+    #[test]
+    fn flow_result_extracts_batched_embeddings_for_batched_input() {
+        let request = batch_request("any", 2);
+        let batched = flow_result(serde_json::json!({ "embeddings": [[0.1], [0.2]] }));
+        let resp = flow_result_to_embedding_response(batched, &request, 2).expect("batched ok");
+        assert_eq!(resp.data.len(), 2);
+    }
+
+    #[test]
+    fn flow_result_missing_field_returns_internal() {
+        let request = make_request("any");
+        let bad = flow_result(serde_json::json!({ "text": "no vectors here" }));
+        let err = flow_result_to_embedding_response(bad, &request, 1)
+            .expect_err("missing embedding field should reject");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+    }
+
+    /// Codex R3b.1 round 2 M3: a batched request that comes back with a
+    /// single vector must be rejected — silent collapse would let a flow
+    /// misconfig hide behind an OK response.
+    #[test]
+    fn flow_result_cardinality_mismatch_returns_internal() {
+        let request = batch_request("any", 3);
+        let single_result = flow_result(serde_json::json!({ "embeddings": [[0.1]] }));
+        let err = flow_result_to_embedding_response(single_result, &request, 3)
+            .expect_err("1 embedding for 3 inputs must reject");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+    }
+
+    fn make_tts_request(model: &str) -> TTSRequest {
+        TTSRequest {
+            model: model.to_string(),
+            input: "hello world".to_string(),
+            voice: "alloy".to_string(),
+            response_format: Some("wav".to_string()),
+            speed: Some(1.0),
+            language: Some("en".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn tts_mesh_forward_returns_pending_cutover() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::MeshForward {
+            node_id: "peer".into(),
+            service_id: 1,
+            model_name: "tts".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_tts_blocking(&target, make_tts_request("tts"), &mut ctx)
+            .await
+            .expect_err("mesh_forward branch should be pending cutover");
+        assert!(matches!(
+            err,
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        ));
+    }
+
+    #[tokio::test]
+    async fn tts_flow_returns_internal() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: 1,
+            published_name: "tts-flow".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_tts_blocking(&target, make_tts_request("any"), &mut ctx)
+            .await
+            .expect_err("flow branch should not handle TTS");
+        match err {
+            ExecutorError::Internal(msg) => assert!(msg.to_lowercase().contains("flow")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// Codex R3b.5+6 L4: direct test for `execute_stt` when no SttRuntime
+    /// is wired. The thin delegate must surface the typed
+    /// `SttRuntimeUnavailable` variant so the caller's narrow fallback
+    /// logic can distinguish it from real backend errors.
+    #[tokio::test]
+    async fn execute_stt_without_runtime_returns_unavailable() {
+        let exec = dummy_executor();
+        let request = TranscriptionRequest {
+            file: std::sync::Arc::from(vec![0u8, 1, 2, 3].into_boxed_slice()),
+            filename: "x.wav".into(),
+            model: "whisper-1".into(),
+            language: None,
+            prompt: None,
+            response_format: None,
+            temperature: None,
+            timestamp_granularities: None,
+            no_speech_threshold: None,
+            avg_logprob_threshold: None,
+            compression_ratio_threshold: None,
+            options: crate::api::openai::types::SttRequestOptions::default(),
+        };
+        let err = exec
+            .execute_stt(request)
+            .await
+            .expect_err("no STT runtime → typed error");
+        assert!(matches!(err, ExecutorError::SttRuntimeUnavailable));
+    }
+
+    #[test]
+    fn samples_to_wav_pcm16_emits_riff_header() {
+        let wav = samples_to_wav_pcm16(&[0.0, 0.5, -0.5], 16_000);
+        assert!(wav.len() > 44);
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        // PCM format = 1, mono = 1
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        // sample rate
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            16_000
+        );
+    }
+
+    /// NaN / Inf in embedding payload break downstream cosine similarity
+    /// silently — reject at parse time so the operator sees a clear error.
+    #[test]
+    fn flow_result_rejects_non_finite_floats() {
+        let request = make_request("any");
+        let bad = flow_result(serde_json::json!({ "embedding": [0.1, "NaN", 0.3] }));
+        // String "NaN" doesn't parse as number → extract returns None →
+        // missing-field error path. The finite check covers numeric NaN/Inf
+        // emitted by serde_json::Number with non-finite f64.
+        let err = flow_result_to_embedding_response(bad, &request, 1)
+            .expect_err("non-numeric entry rejects");
+        assert!(matches!(err, ExecutorError::Internal(_)));
     }
 }
 

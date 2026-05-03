@@ -39,25 +39,54 @@ impl Router {
                 }
             }
         }
-        // Codex M1: deleguj przez SttRuntime (D.3 single owner). MVP
-        // SttRuntime trzyma `Weak<Router>` i wraca tu na `route_audio_transcription`,
-        // ale fakt ze sciezka idzie przez SttRuntime daje nam pierwszorzedne
-        // miejsce na pelne owned-stt + diarization w R4.
-        if let Some(stt_runtime) = self.stt_runtime() {
-            let response = stt_runtime.transcribe(request).await?;
-            return Ok(crate::routing::RouteResult {
-                response,
-                metadata: crate::routing::RouteMetadata {
-                    served_by_node: hostname::get()
-                        .map(|h| h.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| "unknown".to_string()),
-                    backend_type: "stt_runtime".to_string(),
-                    strategy_used: "direct".to_string(),
-                    fallbacks_tried: 0,
-                    hop_count: 0,
-                    latency_ms: None,
-                },
-            });
+        // Delegate through the executor — single dispatch surface for all
+        // four routes (chat / embeddings / tts / stt). `execute_stt` is a
+        // thin wrapper over `SttRuntime` (D.3 single owner) so this path
+        // ends up in the same place as the legacy `Router.stt_runtime()`
+        // delegation; routing through the executor keeps the
+        // `routing/*` -> `services/runtime` -> backend layering uniform.
+        let executor_snapshot = self.executor.read().clone();
+        if let Some(executor) = executor_snapshot {
+            use crate::services::runtime::executor::ExecutorError;
+            match executor.execute_stt(request.clone()).await {
+                Ok(response) => {
+                    return Ok(crate::routing::RouteResult {
+                        response,
+                        metadata: crate::routing::RouteMetadata {
+                            served_by_node: hostname::get()
+                                .map(|h| h.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| "unknown".to_string()),
+                            backend_type: "executor".to_string(),
+                            strategy_used: "executor".to_string(),
+                            fallbacks_tried: 0,
+                            hop_count: 0,
+                            latency_ms: None,
+                        },
+                    });
+                }
+                Err(ExecutorError::SttRuntimeUnavailable) => {
+                    // Codex R3b.5+6 H1: fall back ONLY for executor-not-ready;
+                    // real STT errors must surface so we don't re-dispatch
+                    // the same expensive transcription.
+                    tracing::debug!(
+                        "STT runtime not wired in executor, falling back to legacy route_audio_transcription"
+                    );
+                }
+                Err(ExecutorError::SttBackend(msg)) => {
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("STT backend error: {}", msg),
+                        source: None,
+                    }
+                    .into());
+                }
+                Err(other) => {
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("executor.execute_stt: {}", other),
+                        source: None,
+                    }
+                    .into());
+                }
+            }
         }
         self.route_audio_transcription(request).await
     }
@@ -276,7 +305,7 @@ impl Router {
 
                 match self.synthesize_speech(&tts_request).await {
                     Ok(tts_result) => {
-                        let audio_bytes = tts_result.response;
+                        let audio_bytes = tts_result.response.bytes;
                         let response = ModelResponse {
                             request_id,
                             result: ModelResult::Audio(AudioResult {
@@ -349,7 +378,41 @@ impl Router {
                     options: crate::api::openai::types::SttRequestOptions::default(),
                 };
 
-                match self.route_audio_transcription(request).await {
+                // Codex R3b.5+6 M3: protocol-native STT goes through the
+                // same executor entry point as `/v1/audio/transcriptions`
+                // so the resolver / SttRuntime contract is uniform across
+                // mesh reverse and HTTP. `route_audio_transcription` is
+                // still hit as fallback for DB-less / executor-not-ready.
+                let stt_dispatch = match self.executor.read().clone() {
+                    Some(executor) => {
+                        use crate::services::runtime::executor::ExecutorError;
+                        match executor.execute_stt(request.clone()).await {
+                            Ok(response) => Ok(crate::routing::RouteResult {
+                                response,
+                                metadata: crate::routing::RouteMetadata {
+                                    served_by_node: hostname::get()
+                                        .map(|h| h.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| "unknown".to_string()),
+                                    backend_type: "executor".to_string(),
+                                    strategy_used: "executor".to_string(),
+                                    fallbacks_tried: 0,
+                                    hop_count: 0,
+                                    latency_ms: None,
+                                },
+                            }),
+                            Err(ExecutorError::SttRuntimeUnavailable) => {
+                                self.route_audio_transcription(request).await
+                            }
+                            Err(e) => Err(crate::error::CoreError::InternalError {
+                                message: format!("executor.execute_stt: {}", e),
+                                source: None,
+                            }
+                            .into()),
+                        }
+                    }
+                    None => self.route_audio_transcription(request).await,
+                };
+                match stt_dispatch {
                     Ok(route_result) => {
                         let transcription = route_result.response;
                         // Sprawdz czy mamy segmenty i czy trzeba filtrowac
