@@ -10,7 +10,6 @@ use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::middleware::ResponseMiddleware;
-use crate::services::backend::BackendClient;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 use std::collections::HashMap;
@@ -41,12 +40,6 @@ pub struct Router {
     /// Baza danych (do resolve aliasow modeli)
     pub(crate) db: Option<DbPool>,
 
-    /// Lokalna inferencja in-process (MLX, llama.cpp) — bez HTTP/QUIC
-    pub(crate) local_inference: Arc<crate::inference::local::LocalInferenceHandler>,
-
-    /// Lokalna transkrypcja in-process (Whisper) — bez HTTP/QUIC
-    pub(crate) local_stt: Arc<super::local_stt::LocalSttHandler>,
-
     /// Mesh manager — do forwardowania requestow do zdalnych nodow
     pub(crate) mesh_manager:
         Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
@@ -59,9 +52,6 @@ pub struct Router {
             std::collections::HashMap<String, crate::routing::middleware::CachedAlias>,
         >,
     >,
-
-    /// Globalny counter do round-robin w middleware routing
-    pub(crate) route_counter: Arc<std::sync::atomic::AtomicUsize>,
 
     /// Phase 5 plumbing: read-only handle to the supervisor's services
     /// snapshot. Currently consulted as a fallback after legacy resolution
@@ -329,14 +319,10 @@ impl Router {
             ))
         });
 
-        // === KROK 7: INICJALIZUJ LOKALNA INFERENCJE ===
+        // Embedded inference handle — owned by `ModelRuntimeExecutor`,
+        // not the router. Router only constructs and hands off.
         let local_inference = Arc::new(crate::inference::local::LocalInferenceHandler::new(
             crate::inference::shared_inference_manager(),
-        ));
-
-        // === KROK 8: INICJALIZUJ LOKALNE STT ===
-        let local_stt = Arc::new(super::local_stt::LocalSttHandler::new(
-            crate::stt::shared_stt_manager(),
         ));
 
         info!("Router: Inicjalizacja zakonczona (QUIC connections spawning in background)");
@@ -348,11 +334,8 @@ impl Router {
             response_middleware,
             flow_dispatcher: flow_dispatcher.clone(),
             db: db_clone,
-            local_inference: local_inference.clone(),
-            local_stt,
             mesh_manager: Arc::new(parking_lot::RwLock::new(None)),
             alias_cache,
-            route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             services_snapshot_rx: Arc::new(parking_lot::RwLock::new(None)),
             catalog_provider: Arc::new(crate::services::catalog::CatalogProvider::new()),
             executor: executor_slot.clone(),
@@ -477,20 +460,6 @@ impl Router {
         info!("Router shutdown initiated...");
         self.service_manager.shutdown();
         info!("Shutdown signal sent to all components");
-    }
-
-    /// Resolves an HTTP backend client for `service_name` (the model name) via
-    /// the V2 snapshot pipeline: `find_http_backend_for_model` consults the live
-    /// handles cache; on miss `resolve_http_backends_via_snapshot` materialises
-    /// a fresh client straight from the snapshot.
-    pub(crate) fn select_http_backend(&self, service_name: &str) -> Option<Arc<BackendClient>> {
-        self.service_manager
-            .find_http_backend_for_model(service_name)
-            .or_else(|| {
-                self.service_manager
-                    .resolve_http_backends_via_snapshot(service_name)
-                    .and_then(|v| v.into_iter().next())
-            })
     }
 
     /// Pobierz QUIC embedding client (async - sprawdza czy polaczony)
