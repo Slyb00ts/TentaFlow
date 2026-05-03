@@ -1067,7 +1067,7 @@ impl AddonManager {
         // Vision aliasy są puste przy starcie — wypełnia je auto_bind po
         // pierwszym deployu odpowiedniego silnika (SCRFD → face,
         // HSEmotion → emotion). Brak deployu = pipeline w
-        // `reverse_request.rs::VideoFrame` skipuje inferencję bez błędu.
+        // `mesh/inference_proxy.rs::VideoFrame` skipuje inferencję bez błędu.
         ("teams-vision-face", ""),
         ("teams-vision-emotion", ""),
     ];

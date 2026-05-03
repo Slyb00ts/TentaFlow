@@ -1,5 +1,5 @@
 // =============================================================================
-// Plik: routing/local_inference.rs
+// Plik: inference/local.rs
 // Opis: Adapter konwertujacy OpenAI-compatible requesty na lokalne wywolania
 //       InferenceEngine (llama.cpp / MLX). Obsluguje chat completions,
 //       streaming SSE i embeddingi.
