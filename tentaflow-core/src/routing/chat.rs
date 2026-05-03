@@ -6,19 +6,15 @@
 // =============================================================================
 
 use crate::api::openai::types::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent,
-    TranscriptionRequest, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent, Usage,
 };
-use crate::config::RouterConfig;
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::types::FlowExecutionResult;
 use crate::routing::router::{
-    DiarizedSpeaker, RequestMetrics, Router, SpeakerIdentifyResult, SttWithDiarization, VoiceInfo,
+    RequestMetrics, Router, VoiceInfo,
 };
-use crate::services::runtime::quic_handle::ServiceManager;
 
-use std::sync::Arc;
 use tentaflow_protocol::*;
 use tracing::{debug, error, info, warn};
 

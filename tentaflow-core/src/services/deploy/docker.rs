@@ -8,21 +8,19 @@
 // This strategy compiles only with the `docker` feature. Without it the
 // `DockerDeploy::new` factory returns a stub that always errors at prepare.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusqlite::Transaction;
 
 use super::{
-    build_new_service, category_tag, models_from_manifest, resolve_display_name,
-    smart_health_probe, transport_hint, DeployError, DeployResult, DeployStrategy,
-    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy,
+    LogSink, PreparedDeploy,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
-use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
+use crate::services_repo::services::{self as services_repo, ServiceStatus};
 
 pub struct DockerDeploy {
     manifest: ServiceManifest,

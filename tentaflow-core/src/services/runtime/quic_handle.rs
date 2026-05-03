@@ -15,7 +15,7 @@ use crate::prompt_registry::{create_shared_registry, SharedPromptRegistry};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{watch, RwLock};
 use tracing::{debug, info, warn};
 
 const MAX_HISTORY_MESSAGES: usize = 50;
