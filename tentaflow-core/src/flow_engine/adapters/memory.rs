@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::config::RouterConfig;
 use crate::flow_engine::adapters::NodeAdapter;
 use crate::flow_engine::types::FlowContext;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use tentaflow_protocol::*;
 
 /// Adapter wezla Memory - query/store w grafie wiedzy

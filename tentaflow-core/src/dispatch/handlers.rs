@@ -472,7 +472,7 @@ pub fn model_list_request(
         .unique_models()
         .into_iter()
         .filter(|m| match &user_acl {
-            Some((uid, role)) => crate::routing::acl::check_access_safe(
+            Some((uid, role)) => crate::auth::acl::check_access_safe(
                 &ctx.state.db,
                 "model",
                 &m.model_name,

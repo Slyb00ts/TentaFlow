@@ -10,8 +10,8 @@ use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::middleware::ResponseMiddleware;
-use crate::routing::backend::BackendClient;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::backend::BackendClient;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +51,7 @@ pub struct Router {
     pub(crate) db: Option<DbPool>,
 
     /// Lokalna inferencja in-process (MLX, llama.cpp) — bez HTTP/QUIC
-    pub(crate) local_inference: Arc<super::local_inference::LocalInferenceHandler>,
+    pub(crate) local_inference: Arc<crate::inference::local::LocalInferenceHandler>,
 
     /// Lokalna transkrypcja in-process (Whisper) — bez HTTP/QUIC
     pub(crate) local_stt: Arc<super::local_stt::LocalSttHandler>,
@@ -339,7 +339,7 @@ impl Router {
         });
 
         // === KROK 7: INICJALIZUJ LOKALNA INFERENCJE ===
-        let local_inference = Arc::new(super::local_inference::LocalInferenceHandler::new(
+        let local_inference = Arc::new(crate::inference::local::LocalInferenceHandler::new(
             crate::inference::shared_inference_manager(),
         ));
 

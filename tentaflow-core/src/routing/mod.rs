@@ -4,25 +4,18 @@
 //       Eksportuje wszystkie podmoduly routera.
 // =============================================================================
 
-pub mod acl;
-pub mod backend;
 pub mod chat;
 pub mod chat_template;
 pub mod embeddings;
 pub mod live_metrics;
-pub mod loadbalancer;
-pub mod local_inference;
 pub mod local_stt;
 pub mod meeting_transcript;
 pub mod middleware;
-pub mod reverse_request;
 pub mod router;
-pub mod service_manager;
 pub mod stream_helpers;
 pub mod streaming;
 pub mod stt;
 pub mod transcript_store;
-pub mod transport_client;
 pub mod tts;
 pub mod video_pipeline;
 
@@ -42,7 +35,7 @@ use crate::flow_engine::types::FlowContext;
 pub(crate) fn build_flow_context_for_user(
     request: &ChatCompletionRequest,
     stream: bool,
-    user: Option<crate::routing::acl::UserContext>,
+    user: Option<crate::auth::acl::UserContext>,
 ) -> FlowContext {
     let mut ctx = build_flow_context_inner(request, stream);
     if let Some(u) = user {

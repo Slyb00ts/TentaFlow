@@ -825,7 +825,7 @@ mod tests {
         use crate::flow_engine::adapters::AdapterRegistry;
         use crate::flow_engine::types::FlowDefinition;
         use crate::flow_engine::validation::validate_flow;
-        use crate::routing::service_manager::ServiceManager;
+        use crate::services::runtime::quic_handle::ServiceManager;
         use std::sync::Arc;
 
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");

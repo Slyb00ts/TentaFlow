@@ -24,11 +24,11 @@ impl Router {
     pub async fn route_embeddings_for_user(
         &self,
         request: EmbeddingRequest,
-        user: Option<crate::routing::acl::UserContext>,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(
+                if !crate::auth::acl::check_access_safe(
                     db,
                     "model",
                     &request.model,

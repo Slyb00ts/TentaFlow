@@ -16,7 +16,7 @@ use crate::flow_engine::types::FlowExecutionResult;
 use crate::routing::router::{
     DiarizedSpeaker, RequestMetrics, Router, SpeakerIdentifyResult, SttWithDiarization, VoiceInfo,
 };
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 use std::sync::Arc;
 use tentaflow_protocol::*;
@@ -37,13 +37,13 @@ impl Router {
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
-        user: Option<crate::routing::acl::UserContext>,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
         let mut metrics = RequestMetrics::new();
 
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(
+                if !crate::auth::acl::check_access_safe(
                     db,
                     "model",
                     &request.model,

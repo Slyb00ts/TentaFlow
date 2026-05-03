@@ -475,7 +475,7 @@ async fn run_server(args: Args) -> Result<()> {
                                     }
                                 };
 
-                                let response = tentaflow_core::routing::reverse_request::dispatch_reverse_request(
+                                let response = tentaflow_core::mesh::inference_proxy::dispatch_reverse_request(
                                     &router,
                                     request,
                                 ).await;
@@ -512,7 +512,7 @@ async fn run_server(args: Args) -> Result<()> {
                                             return;
                                         }
                                     };
-                                    tentaflow_core::routing::reverse_request::dispatch_reverse_stream_request(
+                                    tentaflow_core::mesh::inference_proxy::dispatch_reverse_stream_request(
                                         &router,
                                         request,
                                         tx,

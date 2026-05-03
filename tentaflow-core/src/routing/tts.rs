@@ -32,11 +32,11 @@ impl Router {
     pub async fn synthesize_speech_for_user(
         &self,
         request: &crate::api::openai::types::TTSRequest,
-        user: Option<crate::routing::acl::UserContext>,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(
+                if !crate::auth::acl::check_access_safe(
                     db,
                     "model",
                     &request.model,
