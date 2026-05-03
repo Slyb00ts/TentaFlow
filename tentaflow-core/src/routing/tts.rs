@@ -10,6 +10,16 @@ use crate::routing::router::Router;
 
 use tracing::debug;
 
+/// TTS dispatch payload — bytes plus the actual container/codec the
+/// backend produced. Codex R3b.4 M2: callers (HTTP handler) need the
+/// **actual** format to set `Content-Type` correctly when an embedded
+/// engine ignores the requested format and emits WAV.
+#[derive(Debug, Clone)]
+pub struct TtsBytes {
+    pub bytes: Vec<u8>,
+    pub format: String,
+}
+
 /// Domyslny rozmiar chunku PCM dla streamingu TTS — 100 ms audio
 /// (16 kHz mono i16 LE = 16_000 * 0.1 * 2 bajty = 3200 bajtow).
 /// Mniejsze chunki = nizsza pierwsza-probka latency, ale wiecej overhead'u
@@ -33,7 +43,7 @@ impl Router {
         &self,
         request: &crate::api::openai::types::TTSRequest,
         user: Option<crate::auth::acl::UserContext>,
-    ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
+    ) -> Result<crate::routing::RouteResult<TtsBytes>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
                 if !crate::auth::acl::check_access_safe(
@@ -57,244 +67,233 @@ impl Router {
     pub async fn synthesize_speech(
         &self,
         request: &crate::api::openai::types::TTSRequest,
-    ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
-        use crate::routing::middleware::BackendHandle;
-        use tentaflow_protocol::*;
-
-        let model = &request.model;
-        // Wyczysc input przed dispatch: strip emoji + aplikuj reguly
-        // `tts_cleaning_rules` z DB (cachowane w pamieci, refresh przy CRUD).
-        // Bez tego TTS musial wymawiac surowe emoji / skroty / dziwne pattern'y
-        // co dawalo cisze albo zlamana prozodie. Dziala tylko gdy router ma
-        // db Pool — fallback do raw inputu gdy db=None.
+    ) -> Result<crate::routing::RouteResult<TtsBytes>> {
+        // Strip emoji + apply DB-driven `tts_cleaning_rules` BEFORE
+        // dispatch. Without this the TTS engine has to pronounce raw
+        // emoji / abbreviations / odd patterns and produces silence or
+        // mangled prosody. The router cleans here (not the executor)
+        // because the rules are DB-backed and per-deployment.
         let cleaned_input = if let Some(ref db) = self.db {
             crate::tts::clean_cache::clean(&request.input, db)
         } else {
             request.input.clone()
         };
-        let input = &cleaned_input;
-        let voice = &request.voice;
-        let speed = request.speed.unwrap_or(1.0);
-        let format = request.response_format.as_deref().unwrap_or("wav");
-        let language = request.language.clone();
-
-        debug!(
-            "synthesize_speech: model={}, voice={}, format={}, input_len={}",
-            model,
-            voice,
-            format,
-            input.len()
-        );
-
-        let tts_model = model.clone();
-        let route_result = {
-            let this = self.clone();
-            let model_c = model.clone();
-            let input_c = input.clone();
-            let voice_c = voice.clone();
-            let format_c = format.to_string();
-            let language_c = language.clone();
-            self.dispatch_with_fallback(model, 0, Some(crate::services::catalog::InputModality::Text), |handle| {
-                let this = this.clone();
-                let model_c = model_c.clone();
-                let input_c = input_c.clone();
-                let voice_c = voice_c.clone();
-                let format_c = format_c.clone();
-                let language_c = language_c.clone();
-                let handle = handle.clone();
-                async move {
-                    match &handle {
-                        BackendHandle::LocalTts(name) => {
-                            // In-process syntezator (Apple/Kokoro/sherpa)
-                            // zarejestrowany w shared_tts_manager. Synteza
-                            // jest sync (Swift FFI / native), wiec idziemy
-                            // przez spawn_blocking zeby nie zatrzymywac
-                            // tokio reactor'a.
-                            let name = name.clone();
-                            let text = input_c.clone();
-                            let speed_v = speed;
-                            let res = tokio::task::spawn_blocking(
-                                move || -> anyhow::Result<(Vec<f32>, u32)> {
-                                    let mgr = crate::tts::shared_tts_manager();
-                                    let guard = mgr.blocking_read();
-                                    let out = guard.synthesize(
-                                        &name,
-                                        crate::tts::SynthesizeParams {
-                                            text,
-                                            speaker_id: 0,
-                                            speed: speed_v,
-                                        },
-                                    )?;
-                                    Ok((out.samples, out.sample_rate))
-                                },
-                            )
-                            .await
-                            .map_err(|e| anyhow::anyhow!("LocalTts join: {e}"))??;
-                            let (samples, sr) = res;
-                            // Pakujemy jako WAV PCM16 — `synthesize_speech_stream`
-                            // strip'uje header tolerancyjnie. Surowe i16 LE
-                            // bez header'a tez by zadzialalo, ale WAV jest
-                            // bezpieczniejszy jezeli ktos uzywa wyniku spoza
-                            // streama (np. blocking sciezka z dashboardu).
-                            Ok(samples_to_wav_pcm16(&samples, sr))
-                        }
-                        BackendHandle::Http(name) => {
-                            // Python-bundle TTS (chatterbox-mlx, kyutai-tts,
-                            // voxcpm, xtts) wystawiaja OpenAI-compatible
-                            // POST /v1/audio/speech. BackendClient z
-                            // register_native_http_backend ma juz zbudowany
-                            // audio_speech_url, model_name_override i auth.
-                            let backend = this.select_http_backend(name).ok_or_else(|| {
-                                anyhow::anyhow!("Brak HTTP backendow dla {}", name)
-                            })?;
-                            debug!("Using HTTP TTS backend: {} (url={})", name, backend.url());
-                            // Skopiuj request bez `Cow` borrow — BackendClient
-                            // wykonuje async POST i potrzebuje 'static fields.
-                            let req = crate::api::openai::types::TTSRequest {
-                                model: model_c.clone(),
-                                input: input_c.clone(),
-                                voice: voice_c.clone(),
-                                response_format: Some(format_c.clone()),
-                                speed: Some(speed),
-                                language: language_c.clone(),
-                            };
-                            backend.audio_speech(&req).await
-                        }
-                        BackendHandle::QuicTts(name) => {
-                            let quic_client = this
-                                .service_manager
-                                .get_quic_tts_client(name)
-                                .await
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("QUIC TTS service {} nie polaczony", name)
-                                })?;
-
-                            debug!("Using QUIC TTS backend: {}", name);
-                            let request_id = uuid::Uuid::new_v4().to_string();
-                            let model_request = ModelRequest {
-                                request_id: request_id.clone(),
-                                payload: ModelPayload::Audio(AudioPayload {
-                                    operation: AudioOperation::TTS {
-                                        model: model_c,
-                                        input: input_c,
-                                        voice: voice_c,
-                                        format: Some(format_c),
-                                        speed: Some(speed),
-                                        language: language_c,
-                                    },
-                                }),
-                                stream: false,
-                                metadata: None,
-                                session_id: None,
-                            };
-
-                            let response = quic_client
-                                .send_request(model_request)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("QUIC TTS request failed: {}", e))?;
-
-                            match response.result {
-                                ModelResult::Audio(audio_result) => match audio_result.data {
-                                    AudioResultData::Audio(audio_bytes) => {
-                                        debug!("QUIC TTS success: {} bytes", audio_bytes.len());
-                                        Ok(audio_bytes)
-                                    }
-                                    _ => Err(anyhow::anyhow!(
-                                        "QUIC TTS zwrocil nieoczekiwany typ wyniku"
-                                    )),
-                                },
-                                ModelResult::Error(err) => Err(anyhow::anyhow!(
-                                    "QUIC TTS error: {:?} - {}",
-                                    err.error_type,
-                                    err.message
-                                )),
-                                _ => Err(anyhow::anyhow!(
-                                    "QUIC TTS zwrocil nieoczekiwany typ odpowiedzi"
-                                )),
-                            }
-                        }
-                        BackendHandle::MeshForward(node_id, svc) => {
-                            debug!(target_node = %node_id, service = %svc, "MeshForward TTS");
-                            let request_id = uuid::Uuid::new_v4().to_string();
-                            let model_request = ModelRequest {
-                                request_id: request_id.clone(),
-                                payload: ModelPayload::Audio(AudioPayload {
-                                    operation: AudioOperation::TTS {
-                                        model: model_c,
-                                        input: input_c,
-                                        voice: voice_c,
-                                        format: Some(format_c),
-                                        speed: Some(speed),
-                                        language: language_c,
-                                    },
-                                }),
-                                stream: false,
-                                metadata: None,
-                                session_id: None,
-                            };
-                            let response = this
-                                .forward_model_request_to_mesh(node_id, model_request)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Mesh TTS request failed: {}", e))?;
-                            match response.result {
-                                ModelResult::Audio(audio_result) => match audio_result.data {
-                                    AudioResultData::Audio(audio_bytes) => Ok(audio_bytes),
-                                    _ => Err(anyhow::anyhow!(
-                                        "Mesh TTS zwrocil nieoczekiwany typ wyniku"
-                                    )),
-                                },
-                                ModelResult::Error(err) => Err(anyhow::anyhow!(
-                                    "Mesh TTS error: {:?} - {}",
-                                    err.error_type,
-                                    err.message
-                                )),
-                                _ => Err(anyhow::anyhow!(
-                                    "Mesh TTS zwrocil nieoczekiwany typ odpowiedzi"
-                                )),
-                            }
-                        }
-                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla TTS")),
-                    }
-                }
-            })
-            .await
+        let cleaned_request = crate::api::openai::types::TTSRequest {
+            input: cleaned_input,
+            ..request.clone()
         };
 
-        match route_result {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                // Diagnostyka: gdy alias (np. `teams-tts`) faktycznie istnieje
-                // w DB ale `target_model` jest pusty albo wskazuje na nieistniejacy
-                // serwis, log pokazuje user'owi co dokladnie trzeba zrobic.
-                if let Some(ref db) = self.db {
-                    if let Ok(Some(alias)) =
-                        crate::db::repository::resolve_model_alias(db, &tts_model)
-                    {
-                        if alias.target_model.trim().is_empty() {
+        debug!(
+            "synthesize_speech: model={}, voice={}, format={:?}, input_len={}",
+            cleaned_request.model,
+            cleaned_request.voice,
+            cleaned_request.response_format,
+            cleaned_request.input.len()
+        );
+
+        let tts_model = cleaned_request.model.clone();
+        let t = std::time::Instant::now();
+        let executor_snapshot = self.executor.read().clone();
+        if let Some(executor) = executor_snapshot {
+            use crate::services::runtime::context::ExecutionContext;
+            use crate::services::runtime::executor::ExecutorError;
+
+            let mut exec_ctx = ExecutionContext::default();
+            match executor
+                .execute_tts(cleaned_request.clone(), &mut exec_ctx)
+                .await
+            {
+                Ok(result) => {
+                    if let Some(req_fmt) = cleaned_request.response_format.as_deref() {
+                        if req_fmt.eq_ignore_ascii_case(&result.format) == false {
                             tracing::warn!(
-                                alias = %tts_model,
-                                "TTS: alias istnieje ale target_model jest pusty — zdeployuj jakikolwiek TTS (Apple/Kokoro/Sherpa) zeby sie auto-wpial"
-                            );
-                        } else {
-                            tracing::warn!(
-                                alias = %tts_model,
-                                target = %alias.target_model,
-                                "TTS: alias wskazuje na '{}' ale serwis nie ma backendu QUIC (deploy?, mesh disconnect?)",
-                                alias.target_model
+                                requested = %req_fmt,
+                                actual = %result.format,
+                                model = %cleaned_request.model,
+                                "TTS backend returned different format than requested — caller's Content-Type may be misleading"
                             );
                         }
-                    } else {
-                        tracing::warn!(
-                            model = %tts_model,
-                            "TTS: model nie jest aliasem ani serwisem — sprawdz czy serwis TTS jest zdeployowany"
-                        );
                     }
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: exec_ctx
+                            .route_metadata
+                            .served_by_node
+                            .unwrap_or_else(|| {
+                                hostname::get()
+                                    .map(|h| h.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| "unknown".to_string())
+                            }),
+                        backend_type: exec_ctx
+                            .route_metadata
+                            .backend_type
+                            .unwrap_or_else(|| "executor".to_string()),
+                        strategy_used: "executor".to_string(),
+                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                        hop_count: 0,
+                        latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                    };
+                    return Ok(crate::routing::RouteResult {
+                        response: TtsBytes {
+                            bytes: result.bytes,
+                            format: result.format,
+                        },
+                        metadata,
+                    });
                 }
+                Err(ExecutorError::TransportPendingCutover(_)) => {
+                    debug!(
+                        "executor returned TransportPendingCutover for TTS — falling back to legacy mesh dispatch"
+                    );
+                    // fall through
+                }
+                Err(e) => {
+                    self.log_tts_dispatch_diagnostics(&tts_model);
+                    return Err(map_tts_executor_err(e, &tts_model).into());
+                }
+            }
+        }
+
+        // Legacy mesh-only fallback. Disappears together with
+        // `BackendHandle::MeshForward` after R3b.7 wires mesh transport
+        // into the executor.
+        match self.legacy_tts_mesh_dispatch(&cleaned_request).await {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.log_tts_dispatch_diagnostics(&tts_model);
                 Err(CoreError::ModelNotFound {
-                    model_name: format!("TTS nie znaleziono backendow dla modelu '{}'", tts_model),
+                    model_name: format!("TTS no backend found for model '{}'", tts_model),
                 }
                 .into())
             }
+        }
+    }
+
+    /// User-facing diagnostic for "no TTS backend" failures. Inspects the
+    /// alias table so an operator hitting `teams-tts` sees whether the
+    /// alias is missing, points at an empty target, or points at a service
+    /// without a working backend. Codex R3b.4 M1: shared between the
+    /// executor failure path and the legacy mesh fallback so both paths
+    /// emit the same hint instead of only the mesh fallback doing so.
+    fn log_tts_dispatch_diagnostics(&self, tts_model: &str) {
+        let Some(ref db) = self.db else { return };
+        match crate::db::repository::resolve_model_alias(db, tts_model) {
+            Ok(Some(alias)) => {
+                if alias.target_model.trim().is_empty() {
+                    tracing::warn!(
+                        alias = %tts_model,
+                        "TTS: alias exists but target_model is empty — deploy any TTS (Apple/Kokoro/Sherpa) so it auto-wires"
+                    );
+                } else {
+                    tracing::warn!(
+                        alias = %tts_model,
+                        target = %alias.target_model,
+                        "TTS: alias points to '{}' but the service has no working backend (deploy?, mesh disconnect?)",
+                        alias.target_model
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    model = %tts_model,
+                    "TTS: model is not an alias or service — check whether the TTS service is deployed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %tts_model,
+                    error = %e,
+                    "TTS: failed to inspect alias table for diagnostics"
+                );
+            }
+        }
+    }
+
+    /// Mesh-only legacy fallback for `synthesize_speech`. Disappears in
+    /// R3b.7. Other backends (Embedded/Http/Quic) are already routed
+    /// through the executor — only `BackendHandle::MeshForward` remains
+    /// here to preserve cross-node TTS fallback during the cutover.
+    async fn legacy_tts_mesh_dispatch(
+        &self,
+        request: &crate::api::openai::types::TTSRequest,
+    ) -> Result<crate::routing::RouteResult<TtsBytes>> {
+        use crate::routing::middleware::BackendHandle;
+        use tentaflow_protocol::*;
+
+        let this = self.clone();
+        let req = request.clone();
+        let request_format = request
+            .response_format
+            .clone()
+            .unwrap_or_else(|| "wav".to_string());
+        let required_input = Some(crate::services::catalog::InputModality::Text);
+        let inner_result = self.dispatch_with_fallback(&request.model, 0, required_input, |handle| {
+            let this = this.clone();
+            let req = req.clone();
+            let handle = handle.clone();
+            async move {
+                let BackendHandle::MeshForward(node_id, svc) = &handle else {
+                    return Err(anyhow::anyhow!(
+                        "TTS legacy fallback: only MeshForward is handled here \
+                         (executor owns Local/HTTP/QUIC)"
+                    ));
+                };
+                debug!(target_node = %node_id, service = %svc, "MeshForward TTS");
+                let format = req
+                    .response_format
+                    .clone()
+                    .unwrap_or_else(|| "wav".to_string());
+                let model_request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload: ModelPayload::Audio(AudioPayload {
+                        operation: AudioOperation::TTS {
+                            model: req.model.clone(),
+                            input: req.input.clone(),
+                            voice: req.voice.clone(),
+                            format: Some(format),
+                            speed: req.speed,
+                            language: req.language.clone(),
+                        },
+                    }),
+                    stream: false,
+                    metadata: None,
+                    session_id: None,
+                };
+                let response = this
+                    .forward_model_request_to_mesh(node_id, model_request)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Mesh TTS request failed: {}", e))?;
+                match response.result {
+                    ModelResult::Audio(audio_result) => match audio_result.data {
+                        AudioResultData::Audio(bytes) => Ok(bytes),
+                        _ => Err(anyhow::anyhow!(
+                            "Mesh TTS returned non-audio result"
+                        )),
+                    },
+                    ModelResult::Error(err) => Err(anyhow::anyhow!(
+                        "Mesh TTS error {:?}: {}",
+                        err.error_type,
+                        err.message
+                    )),
+                    _ => Err(anyhow::anyhow!(
+                        "Mesh TTS returned unexpected response type"
+                    )),
+                }
+            }
+        })
+        .await;
+
+        // Wrap mesh-forward audio bytes into TtsBytes. Mesh peer echoes
+        // bytes verbatim — we trust the requested format because the
+        // remote TTS engine accepted it.
+        match inner_result {
+            Ok(rr) => Ok(crate::routing::RouteResult {
+                response: TtsBytes {
+                    bytes: rr.response,
+                    format: request_format,
+                },
+                metadata: rr.metadata,
+            }),
+            Err(e) => Err(e),
         }
     }
 
@@ -322,7 +321,7 @@ impl Router {
         F: FnMut(Vec<u8>) -> Result<()>,
     {
         let route_result = self.synthesize_speech(request).await?;
-        let mut audio_bytes = route_result.response;
+        let mut audio_bytes = route_result.response.bytes;
 
         // Strip WAV header gdy backend zignorowal `format=pcm` i zwrocil
         // jednak RIFF/WAVE — pierwszy chunk musi byc czystym PCM, inaczej
@@ -339,34 +338,6 @@ impl Router {
         }
         Ok(())
     }
-}
-
-/// Pakuje samples f32 [-1, 1] do WAV PCM16 mono. Header 44B + dane.
-/// Apple/Kokoro zwracaja f32; downstream (`synthesize_speech_stream`)
-/// strip'uje WAV header i wysyla raw PCM klientowi.
-fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let n = samples.len();
-    let data_size = (n * 2) as u32;
-    let mut out = Vec::with_capacity(44 + n * 2);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36u32 + data_size).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * 2;
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes()); // block align
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_size.to_le_bytes());
-    for &s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
 }
 
 /// Wyciaga raw PCM z WAV po skanowaniu chunkow `fmt `/`data` (parser
@@ -395,6 +366,51 @@ fn strip_wav_header(bytes: &[u8]) -> Result<Vec<u8>> {
     }
     let start = data_start.ok_or_else(|| err("brak data chunk"))?;
     Ok(bytes[start..].to_vec())
+}
+
+/// Map executor errors onto typed `CoreError` variants. Mirror of
+/// `executor_err_to_core` from routing/embeddings.rs but with the
+/// `CapabilityUnsupported` variant routed to `InvalidRequest` (Codex
+/// R3b.4 L1) — a model that has no audio-output candidate is a client
+/// misconfiguration, not an internal failure.
+fn map_tts_executor_err(
+    err: crate::services::runtime::executor::ExecutorError,
+    model: &str,
+) -> CoreError {
+    use crate::services::runtime::executor::ExecutorError;
+    use crate::services::runtime::resolver::ResolveError;
+    match err {
+        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
+            CoreError::ModelNotFound { model_name: m }
+        }
+        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
+            CoreError::InvalidRequest {
+                message: format!(
+                    "TTS model '{}' has no candidate that emits audio output",
+                    requested
+                ),
+                details: None,
+            }
+        }
+        ExecutorError::Resolve(other) => CoreError::InternalError {
+            message: format!("TTS alias resolution: {}", other),
+            source: None,
+        },
+        ExecutorError::AllCandidatesFailed { .. } => CoreError::AllBackendsUnavailable {
+            model_name: model.to_string(),
+        },
+        ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
+            model_name: model.to_string(),
+        },
+        ExecutorError::FlowDispatcherUnavailable
+        | ExecutorError::FlowEmptyResult { .. }
+        | ExecutorError::Internal(_)
+        | ExecutorError::SttRuntimeUnavailable
+        | ExecutorError::SttBackend(_) => CoreError::InternalError {
+            message: format!("executor.execute_tts: {}", err),
+            source: None,
+        },
+    }
 }
 
 #[cfg(test)]

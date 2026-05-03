@@ -478,15 +478,18 @@ async fn handle_audio_tts(
         .await
     {
         Ok(route_result) => {
-            let audio_bytes = route_result.response;
-            // Okresl content type na podstawie formatu
-            let content_type = match tts_request.response_format.as_deref() {
-                Some("mp3") => "audio/mpeg",
-                Some("opus") => "audio/opus",
-                Some("aac") => "audio/aac",
-                Some("flac") => "audio/flac",
-                Some("wav") | None => "audio/wav",
-                Some(other) => {
+            let audio_bytes = route_result.response.bytes;
+            // Codex R3b.4 M2: pick Content-Type from the **actual** format
+            // the executor reports, not from the request hint. Embedded
+            // engines may emit WAV even when the client asked for `mp3`;
+            // the requested-format header would be a lie.
+            let content_type = match route_result.response.format.as_str() {
+                "mp3" => "audio/mpeg",
+                "opus" => "audio/opus",
+                "aac" => "audio/aac",
+                "flac" => "audio/flac",
+                "wav" | "pcm" => "audio/wav",
+                other => {
                     warn!("Unknown audio format '{}', defaulting to audio/wav", other);
                     "audio/wav"
                 }

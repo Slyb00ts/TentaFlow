@@ -1159,12 +1159,29 @@ impl IrohMeshManager {
 
     /// Forward request na peera i czeka na odpowiedz. `request_id` uzyty w
     /// payloadzie dla tracking (format: [u32 id_len][id_bytes][payload]).
+    /// Public trust check used by R3b.7 executor mesh dispatch before
+    /// any payload write. Bypassing this and relying solely on the
+    /// `connections` map would let pre-trust dial registrations forward
+    /// requests to untrusted peers.
+    pub fn is_trusted(&self, node_id: &str) -> bool {
+        self.security.is_trusted(node_id)
+    }
+
     pub async fn forward_request(
         &self,
         target_node_id: &str,
         request_id: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        // Codex R3b.7 H1: explicit trust gate before any payload write.
+        // `connections` map alone is not trust-equivalent — register_connection
+        // does not check trust, so we re-verify here.
+        if !self.security.is_trusted(target_node_id) {
+            return Err(anyhow::anyhow!(
+                "mesh forward refused: peer '{}' is not trusted",
+                target_node_id
+            ));
+        }
         let connection = self
             .connections
             .get(target_node_id)
@@ -1211,6 +1228,13 @@ impl IrohMeshManager {
         request_id: &str,
         payload: Vec<u8>,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>>> + Send>>> {
+        // Codex R3b.7 H1: explicit trust gate (mirror of forward_request).
+        if !self.security.is_trusted(target_node_id) {
+            return Err(anyhow::anyhow!(
+                "mesh stream forward refused: peer '{}' is not trusted",
+                target_node_id
+            ));
+        }
         let connection = self
             .connections
             .get(target_node_id)

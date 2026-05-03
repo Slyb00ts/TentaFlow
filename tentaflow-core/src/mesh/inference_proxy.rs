@@ -43,6 +43,40 @@ pub async fn dispatch_reverse_request(
 
     let request_id = request.request_id.clone();
 
+    // Codex R3b.7 H2: anti-loop. Forwarding peer carries hop count in
+    // metadata (key `x-tentaflow-mesh-hop`). Refuse when we are at or
+    // past `MAX_HOP_COUNT` — A→B→A cycles would otherwise reset hop
+    // tracking on each node and run forever.
+    if let Some(meta) = request.metadata.as_ref() {
+        for (k, v) in meta {
+            if k == crate::services::runtime::context::MESH_HOP_HEADER {
+                if let Ok(received_hop) = v.parse::<u8>() {
+                    if received_hop >= crate::services::runtime::context::MAX_HOP_COUNT {
+                        warn!(
+                            request_id = %request_id,
+                            hop = received_hop,
+                            limit = crate::services::runtime::context::MAX_HOP_COUNT,
+                            "rejecting reverse mesh request: hop limit exceeded"
+                        );
+                        return ModelResponse {
+                            request_id: request_id.clone(),
+                            result: ModelResult::Error(ErrorInfo {
+                                error_type: ErrorType::InvalidRequest,
+                                message: format!(
+                                    "mesh hop limit {} reached — refusing re-forward",
+                                    crate::services::runtime::context::MAX_HOP_COUNT
+                                ),
+                                details: None,
+                            }),
+                            metrics: None,
+                        };
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     match request.payload {
         ModelPayload::Audio(audio_payload) => {
             // Meeting context — bot dopisuje "meeting_id" do ModelRequest.metadata

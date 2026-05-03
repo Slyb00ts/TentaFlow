@@ -78,6 +78,7 @@ mod tests {
             handle: BackendHandle::Embedded {
                 model_name: name.to_string(),
                 node_id: "n".into(),
+                engine_id: "test-engine".into(),
             },
         }
     }

@@ -99,6 +99,7 @@ pub fn ensure_local_embedded(
         BackendHandle::Embedded {
             model_name,
             node_id,
+            engine_id: _,
         } => {
             if node_id == local_node_id {
                 Ok(model_name.clone())
@@ -456,6 +457,7 @@ mod tests {
         let h = BackendHandle::Embedded {
             model_name: "qwen-tiny".into(),
             node_id: "local".into(),
+            engine_id: "test-engine".into(),
         };
         let model = ensure_local_embedded(&h, "local").unwrap();
         assert_eq!(model, "qwen-tiny");
@@ -466,6 +468,7 @@ mod tests {
         let h = BackendHandle::Embedded {
             model_name: "qwen-tiny".into(),
             node_id: "peerB".into(),
+            engine_id: "test-engine".into(),
         };
         let err = ensure_local_embedded(&h, "local").unwrap_err();
         assert!(matches!(err, TransportClientError::EmbeddedRemote(ref n) if n == "peerB"));

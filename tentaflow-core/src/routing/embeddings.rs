@@ -1,8 +1,10 @@
 // =============================================================================
 // Plik: routing/embeddings.rs
-// Opis: Obsluga zapytan o embeddingi — route_embeddings (OpenAI API),
-//       route_embeddings_quic (QUIC protocol), route_embeddings_via_quic
-//       (protocol-native), route_rerank_via_quic (reranking).
+// Opis: Obsluga zapytan o embeddingi — `route_embeddings_for_user`
+//       deleguje przez `ModelRuntimeExecutor.execute_embeddings`; legacy
+//       mesh fallback trzymany do R3b.7 (mesh transport w executor).
+//       `route_embeddings_via_quic` to protocol-native API uzywane przez
+//       mesh reverse handler (`mesh/inference_proxy.rs`).
 // =============================================================================
 
 use crate::api::openai::types::{
@@ -11,7 +13,6 @@ use crate::api::openai::types::{
 use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
 
-use std::sync::Arc;
 use tentaflow_protocol::*;
 use tracing::debug;
 
@@ -43,305 +44,287 @@ impl Router {
                 }
             }
         }
-        self.route_embeddings(request).await
+        self.route_embeddings_inner(request, user).await
     }
 
-    /// Obsluguje zarowno Single jak i Multiple input, kieruje do backendu
-    /// obslugujacego embeddings (QUIC preferowany, HTTP fallback).
-    pub async fn route_embeddings(
+    /// Obsluguje zarowno Single jak i Multiple input. Sciezka glowna idzie
+    /// przez `ModelRuntimeExecutor::execute_embeddings` (single source of
+    /// truth dla alias resolution + strategy + per-instance modality
+    /// filter). MeshForward executor zwraca `TransportPendingCutover` —
+    /// wracamy wtedy do legacy `dispatch_with_fallback` na pojedynczy
+    /// MeshForward branch. Po R3b.7 (mesh w executor) ten fallback zniknie
+    /// razem z `routing::middleware::BackendHandle`.
+    ///
+    /// `user` is propagated into `ExecutionContext.user` so the flow ACL
+    /// gate in `dispatch_by_flow_id` sees the user_id/role. Without this
+    /// embedding-surface flows would skip the per-flow ACL check.
+    async fn route_embeddings_inner(
         &self,
         request: EmbeddingRequest,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         debug!("Routing embeddings dla modelu: {}", request.model);
 
-        let route_result = {
-            use crate::routing::middleware::BackendHandle;
-            let this = self.clone();
-            let req = request.clone();
-            self.dispatch_with_fallback(&request.model, 0, None, |handle| {
-                let this = this.clone();
-                let req = req.clone();
-                let handle = handle.clone();
-                async move {
-                    match &handle {
-                        BackendHandle::QuicEmbedding(name) => {
-                            let quic_client = this
-                                .service_manager
-                                .find_quic_client_for_model(name)
-                                .await
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "QUIC embedding service '{}' not found or not connected",
-                                        name
-                                    )
-                                })?;
-                            debug!("Routing embeddings przez QUIC: {}", name);
-                            this.route_embeddings_quic(quic_client, req, name.clone())
-                                .await
-                        }
-                        BackendHandle::Http(name) => {
-                            let backend = this
-                                .select_http_backend(name)
-                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
-                            debug!("Wybrany backend dla embeddings: {}", backend.url());
-                            let response = backend.embeddings_request(req).await?;
-                            debug!(
-                                "Embeddings zakonczone: {} embeddingow wygenerowanych",
-                                response.data.len()
-                            );
-                            Ok(response)
-                        }
-                        BackendHandle::MeshForward(node_id, svc) => {
-                            debug!(
-                                target_node = %node_id,
-                                service = %svc,
-                                "MeshForward embeddings do zdalnej uslugi"
-                            );
-                            let input_texts = match &req.input {
-                                EmbeddingInput::Single(text) => vec![text.clone()],
-                                EmbeddingInput::Multiple(texts) => texts.clone(),
-                            };
-                            let text_count = input_texts.len();
-                            let request = ModelRequest {
-                                request_id: uuid::Uuid::new_v4().to_string(),
-                                payload: ModelPayload::Embeddings(EmbeddingsPayload {
-                                    model: svc.clone(),
-                                    input: input_texts,
-                                    normalize: true,
-                                }),
-                                stream: false,
-                                metadata: None,
-                                session_id: None,
-                            };
-                            let response = this
-                                .forward_model_request_to_mesh(node_id, request)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Mesh embeddings request failed: {}", e))?;
-                            match response.result {
-                                ModelResult::Embeddings(result) => {
-                                    let data = result
-                                        .embeddings
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(idx, embedding)| EmbeddingData {
-                                            object: "embedding".to_string(),
-                                            index: idx as u32,
-                                            embedding,
-                                        })
-                                        .collect();
-                                    let estimated_tokens = text_count * 50;
-                                    Ok(EmbeddingResponse {
-                                        object: "list".to_string(),
-                                        data,
-                                        model: svc.clone(),
-                                        usage: EmbeddingUsage {
-                                            prompt_tokens: estimated_tokens as u32,
-                                            total_tokens: estimated_tokens as u32,
-                                        },
-                                    })
-                                }
-                                ModelResult::Error(err) => Err(anyhow::anyhow!(
-                                    "Mesh embeddings error {:?}: {}",
-                                    err.error_type,
-                                    err.message
-                                )),
-                                _ => Err(anyhow::anyhow!(
-                                    "Mesh embeddings returned unexpected response type"
-                                )),
-                            }
-                        }
-                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla embeddings")),
-                    }
-                }
-            })
-            .await?
-        };
+        let t = std::time::Instant::now();
+        let executor_snapshot = self.executor.read().clone();
+        if let Some(executor) = executor_snapshot {
+            use crate::services::runtime::context::ExecutionContext;
+            use crate::services::runtime::executor::ExecutorError;
 
-        Ok(route_result)
+            let mut exec_ctx = ExecutionContext {
+                user: user.clone(),
+                ..ExecutionContext::default()
+            };
+            match executor
+                .execute_embeddings(request.clone(), &mut exec_ctx)
+                .await
+            {
+                Ok(response) => {
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: exec_ctx
+                            .route_metadata
+                            .served_by_node
+                            .unwrap_or_else(|| {
+                                hostname::get()
+                                    .map(|h| h.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| "unknown".to_string())
+                            }),
+                        backend_type: exec_ctx
+                            .route_metadata
+                            .backend_type
+                            .unwrap_or_else(|| "executor".to_string()),
+                        strategy_used: "executor".to_string(),
+                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                        hop_count: 0,
+                        latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                    };
+                    return Ok(crate::routing::RouteResult { response, metadata });
+                }
+                Err(ExecutorError::TransportPendingCutover(_)) => {
+                    debug!(
+                        "executor returned TransportPendingCutover for embeddings — falling back to legacy mesh dispatch"
+                    );
+                    // fall through to legacy dispatch below
+                }
+                Err(e) => return Err(executor_err_to_core(e, &request.model).into()),
+            }
+        }
+
+        // Legacy mesh-only fallback. Po R3b.7 mesh transport bedzie w
+        // executor; ten branch wyparuje razem z `BackendHandle::MeshForward`.
+        self.legacy_embeddings_mesh_dispatch(request).await
     }
 
-    /// Routuje embeddings request przez QUIC (TentaFlow.Embeddings).
-    ///
-    /// Konwertuje EmbeddingRequest -> ModelRequest z EmbeddingsPayload,
-    /// wysyla przez QuicClient, konwertuje odpowiedz do EmbeddingResponse.
-    pub(crate) async fn route_embeddings_quic(
+    /// Mesh-only legacy fallback dla `route_embeddings`. Iteruje po
+    /// MeshForward kandydatach z `dispatch_with_fallback` i wysyla
+    /// `EmbeddingsPayload` przez `forward_model_request_to_mesh`. Pozostale
+    /// branche (HTTP/QuicEmbedding) sa obslugiwane przez executor — tutaj
+    /// zostaje tylko mesh, zeby uniknac duplikacji logiki dispatch.
+    async fn legacy_embeddings_mesh_dispatch(
         &self,
-        quic_client: Arc<crate::net::quic::QuicClient>,
         request: EmbeddingRequest,
-        model_name: String,
-    ) -> Result<EmbeddingResponse> {
-        use uuid::Uuid;
-
-        let input_texts = match &request.input {
-            EmbeddingInput::Single(text) => vec![text.clone()],
-            EmbeddingInput::Multiple(texts) => texts.clone(),
-        };
-
-        let text_count = input_texts.len();
-
-        // Mapuj nazwe serwisu Router -> nazwe modelu w Embeddings Engine
-        let embeddings_model_name = model_name
-            .strip_prefix("embeddings-")
-            .unwrap_or(&model_name)
-            .to_string();
-
-        debug!("Model mapping: {} -> {}", model_name, embeddings_model_name);
-
-        let model_request = ModelRequest {
-            request_id: Uuid::new_v4().to_string(),
-            payload: ModelPayload::Embeddings(EmbeddingsPayload {
-                model: embeddings_model_name,
-                input: input_texts,
-                normalize: true,
-            }),
-            stream: false,
-            metadata: None,
-            session_id: None,
-        };
-
-        debug!(
-            "Wysylam embeddings request przez QUIC: {} tekstow",
-            text_count
-        );
-
-        let model_response = quic_client.send_request(model_request).await?;
-
-        match model_response.result {
-            ModelResult::Embeddings(embeddings_result) => {
-                let data: Vec<EmbeddingData> = embeddings_result
-                    .embeddings
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, embedding)| EmbeddingData {
-                        object: "embedding".to_string(),
-                        index: idx as u32,
-                        embedding,
-                    })
-                    .collect();
-
-                let estimated_tokens = text_count * 50;
-
-                let response = EmbeddingResponse {
-                    object: "list".to_string(),
-                    data,
-                    model: model_name,
-                    usage: EmbeddingUsage {
-                        prompt_tokens: estimated_tokens as u32,
-                        total_tokens: estimated_tokens as u32,
-                    },
+    ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
+        use crate::routing::middleware::BackendHandle;
+        let this = self.clone();
+        let req = request.clone();
+        // Enforce text-input modality so the mesh fallback does not forward
+        // `/v1/embeddings` traffic to a remote service that declares only
+        // image inputs (CLIP-vision style). Mirrors the `Text` constraint
+        // in `executor.execute_embeddings`.
+        let required_input = Some(crate::services::catalog::InputModality::Text);
+        self.dispatch_with_fallback(&request.model, 0, required_input, |handle| {
+            let this = this.clone();
+            let req = req.clone();
+            let handle = handle.clone();
+            async move {
+                let BackendHandle::MeshForward(node_id, svc) = &handle else {
+                    return Err(anyhow::anyhow!(
+                        "embeddings legacy fallback: only MeshForward is handled here \
+                         (executor owns Local/HTTP/QUIC)"
+                    ));
                 };
-
                 debug!(
-                    "Embeddings QUIC: {} embeddingow wygenerowanych",
-                    response.data.len()
+                    target_node = %node_id,
+                    service = %svc,
+                    "MeshForward embeddings do zdalnej uslugi"
                 );
-
-                Ok(response)
+                let input_texts = match &req.input {
+                    EmbeddingInput::Single(text) => vec![text.clone()],
+                    EmbeddingInput::Multiple(texts) => texts.clone(),
+                };
+                let text_count = input_texts.len();
+                let request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload: ModelPayload::Embeddings(EmbeddingsPayload {
+                        model: svc.clone(),
+                        input: input_texts,
+                        normalize: true,
+                    }),
+                    stream: false,
+                    metadata: None,
+                    session_id: None,
+                };
+                let response = this
+                    .forward_model_request_to_mesh(node_id, request)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Mesh embeddings request failed: {}", e))?;
+                match response.result {
+                    ModelResult::Embeddings(result) => {
+                        let data = result
+                            .embeddings
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, embedding)| EmbeddingData {
+                                object: "embedding".to_string(),
+                                index: idx as u32,
+                                embedding,
+                            })
+                            .collect();
+                        let estimated = (text_count * 50) as u32;
+                        Ok(EmbeddingResponse {
+                            object: "list".to_string(),
+                            data,
+                            model: svc.clone(),
+                            usage: EmbeddingUsage {
+                                prompt_tokens: estimated,
+                                total_tokens: estimated,
+                            },
+                        })
+                    }
+                    ModelResult::Error(err) => Err(anyhow::anyhow!(
+                        "Mesh embeddings error {:?}: {}",
+                        err.error_type,
+                        err.message
+                    )),
+                    _ => Err(anyhow::anyhow!(
+                        "Mesh embeddings returned unexpected response type"
+                    )),
+                }
             }
-            ModelResult::Error(error_info) => Err(CoreError::InternalError {
-                message: format!(
-                    "Embeddings QUIC error ({}): {}",
-                    model_name, error_info.message
-                ),
-                source: None,
-            }
-            .into()),
-            _ => Err(CoreError::InternalError {
-                message: "Unexpected response type from embeddings QUIC".to_string(),
-                source: None,
-            }
-            .into()),
-        }
+        })
+        .await
     }
 
     /// Routuje embeddings request przez QUIC - wersja dla protocol types.
+    /// Protocol-native embeddings API used by `mesh/inference_proxy.rs`
+    /// when a peer sends `EmbeddingsPayload` over the reverse stream.
+    /// Delegates through the same executor as `/v1/embeddings` so the
+    /// resolver / modality filter applies; a **mesh-forward guard**
+    /// (`hop_count = MAX_HOP_COUNT`) blocks re-forwarding to a third
+    /// node. `TransportPendingCutover` from the executor is mapped to
+    /// `AllBackendsUnavailable` so the peer can retry through another
+    /// route instead of bouncing.
     pub async fn route_embeddings_via_quic(
         &self,
         model: &str,
         texts: Vec<String>,
     ) -> Result<tentaflow_protocol::ModelResponse> {
+        use crate::api::openai::types::EmbeddingInput;
+        use crate::services::runtime::context::ExecutionContext;
+
         debug!("route_embeddings_via_quic: START model={}", model);
 
-        let model_name = self.resolve_model_alias(model);
+        if texts.is_empty() {
+            return Err(CoreError::InvalidRequest {
+                message: "embeddings request has zero inputs".to_string(),
+                details: Some("at least one text is required".to_string()),
+            }
+            .into());
+        }
 
-        debug!(
-            "route_embeddings_via_quic: resolved model={}, texts={}",
-            model_name,
-            texts.len()
-        );
-
-        let quic_client = self
-            .service_manager
-            .find_quic_client_for_model(&model_name)
-            .await
+        let executor = self
+            .executor
+            .read()
+            .clone()
             .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
+                model_name: model.to_string(),
             })?;
 
-        // Mapuj nazwe serwisu Router -> nazwe modelu w Embeddings Engine
-        let embeddings_model_name = model_name
-            .strip_prefix("tentaflow-embeddings-")
-            .unwrap_or(&model_name)
-            .to_string();
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        let model_request = ModelRequest {
-            request_id: request_id.clone(),
-            payload: ModelPayload::Embeddings(EmbeddingsPayload {
-                model: embeddings_model_name,
-                input: texts,
-                normalize: true,
-            }),
-            stream: false,
-            metadata: None,
-            session_id: None,
+        let request = EmbeddingRequest {
+            model: model.to_string(),
+            input: if texts.len() == 1 {
+                EmbeddingInput::Single(texts[0].clone())
+            } else {
+                EmbeddingInput::Multiple(texts.clone())
+            },
+            encoding_format: None,
+            dimensions: None,
+            user: None,
         };
 
-        debug!("route_embeddings_via_quic: wysylam request...");
-        let response = quic_client.send_request(model_request).await?;
-        debug!("route_embeddings_via_quic: odpowiedz otrzymana");
+        // Mesh re-forward guard: max out the hop counter so any further
+        // `enter_hop` call inside the executor's mesh path will reject.
+        // Anti-loop on the protocol-native reverse path — a peer's
+        // EmbeddingsPayload must land on a local instance, never bounce.
+        let mut exec_ctx = ExecutionContext {
+            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
+            ..ExecutionContext::default()
+        };
 
-        Ok(response)
+        let response = match executor.execute_embeddings(request, &mut exec_ctx).await {
+            Ok(r) => r,
+            Err(e) => return Err(executor_err_to_core(e, model).into()),
+        };
+
+        // Convert `EmbeddingResponse` → protocol-native `ModelResponse`
+        // (the reverse handler expects the rkyv-encoded protocol shape).
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let embeddings: Vec<Vec<f32>> =
+            response.data.into_iter().map(|d| d.embedding).collect();
+        let dimensions = embeddings.first().map(|v| v.len()).unwrap_or(0);
+        let proto_response = ModelResponse {
+            request_id,
+            result: ModelResult::Embeddings(EmbeddingsResult {
+                embeddings,
+                dimensions,
+                model: response.model,
+            }),
+            metrics: None,
+        };
+
+        Ok(proto_response)
     }
+}
 
-    /// Routuje request rerankingu przez QUIC.
-    pub async fn route_rerank_via_quic(
-        &self,
-        payload: &tentaflow_protocol::RerankPayload,
-    ) -> Result<tentaflow_protocol::ModelResponse> {
-        debug!("route_rerank_via_quic: START model={}", payload.model);
-
-        let model_name = self.resolve_model_alias(&payload.model);
-
-        let quic_client = self
-            .service_manager
-            .find_quic_client_for_model(&model_name)
-            .await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
-            })?;
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        let model_request = ModelRequest {
-            request_id: request_id.clone(),
-            payload: ModelPayload::Rerank(RerankPayload {
-                model: payload.model.clone(),
-                query: payload.query.clone(),
-                documents: payload.documents.clone(),
-                top_n: payload.top_n,
-                return_documents: payload.return_documents,
-            }),
-            stream: false,
-            metadata: None,
-            session_id: None,
-        };
-
-        debug!("route_rerank_via_quic: wysylam request...");
-        let response = quic_client.send_request(model_request).await?;
-        debug!("route_rerank_via_quic: odpowiedz otrzymana");
-
-        Ok(response)
+/// Map executor errors onto typed `CoreError` variants so the OpenAI HTTP
+/// layer can serve a precise status code (404 / 400 / 503) instead of a
+/// catch-all 500.
+fn executor_err_to_core(
+    err: crate::services::runtime::executor::ExecutorError,
+    model: &str,
+) -> CoreError {
+    use crate::services::runtime::executor::ExecutorError;
+    use crate::services::runtime::resolver::ResolveError;
+    match err {
+        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => CoreError::ModelNotFound {
+            model_name: m,
+        },
+        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
+            CoreError::InvalidRequest {
+                message: format!(
+                    "model '{}' has no candidate matching requested capabilities",
+                    requested
+                ),
+                details: None,
+            }
+        }
+        ExecutorError::Resolve(other) => CoreError::InternalError {
+            message: format!("alias resolution: {}", other),
+            source: None,
+        },
+        ExecutorError::AllCandidatesFailed { .. } => CoreError::AllBackendsUnavailable {
+            model_name: model.to_string(),
+        },
+        ExecutorError::FlowDispatcherUnavailable
+        | ExecutorError::FlowEmptyResult { .. }
+        | ExecutorError::Internal(_)
+        | ExecutorError::SttRuntimeUnavailable
+        | ExecutorError::SttBackend(_) => CoreError::InternalError {
+            message: format!("executor: {}", err),
+            source: None,
+        },
+        ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
+            model_name: model.to_string(),
+        },
     }
 }

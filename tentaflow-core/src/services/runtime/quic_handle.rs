@@ -953,6 +953,7 @@ mod snapshot_helpers_tests {
             BackendHandle::Embedded {
                 model_name: "qwen-tiny".into(),
                 node_id: "local".into(),
+                engine_id: "test-engine".into(),
             },
         );
         // Reach into the manager's cache via Arc swap is not part of the API,

@@ -16,6 +16,13 @@ pub const MAX_HOP_COUNT: u8 = 3;
 pub const MAX_ALIAS_DEPTH: usize = 8;
 pub const MAX_FLOW_DEPTH: usize = 3;
 
+/// Metadata key used to carry the forward-side hop count across mesh
+/// boundaries. Reverse handlers read this and refuse to dispatch when
+/// the value is already at or above `MAX_HOP_COUNT` — that cuts off
+/// A→B→A cycles that would otherwise reset hop tracking on each node
+/// (Codex R3b.7 H2).
+pub const MESH_HOP_HEADER: &str = "x-tentaflow-mesh-hop";
+
 /// Tracing breadcrumbs captured during dispatch — surfaced on the
 /// response metadata so the GUI can show "served by node X via alias Y".
 /// A near-twin lives in `routing/middleware::RouteMetadata` for the
