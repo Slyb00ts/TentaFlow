@@ -33,9 +33,15 @@ pub enum BackendHandle {
     /// reconnect loop spawnowany przez supervisor (krok N7.2).
     Quic(Arc<QuicServiceHandle>),
     /// In-process embedded engine (llama.cpp, MLX, sherpa-onnx itp.). Brak
-    /// kanalu sieciowego — dispatch idzie bezposrednio do
-    /// `LocalInferenceManager` po `model_name`.
-    Embedded { model_name: String, node_id: String },
+    /// kanalu sieciowego — dispatch idzie bezposrednio do silnika
+    /// po `model_name` (LLM/embeddings → `LocalInferenceManager`,
+    /// STT → `SttManager`) lub po `engine_id` (TTS → `TtsManager` keys
+    /// engines pod manifestowym `engine.id`, np. "apple-tts").
+    Embedded {
+        model_name: String,
+        node_id: String,
+        engine_id: String,
+    },
 }
 
 impl BackendHandle {
@@ -172,6 +178,7 @@ pub fn build_handle(svc: &ServiceInfo) -> Result<BackendHandle> {
             Ok(BackendHandle::Embedded {
                 model_name,
                 node_id: svc.node_id.clone(),
+                engine_id: svc.engine_id.clone(),
             })
         }
         Transport::HttpDirect | Transport::ExternalHttp => {
@@ -354,7 +361,7 @@ mod tests {
 
         let h = BackendHandle::Embedded {
             model_name: "qwen3-0.8b".into(),
-            node_id: "nodeA".into(),
+            node_id: "nodeA".into(), engine_id: "test-engine".into(),
         };
         cache.insert("nodeA".into(), 42, h);
         assert_eq!(cache.len(), 1);
@@ -375,7 +382,7 @@ mod tests {
             1,
             BackendHandle::Embedded {
                 model_name: "m1".into(),
-                node_id: "nodeA".into(),
+                node_id: "nodeA".into(), engine_id: "test-engine".into(),
             },
         );
         cache.insert(
@@ -383,7 +390,7 @@ mod tests {
             2,
             BackendHandle::Embedded {
                 model_name: "m2".into(),
-                node_id: "nodeB".into(),
+                node_id: "nodeB".into(), engine_id: "test-engine".into(),
             },
         );
         let mut keys = cache.keys();
@@ -406,7 +413,7 @@ mod tests {
             7,
             BackendHandle::Embedded {
                 model_name: "qwen-0.8b".into(),
-                node_id: "local".into(),
+                node_id: "local".into(), engine_id: "test-engine".into(),
             },
         );
         cache.insert(
@@ -414,7 +421,7 @@ mod tests {
             11,
             BackendHandle::Embedded {
                 model_name: "phi-3-mini".into(),
-                node_id: "remote".into(),
+                node_id: "remote".into(), engine_id: "test-engine".into(),
             },
         );
 
@@ -483,6 +490,7 @@ mod tests {
             BackendHandle::Embedded {
                 model_name,
                 node_id,
+                engine_id: _,
             } => {
                 assert_eq!(model_name, "qwen-tiny");
                 assert_eq!(node_id, "n");

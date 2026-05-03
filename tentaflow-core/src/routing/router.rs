@@ -385,6 +385,8 @@ impl Router {
                 resolver,
                 flow_dispatcher.clone(),
                 local_inference.clone(),
+                router.stt_runtime.clone(),
+                router.mesh_manager.clone(),
                 Vec::new(),
             ));
             *executor_slot.write() = Some(executor);
@@ -570,13 +572,6 @@ impl Router {
     // ========================================================================
     // ALIAS RETENTAFLOWN
     // ========================================================================
-
-    /// Rozwiazuje alias modelu na canonical name. Aliasy nie pochodza juz z
-    /// config.toml — DB `service_aliases` (uzywane przez middleware route
-    /// resolver) jest jedynym zrodlem, wiec tutaj zwracamy nazwe bez zmian.
-    pub(crate) fn resolve_model_alias(&self, model: &str) -> String {
-        model.to_string()
-    }
 
     // ========================================================================
     // HEALTH & MONITORING METHODS

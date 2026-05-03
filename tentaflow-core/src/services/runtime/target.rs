@@ -120,6 +120,7 @@ mod tests {
         BackendHandle::Embedded {
             model_name: name.to_string(),
             node_id: "node".to_string(),
+            engine_id: "test-engine".to_string(),
         }
     }
 

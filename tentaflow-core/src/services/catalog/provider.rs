@@ -457,6 +457,11 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
                 outputs.insert(OutputModality::Image);
             }
             "embeddings" => {
+                // Codex R3b.1 round 2 M2: declare text input so
+                // `execute_embeddings` (which requires `Text` input) can
+                // resolve embedding flows. Without this the resolver
+                // filters every embeddings flow out before dispatch.
+                inputs.insert(InputModality::Text);
                 outputs.insert(OutputModality::Embedding);
             }
             "llm" | "chat" | "memory" | "conversation_history" => {
