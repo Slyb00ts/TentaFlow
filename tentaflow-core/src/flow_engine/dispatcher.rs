@@ -24,7 +24,7 @@ use crate::flow_engine::cache::{CachedFlow, FlowCache};
 use crate::flow_engine::executor_async::{FlowExecutorAsync, ParsedFlow};
 use crate::flow_engine::resolver;
 use crate::flow_engine::types::{FlowContext, FlowExecutionResult};
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -174,7 +174,7 @@ impl FlowDispatcher {
         // Skipujemy gdy ctx nie ma user_id (internal caller).
         if let Some(uid) = ctx.user_id {
             let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
-            if !crate::routing::acl::check_access_safe(
+            if !crate::auth::acl::check_access_safe(
                 &self.db,
                 "flow",
                 &flow_id.to_string(),
@@ -236,7 +236,7 @@ impl FlowDispatcher {
         }
         if let Some(uid) = ctx.user_id {
             let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
-            if !crate::routing::acl::check_access_safe(
+            if !crate::auth::acl::check_access_safe(
                 &self.db,
                 "flow",
                 &flow_id.to_string(),
@@ -312,7 +312,7 @@ impl FlowDispatcher {
 
         if let Some(uid) = ctx.user_id {
             let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
-            if !crate::routing::acl::check_access_safe(
+            if !crate::auth::acl::check_access_safe(
                 &self.db,
                 "flow",
                 &flow_id.to_string(),
@@ -355,7 +355,7 @@ mod flow_dispatch_regression {
     use super::*;
     use crate::config::RouterConfig;
     use crate::db::seed;
-    use crate::routing::service_manager::ServiceManager;
+    use crate::services::runtime::quic_handle::ServiceManager;
     use rusqlite::Connection;
     use std::collections::BTreeSet;
 

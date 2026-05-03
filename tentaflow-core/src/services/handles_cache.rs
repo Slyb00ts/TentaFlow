@@ -15,9 +15,9 @@ use tentaflow_protocol::ServiceInfo;
 use tokio::task::JoinHandle;
 
 use crate::config::ConnectionType;
-use crate::routing::backend::client::BackendClient;
-use crate::routing::loadbalancer::CircuitBreakerConfig;
-use crate::routing::service_manager::{QuicServiceHandle, QuicServiceState};
+use crate::services::backend::client::BackendClient;
+use crate::services::runtime::CircuitBreakerConfig;
+use crate::services::runtime::quic_handle::{QuicServiceHandle, QuicServiceState};
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::transport::Transport;
 

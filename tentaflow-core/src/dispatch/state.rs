@@ -16,7 +16,7 @@ use crate::license::StaticLicenseChecker;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use crate::services::handles_cache::LiveHandlesCache;
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;

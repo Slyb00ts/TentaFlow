@@ -234,7 +234,7 @@ impl Router {
     pub async fn route_chat_completion_stream(
         &self,
         mut request: ChatCompletionRequest,
-        user: Option<crate::routing::acl::UserContext>,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<
         crate::routing::RouteResult<
             Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
@@ -247,7 +247,7 @@ impl Router {
 
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(
+                if !crate::auth::acl::check_access_safe(
                     db,
                     "model",
                     &request.model,

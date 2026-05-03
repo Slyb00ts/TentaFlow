@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::db::{repository, DbPool};
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 use super::container::{self, SpawnRequest};
 use super::native;

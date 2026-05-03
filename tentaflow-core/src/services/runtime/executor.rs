@@ -87,7 +87,7 @@ pub struct ModelRuntimeExecutor {
     catalog: Arc<CatalogProvider>,
     resolver: Arc<AliasResolver>,
     flow_dispatcher: Option<Arc<FlowDispatcher>>,
-    local_inference: Arc<crate::routing::local_inference::LocalInferenceHandler>,
+    local_inference: Arc<crate::inference::local::LocalInferenceHandler>,
     middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     /// Per-alias round-robin state keyed by alias name. `DashMap` so we
     /// can mutate per-key without serialising the whole map.
@@ -99,7 +99,7 @@ impl ModelRuntimeExecutor {
         catalog: Arc<CatalogProvider>,
         resolver: Arc<AliasResolver>,
         flow_dispatcher: Option<Arc<FlowDispatcher>>,
-        local_inference: Arc<crate::routing::local_inference::LocalInferenceHandler>,
+        local_inference: Arc<crate::inference::local::LocalInferenceHandler>,
         middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     ) -> Self {
         Self {
@@ -585,7 +585,7 @@ impl ModelRuntimeExecutor {
     /// bez aplikacji `response_middleware` — to robi caller (api handler /
     /// chat.rs) zeby executor pozostal middleware-agnostic.
     async fn dispatch_chat_quic(
-        handle: &Arc<crate::routing::service_manager::QuicServiceHandle>,
+        handle: &Arc<crate::services::runtime::quic_handle::QuicServiceHandle>,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ExecutorError> {
         use crate::api::openai::types::{Choice, Message, MessageContent, Usage};

@@ -189,7 +189,7 @@ pub fn service_request(
 /// Wysyla request do serwisu przez QUIC — probuje znalezc klienta
 /// w mapach LLM, Embedding, TTS, STT i Memory.
 async fn dispatch_to_service(
-    service_manager: &crate::routing::service_manager::ServiceManager,
+    service_manager: &crate::services::runtime::quic_handle::ServiceManager,
     service_name: &str,
     request_json: &str,
     addon_id: &str,

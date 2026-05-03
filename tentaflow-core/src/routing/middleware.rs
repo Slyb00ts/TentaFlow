@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::routing::router::Router;
-use crate::routing::service_manager::PoolStrategy;
+use crate::services::runtime::quic_handle::PoolStrategy;
 use crate::services::catalog::InputModality;
 use crate::services::transport::Transport;
 
@@ -485,7 +485,7 @@ impl Router {
 #[cfg(test)]
 mod middleware_tests {
     use super::*;
-    use crate::routing::service_manager::PoolStrategy;
+    use crate::services::runtime::quic_handle::PoolStrategy;
 
     // ========================================================================
     // Testy BackendHandle

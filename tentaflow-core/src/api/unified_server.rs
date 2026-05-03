@@ -26,7 +26,7 @@ use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::security::MeshSecurity;
 use crate::metrics::RouterMetrics;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use crate::routing::Router;
 
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler
@@ -314,7 +314,7 @@ pub fn start_unified_server_with_permissions(
                             let path = req.uri().path().to_string();
 
                             if is_openai_path(&path) {
-                                let mut owner_user_ctx: Option<crate::routing::acl::UserContext> =
+                                let mut owner_user_ctx: Option<crate::auth::acl::UserContext> =
                                     None;
                                 // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
                                 if path != "/health" && path != "/ready" {
@@ -344,7 +344,7 @@ pub fn start_unified_server_with_permissions(
                                                         .map(|u| u.role)
                                                         .unwrap_or_else(|| "user".to_string());
                                                         owner_user_ctx = Some(
-                                                            crate::routing::acl::UserContext::new(
+                                                            crate::auth::acl::UserContext::new(
                                                                 uid, role,
                                                             ),
                                                         );

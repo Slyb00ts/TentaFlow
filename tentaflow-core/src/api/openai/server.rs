@@ -250,7 +250,7 @@ async fn handle_chat_completions(
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
     let user_ctx = req
         .extensions()
-        .get::<crate::routing::acl::UserContext>()
+        .get::<crate::auth::acl::UserContext>()
         .cloned();
 
     // Czytamy body
@@ -422,7 +422,7 @@ async fn handle_audio_tts(
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
     let user_ctx = req
         .extensions()
-        .get::<crate::routing::acl::UserContext>()
+        .get::<crate::auth::acl::UserContext>()
         .cloned();
 
     // Parsuj body jako JSON
@@ -556,7 +556,7 @@ async fn handle_audio_transcriptions(
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
     let user_ctx = req
         .extensions()
-        .get::<crate::routing::acl::UserContext>()
+        .get::<crate::auth::acl::UserContext>()
         .cloned();
 
     // Wyciagnij Content-Type header aby sprawdzic boundary
@@ -804,7 +804,7 @@ async fn handle_embeddings(
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
     let user_ctx = req
         .extensions()
-        .get::<crate::routing::acl::UserContext>()
+        .get::<crate::auth::acl::UserContext>()
         .cloned();
 
     // Czytamy body

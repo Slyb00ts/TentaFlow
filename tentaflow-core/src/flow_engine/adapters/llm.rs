@@ -14,7 +14,7 @@ use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 use crate::config::RouterConfig;
 use crate::flow_engine::adapters::{AdapterChunkStream, NodeAdapter};
 use crate::flow_engine::types::FlowContext;
-use crate::routing::service_manager::ServiceManager;
+use crate::services::runtime::quic_handle::ServiceManager;
 use crate::routing::stream_helpers::quic_stream_to_openai_chunks;
 
 /// Adapter wezla LLM - generowanie tekstu przez backend LLM.
