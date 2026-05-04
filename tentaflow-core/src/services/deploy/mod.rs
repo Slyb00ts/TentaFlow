@@ -961,7 +961,10 @@ mod tests {
     async fn deploy_returns_service_id_on_success_for_embedded() {
         let db = open_db();
         let ports = Arc::new(PortAllocator::new((45_900, 45_999), Default::default()).unwrap());
-        let manifest = dummy_manifest("emb-ok", NativeRuntime::Embedded);
+        // engine.id "llama-cpp" maps to a local inference backend; other ids
+        // (e.g. "emb-ok") are rejected by prepare_embedded_llm — see
+        // embedded.rs:145.
+        let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
         let outcome = deploy(
             DeployMethod::NativeEmbedded,
@@ -995,7 +998,7 @@ mod tests {
         // "existing" service row.
         let db = open_db();
         let ports = Arc::new(PortAllocator::new((46_500, 46_599), Default::default()).unwrap());
-        let manifest = dummy_manifest("respawn-emb", NativeRuntime::Embedded);
+        let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
         let outcome = deploy(
             DeployMethod::NativeEmbedded,
@@ -1085,7 +1088,7 @@ mod tests {
     async fn service_manifest_deploy_writes_with_slug() {
         let db = open_db();
         let ports = Arc::new(PortAllocator::new((45_650, 45_699), Default::default()).unwrap());
-        let manifest = dummy_manifest("emb-slug-handler", NativeRuntime::Embedded);
+        let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
 
         let slug = "handler-slug-cccc".to_string();
@@ -1104,7 +1107,7 @@ mod tests {
         let row = crate::services_repo::deployments::get_by_slug(&db, &slug)
             .unwrap()
             .expect("deployments row exists for handler slug");
-        assert_eq!(row.engine_id, "emb-slug-handler");
+        assert_eq!(row.engine_id, "llama-cpp");
         assert_eq!(row.deploy_method, "native_embedded");
         assert_eq!(
             row.status,
@@ -1119,7 +1122,7 @@ mod tests {
         // We verify they reach a subscriber AND get appended to log_tail.
         let db = open_db();
         let ports = Arc::new(PortAllocator::new((45_700, 45_799), Default::default()).unwrap());
-        let manifest = dummy_manifest("emb-with-sink", NativeRuntime::Embedded);
+        let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});
 
         let slug = "test-slug-aaaa".to_string();

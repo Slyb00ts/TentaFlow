@@ -474,8 +474,16 @@ mod tests {
 
         handle.shutdown();
 
-        // Wait at most 2 seconds for the task to wind down.
-        let res = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        // Wait at most 30 seconds for the task to wind down. The current
+        // shutdown path is passive: `tentaflow-transport::ServiceClient::connect`
+        // forwards `shutdown_rx` but still awaits `endpoint.connect(...)` to
+        // completion or failure (tentaflow-transport/src/client.rs:93-108).
+        // For an unreachable fake endpoint iroh DNS discovery can take a few
+        // to ~10 seconds before returning, after which the reconnect loop
+        // observes shutdown_rx and exits. timeout_ms=1000 in QuicConfig
+        // covers the request after a successful connect, not connect itself.
+        // Responsive cancellation through endpoint.connect is upstream work.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(30), task).await;
         assert!(
             res.is_ok(),
             "reconnect loop did not terminate after shutdown"
