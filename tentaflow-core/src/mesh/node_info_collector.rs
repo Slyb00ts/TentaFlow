@@ -10,6 +10,7 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::mesh::peer_store::{NodeInfo, PeerContainerInfo, PeerGpuInfo, PeerNetworkInfo};
@@ -18,32 +19,37 @@ use std::net::IpAddr;
 use sysinfo::{Networks, System};
 use tracing::warn;
 
-lazy_static::lazy_static! {
-    /// Wspoldzielona instancja System — trzymana miedzy wywolaniami
-    /// zeby CPU usage byl obliczany na podstawie delty od ostatniego refresha
-    static ref SYS: Mutex<System> = {
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        Mutex::new(sys)
-    };
+/// Wspoldzielona instancja System — trzymana miedzy wywolaniami
+/// zeby CPU usage byl obliczany na podstawie delty od ostatniego refresha
+fn sys() -> &'static Mutex<System> {
+    static C: OnceLock<Mutex<System>> = OnceLock::new();
+    C.get_or_init(|| {
+        let mut s = System::new_all();
+        s.refresh_all();
+        Mutex::new(s)
+    })
+}
 
-    /// Cache wynikow GPU — unika spawnowania procesow co 500ms
-    static ref GPU_CACHE: Mutex<(Instant, Vec<PeerGpuInfo>)> = {
-        Mutex::new((Instant::now() - Duration::from_secs(10), vec![]))
-    };
+/// Cache wynikow GPU — unika spawnowania procesow co 500ms
+fn gpu_cache() -> &'static Mutex<(Instant, Vec<PeerGpuInfo>)> {
+    static C: OnceLock<Mutex<(Instant, Vec<PeerGpuInfo>)>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(10), vec![])))
+}
 
-    /// Instancja Networks z sysinfo — cross-platform (Linux, macOS, Windows)
-    static ref NETWORKS: Mutex<Networks> = {
+/// Instancja Networks z sysinfo — cross-platform (Linux, macOS, Windows)
+fn networks() -> &'static Mutex<Networks> {
+    static C: OnceLock<Mutex<Networks>> = OnceLock::new();
+    C.get_or_init(|| {
         let mut nets = Networks::new_with_refreshed_list();
         nets.refresh(false);
         Mutex::new(nets)
-    };
+    })
+}
 
-    /// Poprzedni odczyt sieci — do liczenia delt rx/tx per second
-    static ref NET_PREV: Mutex<(Instant, HashMap<String, (u64, u64)>)> = {
-        Mutex::new((Instant::now(), HashMap::new()))
-    };
-
+/// Poprzedni odczyt sieci — do liczenia delt rx/tx per second
+fn net_prev() -> &'static Mutex<(Instant, HashMap<String, (u64, u64)>)> {
+    static C: OnceLock<Mutex<(Instant, HashMap<String, (u64, u64)>)>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new((Instant::now(), HashMap::new())))
 }
 
 /// Klasyfikacja producenta GPU po fragmentach nazwy adaptera. Heurystyka
@@ -196,7 +202,7 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
         #[cfg(target_os = "macos")]
         {
             let total_ram_mb = {
-                let sys = SYS.lock();
+                let sys = sys().lock();
                 sys.total_memory() / (1024 * 1024)
             };
             for gpu in &mut gpus {
@@ -253,7 +259,7 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
     // Zbierz dane systemowe — KROTKO trzymaj lock na SYS, potem zwolnij
     #[allow(unused_mut)] // mut potrzebny na iOS (FFI device name) i Android
     let (hostname, os_info, cpu_count, ram_total_mb) = {
-        let sys = SYS.lock();
+        let sys = sys().lock();
         let mut hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
 
         // iOS: System::host_name() zwraca "localhost" — probuj pobrac nazwe urzadzenia przez FFI
@@ -333,7 +339,7 @@ pub struct CurrentMetrics {
 pub fn collect_fast_metrics() -> CurrentMetrics {
     // KROTKO lockuj SYS — tylko na refresh CPU/RAM/swap, potem zwolnij
     let (cpu_usage, ram_used_mb, swap_total_mb, swap_used_mb) = {
-        let mut sys = SYS.lock();
+        let mut sys = sys().lock();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         (
@@ -448,7 +454,7 @@ pub struct GpuMemSnapshot {
 
 pub fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
     {
-        let cache = GPU_CACHE.lock();
+        let cache = gpu_cache().lock();
         if cache.0.elapsed() < Duration::from_secs(2) {
             return cache.1.clone();
         }
@@ -457,7 +463,7 @@ pub fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
     let result = detect_gpus_with_live_metrics();
 
     {
-        let mut cache = GPU_CACHE.lock();
+        let mut cache = gpu_cache().lock();
         *cache = (Instant::now(), result.clone());
     }
 
@@ -478,7 +484,7 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
         let entries = query_nvidia_smi();
         if !entries.is_empty() {
             let system_ram_mb = {
-                let sys = SYS.lock();
+                let sys = sys().lock();
                 sys.total_memory() / (1024 * 1024)
             };
             gpus = entries
@@ -609,7 +615,7 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
     }
 
     let system_ram_mb = {
-        let sys = SYS.lock();
+        let sys = sys().lock();
         sys.total_memory() / (1024 * 1024)
     };
 
@@ -645,7 +651,7 @@ fn enrich_macos_live(gpus: &mut [PeerGpuInfo]) {
 
     // Apple Silicon unified memory — VRAM total = RAM total
     let total_ram_mb = {
-        let sys = SYS.lock();
+        let sys = sys().lock();
         sys.total_memory() / (1024 * 1024)
     };
 
@@ -1086,7 +1092,7 @@ fn enrich_ios_live(gpus: &mut [PeerGpuInfo]) {
     }
 
     let total_ram_mb = {
-        let sys = SYS.lock();
+        let sys = sys().lock();
         sys.total_memory() / (1024 * 1024)
     };
 
@@ -1408,16 +1414,15 @@ fn detect_all_ipv4_info(name: &str, nets: &Networks) -> Vec<(String, String)> {
     result
 }
 
-// Cache bramek domyslnych per interfejs (parsowane z `ip route show`)
-lazy_static::lazy_static! {
-    static ref GATEWAY_CACHE: Mutex<(Instant, HashMap<String, String>)> = {
-        Mutex::new((Instant::now() - Duration::from_secs(120), HashMap::new()))
-    };
+/// Cache bramek domyslnych per interfejs (parsowane z `ip route show`)
+fn gateway_cache() -> &'static Mutex<(Instant, HashMap<String, String>)> {
+    static C: OnceLock<Mutex<(Instant, HashMap<String, String>)>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(120), HashMap::new())))
 }
 
 /// Pobiera bramke domyslna dla interfejsu
 fn detect_gateway(name: &str) -> String {
-    let mut cache = GATEWAY_CACHE.lock();
+    let mut cache = gateway_cache().lock();
     // Odswiezaj co 30s
     if cache.0.elapsed() > Duration::from_secs(30) {
         #[allow(unused_mut)]
@@ -1459,11 +1464,11 @@ fn detect_gateway(name: &str) -> String {
 // =============================================================================
 
 fn detect_networks() -> Vec<PeerNetworkInfo> {
-    let mut nets = NETWORKS.lock();
+    let mut nets = networks().lock();
     nets.refresh(false);
 
     let now = Instant::now();
-    let mut prev = NET_PREV.lock();
+    let mut prev = net_prev().lock();
     let elapsed_secs = prev.0.elapsed().as_secs_f64();
 
     let mut current_values: HashMap<String, (u64, u64)> = HashMap::new();
@@ -1571,7 +1576,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
 
 /// Pobiera lokalne adresy IP z interfejsow sieciowych (bez loopback)
 pub fn collect_local_addresses() -> Vec<IpAddr> {
-    let mut nets = NETWORKS.lock();
+    let mut nets = networks().lock();
     nets.refresh(true);
 
     let mut addrs: Vec<IpAddr> = Vec::new();

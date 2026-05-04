@@ -27,72 +27,67 @@
 //
 // ============================================================================
 
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
-lazy_static! {
-    /// Regex dla numeru NIP (10 cyfr, opcjonalnie z myślnikami)
-    ///
-    /// Formaty:
-    /// - 1234567890
-    /// - 123-456-78-90
-    /// - 123 456 78 90
-    pub static ref NIP_PATTERN: Regex = Regex::new(
-        r"\b\d{3}[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}\b"
-    ).unwrap();
+/// Regex dla numeru NIP (10 cyfr, opcjonalnie z myślnikami)
+pub fn nip_pattern() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| Regex::new(r"\b\d{3}[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}\b").unwrap())
+}
 
-    /// Regex dla numeru PESEL (11 cyfr)
-    ///
-    /// Format: 12345678901 (bez myślników)
-    pub static ref PESEL_PATTERN: Regex = Regex::new(
-        r"\b\d{11}\b"
-    ).unwrap();
+/// Regex dla numeru PESEL (11 cyfr)
+pub fn pesel_pattern() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| Regex::new(r"\b\d{11}\b").unwrap())
+}
 
-    /// Regex dla adresu email
-    ///
-    /// Uproszczona wersja RFC 5322 - wystarczająco dobra dla 99% przypadków
-    pub static ref EMAIL_PATTERN: Regex = Regex::new(
-        r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
-    ).unwrap();
+/// Regex dla adresu email (uproszczona wersja RFC 5322)
+pub fn email_pattern() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| Regex::new(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b").unwrap())
+}
 
-    /// Regex dla numeru telefonu (polski format)
-    ///
-    /// Formaty:
-    /// - +48 123 456 789
-    /// - 48 123 456 789
-    /// - 123 456 789
-    /// - 123-456-789
-    /// - (12) 345-67-89 (stacjonarny)
-    pub static ref PHONE_PATTERN: Regex = Regex::new(
-        r"\b(?:\+?48[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{3}[\s-]?\d{3}[\s-]?\d{2,3}\b"
-    ).unwrap();
+/// Regex dla numeru telefonu (polski format)
+pub fn phone_pattern() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| {
+        Regex::new(r"\b(?:\+?48[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{3}[\s-]?\d{3}[\s-]?\d{2,3}\b")
+            .unwrap()
+    })
+}
 
-    /// Regex dla adresu pocztowego (ulica + numer + opcjonalnie kod pocztowy)
-    ///
-    /// Formaty:
-    /// - ul. Długa 5
-    /// - al. Jerozolimskie 123/45
-    /// - pl. Zamkowy 1, 00-123 Warszawa
-    pub static ref ADDRESS_PATTERN: Regex = Regex::new(
-        r"(?:ul\.|al\.|pl\.|os\.|rynek)\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)*\s+\d+(?:/\d+)?(?:,?\s+\d{2}-\d{3}\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)?"
-    ).unwrap();
+/// Regex dla adresu pocztowego (ulica + numer + opcjonalnie kod pocztowy)
+pub fn address_pattern() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| {
+        Regex::new(
+            r"(?:ul\.|al\.|pl\.|os\.|rynek)\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)*\s+\d+(?:/\d+)?(?:,?\s+\d{2}-\d{3}\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)?",
+        )
+        .unwrap()
+    })
+}
 
-    /// Regex dla polskich nazwisk (patronimy: -ski, -cki, -dzki, -ny, -ny, etc.)
-    ///
-    /// Wykrywa nazwiska kończące się typowymi polskimi sufiksami
-    /// UWAGA: To może dać false positives dla przymiotników
-    pub static ref SURNAME_PATTERN: Regex = Regex::new(
-        r"\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:ski|cki|dzki|ska|cka|dzka|wicz|owicz|ewicz|ak|ek|ik|czyk|yk)\b"
-    ).unwrap();
+/// Regex dla polskich nazwisk (patronimy: -ski, -cki, -dzki itp.)
+pub fn surname_pattern() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| {
+        Regex::new(
+            r"\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:ski|cki|dzki|ska|cka|dzka|wicz|owicz|ewicz|ak|ek|ik|czyk|yk)\b",
+        )
+        .unwrap()
+    })
+}
 
-    /// HashSet imion dla O(1) lookup zamiast liniowego przeszukiwania tablicy
-    static ref COMMON_NAMES_SET: HashSet<&'static str> =
-        COMMON_POLISH_NAMES.iter().copied().collect();
+fn common_names_set() -> &'static HashSet<&'static str> {
+    static C: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    C.get_or_init(|| COMMON_POLISH_NAMES.iter().copied().collect())
+}
 
-    /// HashSet nazwisk dla O(1) lookup zamiast liniowego przeszukiwania tablicy
-    static ref COMMON_SURNAMES_SET: HashSet<&'static str> =
-        COMMON_POLISH_SURNAMES.iter().copied().collect();
+fn common_surnames_set() -> &'static HashSet<&'static str> {
+    static C: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    C.get_or_init(|| COMMON_POLISH_SURNAMES.iter().copied().collect())
 }
 
 /// Lista najczęstszych polskich imion (dla zwiększenia accuracy)
@@ -321,7 +316,7 @@ pub const COMMON_POLISH_SURNAMES: &[&str] = &[
 ///
 /// Zwraca: true jeśli jest w whitelist imion
 pub fn is_common_name(word: &str) -> bool {
-    COMMON_NAMES_SET.contains(word)
+    common_names_set().contains(word)
 }
 
 /// Sprawdza czy słowo jest popularnym polskim nazwiskiem.
@@ -333,7 +328,7 @@ pub fn is_common_name(word: &str) -> bool {
 ///
 /// Zwraca: true jeśli jest nazwiskiem
 pub fn is_common_surname(word: &str) -> bool {
-    COMMON_SURNAMES_SET.contains(word) || has_polish_surname_suffix(word)
+    common_surnames_set().contains(word) || has_polish_surname_suffix(word)
 }
 
 /// Sufiksy typowe dla polskich nazwisk patronimicznych
@@ -406,11 +401,11 @@ pub fn sanitize_pii(text: &str) -> (String, bool) {
     }
 
     let patterns: &[(&regex::Regex, &str)] = &[
-        (&NIP_PATTERN, "[NIP]"),
-        (&PESEL_PATTERN, "[PESEL]"),
-        (&EMAIL_PATTERN, "[EMAIL]"),
-        (&PHONE_PATTERN, "[TELEFON]"),
-        (&ADDRESS_PATTERN, "[ADRES]"),
+        (nip_pattern(), "[NIP]"),
+        (pesel_pattern(), "[PESEL]"),
+        (email_pattern(), "[EMAIL]"),
+        (phone_pattern(), "[TELEFON]"),
+        (address_pattern(), "[ADRES]"),
     ];
 
     for &(pattern, replacement) in patterns {
@@ -430,30 +425,30 @@ mod tests {
 
     #[test]
     fn test_nip_detection() {
-        assert!(NIP_PATTERN.is_match("1234567890"));
-        assert!(NIP_PATTERN.is_match("123-456-78-90"));
-        assert!(NIP_PATTERN.is_match("123 456 78 90"));
-        assert!(!NIP_PATTERN.is_match("12345")); // Za krótki
+        assert!(nip_pattern().is_match("1234567890"));
+        assert!(nip_pattern().is_match("123-456-78-90"));
+        assert!(nip_pattern().is_match("123 456 78 90"));
+        assert!(!nip_pattern().is_match("12345")); // Za krótki
     }
 
     #[test]
     fn test_pesel_detection() {
-        assert!(PESEL_PATTERN.is_match("12345678901"));
-        assert!(!PESEL_PATTERN.is_match("1234567890")); // Za krótki (10 cyfr)
+        assert!(pesel_pattern().is_match("12345678901"));
+        assert!(!pesel_pattern().is_match("1234567890")); // Za krótki (10 cyfr)
     }
 
     #[test]
     fn test_email_detection() {
-        assert!(EMAIL_PATTERN.is_match("jan.kowalski@example.com"));
-        assert!(EMAIL_PATTERN.is_match("test@test.pl"));
-        assert!(!EMAIL_PATTERN.is_match("invalid@")); // Nieprawidłowy
+        assert!(email_pattern().is_match("jan.kowalski@example.com"));
+        assert!(email_pattern().is_match("test@test.pl"));
+        assert!(!email_pattern().is_match("invalid@")); // Nieprawidłowy
     }
 
     #[test]
     fn test_phone_detection() {
-        assert!(PHONE_PATTERN.is_match("+48 123 456 789"));
-        assert!(PHONE_PATTERN.is_match("123-456-789"));
-        assert!(PHONE_PATTERN.is_match("123 456 789"));
+        assert!(phone_pattern().is_match("+48 123 456 789"));
+        assert!(phone_pattern().is_match("123-456-789"));
+        assert!(phone_pattern().is_match("123 456 789"));
     }
 
     #[test]

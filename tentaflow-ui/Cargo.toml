@@ -12,13 +12,9 @@ egui_extras = { version = "0.30", features = ["image"] }
 
 # Serialization (do komunikacji z Core)
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
 # Async (komunikacja z Core w background)
 tokio = { version = "1.35", features = ["sync", "rt"] }
-
-# Logging
-tracing = "0.1"
 
 # Utils
 chrono = { version = "0.4", features = ["serde"] }

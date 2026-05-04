@@ -20,7 +20,7 @@ inference-sherpa = ["dep:sherpa-rs"]
 # na desktop macOS i iOS. Stary `inference-mlx` (oparty o mlx-rs / mlx-models)
 # zostal usuniety bo Rust port ma bug w 4-bit forward pass — Bielik / Qwen
 # generowaly losowe tokeny.
-inference-mlx = ["dep:tokenizers"]
+inference-mlx = []
 # MLX Whisper przez Swift bridge — laduje libMLXBridge.dylib runtime'em (dlopen)
 # i wola `MLXWhisper_*` z naszego portu whisper.py do mlx-swift. Aktywne tylko
 # na macOS / iOS gdzie dylib istnieje.
@@ -33,7 +33,6 @@ inference-mlx-whisper = ["dep:libloading"]
 inference-mlx-kokoro = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
-metrics-prometheus = ["dep:prometheus"]
 rdma-probe = []
 # Jedna flaga GPU per backend — wlacza akceleracje dla LLM (llama.cpp) i STT
 # (whisper). Duplicate ggml_* symbols rozwiazane przez
@@ -104,8 +103,6 @@ jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
-chacha20poly1305 = "0.10.1"
-curve25519-dalek = "4.1.3"
 
 # WebSocket
 tokio-tungstenite = "0.29.0"
@@ -126,14 +123,11 @@ thiserror = "2.0.18"
 # ~10-30 ms/twarz na M1; akceptowalnie szybko, jednolicie cross-platform.
 tract-onnx = { version = "0.21", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-ndarray = "0.16"
 
 # Embedowanie kontekstu kontenerow w binarce (deploy::bundle)
 flate2 = "1.1.9"
 tar = "0.4.45"
 tempfile = "3.27.0"
-# Parsowanie compose_yaml z wizarda przy deploy bundled containers
-serde_yaml = "0.9.33"
 
 # Synchronizacja
 parking_lot = "0.12.5"
@@ -144,7 +138,6 @@ rustc-hash = "2"
 
 # Utils
 uuid = { version = "1.23.1", features = ["v4"] }
-lazy_static = "1.5.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 rand = "0.10.1"
 rand_core = "0.10"
@@ -163,10 +156,6 @@ bollard = { version = "0.20.2", optional = true }
 llama-cpp-2 = { version = "0.1.143", features = ["sampler"], optional = true }
 encoding_rs = { version = "0.8.35", optional = true }
 
-# Inference — MLX (optional, macOS only). Tokenizery uzywane przez wykrywanie
-# chat_template w mlx_swift_bridge; samo MLX inferencje robi Swift libMLXBridge.dylib.
-tokenizers = { version = "0.22.2", optional = true }
-
 # STT — Whisper (optional)
 whisper-rs = { version = "0.16.0", optional = true }
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
@@ -183,7 +172,6 @@ tentaflow-voice = { path = "../tentaflow-voice", optional = true }
 # MIME detection jest w build.rs
 
 # Mesh
-mdns-sd = "0.19.0"
 hostname = "0.4.2"
 sysinfo = "0.38.4"
 num_cpus = "1"
@@ -206,10 +194,7 @@ dirs = "6.0.0"
 subtle = "2"
 
 # Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
-netdev = "0.31"
-
-# Metrics (optional)
-prometheus = { version = "0.14.0", optional = true }
+netdev = "0.42"
 
 # WASM runtime — wasmtime na Desktop/Router, wasmi na Mobile (iOS/Android)
 # Target-specific dependencies ponizej
@@ -228,7 +213,6 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-core-foundation-sys = "0.8"
 # Parser plist do wynikow `powermetrics -f plist` (samplery cpu_power / gpu_power)
 plist = "1.7"
 
@@ -252,7 +236,6 @@ rcgen = "0.14.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1.2+spec-1.1.0"
-thiserror = "1.0"
 sha2 = "0.10"
 hex = "0.4"
 walkdir = "2"
@@ -261,7 +244,6 @@ walkdir = "2"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 wasmtime = "43.0.1"
 tempfile = "3"
-filetime = "0.2"
 criterion = { version = "0.7", features = ["html_reports"] }
 wiremock = "0.6"
 
