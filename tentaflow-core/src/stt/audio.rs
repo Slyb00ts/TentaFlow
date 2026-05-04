@@ -7,7 +7,6 @@
 use std::io::Cursor;
 
 use anyhow::{bail, Context, Result};
-use hound::WavReader;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -37,8 +36,9 @@ pub fn decode_to_pcm_f32(data: &[u8]) -> Result<Vec<f32>> {
     let format = detect_format(data);
 
     match format {
-        AudioFormat::Wav => decode_wav(data),
-        AudioFormat::Mp3 | AudioFormat::Ogg => decode_symphonia(data, &format),
+        AudioFormat::Wav | AudioFormat::Mp3 | AudioFormat::Ogg => {
+            decode_symphonia(data, &format)
+        }
         AudioFormat::RawPcm16 => decode_raw_pcm16(data),
     }
 }
@@ -71,52 +71,14 @@ fn detect_format(data: &[u8]) -> AudioFormat {
     AudioFormat::RawPcm16
 }
 
-/// Dekoduje WAV przez hound
-fn decode_wav(data: &[u8]) -> Result<Vec<f32>> {
-    let reader = WavReader::new(Cursor::new(data)).context("Nie udalo sie otworzyc WAV")?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let sample_rate = spec.sample_rate;
-
-    let samples_f32: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            reader
-                .into_samples::<i32>()
-                .map(|s| {
-                    let s = s.unwrap_or(0);
-                    match bits {
-                        16 => s as f32 / 32768.0,
-                        24 => s as f32 / 8_388_608.0,
-                        32 => s as f32 / 2_147_483_648.0,
-                        _ => s as f32 / (1u32 << (bits - 1)) as f32,
-                    }
-                })
-                .collect()
-        }
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect(),
-    };
-
-    let mono = to_mono(&samples_f32, channels);
-    let resampled = if sample_rate != TARGET_SAMPLE_RATE {
-        resample_linear(&mono, sample_rate, TARGET_SAMPLE_RATE)
-    } else {
-        mono
-    };
-
-    Ok(resampled)
-}
-
-/// Dekoduje MP3/OGG przez symphonia
+/// Dekoduje WAV/MP3/OGG przez symphonia
 fn decode_symphonia(data: &[u8], format: &AudioFormat) -> Result<Vec<f32>> {
     let cursor = Cursor::new(data.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
     let mut hint = Hint::new();
     match format {
+        AudioFormat::Wav => hint.with_extension("wav"),
         AudioFormat::Mp3 => hint.with_extension("mp3"),
         AudioFormat::Ogg => hint.with_extension("ogg"),
         _ => &mut hint,

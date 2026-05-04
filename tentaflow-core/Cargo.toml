@@ -161,8 +161,7 @@ whisper-rs = { version = "0.16.0", optional = true }
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
 libloading = { version = "0.8", optional = true }
 sherpa-rs = { version = "0.6.8", optional = true }
-hound = "3.5.1"
-symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
 
 # Speaker diarization — pure Rust forward pass przez tentaflow-voice
 # Cross-platform (Linux/macOS/Windows/iOS/Android), bez ort/onnxruntime ABI hell
