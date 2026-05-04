@@ -44,7 +44,13 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
-    let (resp_body, is_error) = dispatch::dispatch(&body, &ctx);
+    // dispatch jest async — kazdy test buduje wlasny tokio runtime, zeby
+    // zachowac sync `#[test]` API w tych testach pipeline.
+    let (resp_body, is_error) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(dispatch::dispatch(&body, &ctx));
 
     let resp_body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp_body)
         .unwrap()

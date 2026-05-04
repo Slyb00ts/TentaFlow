@@ -5,7 +5,6 @@
 use eframe::egui;
 use egui::{Color32, RichText, Rounding, Stroke};
 use crate::state::{SharedAppState, ChatRole};
-use crate::widgets;
 
 pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
     // ── Right sidebar: chat settings ──

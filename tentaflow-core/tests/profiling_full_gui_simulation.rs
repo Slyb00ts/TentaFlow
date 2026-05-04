@@ -19,17 +19,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tentaflow_core::profiling::{
-    CollectorRegistry, MultiSourceSession, ParserRegistry, ProfileStorageV2,
+    CollectorRegistry, MultiSourceSession, ParserRegistry, ProfileStorage,
 };
 use tentaflow_protocol::profiling::{
-    GpuTargets, ProfileReportEnvelope, ProfileScope, ProfileSourceFlags, ProfileTarget,
+    GpuTargets, ProfileReportV2, ProfileScope, ProfileSourceFlags, ProfileTarget,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn full_gui_flow_10s_auto_stop() {
     let tmp = tempfile::tempdir().unwrap();
-    let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+    let storage = Arc::new(ProfileStorage::new(tmp.path()));
     let registry = Arc::new(CollectorRegistry::discover());
     let parsers = Arc::new(ParserRegistry::default_registry());
     let session = MultiSourceSession::new(storage.clone(), registry.clone());
@@ -140,7 +140,7 @@ async fn full_gui_flow_10s_auto_stop() {
     println!("  tmp tree:");
     ls_recursive(tmp.path(), 1);
 
-    // ProfileStorageV2::new() dokleja "profiling" jako subdir storage root.
+    // ProfileStorage::new() dokleja "profiling" jako subdir storage root.
     let session_dir = tmp
         .path()
         .join("profiling")
@@ -192,34 +192,26 @@ async fn full_gui_flow_10s_auto_stop() {
 
     // KROK 6: read_report zwraca prawidlowy envelope.
     println!("\n=== KROK 6: storage.read_report zwraca envelope ===");
-    let envelope = storage
+    let report = storage
         .read_report(&node_id, &session_id)
         .await
         .expect("read_report failed");
-    match envelope {
-        ProfileReportEnvelope::V2(report) => {
-            println!("  envelope: V2");
-            println!("  session_id: {}", report.session_id);
-            println!(
-                "  duration_ns: {} ({:.2}s)",
-                report.duration_ns,
-                report.duration_ns as f64 / 1e9
-            );
-            println!("  collectors: {}", report.collectors.len());
-            println!("  events: {}", report.events.len());
-            assert_eq!(report.session_id, session_id);
-            assert!(
-                report.duration_ns >= 8_000_000_000 && report.duration_ns <= 12_000_000_000,
-                "BUG: duration_ns={} (expected ~10s, range 8-12s)",
-                report.duration_ns
-            );
-            assert!(!report.collectors.is_empty(), "BUG: zero collectors!");
-            assert!(!report.events.is_empty(), "BUG: zero events!");
-        }
-        ProfileReportEnvelope::V1Legacy(_) => {
-            panic!("BUG: spodziewany envelope V2, dostalem V1Legacy");
-        }
-    }
+    println!("  session_id: {}", report.session_id);
+    println!(
+        "  duration_ns: {} ({:.2}s)",
+        report.duration_ns,
+        report.duration_ns as f64 / 1e9
+    );
+    println!("  collectors: {}", report.collectors.len());
+    println!("  events: {}", report.events.len());
+    assert_eq!(report.session_id, session_id);
+    assert!(
+        report.duration_ns >= 8_000_000_000 && report.duration_ns <= 12_000_000_000,
+        "BUG: duration_ns={} (expected ~10s, range 8-12s)",
+        report.duration_ns
+    );
+    assert!(!report.collectors.is_empty(), "BUG: zero collectors!");
+    assert!(!report.events.is_empty(), "BUG: zero events!");
 
     println!("\n=== FULL GUI FLOW: ALL 6 STEPS PASSED ===");
 }

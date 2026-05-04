@@ -359,7 +359,7 @@ fn pii_tab(ui: &mut egui::Ui, state: &SharedAppState) {
                         });
                         row.col(|ui| {
                             ui.horizontal(|ui| {
-                                ui.small_button("\u{270F}");
+                                let _ = ui.small_button("\u{270F}");
                                 if ui.small_button("\u{2716}").clicked() {
                                     state.read().unwrap_or_else(|e| e.into_inner()).send_command(UiCommand::DeletePiiRule(rule.id));
                                 }
@@ -411,7 +411,7 @@ fn fast_path_tab(ui: &mut egui::Ui, state: &SharedAppState) {
                         });
                         row.col(|ui| {
                             ui.horizontal(|ui| {
-                                ui.small_button("\u{270F}");
+                                let _ = ui.small_button("\u{270F}");
                                 if ui.small_button("\u{2716}").clicked() {
                                     state.read().unwrap_or_else(|e| e.into_inner()).send_command(UiCommand::DeleteFastPath(pat.id));
                                 }
@@ -463,7 +463,7 @@ fn tts_cleaning_tab(ui: &mut egui::Ui, state: &SharedAppState) {
                         });
                         row.col(|ui| {
                             ui.horizontal(|ui| {
-                                ui.small_button("\u{270F}");
+                                let _ = ui.small_button("\u{270F}");
                                 if ui.small_button("\u{2716}").clicked() {
                                     state.read().unwrap_or_else(|e| e.into_inner()).send_command(UiCommand::DeleteTtsRule(rule.id));
                                 }

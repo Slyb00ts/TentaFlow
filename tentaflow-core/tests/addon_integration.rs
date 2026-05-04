@@ -12,9 +12,11 @@ use parking_lot::Mutex as ParkingMutex;
 use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::host_functions;
 use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
+use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
 use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::runtime::{compile_module, create_engine, create_linker, instantiate};
 use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db;
 
 // =============================================================================
@@ -22,11 +24,12 @@ use tentaflow_core::db;
 // =============================================================================
 
 /// Sciezka do skompilowanego WASM test-addon (wzgledna od katalogu projektu).
-/// Kompilacja: cd addons/test-addon && cargo build --target wasm32-unknown-unknown --release
-/// Uzywamy wasm32-unknown-unknown zamiast wasm32-wasip1 — addony nie potrzebuja WASI,
-/// wszystkie syscall-e sa przez host functions w namespace "tentaflow".
+/// Kompilacja: cd addons/test-addon && cargo build --target wasm32-wasip1 --release
+/// Target wasm32-wasip1 (rust stdlib wymaga WASI imports nawet jesli addon
+/// uzywa tylko host functions z namespace "tentaflow" — patrz TODO o WASI
+/// linker wiring w runtime_wasmtime.rs).
 const TEST_ADDON_WASM: &str =
-    "addons/test-addon/target/wasm32-unknown-unknown/release/tentaflow_addon_test.wasm";
+    "addons/test-addon/target/wasm32-wasip1/release/tentaflow_addon_test.wasm";
 
 /// Sciezka do katalogu test-addon (dla lifecycle::install)
 const TEST_ADDON_DIR: &str = "addons/test-addon";
@@ -61,7 +64,7 @@ fn load_test_wasm() -> Vec<u8> {
     std::fs::read(&wasm_path).unwrap_or_else(|e| {
         panic!(
             "Nie udalo sie wczytac WASM z {:?}: {}. Skompiluj addon: \
-             cd addons/test-addon && cargo build --target wasm32-unknown-unknown --release",
+             cd addons/test-addon && cargo build --target wasm32-wasip1 --release",
             wasm_path, e
         )
     })
@@ -91,8 +94,11 @@ fn create_addon_state_with_id(
         is_system_call: true,
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
+        settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),
         manifest: Arc::new(AddonManifest::default()),
         memory_limit: 256 * 1024 * 1024,
+        router: None,
+        oauth_refresh_guard: Arc::new(OAuthRefreshGuard::new()),
     }
 }
 
@@ -576,8 +582,11 @@ fn addon_lifecycle_full() {
         is_system_call: true,
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
+        settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),
         manifest: Arc::new(AddonManifest::default()),
         memory_limit: 256 * 1024 * 1024,
+        router: None,
+        oauth_refresh_guard: Arc::new(OAuthRefreshGuard::new()),
     };
 
     let mut store = create_test_store(&engine, state, None);
@@ -776,7 +785,7 @@ fn addon_manifest_parsing() {
 
 /// Sciezka do skompilowanego WASM malicious-addon
 const MALICIOUS_ADDON_WASM: &str =
-    "addons/malicious-addon/target/wasm32-unknown-unknown/release/tentaflow_addon_malicious.wasm";
+    "addons/malicious-addon/target/wasm32-wasip1/release/tentaflow_addon_malicious.wasm";
 
 /// Wczytuje bajty WASM malicious-addon z dysku
 fn load_malicious_wasm() -> Vec<u8> {
@@ -785,7 +794,7 @@ fn load_malicious_wasm() -> Vec<u8> {
     std::fs::read(&wasm_path).unwrap_or_else(|e| {
         panic!(
             "Nie udalo sie wczytac WASM z {:?}: {}. Skompiluj addon: \
-             cd addons/malicious-addon && cargo build --target wasm32-unknown-unknown --release",
+             cd addons/malicious-addon && cargo build --target wasm32-wasip1 --release",
             wasm_path, e
         )
     })
