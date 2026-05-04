@@ -132,8 +132,11 @@ pub async fn start_mesh_pipeline(
     // mdns_enabled=false na iOS bo Apple blokuje raw multicast bez entitlementa;
     // zamiast tego Swift NWBrowser karmi iroh przez FFI tentaflow_mobile_add_discovered_peer.
     // DHT wylaczony na mobile — mainline bootstrap spowalnia start, a LAN Bonjour
-    // + iroh relay wystarczaja do discovery peerow.
-    let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")));
+    // + iroh relay wystarczaja do discovery peerow. Na desktop respektujemy
+    // `mesh.dht_enabled` z config.toml (default true) — uzytkownicy z ISP
+    // blokujacym BitTorrent UDP moga wylaczyc i nie zalewac logow timeout-ami.
+    let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")))
+        && mesh_config.dht_enabled;
     let relay_url = load_relay_url(db_pool.as_ref(), Some(mesh_config));
 
     // Wyczysc stare wpisy `trusted_contact:*` z martwym relay URL zanim

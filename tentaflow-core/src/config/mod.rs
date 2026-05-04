@@ -167,6 +167,14 @@ pub struct MeshConfig {
     #[serde(default = "default_true")]
     pub mdns_enabled: bool,
 
+    /// Wlacz BitTorrent DHT (pkarr-mainline) discovery dla peerow w internecie
+    /// bez wspolnego relay. Defaultowo true. Wylacz (`false`) gdy ISP/router
+    /// blokuje BitTorrent UDP traffic — wtedy mainline floodowac bedzie logi
+    /// ostrzezeniami "os error 10060". mDNS (LAN) i N0 relays (WAN) dzialaja
+    /// dalej bez DHT.
+    #[serde(default = "default_true")]
+    pub dht_enabled: bool,
+
     /// Interwal heartbeat QUIC w milisekundach
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
@@ -898,6 +906,7 @@ impl Default for NodeConfig {
                 port: 8090,
                 static_peers: vec![],
                 mdns_enabled: true,
+                dht_enabled: true,
                 heartbeat_interval_ms: default_heartbeat_interval_ms(),
                 peer_timeout_ms: default_peer_timeout_ms(),
                 cluster_name: "tentaflow".to_string(),
