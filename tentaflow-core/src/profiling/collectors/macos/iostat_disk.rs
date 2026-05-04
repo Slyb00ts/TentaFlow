@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 // =============================================================================
 // File: collectors/macos/iostat_disk.rs — macOS disk throughput collector
 // backed by `iostat -d -w 1 -K`. macOS iostat reports a unified KB/s plus

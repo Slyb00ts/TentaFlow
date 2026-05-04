@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -27,6 +28,7 @@ use tentaflow_protocol::profiling::{
     ClockSamples, ElevationRequirement, EventCategory, EventPayload, TimelineEvent,
 };
 
+use crate::profiling::collectors::elevation::ElevationKind;
 use crate::profiling::collectors::{
     CollectorCapability, CollectorError, CollectorParser, FrameInterner,
     NameInterner, PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector,

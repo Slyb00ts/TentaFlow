@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 // =============================================================================
 // File: collectors/macos/powermetrics_power.rs — macOS CPU/DRAM/ANE/SoC power
 // collector backed by `sudo powermetrics --samplers cpu_power -i 500 -n 0

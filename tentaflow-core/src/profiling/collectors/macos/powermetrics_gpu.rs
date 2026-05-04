@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 // =============================================================================
 // File: collectors/macos/powermetrics_gpu.rs — Apple Silicon GPU collector
 // backed by `sudo powermetrics --samplers gpu_power -i 500 -n 0 --format
