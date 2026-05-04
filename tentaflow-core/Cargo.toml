@@ -42,7 +42,13 @@ rdma-probe = []
 # bez niego linker pada na "could not find native static library cublas_static".
 gpu-cuda = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/cuda", "llama-cpp-2/dynamic-link", "whisper-rs/cuda"]
 gpu-vulkan = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/vulkan", "whisper-rs/vulkan"]
-gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/hipblas"]
+# whisper-rs-sys 0.15.0 ma hardcoded panic na Windows + hipblas (echo bug-a
+# z czasow ROCm 5.7, naprawione upstream w whisper.cpp ale crate sie nie
+# zaktualizowal). Whisper na Vulkanie ma porownywalna wydajnosc do hipblas
+# (mala roznica, model jest maly), wiec uzywamy Vulkan dla whisper nawet pod
+# flaga gpu-rocm. Vulkan SDK jest wymagane (na Windows env var VULKAN_SDK,
+# instalator setup.ps1 -Vulkan to obsluguje).
+gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/vulkan"]
 gpu-metal = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/metal", "whisper-rs/metal"]
 
 [dependencies]
@@ -217,6 +223,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Performance",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

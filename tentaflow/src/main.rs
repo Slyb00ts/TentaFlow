@@ -111,6 +111,12 @@ async fn run_server(args: Args) -> Result<()> {
     // Inicjalizacja loggingu
     setup_logging(args.verbose)?;
 
+    // Windows Firewall self-check — przy braku regul Allow Inbound dla
+    // 8090 TCP+UDP odpala UAC z PowerShell New-NetFirewallRule. Blad nie
+    // przerywa startu — server moze dzialac lokalnie nawet bez regul.
+    #[cfg(target_os = "windows")]
+    tentaflow_core::firewall_check::ensure_firewall_rules();
+
     // Bootstrap Swift MLX bridge (macOS) — musi sie wykonac PRZED router init,
     // zeby InferenceManager::new() zauwazyl ze MlxSwiftEngine jest dostepny i
     // dal mu priorytet nad mlx-models. Bledy nie blokuja startu — fallback na
@@ -678,7 +684,8 @@ fn setup_logging(verbose: bool) -> Result<()> {
         noq_proto=error,\
         noq_udp=error,\
         wgpu_hal=error,\
-        wgpu_core=error";
+        wgpu_core=error,\
+        mainline=error";
     // RUST_LOG MOZE byc ustawione w srodowisku — wtedy uzytkownik dostaje
     // kontrole nad poziomem, ale BASE_FILTER dokladamy ZAWSZE zeby iroh/noq
     // spam nie wrocil tylnymi drzwiami. Directives sa wstawiane PRZED

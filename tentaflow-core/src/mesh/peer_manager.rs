@@ -894,6 +894,7 @@ mod tests {
             port: 8090,
             static_peers: vec![],
             mdns_enabled: false,
+            dht_enabled: false,
             heartbeat_interval_ms: 500,
             peer_timeout_ms: 3000,
             cluster_name: "test".to_string(),

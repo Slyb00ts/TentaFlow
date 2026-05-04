@@ -38,11 +38,24 @@ fn main() {
 //    user moze potrzebowac obu jednoczesnie (LLM + STT lokalnie).
 fn set_linux_rpath() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "linux" {
-        return;
+    match target_os.as_str() {
+        "linux" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+            println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
+        }
+        "windows" => {
+            // MSVC odpowiednik --allow-multiple-definition. whisper-rs-sys i
+            // llama-cpp-sys-2 obie linkuja wlasna kopie ggml-quants.c, na
+            // Windowsie link.exe pada z LNK2005 dla kazdego quantize_row_*.
+            // /FORCE:MULTIPLE kaze wybrac pierwsza definicje i ignorowac
+            // kolejne (identyczne bo to ten sam ggml).
+            println!("cargo:rustc-link-arg=/FORCE:MULTIPLE");
+            // /NODEFAULTLIB:library — niepotrzebne, ale bez tego LNK4098
+            // wala na konsoli o konflikcie msvcrt z innymi libs (warning,
+            // nie blocker, zostaje).
+        }
+        _ => {}
     }
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-    println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
 }
 
 // llama-cpp-sys-2 build.rs:124 ma glob "*.so" ktory matchuje tylko symlinki bez
