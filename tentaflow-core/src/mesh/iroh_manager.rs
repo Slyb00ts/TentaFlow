@@ -2145,7 +2145,7 @@ mod tie_break_tests {
     use super::*;
     use crate::crypto::SettingsCipher;
     use crate::mesh::security::MeshSecurity;
-    use iroh::{endpoint::Connection, SecretKey};
+    use iroh::endpoint::Connection;
     use std::sync::Mutex;
     use std::time::Duration;
 

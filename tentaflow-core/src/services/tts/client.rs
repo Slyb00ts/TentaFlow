@@ -247,8 +247,6 @@ impl TTSClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_tts_client_creation() {
         // Test wymaga TTS API key w zmiennej srodowiskowej

@@ -9,8 +9,12 @@
 //       force-remove stale containers przy starcie.
 // =============================================================================
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "docker")]
+use anyhow::Context;
+#[cfg(feature = "docker")]
 use std::collections::HashMap;
+#[cfg(feature = "docker")]
 use tracing::{info, warn};
 
 use super::port_pool::AllocatedPorts;
@@ -260,6 +264,7 @@ pub async fn cleanup_stale_containers() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
 pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
     vec![
         format!("MEETING_URL={}", req.meeting_url),

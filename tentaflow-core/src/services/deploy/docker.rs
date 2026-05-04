@@ -13,23 +13,32 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rusqlite::Transaction;
 
+#[cfg(feature = "docker")]
 use std::path::PathBuf;
 
 use super::{
-    build_new_service, category_tag, models_from_manifest, resolve_display_name,
-    smart_health_probe, transport_hint, DeployError, DeployResult, DeployStrategy,
-    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy, LogSink,
+    PreparedDeploy,
+};
+#[cfg(feature = "docker")]
+use super::{
+    category_tag, models_from_manifest, resolve_display_name, smart_health_probe, RuntimeHandle,
+    SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
-use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
+#[cfg(feature = "docker")]
+use crate::services_repo::services::DeployMethod;
+use crate::services_repo::services::{self as services_repo, ServiceStatus};
 
 pub struct DockerDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     log_sink: Option<LogSink>,
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     container_id: std::sync::Mutex<Option<String>>,
 }
 
@@ -55,6 +64,7 @@ impl DockerDeploy {
     /// field — `sidecar-quic` or `direct-http`. The legacy `transport_explicit`
     /// hint in `user_config` is honoured as an override only when set, which
     /// keeps existing wizard requests working until the GUI stops sending it.
+    #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     fn pick_transport(&self) -> Transport {
         if let Some(hint) = transport_hint(&self.user_config) {
             return match hint.as_str() {
