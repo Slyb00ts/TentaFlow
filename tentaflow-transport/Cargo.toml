@@ -12,13 +12,13 @@ path = "src/lib.rs"
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 
 # Transport
-iroh = { version = "=0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
+iroh = { version = "=0.98.2", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 
 # Serialization
-rkyv = { version = "0.8.12", features = ["std", "bytecheck", "unaligned"] }
+rkyv = { version = "0.8.16", features = ["std", "bytecheck", "unaligned"] }
 
 # Async runtime
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
+tokio = { version = "1.52.2", features = ["rt", "sync", "time", "macros", "io-util"] }
 async-trait = "0.1"
 
 # Utils
@@ -30,7 +30,7 @@ hex = "0.4"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 anyhow = "1"
 
 [[bench]]
