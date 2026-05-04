@@ -242,25 +242,6 @@ mod macos_rdma {
     }
 
     // =========================================================================
-    // Wrapper na raw pointer — bezpieczne przesylanie miedzy watkami
-    // =========================================================================
-
-    /// Opakowanie na `*mut c_void` jako usize — umozliwia przesylanie miedzy watkami.
-    /// SAFETY: Swift side gwarantuje thread-safety przez DispatchQueue.
-    #[derive(Clone, Copy)]
-    struct SendPtr(usize);
-
-    impl SendPtr {
-        fn from_raw(ptr: *mut c_void) -> Self {
-            Self(ptr as usize)
-        }
-
-        fn as_ptr(self) -> *mut c_void {
-            self.0 as *mut c_void
-        }
-    }
-
-    // =========================================================================
     // Publiczne API macOS
     // =========================================================================
 

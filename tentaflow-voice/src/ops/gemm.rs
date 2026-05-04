@@ -35,6 +35,10 @@ fn has_avx512f() -> bool {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)] // Cross-platform stub: callers gate AVX-512 paths
+                    // behind this on x86_64; on arm64/etc the result is
+                    // always false and cargo would otherwise flag the
+                    // gating call sites as dead.
 fn has_avx512f() -> bool {
     false
 }
@@ -745,6 +749,8 @@ pub fn gemm(
     // Prog poniżej ktorego nie uzywamy rayona — overhead spawn > computation
     const RAYON_THRESHOLD: usize = 32;
     // Rozmiar bloku wierszy dla register blocking 4xN (AVX-512)
+    // Dead on non-x86_64 (AVX-512 path is cfg-gated to `false` upstream).
+    #[allow(dead_code)]
     const MR: usize = 4;
 
     // Fast path: M>=4, AVX-512F, uzywamy 4-row microkernela.
@@ -910,6 +916,8 @@ pub fn gemm_accumulate(
     debug_assert_eq!(c.len(), m * n);
 
     const RAYON_THRESHOLD: usize = 32;
+    // Dead on non-x86_64 (AVX-512 path is cfg-gated to `false` upstream).
+    #[allow(dead_code)]
     const MR: usize = 4;
 
     #[cfg(target_arch = "x86_64")]
@@ -1048,6 +1056,8 @@ pub fn gemm_accumulate_strided(
     debug_assert!(c_row_stride >= n);
     debug_assert_eq!(a.len(), m * k);
 
+    // Dead on non-x86_64 (AVX-512 path is cfg-gated to `false` upstream).
+    #[allow(dead_code)]
     const MR: usize = 4;
 
     // Fast path: 4-row AVX-512 strided kernel. Single-threaded bo zwykle m

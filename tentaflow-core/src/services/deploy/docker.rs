@@ -13,14 +13,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rusqlite::Transaction;
 
+use std::path::PathBuf;
+
 use super::{
-    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy,
-    LogSink, PreparedDeploy,
+    build_new_service, category_tag, models_from_manifest, resolve_display_name,
+    smart_health_probe, transport_hint, DeployError, DeployResult, DeployStrategy,
+    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
-use crate::services_repo::services::{self as services_repo, ServiceStatus};
+use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
 pub struct DockerDeploy {
     manifest: ServiceManifest,
