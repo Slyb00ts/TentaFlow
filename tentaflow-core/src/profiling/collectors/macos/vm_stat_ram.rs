@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 // =============================================================================
 // File: collectors/macos/vm_stat_ram.rs — macOS RAM collector backed by
 // `vm_stat 0.5`. Spawns the binary, parses the multi-line frames it emits,

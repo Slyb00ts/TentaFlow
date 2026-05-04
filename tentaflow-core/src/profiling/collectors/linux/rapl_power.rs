@@ -222,6 +222,7 @@ struct RaplDomain {
     /// Raw powercap name (e.g. "package-0", "core", "dram").
     name: String,
     /// Mapped enum we report on parse.
+    #[allow(dead_code)]
     domain: PowerDomain,
     /// Path to the energy_uj counter.
     energy_path: PathBuf,
