@@ -151,14 +151,6 @@ impl MeetingManager {
         })
     }
 
-    /// Service name carrying the session_id for
-    /// unikalności. Substring "meeting-bot" wymuszany przez spawn_connection_tasks
-    /// żeby trafić do dedykowanego `meeting_bot_connection_loop` (reverse listener
-    /// + transcript subscriber).
-    fn service_name(session_id: i64) -> String {
-        format!("meeting-bot-{}", session_id)
-    }
-
     /// Startuje nową sesję Meeting Bot. Flow:
     /// 1. INSERT meeting_sessions (status=idle)
     /// 2. Alokuj trójkę portów (quic/vnc/novnc)

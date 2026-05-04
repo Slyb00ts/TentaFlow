@@ -38,6 +38,12 @@ type FreeBufferFn = unsafe extern "C" fn(ptr: *mut f32);
 struct Bridge {
     _lib: &'static Library,
     load_fn: LoadModelFn,
+    /// Held for future Drop impl — Kokoro bridge owns model resources
+    /// across the FFI boundary; releasing them on engine drop avoids
+    /// leaking GPU memory between manager unregister cycles. Currently
+    /// the bridge is `unsafe impl Sync` and lives for the process
+    /// lifetime, so the call site is intentionally absent.
+    #[allow(dead_code)]
     unload_fn: UnloadModelFn,
     synthesize_fn: SynthesizeFn,
     free_buffer_fn: FreeBufferFn,

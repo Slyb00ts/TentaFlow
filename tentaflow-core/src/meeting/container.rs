@@ -9,7 +9,9 @@
 //       force-remove stale containers przy starcie.
 // =============================================================================
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use tracing::{info, warn};
 
 use super::port_pool::AllocatedPorts;
 

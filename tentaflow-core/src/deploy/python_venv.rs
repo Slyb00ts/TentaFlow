@@ -1747,6 +1747,9 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
 }
 
 /// Podstawia `${VAR}` i `${VAR:-default}` w stringu na wartosci z env+bundle_dir.
+/// Test-only convenience wrapper — production code uses
+/// `substitute_vars_full` z explicit `venv_dir`.
+#[cfg(test)]
 fn substitute_vars(s: &str, env: &HashMap<String, String>, bundle_dir: &Path) -> String {
     substitute_vars_full(s, env, bundle_dir, Path::new(""))
 }
