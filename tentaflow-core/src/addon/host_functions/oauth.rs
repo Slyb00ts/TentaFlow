@@ -459,6 +459,8 @@ mod tests {
             oauth_refresh_guard: Arc::new(
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
             ),
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             store_limits: wasmi::StoreLimitsBuilder::new()
                 .memory_size(64 * 1024 * 1024)
