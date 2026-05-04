@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock as PlRwLock};
 use runtime::{WasmEngine, WasmInstance, WasmModule, WasmStore};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -276,6 +276,14 @@ pub struct AddonState {
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
+    /// WASI preview1 context for wasmtime (Desktop/Router). Addons compiled
+    /// to `wasm32-wasip1` import `wasi_snapshot_preview1::{environ_get,
+    /// fd_write, proc_exit, random_get}` through Rust stdlib (panic handler,
+    /// allocator init, getrandom). Without a wired WASI linker addons fail
+    /// to instantiate; `wasmtime_wasi::p1::add_to_linker_sync` in
+    /// `runtime_wasmtime::create_linker` provides the implementations.
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    pub wasi: wasmtime_wasi::p1::WasiP1Ctx,
 }
 
 // =============================================================================
@@ -298,19 +306,26 @@ pub struct AddonInstance {
 /// Centralny manager addonow — zarzadza cyklem zycia, instancjami, uprawnieniami i eventami
 pub struct AddonManager {
     db: DbPool,
-    instances: Arc<RwLock<HashMap<String, Vec<AddonInstance>>>>,
+    /// Wraps `HashMap<String, Vec<AddonInstance>>` in a `Mutex` (not `RwLock`)
+    /// because `AddonInstance.store` contains `WasiP1Ctx` whose
+    /// `Box<dyn StdinStream>` is `Send` but not `Sync`. `Mutex<T>: Sync`
+    /// requires only `T: Send`, while `RwLock<T>: Sync` would additionally
+    /// require `T: Sync`. The map is small and access patterns are mostly
+    /// brief writes (insert/remove), so serializing reads has negligible
+    /// cost compared to the WASM execution time.
+    instances: Arc<Mutex<HashMap<String, Vec<AddonInstance>>>>,
     event_bus: Arc<EventBus>,
     engine: WasmEngine,
     permission_checker: Arc<PermissionChecker>,
     settings_cipher: Arc<crate::crypto::SettingsCipher>,
     /// Skompilowane moduly WASM — cache po addon_id
-    compiled_modules: Arc<RwLock<HashMap<String, WasmModule>>>,
+    compiled_modules: Arc<PlRwLock<HashMap<String, WasmModule>>>,
     /// Per-account mutex map used to serialize OAuth refresh_token calls.
     oauth_refresh_guard: Arc<oauth_refresh_guard::OAuthRefreshGuard>,
     /// Zarejestrowane narzedzia ze wszystkich addonow
-    registered_tools: Arc<RwLock<Vec<ToolDefinition>>>,
+    registered_tools: Arc<PlRwLock<Vec<ToolDefinition>>>,
     /// Router do routowania requestow LLM z addonow
-    router: Arc<RwLock<Option<Arc<crate::routing::router::Router>>>>,
+    router: Arc<PlRwLock<Option<Arc<crate::routing::router::Router>>>>,
 }
 
 impl AddonManager {
@@ -331,15 +346,15 @@ impl AddonManager {
 
         Ok(Self {
             db,
-            instances: Arc::new(RwLock::new(HashMap::new())),
+            instances: Arc::new(Mutex::new(HashMap::new())),
             event_bus,
             engine,
             permission_checker,
             settings_cipher,
-            compiled_modules: Arc::new(RwLock::new(HashMap::new())),
+            compiled_modules: Arc::new(PlRwLock::new(HashMap::new())),
             oauth_refresh_guard: Arc::new(oauth_refresh_guard::OAuthRefreshGuard::new()),
-            registered_tools: Arc::new(RwLock::new(Vec::new())),
-            router: Arc::new(RwLock::new(None)),
+            registered_tools: Arc::new(PlRwLock::new(Vec::new())),
+            router: Arc::new(PlRwLock::new(None)),
         })
     }
 
@@ -378,7 +393,7 @@ impl AddonManager {
 
         // Zatrzymaj wszystkie instancje tego addonu
         let instance_ids: Vec<String> = {
-            let instances = self.instances.read();
+            let instances = self.instances.lock();
             instances
                 .get(addon_id)
                 .map(|v| v.iter().map(|i| i.instance_id.clone()).collect())
@@ -452,6 +467,8 @@ impl AddonManager {
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.read().clone(),
             oauth_refresh_guard: self.oauth_refresh_guard.clone(),
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             store_limits: wasmi::StoreLimitsBuilder::new()
                 .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
@@ -505,7 +522,7 @@ impl AddonManager {
 
         // Dodaj do mapy instancji
         self.instances
-            .write()
+            .lock()
             .entry(addon_id.to_string())
             .or_default()
             .push(addon_instance);
@@ -538,7 +555,7 @@ impl AddonManager {
     pub fn stop_addon(&self, instance_id: &str) -> Result<()> {
         info!("Zatrzymywanie instancji: {}", instance_id);
 
-        let mut instances = self.instances.write();
+        let mut instances = self.instances.lock();
 
         // Znajdz addon_id i indeks instancji
         let mut found = None;
@@ -620,7 +637,7 @@ impl AddonManager {
     }
 
     /// Wywoluje narzedzie addonu (dla LLM tool calling).
-    /// K4: Minimalizacja czasu trzymania write lock — instancja jest wyjmowana z mapy
+    /// K4: Minimalizacja czasu trzymania lock — instancja jest wyjmowana z mapy
     /// pod lockiem (krotko), WASM jest wykonywany poza lockiem, potem wkladana z powrotem.
     pub fn call_tool(
         &self,
@@ -647,9 +664,9 @@ impl AddonManager {
             );
         }
 
-        // K4: Wez instancje z mapy pod write lockiem (krotko)
+        // K4: Wez instancje z mapy pod lockiem (krotko)
         let mut addon_instance = {
-            let mut instances = self.instances.write();
+            let mut instances = self.instances.lock();
             let addon_instances = instances.get_mut(addon_id).ok_or_else(|| {
                 anyhow::anyhow!("Addon '{}' nie ma uruchomionych instancji", addon_id)
             })?;
@@ -822,7 +839,7 @@ impl AddonManager {
 
         // K4: Wloz instancje z powrotem do mapy
         {
-            let mut instances = self.instances.write();
+            let mut instances = self.instances.lock();
             instances
                 .entry(addon_id.to_string())
                 .or_default()
@@ -836,7 +853,7 @@ impl AddonManager {
     }
 
     /// Rozsyla event do zasubskrybowanych addonow.
-    /// K5: Minimalizacja write lock contention — zbierz instancje pod lockiem,
+    /// K5: Minimalizacja lock contention — zbierz instancje pod lockiem,
     /// wykonaj WASM poza lockiem, wloz z powrotem.
     pub fn handle_event(&self, event: Event) -> Result<()> {
         let subscribers = self.event_bus.get_subscribers(&event.event_type);
@@ -852,7 +869,7 @@ impl AddonManager {
         // K5: Zbierz instancje pod lockiem (krotko)
         let mut extracted: Vec<(String, usize, AddonInstance)> = Vec::new();
         {
-            let mut instances = self.instances.write();
+            let mut instances = self.instances.lock();
             for subscriber in &subscribers {
                 if let Some(addon_instances) = instances.get_mut(&subscriber.addon_id) {
                     if let Some(pos) = addon_instances
@@ -915,7 +932,7 @@ impl AddonManager {
 
         // K5: Wloz instancje z powrotem do mapy
         {
-            let mut instances = self.instances.write();
+            let mut instances = self.instances.lock();
             for (addon_id, _pos, inst) in extracted {
                 instances.entry(addon_id).or_default().push(inst);
             }
