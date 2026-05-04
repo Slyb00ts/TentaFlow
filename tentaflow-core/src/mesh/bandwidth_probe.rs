@@ -35,7 +35,6 @@ pub struct ProbeResult {
 struct StreamResult {
     bytes_sent: u64,
     elapsed: Duration,
-    latency_us: u64,
 }
 
 /// Uruchom serwer probing na podanym IP. Binduje port 0 (OS przydziela).
@@ -346,6 +345,5 @@ async fn send_data_stream(
     Ok(StreamResult {
         bytes_sent: total,
         elapsed,
-        latency_us: 0,
     })
 }

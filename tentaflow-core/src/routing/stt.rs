@@ -230,7 +230,8 @@ impl Router {
                 // so the resolver / SttRuntime contract is uniform across
                 // mesh reverse and HTTP. `route_audio_transcription` is
                 // still hit as fallback for DB-less / executor-not-ready.
-                let stt_dispatch = match self.executor.read().clone() {
+                let executor_snapshot = self.executor.read().clone();
+                let stt_dispatch = match executor_snapshot {
                     Some(executor) => {
                         use crate::services::runtime::executor::ExecutorError;
                         match executor.execute_stt(request.clone()).await {

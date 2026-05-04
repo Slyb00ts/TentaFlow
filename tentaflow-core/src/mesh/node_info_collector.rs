@@ -1386,14 +1386,6 @@ fn detect_rdma_available(name: &str) -> bool {
     }
 }
 
-/// Pobiera PIERWSZY adres IPv4 i maske interfejsu z sysinfo::Networks
-fn detect_ipv4_info(name: &str, nets: &Networks) -> (String, String) {
-    let all = detect_all_ipv4_info(name, nets);
-    all.into_iter()
-        .next()
-        .unwrap_or((String::new(), String::new()))
-}
-
 /// Pobiera WSZYSTKIE adresy IPv4 interfejsu (bridge moze miec wiele adresow)
 fn detect_all_ipv4_info(name: &str, nets: &Networks) -> Vec<(String, String)> {
     let mut result = Vec::new();

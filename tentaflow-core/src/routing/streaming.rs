@@ -15,7 +15,6 @@ use crate::routing::router::{RequestMetrics, Router};
 use std::pin::Pin;
 use tracing::{debug, warn};
 
-use futures::stream::StreamExt;
 use futures::Stream;
 
 /// Single PII streaming wrapper — uzywany przez wszystkie streaming

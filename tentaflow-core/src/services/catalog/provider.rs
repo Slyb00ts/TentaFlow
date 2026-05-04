@@ -381,6 +381,11 @@ fn build_flow_entries(
 /// signature. Listed explicitly so a `flow_node_templates` snapshot test
 /// can detect any seeded type that this function does not handle (drift
 /// would make the catalog advertise wrong modalities for new node kinds).
+///
+/// Used only by the `every_seeded_node_type_has_modality_decision` test
+/// (declarative drift guard). `infer_flow_modalities` itself reads node
+/// types directly via match arms.
+#[allow(dead_code)]
 pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "stt",
     "whisper",
@@ -404,6 +409,7 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
 /// Together with `MODALITY_CONTRIBUTING_NODE_TYPES` this list must cover
 /// every type seeded into `flow_node_templates`; the snapshot test
 /// `every_seeded_node_type_has_modality_decision` enforces it.
+#[allow(dead_code)]
 pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "trigger",
     "output",
