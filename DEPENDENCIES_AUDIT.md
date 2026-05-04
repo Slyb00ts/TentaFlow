@@ -332,18 +332,67 @@ duplicate `netdev` w `cargo tree --duplicates`.
 
 ### Niskie priorytety (audit wspomniał, nie zrobione)
 
-- `hound` removal w favor `symphonia::wav` — minimal overlap, 2-3h
-  refactor, low priority.
+- ✅ **`hound` removal** — usunięte (commit `02de50a`). `decode_wav`
+  scalone z `decode_symphonia` (feature `wav` dodane do symphonii).
+  13/13 audio tests pass, zero hound w `cargo tree`.
 - `tokenizers` (Faza 1 usunięte) — dep wraca gdy MLX bridge zacznie
   używać `tokenizers::Tokenizer` API zamiast file IO.
 
 ### Sumarycznie po cleanup
 
-- **75+ dead direct dependency entries** usunięte cross-workspace
+- **76+ dead direct dependency entries** usunięte cross-workspace
+  (75 z faz 0-4 + `hound`)
 - **1 cały crate** (`tentaflow-iroh-spike`) usunięty
-- **31 plików** zmienionych: -2297 / +246 linii (czysta redukcja)
 - **lazy_static** modernization (Rust 1.70+ idiomatic OnceLock)
 - **netdev** version unified (eliminacja jednego transitive duplicate)
 - **1 deferred refactor** dla `wasmtime-wasi` wiring (zapisany w kodzie
   + memory)
+
+---
+
+## 12. Follow-up po audit (2026-05-04)
+
+Dodatkowy cleanup w tej samej sesji, poza scope auditu:
+
+### Audio overlap (`hound` → `symphonia`) ✅
+
+Commit `02de50a`. `decode_wav` z `stt/audio.rs` scalone z `decode_symphonia`
+po dodaniu feature `wav` do symphonii. Eliminuje funkcjonalny overlap.
+
+### Warning cleanup ✅
+
+Commit `09ef3cb` — 0 warnings dla wszystkich feature combos w lib + tests
+(no-default+dashboard-api, full features, inference-llamacpp,
+inference-whisper+docker, dashboard-api+docker+sherpa):
+- Usunięte unused imports (`SecretKey`, `super::*`, `Style`,
+  `crate::widgets`, `Color32`)
+- Dead code removal (`CountSink` struct + impl, unused `version` param)
+- Feature-gating dla docker-only kodu (`services/deploy/docker.rs`,
+  `meeting/container.rs`) — modules kompilują się bez `docker` feature
+
+Commit `c0acd19` — `let _ = ui.small_button(...)` dla 5 przycisków
+ołówek/Test których klik jest celowo ignorowany w UI.
+
+### Naprawione broken integration tests ✅
+
+Commit `c0acd19`:
+- `tests/profiling_{phase1_audit,full_gui_simulation,real_session_e2e}` —
+  rename `ProfileStorageV2` → `ProfileStorage`, `ProfileReportEnvelope` →
+  `ProfileReportV2`, usunięte match na enum (envelope wycięte w
+  `3786d22`).
+- `tests/ws_binary_pipeline` — `dispatch::dispatch` async, `server_handle`
+  buduje per-call tokio runtime + `block_on`. **11/11 runtime pass.**
+- `tests/addon_integration` — 3 nowe pola w `AddonState` (`settings_cipher`,
+  `router`, `oauth_refresh_guard`); fix wasm target paths (kompilują się).
+  Runtime: 23/25 nadal blocked-by-deferred-WASI-wiring (`unknown import:
+  wasi_snapshot_preview1::random_get` — to dokładnie problem opisany
+  w TODO `runtime_wasmtime.rs:154`).
+
+### Dalej zostało
+
+- **Architektura:** wasmtime-wasi wiring (deferred), ed25519 crypto policy
+- **Pre-existing 9 baseline test fails** w `services::deploy::*` i
+  `services::handles_cache::*` (port leak + deploy fixtures) — niezwiązane
+  z cleanup, audit zostawia
+- **Process:** Faza 6 upstream tracking (ongoing)
 
