@@ -241,6 +241,12 @@ pub struct MeshPeerStore {
     /// id so TransportClosed can reference the same value as the matching
     /// DialOk.
     shadow_conn_seq: Arc<AtomicU64>,
+    /// Debug-only dedup for shadow drift logs: records the last (peer, reg_state)
+    /// we already logged, so a persistent divergence (e.g. during shutdown when
+    /// store.quic_connected is still true and the registry has gone Offline)
+    /// emits one entry, not thousands.
+    #[cfg(debug_assertions)]
+    shadow_drift_seen: Arc<DashMap<String, ConnectionStateTag>>,
 }
 
 impl MeshPeerStore {
@@ -255,6 +261,8 @@ impl MeshPeerStore {
             routes_dirty: Arc::new(AtomicBool::new(false)),
             peer_registry: None,
             shadow_conn_seq: Arc::new(AtomicU64::new(1)),
+            #[cfg(debug_assertions)]
+            shadow_drift_seen: Arc::new(DashMap::new()),
         }
     }
 
@@ -397,42 +405,58 @@ impl MeshPeerStore {
         };
         let store_connected = store.quic_connected;
         let reg_connected = matches!(detail.summary.conn_tag, ConnectionStateTag::Connected);
-        if store_connected != reg_connected
+        let drift_active = store_connected != reg_connected
             && !matches!(
                 detail.summary.conn_tag,
                 ConnectionStateTag::Degraded | ConnectionStateTag::Reconnecting
-            )
-        {
-            // store says the QUIC connection is up but the registry has fallen
-            // into Offline / Disconnected. Force a Discovered trigger so the
-            // registry leaves Offline and reconnect logic schedules a fresh
-            // dial — that path will populate Connected with real conn_id+path.
-            // Faking DialOk here with synthetic data would corrupt the
-            // registry's path tracking.
-            if store_connected
-                && matches!(
-                    detail.summary.conn_tag,
-                    ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
-                )
-            {
-                reg.ensure_present(id);
-                tracing::info!(
-                    target: "mesh::shadow",
-                    node_id = %node_id,
-                    site = %where_,
-                    reg_state = ?detail.summary.conn_tag,
-                    "peer_store ↔ peer_registry rozjazd: forced Discovered to nudge registry out of Offline",
-                );
-            } else {
-                tracing::warn!(
-                    target: "mesh::shadow",
-                    node_id = %node_id,
-                    site = %where_,
-                    store_connected,
-                    reg_state = ?detail.summary.conn_tag,
-                    "peer_store ↔ peer_registry rozjazd: connection flag",
-                );
+            );
+        if drift_active {
+            // Dedup: only log when the (peer, reg_state) pair flips into a new
+            // value. A peer stuck mid-shutdown re-enters this branch on every
+            // heartbeat broadcast; without this guard we would emit thousands of
+            // identical INFO/WARN lines.
+            let already_logged = self
+                .shadow_drift_seen
+                .get(node_id)
+                .map(|v| *v == detail.summary.conn_tag)
+                .unwrap_or(false);
+            if !already_logged {
+                self.shadow_drift_seen
+                    .insert(node_id.to_string(), detail.summary.conn_tag);
+                if store_connected
+                    && matches!(
+                        detail.summary.conn_tag,
+                        ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
+                    )
+                {
+                    // store says the QUIC connection is up but the registry has
+                    // fallen into Offline / Disconnected. Force a Discovered
+                    // trigger so the registry leaves Offline and reconnect logic
+                    // schedules a fresh dial — that path will populate Connected
+                    // with real conn_id+path. Faking DialOk here with synthetic
+                    // data would corrupt the registry's path tracking.
+                    reg.ensure_present(id);
+                    tracing::info!(
+                        target: "mesh::shadow",
+                        node_id = %node_id,
+                        site = %where_,
+                        reg_state = ?detail.summary.conn_tag,
+                        "peer_store ↔ peer_registry rozjazd: forced Discovered to nudge registry out of Offline",
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "mesh::shadow",
+                        node_id = %node_id,
+                        site = %where_,
+                        store_connected,
+                        reg_state = ?detail.summary.conn_tag,
+                        "peer_store ↔ peer_registry rozjazd: connection flag",
+                    );
+                }
             }
+        } else {
+            // Drift resolved — clear the dedup so a future divergence logs again.
+            self.shadow_drift_seen.remove(node_id);
         }
         if !store.hostname.is_empty()
             && !detail.summary.hostname.is_empty()
