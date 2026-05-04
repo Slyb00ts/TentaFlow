@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use tentaflow_core::profiling::ProfileStorageV2;
-use tentaflow_protocol::profiling::ProfileReportEnvelope;
+use tentaflow_core::profiling::ProfileStorage;
+use tentaflow_protocol::profiling::ProfileReportV2;
 
 const TENTAFLOW_HOME_HINT: &str = "TENTAFLOW_HOME_FOR_E2E";
 
@@ -34,7 +34,7 @@ fn home_for_e2e() -> Option<std::path::PathBuf> {
     None
 }
 
-fn find_first_session(storage: &ProfileStorageV2) -> Option<(String, String)> {
+fn find_first_session(storage: &ProfileStorage) -> Option<(String, String)> {
     let root = storage.root();
     if !root.is_dir() {
         return None;
@@ -68,7 +68,7 @@ async fn read_real_session_envelope() {
     };
     println!("home = {}", home.display());
 
-    let storage = ProfileStorageV2::new(&home);
+    let storage = ProfileStorage::new(&home);
     let Some((node_id, session_id)) = find_first_session(&storage) else {
         eprintln!("SKIP: brak zadnej sesji w {}", storage.root().display());
         return;
@@ -76,30 +76,20 @@ async fn read_real_session_envelope() {
     println!("node_id    = {}", node_id);
     println!("session_id = {}", session_id);
 
-    // Faktyczny test: storage.read_report -> envelope.
-    let envelope = storage
+    // Faktyczny test: storage.read_report -> ProfileReportV2.
+    let report = storage
         .read_report(&node_id, &session_id)
         .await
         .expect("read_report failed");
 
-    match envelope {
-        ProfileReportEnvelope::V2(report) => {
-            println!("envelope = V2");
-            println!("schema_version = {}", report.schema_version);
-            println!("session_id     = {}", report.session_id);
-            println!(
-                "node_id (krotki) = {}",
-                &report.node_id[..16.min(report.node_id.len())]
-            );
-            assert_eq!(report.schema_version, 2);
-            assert_eq!(report.session_id, session_id);
-        }
-        ProfileReportEnvelope::V1Legacy(report) => {
-            println!("envelope = V1Legacy");
-            println!("session_id = {}", report.meta.session_id);
-            assert_eq!(report.meta.session_id, session_id);
-        }
-    }
+    println!("schema_version = {}", report.schema_version);
+    println!("session_id     = {}", report.session_id);
+    println!(
+        "node_id (krotki) = {}",
+        &report.node_id[..16.min(report.node_id.len())]
+    );
+    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.session_id, session_id);
 }
 
 #[tokio::test]
@@ -113,26 +103,22 @@ async fn read_real_session_serializes_to_json_for_gui() {
         eprintln!("SKIP: brak TENTAFLOW_HOME_FOR_E2E");
         return;
     };
-    let storage = ProfileStorageV2::new(&home);
+    let storage = ProfileStorage::new(&home);
     let Some((node_id, session_id)) = find_first_session(&storage) else {
         eprintln!("SKIP: brak sesji");
         return;
     };
 
-    let envelope = storage
+    let report = storage
         .read_report(&node_id, &session_id)
         .await
         .expect("read_report");
 
-    // ProfileReportEnvelope nie ma derive Serialize bo rkyv go obsluguje
-    // dla wire format. Sprawdzmy ze possible to access fields.
-    let summary = match &envelope {
-        ProfileReportEnvelope::V2(r) => {
-            format!("V2 schema={} sid={}", r.schema_version, r.session_id)
-        }
-        ProfileReportEnvelope::V1Legacy(r) => format!("V1Legacy sid={}", r.meta.session_id),
-    };
-    println!("envelope summary: {}", summary);
+    let summary = format!(
+        "V2 schema={} sid={}",
+        report.schema_version, report.session_id
+    );
+    println!("report summary: {}", summary);
 }
 
 #[tokio::test]
@@ -142,7 +128,7 @@ async fn list_sessions_v2_returns_real_sessions() {
         eprintln!("SKIP");
         return;
     };
-    let storage = ProfileStorageV2::new(&home);
+    let storage = ProfileStorage::new(&home);
     let root = storage.root();
     let mut node_ids: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root) {

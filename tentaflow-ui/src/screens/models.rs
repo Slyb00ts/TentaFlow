@@ -111,7 +111,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                                 row.col(|ui| {
                                     let alias_id = alias.id;
                                     ui.horizontal(|ui| {
-                                        ui.small_button("\u{270F}");
+                                        let _ = ui.small_button("\u{270F}");
                                         if ui.small_button("\u{2716}").on_hover_text("Usun").clicked() {
                                             state.read().unwrap_or_else(|e| e.into_inner()).send_command(
                                                 UiCommand::DeleteModelAlias(alias_id),

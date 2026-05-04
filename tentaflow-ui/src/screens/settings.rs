@@ -3,9 +3,8 @@
 // =============================================================================
 
 use eframe::egui;
-use egui::{Color32, RichText};
+use egui::RichText;
 use crate::state::{SharedAppState, UiCommand};
-use crate::widgets;
 
 pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -180,7 +179,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                                         row.col(|ui| { ui.label(&inst.auth_type); });
                                         row.col(|ui| {
                                             ui.horizontal(|ui| {
-                                                ui.small_button("Test");
+                                                let _ = ui.small_button("Test");
                                                 if ui.small_button("\u{2716}").clicked() {
                                                     let cmd = UiCommand::DeletePortainerInstance(inst.id);
                                                     state.read().unwrap_or_else(|e| e.into_inner()).send_command(cmd);

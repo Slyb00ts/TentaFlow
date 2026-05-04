@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tentaflow_core::profiling::{
-    CollectorRegistry, MultiSourceSession, ParserRegistry, ProfileStorageV2,
+    CollectorRegistry, MultiSourceSession, ParserRegistry, ProfileStorage,
 };
 use tentaflow_protocol::profiling::{
     EventPayload, GpuTargets, ProfileScope, ProfileSourceFlags, ProfileTarget,
@@ -21,7 +21,7 @@ use tentaflow_protocol::profiling::{
 #[ignore]
 async fn audit_real_session_3s() {
     let tmp = tempfile::tempdir().unwrap();
-    let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+    let storage = Arc::new(ProfileStorage::new(tmp.path()));
     let registry = Arc::new(CollectorRegistry::discover());
     let parsers = Arc::new(ParserRegistry::default_registry());
     let session = MultiSourceSession::new(storage.clone(), registry.clone());
@@ -153,23 +153,16 @@ async fn audit_real_session_3s() {
         manifest.collectors_used.len()
     );
 
-    let envelope = storage
+    let read_back = storage
         .read_report("node-phase1", &session_id)
         .await
         .expect("read_report");
-    match envelope {
-        tentaflow_protocol::profiling::ProfileReportEnvelope::V2(r) => {
-            println!(
-                "envelope: V2 ({} events, schema={})",
-                r.events.len(),
-                r.schema_version
-            );
-            assert_eq!(r.events.len(), report.events.len());
-        }
-        tentaflow_protocol::profiling::ProfileReportEnvelope::V1Legacy(_) => {
-            panic!("expected V2 envelope, got V1Legacy");
-        }
-    }
+    println!(
+        "report: V2 ({} events, schema={})",
+        read_back.events.len(),
+        read_back.schema_version
+    );
+    assert_eq!(read_back.events.len(), report.events.len());
 
     // Sanity: report ma JAKIES wydarzenia. Jesli 0 - to znaczy ze zaden collector
     // nie zadzialal i to jest bug do zgloszenia.
