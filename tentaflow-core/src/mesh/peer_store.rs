@@ -403,36 +403,17 @@ impl MeshPeerStore {
                 ConnectionStateTag::Degraded | ConnectionStateTag::Reconnecting
             )
         {
-            // store says the QUIC connection is up but the registry has fallen
-            // into Offline / Disconnected. Force a Discovered trigger so the
-            // registry leaves Offline and reconnect logic schedules a fresh
-            // dial — that path will populate Connected with real conn_id+path.
-            // Faking DialOk here with synthetic data would corrupt the
-            // registry's path tracking.
-            if store_connected
-                && matches!(
-                    detail.summary.conn_tag,
-                    ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
-                )
-            {
-                reg.ensure_present(id);
-                tracing::info!(
-                    target: "mesh::shadow",
-                    node_id = %node_id,
-                    site = %where_,
-                    reg_state = ?detail.summary.conn_tag,
-                    "peer_store ↔ peer_registry rozjazd: forced Discovered to nudge registry out of Offline",
-                );
-            } else {
-                tracing::warn!(
-                    target: "mesh::shadow",
-                    node_id = %node_id,
-                    site = %where_,
-                    store_connected,
-                    reg_state = ?detail.summary.conn_tag,
-                    "peer_store ↔ peer_registry rozjazd: connection flag",
-                );
-            }
+            // Pure diagnostic. Recovery from `store=connected ∧ reg=Offline`
+            // is the responsibility of `update_metrics`, which fires a
+            // Discovered trigger when a heartbeat arrives for an Offline peer.
+            tracing::warn!(
+                target: "mesh::shadow",
+                node_id = %node_id,
+                site = %where_,
+                store_connected,
+                reg_state = ?detail.summary.conn_tag,
+                "peer_store ↔ peer_registry rozjazd: connection flag",
+            );
         }
         if !store.hostname.is_empty()
             && !detail.summary.hostname.is_empty()
@@ -929,6 +910,23 @@ impl MeshPeerStore {
         // + platform so the shadow consistency check stays clean.
         if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             r.ensure_present(id);
+            // Receiving an app-level heartbeat is provable liveness: bytes
+            // arrived over a live transport. If liveness previously tripped
+            // and parked the registry in Offline/Disconnected, the bare
+            // Heartbeat trigger will not wake it (state machine returns
+            // no_change for those cases — we cannot fabricate a Connected
+            // state without a real conn_id+path). Resync via the synthetic
+            // DialStarted+DialOk path used elsewhere on the read side; this
+            // fires at most once per drift event because the next heartbeat
+            // sees Connected and skips the branch.
+            if let Some(detail) = r.snapshot_detail(&id) {
+                if matches!(
+                    detail.summary.conn_tag,
+                    ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
+                ) {
+                    self.shadow_mark_connected(node_id);
+                }
+            }
             // Defense-in-depth: receiving metrics means the peer is alive; force
             // the registry to record a heartbeat so liveness state matches the
             // physical reality even if the HEARTBEAT frame path missed for any
@@ -1372,5 +1370,52 @@ mod tests {
         assert!(decoded
             .profiling_collectors_available
             .contains(&"nvidia.nsys.gpu".to_string()));
+    }
+
+    /// Heartbeat trigger for an Offline/Disconnected peer in the shadow
+    /// registry must wake the state machine, otherwise the registry stays
+    /// stuck (state.rs returns no_change for `(_, Heartbeat)` outside the
+    /// Connected/Degraded branches). Before the fix, every subsequent
+    /// `update_metrics` call re-detected the same drift and the debug
+    /// consistency check spammed thousands of identical INFO lines during
+    /// shutdown.
+    #[test]
+    fn update_metrics_wakes_offline_registry() {
+        let mut store = MeshPeerStore::new();
+        let registry = crate::mesh::peer_registry::PeerRegistry::new(64);
+        store.set_registry(registry.clone());
+
+        let node_bytes = [7u8; 32];
+        let node_id_hex = hex::encode(node_bytes);
+
+        // Register the peer in Disconnected state — the same state liveness
+        // ends up in (Offline → ScheduleDial → Disconnected) but reachable
+        // directly here for the test.
+        registry.upsert_discovered(node_bytes, Default::default());
+        assert!(!registry.is_connected(&node_bytes));
+
+        let hb = HeartbeatMetrics {
+            cpu_usage_percent: 1.0,
+            ram_used_mb: 0,
+            gpus: vec![],
+            containers: vec![],
+            networks: vec![],
+            platform: String::new(),
+            cpu_temperature_c: None,
+            swap_total_mb: 0,
+            swap_used_mb: 0,
+            connected_peers: vec![],
+            active_requests: 0,
+            tokens_per_sec: 0.0,
+            nsys_available: false,
+            nsys_version: String::new(),
+            profiling_collectors_available: vec![],
+        };
+        store.update_metrics(&node_id_hex, &hb);
+
+        assert!(
+            registry.is_connected(&node_bytes),
+            "update_metrics must wake the registry out of Disconnected/Offline so the consistency check stops re-detecting drift on every heartbeat",
+        );
     }
 }
