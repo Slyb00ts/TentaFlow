@@ -14,8 +14,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
