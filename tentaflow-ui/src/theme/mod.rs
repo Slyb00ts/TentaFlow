@@ -3,7 +3,7 @@
 // Opis: Motyw wizualny — kolory, fonty, spacing, dark/light mode.
 // =============================================================================
 
-use egui::{Color32, FontFamily, FontId, Rounding, Stroke, Style, TextStyle, Visuals};
+use egui::{Color32, FontFamily, FontId, Rounding, Stroke, TextStyle, Visuals};
 
 /// Rozmiary fontow
 #[derive(Debug, Clone)]
