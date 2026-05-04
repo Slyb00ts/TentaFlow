@@ -1,383 +1,255 @@
 # Audyt zależności TentaFlow workspace
 
-**Data audytu:** 2026-05-04
-**Wersja Rust:** 1.95.0
-**Crates w workspace:** 25 (z czego 6 to addons/SDK/fuzz)
+**Data:** 2026-05-04
+**Metoda:** `cargo metadata`, `cargo-machete` (per crate), manualna weryfikacja
+przez `grep` callsite (świadomie omijając cargo-machete blind spots dla
+feature-gated/cfg-gated/build-deps), `cargo tree --duplicates`.
+**Synteza:** dwa niezależne audyty (Claude + Codex) zderzone w discussion
+roundzie; wszystkie sporne pozycje rozstrzygnięte przez `grep`/`cat` z path:line.
 
 ---
 
-## 1. Inwentarz crate'ów
+## 1. Inwentarz crates (25)
 
 ### Produkcyjne (15)
-| Crate | Rola | LOC Cargo.toml |
-|-------|------|----------------|
-| `tentaflow-core` | Główna biblioteka — routing, mesh, services, dispatch | 270 |
-| `tentaflow` | Binary serwer (main bin) — entry point, CLI, init | ~80 |
-| `tentaflow-protocol` | rkyv wire types — ModelRequest, ServiceInfo, etc. | ~50 |
-| `tentaflow-transport` | iroh QUIC transport wrapper | ~40 |
-| `tentaflow-voice` | BLAS/SIMD GEMM dla embeddings + diarization | ~50 |
-| `tentaflow-macros` | Proc-macro dla protocol code-gen | ~20 |
-| `tentaflow-ui` | egui/wgpu shared GUI komponenty desktop+mobile | ~40 |
-| `tentaflow-desktop/core` | Wspólna logika desktop (config, paths) | ~40 |
-| `tentaflow-desktop/macos` | macOS-specific app shell | ~20 |
-| `tentaflow-desktop/linux` | Linux app shell | ~20 |
-| `tentaflow-desktop/windows` | Windows app shell + winresource | ~20 |
-| `tentaflow-mobile` | Mobile binary (Android/iOS) | ~30 |
-| `tentaflow-mobile/core` | Wspólna mobile logic | ~30 |
-| `tentaflow-client/native` | Rust FFI biblioteka dla .NET P/Invoke | ~40 |
-| `tentaflow-protocol-wasm` | wasm-bindgen glue dla browser dashboard | ~30 |
 
-### Eksperymentalne / test (4)
-| `tentaflow-iroh-spike` | iroh prototype — **kandydat do delete** | ~25 |
-| `tentaflow-protocol/fuzz` | Fuzzing protocol parser | ~15 |
-| `tentaflow-containers/sidecar` | QUIC sidecar dla python bundles | ~30 |
-| `tentaflow-containers/agents/native/teams-bot` | Teams meeting bot | ~30 |
+| Crate | Path | Rola | Direct deps |
+|-------|------|------|------------:|
+| `tentaflow-core` | `tentaflow-core/` | mesh, routing, addon runtime, dashboard API, services, DB, inference, profiling | 102 |
+| `tentaflow` | `tentaflow/` | main binary: API gateway + mesh node bootstrap | 23 |
+| `tentaflow-protocol` | `tentaflow-protocol/` | rkyv wire types (QUIC mesh + dashboard WSS) | 5 |
+| `tentaflow-transport` | `tentaflow-transport/` | iroh QUIC endpoint/framing wrapper | 14 |
+| `tentaflow-voice` | `tentaflow-voice/` | pure Rust ONNX/prost + SIMD/GEMM voice/diarization | 10 |
+| `tentaflow-macros` | `tentaflow-macros/` | proc-macros (handler/policy/observability registration) | 3 |
+| `tentaflow-ui` | `tentaflow-ui/` | egui/wgpu shared GUI (desktop+mobile) | 8 |
+| `tentaflow-desktop-core` | `tentaflow-desktop/core/` | desktop app shell, runtime paths, tray | 19 |
+| `tentaflow-desktop-{linux,macos,windows}` | `tentaflow-desktop/{...}/` | platform entry points | 2-4 |
+| `tentaflow-mobile` | `tentaflow-mobile/core/` | iOS/Android staticlib + platform logging | 17 |
+| `tentaflow-client-native` | `tentaflow-client/native/` | Rust FFI dla .NET P/Invoke (cbindgen → C header) | 16 |
+| `tentaflow-protocol-wasm` | `tentaflow-protocol-wasm/` | wasm-bindgen browser dashboard glue | 14 |
 
-### Addons + SDK (6)
-| `tentaflow-core/addon-sdk/sdk` | WASM addon trait/host functions API | ~15 |
-| `tentaflow-core/addon-sdk/template` | Template addon | ~10 |
-| `tentaflow-core/addons/test-addon` | Test fixture | ~10 |
-| `tentaflow-core/addons/embeddings-chunker` | Real embedding chunker addon | ~10 |
-| `tentaflow-core/addons/malicious-addon` | Test fixture (security) | ~10 |
+### Eksperymentalne / kontenerowe (4)
+
+| Crate | Path | Rola |
+|-------|------|------|
+| `tentaflow-iroh-spike` | `tentaflow-iroh-spike/` | iroh prototype, **standalone, nie referenced** |
+| `tentaflow-protocol-fuzz` | `tentaflow-protocol/fuzz/` | libFuzzer target |
+| `tentaflow-sidecar` | `tentaflow-containers/sidecar/` | QUIC reverse proxy dla python bundles |
+| `tentaflow-teams-bot` | `tentaflow-containers/agents/native/teams-bot/` | Chromium-driven Teams bot |
+
+### Addons + SDK (5)
+
+`tentaflow-addon-{sdk,template,test,malicious,embeddings-chunker}` — fixtures + SDK.
 
 ### Vendored (1)
-| `vendor/ed25519-dalek` | Local fork (3.0.0-pre.6) | n/a |
+
+`vendor/ed25519-dalek` 3.0.0-pre.6 — **aktywnie używany przez 3 patches**:
+- `tentaflow-core/Cargo.toml:269-270`
+- `tentaflow-transport/Cargo.toml:42-43`
+- `tentaflow-containers/sidecar/Cargo.toml:45-46`
 
 ---
 
 ## 2. Statystyki
 
-- **102 unique deps w `tentaflow-core`** (z `[dependencies]`, `[dev-dependencies]`, target-specific i `[build-dependencies]`)
-- **169 unique deps cross-workspace** (suma)
-- **65 transitive duplicate crates** (różne wersje używane przez różne deps tree branches)
-- **Największe podgrupy unique deps:**
-  - HTTP/networking: ~15
-  - Crypto/security: ~12
-  - Async/sync prymitywy: ~10
-  - Serialization: ~8
-  - AI/ML inference: ~7
-  - Audio: ~6
-  - Monitoring/metrics: ~5
+- **329 direct dependency entries** cross-workspace, **144 unique** dependency names
+- **102 unique deps** w `tentaflow-core` (113 entries z target/dev/build)
+- **68 transitive duplicate package names** w `tentaflow-core` (cargo tree --duplicates)
+- **54 confirmed dead direct entries** do usunięcia + **1 manual review** (`wasmtime-wasi`)
 
 ---
 
-## 3. Nieużywane zależności (cargo-machete weryfikacja)
+## 3. Confirmed dead dependencies — akcje DELETE
 
-### `tentaflow-core` — 7 confirmed dead, 4 false positive
+Każdy wpis zweryfikowany manualnie przez `grep -RIn "<dep>::"` w odpowiednim
+crate (path:line gdzie codex wykrył brak callsite).
 
-**Confirmed dead (do delete):**
-| Dep | Wersja | Rationale | Akcja |
-|-----|--------|-----------|-------|
-| `chacha20poly1305` | 0.10.1 | Cipher zastąpiony przez `aes-gcm` | DELETE |
-| `curve25519-dalek` | 4.1.3 | Używamy ed25519-dalek (wraps własny X25519) | DELETE |
-| `mdns-sd` | 0.19.0 | mDNS discovery zastąpione przez iroh peer discovery | DELETE |
-| `serde_yaml` | 0.9.33 | Konfig migrowała na TOML | DELETE |
-| `walkdir` | 2 | Tylko `std::fs` używane | DELETE |
-| `filetime` | 0.2 | Brak callerów | DELETE |
-| `core-foundation-sys` | 0.8 | `core-foundation` jest re-export | DELETE (sprawdź target-specific) |
+| Crate | Dep do usunięcia | Evidence (path:line) |
+|-------|------------------|----------------------|
+| `tentaflow-core` | `chacha20poly1305` | brak `chacha20poly1305::` w `tentaflow-core/src/`; AEAD zastąpione `aes-gcm` |
+| `tentaflow-core` | `curve25519-dalek` | brak `curve25519_dalek::` callsite; `ed25519-dalek` 2.2 + `x25519-dalek` agregują własny stack |
+| `tentaflow-core` | `mdns-sd` | iroh discovery zastąpiło mDNS; brak `mdns_sd::` |
+| `tentaflow-core` | `ndarray` | tylko `tract_ndarray::Array4` (vision/yolo_pose.rs:61, scrfd.rs:80, movenet.rs:45, yolov8_face.rs:53, hsemotion.rs:49) |
+| `tentaflow-core` | `prometheus` | manual renderer w `dispatch/metrics.rs:170` (`out.push_str` + `format!`); brak `prometheus::`; usuń też `[features] metrics-prometheus` lub odepnij `dep:prometheus` |
+| `tentaflow-core` | `serde_yaml` | konfiguracja na TOML; brak `serde_yaml::` |
+| `tentaflow-core` | `tokenizers` | MLX bridge czyta `tokenizer_config.json` jako JSON (`routing/chat_template.rs:240-255`); MLX whisper ściąga pliki bez crate (`stt/mlx_whisper.rs:140-145`); brak `tokenizers::Tokenizer` |
+| `tentaflow-core` | `core-foundation-sys` (macOS target) | brak `core_foundation_sys::`; `core-foundation` agreguje sys |
+| `tentaflow-core` | `filetime` (dev) | brak callsite |
+| `tentaflow-core` | `thiserror` (build-dep v1) | nieużywany w build.rs |
+| `tentaflow-protocol` | `bytecheck` | tylko `rkyv::bytecheck::CheckBytes`, nie crate path |
+| `tentaflow-protocol-wasm` | `bytecheck`, `getrandom`, `serde`, `wasm-bindgen-futures` | brak callsite (wasm protocol używa rkyv przez re-export + js-sys) |
+| `tentaflow-transport` | `bytecheck`, `futures` | `bytecheck` przez `rkyv::bytecheck` (framing.rs:52); `futures` brak callsite |
+| `tentaflow-ui` | `serde_json`, `tracing` | brak callsite (egui ma własny state) |
+| `tentaflow-mobile` | `hostname`, `tentaflow-protocol`, `uuid`, `android-activity` (Android target) | brak callsite |
+| `tentaflow-desktop-core` | `hex`, `hostname`, `image`, `tentaflow-protocol` | brak callsite |
+| `tentaflow-iroh-spike` | `hmac`, `tracing`, `tracing-subscriber` | tylko `rand` żywe (pairing.rs:88) — **kandydat do usunięcia całego crate** (patrz §6.3) |
+| `tentaflow-client-native` | `ahash`, `libc`, `smallvec` | brak callsite (cbindgen build-dep ZOSTAJE — używany w `build.rs:24,44`) |
+| `tentaflow-teams-bot` | `async-trait`, `byteorder`, `rkyv` | tylko komentarze; transport agreguje serializację |
+| `tentaflow-sidecar` | `bytes`, `futures`, `parking_lot`, `rkyv`, `thiserror`, `uuid` | tylko `futures-util::StreamExt` żywe (reverse_proxy.rs:243) |
+| `tentaflow-addon-template` | `serde` | importowane z `tentaflow_addon_sdk::prelude::*` |
+| `tentaflow-addon-embeddings-chunker` | `serde` | jw. (lib.rs:31 derive z prelude) |
+| `tentaflow` (binary) | `chrono`, `futures`, `hex`, `http-body`, `http-body-util`, `hyper`, `hyper-util`, `serde`, `tokio-rustls`, `uuid` | per-dep grep `crate::` w `tentaflow/src/` zwraca **0 callsite**; legacy z czasów własnego HTTP server (cały HTTP stack przeniesiony do tentaflow-core) |
 
-**False positives (feature-gated, zostają):**
-| Dep | Feature flag | Powód detection failure |
-|-----|--------------|------------------------|
-| `prometheus` | `metrics-prometheus` | cargo-machete nie skanuje feature-gated |
-| `tokenizers` | `inference-mlx` | jw. |
-| `wasmtime-wasi` | `wasmtime` re-export | używane tranzytywnie |
-| `ndarray` | brak | 5 use-sites w `embeddings/` (false positive cargo-machete) |
+**Razem: 54 dead entries do usunięcia mechanicznie + 1 manual.**
 
-### Pozostałe crates — confirmed dead
+### Uwagi do potwierdzeń (kluczowe korekty mojego pierwotnego raportu)
 
-#### `tentaflow-transport` (2)
-- `bytecheck` — protocol used to derive Archive (już teraz nie potrzebne)
-- `futures` — tylko sub-deps używają
+| Dep | Mój pierwotny wyrok | Codex korekta | Final |
+|-----|---------------------|---------------|-------|
+| `walkdir` (core) | DELETE ❌ | KEEP — `build.rs:1126` `use walkdir::WalkDir; ... compute_source_hash` | **KEEP** |
+| `prost-build` (voice) | DELETE ❌ | KEEP — `build.rs:27` `prost_build::Config::new()` | **KEEP** |
+| `protobuf-src` (voice) | DELETE ❌ | KEEP — `build.rs:13` `protobuf_src::protoc()` | **KEEP** |
+| `cbindgen` (client/native) | DELETE ❌ | KEEP — `build.rs:24,44` C header gen | **KEEP** |
+| `prometheus` (core) | KEEP (false positive) ❌ | DELETE — manual renderer | **DELETE** |
+| `tokenizers` (core) | KEEP (false positive) ❌ | DELETE — JSON file IO | **DELETE** |
+| `ndarray` (core) | KEEP (false positive) ❌ | DELETE — tract_ndarray re-export | **DELETE** |
 
-#### `tentaflow-protocol-wasm` (4)
-- `bytecheck`, `getrandom`, `serde`, `wasm-bindgen-futures` — wszystkie nieużywane
-
-#### `tentaflow-iroh-spike` (3)
-- `hmac`, `tracing`, `tracing-subscriber` — **CAŁY CRATE prawdopodobnie do delete**
-
-#### `tentaflow-ui` (2)
-- `serde_json`, `tracing` — nieużywane
-
-#### `tentaflow-mobile/core` (3)
-- `hostname`, `tentaflow-protocol`, `uuid` (+ android-activity dla android)
-
-#### `tentaflow` (10) ⚠ NAJWIĘKSZA LISTA
-- `chrono`, `futures`, `hex`, `http-body`, `http-body-util`, `hyper`, `hyper-util`, `serde`, `tokio-rustls`, `uuid`
-- Większość pewnie używana przez transitive — tentaflow-core eksportuje. Wymaga manual review.
-
-#### `tentaflow-desktop/core` (4)
-- `hex`, `hostname`, `image`, `tentaflow-protocol`
-
-#### `tentaflow-protocol` (1)
-- `bytecheck`
-
-#### `tentaflow-containers/sidecar` (6)
-- `bytes`, `futures`, `parking_lot`, `rkyv`, `thiserror`, `uuid`
-
-#### `tentaflow-client/native` (4)
-- `ahash`, `cbindgen`, `libc`, `smallvec`
-
-#### `tentaflow-containers/agents/native/teams-bot` (3)
-- `async-trait`, `byteorder`, `rkyv`
-
-#### `tentaflow-voice` (2)
-- `prost-build`, `protobuf-src` — pre-existing nieużywane
-
-**Sumarycznie do delete: ~52 unused deps cross-workspace** (po weryfikacji manualnej).
+Powód moich błędów: brak weryfikacji `grep` po path:line, zgaduwanie po nazwach modułów. Codex użył precyzyjnych grep'ów na crate path i sprawdził build.rs — to jest correct methodology.
 
 ---
 
-## 4. Duplicated transitive deps (cargo tree --duplicates)
+## 4. Manual review (1 pozycja)
 
-### 65 unique crate names z >1 wersją
+### `wasmtime-wasi` w `tentaflow-core` (desktop target)
 
-**Najczęstsze konflikty:**
-| Crate | Wersje | Źródło |
-|-------|--------|--------|
-| `bitflags` | 1.3.2 + 2.11.1 | symphonia (v1) vs wasmtime/iroh (v2) |
-| `hashbrown` | 0.14.5 + 0.16.1 + 0.17.0 | ahash, sled, hashbrown |
-| `getrandom` | 0.2 + 0.3 + 0.4 | crypto crates różne pokolenia |
-| `rand` | 0.8 + 0.10 | ed25519 vs nasz workspace |
-| `rand_core` | 0.6 + 0.10 | jw. |
-| `itertools` | 0.10 + 0.12 + 0.13 + 0.14 | różne crates |
-| `bit-set`/`bit-vec` | 0.5 + 0.9 | tract-onnx (v0.5) vs wgpu (v0.9) |
-| `crypto-common` | 0.1 + 0.2 | digest v0.10 vs v0.11 |
-| `digest` | 0.10 + 0.11 | jw. |
-| `der`/`spki`/`pkcs8` | 0.7 + 0.8 | X.509 stack przejście |
-| `core-foundation` | 0.9 + 0.10 | macOS bindings różne pokolenia |
-| `curve25519-dalek` | 4.1.3 + 5.0.0-pre.6 | nasz vendor + iroh |
-| `ed25519-dalek` | 2.2.0 + 3.0.0-pre.6 | jw. |
-| `reqwest` | 2 versions | nasze + iroh |
-| `rustls-pki-types` | 2 versions | jw. |
-| `time` | 2 versions | jw. |
-| `toml` | 2 versions | jw. |
-| `wasmtime-environ`, `wasmtime-internal-core` | wasmtime + nasze | naprzemienne |
+**Stan:**
+- `Cargo.toml:236-238` — `wasmtime = "43.0.1"` + `wasmtime-wasi = "43.0.1"` (cfg=non-mobile)
+- `addon/runtime/runtime_wasmtime.rs:154-166` — `WasmLinker::new(engine)` bez WASI wiring
+- `addon/host_functions/mod.rs:48-50` — rejestrujemy tylko namespace `"tentaflow"`
+- Addony skompilowane do `wasm32-wasip1` **importują** WASI: `strings test-addon.wasm` pokazuje `wasi_snapshot_preview1`, `environ_get`, `fd_write`, `proc_exit`, `random_get` (malicious)
 
-**Wniosek:** większość duplikatów to nieuniknione naturalne pokoleniowe rozjazdy między ekosystemowymi crates (iroh używa jeszcze starych pokoleń kryptografii, X.509 stack przechodzi na nowy `der` 0.8). Nie da się tego unifikować bez forka iroh.
+**Konflikt:** addony deklarują WASI imports, ale linker ich nie obsługuje. Albo:
+- **(A) wire WASI**: dodać `wasmtime_wasi::add_to_linker_async` w `create_linker` → KEEP dep, addony działają faktycznie z WASI
+- **(B) zrezygnuj z WASI**: zmienić target addonów na `wasm32-unknown-unknown` lub no-WASI custom target → DELETE dep, ale wymaga rebuild wszystkich addonów
 
-**Co MOŻNA zunifikować:**
-- `vendor/ed25519-dalek` (3.0.0-pre.6) — sprawdzić czy fork wciąż potrzebny vs upstream 2.2.0
-- `curve25519-dalek` 4.1.3 w `tentaflow-core/Cargo.toml` — confirmed unused, można delete
-- `bitflags` v1 zostanie póki używamy `symphonia` (audio decoder) — alternatywa: `hound` (już mamy) jako prosty WAV-only decoder
+**Rekomendacja:** osobna decyzja produktowa. Aktualnie addony "działają" tylko gdy nie wywołują WASI imports — to niejawna umowa, łatwo złamać. Sugeruję (A) — dodać WASI linker wiring (godzina pracy) i utrzymać dep jako udokumentowane.
 
 ---
 
-## 5. Funkcjonalne overlap'y (różne crates, podobna funkcja)
+## 5. Cross-crate functional overlap analysis
 
-### 5.1 Crypto / hashing
-
-| Cel | Używane | Status | Rekomendacja |
-|-----|---------|--------|--------------|
-| Symmetric AEAD | `aes-gcm` 0.10 | ✅ używane | KEEP |
-| | `chacha20poly1305` 0.10 | ❌ nieużywane | **DELETE** |
-| ECC sign | `ed25519-dalek` 2.2 | ✅ używane | KEEP |
-| ECC DH | `curve25519-dalek` 4.1 | ❌ nieużywane | **DELETE** |
-| KDF | `hkdf` 0.12 | ✅ używane | KEEP |
-| MAC | `hmac` 0.12 | ✅ używane | KEEP |
-| Hash | `sha2` 0.10 | ✅ używane | KEEP |
-| Password hash | `argon2` 0.5 | ✅ używane | KEEP |
-| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` | ✅ używane | KEEP |
-| Cert gen | `rcgen` 0.14 | ✅ używane (mesh self-signed) | KEEP |
-| JWT | `jsonwebtoken` 10 | ✅ używane (dashboard auth) | KEEP |
-| Random | `rand` 0.10 + `rand_core` 0.10 + `rand_core_06` (alias) + `getrandom` | ✅ wszystkie używane | KEEP — `rand_core_06` wymagane dla ed25519-dalek 2.2 |
-| Constant-time compare | `subtle` 2 | ✅ używane | KEEP |
-
-**Akcje:**
-- DELETE `chacha20poly1305` z `tentaflow-core/Cargo.toml`
-- DELETE `curve25519-dalek` z `tentaflow-core/Cargo.toml`
-
-### 5.2 Async / concurrency
-
-| Cel | Używane | Status | Rekomendacja |
-|-----|---------|--------|--------------|
-| Runtime | `tokio` (full) | ✅ KEEP | jedyna opcja |
-| Sync prymitywy | `parking_lot` + `tokio::sync` + `std::sync` + `arc-swap` | ✅ KEEP | różne use cases |
-| Concurrent map | `dashmap` | ✅ KEEP | hot paths (handles cache, strategy state) |
-| Atomic ops | `std::sync::atomic` | ✅ KEEP | |
-| OnceLock | `lazy_static` 1.5 | ⚠ legacy | **MIGRACJA** do `std::sync::OnceLock` (Rust 1.70+) — usunąć `lazy_static` |
-| Streams | `futures` 0.3 + `async-stream` | ✅ KEEP | różne use cases |
-| async-trait | `async-trait` | ✅ KEEP | dla trait objects |
-
-**Akcje:**
-- ROZWAŻYĆ migracja `lazy_static` → `OnceLock` (~20-30 callsite)
-
-### 5.3 Errors
-
-| Cel | Używane | Status |
-|-----|---------|--------|
-| Library errors | `thiserror` 2 | ✅ KEEP — for typed errors |
-| Application errors | `anyhow` 1 | ✅ KEEP — for boundaries |
-
-Pattern jest poprawny (thiserror wewnątrz `crate::error::CoreError`, anyhow jako `Result<T>` na granicach). Zero overlap.
-
-### 5.4 Serialization
-
-| Cel | Używane | Status |
-|-----|---------|--------|
-| JSON | `serde_json` | ✅ KEEP |
-| YAML | `serde_yaml` | ❌ **DELETE** — nieużywane |
-| TOML | `toml` | ✅ KEEP |
-| Binary wire | `rkyv` 0.8 | ✅ KEEP (zero-copy QUIC) |
-| Base64 | `base64` 0.22 | ✅ KEEP |
-| Hex | `hex` 0.4 | ✅ KEEP |
-
-### 5.5 HTTP
-
-| Cel | Używane | Status | Rekomendacja |
-|-----|---------|--------|--------------|
-| Server | `hyper` 1 + `hyper-util` | ✅ KEEP — niskopoziomowy server |
-| Client | `reqwest` 0.12 | ✅ KEEP — backendów HTTP |
-| Body utils | `http-body` + `http-body-util` | ✅ KEEP |
-| WebSocket | `tokio-tungstenite` | ✅ KEEP |
-| Multipart | `multer` | ✅ KEEP — `/v1/audio/transcriptions` |
-
-Brak overlap. Stack jest ekonomiczny (jedyna alternatywa to `axum` która agreguje hyper+tower; nie warto migracji).
-
-### 5.6 AI / ML inference
-
-| Cel | Używane | Feature flag | Status |
-|-----|---------|--------------|--------|
-| LLM (CPU) | `llama-cpp-2` | `inference-llamacpp` | ✅ KEEP |
-| LLM (Apple) | mlx-swift bridge (FFI) | `inference-mlx` | ✅ KEEP |
-| Whisper STT | `whisper-rs` | `inference-whisper` (default) | ✅ KEEP |
-| MLX Whisper | `libloading` (FFI) | `inference-mlx-whisper` | ✅ KEEP |
-| Sherpa STT/TTS | `sherpa-rs` | `inference-sherpa` | ✅ KEEP |
-| MLX Kokoro TTS | `libloading` (FFI) | `inference-mlx-kokoro` | ✅ KEEP |
-| Apple AVSpeech | bezpośrednio (FFI) | (target-gated) | ✅ KEEP |
-| Vision/diarization | `tract-onnx` + `tentaflow-voice` | `inference-diarization` | ✅ KEEP |
-| HuggingFace download | `hf-hub` | brak | ✅ KEEP |
-| Tokenizers | `tokenizers` | `inference-mlx` | ✅ KEEP (false positive cargo-machete) |
-
-### 5.7 Audio
-
-| Cel | Używane | Status |
-|-----|---------|--------|
-| Codec multi-format | `symphonia` (mp3+vorbis+pcm+ogg) | ✅ KEEP |
-| WAV write | `hound` | ✅ KEEP |
-
-Overlap minimal — `symphonia` ma WAV write ale `hound` jest prostszy. Można rozważyć eliminację `hound` na rzecz `symphonia` ale to refactor 2-3h. Niska priorytet.
-
-### 5.8 Database / storage
-
-| Cel | Używane | Status |
-|-----|---------|--------|
-| SQLite | `rusqlite` (bundled) | ✅ KEEP |
-| Filesystem walk | `walkdir` | ❌ **DELETE** — nieużywane |
-| Compression | `flate2` | ✅ KEEP |
-| Tar | `tar` | ✅ KEEP |
-| Temp files | `tempfile` | ✅ KEEP |
-
-### 5.9 Mesh / networking
-
-| Cel | Używane | Status |
-|-----|---------|--------|
-| QUIC mesh | `iroh` 0.98 + `iroh-relay` | ✅ KEEP |
-| QUIC transport | `tentaflow-transport` (wrapper) | ✅ KEEP |
-| Network detection | `netdev` | ✅ KEEP |
-| mDNS | `mdns-sd` | ❌ **DELETE** — zastąpione przez iroh discovery |
-| DNS sysconfig | `system-configuration` (transitive) | ✅ KEEP |
-
-### 5.10 Utility
-
-| Cel | Używane | Status |
-|-----|---------|--------|
-| Time | `chrono` | ✅ KEEP |
-| UUID | `uuid` | ✅ KEEP |
-| Regex | `regex` | ✅ KEEP |
-| Env paths | `dirs` | ✅ KEEP |
-| OS info | `sysinfo` | ✅ KEEP |
-| FFI utility | `libloading` + `libc` | ✅ KEEP |
-| Logging | `tracing` + `tracing-subscriber` | ✅ KEEP |
-| Numeric IDs | `inventory` | ✅ KEEP (manifest registry) |
+| Domena | Aktywne | Status | Akcja |
+|--------|---------|--------|-------|
+| **Crypto AEAD** | `aes-gcm` 0.10 ✅ + `chacha20poly1305` ❌ | overlap nieaktywny | DELETE chacha (mesh transport używa iroh TLS) |
+| **ECC sign+DH** | `ed25519-dalek` 2.2 + `x25519-dalek` ✅ + `curve25519-dalek` ❌ | curve25519 dead | DELETE curve25519 |
+| **JSON** | `serde_json` ✅ | brak overlap | KEEP |
+| **YAML** | `serde_yaml` ❌ | dead | DELETE |
+| **TOML** | `toml` ✅ (config + manifest) | brak overlap | KEEP |
+| **Wire binary** | `rkyv` ✅ (zero-copy QUIC) | brak overlap | KEEP |
+| **bytecheck direct** | declared w 3 crates ❌ | wszędzie kod używa `rkyv::bytecheck` | DELETE z protocol/transport/wasm |
+| **Logging** | `tracing` + `tracing-subscriber` ✅ | brak overlap | KEEP, delete dead z ui/iroh-spike |
+| **HTTP server** | `hyper` + `hyper-util` (core only) | KEEP w core, DEAD w `tentaflow` binary | DELETE z binary |
+| **HTTP client** | `reqwest` 0.13 (core) | brak overlap | KEEP |
+| **Async runtime** | `tokio` (full) | brak overlap | KEEP |
+| **Streams** | `futures` 0.3 + `async-stream` + `futures-util` | różne use cases | KEEP w core, DELETE z `tentaflow`/transport/sidecar |
+| **Errors** | `anyhow` (boundaries) + `thiserror` 2 (typed lib) | poprawny pattern | KEEP both, DELETE dead `thiserror` v1 build-dep |
+| **Sync** | `parking_lot` + `arc-swap` + `dashmap` + `tokio::sync` | różne use cases | KEEP all |
+| **OnceLock** | `lazy_static` 1.5 (4 bloki) ⚠ legacy | migracja możliwa | **MIGRUJ** → `std::sync::OnceLock` (Faza 3) |
+| **mDNS** | `mdns-sd` ❌ | iroh discovery zastąpił | DELETE |
+| **Audio** | `symphonia` + `hound` | minimal overlap (hound = WAV-only) | KEEP both (hound prostszy dla TTS output) |
+| **WASM runtime** | `wasmtime` (desktop) + `wasmi` (mobile) | target-specific | KEEP both |
+| **Tokenizers** | `tokenizers` ❌ | MLX bridge używa file IO | DELETE |
+| **Vision tensors** | `tract-onnx` (z `tract_ndarray`) ✅ + direct `ndarray` ❌ | direct `ndarray` dead | DELETE direct |
+| **Build proto** | `prost-build` + `protobuf-src` ✅ | both used in voice/build.rs | KEEP both |
 
 ---
 
-## 6. Architektoniczne overlapy (kandydaci do unifikacji)
+## 6. Architektoniczne kandydaty do redukcji
 
-### 6.1 Multiple BackendHandle definitions
+### 6.1 `tentaflow-iroh-spike` — kandydat do DELETE
+
+- Standalone crate, **żaden `Cargo.toml` nie odwołuje się przez `path =`** (codex find: tylko własny Cargo.toml)
+- 3 dead deps + crate jako całość nie linked do production builds
+- Iroh integration ukończona w `tentaflow-core/src/mesh/iroh_manager.rs`
+- **Akcja:** `git rm -r tentaflow-iroh-spike/` chyba że jest świadomie trzymany jako reference
+
+### 6.2 `lazy_static` → `std::sync::OnceLock`
+
+Tylko 4 bloki w `tentaflow-core`:
+- `mesh/node_info_collector.rs:21, 1412`
+- `middleware/pii.rs:34`
+- `services/tts/processor.rs:13`
+
+Mechaniczna migracja, low-risk. Po migracji DELETE crate `lazy_static`.
+
+### 6.3 `vendor/ed25519-dalek` — KEEP
+
+Vendor patch aktywnie referenced przez 3 manifesty (`[patch.crates-io]`). Nie usuwać bez planu deprekacji (wymaga upstream coordination z iroh, który używa 3.0-pre.6 API).
+
+### 6.4 Multiple `BackendHandle` definitions
+
 **Status:** Naprawione w R3b.8 (2026-05-03). Single `BackendHandle` w `services/handles_cache`.
 
-### 6.2 STT path
+### 6.5 STT path
+
 **Status:** Naprawione w R5f (2026-05-04). Single owned dispatch w `SttRuntime`.
 
-### 6.3 `tentaflow-iroh-spike` ⚠
-Crate eksperymentalny z 3 unused deps (cały crate prawdopodobnie nieużywany).
-- Sprawdzić czy kod jest reference dla iroh integration
-- Jeśli iroh integration ukończona w `tentaflow-core/src/mesh/iroh_manager.rs` — **DELETE crate**
+---
 
-### 6.4 Vendored `ed25519-dalek` 3.0.0-pre.6
-- Workspace ma `vendor/ed25519-dalek` (3.0.0-pre.6) ale używamy z `crates.io` `ed25519-dalek` 2.2.0
-- 2 warianty w drzewie zależności (cargo tree pokazuje oba)
-- Sprawdzić CZY vendor jest używany — jeśli nie, **DELETE vendor**
+## 7. Transitive duplicates — `cargo tree --duplicates` w `tentaflow-core/`
 
-### 6.5 `lazy_static` legacy
-~20-30 callsite z `lazy_static!` — wszystkie mogą być zastąpione przez `std::sync::OnceLock` (stable od 1.70). Refactor mechaniczny, low-risk. **Zalecane** ale poza scope tego cleanup'u.
+68 unique package names z >1 wersją. Większość to **upstream-driven** (iroh, wasmtime, hf-hub używają różnych pokoleń `getrandom`/`rand`/`hashbrown`/`bitflags`/X.509 stack/`windows-sys`).
 
-### 6.6 `serde_json` w `tentaflow-ui`
-UI używa `egui` które ma własny state management. Brak callsites `serde_json` — usunąć z `tentaflow-ui/Cargo.toml`.
+### Najbardziej actionable (mamy lokalną kontrolę):
 
-### 6.7 `tracing` w `tentaflow-iroh-spike`, `tentaflow-ui`, `tentaflow-mobile`
-Wszystkie 3 to "dummy includes" bez actual use. Usunąć.
+| Package | Wersje | Akcja |
+|---------|--------|-------|
+| `chacha20` | 0.9, 0.10 | po DELETE `chacha20poly1305` z core — branch 0.9 znika (jeśli nie jest pulled by upstream) |
+| `core-foundation-sys` (sub-crate) | n/a — naprawione przez DELETE direct dep | DELETE `core-foundation-sys` z `tentaflow-core/Cargo.toml` macOS target |
+| `netdev` | 0.31, 0.42 | upgrade direct `netdev` 0.31 → 0.42 (iroh już używa 0.42); wymaga sprawdzenia API w `mesh/network_interfaces.rs` |
+| `thiserror`/`thiserror-impl` | 1.0, 2.0 | DELETE build-dep `thiserror = "1.0"` z core; v1 zostanie tylko jeśli upstream `witx` go używa |
+| `core-foundation` | 0.9, 0.10 | częściowo unifikuje się przez upgrade `netdev` |
+| `system-configuration` | 0.6, 0.7 | jw. (idzie z netdev) |
+
+### Upstream-only (nie ruszać lokalnie):
+
+`bitflags`, `bit-set`, `bit-vec`, `block-buffer`, `const-oid`, `cpufeatures`,
+`crypto-common`, `der`, `digest`, `dlopen2`, `ed25519`, `embedded-io`,
+`fiat-crypto`, `foldhash`, `getrandom` (3 wersje), `hashbrown` (4 wersje),
+`itertools` (4 wersje), `jni`, `jni-sys`, `linux-raw-sys`, `netlink-packet-*`,
+`pem-rfc7468`, `pkcs8`, `r-efi`, `rand`/`rand_chacha`/`rand_core`,
+`redox_*`, `reqwest` (0.12 z hf-hub vs 0.13 w core), `rustc-hash`, `rustix`,
+`sha1`/`sha2`, `signature`, `spin`, `spki`, `string-interner`, `syn`,
+`toml`/`toml_datetime`, `vergen-lib`, `wasm-encoder`/`wasm-streams`/`wasmparser`/`wast`,
+`windows-sys` (6 wersji), `windows-targets` + `windows_*` (4 wersje), `winnow`,
+`wit-bindgen`, `wit-parser`.
+
+### Crypto policy issue (osobna decyzja security):
+
+`ed25519-dalek` 2.2 vs vendored 3.0-pre.6 — iroh używa fork 3.0-pre, my używamy 2.2 API. Unifikacja wymaga policy decision (czy idziemy na pre-release ed25519 globalnie). Treat as upstream coordination, nie cleanup.
 
 ---
 
-## 7. Rekomendowany plan akcji
+## 8. Plan akcji w fazach
 
-### Faza 1 — bezpieczne delete (zero ryzyka, ~1h)
-Usunąć z odpowiednich `Cargo.toml`:
-
-| Crate | Plik | Dep do delete |
-|-------|------|---------------|
-| tentaflow-core | tentaflow-core/Cargo.toml | `chacha20poly1305`, `curve25519-dalek`, `mdns-sd`, `serde_yaml`, `walkdir`, `filetime` |
-| tentaflow-transport | tentaflow-transport/Cargo.toml | `bytecheck`, `futures` |
-| tentaflow-protocol | tentaflow-protocol/Cargo.toml | `bytecheck` |
-| tentaflow-protocol-wasm | tentaflow-protocol-wasm/Cargo.toml | `bytecheck`, `getrandom`, `serde`, `wasm-bindgen-futures` |
-| tentaflow-ui | tentaflow-ui/Cargo.toml | `serde_json`, `tracing` |
-| tentaflow-mobile/core | mobile/core/Cargo.toml | `hostname`, `uuid` (+ android-activity sprawdzić cfg) |
-| tentaflow-desktop/core | desktop/core/Cargo.toml | `hex`, `hostname`, `image`, `tentaflow-protocol` |
-| tentaflow-containers/sidecar | sidecar/Cargo.toml | `bytes`, `futures`, `parking_lot`, `rkyv`, `thiserror`, `uuid` |
-| tentaflow-containers/agents/native/teams-bot | teams-bot/Cargo.toml | `async-trait`, `byteorder`, `rkyv` |
-| tentaflow-client/native | client/native/Cargo.toml | `ahash`, `libc`, `smallvec` |
-| tentaflow | tentaflow/Cargo.toml | `chrono`, `futures`, `hex`, `serde`, `uuid` (po manualnej weryfikacji 10 z listy) |
-| tentaflow-voice | voice/Cargo.toml | `prost-build`, `protobuf-src` |
-
-**Uwaga przed delete:** każda dep wymaga `cargo build --all-features` po edycji bo cargo-machete ma blind spots dla:
-- target-specific deps (cfg-gated)
-- proc-macro deps (re-eksport)
-- transitive enable (feature → feature → dep)
-
-### Faza 2 — manual review (~2h)
-1. **`tentaflow-iroh-spike`**: czy crate jest jeszcze referenced z root workspace? Jeśli nie — `git rm -r tentaflow-iroh-spike/`.
-2. **`vendor/ed25519-dalek`**: sprawdzić czy `Cargo.toml` w workspace odwołuje się przez `path = "vendor/ed25519-dalek"`. Jeśli nie — `git rm -r vendor/ed25519-dalek/`.
-3. **`tentaflow/Cargo.toml`** 10 dep z machete listy — niektóre (np. `hyper`, `hyper-util`, `http-body-util`, `tokio-rustls`) mogą być wymagane dla custom server setup w `main.rs`. Per-dep grep.
-
-### Faza 3 — modernization (opcjonalna, ~3h)
-1. `lazy_static` → `std::sync::OnceLock` (mechaniczny refactor, ~30 callsites)
-2. Rozważ `hound` removal — `symphonia` może to zastąpić (audio output WAV w STT/TTS pipeline)
-
-### Faza 4 — duplicate version reduction (poza naszą kontrolą głównie)
-1. Sprawdzić czy `iroh` 0.99 / 0.100 ma update do nowszych curve25519-dalek/rand_core/etc.
-2. `bit-set` / `bit-vec` — wymaga upgrade `tract-onnx` (źle utrzymywany crate)
-3. `core-foundation` 0.9 vs 0.10 — naturalna migracja, każda upgrade zależności rozwiązuje
+| Faza | Zmiany | Estymacja | Ryzyko | Verification |
+|------|--------|----------:|--------|--------------|
+| **0: mechaniczne delete** | 44 dead entries poza `tentaflow-core` (`tentaflow` binary, sidecar, teams-bot, ui, mobile, desktop-core, protocol-wasm, protocol, transport, client/native, addon template/chunker, iroh-spike) | 1-2h | Low | per-crate `cargo check` + `cargo machete` |
+| **1: tentaflow-core dead deps** | DELETE `chacha20poly1305`, `curve25519-dalek`, `mdns-sd`, `ndarray`, `prometheus` (+ feature), `serde_yaml`, `tokenizers` (+ feature), `filetime` (dev), `core-foundation-sys` (macOS), `thiserror` v1 build-dep | 2-3h | Medium (feature matrix) | full features build, `--no-default-features --features dashboard-api`, `--features metrics-prometheus`, macOS target |
+| **2: target/manual** | DELETE `android-activity` z mobile; DECISION na `wasmtime-wasi` (A: wire WASI, B: switch addon target) | 0.5-1d | Medium | Android target check, addon integration tests |
+| **3: modernization** | `lazy_static` → `OnceLock` (4 bloki) → DELETE `lazy_static` z core; rozważ DELETE crate `tentaflow-iroh-spike` | 0.5d | Low | unit tests, pii regex test |
+| **4: duplicate reduction** | upgrade `netdev` 0.31 → 0.42 (review API zmian w `mesh/network_interfaces.rs`) | 0.5-1d | Medium | `mesh_discovery_repro`, network config tests, manual LAN check |
+| **5: crypto policy** | decyzja na `ed25519-dalek` 2.2 vs vendored 3.0-pre — wymaga security review | 1-2d | High | pairing/security tests, iroh interop |
+| **6: upstream tracking** | issues/notes na `hf-hub`/`reqwest` 0.12, wasmtime version sprawl, Windows generations | ongoing | Low | periodic `cargo update --dry-run` |
 
 ---
 
-## 8. Sumaryczny benefit po Fazie 1
+## 9. Sumaryczny benefit po Fazie 0+1
 
-- **~52 unused deps cross-workspace usunięte** = mniejszy `Cargo.lock`, szybszy resolve
-- **~5-10 transitive crates zniknie** (deps deps)
-- **Czas kompilacji:** ~3-5% szybsza incremental build (estymata na podstawie typowych Rust workspace cleanups)
-- **Maintenance:** jasniejszy obraz co projekt rzeczywiście potrzebuje
-- **Security:** mniejszy attack surface (np. usunięcie `mdns-sd` które potencjalnie nasłuchiwało na 5353/udp)
+- **~54 dead direct deps usunięte** = mniejszy `Cargo.lock`, szybszy resolve
+- **~3-5% szybsza incremental build** (estymata)
+- **Security:** mniejszy attack surface (`mdns-sd` listening na 5353/udp, dead crypto crates)
+- **Maintenance:** clear ownership co projekt rzeczywiście potrzebuje
+- **Cargo.toml diff:** -54 linii direct deps + -2 features (metrics-prometheus, część inference-mlx)
 
-## 9. Ryzyko
+## 10. Niezgodności rozstrzygnięte (audit synthesis)
 
-- **Niskie:** Faza 1 — `cargo build --all-features --workspace` po każdej zmianie wykryje regression
-- **Średnie:** Faza 2 — delete vendored fork wymaga sprawdzenia czy upstream wersja ma nasze patche
-- **Niskie:** Faza 3 — mechaniczna migracja `lazy_static`
-- **Wysokie:** Faza 4 — wymaga upstream coordination, poza scope
+11 spornych pozycji zderzonych w discussion roundzie z codexem. Wszystkie
+rozstrzygnięte przez `grep`/`cat` z path:line. Pełne ślady w
+`/tmp/codex_deps_audit.md` (raport codexa) i `/tmp/codex_deps_discussion.md`
+(round dyskusji). Mój pierwotny audit miał **7 błędów** (3x false-positive
+delete dla build-deps, 4x false-keep dla dead optional/feature deps) —
+korekty ujęte w §3 tabeli "Uwagi do potwierdzeń".
 
----
-
-**Wynik:** raport gotowy. Faza 1 (~1h) zalecana jako natychmiastowy follow-up — wszystkie zmiany bezpieczne (cargo build verification per-dep). Pełny cleanup do Fazy 3 ~6h.
+**Wynik:** raport gotowy. Faza 0+1 (~3-5h) zalecana jako natychmiastowy
+follow-up — wszystkie zmiany weryfikowalne `cargo build` per-feature.
