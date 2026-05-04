@@ -153,6 +153,19 @@ impl EmbeddedDeploy {
             }
         };
 
+        // Test mode: cfg(test) returns a stub PathBuf without touching HF
+        // download or the real backend load. Plumbing tests (DB writes,
+        // transport selection, log sink) do not need a loaded model —
+        // load_model requires a real .gguf/.safetensors file which unit
+        // tests do not provide.
+        #[cfg(test)]
+        {
+            let _ = (selection, preferred_backend);
+            return Ok(Some(std::path::PathBuf::from("/tmp/tentaflow-test-model.gguf")));
+        }
+        #[cfg(not(test))]
+        {
+
         let model_path = if let Some(path) = self
             .user_config
             .get("model_path")
@@ -245,6 +258,7 @@ impl EmbeddedDeploy {
         }
 
         Ok(Some(load_path))
+        }
     }
 }
 
@@ -440,8 +454,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_emits_models_for_embedded() {
+        // engine.id must be known to prepare_embedded_llm — "llama-cpp" or "mlx".
+        // Other ids return DeployError::Manifest("no local inference backend mapping").
         let m = manifest(
-            "emb-ok",
+            "llama-cpp",
             NativeRuntime::Embedded,
             vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
         );

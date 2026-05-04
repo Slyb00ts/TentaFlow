@@ -401,7 +401,7 @@ fi
         let dir = tempfile::tempdir().unwrap();
         write_fake_server(dir.path());
         let manifest = make_manifest("bin-rb", dir.path().to_str().unwrap());
-        let ports = Arc::new(PortAllocator::new((47_200, 47_210), HashSet::new()).unwrap());
+        let ports = Arc::new(PortAllocator::new((47_200, 47_299), HashSet::new()).unwrap());
         let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone(), None);
         let prepared = s.prepare().await.unwrap();
         let used = prepared.runtime.port.unwrap();
@@ -410,7 +410,7 @@ fi
         let next = ports.acquire().unwrap();
         // Cycle eventually returns the previously released port; we just check
         // we can keep allocating without exhausting the small range.
-        assert!(next >= 47_200 && next <= 47_210);
+        assert!(next >= 47_200 && next <= 47_299);
         let _ = ports.release(used);
         let _ = ports.release(next);
     }
