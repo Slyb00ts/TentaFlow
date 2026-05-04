@@ -253,3 +253,97 @@ korekty ujęte w §3 tabeli "Uwagi do potwierdzeń".
 
 **Wynik:** raport gotowy. Faza 0+1 (~3-5h) zalecana jako natychmiastowy
 follow-up — wszystkie zmiany weryfikowalne `cargo build` per-feature.
+
+---
+
+## 11. Wyniki cleanup (2026-05-04)
+
+Fazy 0-4 wykonane w jednym commicie (`469d8ec` na `main`). Każda faza
+weryfikowana niezależnym codex review.
+
+### Faza 0 — cross-workspace mechanical delete ✅
+
+50 dead deps usuniętych z 11 `Cargo.toml`. Trzy pozycje rollback'owane vs.
+codex audit (codex audit się mylił):
+- `serde` w `addon-template` i `embeddings-chunker` — derive macro wymaga
+  `serde` jako root crate, re-export przez SDK prelude nie wystarczy
+- `getrandom` w `protocol-wasm` — feature `js` wymagana przez transitive
+  deps (curve25519, serde) dla wasm32-unknown-unknown
+
+### Faza 1 — tentaflow-core dead deps ✅
+
+10 deps + feature `metrics-prometheus` usunięte:
+`chacha20poly1305`, `curve25519-dalek`, `mdns-sd`, `ndarray`, `prometheus`
+(+ feature), `serde_yaml`, `tokenizers`, `filetime` (dev), `core-foundation-sys`
+(macOS), `thiserror v1` (build).
+
+Codex review pierwotnie REJECT bo `metrics-prometheus = []` to no-op
+feature — fixed przez całkowite usunięcie feature i `tentaflow/Cargo.toml:16`
+nie enables go już.
+
+### Faza 2 — target/manual decision ⚠
+
+- `android-activity` ✅ usunięte (już w Fazie 0)
+- `wasmtime-wasi` 📌 **DEFERRED** — addony `wasm32-wasip1` faktycznie
+  importują `wasi_snapshot_preview1` (`environ_get`, `fd_write`, `proc_exit`,
+  `random_get`), ale `runtime_wasmtime::create_linker` nie wire'uje WASI.
+  Decyzja: utrzymać dep + zaplanowany dedykowany refactor (3-4h pracy) —
+  TODO komment w `runtime_wasmtime.rs:154` + memory note
+  `project_wasmtime_wasi_wiring_todo.md`.
+
+### Faza 3 — modernization ✅
+
+- `lazy_static` → `std::sync::OnceLock` w 4 blokach (~24 callsite):
+  `middleware/pii.rs` (8 patterns), `services/tts/processor.rs` (2 regex),
+  `mesh/node_info_collector.rs` (5 Mutex). Crate `lazy_static` usunięty.
+- `tentaflow-iroh-spike` — cały standalone crate usunięty (`git rm -r`,
+  661 LOC, historyczne `DECISION.md` rekomendowało CUT, iroh integration
+  ukończona w `mesh/iroh_manager.rs`).
+
+Codex review REJECT był false-positive (codex nie wiedział że diff
+kumulatywny od `cea1569` zawiera też Fazy 1+2). Funkcjonalnie wszystko
+clean — 0 stare callsite, 0 external uses.
+
+### Faza 4 — duplicate reduction ✅
+
+`netdev` 0.31 → 0.42 + 1 path fix w `mesh/network_interfaces.rs`
+(`InterfaceType` przeniesiony do `interface::types`). Eliminuje
+duplicate `netdev` w `cargo tree --duplicates`.
+
+### Verification matrix
+
+| Cel | Status | Czas |
+|-----|--------|-----:|
+| `cargo check` tentaflow-core full features | ✅ pass | 26s |
+| `cargo check` tentaflow binary | ✅ pass | 53s |
+| `cargo test --lib` tentaflow-core | ✅ 1119 pass / 9 baseline fails (pre-existing) | 70s |
+| `cargo check` tentaflow-mobile (iOS target) | ✅ pass | 12 min (1st build) |
+| `cargo check` tentaflow-desktop-macos | ✅ pass | 24s |
+| Android target (aarch64-linux-android) | ⏸ skip | target not installed |
+
+### Fazy odłożone
+
+- **Faza 5** — `ed25519-dalek` 2.2 vs vendored 3.0-pre.6 crypto policy.
+  Wymaga security review + upstream coordination z iroh. Wykracza poza
+  scope cleanup zależności.
+- **Faza 6** — upstream tracking (`hf-hub`, `reqwest` 0.12, wasmtime
+  versions, Windows generations). Ongoing process: periodyczne
+  `cargo update --dry-run`, monitoring upstream releases.
+
+### Niskie priorytety (audit wspomniał, nie zrobione)
+
+- `hound` removal w favor `symphonia::wav` — minimal overlap, 2-3h
+  refactor, low priority.
+- `tokenizers` (Faza 1 usunięte) — dep wraca gdy MLX bridge zacznie
+  używać `tokenizers::Tokenizer` API zamiast file IO.
+
+### Sumarycznie po cleanup
+
+- **75+ dead direct dependency entries** usunięte cross-workspace
+- **1 cały crate** (`tentaflow-iroh-spike`) usunięty
+- **31 plików** zmienionych: -2297 / +246 linii (czysta redukcja)
+- **lazy_static** modernization (Rust 1.70+ idiomatic OnceLock)
+- **netdev** version unified (eliminacja jednego transitive duplicate)
+- **1 deferred refactor** dla `wasmtime-wasi` wiring (zapisany w kodzie
+  + memory)
+
