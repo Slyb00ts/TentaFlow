@@ -94,7 +94,7 @@ fn is_alive_impl(pid: u32) -> bool {
     };
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle == 0 {
+        if handle.is_null() {
             return false;
         }
         let mut code: u32 = 0;
@@ -117,7 +117,7 @@ fn force_kill(pid: u32) -> Result<()> {
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle == 0 {
+        if handle.is_null() {
             anyhow::bail!("OpenProcess pid={} zwrocil null", pid);
         }
         let rc = TerminateProcess(handle, 1);

@@ -11,8 +11,12 @@ use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Performance::{
     PdhAddCounterW, PdhCloseQuery, PdhCollectQueryData, PdhEnumObjectItemsW,
     PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
-    PDH_FMT_NOCAP100, PERF_DETAIL_WIZARD,
+    PERF_DETAIL_WIZARD,
 };
+
+// PDH_FMT_NOCAP100 nie jest exportowane przez windows-sys 0.59. Stala z PDH API
+// (pdhmsg.h): nie capnij wartosci na 100 dla licznikow procentowych.
+const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 
 /// PDH operation error: a Win32 status code surfaced from the PDH API.
 #[derive(Debug)]
