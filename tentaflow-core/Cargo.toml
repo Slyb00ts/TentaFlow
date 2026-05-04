@@ -61,7 +61,7 @@ tentaflow-macros = { path = "../tentaflow-macros" }
 inventory = "0.3.24"
 
 # Async runtime
-tokio = { version = "1.52.1", features = ["full"] }
+tokio = { version = "1.52.2", features = ["full"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
 async-stream = "0.3.6"
@@ -69,16 +69,16 @@ async-stream = "0.3.6"
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
-iroh = { version = "=0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
+iroh = { version = "=0.98.2", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 iroh-relay = { version = "0.98.0", default-features = false, features = ["server"] }
 tentaflow-transport = { path = "../tentaflow-transport" }
-rustls = { version = "0.23.38", features = ["ring"] }
+rustls = { version = "0.23.40", features = ["ring"] }
 tokio-rustls = "0.26.4"
-rustls-pemfile = "2.2.0"
+rustls-pemfile = "2.1.3"
 tokio-util = "0.7.18"
 
 # HTTP
-reqwest = { version = "0.13.2", features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
+reqwest = { version = "0.13.3", features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
 hyper = { version = "1.9.0", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.3"
@@ -87,21 +87,21 @@ http-body-util = "0.1.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "1.1.2+spec-1.1.0"
-rkyv = { version = "0.8.15", features = ["unaligned"] }
+rkyv = { version = "0.8.16", features = ["unaligned"] }
 
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 # Crypto
 argon2 = "0.5.3"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.10.9"
+hmac = "0.12.1"
 aes-gcm = "0.10.3"
-hkdf = "0.12"
+hkdf = "0.12.4"
 zeroize = "1.8.2"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
-rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 
 # WebSocket
@@ -121,7 +121,7 @@ thiserror = "2.0.18"
 # Uzywany do YOLOv8-face / SCRFD / MiVOLO v2 / HSEmotion / EmoNet — modele
 # embedowane w binarce przez build.rs::embed_vision_models. Latencja CPU
 # ~10-30 ms/twarz na M1; akceptowalnie szybko, jednolicie cross-platform.
-tract-onnx = { version = "0.21", default-features = false }
+tract-onnx = { version = "0.22.1", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Embedowanie kontekstu kontenerow w binarce (deploy::bundle)
@@ -134,7 +134,7 @@ parking_lot = "0.12.5"
 dashmap = "6.1.0"
 arc-swap = "1.7.1"
 smallvec = "1.13"
-rustc-hash = "2"
+rustc-hash = "2.1.2"
 
 # Utils
 uuid = { version = "1.23.1", features = ["v4"] }
@@ -150,16 +150,16 @@ regex = "1.12.3"
 multer = "3.1"
 
 # Docker (optional)
-bollard = { version = "0.20.2", optional = true }
+bollard = { version = "0.21.0", optional = true }
 
 # Inference — llama.cpp (optional)
-llama-cpp-2 = { version = "0.1.143", features = ["sampler"], optional = true }
+llama-cpp-2 = { version = "0.1.146", features = ["sampler"], optional = true }
 encoding_rs = { version = "0.8.35", optional = true }
 
 # STT — Whisper (optional)
 whisper-rs = { version = "0.16.0", optional = true }
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9.0", optional = true }
 sherpa-rs = { version = "0.6.8", optional = true }
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
 
@@ -181,7 +181,7 @@ zip = "8.5.1"
 rcgen = "0.14.7"
 
 # GPU detection — cross-platform (Metal, Vulkan, DX12, GL)
-wgpu = "29.0.1"
+wgpu = "29.0.3"
 
 # Pobieranie modeli z HuggingFace
 hf-hub = "0.5.0"
@@ -193,17 +193,17 @@ dirs = "6.0.0"
 subtle = "2"
 
 # Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
-netdev = "0.42"
+netdev = "0.43.0"
 
 # WASM runtime — wasmtime na Desktop/Router, wasmi na Mobile (iOS/Android)
 # Target-specific dependencies ponizej
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.185"
+libc = "0.2.186"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.52"
-windows-sys = { version = "0.59", features = [
+winreg = "0.56.0"
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Performance",
     "Win32_System_SystemInformation",
@@ -213,19 +213,19 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 # Parser plist do wynikow `powermetrics -f plist` (samplery cpu_power / gpu_power)
-plist = "1.7"
+plist = "1.9.0"
 
 # libloading jest required na macOS/iOS, bo apple-tts (AVSpeechSynthesizer
 # przez libMLXBridge.dylib) jest ZAWSZE skompilowany na tych targetach,
 # bez feature flag. Inne featury (mlx-whisper, mlx-kokoro) tez go uzywaja
 # pod feature flag — ten wpis zapewnia ze libloading jest dostepny niezaleznie.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-libloading = "0.8"
+libloading = "0.9.0"
 
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-wasmtime = "43.0.1"
-wasmtime-wasi = "43.0.1"
+wasmtime = "44.0.1"
+wasmtime-wasi = "44.0.1"
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 wasmi = "1.0.9"
@@ -235,15 +235,15 @@ rcgen = "0.14.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1.2+spec-1.1.0"
-sha2 = "0.10"
+sha2 = "0.10.9"
 hex = "0.4"
 walkdir = "2"
 
 [dev-dependencies]
 rusqlite = { version = "0.39.0", features = ["bundled"] }
-wasmtime = "43.0.1"
+wasmtime = "44.0.1"
 tempfile = "3"
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 wiremock = "0.6"
 
 [[bench]]
