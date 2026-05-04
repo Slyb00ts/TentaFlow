@@ -13,7 +13,6 @@ path = "src/main.rs"
 tentaflow-protocol = { path = "../../../../tentaflow-protocol" }
 tentaflow-transport = { path = "../../../../tentaflow-transport" }
 iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
-rkyv = { version = "0.8", features = ["unaligned"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -48,10 +47,8 @@ clap = { version = "4", features = ["derive"] }
 
 # Inne
 anyhow = "1"
-byteorder = "1"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
-async-trait = "0.1"
 bytemuck = "1"
 # Dekodowanie base64 z DomEvent::VideoFrame — JS→Rust przez CDP binding nosi
 # tylko JSON, więc binarne klatki idą jako base64; tu wracamy do bajtów

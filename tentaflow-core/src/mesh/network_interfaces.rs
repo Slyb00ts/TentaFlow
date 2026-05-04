@@ -126,7 +126,7 @@ fn classify_interface(iface: &netdev::Interface) -> String {
     if n.starts_with("docker")
         || n.starts_with("br-")
         || n.starts_with("veth")
-        || n == "br0" && iface.if_type != netdev::interface::InterfaceType::Ethernet
+        || n == "br0" && iface.if_type != netdev::interface::types::InterfaceType::Ethernet
     {
         return "docker".to_string();
     }
@@ -147,7 +147,7 @@ fn classify_interface(iface: &netdev::Interface) -> String {
     if n.starts_with("wl") || n.starts_with("wlan") || n.starts_with("wlp") {
         return "wifi".to_string();
     }
-    if n == "lo" || iface.if_type == netdev::interface::InterfaceType::Loopback {
+    if n == "lo" || iface.if_type == netdev::interface::types::InterfaceType::Loopback {
         return "loopback".to_string();
     }
     if !iface.ipv4.is_empty() {

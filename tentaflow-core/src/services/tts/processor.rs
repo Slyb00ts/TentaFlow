@@ -6,31 +6,38 @@
 
 use crate::error::Result;
 
-use lazy_static::lazy_static;
 use regex::Regex;
+use std::sync::OnceLock;
 use tracing::debug;
 
-lazy_static! {
-    /// Regex do usuwania wielokrotnych spacji
-    static ref SPACES_REGEX: Regex = Regex::new(r"\s{2,}").unwrap();
+/// Regex do usuwania wielokrotnych spacji
+fn spaces_regex() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| Regex::new(r"\s{2,}").unwrap())
+}
 
-    /// Regex do usuwania emotikon (wszystkie Unicode emoji)
-    static ref EMOJI_REGEX: Regex = Regex::new(concat!(
-        r"[\x{1F600}-\x{1F64F}]|",  // Emoticons
-        r"[\x{1F300}-\x{1F5FF}]|",  // Misc Symbols and Pictographs
-        r"[\x{1F680}-\x{1F6FF}]|",  // Transport and Map
-        r"[\x{1F700}-\x{1F77F}]|",  // Alchemical Symbols
-        r"[\x{1F780}-\x{1F7FF}]|",  // Geometric Shapes Extended
-        r"[\x{1F800}-\x{1F8FF}]|",  // Supplemental Arrows-C
-        r"[\x{1F900}-\x{1F9FF}]|",  // Supplemental Symbols and Pictographs
-        r"[\x{1FA00}-\x{1FA6F}]|",  // Chess Symbols
-        r"[\x{1FA70}-\x{1FAFF}]|",  // Symbols and Pictographs Extended-A
-        r"[\x{2600}-\x{26FF}]|",    // Misc symbols (sun, moon, etc.)
-        r"[\x{2700}-\x{27BF}]|",    // Dingbats
-        r"[\x{FE00}-\x{FE0F}]|",    // Variation Selectors
-        r"[\x{1F000}-\x{1F02F}]|",  // Mahjong Tiles
-        r"[\x{1F0A0}-\x{1F0FF}]"    // Playing Cards
-    )).unwrap();
+/// Regex do usuwania emotikon (wszystkie Unicode emoji)
+fn emoji_regex() -> &'static Regex {
+    static C: OnceLock<Regex> = OnceLock::new();
+    C.get_or_init(|| {
+        Regex::new(concat!(
+            r"[\x{1F600}-\x{1F64F}]|",  // Emoticons
+            r"[\x{1F300}-\x{1F5FF}]|",  // Misc Symbols and Pictographs
+            r"[\x{1F680}-\x{1F6FF}]|",  // Transport and Map
+            r"[\x{1F700}-\x{1F77F}]|",  // Alchemical Symbols
+            r"[\x{1F780}-\x{1F7FF}]|",  // Geometric Shapes Extended
+            r"[\x{1F800}-\x{1F8FF}]|",  // Supplemental Arrows-C
+            r"[\x{1F900}-\x{1F9FF}]|",  // Supplemental Symbols and Pictographs
+            r"[\x{1FA00}-\x{1FA6F}]|",  // Chess Symbols
+            r"[\x{1FA70}-\x{1FAFF}]|",  // Symbols and Pictographs Extended-A
+            r"[\x{2600}-\x{26FF}]|",    // Misc symbols (sun, moon, etc.)
+            r"[\x{2700}-\x{27BF}]|",    // Dingbats
+            r"[\x{FE00}-\x{FE0F}]|",    // Variation Selectors
+            r"[\x{1F000}-\x{1F02F}]|",  // Mahjong Tiles
+            r"[\x{1F0A0}-\x{1F0FF}]"    // Playing Cards
+        ))
+        .unwrap()
+    })
 }
 
 /// Case-insensitive zamiana tekstu bez kompilacji regex przy kazdym wywolaniu.
@@ -64,7 +71,7 @@ fn clean_text_for_tts(text: &str) -> String {
     let mut result = text.to_string();
 
     // Usun emotikony
-    result = EMOJI_REGEX.replace_all(&result, "").to_string();
+    result = emoji_regex().replace_all(&result, "").to_string();
 
     // Usun znaki markdown formatting (gwiazdki do bold/italic)
     result = result.replace("**", "").replace("*", "");
@@ -174,7 +181,7 @@ fn clean_text_for_tts(text: &str) -> String {
     }
 
     // Usun wielokrotne spacje
-    result = SPACES_REGEX.replace_all(&result, " ").to_string();
+    result = spaces_regex().replace_all(&result, " ").to_string();
 
     // Trim
     result.trim().to_string()
