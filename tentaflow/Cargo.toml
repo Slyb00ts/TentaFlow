@@ -13,7 +13,7 @@ gpu-rocm = ["tentaflow-core/gpu-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
 
 [dependencies]
-tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus", "inference-diarization", "inference-sherpa"] }
+tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
@@ -21,19 +21,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rkyv = { version = "0.8.12", features = ["unaligned"] }
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-http-body = "1"
-futures = "0.3"
-uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
 parking_lot = "0.12"
-hex = "0.4"
 # Self-update — `tentaflow update` pobiera nowsza wersje z GitHub Releases
 # i podmienia biezaca binarke (external updater process — Windows nie blokuje
 # pliku w trakcie kopiowania).

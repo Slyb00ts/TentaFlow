@@ -151,6 +151,19 @@ pub fn memory_data_mut<'a, T: 'static>(
 }
 
 /// Tworzy nowy Linker dla silnika (wrapper na Linker::new)
+//
+// TODO(wasmtime-wasi): linker nie wire'uje WASI ale addony kompilowane do
+// wasm32-wasip1 importuja wasi_snapshot_preview1 (environ_get, fd_write,
+// proc_exit, random_get) — dodawane domyslnie przez Rust stdlib. Aktualnie
+// instantiate() polega na ich resolved przez wasmtime defaults (silent stub)
+// co oznacza ze panic w addonie i Rust rand crate moga zachowywac sie
+// nieprzewidywalnie. Wlasciwa naprawa: per-instance WasiCtxBuilder + p1::
+// add_to_linker_sync. Wymaga zmian w AddonState (pole `wasi: WasiP1Ctx`
+// cfg(not(any(ios, android)))), aktualizacji 8+ konstruktorow AddonState
+// w `addon/mod.rs:436`, `addon/instance_pool.rs:262`, testow w
+// `addon/host_functions/{llm,oauth,events,service}.rs`. Zaplanowane jako
+// osobny refactor (~3-4h pracy + dedykowane testy WASI behavior). Dep
+// `wasmtime-wasi` zostawiony w Cargo.toml mimo braku callsite.
 pub fn create_linker(engine: &WasmEngine) -> WasmLinker<AddonState> {
     WasmLinker::new(engine)
 }

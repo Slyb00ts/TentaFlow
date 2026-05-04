@@ -16,12 +16,10 @@ iroh = { version = "=0.98.0", default-features = false, features = ["address-loo
 
 # Serialization
 rkyv = { version = "0.8.12", features = ["std", "bytecheck", "unaligned"] }
-bytecheck = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
 async-trait = "0.1"
-futures = "0.3"
 
 # Utils
 thiserror = "2"

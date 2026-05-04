@@ -11,8 +11,6 @@ crate-type = ["staticlib"]
 [dependencies]
 tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "dashboard-api"] }
 tentaflow-ui = { path = "../../tentaflow-ui" }
-tentaflow-protocol = { path = "../../tentaflow-protocol" }
-hostname = "0.4"
 eframe = { version = "0.30", default-features = false, features = ["wgpu", "default_fonts"] }
 egui = "0.30"
 
@@ -21,7 +19,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 dirs = "5"
-uuid = { version = "1.0", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 hex = "0.4"
 data-encoding = "2"
@@ -31,4 +28,3 @@ tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inferen
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13"
-android-activity = "0.6"
