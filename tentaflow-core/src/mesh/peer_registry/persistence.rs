@@ -345,7 +345,7 @@ mod tests {
         }
     }
 
-    fn snap(version: u64) -> PeerPersistSnapshot {
+    fn snap() -> PeerPersistSnapshot {
         PeerPersistSnapshot {
             pubkey: vec![1, 2, 3],
             trust_state: TrustState::Discovered,
@@ -375,7 +375,7 @@ mod tests {
         for v in 1..=5 {
             tx.send(PersistOp::UpsertEntry {
                 node_id: id,
-                snapshot: snap(v),
+                snapshot: snap(),
                 version: v,
             })
             .await
@@ -414,7 +414,7 @@ mod tests {
             id[..4].copy_from_slice(&i.to_le_bytes());
             tx.send(PersistOp::UpsertEntry {
                 node_id: id,
-                snapshot: snap(1),
+                snapshot: snap(),
                 version: 1,
             })
             .await
@@ -438,7 +438,7 @@ mod tests {
             &mut buf,
             PersistOp::UpsertEntry {
                 node_id: id,
-                snapshot: snap(1),
+                snapshot: snap(),
                 version: 1,
             },
         );

@@ -417,20 +417,8 @@ fn peer_registry_subscribe_receives_delta_after_mutation() {
 // PR5: PersistenceWriter wiring + hydrate_from_db
 // =============================================================================
 
-use crate::mesh::peer_registry::persistence::{PendingWriteSnapshot, PersistOp, PersistSink};
+use crate::mesh::peer_registry::persistence::PersistOp;
 use crate::mesh::peer_registry::HintKind;
-
-#[derive(Default)]
-struct CountSink {
-    inner: std::sync::Mutex<Vec<Vec<(NodeId, PendingWriteSnapshot)>>>,
-}
-
-impl PersistSink for CountSink {
-    fn write_peer_batch(&self, ops: &[(NodeId, PendingWriteSnapshot)]) -> anyhow::Result<()> {
-        self.inner.lock().unwrap().push(ops.to_vec());
-        Ok(())
-    }
-}
 
 fn install_test_writer(reg: &PeerRegistry) -> Arc<std::sync::Mutex<Vec<PersistOp>>> {
     use tokio::sync::mpsc;

@@ -698,6 +698,7 @@ pub(crate) fn models_from_manifest(
 
 /// Reads the optional `transport_explicit` hint from user_config. Used by
 /// docker strategy as a Phase 6 preview (bypass sidecar for `direct_http`).
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
 pub(crate) fn transport_hint(user_config: &serde_json::Value) -> Option<String> {
     user_config
         .get("transport_explicit")
