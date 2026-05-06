@@ -1,6 +1,38 @@
 # Etap 3c — Streaming TTS
 
-**Plan v1.0 (do review codex)**
+**Plan v1.1 (po round 1 codex)**
+
+## Zmiany v1.0 → v1.1 (codex round 1)
+
+1. **CRITICAL — single-chunk wrapper to nie streaming.** Plan v1.0
+   proponował `stream_synthesize` jako `synthesize → 1 chunk → Stop`,
+   co dodaje SSE+base64 overhead bez korzyści (klient mógłby tak samo
+   użyć blocking `/v1/audio/speech`). Plan v1.1 oparty o **istniejący
+   chunking** w `routing/tts.rs::synthesize_speech_stream` (już dziś
+   tnie buffer na ~100ms PCM chunki, strip WAV header). Real streaming
+   = real chunking, end-to-end.
+2. **CRITICAL — konflikt z istniejącym `synthesize_speech_stream`.**
+   Legacy używa callback API (`chunk_sink: F`), nowy endpoint potrzebuje
+   `Stream<Item=TtsStreamChunk>`. Plan v1.1: refactor istniejącego API
+   na `Stream`-based + dodanie `cancel_token` parametru. Stara
+   sygnatura znika; jedyny caller (gdyby jakiś istniał — sprawdzić)
+   migrowany na nową.
+3. **IMPORTANT — cancel propagation.** Plan v1.1 dodaje route-level
+   `CancellationToken` przekazywany do `synthesize_speech_stream`.
+   Klient disconnect → `CancelOnDropStream` puszcza cancel → TTS abort
+   na granicy chunka. Backend native cancel (np. abort sherpa stream
+   socket) dochodzi z backend integration; Etap 3c pilnuje że nie
+   dodajemy KOLEJNYCH chunków do bufora po cancel.
+4. **IMPORTANT — clarify HTTP schema is private.** SSE shape `{audio_chunk:
+   "<base64>", mime, finish_reason}` to **TentaFlow-specific** endpoint
+   (`POST /v1/audio/speech/stream`), NIE OpenAI-compatible. OpenAI nie
+   ma streaming TTS contract'a (Realtime API to inny protokół, WebSocket
+   audio frames). Plan v1.1 nazywa endpoint `/v1/audio/speech/stream` ale
+   document'uje wprost: prywatny TentaFlow contract.
+5. **NIT akceptowany** — `AudioStreamChunk` shape OK dla 3c. Nie
+   próbujemy obsłużyć Realtime/WebSocket bez translation w przyszłości.
+
+## Plan v1.0 (do review codex)
 **Codex session ID:** `019dfca1-fef1-7ca1-b154-b73a796670a8`
 **Data:** 2026-05-06
 **Bazuje na:** Etap 3b (commit `7b197c4`)
@@ -149,39 +181,110 @@ pub trait TtsDispatcher: Send + Sync {
 
 ---
 
-## TtsDispatcherImpl::stream_synthesize
+## TtsDispatcherImpl::stream_synthesize (v1.1)
 
-Etap 3c implementacja: zawsze fallback. Backend native streaming będzie
-podpinany per-backend gdy ich integracja dorzuci `stream_synthesize`.
+**Real chunking** — bazujemy na istniejącym mechanizmie z
+`routing/tts.rs::synthesize_speech_stream` (PCM chunked at
+~100ms / `TTS_STREAM_CHUNK_BYTES`). Refactor istniejącego API na
+`Stream`-based + cancel:
 
 ```rust
-async fn stream_synthesize(
-    &self,
-    req: TtsRequest,
-) -> Result<BoxStream<'static, Result<TtsStreamChunk>>> {
-    // Etap 3c: blocking fallback. Wszystkie backendy poprzez
-    // `executor.execute_tts` zwracają cały blob; opakowujemy w jeden
-    // chunk + emit. Real streaming integration (sherpa, xtts) wraca
-    // w backend-specific follow-up.
-    let response = self.synthesize(req).await?;
-    let bytes = self.blobs.get(&response.audio).await?;
-    let chunk = TtsStreamChunk {
-        bytes_delta: bytes,
-        mime: response.mime,
-        sample_rate: response.sample_rate,
-        finish_reason: Some(FinishReason::Stop),
-    };
-    let stream = futures::stream::once(async move { Ok(chunk) });
-    Ok(Box::pin(stream))
+// routing/tts.rs (REFACTOR)
+const TTS_STREAM_CHUNK_BYTES: usize = 16_000; // ~100ms PCM @ 16kHz
+
+impl Router {
+    /// Etap 3c v1.1: zwraca Stream zamiast callback. Backend produkuje
+    /// całość blocking, my tniemy buffer + emitujemy chunki PCM.
+    /// `cancel` z `CancelOnDropStream` na endpoint side abortuje na
+    /// granicy chunka — kolejne chunki nie są emitowane po cancel.
+    pub async fn synthesize_speech_stream(
+        &self,
+        request: &TTSRequest,
+        user: Option<UserContext>,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<TtsStreamChunk>>> {
+        // Step 1: blocking synthesize (cała próbka).
+        let route_result = self.synthesize_speech(request, user).await?;
+        let mut bytes = route_result.response.bytes;
+        let mime = route_result.response.format.clone();
+        let sample_rate = ...;  // z backendu, gdy WAV — odkrywamy z header
+
+        // Step 2: jeśli WAV, strip header — surowe PCM chunki bez RIFF.
+        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+            bytes = strip_wav_header(&bytes)?;
+        }
+
+        // Step 3: chunkuj. Stream owinięty w state machine z cancel check.
+        let chunk_iter = bytes.chunks(TTS_STREAM_CHUNK_BYTES)
+            .map(|c| c.to_vec())
+            .collect::<Vec<_>>();
+        let total = chunk_iter.len();
+
+        let mime_clone = mime.clone();
+        let stream = futures::stream::iter(chunk_iter.into_iter().enumerate())
+            .map(move |(idx, chunk_bytes)| {
+                let is_last = idx + 1 == total;
+                Ok(TtsStreamChunk {
+                    bytes_delta: chunk_bytes,
+                    mime: mime_clone.clone(),
+                    sample_rate,
+                    finish_reason: if is_last {
+                        Some(FinishReason::Stop)
+                    } else {
+                        None
+                    },
+                })
+            })
+            // CancelOnDrop bridge: gdy klient disconnect, cancel.cancel()
+            // wywołane w drop, kolejne `next()` zwraca None.
+            .take_while(move |_| {
+                let cancelled = cancel.is_cancelled();
+                async move { !cancelled }
+            });
+        Ok(Box::pin(stream))
+    }
 }
 ```
 
-Po 3c, gdy chcemy real streaming dla sherpa-onnx: dodajemy gałąź "if
-backend supports streaming → backend.stream_chunks() else fallback".
+`TtsDispatcher::stream_synthesize` w `flow_engine/dispatchers/tts.rs`
+nadal zostaje na traicie (dla flow-engine spójności), ale **endpoint
+3c nie idzie przez dispatcher** — idzie direct przez
+`Router::synthesize_speech_stream` (już ma backend dispatch logic).
+TtsDispatcher::stream_synthesize w 3c implementacji robi to samo (woła
+Router'a) — symetryczne dla future flow integration.
+
+**Nie usuwamy** `TtsDispatcher::stream_synthesize` żeby trait surface
+nie był asymetryczny vs `LlmDispatcher::stream_chat`. Etap 3e (TTS-as-flow
+streaming) podepnie to do executor'a.
+
+### Cancel mechanism
+
+`CancelOnDropStream` (już istnieje w `flow_engine/cancel_on_drop.rs`)
+opakuje finalny SSE response. Drop → `cancel_token.cancel()` →
+`take_while` w stream machinerii widzi `is_cancelled() == true` → Stream
+EOF.
+
+**Limitation:** backend blocking synthesize nie jest abort'owany. Jeśli
+backend bierze 5s na pełną syntezę i klient disconnect po 1s, backend
+i tak skończy syntezę zanim my stream'ujemy. Real abort wymaga
+backend-side cancel (sherpa: WebSocket close; xtts: drop generator
+async).
+
+Etap 3c **dokumentuje to ograniczenie** — pełny resource leak fix wraca
+z backend native streaming + native cancel (osobny per-backend follow-up).
+3c daje:
+- działający chunked stream interface
+- klient już może konsumować chunked PCM
+- gdy backend support'uje real streaming, `synthesize_speech_stream`
+  refactor'owany do real-time emit (zamiast post-blocking chunking)
 
 ---
 
 ## Endpoint `/v1/audio/speech/stream`
+
+**TentaFlow-specific contract** (NIE OpenAI-compatible). OpenAI nie ma
+streaming TTS endpointa (Realtime API to inny protokół, WebSocket audio
+frames). Nasz endpoint = SSE z chunked PCM payload.
 
 ### Routing
 
@@ -271,13 +374,24 @@ impl FlowDispatcher {
 
 ---
 
-## CancelOnDropStream w SSE
+## CancelOnDropStream w SSE (v1.1)
 
-Klient disconnect → hyper drop response body → `CancelOnDropStream`
-puszcza cancel_token (z meta — ale dla TTS-stream meta nie istnieje, bo
-to nie jest flow). Etap 3c: nie podpinamy cancel — backend blocking
-i tak fini'shuje przed emisją tail. Real cancel wraca razem z real
-backend streaming.
+Endpoint tworzy `CancellationToken`, przekazuje do
+`synthesize_speech_stream`. Response body owinięty
+`CancelOnDropStream(stream, cancel_token)`. Klient disconnect → hyper
+drop body → `Drop` impl `cancel_token.cancel()` → stream `take_while`
+widzi `is_cancelled()` true → EOF.
+
+**Co robi:** zatrzymuje emisję KOLEJNYCH chunków po cancel. Bufor
+wewnętrzny się nie wypełnia, kolejne `chunk_iter.next()` nie powodują
+więcej allocs.
+
+**Czego NIE robi (limitation Etap 3c):** nie abortuje backend blocking
+synthesize. Jeśli backend bierze 5s, my czekamy 5s na pierwszy
+`synthesize_speech_stream(...)` await — cancel sygnalizuje się dopiero
+PO blocking syntezie. To jest świadomy ograniczenie 3c; pełny abort
+wymaga backend-native cancel (sherpa WebSocket close, xtts generator
+drop) i wraca z per-backend streaming follow-up.
 
 ---
 
@@ -290,11 +404,12 @@ backend streaming.
 | `flow_engine/dispatchers_impl/tts_impl.rs` | + `stream_synthesize` impl (fallback wrapper) | +50 |
 | `flow_engine/dispatcher.rs` | + `pub fn tts()` accessor | +10 |
 | `api/openai/server.rs` | + `handle_audio_tts_stream` + route | +120 |
-| `routing/tts.rs` | (sprawdzić obecny `synthesize_speech_stream`, refactor lub usunąć — to dziś jest bare passthrough z chunkowaniem PCM) | +0 / -50 (cleanup) |
+| `routing/tts.rs` | refactor `synthesize_speech_stream`: callback `chunk_sink: F` → `Stream<Item=TtsStreamChunk>`. + `cancel_token` parametr. take_while bridge. + `strip_wav_header` reused. | +60 |
 | Tests w `flow_engine/dispatchers_impl/tts_impl.rs` | unit test: stream_synthesize fallback emituje 1 chunk | +30 |
 | Tests w `api/openai/server.rs` (lub integration) | E2E SSE response shape | +60 |
 
-**Razem: ~285 LOC.** Małe sub-stage.
+**Razem v1.1: ~330 LOC** (refactor `synthesize_speech_stream` zamiast
+pseudo-streaming wrapper).
 
 ---
 
