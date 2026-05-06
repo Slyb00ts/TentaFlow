@@ -1423,6 +1423,15 @@ pub(crate) fn standard_engine_env() -> HashMap<String, String> {
     env.insert("HUGGINGFACE_HUB_CACHE".into(), hf_str.clone());
     env.insert("TRANSFORMERS_CACHE".into(), hf_str);
     env.insert("TORCH_HOME".into(), torch.to_string_lossy().to_string());
+    // VLLM_CACHE_ROOT — shared persistent cache for Triton kernels,
+    // torch.compile artifacts and FlashInfer JIT. Set unconditionally
+    // (harmless for non-vLLM engines, big win for any vLLM family).
+    // For Docker the container path is used; native deploys override
+    // with the host path in `python_venv::spawn_engine`.
+    env.insert(
+        "VLLM_CACHE_ROOT".into(),
+        crate::paths::CONTAINER_VLLM_CACHE_PATH.to_string(),
+    );
     env
 }
 
@@ -1529,6 +1538,9 @@ mod tests {
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,
+                speculator_repo: None,
+                speculator_method: None,
+                speculator_num_tokens: None,
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

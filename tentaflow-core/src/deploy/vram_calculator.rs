@@ -1040,6 +1040,17 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
         parts.push("--enable-chunked-prefill".into());
     }
 
+    // prefix-caching: dramatyczne wygrana dla powtarzalnych promptow
+    // (system prompts, RAG context). Bezpieczne dla wszystkich kategorii
+    // modeli — vllm sam wylacza w przypadkach gdzie nie ma sensu.
+    parts.push("--enable-prefix-caching".into());
+
+    // FlashInfer autotune — wybor najlepszych CUDA kerneli per (shape,
+    // dtype, arch) przy pierwszym starcie + cache w VLLM_CACHE_ROOT.
+    // Aktywny tylko gdy backend == FlashInfer (vllm sam wybiera lub
+    // VLLM_ATTENTION_BACKEND=FLASHINFER); na innych backendach no-op.
+    parts.push("--enable-flashinfer-autotune".into());
+
     if input.tensor_parallel > 1 {
         parts.push("--tensor-parallel-size".into());
         parts.push(input.tensor_parallel.to_string());

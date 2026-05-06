@@ -60,6 +60,14 @@ pub struct InstallVariant {
     pub extras_no_build_isolation: Vec<String>,
     #[serde(default)]
     pub install_hint: Option<String>,
+    /// Env vars wstrzykiwane wylacznie do procesow `pip install` (a wiec
+    /// rowniez do source builda gdy `source = "git"`). Uzywane np. przez
+    /// `vllm-spark` zeby ustawic `TORCH_CUDA_ARCH_LIST=12.1a` przed
+    /// `pip install -e .` (build CUDA kerneli pod sm_121a). Mergowane na
+    /// install z `extra_env` z deploy requestu — wariant wygrywa gdy klucze
+    /// sie pokrywaja, bo manifest jest twardszym kontraktem niz runtime hint.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     /// Pakiety force-reinstallowane PO calym install flow (lock + extras +
     /// main + extras_no_build_isolation). Naprawia sytuacje gdy main package
     /// upstream upgraduje wersje, ktore my musimy trzymac na konkretnej
@@ -238,7 +246,7 @@ pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEn
     check_platform_compat(&spec.requires)?;
 
     let detected = crate::system_check::collect();
-    let backend_name = backend_to_str(&detected.gpu.preferred_backend);
+    let backend_name = install_variant_tag(&detected.gpu);
     let variant = pick_install_variant(&spec.install_variants, backend_name)?;
     log(&format!(
         "bootstrap: engine={} backend={}",
@@ -291,7 +299,7 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
 
     // Wykryj backend (CUDA/ROCm/Metal/XPU) i wybierz odpowiedni variant.
     let detected = crate::system_check::collect();
-    let backend_name = backend_to_str(&detected.gpu.preferred_backend);
+    let backend_name = install_variant_tag(&detected.gpu);
     let variant = pick_install_variant(&spec.install_variants, backend_name)?;
     log(&format!(
         "wariant instalacji: engine={} backend={}",
@@ -906,12 +914,18 @@ fn install_deps(
     log: &LogSink,
 ) -> Result<()> {
     let extra_index = variant.and_then(|v| v.extra_index.clone());
+    let mut merged_env = extra_env.clone();
+    if let Some(v) = variant {
+        for (k, val) in &v.env {
+            merged_env.insert(k.clone(), val.clone());
+        }
+    }
     let installer = Installer::new(
         venv,
         uv.as_deref(),
         extra_index,
         Arc::clone(log),
-        extra_env.clone(),
+        merged_env,
     );
     // setuptools>=77 wymagane zeby VoxCPM / niektore nowe pyproject.toml
     // z `license = "MIT"` (string form, PEP 639) sie instalowaly.
@@ -1261,8 +1275,22 @@ fn backend_to_str(b: &crate::system_check::GpuBackend) -> &'static str {
     }
 }
 
+/// Tag wariantu installu uwzgledniajacy DGX Spark. Dla zwyklych hostow
+/// zwraca to samo co `backend_to_str`. Dla Sparka (sm_121a) zwraca
+/// `"cuda-spark"` — bundle moze zadeklarowac osobny wariant z innym
+/// `extra_index` (nightly aarch64 wheels) i innymi env (TORCH_CUDA_ARCH_LIST).
+fn install_variant_tag(gpu: &crate::system_check::GpuSnapshot) -> &'static str {
+    if gpu.is_dgx_spark && matches!(gpu.preferred_backend, crate::system_check::GpuBackend::Cuda) {
+        "cuda-spark"
+    } else {
+        backend_to_str(&gpu.preferred_backend)
+    }
+}
+
 /// Wybiera wariant instalacji pasujacy do backendu. Jesli brak wariantu
-/// dla danego backendu — fallback w kolejnosci cuda/rocm/metal/xpu/cpu.
+/// dla danego backendu — dla `cuda-spark` probujemy `cuda` jako fallback
+/// (zachowanie BC dla bundli ktore nie deklaruja jeszcze wariantu Spark);
+/// dla innych: pierwszy dostepny + ostrzezenie.
 fn pick_install_variant<'a>(
     variants: &'a [InstallVariant],
     backend: &str,
@@ -1272,6 +1300,14 @@ fn pick_install_variant<'a>(
     }
     if let Some(v) = variants.iter().find(|v| v.backend == backend) {
         return Ok(Some(v));
+    }
+    if backend == "cuda-spark" {
+        if let Some(v) = variants.iter().find(|v| v.backend == "cuda") {
+            tracing::warn!(
+                "bundle nie ma wariantu 'cuda-spark' — fallback na 'cuda' (PyPI wheels moga sypac sie na sm_121)"
+            );
+            return Ok(Some(v));
+        }
     }
     // Fallback: spytaj pierwsze dostepne, ale ostrzez
     tracing::warn!(
@@ -1404,11 +1440,17 @@ impl<'a> Installer<'a> {
         self.run_install(&mut c)
     }
     fn install_editable(&self, path: &Path) -> Result<()> {
-        (self.log)(&format!("pip: install -e {}", path.display()));
+        (self.log)(&format!("pip: install -e {} (verbose)", path.display()));
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
+        // `-v` jest celowo TYLKO dla install_editable. To jedyna faza ktora
+        // potrafi byc cicha 20-30 min (vllm/sglang z source -> CMake -> nvcc
+        // kernels). Verbose pokazuje kazdy subprocess ktory uv/pip odpala
+        // (`python setup.py build`, `cmake --build`, `nvcc ...`), wiec user
+        // widzi co sie dzieje w tle bez polegania tylko na heartbeacie.
+        c.arg("-v");
         c.arg("-e").arg(path);
         self.run_install(&mut c)
     }
@@ -1670,11 +1712,17 @@ fn spawn_engine(
     let _ = crate::paths::ensure_models_dirs();
     let hf = crate::paths::hf_home();
     let torch = crate::paths::torch_home();
+    let vllm_cache = crate::paths::vllm_cache_dir();
+    let _ = std::fs::create_dir_all(&vllm_cache);
     for (k, v) in [
         ("HF_HOME", hf.clone()),
         ("HUGGINGFACE_HUB_CACHE", hf.clone()),
         ("TRANSFORMERS_CACHE", hf.clone()),
         ("TORCH_HOME", torch.clone()),
+        // Shared vLLM kernel cache (host path for native; Docker uses
+        // CONTAINER_VLLM_CACHE_PATH from standard_engine_env). Persists
+        // Triton/torch.compile/FlashInfer JIT across restarts.
+        ("VLLM_CACHE_ROOT", vllm_cache.clone()),
     ] {
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
@@ -1919,6 +1967,7 @@ fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let program = format!("{:?}", cmd.get_program());
     let mut child = cmd.spawn().with_context(|| format!("spawn {}", program))?;
+    let child_pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -1939,13 +1988,130 @@ fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
         }
     });
 
+    // Heartbeat — emit kazde 30s wskazujac ze subprocess wciaz zyje + co
+    // konkretnie teraz robi (lista descendants z RSS). Krytyczne dla
+    // dlugich `pip install -e` (kompilacja CUDA kerneli moze siedziec cicho
+    // przez 20-30 min). Wątek wisi na flagstop ustawianej po `wait()`.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = Arc::clone(&stop);
+    let cb_hb = Arc::clone(log_cb);
+    let hb_handle = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(30);
+        let mut next_tick = start + interval;
+        loop {
+            if stop_t.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let now = std::time::Instant::now();
+            if now < next_tick {
+                continue;
+            }
+            next_tick = now + interval;
+            let elapsed = now.duration_since(start);
+            let mins = elapsed.as_secs() / 60;
+            let secs = elapsed.as_secs() % 60;
+            let descendants = collect_descendant_summary(child_pid);
+            let summary = if descendants.is_empty() {
+                "(brak aktywnych pod-procesow)".to_string()
+            } else {
+                descendants
+            };
+            cb_hb(&format!(
+                "[heartbeat] elapsed={:02}:{:02} active: {}",
+                mins, secs, summary
+            ));
+        }
+    });
+
     let status = child.wait().with_context(|| format!("wait {}", program))?;
+    stop.store(true, Ordering::Relaxed);
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
+    let _ = hb_handle.join();
     if !status.success() {
         anyhow::bail!("{} zwrocilo kod {}", program, status);
     }
     Ok(())
+}
+
+/// Zbiera listę aktywnych descendants procesu `root_pid` z czytelnym
+/// streszczeniem `comm(rss_mb)`. Linux-only — na innych OS zwraca pusty
+/// string (heartbeat dalej leci, tylko bez listy podprocesów). Używa `ps`,
+/// bo to jedyny sposób bez doinstalowania zewnętrznych crate'ów.
+fn collect_descendant_summary(root_pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        // ps -e -o pid,ppid,rss,comm — RSS w KB. Jedna kolumna comm na koncu.
+        let out = Command::new("ps")
+            .args(["-e", "-o", "pid=,ppid=,rss=,comm="])
+            .output();
+        let stdout = match out {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => return String::new(),
+        };
+        let text = String::from_utf8_lossy(&stdout);
+        // Build pid -> (ppid, rss_kb, comm)
+        let mut by_pid: std::collections::HashMap<u32, (u32, u64, String)> =
+            std::collections::HashMap::new();
+        for line in text.lines() {
+            let mut it = line.split_ascii_whitespace();
+            let pid: u32 = match it.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            let ppid: u32 = match it.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            let rss: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let comm: String = it.collect::<Vec<_>>().join(" ");
+            if comm.is_empty() {
+                continue;
+            }
+            by_pid.insert(pid, (ppid, rss, comm));
+        }
+        // BFS od root_pid przez ppid relację.
+        let mut active = std::collections::HashSet::new();
+        active.insert(root_pid);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (pid, (ppid, _, _)) in &by_pid {
+                if active.contains(ppid) && !active.contains(pid) {
+                    active.insert(*pid);
+                    changed = true;
+                }
+            }
+        }
+        // Render — tylko descendants (pomijamy root_pid), max 6 wpisów po
+        // RSS malejaco zeby linia heartbeat nie spuchla.
+        let mut entries: Vec<(u64, String)> = active
+            .iter()
+            .filter(|p| **p != root_pid)
+            .filter_map(|p| by_pid.get(p).map(|(_, rss, comm)| (*rss, comm.clone())))
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        let max = 6;
+        let truncated_count = entries.len().saturating_sub(max);
+        entries.truncate(max);
+        let parts: Vec<String> = entries
+            .into_iter()
+            .map(|(rss_kb, comm)| format!("{}({}MB)", comm, rss_kb / 1024))
+            .collect();
+        if truncated_count > 0 {
+            format!("{} +{} more", parts.join(", "), truncated_count)
+        } else {
+            parts.join(", ")
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root_pid;
+        String::new()
+    }
 }
 
 #[cfg(test)]
@@ -2222,6 +2388,7 @@ mod tests {
                 extras: vec![],
                 extras_no_build_isolation: vec![],
                 install_hint: None,
+                env: HashMap::new(),
                 force_pins: vec![],
             },
             InstallVariant {
@@ -2230,6 +2397,7 @@ mod tests {
                 extras: vec![],
                 extras_no_build_isolation: vec![],
                 install_hint: None,
+                env: HashMap::new(),
                 force_pins: vec![],
             },
             InstallVariant {
@@ -2238,6 +2406,7 @@ mod tests {
                 extras: vec!["vllm-metal".into()],
                 extras_no_build_isolation: vec![],
                 install_hint: None,
+                env: HashMap::new(),
                 force_pins: vec![],
             },
         ];
