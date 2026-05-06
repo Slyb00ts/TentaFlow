@@ -39,7 +39,7 @@ use crate::flow_engine::node_adapters::{
     ConditionNodeAdapter, ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter,
     MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, SessionContextNodeAdapter,
     SpeakerContextNodeAdapter, SttNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
-    TtsNodeAdapter,
+    TtsNodeAdapter, VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::services::runtime::quic_handle::ServiceManager;
@@ -148,7 +148,8 @@ impl FlowDispatcher {
         let quic_finder = Arc::new(ServiceManagerQuicFinder::new(service_manager.clone()));
         let memory: Arc<dyn MemoryStore> = Arc::new(MemoryStoreImpl::new(quic_finder));
 
-        let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(runtime_slot.clone()));
+        let llm: Arc<dyn LlmDispatcher> =
+            Arc::new(LlmDispatcherImpl::new(runtime_slot.clone(), blobs.clone()));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
@@ -203,9 +204,10 @@ impl FlowDispatcher {
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> Result<Option<FlowExecutionOutcome>> {
-        let cache_key = format!("{}:{}", model_name, service_type);
+        let modality = derive_modality(&initial);
+        let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
         let cached = match self
-            .resolve_cached(&cache_key, model_name, service_type)
+            .resolve_cached(&cache_key, model_name, service_type, modality)
             .await?
         {
             Some(c) => c,
@@ -253,9 +255,10 @@ impl FlowDispatcher {
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> Result<Option<StreamingExecution>> {
-        let cache_key = format!("{}:{}", model_name, service_type);
+        let modality = derive_modality(&initial);
+        let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
         let cached = match self
-            .resolve_cached(&cache_key, model_name, service_type)
+            .resolve_cached(&cache_key, model_name, service_type, modality)
             .await?
         {
             Some(c) => c,
@@ -328,6 +331,7 @@ impl FlowDispatcher {
         cache_key: &str,
         model_name: &str,
         service_type: &str,
+        request_modality: &'static str,
     ) -> Result<Option<Arc<CachedFlow>>> {
         if let Some(slot) = self.cache.get(cache_key) {
             return Ok(slot);
@@ -336,7 +340,7 @@ impl FlowDispatcher {
         let model_owned = model_name.to_string();
         let service_owned = service_type.to_string();
         let resolved = tokio::task::spawn_blocking(move || {
-            resolver::resolve_flow(&pool, &model_owned, &service_owned)
+            resolver::resolve_flow(&pool, &model_owned, &service_owned, request_modality)
         })
         .await??;
         match resolved {
@@ -364,6 +368,17 @@ impl FlowDispatcher {
     }
 }
 
+/// Etap 3b: derive request modality z initial envelope payload — vision
+/// flows MUSZĄ być explicit bound, default flow działa tylko dla text.
+/// `Image` payload → "image", reszta (Text/Empty/Json/...) → "text".
+fn derive_modality(envelope: &FlowEnvelope) -> &'static str {
+    use crate::flow_engine::envelope::FlowValue;
+    match envelope.payload {
+        FlowValue::Image { .. } => "image",
+        _ => "text",
+    }
+}
+
 /// Buduje AdapterRegistry z wszystkimi 13 adapterami stage 1c. Side effect-free
 /// (adaptery są stateless / leniwie pobierają state z ExecutionContext).
 fn build_registry() -> AdapterRegistry {
@@ -381,6 +396,7 @@ fn build_registry() -> AdapterRegistry {
         Arc::new(ConversationHistoryNodeAdapter::new()),
         Arc::new(SessionContextNodeAdapter::new()),
         Arc::new(SpeakerContextNodeAdapter::new()),
+        Arc::new(VisionNodeAdapter::new()),
     ];
     for a in arcs {
         r.register(a);

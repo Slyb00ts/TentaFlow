@@ -58,7 +58,10 @@ impl ConversationHistoryStore for ConversationHistoryImpl {
             .skip(start)
             .map(|m| ChatMessage {
                 role: role_from_str(&m.role),
-                content: m.content,
+                // Etap 3b: cache trzyma plain String — zawsze Text content.
+                // Multimodal historia (image w cache) wraca razem z storage
+                // rewrite (Etap 4+).
+                content: crate::flow_engine::envelope::ChatMessageContent::Text(m.content),
                 name: None,
                 tool_call_id: None,
             })
@@ -66,8 +69,12 @@ impl ConversationHistoryStore for ConversationHistoryImpl {
     }
 
     async fn append(&self, session_id: &str, message: ChatMessage) -> Result<()> {
+        // Cache string-only — text_or_default skleja text parts gdy
+        // multimodal, image parts są dropowane (storage limit, wraca z
+        // multimodal cache w late Etap 3+).
+        let content = message.text_or_default();
         self.cache
-            .add_message(session_id, role_to_str(message.role), &message.content)
+            .add_message(session_id, role_to_str(message.role), &content)
             .await;
         Ok(())
     }
@@ -93,7 +100,7 @@ mod tests {
         assert_eq!(h.len(), 2);
         assert_eq!(h[0].role, ChatRole::User);
         assert_eq!(h[1].role, ChatRole::Assistant);
-        assert_eq!(h[0].content, "hello");
+        assert_eq!(h[0].text(), Some("hello"));
     }
 
     #[tokio::test]
@@ -108,7 +115,7 @@ mod tests {
         }
         let h = store.recent("s", 2).await.unwrap();
         assert_eq!(h.len(), 2);
-        assert_eq!(h[0].content, "m3");
-        assert_eq!(h[1].content, "m4");
+        assert_eq!(h[0].text(), Some("m3"));
+        assert_eq!(h[1].text(), Some("m4"));
     }
 }

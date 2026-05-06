@@ -16,20 +16,29 @@ use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest, Message, MessageContent,
+    ChatCompletionChunk, ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent,
 };
+use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
-use crate::flow_engine::envelope::{ChatMessage, ChatRole, FinishReason, LlmStreamChunk, TokenUsage};
+use crate::flow_engine::envelope::{
+    ChatMessage, ChatMessageContent, ChatRole, FinishReason, LlmStreamChunk, MessagePart,
+    TokenUsage,
+};
 use super::{build_user_context, ModelRuntimeSlot};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
+use base64::Engine;
+use std::sync::Arc;
 
 pub struct LlmDispatcherImpl {
     runtime: ModelRuntimeSlot,
+    /// Etap 3b: BlobStore do rozwijania `MessagePart::Image.blob_ref` na
+    /// data URL przed wysłaniem do backendu.
+    blobs: Arc<dyn BlobStore>,
 }
 
 impl LlmDispatcherImpl {
-    pub fn new(runtime: ModelRuntimeSlot) -> Self {
-        Self { runtime }
+    pub fn new(runtime: ModelRuntimeSlot, blobs: Arc<dyn BlobStore>) -> Self {
+        Self { runtime, blobs }
     }
 
     fn runtime(&self) -> Result<std::sync::Arc<crate::services::runtime::executor::ModelRuntimeExecutor>> {
@@ -46,7 +55,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
     async fn execute_chat(&self, req: LlmRequest) -> Result<LlmResponse> {
         let cancel = req.cancel_token.clone();
         let deadline = req.deadline;
-        let api_req = build_chat_request(&req, false);
+        let api_req = build_chat_request(&req, false, self.blobs.as_ref()).await?;
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let mut rctx = RuntimeContext::new(user);
         // Cancel + deadline są egzekwowane na poziomie wrappera bo
@@ -106,7 +115,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
     ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
         let cancel = req.cancel_token.clone();
         let deadline = req.deadline;
-        let api_req = build_chat_request(&req, true);
+        let api_req = build_chat_request(&req, true, self.blobs.as_ref()).await?;
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let mut rctx = RuntimeContext::new(user);
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
@@ -215,10 +224,18 @@ where
     }
 }
 
-fn build_chat_request(req: &LlmRequest, stream: bool) -> ChatCompletionRequest {
-    ChatCompletionRequest {
+async fn build_chat_request(
+    req: &LlmRequest,
+    stream: bool,
+    blobs: &dyn BlobStore,
+) -> Result<ChatCompletionRequest> {
+    let mut messages = Vec::with_capacity(req.messages.len());
+    for m in &req.messages {
+        messages.push(chat_msg_to_openai(m, blobs).await?);
+    }
+    Ok(ChatCompletionRequest {
         model: req.model.clone(),
-        messages: req.messages.iter().map(chat_msg_to_openai).collect(),
+        messages,
         temperature: req.temperature,
         max_tokens: req.max_tokens,
         top_p: req.top_p,
@@ -238,18 +255,45 @@ fn build_chat_request(req: &LlmRequest, stream: bool) -> ChatCompletionRequest {
         n: None,
         memory_options: None,
         audio_input: None,
-    }
+    })
 }
 
-fn chat_msg_to_openai(m: &ChatMessage) -> Message {
-    Message {
+/// Etap 3b: async — rozwija `MessagePart::Image.blob_ref` przez BlobStore
+/// na base64 data URL. `Text` content przechodzi bez async work.
+async fn chat_msg_to_openai(m: &ChatMessage, blobs: &dyn BlobStore) -> Result<Message> {
+    let content = match &m.content {
+        ChatMessageContent::Text(t) => Some(MessageContent::Text(t.clone())),
+        ChatMessageContent::Parts(parts) => {
+            let mut openai_parts = Vec::with_capacity(parts.len());
+            for p in parts {
+                match p {
+                    MessagePart::Text { text } => {
+                        openai_parts.push(ContentPart::Text { text: text.clone() });
+                    }
+                    MessagePart::Image { blob_ref, detail } => {
+                        let bytes = blobs.get(blob_ref).await?;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let url = format!("data:{};base64,{}", blob_ref.mime, b64);
+                        openai_parts.push(ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url,
+                                detail: Some(detail.clone()),
+                            },
+                        });
+                    }
+                }
+            }
+            Some(MessageContent::Parts(openai_parts))
+        }
+    };
+    Ok(Message {
         role: chat_role_to_str(m.role).to_string(),
-        content: Some(MessageContent::Text(m.content.clone())),
+        content,
         reasoning_content: None,
         name: m.name.clone(),
         tool_calls: None,
         tool_call_id: m.tool_call_id.clone(),
-    }
+    })
 }
 
 fn chat_role_to_str(r: ChatRole) -> &'static str {
@@ -322,14 +366,48 @@ mod tests {
         assert_eq!(openai_finish_to_envelope(Some("xxx")), FinishReason::Stop);
     }
 
-    #[test]
-    fn chat_msg_round_trips_role_and_content() {
+    #[tokio::test]
+    async fn chat_msg_round_trips_role_and_content() {
+        use crate::flow_engine::blob_store::InMemoryBlobStore;
         let m = ChatMessage::user("hello");
-        let api = chat_msg_to_openai(&m);
+        let blobs = InMemoryBlobStore::new();
+        let api = chat_msg_to_openai(&m, &blobs).await.unwrap();
         assert_eq!(api.role, "user");
         match api.content {
             Some(MessageContent::Text(t)) => assert_eq!(t, "hello"),
             _ => panic!("expected text content"),
+        }
+    }
+
+    /// Etap 3b: multimodal Parts → OpenAI Parts z base64 data URL.
+    #[tokio::test]
+    async fn chat_msg_multimodal_resolves_blob_to_data_url() {
+        use crate::flow_engine::blob_store::InMemoryBlobStore;
+        use crate::flow_engine::envelope::MessagePart;
+        let blobs = InMemoryBlobStore::new();
+        let blob_ref = blobs
+            .put(b"fake-jpeg".to_vec(), "image/jpeg")
+            .await
+            .unwrap();
+        let m = ChatMessage::user_multimodal(vec![
+            MessagePart::Text { text: "what?".into() },
+            MessagePart::Image {
+                blob_ref: blob_ref.clone(),
+                detail: "auto".into(),
+            },
+        ]);
+        let api = chat_msg_to_openai(&m, &blobs).await.unwrap();
+        match api.content {
+            Some(MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                if let ContentPart::ImageUrl { image_url } = &parts[1] {
+                    assert!(image_url.url.starts_with("data:image/jpeg;base64,"));
+                    assert_eq!(image_url.detail.as_deref(), Some("auto"));
+                } else {
+                    panic!("expected ImageUrl in parts[1]");
+                }
+            }
+            _ => panic!("expected Parts content"),
         }
     }
 }
