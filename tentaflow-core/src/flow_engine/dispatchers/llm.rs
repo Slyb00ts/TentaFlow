@@ -19,6 +19,11 @@ pub struct LlmRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Etap 2: pozostałe sampling params z `ChatCompletionRequest` —
+    /// adapter LLM czyta je z fallback `node.config -> envelope.meta`.
+    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub stop: Vec<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
@@ -36,6 +41,9 @@ impl LlmRequest {
             messages: Vec::new(),
             temperature: None,
             max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             stop: Vec::new(),
             deadline: None,
             cancel_token: CancellationToken::new(),

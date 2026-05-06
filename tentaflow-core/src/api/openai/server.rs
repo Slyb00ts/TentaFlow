@@ -427,6 +427,7 @@ async fn handle_audio_tts(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -533,6 +534,9 @@ async fn handle_audio_tts(
                     );
                 }
             }
+            if want_trailers {
+                emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
+            }
             Ok(resp)
         }
         Err(e) => {
@@ -564,6 +568,7 @@ async fn handle_audio_transcriptions(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -784,6 +789,9 @@ async fn handle_audio_transcriptions(
                     );
                 }
             }
+            if want_trailers {
+                emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
+            }
             Ok(resp)
         }
         Err(e) => {
@@ -812,6 +820,7 @@ async fn handle_embeddings(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -853,6 +862,9 @@ async fn handle_embeddings(
                         "X-TentaFlow-Route".parse().unwrap(),
                     );
                 }
+            }
+            if want_trailers {
+                emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
             }
             Ok(resp)
         }

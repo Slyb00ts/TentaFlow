@@ -221,9 +221,9 @@ fn build_chat_request(req: &LlmRequest, stream: bool) -> ChatCompletionRequest {
         messages: req.messages.iter().map(chat_msg_to_openai).collect(),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
-        top_p: None,
-        frequency_penalty: None,
-        presence_penalty: None,
+        top_p: req.top_p,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
         stop: if req.stop.is_empty() {
             None
         } else {

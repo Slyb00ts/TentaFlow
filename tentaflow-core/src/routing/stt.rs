@@ -157,7 +157,9 @@ impl Router {
                     language: language.clone(),
                 };
 
-                match self.synthesize_speech(&tts_request).await {
+                // route_audio_via_protocol jest wywoływane przez reverse-mesh
+                // path bez user context (internal caller, ACL fail-open).
+                match self.synthesize_speech(&tts_request, None).await {
                     Ok(tts_result) => {
                         let audio_bytes = tts_result.response.bytes;
                         let response = ModelResponse {
