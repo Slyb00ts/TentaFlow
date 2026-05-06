@@ -793,9 +793,12 @@ impl ModelRuntimeExecutor {
                 // that is not the one this branch picked.
                 let dispatch_result = {
                     let user = ctx.user.clone();
+                    let blobs = dispatcher.blobs();
                     let (initial, meta) = crate::routing::build_initial_envelope_for_user(
-                        &request, user,
-                    );
+                        &request, user, &blobs,
+                    )
+                    .await
+                    .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
                     dispatcher
                         .dispatch_by_flow_id(*flow_id, initial, meta)
                         .await
