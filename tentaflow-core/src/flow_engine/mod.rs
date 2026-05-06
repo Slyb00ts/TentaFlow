@@ -14,6 +14,8 @@ pub mod dispatcher;
 pub mod dispatchers;
 pub mod envelope;
 pub mod executor_async;
+pub mod node_adapter;
+pub mod node_adapters;
 pub mod resolver;
 pub mod types;
 pub mod validation;
