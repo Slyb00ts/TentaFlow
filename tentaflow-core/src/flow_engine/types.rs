@@ -8,6 +8,50 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Typ danych płynących edge'em flow. Etap 2 używa go jako deklaracji (nie
+/// konwertera) — walidacja R8 sprawdza zgodność producenta, konsumenta i
+/// edge'a. `Any` jest przejściowym fallback'em dla legacy flow_json + portów
+/// które nie wiedzą jaki typ przepuszczają (passthrough adaptery: trigger,
+/// output, condition, conversation_history, session_context, speaker_context).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowDataType {
+    #[default]
+    Any,
+    Text,
+    Audio,
+    Image,
+    Video,
+    Embedding,
+    Json,
+}
+
+impl FlowDataType {
+    /// `Any` na której kolwiek stronie = wildcard (compatible z każdym
+    /// konkretnym typem). Inaczej wymaga dokładnego match'a.
+    pub fn compatible_with(self, other: FlowDataType) -> bool {
+        matches!(self, FlowDataType::Any)
+            || matches!(other, FlowDataType::Any)
+            || self == other
+    }
+
+    /// Mapowanie z `FlowValue` na typ. `Empty` → `None` (brak payloadu ≠
+    /// wildcard) — caller decyduje czy to legalne (np. trigger może
+    /// wystartować flow bez payloadu).
+    pub fn from_value(v: &crate::flow_engine::envelope::FlowValue) -> Option<Self> {
+        use crate::flow_engine::envelope::FlowValue;
+        match v {
+            FlowValue::Empty => None,
+            FlowValue::Text(_) => Some(FlowDataType::Text),
+            FlowValue::Json(_) => Some(FlowDataType::Json),
+            FlowValue::Audio { .. } => Some(FlowDataType::Audio),
+            FlowValue::Image { .. } => Some(FlowDataType::Image),
+            FlowValue::Video { .. } => Some(FlowDataType::Video),
+            FlowValue::Embedding(_) => Some(FlowDataType::Embedding),
+        }
+    }
+}
+
 /// Wezel w grafie flow DAG
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowNode {
@@ -85,6 +129,17 @@ pub struct FlowEdge {
         skip_serializing_if = "is_default_port_in"
     )]
     pub to_port: String,
+
+    /// Deklarowany typ danych płynących edge'em (Etap 2). Default `Any` żeby
+    /// legacy flow_json round-trippowało byte-identycznie. Walidacja R8
+    /// sprawdza zgodność z `producent.output_port_type` i
+    /// `konsument.input_port_type`.
+    #[serde(default, skip_serializing_if = "is_default_data_type")]
+    pub data_type: FlowDataType,
+}
+
+fn is_default_data_type(t: &FlowDataType) -> bool {
+    matches!(t, FlowDataType::Any)
 }
 
 fn default_port_full() -> String {
@@ -141,6 +196,7 @@ mod tests {
             condition: None,
             from_port: "full".into(),
             to_port: "in".into(),
+            data_type: FlowDataType::Any,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(!s.contains("from_port"), "got: {s}");

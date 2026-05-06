@@ -44,8 +44,8 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
         let api_req = EmbeddingRequest {
             model: req.model,
             input,
-            encoding_format: None,
-            dimensions: None,
+            encoding_format: req.encoding_format.clone(),
+            dimensions: req.dimensions,
             user: None,
         };
 

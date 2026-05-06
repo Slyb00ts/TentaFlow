@@ -89,6 +89,8 @@ impl Router {
                         fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
                         hop_count: 0,
                         latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                    usage: None,
+                    finish_reason: None,
                     };
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }

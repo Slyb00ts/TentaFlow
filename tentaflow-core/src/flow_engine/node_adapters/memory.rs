@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use crate::flow_engine::dispatchers::{MemoryQuery, MemoryRecord};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "memory";
 const DEFAULT_TOP_K: u32 = 10;
@@ -81,6 +81,16 @@ impl NodeAdapter for MemoryNodeAdapter {
     }
     fn supported_output_ports(&self) -> &[&'static str] {
         &["full"]
+    }
+
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        // Memory mutuje system_prompts; payload pass-through (Text wchodzi,
+        // Text wychodzi).
+        FlowDataType::Text
     }
 
     async fn execute(

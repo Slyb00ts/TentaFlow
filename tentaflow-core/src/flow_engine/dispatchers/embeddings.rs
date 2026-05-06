@@ -14,6 +14,10 @@ use crate::flow_engine::envelope::TokenUsage;
 pub struct EmbeddingsRequest {
     pub model: String,
     pub inputs: Vec<String>,
+    /// Etap 2: opcjonalna dimension hint dla embedding-3* modeli.
+    pub dimensions: Option<u32>,
+    /// Etap 2: "float" lub "base64". Backend embedded ignoruje.
+    pub encoding_format: Option<String>,
     pub user_id: Option<i64>,
     pub user_role: Option<String>,
 }

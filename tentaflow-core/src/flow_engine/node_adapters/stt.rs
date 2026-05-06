@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::flow_engine::dispatchers::SttRequest;
 use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "stt";
 
@@ -70,6 +70,18 @@ impl NodeAdapter for SttNodeAdapter {
     }
     fn supported_output_ports(&self) -> &[&'static str] {
         &["full"]
+    }
+
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Audio
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn produced_artifacts(&self) -> &[(&'static str, FlowDataType)] {
+        &[("source_audio", FlowDataType::Audio)]
     }
 
     async fn execute(

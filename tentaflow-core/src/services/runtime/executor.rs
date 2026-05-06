@@ -1536,9 +1536,26 @@ impl ModelRuntimeExecutor {
                     )),
                 }
             }
-            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
-                "TTS via flow not supported yet".into(),
-            )),
+            ResolvedExecutionTarget::Flow { flow_id, .. } => {
+                let dispatcher = self
+                    .flow_dispatcher
+                    .as_ref()
+                    .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+                ctx.enter_flow(*flow_id).map_err(|e| {
+                    ExecutorError::Internal(format!("flow recursion limit: {e}"))
+                })?;
+                let (initial, meta) =
+                    tts_request_to_initial_envelope(&request, ctx.user.clone());
+                let dispatch_result =
+                    dispatcher.dispatch_by_flow_id(*flow_id, initial, meta).await;
+                ctx.leave_flow();
+                let outcome = dispatch_result
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
+                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
+                        model: request.model.clone(),
+                    })?;
+                flow_outcome_to_tts_result(outcome, dispatcher.blobs()).await
+            }
         }
     }
 
@@ -1707,6 +1724,16 @@ fn embeddings_request_to_initial_envelope(
         "embeddings_model".into(),
         serde_json::Value::String(request.model.clone()),
     );
+    if let Some(d) = request.dimensions {
+        env.meta
+            .insert("dimensions".into(), serde_json::Value::Number(d.into()));
+    }
+    if let Some(fmt) = &request.encoding_format {
+        env.meta.insert(
+            "encoding_format".into(),
+            serde_json::Value::String(fmt.clone()),
+        );
+    }
 
     let mut meta =
         crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
@@ -1715,6 +1742,89 @@ fn embeddings_request_to_initial_envelope(
         meta.user_role = Some(u.role);
     }
     (env, meta)
+}
+
+/// Buduje seed envelope + meta dla TTS-as-flow path. `voice` / `format` /
+/// `language` lądują w `envelope.meta`, `TtsNodeAdapter::pick_optional_str`
+/// czyta je z fallback `node.config -> envelope.meta`. Operator może
+/// override'ować przez node config; brak override = użyj wartości z requestu.
+fn tts_request_to_initial_envelope(
+    request: &TTSRequest,
+    user: Option<crate::auth::acl::UserContext>,
+) -> (
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+) {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Text(request.input.clone());
+    env.meta.insert(
+        "tts_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    env.meta.insert(
+        "voice".into(),
+        serde_json::Value::String(request.voice.clone()),
+    );
+    if let Some(fmt) = &request.response_format {
+        env.meta
+            .insert("format".into(), serde_json::Value::String(fmt.clone()));
+    }
+    if let Some(lang) = &request.language {
+        env.meta
+            .insert("language".into(), serde_json::Value::String(lang.clone()));
+    }
+
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    (env, meta)
+}
+
+/// Konwertuje FlowExecutionOutcome (z TTS-as-flow) na `TtsExecutionResult`.
+/// Output flow musi mieć `payload = FlowValue::Audio { blob_ref, mime, .. }`;
+/// w przeciwnym wypadku zwracamy Internal — runtime check ostatniej deski
+/// ratunku, bo R8 walidacja sama nie wymusza Audio-on-output (`output` adapter
+/// ma `input_port_type = Any`).
+async fn flow_outcome_to_tts_result(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> Result<TtsExecutionResult, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    match outcome.final_envelope.payload {
+        FlowValue::Audio { blob_ref, mime, .. } => {
+            let bytes = blobs.get(&blob_ref).await.map_err(|e| {
+                ExecutorError::Internal(format!("tts flow blob read: {e}"))
+            })?;
+            let format = tts_mime_to_format(&mime)?;
+            Ok(TtsExecutionResult { bytes, format })
+        }
+        other => Err(ExecutorError::Internal(format!(
+            "tts flow returned non-Audio payload kind: {}",
+            other.kind()
+        ))),
+    }
+}
+
+fn tts_mime_to_format(mime: &str) -> Result<String, ExecutorError> {
+    let format = match mime {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/opus" => "opus",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
+        "audio/ogg" => "ogg",
+        other => {
+            return Err(ExecutorError::Internal(format!(
+                "tts flow output mime '{other}' nie ma mapowania format — \
+                 dodaj entry w tts_mime_to_format albo popraw flow"
+            )));
+        }
+    };
+    Ok(format.to_string())
 }
 
 /// Konwertuje FlowExecutionOutcome na EmbeddingResponse z walidacją
@@ -1984,8 +2094,11 @@ mod tests {
         ));
     }
 
+    /// Etap 2: TTS-as-flow path działa, ale dummy_executor nie ma
+    /// FlowDispatcher (Router::new go tworzy). Bez dispatchera dostajemy
+    /// `FlowDispatcherUnavailable`, nie `Internal('not supported')`.
     #[tokio::test]
-    async fn tts_flow_returns_internal() {
+    async fn tts_flow_without_dispatcher_returns_typed_error() {
         let exec = dummy_executor();
         let target = ResolvedExecutionTarget::Flow {
             flow_id: 1,
@@ -1995,11 +2108,8 @@ mod tests {
         let err = exec
             .dispatch_tts_blocking(&target, make_tts_request("any"), &mut ctx)
             .await
-            .expect_err("flow branch should not handle TTS");
-        match err {
-            ExecutorError::Internal(msg) => assert!(msg.to_lowercase().contains("flow")),
-            other => panic!("expected Internal, got {other:?}"),
-        }
+            .expect_err("flow without dispatcher should be a typed error");
+        assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
     }
 
     /// Codex R3b.5+6 L4: direct test for `execute_stt` when no SttRuntime

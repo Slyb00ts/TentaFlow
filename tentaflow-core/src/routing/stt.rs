@@ -66,6 +66,8 @@ impl Router {
                             fallbacks_tried: 0,
                             hop_count: 0,
                             latency_ms: None,
+                        usage: None,
+                        finish_reason: None,
                         },
                     });
                 }
@@ -254,6 +256,8 @@ impl Router {
                                     fallbacks_tried: 0,
                                     hop_count: 0,
                                     latency_ms: None,
+                        usage: None,
+                        finish_reason: None,
                                 },
                             }),
                             Err(ExecutorError::SttRuntimeUnavailable) => {
