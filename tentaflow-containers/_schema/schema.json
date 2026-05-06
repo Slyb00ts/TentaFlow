@@ -72,6 +72,10 @@
         "resource_kind": { "type": "string", "enum": ["ai", "infra"] },
         "requires_model": { "type": "boolean" },
         "gpu_supported": { "type": "boolean" },
+        "dgx_spark": {
+          "type": "boolean",
+          "description": "true = silnik dziala TYLKO na DGX Spark (GB10 Grace Blackwell, sm_121), false = silnik NIE dziala na DGX Spark, brak = brak ograniczenia."
+        },
         "default_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "api": { "$ref": "#/$defs/api" },
         "version": { "type": "string", "minLength": 1 }
@@ -174,7 +178,21 @@
         "display_name": { "type": "string", "minLength": 1 },
         "repo": { "type": "string", "minLength": 1 },
         "quantization": { "type": "string" },
-        "recommended": { "type": "boolean", "default": false }
+        "recommended": { "type": "boolean", "default": false },
+        "speculator_repo": {
+          "type": "string",
+          "description": "HF repo dla speculatora vLLM (np. 'RedHatAI/gemma-4-31B-it-speculator.dflash'). Wizard pre-fillsule panel Speculative Decoding."
+        },
+        "speculator_method": {
+          "type": "string",
+          "description": "Metoda speculative decoding przekazywana do vllm `--speculative-config method`. Np.: dflash, pflash, eagle, eagle3, medusa, mtp, draft_model, ngram."
+        },
+        "speculator_num_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "description": "Default num_speculative_tokens. Brak = 8."
+        }
       }
     }
   }

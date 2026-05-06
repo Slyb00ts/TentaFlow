@@ -1,0 +1,87 @@
+# =============================================================================
+# Plik: python-bundles/vllm-spark/bundle.toml
+# Opis: vLLM 0.20.1 budowane ze zrodel (`pip install -e .`) pod NVIDIA
+#       DGX Spark (GB10 Grace Blackwell, aarch64, sm_121a). PyPI wheels
+#       targetuja sm_120 max — sm_121 sypie sie w FP8/Mamba/NVFP4 kernelach,
+#       wiec jedyna sciezka do dokladnie 0.20.1 dzialajacego na Sparku to
+#       lokalny build z TORCH_CUDA_ARCH_LIST=12.1a. Pierwszy install trwa
+#       20-30 min (kompilacja CUDA kerneli) — w UI jest informacja o tym.
+# =============================================================================
+
+[bundle]
+engine = "vllm-spark"
+description = "vLLM 0.20.1 built from source for DGX Spark (GB10, sm_121a)"
+python_version = "3.12"
+# `git` source — clone tagu v0.20.1 i lokalny `pip install -e .`. Ten flow
+# odpala build CUDA kerneli pod TORCH_CUDA_ARCH_LIST z install_variants.env.
+source = "git"
+git_repo = "https://github.com/vllm-project/vllm"
+git_ref = "v0.20.1"
+
+[launch]
+command = "python"
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+    "--model", "${MODEL}",
+    "--dtype", "auto",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+    "--max-num-batched-tokens", "${MAX_NUM_BATCHED_TOKENS:-8192}",
+    # Performance baseline — wspolne dla wszystkich vllm (patrz
+    # vllm/bundle.toml).
+    "--enable-prefix-caching",
+    "--enable-chunked-prefill",
+    # FlashInfer autotune — Spark forcuje VLLM_ATTENTION_BACKEND=FLASHINFER,
+    # wiec autotune ma sens 1:1. Wybiera najlepsze sm_121a kernele per
+    # (shape, dtype) przy pierwszym starcie, cache w VLLM_CACHE_ROOT.
+    "--enable-flashinfer-autotune",
+    # NOTE: vllm 0.20.1 NIE ma juz `--swap-space` (flaga zostala wyrzucona).
+    # Spark unified memory i tak nie potrzebuje CPU swap — default behaviour
+    # OK. Dla offloadu (gdyby kiedys byl potrzebny) sa nowe: `--cpu-offload-gb`,
+    # `--kv-offloading-size`, `--kv-offloading-backend`.
+]
+internal_port = 8000
+
+[launch.env]
+# Runtime env — wymuszone niezaleznie od wizarda. Patrz researche w
+# eelbaz/dgx-spark-vllm-setup i eugr/spark-vllm-docker dla detali sm_121a.
+TORCH_CUDA_ARCH_LIST = "12.1a"
+VLLM_USE_FLASHINFER_MXFP4_MOE = "1"
+# FlashInfer attention backend ma natywne sm_121 kernele Blackwell.
+# Bez tej zmiennej vllm moze fallback na FlashAttention ktora celuje sm_120
+# i bywa wolniejsza na GB10.
+VLLM_ATTENTION_BACKEND = "FLASHINFER"
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 30
+# Spark = aarch64 only. Wykluczamy x86 i Windows zeby manifest nie
+# probowal sie instalowac w nieobslugiwanym srodowisku.
+platforms = ["linux-aarch64"]
+
+# Wariant `cuda-spark` jest wybierany przez `python_venv::install_variant_tag`
+# kiedy `system_check.gpu.is_dgx_spark == true`. Fallback na `cuda` istnieje
+# w pick_install_variant — nie korzystamy z niego tu (zaden inny variant nie
+# zadziala bez build-time TORCH_CUDA_ARCH_LIST).
+[[install_variants]]
+backend = "cuda-spark"
+# Nightly aarch64 wheels torcha pod cu130 — wymagane jako baseline dla
+# vllm 0.20.1 (PyTorch 2.11 + CUDA 13.0). Stable PyPI nie ma jeszcze
+# torch-2.11.0+cu130 dla aarch64 + sm_121.
+extra_index = "https://download.pytorch.org/whl/nightly/cu130"
+extras = []
+
+# Env wstrzykiwane WYLACZNIE do procesow `pip install` (a wiec rowniez do
+# source builda vllm 0.20.1). Bez tego nvcc kompiluje kernele do sm_120
+# i runtime crashuje na sm_121 z `cudaErrorLaunchFailure` / illegal instruction.
+[install_variants.env]
+TORCH_CUDA_ARCH_LIST = "12.1a"
+VLLM_TARGET_DEVICE = "cuda"
+# Build kerneli z lokalnych zrodel — bez tego pip moglby probowac
+# sciagnac prebuilt wheel z PyPI.
+VLLM_USE_PRECOMPILED = "0"
+# Triton 3.5+ jest potrzebny dla sm_121 PTX — vllm 0.20.1 ciaga konkretna
+# wersje przez requirements, ale upewniamy sie ze build nie cache'uje
+# starszej z systemowego cache.
+TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"

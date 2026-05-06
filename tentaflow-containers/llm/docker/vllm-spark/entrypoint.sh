@@ -1,37 +1,35 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Plik: entrypoint.sh
-# Opis: Uruchamia sidecar QUIC + vLLM OpenAI API rownolegle. Sidecar nasluchuje
-#       iroh natychmiast (klient tentaflow widzi peera od razu); vLLM laduje
-#       model w tle. Logi obu procesow trafiaja na stdout kontenera z prefixem.
-#       PID 1 czeka na pierwszego z procesow ktory padnie - druga konczymy
-#       grzecznie i exit z jego kodem (docker restart policy decyduje co dalej).
+# Plik: entrypoint.sh (vllm-spark)
+# Opis: Identyczny lifecycle co `llm/docker/vllm/entrypoint.sh` (sidecar QUIC
+#       + vllm OpenAI API rownolegle), ale z DGX Spark env baseline:
+#       TORCH_CUDA_ARCH_LIST=12.1a + VLLM_USE_FLASHINFER_MXFP4_MOE=1 zeby
+#       runtime nie cofal sie do sm_120 forward-compat na FP8/Mamba kernelach.
 # =============================================================================
 
 set -uo pipefail
 
+# Spark-specific runtime env. Te same wartosci sa w bundle.toml [launch.env]
+# dla deploy.native — duplikujemy tu zeby docker dzialal niezaleznie od bundla.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
+export VLLM_USE_FLASHINFER_MXFP4_MOE="${VLLM_USE_FLASHINFER_MXFP4_MOE:-1}"
+# FlashInfer attention backend — natywne sm_121 kernele.
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+
 CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 [[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
 
-MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen2.5-0.5B-Instruct'}"
+MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen3.5-0.8B'}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
-# Auto-detect liczby GPU widzialnych dla kontenera (CUDA_VISIBLE_DEVICES albo
-# wszystkie z --gpus all). Ustawia TP automatycznie gdy user nie wymusil.
 GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
 [[ "$GPU_COUNT" -lt 1 ]] && GPU_COUNT=1
-echo "[entrypoint] wykryto $GPU_COUNT GPU widocznych dla kontenera"
+echo "[entrypoint] DGX Spark vllm — GPU widocznych: $GPU_COUNT"
 
-# Default TP/PP wedlug GPU count. User moze nadpisac w VLLM_ARGS.
-# Uwaga: TP musi dzielic num_attention_heads modelu, PP musi dzielic
-# num_hidden_layers. Dla 3/6/12 GPU lepiej uzyc TP=2 x PP=3 niz TP=3.
+# DGX Spark to single-GPU SoC (jeden GB10) — TP=1 to default. Multi-Spark
+# mesh nie idzie przez jeden kontener, wiec nie kombinujemy z PP.
 case "$GPU_COUNT" in
   1) AUTO_PARALLEL="--tensor-parallel-size 1" ;;
-  2) AUTO_PARALLEL="--tensor-parallel-size 2" ;;
-  3) AUTO_PARALLEL="--tensor-parallel-size 1 --pipeline-parallel-size 3" ;;
-  4) AUTO_PARALLEL="--tensor-parallel-size 4" ;;
-  6) AUTO_PARALLEL="--tensor-parallel-size 2 --pipeline-parallel-size 3" ;;
-  8) AUTO_PARALLEL="--tensor-parallel-size 8" ;;
   *) AUTO_PARALLEL="--tensor-parallel-size $GPU_COUNT" ;;
 esac
 
@@ -43,7 +41,7 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT"
+echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (sm_121a)"
 # shellcheck disable=SC2086
 vllm serve "$MODEL" \
   --host 127.0.0.1 \

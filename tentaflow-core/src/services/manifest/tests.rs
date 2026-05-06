@@ -32,6 +32,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         resource_kind: None,
         requires_model: None,
         gpu_supported: None,
+        dgx_spark: None,
         service_surfaces: None,
         input_modalities: None,
         output_modalities: None,
@@ -984,6 +985,9 @@ mod capability_axes {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            speculator_repo: None,
+            speculator_method: None,
+            speculator_num_tokens: None,
         }
     }
 
