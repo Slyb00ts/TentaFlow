@@ -55,7 +55,7 @@ pub trait TtsDispatcher: Send + Sync {
 
     /// Etap 3c: streaming TTS. Backendy native streaming yield chunki w
     /// czasie syntezy; backendy blocking — chunkowane post-blocking
-    /// (current Router::synthesize_speech_stream pattern).
+    /// (chunkowane PCM @ 100 ms = 3200 B per frame przy 16 kHz mono i16).
     async fn stream_synthesize(
         &self,
         req: TtsRequest,
