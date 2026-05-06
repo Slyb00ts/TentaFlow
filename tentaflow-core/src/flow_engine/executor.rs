@@ -61,6 +61,22 @@ pub async fn execute_blocking(
     let mut last_finish_reason: Option<FinishReason> = None;
 
     for (run_idx, &def_idx) in compiled.execution_order.iter().enumerate() {
+        // Cancel + deadline gate między node'ami: klient disconnect /
+        // operator timeout abortuje flow zanim wystartuje kolejny adapter.
+        // Per-adapter cancel/deadline propaguje się przez ExecutionContext
+        // wewnątrz LLM dispatcher; tu pilnujemy granicy topo-loopa.
+        if ctx.cancel_token.is_cancelled() {
+            error = Some("cancelled".into());
+            last_finish_reason = Some(FinishReason::Cancelled);
+            break;
+        }
+        if let Some(dl) = ctx.deadline {
+            if Instant::now() >= dl {
+                error = Some("deadline exceeded".into());
+                last_finish_reason = Some(FinishReason::Error);
+                break;
+            }
+        }
         let node = &compiled.definition.nodes[def_idx];
         let inputs = build_inputs(&compiled, run_idx, &outputs);
         let adapter = adapters.get(&node.node_type).ok_or_else(|| {
@@ -167,8 +183,18 @@ pub async fn execute_streaming(
     let mut outputs: Vec<Option<Arc<FlowEnvelope>>> = vec![None; n];
     let mut trace: Vec<TraceStep> = Vec::with_capacity(n);
 
-    // Pre-LLM topo loop
+    // Pre-LLM topo loop. Cancel/deadline checked between nodes — same
+    // contract as `execute_blocking`. LLM streaming dispatch ma własny
+    // wrapper (StreamBoundary) honorujący te flagi w trakcie streamu.
     for run_idx in 0..llm_run_idx {
+        if ctx.cancel_token.is_cancelled() {
+            return Err(anyhow!("cancelled"));
+        }
+        if let Some(dl) = ctx.deadline {
+            if Instant::now() >= dl {
+                return Err(anyhow!("deadline exceeded"));
+            }
+        }
         let def_idx = compiled.execution_order[run_idx];
         let node = &compiled.definition.nodes[def_idx];
         let inputs = build_inputs(&compiled, run_idx, &outputs);
