@@ -1,9 +1,36 @@
 # Etap 2 — Typed porty + ArtifactKey + TTS-as-flow + trailers + FileBlobStore
 
-**Plan v1.0 (do review codex)**
+**Plan v1.1 (po round 1 codex)**
 **Codex session ID:** `019dfca1-fef1-7ca1-b154-b73a796670a8` (kontynuacja po Etapie 1)
 **Data:** 2026-05-06
 **Bazuje na:** Etap 1 v4.2 (zamknięty, commits do `400baa0`)
+
+## Zmiany v1.0 → v1.1 (codex round 1)
+
+1. **FileBlobStore zakres ścięty** — istniejący `flow_engine/blob_store.rs::FileBlobStore`
+   ma już atomic write (temp+rename), dedup verify-on-disk, sha256 integrity check w
+   `get`. Jedyny brakujący kawałek to `gc(retention)` (dziś stub). `BlobStore` trait
+   świadomie nie ma `delete()` — dedup-by-sha sprawia że dwa `BlobRef` mogą wskazywać
+   na ten sam plik i naiwny per-ref delete rozsadza drugi. Etap 2 = wire + gc impl,
+   nie redesign.
+2. **TTS-as-flow dropowało voice/format/language** — `TtsNodeAdapter::pick_optional_str`
+   czyta tylko `node.config`. Plan v1.0 wsadzał voice/format/language do `envelope.meta`
+   ale adapter nie czytał. Fix: rozszerzamy `TtsNodeAdapter` (i `LlmNodeAdapter`/
+   `EmbeddingsNodeAdapter` analogicznie) o fallback `node.config -> envelope.meta`.
+3. **`FlowDataType::from_value(Empty)`** zwracało `Any` co miesza "no payload" z
+   "wildcard". Fix: `from_value(&FlowValue) -> Option<FlowDataType>`, gdzie `Empty`
+   → `None`. Validation/runtime check gracefully handle'uje None (treat as
+   "missing", caller decyduje czy to error).
+4. **R8 nie jest bridgem** — `edge.data_type` to deklaracja, nie konwerter.
+   Producent `Text` + konsument `Audio` zostają niekompatybilni niezależnie od
+   edge.data_type. Plan v1.1 doprecyzowuje że R8 sprawdza 3 rzeczy: producent vs
+   konsument (must be compatible), edge.data_type vs producent (must compat),
+   edge.data_type vs konsument (must compat). Brak "bridge".
+5. **Seedowane flows pass R8 trywialnie** — wszystkie edges domyślnie `Any`, więc
+   walidacja przepuszcza. R8 zaczyna realnie chronić dopiero gdy GUI/save zacznie
+   produkować konkretne `data_type`. Plan v1.1 stwierdza to wprost zamiast
+   sugerować że R8 łapie TTS-flow output mismatch (łapie tylko `flow_outcome_to_tts_result`
+   runtime check).
 
 ---
 
@@ -97,18 +124,20 @@ impl FlowDataType {
     }
 
     /// Mapowanie z `FlowValue` na typ — używane przy runtime sanity checks
-    /// (Etap 3) i w testach. Empty → Any (puste pole pasuje do każdego typu
-    /// jako "no value yet").
-    pub fn from_value(v: &crate::flow_engine::envelope::FlowValue) -> Self {
+    /// (Etap 3) i w testach. `Empty` → `None` (brak payloadu ≠ wildcard;
+    /// caller decyduje czy to legalne — np. trigger może wystartować flow
+    /// bez payloadu). `Any` jako wariant `FlowDataType` istnieje tylko jako
+    /// transitional default na edges, nie produkujemy go z FlowValue.
+    pub fn from_value(v: &crate::flow_engine::envelope::FlowValue) -> Option<Self> {
         use crate::flow_engine::envelope::FlowValue;
         match v {
-            FlowValue::Empty => FlowDataType::Any,
-            FlowValue::Text(_) => FlowDataType::Text,
-            FlowValue::Json(_) => FlowDataType::Json,
-            FlowValue::Audio { .. } => FlowDataType::Audio,
-            FlowValue::Image { .. } => FlowDataType::Image,
-            FlowValue::Video { .. } => FlowDataType::Video,
-            FlowValue::Embedding(_) => FlowDataType::Embedding,
+            FlowValue::Empty => None,
+            FlowValue::Text(_) => Some(FlowDataType::Text),
+            FlowValue::Json(_) => Some(FlowDataType::Json),
+            FlowValue::Audio { .. } => Some(FlowDataType::Audio),
+            FlowValue::Image { .. } => Some(FlowDataType::Image),
+            FlowValue::Video { .. } => Some(FlowDataType::Video),
+            FlowValue::Embedding(_) => Some(FlowDataType::Embedding),
         }
     }
 }
@@ -204,34 +233,16 @@ pass-through.
 
 ## Validation R8 (rozszerzenie `validation.rs`)
 
+`edge.data_type` to deklaracja, NIE konwerter — Etap 2 nie ma rzutowania typów.
+Walidacja sprawdza 3 niezależne pary kompatybilności:
+
 ```rust
 // W pętli edges, po istniejących sprawdzeniach R3 (port membership):
 let from_type = from_adapter.output_port_type(&edge.from_port);
 let to_type = to_adapter.input_port_type(&edge.to_port);
 
-// Edge.data_type compatibility:
-// - edge.Any (legacy domyślne) → akceptujemy każdy from_type/to_type
-// - edge konkretne → musi być compatible z producent i konsument
-// - producent/konsument Any → wildcard (przepuszczamy)
-if !edge.data_type.compatible_with(from_type) {
-    return Err(FlowValidationError::EdgeTypeMismatch {
-        edge_id: edge.id.clone().unwrap_or_else(|| format!("{}->{}", edge.from, edge.to)),
-        side: "from",
-        edge_type: edge.data_type,
-        port_type: from_type,
-    });
-}
-if !edge.data_type.compatible_with(to_type) {
-    return Err(FlowValidationError::EdgeTypeMismatch {
-        edge_id: edge.id.clone().unwrap_or_else(|| format!("{}->{}", edge.from, edge.to)),
-        side: "to",
-        edge_type: edge.data_type,
-        port_type: to_type,
-    });
-}
-
-// Dodatkowo: producent vs konsument muszą być spójne ze sobą gdy oba są
-// konkretne (oba Any to OK, bo edge.data_type pełni rolę pomostu).
+// (a) producent vs konsument — bez tego edge.data_type byłby tylko grzecznym
+//     opisem przy realnym mismatchu. `Any` na każdej stronie = wildcard.
 if !from_type.compatible_with(to_type) {
     return Err(FlowValidationError::EdgePortTypesMismatch {
         from_node: edge.from.clone(),
@@ -242,11 +253,46 @@ if !from_type.compatible_with(to_type) {
         to_type,
     });
 }
+
+// (b) edge.data_type vs producent.output_port_type
+if !edge.data_type.compatible_with(from_type) {
+    return Err(FlowValidationError::EdgeTypeMismatch {
+        edge_id: edge.id.clone().unwrap_or_else(|| format!("{}->{}", edge.from, edge.to)),
+        side: "from",
+        edge_type: edge.data_type,
+        port_type: from_type,
+    });
+}
+
+// (c) edge.data_type vs konsument.input_port_type
+if !edge.data_type.compatible_with(to_type) {
+    return Err(FlowValidationError::EdgeTypeMismatch {
+        edge_id: edge.id.clone().unwrap_or_else(|| format!("{}->{}", edge.from, edge.to)),
+        side: "to",
+        edge_type: edge.data_type,
+        port_type: to_type,
+    });
+}
 ```
 
 `FlowValidationError` rozszerza się o 2 warianty: `EdgeTypeMismatch` (edge declared
 nie pasuje do portu) i `EdgePortTypesMismatch` (producent vs konsument różne
-konkretne typy bez edge.data_type bridge).
+konkretne typy).
+
+**R8 nie chroni TTS-flow output:** `output` adapter ma `input_port_type("in") = Any`
+(passthrough). Producent (np. `tts`) ma `output_port_type("full") = Audio`. Edge
+między nimi przechodzi R8 niezależnie od `edge.data_type` (`Any` ↔ `Audio` =
+compatible). Walidacja "TTS flow musi kończyć Audio na payloadzie" siedzi w runtime
+checku `flow_outcome_to_tts_result` (zwraca Internal gdy outcome.payload nie jest
+Audio), nie w R8. To świadomy choice: R8 sprawdza port-level compatibility, nie
+end-of-flow payload type.
+
+**R8 transitional weakness:** wszystkie obecne seedowane flowy (`Standardowy
+pipeline LLM`, `teams-flow`) mają `edge.data_type = Any` (default), więc R8
+przepuszcza je trywialnie. Realna ochrona zaczyna działać dopiero gdy GUI zacznie
+zapisywać konkretne `data_type` na edges (Etap 2 dorzuca to do save handler) i gdy
+trigger dostaje typed output (Etap 3 multimodal trigger). Etap 2 daje fundament,
+nie pełną twardą walidację.
 
 ---
 
@@ -282,7 +328,54 @@ ResolvedExecutionTarget::Flow { flow_id, .. } => {
 }
 ```
 
-### Helpers
+### Adapter envelope-meta fallback
+
+Plan v1.0 był niekompletny: `tts_request_to_initial_envelope` wsadzał voice/format/
+language do `envelope.meta`, ale `TtsNodeAdapter::pick_optional_str` czytał tylko
+`node.config`. Plan v1.1 dodaje fallback `node.config -> envelope.meta` w 3
+adapterach (tts, llm, embeddings) — symetrycznie do istniejącego `pick_model`:
+
+```rust
+// flow_engine/node_adapters/tts.rs
+fn pick_optional_str(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<String> {
+    // 1. Override z node config — najwyższy priorytet (operator pin'uje
+    //    konkretne ustawienie dla tej ścieżki flow).
+    if let Some(s) = node
+        .config
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(s.to_string());
+    }
+    // 2. Fallback z envelope.meta — request seed (np. TTS-as-flow z user
+    //    request voice/format/language).
+    envelope
+        .meta
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+```
+
+Klucze które adapter czyta (z fallback) — kontrakt request → envelope → adapter:
+
+| Adapter | Key | Source w trigger seed | Default gdy brak |
+|---------|-----|------------------------|------------------|
+| `tts` | `voice` | `TTSRequest.voice` | (brak — `TtsDispatcherImpl` ma `DEFAULT_VOICE = "alloy"`) |
+| `tts` | `format` | `TTSRequest.response_format` | (brak — backend wybiera) |
+| `tts` | `language` | `TTSRequest.language` | (brak) — Etap 2 dodaje pole `language` do `TtsRequest` DTO |
+| `llm` | `temperature` | `ChatCompletionRequest.temperature` | (brak — backend default) |
+| `llm` | `max_tokens` | `ChatCompletionRequest.max_tokens` | (brak) |
+| `embeddings` | `dimensions` | `EmbeddingRequest.dimensions` | (brak) — Etap 2 dodaje |
+| `embeddings` | `encoding_format` | `EmbeddingRequest.encoding_format` | (brak) |
+
+Plan v1.1 rozszerza `TtsRequest` DTO (`flow_engine/dispatchers/tts.rs`) o pole
+`language: Option<String>` żeby dispatcher impl mógł je propagować do `TTSRequest`
+runtime.
+
+### TTS seed envelope helper
 
 ```rust
 // services/runtime/executor.rs
@@ -438,125 +531,73 @@ if want_trailers {
 
 ## FileBlobStore
 
-### Layout
+### Stan obecny (po Etapie 1)
 
-```
-<TENTAFLOW_HOME>/blobs/<sha2[0:2]>/<sha2[2:4]>/<full_sha2>.bin
-```
+`flow_engine/blob_store.rs::FileBlobStore` jest już zaimplementowany:
+- Sharded layout `<root>/<sha[0:2]>/<sha[2:4]>/<full_sha>.bin`
+- Atomic write: `temp + fsync + rename` (rename same-fs)
+- Dedup with verify-on-disk (corrupted half-written blob z poprzedniej sesji
+  zostaje wykryty i nadpisany)
+- `get` robi sha256 integrity check po read (corrupted content rzuca błąd zamiast
+  cicho propagować)
+- Race przy concurrent put tego samego content: target verify after rename failure,
+  redundant temp cleanup
+- `delete()` świadomie nie ma w trait — dedup-by-sha sprawia że dwa BlobRef
+  wskazujące na ten sam plik nie mogą bezpiecznie usuwać per ref
 
-`<TENTAFLOW_HOME>` = env `TENTAFLOW_HOME` lub `~/.tentaflow` jako default. Bootstrap
-przekazuje `Arc<dyn BlobStore>` do `FlowDispatcher::new`.
+`gc(retention)` jest dziś stub (zwraca 0).
 
-### Operacje
+### Co Etap 2 dodaje
+
+1. **`gc(retention)` impl** — walk po `<root>/*/*/*.bin`, stat mtime, usuń pliki
+   starsze niż `retention`. Bez refcount/orphan registry: gc pasuje gdy żadne
+   request nie używa obecnie blobs starszych niż retention. Default retention 24h
+   (config'owalny). Race z concurrent put tego samego content: get-after-delete
+   może dostać NotFound, caller potraktuje jako transient błąd. To jest akceptowalny
+   trade-off dla pierwszej iteracji GC.
 
 ```rust
-pub struct FileBlobStore {
-    root: PathBuf,
-}
-
-impl FileBlobStore {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
-    }
-
-    fn path_for(&self, sha: &str) -> PathBuf {
-        self.root
-            .join(&sha[0..2])
-            .join(&sha[2..4])
-            .join(format!("{sha}.bin"))
-    }
-}
-
-#[async_trait]
-impl BlobStore for FileBlobStore {
-    async fn put(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobRef> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let sha = sha256_hex(&bytes);
-        let path = self.path_for(&sha);
-        let dir = path.parent().expect("path has parent");
-        let root = self.root.clone();
-        let bytes_clone = bytes.clone();
-        let path_clone = path.clone();
-        let dir_clone = dir.to_path_buf();
-        // Atomic write: temp w samym dir + rename. Brak race nawet przy
-        // współbieżnym put tego samego sha (rename nadpisuje, content
-        // identyczny dla tego samego sha).
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::create_dir_all(&dir_clone)?;
-            let temp = dir_clone.join(format!("{id}.tmp", id = id_alpha()));
-            std::fs::write(&temp, &bytes_clone)?;
-            std::fs::rename(&temp, &path_clone)?;
-            Ok(())
-        })
-        .await??;
-        Ok(BlobRef {
-            id,
-            size_bytes: bytes.len() as u64,
-            mime: mime.to_string(),
-            sha256: sha,
-        })
-    }
-
-    async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
-        let path = self.path_for(&blob_ref.sha256);
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path)).await??;
-        Ok(bytes)
-    }
-
-    async fn delete(&self, blob_ref: &BlobRef) -> Result<()> {
-        let path = self.path_for(&blob_ref.sha256);
-        tokio::task::spawn_blocking(move || {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-            Ok::<_, std::io::Error>(())
-        })
-        .await??;
-        Ok(())
-    }
-
-    async fn gc(&self, retention: Duration) -> Result<u64> {
-        let root = self.root.clone();
-        let cutoff = std::time::SystemTime::now() - retention;
-        tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-            let mut removed = 0u64;
-            for shard in std::fs::read_dir(&root)?.flatten() {
-                if !shard.file_type()?.is_dir() { continue; }
-                for sub in std::fs::read_dir(shard.path())?.flatten() {
-                    if !sub.file_type()?.is_dir() { continue; }
-                    for blob in std::fs::read_dir(sub.path())?.flatten() {
-                        let meta = blob.metadata()?;
-                        if let Ok(modified) = meta.modified() {
-                            if modified < cutoff {
-                                std::fs::remove_file(blob.path())?;
-                                removed += 1;
-                            }
+async fn gc(&self, retention: Duration) -> Result<u64> {
+    let root = self.root.clone();
+    let cutoff = std::time::SystemTime::now() - retention;
+    let removed = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut count = 0u64;
+        for shard in std::fs::read_dir(&root)?.flatten() {
+            if !shard.file_type()?.is_dir() { continue; }
+            for sub in std::fs::read_dir(shard.path())?.flatten() {
+                if !sub.file_type()?.is_dir() { continue; }
+                for blob in std::fs::read_dir(sub.path())?.flatten() {
+                    let meta = blob.metadata()?;
+                    let modified = meta.modified().unwrap_or_else(|_| std::time::SystemTime::now());
+                    if modified < cutoff {
+                        if std::fs::remove_file(blob.path()).is_ok() {
+                            count += 1;
                         }
                     }
                 }
             }
-            Ok(removed)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("blob gc join: {e}"))??;
-        Ok(0)
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    hex::encode(h.finalize())
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("blob gc join: {e}"))??;
+    Ok(removed)
 }
 ```
 
-`gc` zostaje proste (no concurrent put detection, no in-progress delete) — jeden
-proces TentaFlow trzyma BlobStore, GC odpalany przez scheduler raz na N minut z
-retention = 24h. Jeśli race z concurrent put zdarzy się, get-after-delete dostanie
-NotFound i caller (TTS adapter) potraktuje jako transient error.
+2. **GC scheduler (opcjonalny)** — w `Router::start` (lub osobny tick task)
+   spawnujemy task który co N minut woła `blob_store.gc(retention)`. Defaults:
+   interval = 1h, retention = 24h. W Etapie 2 zostawiamy to OPCJONALNE — operator
+   może wywołać gc przez ręczny endpoint admina, scheduler zostaje za feature flag
+   `blob_gc_scheduler_enabled` w config (default false). Jeśli refcount/orphan
+   registry kiedyś powstanie, scheduler będzie używał go zamiast czystego mtime.
+
+3. **Wire FileBlobStore zamiast InMemoryBlobStore w `Router::new`** — dziś
+   `FlowDispatcher::new` tworzy `Arc::new(InMemoryBlobStore::new())` wewnątrz.
+   Etap 2: `FlowDispatcher::new` przyjmuje `blobs: Arc<dyn BlobStore>` jako
+   parametr. `Router::new` decyduje:
+   - Default: `FileBlobStore` w `<TENTAFLOW_HOME>/blobs`
+   - Override: `TENTAFLOW_BLOB_STORE=memory` → `InMemoryBlobStore` (testy/local dev)
 
 ### Bootstrap
 
@@ -590,8 +631,8 @@ let flow_dispatcher = db.map(|pool| {
 
 ## Dependencies
 
-`Cargo.toml`: `sha2 = "0.10"` i `hex = "0.4"` jeśli nie ma. Sprawdzić — `sha2` jest
-prawdopodobnie już used elsewhere, `hex` często też.
+`sha2` jest już używane przez `blob_store.rs`; nie trzeba dodawać. Inne nowe deps:
+brak — Etap 2 używa standard library + istniejących crate'ów.
 
 ---
 
@@ -603,7 +644,7 @@ prawdopodobnie już used elsewhere, `hex` często też.
 | `flow_engine/node_adapter.rs` | + 4 default trait methods | +30 |
 | `flow_engine/node_adapters/*.rs` | per-adapter override (12 adapterów × ~10 linii) | +120 |
 | `flow_engine/validation.rs` | R8 + 2 nowe warianty błędów + testy | +180 |
-| `flow_engine/blob_store.rs` | + `FileBlobStore` impl + 4 testy | +280 |
+| `flow_engine/blob_store.rs` | impl `gc(retention)` + 2-3 testy GC (FileBlobStore istnieje) | +80 |
 | `flow_engine/dispatcher.rs` | przyjmuje `blobs` parameter, `pub fn blobs()` | +20 |
 | `flow_engine/converter.rs` | + `flow_outcome_to_tts_result` | +50 |
 | `services/runtime/executor.rs` | TTS Flow arm, `tts_request_to_initial_envelope` | +80 |
@@ -613,7 +654,8 @@ prawdopodobnie już used elsewhere, `hex` często też.
 | `routing/router.rs` | wire `FileBlobStore` → `FlowDispatcher::new` | +30 |
 | `Cargo.toml` | `sha2` / `hex` deps (jeśli brak) | +2 |
 
-**Razem: ~980 LOC.** Mieści się w jednej sesji.
+**Razem: ~780 LOC** (po ścięciu FileBlobStore z plan v1.0). Mieści się w jednej
+sesji bez problemu.
 
 ---
 
