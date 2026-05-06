@@ -8187,12 +8187,12 @@ mod notes_tests {
             crate::db::migrations::run(&conn).expect("re-run migrations again");
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM _migrations WHERE version = 46",
+                    "SELECT COUNT(*) FROM _migrations WHERE version = 1",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(count, 1, "migration 46 must appear exactly once");
+            assert_eq!(count, 1, "initial schema must appear exactly once");
             let tbl: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='notes'",

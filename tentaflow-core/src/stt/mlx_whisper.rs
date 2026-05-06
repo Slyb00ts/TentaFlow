@@ -271,7 +271,12 @@ impl SttEngine for MlxWhisperEngine {
         vec!["wav".to_string(), "pcm".to_string()]
     }
 
-    async fn load_model(&self, model_path: &Path, _device: Option<&str>) -> Result<SttModelInfo> {
+    async fn load_model(
+        &self,
+        model_path: &Path,
+        _device: Option<&str>,
+        _deploy_params: &super::WhisperDeployParams,
+    ) -> Result<SttModelInfo> {
         self.ensure_bridge()?;
         // Akceptujemy dwa formaty `model_path`:
         //   1. Lokalna scieżka istniejaca na dysku — uzywamy bezposrednio.

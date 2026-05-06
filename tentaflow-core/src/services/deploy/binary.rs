@@ -14,9 +14,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::{
-    build_new_service, category_tag, host_os_supported, models_from_manifest, resolve_display_name,
-    smart_health_probe, standard_engine_env, DeployError, DeployResult, DeployStrategy,
-    LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    build_endpoint_url, build_new_service, category_tag, host_os_supported, models_from_manifest,
+    resolve_display_name, smart_health_probe, standard_engine_env, DeployError, DeployResult,
+    DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
@@ -210,7 +210,11 @@ impl DeployStrategy for BinaryDeploy {
             pid,
             port: Some(port),
             sidecar_port: None,
-            endpoint_url: Some(format!("http://127.0.0.1:{}", port)),
+            endpoint_url: Some(build_endpoint_url(
+                "127.0.0.1",
+                port,
+                self.manifest.engine.api,
+            )),
             container_id: None,
             instance_dir: None,
         };
@@ -228,7 +232,16 @@ impl DeployStrategy for BinaryDeploy {
             models_from_manifest(&self.manifest, &self.user_config)
         };
 
-        let config_json = serde_json::to_string(&self.user_config)
+        // Typed schema params + request_time → config_json. Dla binary
+        // engines (sherpa-onnx, stable-diffusion-cpp, teams-bot) zwykle
+        // pusta `parameters` w manifescie, wiec request_time = default.
+        let (_param_app, request_time) = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::NativeBinary,
+        )
+        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+        let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
         Ok(PreparedDeploy {
@@ -316,6 +329,7 @@ mod tests {
                 external: None,
             },
             model_presets: vec![],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }

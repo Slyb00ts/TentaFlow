@@ -196,7 +196,11 @@ impl InferenceEngine for MlxSwiftEngine {
         vec!["safetensors".to_string(), "mlx".to_string()]
     }
 
-    async fn load_model(&self, model_path: &Path, _gpu_layers: Option<u32>) -> Result<ModelInfo> {
+    async fn load_model(
+        &self,
+        model_path: &Path,
+        _deploy_params: &super::DeployParamsSnapshot,
+    ) -> Result<ModelInfo> {
         let callbacks = get_callbacks()?;
         let path_str = model_path
             .to_str()

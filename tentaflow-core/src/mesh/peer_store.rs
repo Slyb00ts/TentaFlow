@@ -385,6 +385,14 @@ impl MeshPeerStore {
     /// to nothing.
     #[cfg(debug_assertions)]
     fn shadow_consistency_check(&self, node_id: &str, where_: &str) {
+        // `update_local_extras` updatuje wpis dla self-node. peer_registry nie
+        // dostaje TransportEstablished dla siebie samego (local node nie
+        // dialuje siebie), wiec jego `conn_tag` zostaje Offline mimo
+        // `quic_connected=true` w store. Ten "rozjazd" jest by-design — nie
+        // logujemy go co heartbeat.
+        if where_ == "update_local_extras" {
+            return;
+        }
         let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         else {
             return;

@@ -51,6 +51,10 @@ class SpeechRequest(BaseModel):
     voice: Optional[str] = None
     response_format: Optional[str] = "wav"
     speed: Optional[float] = 1.0
+    # Pydantic v2: pozwol na dodatkowe pola z BackendClient (typed
+    # request-time overrides z `apply_chat_overrides` w Rust). Bez tego
+    # FastAPI odrzucal request z `language`/inne extras.
+    model_config = {"extra": "allow"}
 
 
 app = FastAPI(title="Kyutai Pocket TTS", version="2.0.0")

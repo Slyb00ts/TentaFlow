@@ -831,6 +831,7 @@ mod tests {
                 }],
                 created_at: String::new(),
                 updated_at: String::new(),
+                request_time_parameters: Default::default(),
             }],
         );
 
@@ -900,6 +901,7 @@ mod tests {
                 }],
                 created_at: String::new(),
                 updated_at: String::new(),
+                request_time_parameters: Default::default(),
             }],
         );
 
@@ -955,6 +957,7 @@ mod tests {
             }],
             created_at: String::new(),
             updated_at: String::new(),
+            request_time_parameters: Default::default(),
         };
         registry.replace_local(
             local_node.clone(),

@@ -180,7 +180,11 @@ impl LoadableEngine for EmbeddedEngine {
         let shared = crate::inference::shared_inference_manager();
         let mut mgr = shared.write().await;
         let _info = mgr
-            .load_model(&self.model_path, None, Some(&self.backend))
+            .load_model(
+                &self.model_path,
+                crate::inference::DeployParamsSnapshot::default(),
+                Some(&self.backend),
+            )
             .await
             .with_context(|| format!("load_model {}/{}", self.backend, self.model_repo))?;
         self.loaded.store(true, Ordering::Release);

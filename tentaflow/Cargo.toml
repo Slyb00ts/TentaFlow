@@ -15,26 +15,26 @@ gpu-metal = ["tentaflow-core/gpu-metal"]
 [dependencies]
 tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
-clap = { version = "4", features = ["derive"] }
-rustls = { version = "0.23", features = ["ring"] }
+clap = { version = "4.6.1", features = ["derive"] }
+rustls = { version = "0.23.40", features = ["ring"] }
 serde_json = "1.0"
-rkyv = { version = "0.8.12", features = ["unaligned"] }
+rkyv = { version = "0.8.16", features = ["unaligned"] }
 parking_lot = "0.12"
 # Self-update — `tentaflow update` pobiera nowsza wersje z GitHub Releases
 # i podmienia biezaca binarke (external updater process — Windows nie blokuje
 # pliku w trakcie kopiowania).
-axoupdater = { version = "0.9", features = ["blocking"] }
+axoupdater = { version = "0.10.0", features = ["blocking"] }
 
 # MLX inference — tylko na macOS. Implementacja przez Swift bridge
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i
 # src/mlx_swift_init.rs.
 [target.'cfg(target_os = "macos")'.dependencies]
 tentaflow-core = { path = "../tentaflow-core", features = ["inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
-libloading = "0.8"
+libloading = "0.9.0"
 
 [profile.release]
 opt-level = 3

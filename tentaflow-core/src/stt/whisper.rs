@@ -28,20 +28,30 @@ struct LoadedWhisperModel {
 unsafe impl Send for LoadedWhisperModel {}
 unsafe impl Sync for LoadedWhisperModel {}
 
-/// Adapter whisper.cpp — lokalna transkrypcja mowy
+/// Adapter whisper.cpp — lokalna transkrypcja mowy.
+/// Trzyma snapshot deploy_params z `load_model` zeby `transcribe()` moglo
+/// uzyc ich jako baseline gdy `TranscribeParams` per-call nie ma wartosci
+/// (np. brak `language` w request → fallback do `default_language` z
+/// deploy params).
 pub struct WhisperEngine {
     state: Arc<Mutex<Option<LoadedWhisperModel>>>,
+    deploy_params: Arc<Mutex<super::WhisperDeployParams>>,
 }
 
 impl WhisperEngine {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(None)),
+            deploy_params: Arc::new(Mutex::new(super::WhisperDeployParams::default())),
         }
     }
 
-    /// Liczba watkow do przetwarzania
-    fn num_threads() -> i32 {
+    /// Liczba watkow do przetwarzania. Honoruje `deploy_params.n_threads`
+    /// gdy jest, inaczej spada do `available_parallelism`.
+    fn num_threads_with_default(default: Option<i32>) -> i32 {
+        if let Some(n) = default {
+            return n;
+        }
         std::thread::available_parallelism()
             .map(|n| n.get() as i32)
             .unwrap_or(4)
@@ -59,18 +69,43 @@ impl WhisperEngine {
         }
     }
 
-    /// Buduje FullParams z TranscribeParams
-    fn build_full_params(params: &TranscribeParams) -> FullParams<'_, '_> {
-        let mut fp = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    /// Buduje FullParams z TranscribeParams + deploy_params jako fallback
+    /// dla niewypelnionych pol w request (language/translate/beam_size).
+    /// `n_threads` ZAWSZE z deploy_params (jezeli jest), inaczej CPU detect.
+    /// Beam search: gdy `default_beam_size > 1` w deploy_params, uzywamy
+    /// `BeamSearch` zamiast `Greedy { best_of: 1 }`.
+    fn build_full_params<'a>(
+        params: &'a TranscribeParams,
+        deploy: &'a super::WhisperDeployParams,
+    ) -> FullParams<'a, 'a> {
+        let beam = deploy.default_beam_size.unwrap_or(1);
+        let strategy = if beam > 1 {
+            SamplingStrategy::BeamSearch {
+                beam_size: beam,
+                patience: 1.0,
+            }
+        } else {
+            SamplingStrategy::Greedy { best_of: 1 }
+        };
+        let mut fp = FullParams::new(strategy);
 
-        // Jezyk zrodlowy (None = auto-detekcja)
+        // Jezyk: per-request override > deploy default > None (auto-detect).
         if let Some(ref lang) = params.language {
+            fp.set_language(Some(lang));
+        } else if let Some(ref lang) = deploy.default_language {
             fp.set_language(Some(lang));
         } else {
             fp.set_language(None);
         }
 
-        fp.set_translate(params.translate);
+        // Translate: per-request override > deploy default > false.
+        let translate = if params.translate {
+            true
+        } else {
+            deploy.default_translate.unwrap_or(false)
+        };
+        fp.set_translate(translate);
+
         fp.set_print_special(false);
         fp.set_print_progress(false);
         fp.set_print_realtime(false);
@@ -83,7 +118,7 @@ impl WhisperEngine {
 
         fp.set_temperature(params.temperature.unwrap_or(0.0));
         fp.set_no_speech_thold(params.no_speech_threshold.unwrap_or(0.6));
-        fp.set_n_threads(Self::num_threads());
+        fp.set_n_threads(Self::num_threads_with_default(deploy.n_threads));
 
         fp
     }
@@ -93,6 +128,7 @@ impl WhisperEngine {
         loaded: &LoadedWhisperModel,
         pcm: &[f32],
         params: &TranscribeParams,
+        deploy: &super::WhisperDeployParams,
     ) -> Result<TranscribeResult> {
         let start = Instant::now();
 
@@ -101,7 +137,7 @@ impl WhisperEngine {
             .create_state()
             .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc stanu Whisper: {}", e))?;
 
-        let full_params = Self::build_full_params(params);
+        let full_params = Self::build_full_params(params, deploy);
 
         state
             .full(full_params, pcm)
@@ -188,9 +224,18 @@ impl SttEngine for WhisperEngine {
         ]
     }
 
-    async fn load_model(&self, model_path: &Path, device: Option<&str>) -> Result<SttModelInfo> {
+    async fn load_model(
+        &self,
+        model_path: &Path,
+        device: Option<&str>,
+        deploy_params: &super::WhisperDeployParams,
+    ) -> Result<SttModelInfo> {
         let path = model_path.to_path_buf();
         let device_str = device.unwrap_or("cpu").to_string();
+        // Zachowaj deploy_params zeby `transcribe()` moglo ich uzyc jako
+        // baseline gdy `TranscribeParams` per-call nie ma wartosci
+        // (default_language/default_translate/default_beam_size/n_threads).
+        *self.deploy_params.lock().await = deploy_params.clone();
 
         info!(
             "Ladowanie modelu Whisper: {} (device={})",
@@ -298,6 +343,7 @@ impl SttEngine for WhisperEngine {
         );
 
         let state = self.state.clone();
+        let deploy_params = self.deploy_params.lock().await.clone();
 
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -306,7 +352,7 @@ impl SttEngine for WhisperEngine {
                 .as_ref()
                 .context("Model Whisper zostal wyladowany w trakcie transkrypcji")?;
 
-            Self::transcribe_sync(loaded, &pcm, &params)
+            Self::transcribe_sync(loaded, &pcm, &params, &deploy_params)
         })
         .await
         .context("Blad w spawn_blocking podczas transkrypcji")?
@@ -328,6 +374,7 @@ impl SttEngine for WhisperEngine {
 
         let (tx, rx) = mpsc::channel::<TranscribeChunk>(64);
         let state = self.state.clone();
+        let deploy_params = self.deploy_params.lock().await.clone();
 
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -341,7 +388,7 @@ impl SttEngine for WhisperEngine {
             };
 
             // Transkrypcja calosciowa, nastepnie wysylka segmentow jako chunki
-            match Self::transcribe_sync(loaded, &pcm, &params) {
+            match Self::transcribe_sync(loaded, &pcm, &params, &deploy_params) {
                 Ok(result) => {
                     for segment in &result.segments {
                         let chunk = TranscribeChunk {

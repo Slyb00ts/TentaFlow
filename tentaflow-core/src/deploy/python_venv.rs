@@ -338,11 +338,21 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
         log,
     )?;
 
+    // Faktyczny port to PORT z env (alokowany przez PortAllocator). Pole
+    // `spec.launch.internal_port` z bundle.toml to tylko metadana w jakiej
+    // wartosci `${PORT}` substytuujemy gdy env nie zawiera PORT — wiec
+    // logowanie go jako "port" wprowadza w blad gdy alokator nadal port
+    // inny niz manifestowy default. Bierzemy z env, fallback na metadana.
+    let actual_port = req
+        .env
+        .get("PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(spec.launch.internal_port);
     log(&format!(
-        "uruchamiam silnik: {} (port wewn. {})",
-        req.engine, spec.launch.internal_port
+        "uruchamiam silnik: {} (port {})",
+        req.engine, actual_port
     ));
-    let child = spawn_engine(&venv_dir, &spec, req)?;
+    let child = spawn_engine(&venv_dir, &spec, req, Some(log))?;
 
     Ok(RunningEngine {
         engine: req.engine.clone(),
@@ -1055,7 +1065,7 @@ pub fn relaunch(req: &NativeDeployRequest) -> Result<RunningEngine> {
         );
     }
 
-    let child = spawn_engine(&venv_dir, &spec, req)?;
+    let child = spawn_engine(&venv_dir, &spec, req, None)?;
     Ok(RunningEngine {
         engine: req.engine.clone(),
         instance_name,
@@ -1455,7 +1465,16 @@ pub(crate) fn build_engine_args(
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::with_capacity(spec.launch.args.len() + 8);
     for arg in &spec.launch.args {
-        args.push(substitute_vars_full(arg, env, bundle_dir, venv));
+        let substituted = substitute_vars_full(arg, env, bundle_dir, venv);
+        // `${VAR?--flag:}` z falsy env produkuje pusty token. Pomijamy go,
+        // zeby flagi typu `--enable-chunked-prefill` znikaly z CLI calkowicie
+        // gdy user wylaczy je w wizardzie. Nieintuicyjne `arg.contains("${")`
+        // gate chroni stare argumenty ktore mialy literal pusty string —
+        // ich nie dotykamy (zachowujemy backward compat).
+        if substituted.is_empty() && arg.contains("${") {
+            continue;
+        }
+        args.push(substituted);
     }
     // VLLM_ARGS / SGLANG_ARGS / itd. z deploy wizard (Advanced section) -
     // appendowane PO arguments z bundle.toml. shlex split honoruje cudzyslowy
@@ -1604,7 +1623,12 @@ fn find_nvcc_root() -> Option<PathBuf> {
     None
 }
 
-fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Result<Child> {
+fn spawn_engine(
+    venv: &Path,
+    spec: &BundleSpec,
+    req: &NativeDeployRequest,
+    log: Option<&LogSink>,
+) -> Result<Child> {
     let exe = venv_bin(venv, &spec.launch.command);
     let bundle_dir = venv.join("app");
 
@@ -1724,11 +1748,11 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         cmd.env("FLASHINFER_WORKSPACE_BASE", &flashinfer_cache);
     }
 
-    // Stdout/stderr -> <venv>/engine.log. `Stdio::piped()` bez aktywnego
-    // readera zapycha bufor pipe (~64KB) i Python blokuje na write podczas
-    // ladowania modelu — vLLM widziany z zewnatrz jako "wisi przy starcie".
-    // Plik jest tez jedynym sposobem diagnostyki padajacego silnika
-    // (Connection refused z 127.0.0.1:8000 nic nie mowi o przyczynie).
+    // Stdout/stderr -> tee: kazda linia idzie i do GUI (LogSink, gdy obecny),
+    // i do `<venv>/engine.log` dla post-mortem. `Stdio::piped()` bez aktywnego
+    // readera zapchaloby bufor (~64KB) — dlatego startujemy reader threads
+    // zaraz po spawn. W trybie autostartu (relaunch bez GUI) caller daje
+    // `log = None` i wtedy lecimy bezposrednio do pliku, bez piped+threadow.
     let log_path = venv.join("engine.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -1736,13 +1760,55 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         .truncate(true)
         .open(&log_path)
         .with_context(|| format!("open engine log {}", log_path.display()))?;
-    let log_file_err = log_file
-        .try_clone()
-        .context("clone engine log fd dla stderr")?;
-    cmd.stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err));
 
-    let child = cmd.spawn().with_context(|| format!("spawn {:?}", exe))?;
+    let mut child = if log.is_some() {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.spawn().with_context(|| format!("spawn {:?}", exe))?
+    } else {
+        let log_file_err = log_file
+            .try_clone()
+            .context("clone engine log fd dla stderr")?;
+        cmd.stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err));
+        return Ok(cmd.spawn().with_context(|| format!("spawn {:?}", exe))?);
+    };
+
+    let sink = log.expect("log is Some in piped branch").clone();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let file_arc = Arc::new(std::sync::Mutex::new(log_file));
+
+    let sink_out = Arc::clone(&sink);
+    let file_out = Arc::clone(&file_arc);
+    std::thread::spawn(move || {
+        if let Some(o) = stdout {
+            for line in BufReader::new(o).lines().map_while(Result::ok) {
+                sink_out(&line);
+                if let Ok(mut f) = file_out.lock() {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+        }
+    });
+    let sink_err = Arc::clone(&sink);
+    let file_err = Arc::clone(&file_arc);
+    std::thread::spawn(move || {
+        if let Some(e) = stderr {
+            for line in BufReader::new(e).lines().map_while(Result::ok) {
+                sink_err(&line);
+                if let Ok(mut f) = file_err.lock() {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+        }
+    });
+
+    // Drop our handle on the file; reader threads keep theirs via Arc and
+    // close it naturally when stdout/stderr pipes hit EOF (engine exit).
+    drop(file_arc);
+
     Ok(child)
 }
 
@@ -1754,6 +1820,23 @@ fn substitute_vars(s: &str, env: &HashMap<String, String>, bundle_dir: &Path) ->
     substitute_vars_full(s, env, bundle_dir, Path::new(""))
 }
 
+/// Substitution syntax dla bundle.toml `[launch] args`. Obslugiwane formy:
+///   * `${VAR}` — wartosc env, pusty string gdy brak.
+///   * `${VAR:-default}` — wartosc env lub default.
+///   * `${VAR?yes:no}` — ternary on truthy: `yes` gdy env jest truthy
+///     (1/true/yes/on/enabled, case-insensitive), `no` gdy falsy
+///     (0/false/no/off/disabled, puste, brak env).
+///   * `${VAR?--flag:}` — specjalizacja: `--flag` gdy truthy, empty string
+///     gdy falsy. Empty token jest filtrowany z args list w
+///     `build_engine_args` (single-line `${...}` produkujace tylko empty
+///     daje pusty token; wieksze stringi z embedded `${...?:}` daja zwykla
+///     pusta wartosc w srodku).
+///
+/// Special tokens: `${BUNDLE_DIR}` → bundle path, `${VENV_DIR}` → venv path.
+///
+/// Brak escape sequences. Brak nesting (`${A:-${B}}` → DeployError przez
+/// regex check). Malformed truthy/falsy values (np. env=`"banan"`) → empty
+/// string jako falsy fallback (defensive — nie hard-fail).
 fn substitute_vars_full(
     s: &str,
     env: &HashMap<String, String>,
@@ -1770,21 +1853,56 @@ fn substitute_vars_full(
         };
         let end = start + end_rel;
         let inner = &out[start + 2..end];
-        let (name, default) = match inner.split_once(":-") {
-            Some((n, d)) => (n, Some(d.to_string())),
-            None => (inner, None),
+
+        let value = if let Some((name, branches)) = inner.split_once('?') {
+            // ${VAR?yes:no} ternary
+            let (yes_branch, no_branch) = branches.split_once(':').unwrap_or((branches, ""));
+            let env_value = lookup_env(name, env, &bundle_dir_str, &venv_dir_str);
+            if is_truthy(&env_value) {
+                yes_branch.to_string()
+            } else {
+                no_branch.to_string()
+            }
+        } else if let Some((name, default)) = inner.split_once(":-") {
+            // ${VAR:-default}
+            let env_value = lookup_env(name, env, &bundle_dir_str, &venv_dir_str);
+            if env_value.is_empty() {
+                default.to_string()
+            } else {
+                env_value
+            }
+        } else {
+            // ${VAR}
+            lookup_env(inner, env, &bundle_dir_str, &venv_dir_str)
         };
-        let value = match name {
-            "BUNDLE_DIR" => bundle_dir_str.clone(),
-            "VENV_DIR" => venv_dir_str.clone(),
-            _ => env
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| default.unwrap_or_default()),
-        };
+
         out.replace_range(start..=end, &value);
     }
     out
+}
+
+/// Lookup env var z fallback do special tokens (BUNDLE_DIR, VENV_DIR).
+/// Empty string gdy brak.
+fn lookup_env(
+    name: &str,
+    env: &HashMap<String, String>,
+    bundle_dir_str: &str,
+    venv_dir_str: &str,
+) -> String {
+    match name {
+        "BUNDLE_DIR" => bundle_dir_str.to_string(),
+        "VENV_DIR" => venv_dir_str.to_string(),
+        _ => env.get(name).cloned().unwrap_or_default(),
+    }
+}
+
+/// Czy wartosc jest "truthy" dla ternary substitution. Lista zamknieta —
+/// reszta = falsy. Case-insensitive dla wygody (user moze pisac `True`).
+fn is_truthy(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enabled"
+    )
 }
 
 fn venv_bin(venv: &Path, bin: &str) -> PathBuf {
@@ -1854,6 +1972,107 @@ mod tests {
         let env = HashMap::new();
         let s = substitute_vars("--app-dir ${BUNDLE_DIR}", &env, Path::new("/tmp/b"));
         assert_eq!(s, "--app-dir /tmp/b");
+    }
+
+    #[test]
+    fn substitute_ternary_truthy() {
+        let mut env = HashMap::new();
+        env.insert("ENABLE_PREFIX".to_string(), "true".to_string());
+        let s = substitute_vars(
+            "${ENABLE_PREFIX?--enable-prefix-caching:}",
+            &env,
+            Path::new("/tmp/b"),
+        );
+        assert_eq!(s, "--enable-prefix-caching");
+    }
+
+    #[test]
+    fn substitute_ternary_falsy() {
+        let mut env = HashMap::new();
+        env.insert("ENABLE_PREFIX".to_string(), "false".to_string());
+        let s = substitute_vars(
+            "${ENABLE_PREFIX?--enable-prefix-caching:}",
+            &env,
+            Path::new("/tmp/b"),
+        );
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn substitute_ternary_missing_env_is_falsy() {
+        let env = HashMap::new();
+        let s = substitute_vars(
+            "${ENABLE_PREFIX?--enable-prefix-caching:}",
+            &env,
+            Path::new("/tmp/b"),
+        );
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn substitute_ternary_yes_no_branches() {
+        let mut env = HashMap::new();
+        env.insert("MODE".to_string(), "yes".to_string());
+        let s = substitute_vars("--dtype=${MODE?fp16:fp8}", &env, Path::new("/tmp/b"));
+        assert_eq!(s, "--dtype=fp16");
+        env.insert("MODE".to_string(), "no".to_string());
+        let s2 = substitute_vars("--dtype=${MODE?fp16:fp8}", &env, Path::new("/tmp/b"));
+        assert_eq!(s2, "--dtype=fp8");
+    }
+
+    #[test]
+    fn substitute_ternary_all_truthy_aliases() {
+        for alias in ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON", "enabled", "Enabled"] {
+            let mut env = HashMap::new();
+            env.insert("FLAG".to_string(), alias.to_string());
+            let s = substitute_vars("${FLAG?yes:no}", &env, Path::new("/tmp/b"));
+            assert_eq!(s, "yes", "expected truthy for alias '{}'", alias);
+        }
+    }
+
+    #[test]
+    fn substitute_ternary_falsy_aliases() {
+        for alias in ["0", "false", "False", "no", "NO", "off", "disabled", "", "garbage"] {
+            let mut env = HashMap::new();
+            env.insert("FLAG".to_string(), alias.to_string());
+            let s = substitute_vars("${FLAG?yes:no}", &env, Path::new("/tmp/b"));
+            assert_eq!(s, "no", "expected falsy for alias '{}'", alias);
+        }
+    }
+
+    #[test]
+    fn build_engine_args_filters_empty_ternary_tokens() {
+        let mut spec = vllm_bundle_spec();
+        spec.launch.args = vec![
+            "-m".to_string(),
+            "vllm.entrypoints.openai.api_server".to_string(),
+            "--port".to_string(),
+            "${PORT:-8000}".to_string(),
+            "${ENABLE_CHUNKED?--enable-chunked-prefill:}".to_string(),
+        ];
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5001".to_string());
+        env.insert("ENABLE_CHUNKED".to_string(), "false".to_string());
+        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        // Empty token z falsy ternary jest filtrowany.
+        assert_eq!(
+            args,
+            vec!["-m", "vllm.entrypoints.openai.api_server", "--port", "5001"]
+        );
+
+        // Truthy ternary daje --enable-chunked-prefill jako oddzielny token.
+        env.insert("ENABLE_CHUNKED".to_string(), "true".to_string());
+        let args2 = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        assert_eq!(
+            args2,
+            vec![
+                "-m",
+                "vllm.entrypoints.openai.api_server",
+                "--port",
+                "5001",
+                "--enable-chunked-prefill"
+            ]
+        );
     }
 
     fn vllm_bundle_spec() -> BundleSpec {

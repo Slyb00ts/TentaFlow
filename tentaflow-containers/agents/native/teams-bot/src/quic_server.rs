@@ -129,6 +129,7 @@ impl RouterClient {
                     no_speech_threshold: None,
                     avg_logprob_threshold: None,
                     compression_ratio_threshold: None,
+                    extra_params: None,
                 },
             }),
             stream: false,

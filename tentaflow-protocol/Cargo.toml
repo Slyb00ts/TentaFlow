@@ -9,12 +9,12 @@ description = "Wspólne typy protokołu QUIC+rkyv dla TentaFlow"
 
 [dependencies]
 # Zero-copy serialization
-rkyv = { version = "0.8.12", features = ["unaligned"] }
+rkyv = { version = "0.8.16", features = ["unaligned"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [dev-dependencies]
-serde_json = "1.0"
-criterion = { version = "0.7", features = ["html_reports"] }
+serde_json = "1.0.149"
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "noop"

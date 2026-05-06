@@ -22,8 +22,8 @@ use super::{
 };
 #[cfg(feature = "docker")]
 use super::{
-    category_tag, models_from_manifest, resolve_display_name, smart_health_probe, RuntimeHandle,
-    SmartProbeConfig, SmartProbeOutcome,
+    build_endpoint_url, category_tag, models_from_manifest, resolve_display_name,
+    smart_health_probe, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -518,7 +518,11 @@ impl DeployStrategy for DockerDeploy {
 
         let endpoint_url = match transport {
             Transport::SidecarQuic => Some(format!("quic://127.0.0.1:{}", sidecar_quic.unwrap())),
-            Transport::HttpDirect => Some(format!("http://127.0.0.1:{}", host_http)),
+            Transport::HttpDirect => Some(build_endpoint_url(
+                "127.0.0.1",
+                host_http,
+                self.manifest.engine.api,
+            )),
             _ => None,
         };
 
@@ -531,7 +535,17 @@ impl DeployStrategy for DockerDeploy {
             instance_dir: None,
         };
         let models = models_from_manifest(&self.manifest, &self.user_config);
-        let config_json = serde_json::to_string(&self.user_config)
+        // Typed schema params + request_time → config_json. Docker silniki
+        // konsumuja env binding (vllm/sglang/tensorrt-llm — env do
+        // entrypoint.sh) plus opcjonalnie request-time (gdy api jest
+        // OpenAI-compat, materializuje sie przez BackendClient).
+        let (_param_app, request_time) = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::Docker,
+        )
+        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+        let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
         Ok(PreparedDeploy {
@@ -629,6 +643,7 @@ mod tests {
                 external: None,
             },
             model_presets: vec![],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }

@@ -84,6 +84,39 @@ impl Default for GenerateParams {
     }
 }
 
+impl GenerateParams {
+    /// Inicjalizuj `GenerateParams` z deploy-time defaults dla MLX engine.
+    /// `default_max_tokens` / `default_temperature` / `default_top_p` /
+    /// `default_top_k` / `default_repeat_penalty` z `mlx` mapy nadpisuja
+    /// hardcoded `Default` jako baseline. Request-time wartosci z OpenAI
+    /// API maja priorytet wyzszy (dolaczane przez
+    /// `merge_request_override`).
+    pub fn from_mlx_deploy_defaults(
+        defaults: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Self {
+        let mut p = Self::default();
+        if let Some(v) = defaults.get("default_max_tokens").and_then(|v| v.as_u64()) {
+            p.max_tokens = v as u32;
+        }
+        if let Some(v) = defaults.get("default_temperature").and_then(|v| v.as_f64()) {
+            p.temperature = v as f32;
+        }
+        if let Some(v) = defaults.get("default_top_p").and_then(|v| v.as_f64()) {
+            p.top_p = v as f32;
+        }
+        if let Some(v) = defaults.get("default_top_k").and_then(|v| v.as_u64()) {
+            p.top_k = v as u32;
+        }
+        if let Some(v) = defaults
+            .get("default_repeat_penalty")
+            .and_then(|v| v.as_f64())
+        {
+            p.repeat_penalty = v as f32;
+        }
+        p
+    }
+}
+
 /// Wynik generowania
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateResult {
@@ -130,6 +163,31 @@ pub struct EmbeddingResult {
     pub dimensions: usize,
 }
 
+/// Snapshot deploy-time parametrow zwiazanych z aktywnym modelem.
+/// Wszystkie mapy `key → JSON value` — backend interpretuje per silnik
+/// (np. llama-cpp czyta `ctx_size`/`n_gpu_layers`/`threads`/`batch_size`,
+/// MLX trzyma `default_max_tokens`/`default_temperature` jako request-
+/// time defaults). Empty snapshot = sensowne defaulty per backend.
+#[derive(Debug, Default, Clone)]
+pub struct DeployParamsSnapshot {
+    pub llamacpp: std::collections::HashMap<String, serde_json::Value>,
+    pub mlx: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl DeployParamsSnapshot {
+    /// Convenience: legacy `gpu_layers` jako pojedyncze pole — trzymane
+    /// dla zachowania prostej sciezki migracji starych callerow ktorzy
+    /// znaja tylko `gpu_layers`.
+    pub fn with_gpu_layers(layers: Option<u32>) -> Self {
+        let mut s = Self::default();
+        if let Some(l) = layers {
+            s.llamacpp
+                .insert("n_gpu_layers".into(), serde_json::json!(l));
+        }
+        s
+    }
+}
+
 /// Interfejs silnika inferencji — implementowany przez backendy (llama.cpp, MLX)
 #[async_trait]
 pub trait InferenceEngine: Send + Sync {
@@ -139,11 +197,15 @@ pub trait InferenceEngine: Send + Sync {
     /// Lista obslugiwanych formatow modeli
     fn supported_formats(&self) -> Vec<String>;
 
-    /// Zaladuj model z podanej sciezki
+    /// Zaladuj model z podanej sciezki. `deploy_params` niesie typed
+    /// load-time tunables — llama-cpp czyta `ctx_size`/`n_gpu_layers`/
+    /// `threads`/`batch_size`, MLX nic z load-time nie konsumuje
+    /// (deploy defaults zywa w `InferenceManager.active_deploy_params`
+    /// i sa materializowane przy kazdym `generate`).
     async fn load_model(
         &self,
         model_path: &Path,
-        gpu_layers: Option<u32>,
+        deploy_params: &DeployParamsSnapshot,
     ) -> anyhow::Result<ModelInfo>;
 
     /// Wyladuj model z pamieci
@@ -175,10 +237,19 @@ pub trait InferenceEngine: Send + Sync {
     }
 }
 
-/// Manager silnikow inferencji — wybiera odpowiedni backend
+/// Manager silnikow inferencji — wybiera odpowiedni backend.
+/// **Singleton invariant:** jeden active embedded LLM per host process
+/// (architektura `OnceLock<Arc<RwLock<InferenceManager>>>` w
+/// `shared_inference_manager`). Deploy drugiego embedded LLM podmienia
+/// active_engine + active_deploy_params.
 pub struct InferenceManager {
     engines: Vec<Box<dyn InferenceEngine>>,
     active_engine: Option<usize>,
+    /// Typed deploy params aktualnego modelu. Ustawiane przy `load_model`,
+    /// czyszczone w `unload_model`. `LocalInferenceHandler` czyta przez
+    /// `get_deploy_params()` i materializuje do `GenerateParams` jako
+    /// baseline (request override z OpenAI API ma priorytet wyzszy).
+    active_deploy_params: DeployParamsSnapshot,
 }
 
 impl InferenceManager {
@@ -205,7 +276,16 @@ impl InferenceManager {
         Self {
             engines,
             active_engine: None,
+            active_deploy_params: DeployParamsSnapshot::default(),
         }
+    }
+
+    /// Snapshot aktualnych deploy params. `LocalInferenceHandler` woła to
+    /// per chat completion request zeby zbudowac `GenerateParams` z
+    /// `default_temperature`/`default_max_tokens`/`default_top_p` z
+    /// `mlx` mapy jako baseline.
+    pub fn get_deploy_params(&self) -> DeployParamsSnapshot {
+        self.active_deploy_params.clone()
     }
 
     /// Lista dostepnych backendow
@@ -222,11 +302,14 @@ impl InferenceManager {
             .and_then(|i| self.engines.get(i).map(|e| e.as_ref()))
     }
 
-    /// Zaladuj model — automatycznie wybierze backend na podstawie formatu
+    /// Zaladuj model — automatycznie wybierze backend na podstawie formatu.
+    /// `deploy_params` niesie typed load-time tunables (czytane przez
+    /// llama-cpp) i request-time defaults (czytane przez MLX z
+    /// `active_deploy_params`).
     pub async fn load_model(
         &mut self,
         model_path: &Path,
-        gpu_layers: Option<u32>,
+        deploy_params: DeployParamsSnapshot,
         preferred_backend: Option<&str>,
     ) -> anyhow::Result<ModelInfo> {
         let ext = model_path
@@ -261,17 +344,20 @@ impl InferenceManager {
         };
 
         let info = self.engines[engine_idx]
-            .load_model(model_path, gpu_layers)
+            .load_model(model_path, &deploy_params)
             .await?;
         self.active_engine = Some(engine_idx);
+        self.active_deploy_params = deploy_params;
         Ok(info)
     }
 
-    /// Wyladuj model
+    /// Wyladuj model. Czysci tez `active_deploy_params` zeby kolejne
+    /// request po unload nie czytaly stale wartosci poprzedniego modelu.
     pub async fn unload_model(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.active_engine {
             self.engines[idx].unload_model().await?;
             self.active_engine = None;
+            self.active_deploy_params = DeployParamsSnapshot::default();
         }
         Ok(())
     }

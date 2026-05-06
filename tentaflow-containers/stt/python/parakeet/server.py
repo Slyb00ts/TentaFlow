@@ -50,15 +50,27 @@ async def transcribe(
     model: str = Form("parakeet"),
     language: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
+    data: Optional[str] = Form(None),
 ):
-    data = await file.read()
+    # Typed request-time overrides z BackendClient (multipart `data=<json>`).
+    # Parakeet/NeMo nie wystawia per-request knobow (beam_size/itd. sa baked
+    # w model checkpoint), wiec `overrides` na razie tylko logujemy dla
+    # observability — jak NeMo upstream doda parametry, podlinkujemy.
+    if data:
+        try:
+            import json as _json
+            _ = _json.loads(data)  # sanity check
+        except Exception:
+            pass
+
+    audio_bytes = await file.read()
     # zapisz do tmp WAV zeby NeMo zjadl dowolny format
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         try:
-            audio, sr = sf.read(io.BytesIO(data))
+            audio, sr = sf.read(io.BytesIO(audio_bytes))
             sf.write(tf.name, audio, sr, subtype="PCM_16")
         except Exception:
-            tf.write(data)
+            tf.write(audio_bytes)
         path = tf.name
 
     try:

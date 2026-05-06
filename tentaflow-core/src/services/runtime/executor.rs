@@ -1542,36 +1542,105 @@ impl ModelRuntimeExecutor {
     // R3b.5 — STT dispatch (thin delegate to SttRuntime)
     // =========================================================================
 
-    /// STT delegate. The executor does **not** own STT dispatch logic — it
-    /// hands off to `SttRuntime` (D.3 single-owner). Resolver/strategy
-    /// would not add value for MVP because each node runs at most one STT
-    /// engine; the SttRuntime already encapsulates QUIC/HTTP/embedded
-    /// fallback and per-engine speaker pipeline. When a future iteration
-    /// needs multi-instance STT routing (e.g. picking between whisper-cpp
-    /// and parakeet), the dispatch can move into the resolver and this
-    /// method can grow into a full `dispatch_stt_blocking` like the
-    /// other surfaces.
-    ///
-    /// **ACL is the caller's responsibility** — mirror of the other
-    /// `execute_*` entry points.
-    ///
-    /// Codex R3b.5+6 H1/M2: failure modes are split into typed variants
-    /// so the caller can distinguish "executor not ready, retry through
-    /// the legacy path" (`SttRuntimeUnavailable`) from "real STT error,
-    /// surface to the user" (`SttBackend(SttBackendError)`). Without this
-    /// split the legacy fallback runs the same expensive transcription
-    /// twice on transient backend errors.
+    /// STT delegate. Resolver wybiera service po modelu (`build_stt_resolve_request`):
+    /// * `Local{service_id}` → `transcribe_for_service(service_id)` —
+    ///   wybiera per-service backend (Http dla python-bundle wrapperow,
+    ///   Local dla embedded whisper).
+    /// * `MeshForward{node_id, service_id}` → forward STT request przez
+    ///   QUIC/iroh do peera. Aktualnie nie wspierane wprost na poziomie
+    ///   Executor (mesh STT forward jest TODO przy bigger refactor mesh
+    ///   inference proxy); wracamy `SttBackend("mesh forward not implemented")`
+    ///   zeby request padal czytelnie zamiast cicho lokalnym whisperem.
+    /// * `Flow` → wracamy clean failure (flow STT idzie przez flow_engine
+    ///   adapter, nie executor).
+    /// Resolver error (UnknownModel/CapabilityUnsupported) padamy
+    /// `SttBackend(error)` zeby user zobaczyl klarowny blad.
+    /// Gdy `model` jest pusty / brak kandydatow → fallback do default
+    /// local whisper (zachowuje pre-existing UX dla single-engine node'u).
     pub async fn execute_stt(
         &self,
         request: TranscriptionRequest,
+        ctx: &mut ExecutionContext,
     ) -> Result<TranscriptionResponse, ExecutorError> {
         let runtime = self.stt_runtime.read().clone().ok_or_else(|| {
             ExecutorError::SttRuntimeUnavailable
         })?;
-        runtime
-            .transcribe(request)
-            .await
-            .map_err(|e| ExecutorError::SttBackend(e.to_string()))
+
+        // Pusty model = bezposredni fallback do default local whisper
+        // (handler `/v1/audio/transcriptions` bez `model` field — legacy
+        // zachowanie).
+        if request.model.trim().is_empty() {
+            return runtime
+                .transcribe(request)
+                .await
+                .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+        }
+
+        let snapshot = self.catalog.snapshot();
+        let req = self.build_stt_resolve_request(&request);
+        let outcome = match self.resolver.resolve(&req, &snapshot, ctx) {
+            Ok(o) => o,
+            Err(crate::services::runtime::resolver::ResolveError::UnknownModel(_))
+            | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported { .. }) => {
+                // Legacy single-node bez catalog STT entries: client wysyla
+                // `model="whisper-1"` (default), katalog nie ma takiego
+                // wpisu — fallback do default local whisper zamiast hard
+                // error. Inne resolver errors (np. AclDenied) propagujemy.
+                return runtime
+                    .transcribe(request)
+                    .await
+                    .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+            }
+            Err(e) => return Err(ExecutorError::SttBackend(format!("resolver: {}", e))),
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+        if ranked.is_empty() {
+            // Resolver nie zwrocil zadnego kandydata mimo OK — fallback
+            // do default local zeby legacy single-node node bez STT services
+            // w katalogu nadal dzialal.
+            return runtime
+                .transcribe(request)
+                .await
+                .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+        }
+
+        for target in ranked {
+            match target {
+                ResolvedExecutionTarget::Local { service_id, .. } => {
+                    return runtime
+                        .transcribe_for_service(service_id, request)
+                        .await
+                        .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+                }
+                ResolvedExecutionTarget::MeshForward { node_id, .. } => {
+                    return Err(ExecutorError::SttBackend(format!(
+                        "mesh forward STT (node {}) not implemented yet",
+                        node_id
+                    )));
+                }
+                ResolvedExecutionTarget::Flow { .. } => {
+                    return Err(ExecutorError::SttBackend(
+                        "STT through flow_engine not supported via executor.execute_stt"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        unreachable!("ranked has at least one element after empty check")
+    }
+
+    fn build_stt_resolve_request<'a>(
+        &self,
+        request: &'a TranscriptionRequest,
+    ) -> ResolveRequest<'a> {
+        ResolveRequest {
+            requested_model: &request.model,
+            required_surface: ServiceSurface::Stt,
+            required_input_modalities: &[InputModality::Audio],
+            required_output_modalities: &[OutputModality::Text],
+        }
     }
 }
 
@@ -1829,7 +1898,7 @@ mod tests {
     #[tokio::test]
     async fn embeddings_embedded_routes_through_local_inference() {
         let exec = dummy_executor();
-        let target = ResolvedExecutionTarget::Local {
+        let target = ResolvedExecutionTarget::Local { service_id: 1,
             model_name: "qwen-emb".into(),
             handle: BackendHandle::Embedded {
                 model_name: "qwen-emb".into(),
@@ -2016,8 +2085,9 @@ mod tests {
             compression_ratio_threshold: None,
             options: crate::api::openai::types::SttRequestOptions::default(),
         };
+        let mut ctx = crate::services::runtime::context::ExecutionContext::default();
         let err = exec
-            .execute_stt(request)
+            .execute_stt(request, &mut ctx)
             .await
             .expect_err("no STT runtime → typed error");
         assert!(matches!(err, ExecutorError::SttRuntimeUnavailable));

@@ -22,7 +22,9 @@ use tokio::sync::broadcast;
 use crate::db::DbPool;
 use crate::deploy::log_bus::{now_ms, BusMessage, LogLine};
 use crate::services::lifecycle::ServiceEndpoint;
-use crate::services::manifest::ServiceManifest;
+use crate::services::manifest::{
+    ApiKind, BindingTarget, DeployTarget, EngineParameter, ParameterKind, ServiceManifest,
+};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::deployments::{self as deployments_repo, DeploymentStatus};
@@ -430,6 +432,30 @@ pub async fn respawn(
 /// the container, and releases its host-allocated ports. Does **not** delete
 /// the `services` row — the caller decides whether to mark it `stopped`
 /// or `DELETE` it (cascade removes `model_registry`). Errors are merged
+/// Shutdown wszystkich supervised services przy zamykaniu tentaflow.
+/// Iteruje po `services` rzedach w DB ze statusem != stopped i wola `stop()`
+/// dla kazdego (docker container stop+rm, native PID terminate). Bez tego
+/// vLLM/sglang/llama-cpp subprocessy zostawaly zombie po Ctrl+C, trzymajac
+/// VRAM i blokujac port 5000-6000 dla nowych deployow.
+pub async fn stop_all_supervised(
+    db: &crate::db::DbPool,
+    ports: Arc<PortAllocator>,
+) -> Vec<(i64, String)> {
+    let services = match db.lock() {
+        Ok(conn) => crate::services_repo::services::list_supervised(&conn).unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let mut errors: Vec<(i64, String)> = Vec::new();
+    for svc in services {
+        let id = svc.id;
+        let engine_id = svc.engine_id.clone();
+        if let Err(e) = stop(&svc, ports.clone()).await {
+            errors.push((id, format!("{}: {}", engine_id, e)));
+        }
+    }
+    errors
+}
+
 /// into a single `DeployError::Other` so callers can surface them as a single
 /// "stop failed" message.
 pub async fn stop(
@@ -519,7 +545,12 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         deploy_method: prepared.deploy_method,
         transport: prepared.transport,
         status,
-        pinned: false,
+        // Domyslnie pinned: po Ctrl+C tentaflow stop_all_supervised terminuje
+        // procesy (zwalnia VRAM/porty), a przy starcie supervisor.first_tick
+        // → auto_start_pinned respawnuje serwis. Bez pin user musialby recznie
+        // klikac Start po kazdym restarcie. Odpinanie zostaje pod kontrola
+        // usera (przycisk pin w GUI).
+        pinned: true,
         paused: false,
         runtime_pid: prepared.runtime.pid,
         runtime_port: prepared.runtime.port,
@@ -696,6 +727,667 @@ pub(crate) fn models_from_manifest(
     }]
 }
 
+/// Resolves the actual model repository identifier (e.g. `Qwen/Qwen3.5-0.8B`)
+/// the engine should load. Mirrors `models_from_manifest` selection rules but
+/// returns the *repo string* the engine consumes via env (`${MODEL}`):
+///   1. `user_config.model_repo` — custom HF repo.
+///   2. `user_config.model_preset_id` — preset.repo lookup.
+///   3. Recommended preset's repo (or first preset's repo as fallback).
+///   4. None — manifest has no presets and wizard sent no repo.
+pub(crate) fn resolve_model_repo(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+) -> Option<String> {
+    if let Some(repo) = user_config
+        .get("model_repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(repo.to_string());
+    }
+    if let Some(id) = user_config
+        .get("model_preset_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(p) = manifest.model_presets.iter().find(|m| m.id == id) {
+            return Some(p.repo.clone());
+        }
+    }
+    if manifest.model_presets.is_empty() {
+        return None;
+    }
+    let chosen = manifest
+        .model_presets
+        .iter()
+        .find(|p| p.recommended)
+        .unwrap_or(&manifest.model_presets[0]);
+    Some(chosen.repo.clone())
+}
+
+/// Builds the canonical base URL we persist as `services.endpoint_url` for
+/// HTTP transports. `BackendClient` (in `services/backend/client.rs`) appends
+/// `/chat/completions`, `/embeddings`, `/audio/{transcriptions,speech}` to
+/// whatever we hand it — so for OpenAI-compatible engines the base URL must
+/// already include the `/v1` prefix or every request lands on a 404. Other
+/// API families (Ollama `/api/...`, sherpa native, comfyui) keep the bare
+/// `host:port` and rely on `custom_endpoint` overrides downstream.
+pub(crate) fn build_endpoint_url(host: &str, port: u16, api: ApiKind) -> String {
+    let base = format!("http://{}:{}", host, port);
+    match api {
+        ApiKind::OpenaiCompatible => format!("{}/v1", base),
+        ApiKind::OllamaNative
+        | ApiKind::SherpaTts
+        | ApiKind::SherpaStt
+        | ApiKind::Comfyui
+        | ApiKind::Custom => base,
+    }
+}
+
+#[cfg(test)]
+mod build_endpoint_url_tests {
+    use super::*;
+
+    #[test]
+    fn openai_compatible_appends_v1() {
+        assert_eq!(
+            build_endpoint_url("127.0.0.1", 5001, ApiKind::OpenaiCompatible),
+            "http://127.0.0.1:5001/v1"
+        );
+    }
+
+    #[test]
+    fn ollama_keeps_bare_base() {
+        assert_eq!(
+            build_endpoint_url("127.0.0.1", 11434, ApiKind::OllamaNative),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn sherpa_keeps_bare_base() {
+        assert_eq!(
+            build_endpoint_url("127.0.0.1", 5002, ApiKind::SherpaTts),
+            "http://127.0.0.1:5002"
+        );
+        assert_eq!(
+            build_endpoint_url("127.0.0.1", 5003, ApiKind::SherpaStt),
+            "http://127.0.0.1:5003"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_parameters_deploy_tests {
+    use super::*;
+    use crate::services::manifest::{
+        BindingTarget, Category, DeploySection, DockerDeploy, DockerTransport, Engine,
+        EngineParameter, NumRange, ParameterBinding, ParameterKind, TargetOs,
+    };
+    use serde_json::json;
+
+    fn make_engine(id: &str) -> Engine {
+        Engine {
+            id: id.into(),
+            category: Category::Llm,
+            name: id.into(),
+            description_pl: String::new(),
+            description_en: String::new(),
+            homepage: String::new(),
+            license: String::new(),
+            icon: None,
+            resource_kind: None,
+            requires_model: Some(true),
+            gpu_supported: None,
+            default_port: 8000,
+            api: ApiKind::OpenaiCompatible,
+            version: "0.1.0".into(),
+            service_surfaces: None,
+            input_modalities: None,
+            output_modalities: None,
+        }
+    }
+
+    fn docker_deploy() -> DeploySection {
+        DeploySection {
+            docker: Some(DockerDeploy {
+                context_path: Some("docker/test".into()),
+                compose_path: None,
+                platforms: vec![TargetOs::Linux],
+                download_image: None,
+                download_size_mb: None,
+                transport: Some(DockerTransport::SidecarQuic),
+            }),
+            native: None,
+            external: None,
+        }
+    }
+
+    fn manifest_with_params(parameters: Vec<EngineParameter>) -> ServiceManifest {
+        ServiceManifest {
+            engine: make_engine("test"),
+            deploy: docker_deploy(),
+            model_presets: vec![],
+            parameters,
+            docker_source_hash: String::new(),
+            native_source_hash: String::new(),
+        }
+    }
+
+    fn float_param(key: &str, env: &str, default: f64) -> EngineParameter {
+        EngineParameter {
+            key: key.into(),
+            label_pl: key.into(),
+            label_en: key.into(),
+            kind: ParameterKind::Float,
+            range: Some(NumRange {
+                min: 0.1,
+                max: 0.95,
+                step: Some(0.05),
+            }),
+            options: None,
+            default: json!(default),
+            bindings: vec![ParameterBinding {
+                when: DeployTarget::Docker,
+                target: BindingTarget::Env { name: env.into() },
+            }],
+        }
+    }
+
+    #[test]
+    fn empty_parameters_returns_empty_application() {
+        let m = manifest_with_params(vec![]);
+        let (app, req) =
+            apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
+        assert!(app.env.is_empty());
+        assert!(req.ollama_options.is_empty());
+    }
+
+    #[test]
+    fn user_value_overrides_default() {
+        let m = manifest_with_params(vec![float_param(
+            "gpu_memory_utilization",
+            "GPU_MEMORY_UTILIZATION",
+            0.9,
+        )]);
+        let user_config = json!({ "parameters": { "gpu_memory_utilization": 0.6 } });
+        let (app, _) =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap();
+        assert_eq!(app.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.6");
+    }
+
+    #[test]
+    fn missing_user_value_uses_default() {
+        let m = manifest_with_params(vec![float_param(
+            "gpu_memory_utilization",
+            "GPU_MEMORY_UTILIZATION",
+            0.9,
+        )]);
+        let (app, _) =
+            apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
+        assert_eq!(app.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.9");
+    }
+
+    #[test]
+    fn out_of_range_returns_error() {
+        let m = manifest_with_params(vec![float_param(
+            "gpu_memory_utilization",
+            "GPU_MEMORY_UTILIZATION",
+            0.9,
+        )]);
+        let user_config = json!({ "parameters": { "gpu_memory_utilization": 2.0 } });
+        let err =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
+        assert!(matches!(err, ParameterError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn type_mismatch_returns_error() {
+        let m = manifest_with_params(vec![float_param(
+            "gpu_memory_utilization",
+            "GPU_MEMORY_UTILIZATION",
+            0.9,
+        )]);
+        let user_config = json!({ "parameters": { "gpu_memory_utilization": "not a float" } });
+        let err =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
+        assert!(matches!(err, ParameterError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn binding_for_other_target_is_skipped() {
+        let m = manifest_with_params(vec![float_param(
+            "gpu_memory_utilization",
+            "GPU_MEMORY_UTILIZATION",
+            0.9,
+        )]);
+        // Manifest ma binding when="docker", pytamy o native_embedded.
+        // Backend rozsadnie nic nie zwraca dla tej deploy method.
+        let (app, _) =
+            apply_parameters_deploy(&m, &json!({}), DeployTarget::NativeEmbedded).unwrap();
+        assert!(app.env.is_empty());
+    }
+
+    #[test]
+    fn dual_binding_dispatches_per_target() {
+        let p = EngineParameter {
+            key: "ctx_size".into(),
+            label_pl: "ctx".into(),
+            label_en: "ctx".into(),
+            kind: ParameterKind::Int,
+            range: Some(NumRange {
+                min: 512.0,
+                max: 131072.0,
+                step: Some(512.0),
+            }),
+            options: None,
+            default: json!(8192),
+            bindings: vec![
+                ParameterBinding {
+                    when: DeployTarget::NativeEmbedded,
+                    target: BindingTarget::LlamacppField {
+                        field: "ctx_size".into(),
+                    },
+                },
+                ParameterBinding {
+                    when: DeployTarget::Docker,
+                    target: BindingTarget::Env {
+                        name: "CTX_SIZE".into(),
+                    },
+                },
+            ],
+        };
+        let m = manifest_with_params(vec![p]);
+        let user_config = json!({ "parameters": { "ctx_size": 32768 } });
+
+        let (app_docker, _) =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap();
+        assert_eq!(app_docker.env.get("CTX_SIZE").unwrap(), "32768");
+        assert!(app_docker.llamacpp.is_empty());
+
+        let (app_emb, _) =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::NativeEmbedded).unwrap();
+        assert!(app_emb.env.is_empty());
+        assert_eq!(app_emb.llamacpp.get("ctx_size").unwrap(), &json!(32768));
+    }
+
+    #[test]
+    fn whisper_field_with_request_override_populates_both_maps() {
+        let p = EngineParameter {
+            key: "beam_size".into(),
+            label_pl: "beam".into(),
+            label_en: "beam".into(),
+            kind: ParameterKind::Int,
+            range: Some(NumRange {
+                min: 1.0,
+                max: 16.0,
+                step: None,
+            }),
+            options: None,
+            default: json!(5),
+            bindings: vec![ParameterBinding {
+                when: DeployTarget::NativeEmbedded,
+                target: BindingTarget::WhisperField {
+                    field: "default_beam_size".into(),
+                    request_override: true,
+                },
+            }],
+        };
+        let mut m = manifest_with_params(vec![p]);
+        // Manifest musi mieć [deploy.native] z runtime=embedded zeby
+        // walidacja w build.rs przeszla, ale ten test nie odpala
+        // walidacji — deploy section w manifestcie tylko dispatch, my
+        // pytamy o NativeEmbedded.
+        m.deploy.native = Some(crate::services::manifest::NativeDeploy {
+            runtime: crate::services::manifest::NativeRuntime::Embedded,
+            platforms: vec![TargetOs::Linux],
+            feature_flag: Some("inference-whisper".into()),
+            binary_path: None,
+            bundle_path: None,
+        });
+        m.deploy.docker = None;
+
+        let user_config = json!({ "parameters": { "beam_size": 8 } });
+        let (app, req) =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::NativeEmbedded).unwrap();
+        assert_eq!(app.whisper.get("default_beam_size").unwrap(), &json!(8));
+        assert_eq!(req.whisper_overridable.get("default_beam_size").unwrap(), &json!(8));
+    }
+
+    #[test]
+    fn ollama_options_goes_to_request_time() {
+        let p = EngineParameter {
+            key: "context_size".into(),
+            label_pl: "ctx".into(),
+            label_en: "ctx".into(),
+            kind: ParameterKind::Int,
+            range: Some(NumRange {
+                min: 512.0,
+                max: 131072.0,
+                step: None,
+            }),
+            options: None,
+            default: json!(8192),
+            bindings: vec![ParameterBinding {
+                when: DeployTarget::External,
+                target: BindingTarget::OllamaOptions {
+                    key: "num_ctx".into(),
+                },
+            }],
+        };
+        let mut m = manifest_with_params(vec![p]);
+        m.deploy.docker = None;
+        m.deploy.external = Some(crate::services::manifest::ExternalDeploy {
+            platforms: vec![TargetOs::Linux],
+            detection_binary: "ollama".into(),
+            detection_endpoint: "http://localhost:11434".into(),
+            detection_health_path: "/api/tags".into(),
+        });
+
+        let user_config = json!({ "parameters": { "context_size": 16384 } });
+        let (app, req) =
+            apply_parameters_deploy(&m, &user_config, DeployTarget::External).unwrap();
+        assert!(app.env.is_empty());
+        assert_eq!(req.ollama_options.get("num_ctx").unwrap(), &json!(16384));
+    }
+}
+
+/// Merguje `user_config` z typed `request_time_parameters` i serializuje
+/// do JSON do zapisu w `services.config_json`. Snapshot builder czyta to
+/// pole obratem i propaguje do `BackendClient` przez `LiveHandlesCache`.
+/// Bez tego wywoływania typed overrides z `apply_parameters_deploy`
+/// nigdy nie docierałyby do request body.
+pub fn merge_config_json(
+    user_config: &serde_json::Value,
+    request_time: &RequestTimeParameters,
+) -> Result<String, serde_json::Error> {
+    let mut value = user_config.clone();
+    if !value.is_object() {
+        value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let to_value_map = |m: &HashMap<String, serde_json::Value>| -> serde_json::Map<String, serde_json::Value> {
+        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let rtp = serde_json::json!({
+        "ollama_options": to_value_map(&request_time.ollama_options),
+        "python_request": to_value_map(&request_time.python_request),
+        "whisper_overridable": to_value_map(&request_time.whisper_overridable),
+        "mlx_overridable": to_value_map(&request_time.mlx_overridable),
+    });
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("request_time_parameters".into(), rtp);
+    }
+    serde_json::to_string(&value)
+}
+
+/// Reads `(free_mib, total_mib)` for cuda:0 via `nvidia-smi`. Returns `None`
+/// when the binary is missing or fails (e.g. AMD-only / Apple host). vLLM
+/// default targets device 0 unless `CUDA_VISIBLE_DEVICES` reorders things,
+/// so we report the first row.
+pub(crate) fn query_cuda0_vram_mib() -> Option<(u64, u64)> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?;
+    let parts: Vec<&str> = first.split(',').map(str::trim).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let free = parts[0].parse().ok()?;
+    let total = parts[1].parse().ok()?;
+    Some((free, total))
+}
+
+/// Computes a safe `--gpu-memory-utilization` ratio so the resulting allocation
+/// fits in currently free VRAM with a headroom buffer. vLLM checks
+/// `total_mib * ratio <= free_mib` at startup and crashes otherwise. We aim at
+/// `min(0.92, 0.94 * free/total)` — leaves ~6% headroom for fragmentation,
+/// torch allocator slack, kernel JIT scratch. Returns `None` when nvidia-smi
+/// is unavailable (caller should keep the manifest default).
+pub(crate) fn auto_gpu_memory_utilization() -> Option<f64> {
+    let (free_mib, total_mib) = query_cuda0_vram_mib()?;
+    if total_mib == 0 {
+        return None;
+    }
+    let free_ratio = free_mib as f64 / total_mib as f64;
+    let ratio = (0.94 * free_ratio).min(0.92);
+    if ratio < 0.10 {
+        return Some(ratio);
+    }
+    let rounded = (ratio * 100.0).floor() / 100.0;
+    Some(rounded)
+}
+
+
+/// Wynik aplikacji typed schemy parametrów dla konkretnego deployu.
+/// **Deploy-time** wartości — konsumowane raz przy spawnie procesu albo
+/// load modelu. Per-binding-type rozsiane do osobnych map zeby caller mial
+/// to zone (env idzie do procesu/dockera, llamacpp/whisper/mlx do loadera).
+#[derive(Debug, Default, Clone)]
+pub struct ParameterApplication {
+    /// Env vars dla python-bundle/docker/binary engines.
+    pub env: HashMap<String, String>,
+    /// Pola `LlamaCppDeployParams` dla embedded llama-cpp.
+    pub llamacpp: HashMap<String, serde_json::Value>,
+    /// Pola `WhisperDeployParams` dla embedded whisper / mlx-whisper.
+    pub whisper: HashMap<String, serde_json::Value>,
+    /// Pola `MlxDeployParams` dla embedded mlx LLM.
+    pub mlx: HashMap<String, serde_json::Value>,
+}
+
+/// Wynik aplikacji typed schemy dla **request-time** wartosci.
+/// Persystowane w `services.config_json` jako typed JSON; przy kazdym
+/// requestcie do silnika materializowane (Ollama options w POST body,
+/// extra fields w multipart `data`, deploy defaults dla MLX/Whisper z
+/// per-request override).
+#[derive(Debug, Default, Clone)]
+pub struct RequestTimeParameters {
+    /// Klucz=wartosc dla Ollama API `options` mapy.
+    pub ollama_options: HashMap<String, serde_json::Value>,
+    /// Pola POST body do generic Python wrappera (qwen-asr, kyutai-tts,
+    /// xtts, voxcpm, chatterbox).
+    pub python_request: HashMap<String, serde_json::Value>,
+    /// Whisper deploy defaults z `request_override = true` — backend
+    /// przy `transcribe()` uzywa jako baseline; klient API moze nadpisac.
+    pub whisper_overridable: HashMap<String, serde_json::Value>,
+    /// MLX deploy defaults z `request_override = true` — analogicznie.
+    pub mlx_overridable: HashMap<String, serde_json::Value>,
+}
+
+/// Bledy walidacji parametrow na ktore deploy powinien upasc zanim
+/// alokuje zasoby (port, container, venv).
+#[derive(Debug, thiserror::Error)]
+pub enum ParameterError {
+    #[error("parameter '{key}' not in manifest schema")]
+    UnknownKey { key: String },
+    #[error("parameter '{key}' value type {actual} does not match kind {expected:?}")]
+    TypeMismatch {
+        key: String,
+        expected: ParameterKind,
+        actual: &'static str,
+    },
+    #[error("parameter '{key}' value {value} out of range [{min}, {max}]")]
+    OutOfRange {
+        key: String,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+    #[error("parameter '{key}' value '{value}' not in options {options:?}")]
+    NotInOptions {
+        key: String,
+        value: String,
+        options: Vec<String>,
+    },
+    #[error("parameter '{key}' has no binding for deploy target {target:?}")]
+    NoBindingForTarget {
+        key: String,
+        target: DeployTarget,
+    },
+}
+
+/// Aplikuje typed schemę parametrów z manifestu do `user_config.parameters`
+/// mapy, produkując osobno deploy-time bindings (`ParameterApplication`)
+/// i request-time bindings (`RequestTimeParameters`).
+///
+/// Algorytm per parametr w manifeście:
+///   1. Czytaj wartość z `user_config.parameters[p.key]` lub `p.default`.
+///   2. Waliduj zgodność z `kind`, `range`, `options`. Niezgodność → error.
+///   3. Z `p.bindings[]` wybierz ten z `when == deploy_target`. Brak → skip.
+///   4. Dispatch po `binding.target`:
+///      - `Env` → `app.env`
+///      - `LlamacppField` → `app.llamacpp`
+///      - `WhisperField` → `app.whisper` (+ `req.whisper_overridable` gdy
+///        `request_override = true`)
+///      - `MlxField` → `app.mlx` (+ `req.mlx_overridable` gdy
+///        `request_override = true`)
+///      - `OllamaOptions` → `req.ollama_options`
+///      - `PythonRequestBody` → `req.python_request`
+///
+/// Wizard wysyła `parameters: { key: value, ... }` jako mapę top-level.
+/// Klucze nieznane manifestowi są ignorowane (nie błąd — schema mogła się
+/// zmienić, redeploy starym configiem nie powinien failować).
+pub fn apply_parameters_deploy(
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+    deploy_target: DeployTarget,
+) -> Result<(ParameterApplication, RequestTimeParameters), ParameterError> {
+    let mut app = ParameterApplication::default();
+    let mut req = RequestTimeParameters::default();
+
+    let user_params = user_config
+        .get("parameters")
+        .and_then(|v| v.as_object());
+
+    for p in &manifest.parameters {
+        let value = user_params
+            .and_then(|m| m.get(&p.key))
+            .cloned()
+            .unwrap_or_else(|| p.default.clone());
+
+        validate_parameter_value(p, &value)?;
+
+        let Some(binding) = p.bindings.iter().find(|b| b.when == deploy_target) else {
+            continue;
+        };
+
+        match &binding.target {
+            BindingTarget::Env { name } => {
+                let s = json_to_env_string(&value);
+                app.env.insert(name.clone(), s);
+            }
+            BindingTarget::LlamacppField { field } => {
+                app.llamacpp.insert(field.clone(), value);
+            }
+            BindingTarget::WhisperField {
+                field,
+                request_override,
+            } => {
+                app.whisper.insert(field.clone(), value.clone());
+                if *request_override {
+                    req.whisper_overridable.insert(field.clone(), value);
+                }
+            }
+            BindingTarget::MlxField {
+                field,
+                request_override,
+            } => {
+                app.mlx.insert(field.clone(), value.clone());
+                if *request_override {
+                    req.mlx_overridable.insert(field.clone(), value);
+                }
+            }
+            BindingTarget::OllamaOptions { key } => {
+                req.ollama_options.insert(key.clone(), value);
+            }
+            BindingTarget::PythonRequestBody { field } => {
+                req.python_request.insert(field.clone(), value);
+            }
+        }
+    }
+
+    Ok((app, req))
+}
+
+fn validate_parameter_value(
+    p: &EngineParameter,
+    value: &serde_json::Value,
+) -> Result<(), ParameterError> {
+    let actual = match value {
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(n) if n.is_f64() => "float",
+        serde_json::Value::Number(_) => "int",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+
+    let kind_ok = match p.kind {
+        ParameterKind::Float => value.is_f64() || value.is_i64(),
+        ParameterKind::Int => value.is_i64() || value.is_u64(),
+        ParameterKind::Bool => value.is_boolean(),
+        ParameterKind::Enum => value.is_string(),
+        ParameterKind::String => value.is_string(),
+    };
+    if !kind_ok {
+        return Err(ParameterError::TypeMismatch {
+            key: p.key.clone(),
+            expected: p.kind,
+            actual,
+        });
+    }
+
+    if let Some(range) = p.range {
+        let v = value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|i| i as f64))
+            .or_else(|| value.as_u64().map(|u| u as f64));
+        if let Some(num) = v {
+            if num < range.min || num > range.max {
+                return Err(ParameterError::OutOfRange {
+                    key: p.key.clone(),
+                    value: num,
+                    min: range.min,
+                    max: range.max,
+                });
+            }
+        }
+    }
+
+    if let (ParameterKind::Enum, Some(opts)) = (p.kind, p.options.as_ref()) {
+        let s = value.as_str().unwrap_or_default();
+        if !opts.iter().any(|o| o == s) {
+            return Err(ParameterError::NotInOptions {
+                key: p.key.clone(),
+                value: s.to_string(),
+                options: opts.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn json_to_env_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => v.to_string(),
+    }
+}
+
 /// Reads the optional `transport_explicit` hint from user_config. Used by
 /// docker strategy as a Phase 6 preview (bypass sidecar for `direct_http`).
 #[cfg_attr(not(feature = "docker"), allow(dead_code))]
@@ -838,6 +1530,7 @@ mod tests {
                 input_modalities: None,
                 output_modalities: None,
             }],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }
