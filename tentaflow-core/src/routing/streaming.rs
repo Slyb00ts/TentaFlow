@@ -393,6 +393,11 @@ impl Router {
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
             let (initial_stream, meta_stream) =
                 crate::routing::build_initial_envelope_for_user(&request, user.clone());
+            // Disconnect bridge: ten sam cancel_token co w meta dostaje
+            // CancelOnDropStream poniżej, więc gdy hyper droppuje SSE body
+            // (klient się rozłączył), token zostaje cancelled i finalizer
+            // executor'a zauważa to przez biased select! (R7 plan).
+            let stream_cancel = meta_stream.cancel_token.clone();
             match dispatcher
                 .try_dispatch_streaming(&request.model, "chat", initial_stream, meta_stream)
                 .await
@@ -403,6 +408,19 @@ impl Router {
                         envelope_stream_to_chunk_stream(stream_exec, model_for_stream);
                     let filtered =
                         wrap_with_pii_streaming(chunk_stream, self.response_middleware.clone());
+                    let cancel_wrapped: std::pin::Pin<
+                        Box<
+                            dyn futures::Stream<
+                                    Item = crate::error::Result<
+                                        crate::api::openai::types::ChatCompletionChunk,
+                                    >,
+                                > + Send,
+                        >,
+                    > = Box::pin(crate::flow_engine::cancel_on_drop::CancelOnDropStream::new(
+                        filtered,
+                        stream_cancel,
+                    ));
+                    let filtered = cancel_wrapped;
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: stream_node_name.clone(),
                         backend_type: "flow_engine_stream".to_string(),
