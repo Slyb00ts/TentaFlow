@@ -121,7 +121,7 @@ fn validate_flow_json_str(ctx: &HandlerContext, flow_json: &str) -> Result<(), P
     };
     let parsed: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
         .map_err(|e| ProtocolError::bad_request(format!("invalid flow_json: {}", e)))?;
-    crate::flow_engine::validation::validate_flow(&parsed, dispatcher.registry())
+    crate::flow_engine::validation::validate(&parsed, dispatcher.registry())
         .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
 }
 

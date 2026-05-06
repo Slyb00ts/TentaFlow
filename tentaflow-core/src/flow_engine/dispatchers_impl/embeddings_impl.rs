@@ -10,20 +10,19 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
 
+use super::ModelRuntimeSlot;
 use crate::api::openai::types::{EmbeddingInput, EmbeddingRequest};
 use crate::flow_engine::dispatchers::{EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse};
 use crate::flow_engine::envelope::TokenUsage;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
-use crate::services::runtime::executor::ModelRuntimeExecutor;
 
 pub struct EmbeddingsDispatcherImpl {
-    runtime: Arc<ModelRuntimeExecutor>,
+    runtime: ModelRuntimeSlot,
 }
 
 impl EmbeddingsDispatcherImpl {
-    pub fn new(runtime: Arc<ModelRuntimeExecutor>) -> Self {
+    pub fn new(runtime: ModelRuntimeSlot) -> Self {
         Self { runtime }
     }
 }
@@ -50,8 +49,13 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
         };
 
         let mut rctx = RuntimeContext::new(None);
-        let response = self
+        let runtime = self
             .runtime
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("EmbeddingsDispatcher: ModelRuntimeExecutor not wired"))?;
+        let response = runtime
             .execute_embeddings(api_req, &mut rctx)
             .await
             .map_err(|e| anyhow!("EmbeddingsDispatcher: {e}"))?;

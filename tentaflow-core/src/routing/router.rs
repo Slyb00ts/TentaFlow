@@ -313,7 +313,6 @@ impl Router {
             Arc::new(FlowDispatcher::new(
                 pool,
                 service_manager.clone(),
-                config.clone(),
                 executor_slot.clone(),
                 stt_runtime_slot.clone(),
             ))

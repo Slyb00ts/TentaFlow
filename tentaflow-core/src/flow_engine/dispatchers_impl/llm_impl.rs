@@ -10,7 +10,6 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::time::sleep_until;
@@ -21,16 +20,24 @@ use crate::api::openai::types::{
 };
 use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
 use crate::flow_engine::envelope::{ChatMessage, ChatRole, FinishReason, LlmStreamChunk, TokenUsage};
+use super::ModelRuntimeSlot;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
-use crate::services::runtime::executor::ModelRuntimeExecutor;
 
 pub struct LlmDispatcherImpl {
-    runtime: Arc<ModelRuntimeExecutor>,
+    runtime: ModelRuntimeSlot,
 }
 
 impl LlmDispatcherImpl {
-    pub fn new(runtime: Arc<ModelRuntimeExecutor>) -> Self {
+    pub fn new(runtime: ModelRuntimeSlot) -> Self {
         Self { runtime }
+    }
+
+    fn runtime(&self) -> Result<std::sync::Arc<crate::services::runtime::executor::ModelRuntimeExecutor>> {
+        self.runtime
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("LlmDispatcher: ModelRuntimeExecutor not wired"))
     }
 }
 
@@ -46,8 +53,9 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // select! w pierwszej kolejności sprawdza cancel/deadline, więc
         // klient disconnect / timeout abort'uje request natychmiast nawet
         // jeśli backend nie odpowiada.
+        let runtime = self.runtime()?;
         let response = run_with_deadline_and_cancel(
-            self.runtime.execute_chat(api_req, &mut rctx),
+            runtime.execute_chat(api_req, &mut rctx),
             deadline,
             cancel,
         )
@@ -102,8 +110,9 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
         // resolver/strategy się zacina lub backend nie zdąży otworzyć
         // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.
+        let runtime = self.runtime()?;
         let stream = run_with_deadline_and_cancel(
-            self.runtime.stream_chat(api_req, &mut rctx),
+            runtime.stream_chat(api_req, &mut rctx),
             deadline,
             cancel.clone(),
         )

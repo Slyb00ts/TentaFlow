@@ -9,7 +9,7 @@ use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, MessageContent,
 };
 use crate::error::Result;
-use crate::routing::chat::flow_result_to_chat_response;
+use crate::routing::chat::flow_outcome_to_chat_response;
 use crate::routing::router::{RequestMetrics, Router};
 
 use std::pin::Pin;
@@ -33,6 +33,83 @@ use futures::Stream;
 ///   Jezeli oryginalny finish chunk niesie tez `delta.content` /
 ///   `delta.reasoning_content`, splitujemy go na content-only (emit od razu,
 ///   przepuszczone przez procesor) + finish-only (hold do konca).
+/// Bridge `StreamingExecution.stream` (rkyv `EnvelopeDelta::Llm`) na strumień
+/// `ChatCompletionChunk` zgodny z OpenAI SSE. Outcome receiver z executor'a
+/// jest spawnowany do background task'a (per plan: routing nie czeka na
+/// outcome). Disconnect klienta propaguje się przez `CancelOnDropStream`
+/// wstawiony przez SSE wrapper.
+fn envelope_stream_to_chunk_stream(
+    stream_exec: crate::flow_engine::executor::StreamingExecution,
+    model: String,
+) -> std::pin::Pin<
+    Box<
+        dyn futures::Stream<Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>>
+            + Send,
+    >,
+> {
+    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
+    use crate::flow_engine::envelope::EnvelopeDelta;
+    use futures::StreamExt;
+
+    let crate::flow_engine::executor::StreamingExecution { stream, outcome } = stream_exec;
+    tokio::spawn(async move {
+        match outcome.await {
+            Ok(o) => tracing::info!(
+                latency_ms = o.total_latency_ms,
+                prompt_tokens = o.usage.prompt_tokens,
+                completion_tokens = o.usage.completion_tokens,
+                error = ?o.error,
+                "flow streaming completed"
+            ),
+            Err(_) => tracing::warn!("flow finalizer dropped without outcome"),
+        }
+    });
+    let id = format!("flow-{}", uuid::Uuid::new_v4());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mapped = stream.map(move |item| match item {
+        Ok(EnvelopeDelta::Llm(c)) => {
+            let chunk = ChatCompletionChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: if c.text_delta.is_empty() {
+                            None
+                        } else {
+                            Some(c.text_delta)
+                        },
+                        reasoning_content: c.reasoning_delta,
+                        tool_calls: None,
+                    },
+                    finish_reason: c.finish_reason.and_then(|f| f.as_openai_str().map(|s| s.to_string())),
+                    logprobs: None,
+                }],
+                system_fingerprint: None,
+                audio: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+            };
+            Ok(chunk)
+        }
+        Err(e) => Err(crate::error::CoreError::InternalError {
+            message: format!("flow stream error: {e}"),
+            source: None,
+        }
+        .into()),
+    });
+    Box::pin(mapped)
+}
+
 fn wrap_with_pii_streaming(
     upstream: std::pin::Pin<
         Box<
@@ -314,17 +391,18 @@ impl Router {
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
-            let ctx_stream = crate::routing::build_flow_context_for_user(&request, true, user.clone());
+            let (initial_stream, meta_stream) =
+                crate::routing::build_initial_envelope_for_user(&request, user.clone());
             match dispatcher
-                .try_dispatch_streaming(&request.model, "chat", ctx_stream)
+                .try_dispatch_streaming(&request.model, "chat", initial_stream, meta_stream)
                 .await
             {
-                Ok(Some(stream)) => {
-                    // Codex H1 round 2: flow streaming path tez musi mieć
-                    // PII filter — wczesniej tylko executor sciezka miala
-                    // scan z StreamingProcessor. Reuse tego samego helpera
-                    // co executor success path (wymaga lift do osobnej fn).
-                    let filtered = wrap_with_pii_streaming(stream, self.response_middleware.clone());
+                Ok(Some(stream_exec)) => {
+                    let model_for_stream = request.model.clone();
+                    let chunk_stream =
+                        envelope_stream_to_chunk_stream(stream_exec, model_for_stream);
+                    let filtered =
+                        wrap_with_pii_streaming(chunk_stream, self.response_middleware.clone());
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: stream_node_name.clone(),
                         backend_type: "flow_engine_stream".to_string(),
@@ -347,10 +425,14 @@ impl Router {
                 }
             }
 
-            let ctx = crate::routing::build_flow_context_for_user(&request, true, user.clone());
-            match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
-                Ok(Some(result)) => {
-                    let response = flow_result_to_chat_response(result, &request.model);
+            let (initial, meta) =
+                crate::routing::build_initial_envelope_for_user(&request, user.clone());
+            match dispatcher
+                .try_dispatch(&request.model, "chat", initial, meta)
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    let response = flow_outcome_to_chat_response(outcome, &request.model);
                     let raw_text = response
                         .choices
                         .first()

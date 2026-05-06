@@ -10,21 +10,21 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use super::ModelRuntimeSlot;
 use crate::api::openai::types::TTSRequest;
 use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::dispatchers::{TtsDispatcher, TtsRequest, TtsResponse};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
-use crate::services::runtime::executor::ModelRuntimeExecutor;
 
 const DEFAULT_VOICE: &str = "alloy";
 
 pub struct TtsDispatcherImpl {
-    runtime: Arc<ModelRuntimeExecutor>,
+    runtime: ModelRuntimeSlot,
     blobs: Arc<dyn BlobStore>,
 }
 
 impl TtsDispatcherImpl {
-    pub fn new(runtime: Arc<ModelRuntimeExecutor>, blobs: Arc<dyn BlobStore>) -> Self {
+    pub fn new(runtime: ModelRuntimeSlot, blobs: Arc<dyn BlobStore>) -> Self {
         Self { runtime, blobs }
     }
 }
@@ -46,8 +46,13 @@ impl TtsDispatcher for TtsDispatcherImpl {
         };
 
         let mut rctx = RuntimeContext::new(None);
-        let result = self
+        let runtime = self
             .runtime
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("TtsDispatcher: ModelRuntimeExecutor not wired"))?;
+        let result = runtime
             .execute_tts(api_req, &mut rctx)
             .await
             .map_err(|e| anyhow!("TtsDispatcher: {e}"))?;

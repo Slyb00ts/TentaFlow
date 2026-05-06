@@ -808,58 +808,33 @@ mod tests {
     /// blokowaloby zapis flow przez walidacje dispatch/handlers.rs.
     #[test]
     fn seeded_flows_pass_adapter_validation() {
-        use crate::config::RouterConfig;
-        use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
-        use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
-        use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
-        use crate::flow_engine::adapters::llm::LlmNodeAdapter;
-        use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
-        use crate::flow_engine::adapters::output::OutputNodeAdapter;
-        use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
-        use crate::flow_engine::adapters::session_context::SessionContextAdapter;
-        use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
-        use crate::flow_engine::adapters::stt::SttNodeAdapter;
-        use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
-        use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-        use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
-        use crate::flow_engine::adapters::AdapterRegistry;
+        use crate::flow_engine::node_adapter::AdapterRegistry;
+        use crate::flow_engine::node_adapters::{
+            ConditionNodeAdapter, ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter,
+            LlmNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter,
+            SessionContextNodeAdapter, SpeakerContextNodeAdapter, SttNodeAdapter,
+            TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
+        };
         use crate::flow_engine::types::FlowDefinition;
-        use crate::flow_engine::validation::validate_flow;
-        use crate::services::runtime::quic_handle::ServiceManager;
+        use crate::flow_engine::validation::validate;
         use std::sync::Arc;
 
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let config = Arc::new(RouterConfig::default());
-        let sm = Arc::new(
-            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
-        );
 
         let mut registry = AdapterRegistry::new();
-        // R2a: w teście walidacji adapter LLM dostaje pusty executor slot —
-        // adapter wywoluje legacy mini-router gdy slot jest None, co
-        // pasuje do scenariusza testu (sprawdzamy tylko walidacje
-        // flow_json + adapter port metadata, nie dispatch).
-        let executor_slot: crate::flow_engine::dispatcher::ExecutorSlot =
-            std::sync::Arc::new(parking_lot::RwLock::new(None));
-        let stt_runtime_slot: crate::flow_engine::dispatcher::SttRuntimeSlot =
-            std::sync::Arc::new(parking_lot::RwLock::new(None));
-        registry.register(LlmNodeAdapter::new(
-            sm.clone(),
-            config.clone(),
-            executor_slot,
-        ));
-        registry.register(SttNodeAdapter::new(stt_runtime_slot));
-        registry.register(TtsNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(EmbeddingsNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(MemoryNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(ConversationHistoryAdapter::new(sm.clone(), config.clone()));
-        registry.register(SessionContextAdapter::new(sm.clone(), config.clone()));
-        registry.register(SpeakerContextAdapter::new(sm, config));
-        registry.register(TriggerNodeAdapter::new());
-        registry.register(OutputNodeAdapter::new());
-        registry.register(ConditionNodeAdapter::new());
-        registry.register(PiiFilterNodeAdapter::new(pool.clone()));
-        registry.register(TtsCleanNodeAdapter::new(pool.clone()));
+        registry.register(Arc::new(TriggerNodeAdapter::new()));
+        registry.register(Arc::new(OutputNodeAdapter::new()));
+        registry.register(Arc::new(ConditionNodeAdapter::new()));
+        registry.register(Arc::new(PiiFilterNodeAdapter::new()));
+        registry.register(Arc::new(TtsCleanNodeAdapter::new()));
+        registry.register(Arc::new(SttNodeAdapter::new()));
+        registry.register(Arc::new(TtsNodeAdapter::new()));
+        registry.register(Arc::new(EmbeddingsNodeAdapter::new()));
+        registry.register(Arc::new(MemoryNodeAdapter::new()));
+        registry.register(Arc::new(ConversationHistoryNodeAdapter::new()));
+        registry.register(Arc::new(SessionContextNodeAdapter::new()));
+        registry.register(Arc::new(SpeakerContextNodeAdapter::new()));
+        registry.register_llm(Arc::new(LlmNodeAdapter::new()));
 
         let flow_jsons: Vec<(String, String)> = {
             let conn = pool.lock().unwrap();
@@ -876,7 +851,7 @@ mod tests {
         for (name, json) in &flow_jsons {
             let parsed: FlowDefinition = serde_json::from_str(json)
                 .unwrap_or_else(|e| panic!("flow '{}': nie parsuje: {}", name, e));
-            validate_flow(&parsed, &registry)
+            validate(&parsed, &registry)
                 .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
         }
     }

@@ -1,301 +1,228 @@
 // =============================================================================
 // Plik: flow_engine/converter.rs
-// Opis: Konwersja FlowExecutionResult na rozne formaty odpowiedzi - OpenAI
-//       ChatCompletion (non-streaming i streaming chunk).
+// Opis: Konwertery FlowExecutionOutcome → response w formatach OpenAI-compat
+//       (chat completions, embeddings). Streaming chunk converter siedzi w
+//       routing/streaming.rs (mapuje EnvelopeDelta::Llm → ChatCompletionChunk).
 // =============================================================================
 
-use crate::flow_engine::types::FlowExecutionResult;
-use serde_json::Value;
 use std::borrow::Cow;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-fn unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+use crate::api::openai::types::{
+    ChatCompletionResponse, Choice, EmbeddingData, EmbeddingResponse, EmbeddingUsage, Message,
+    MessageContent, Usage,
+};
+use crate::error::{CoreError, Result as CoreResult};
+use crate::flow_engine::envelope::{FlowExecutionOutcome, FlowValue};
+
+pub fn flow_outcome_to_chat_response(
+    outcome: &FlowExecutionOutcome,
+    model: &str,
+) -> ChatCompletionResponse {
+    let content: Cow<str> = match &outcome.final_envelope.payload {
+        FlowValue::Text(t) => Cow::Borrowed(t.as_str()),
+        FlowValue::Empty => Cow::Borrowed(""),
+        other => Cow::Owned(serde_json::to_string(&payload_to_json(other)).unwrap_or_default()),
+    };
+    let finish_reason = outcome
+        .finish_reason
+        .as_openai_str()
+        .map(|s| s.to_string());
+
+    ChatCompletionResponse {
+        id: generate_response_id(),
+        object: "chat.completion".to_string(),
+        created: unix_timestamp(),
+        model: model.to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Text(content.into_owned())),
+                reasoning_content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            finish_reason,
+            logprobs: None,
+        }],
+        usage: Some(Usage {
+            prompt_tokens: outcome.usage.prompt_tokens as u32,
+            completion_tokens: outcome.usage.completion_tokens as u32,
+            total_tokens: outcome.usage.total_tokens as u32,
+        }),
+        system_fingerprint: None,
+        transcribed_text: None,
+        speaker_id: None,
+        speaker_name: None,
+        speaker_confidence: None,
+        detected_intent: None,
+        detected_tools: None,
+    }
+}
+
+pub fn flow_outcome_to_embedding_response(
+    outcome: &FlowExecutionOutcome,
+    model: &str,
+) -> CoreResult<EmbeddingResponse> {
+    let data = match &outcome.final_envelope.payload {
+        FlowValue::Embedding(v) => vec![EmbeddingData {
+            object: "embedding".to_string(),
+            index: 0,
+            embedding: v.clone(),
+        }],
+        FlowValue::Json(v) => parse_embedding_batch(v)?,
+        FlowValue::Empty => Vec::new(),
+        other => {
+            return Err(CoreError::InternalError {
+                message: format!(
+                    "embedding flow returned unexpected payload kind: {}",
+                    other.kind()
+                ),
+                source: None,
+            }
+            .into());
+        }
+    };
+    Ok(EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model: model.to_string(),
+        usage: EmbeddingUsage {
+            prompt_tokens: outcome.usage.prompt_tokens as u32,
+            total_tokens: outcome.usage.total_tokens as u32,
+        },
+    })
+}
+
+fn parse_embedding_batch(v: &serde_json::Value) -> CoreResult<Vec<EmbeddingData>> {
+    let arr = v
+        .get("embeddings")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| {
+            anyhow::Error::from(CoreError::InternalError {
+                message: "embedding batch missing 'embeddings' field".to_string(),
+                source: None,
+            })
+        })?;
+    arr.iter()
+        .enumerate()
+        .map(|(i, vec_val)| {
+            let embedding = vec_val
+                .as_array()
+                .ok_or_else(|| {
+                    anyhow::Error::from(CoreError::InternalError {
+                        message: format!("embedding[{i}] not array"),
+                        source: None,
+                    })
+                })?
+                .iter()
+                .map(|x| x.as_f64().map(|f| f as f32))
+                .collect::<Option<Vec<f32>>>()
+                .ok_or_else(|| {
+                    anyhow::Error::from(CoreError::InternalError {
+                        message: format!("embedding[{i}] non-numeric"),
+                        source: None,
+                    })
+                })?;
+            Ok(EmbeddingData {
+                object: "embedding".to_string(),
+                index: i as u32,
+                embedding,
+            })
+        })
+        .collect()
+}
+
+fn payload_to_json(v: &FlowValue) -> serde_json::Value {
+    match v {
+        FlowValue::Empty => serde_json::Value::Null,
+        FlowValue::Text(t) => serde_json::Value::String(t.clone()),
+        FlowValue::Json(v) => v.clone(),
+        FlowValue::Audio { blob_ref, mime, .. } => serde_json::json!({
+            "type": "audio",
+            "blob_id": blob_ref.id,
+            "mime": mime,
+        }),
+        FlowValue::Image { blob_ref, mime, .. } => serde_json::json!({
+            "type": "image",
+            "blob_id": blob_ref.id,
+            "mime": mime,
+        }),
+        FlowValue::Video { blob_ref, mime, .. } => serde_json::json!({
+            "type": "video",
+            "blob_id": blob_ref.id,
+            "mime": mime,
+        }),
+        FlowValue::Embedding(e) => serde_json::json!({"type":"embedding","values":e}),
+    }
 }
 
 fn generate_response_id() -> String {
-    format!("chatcmpl-flow-{}", uuid::Uuid::new_v4())
+    format!("flow-{}", uuid::Uuid::new_v4())
 }
 
-/// Zwraca finish_reason zgodny z OpenAI API: "stop" lub null
-fn finish_reason_value(status: &str) -> Value {
-    if status == "completed" {
-        Value::String("stop".to_string())
-    } else {
-        Value::Null
-    }
-}
-
-/// Konwertuje wynik flow na format ChatCompletionResponse (JSON Value)
-pub fn flow_result_to_chat_response(result: &FlowExecutionResult, model: &str) -> Value {
-    let content = extract_text_from_output(&result.output);
-
-    serde_json::json!({
-        "id": generate_response_id(),
-        "object": "chat.completion",
-        "created": unix_timestamp(),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content,
-            },
-            "finish_reason": finish_reason_value(&result.status),
-        }],
-        "usage": {
-            "prompt_tokens": result.prompt_tokens,
-            "completion_tokens": result.completion_tokens,
-            "total_tokens": result.total_tokens,
-        }
-    })
-}
-
-/// Konwertuje wynik flow na format streaming chunk (SSE).
-/// Zwraca pojedynczy chunk z calym wynikiem - w przyszlosci bedzie
-/// zamieniany na prawdziwy streaming z tokenami.
-#[allow(dead_code)]
-pub fn flow_result_to_stream_chunk(result: &FlowExecutionResult, model: &str) -> Value {
-    let content = extract_text_from_output(&result.output);
-
-    serde_json::json!({
-        "id": generate_response_id(),
-        "object": "chat.completion.chunk",
-        "created": unix_timestamp(),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "role": "assistant",
-                "content": content,
-            },
-            "finish_reason": finish_reason_value(&result.status),
-        }]
-    })
-}
-
-/// Wyciaga tekst z output flow - probuje kolejno pola: string, "text", "content",
-/// a jesli nic nie pasuje - serializuje do stringa.
-/// Zwraca Cow aby uniknac alokacji gdy tekst jest juz dostepny jako &str.
-fn extract_text_from_output(output: &Value) -> Cow<'_, str> {
-    match output {
-        Value::String(s) => Cow::Borrowed(s.as_str()),
-        Value::Null => Cow::Borrowed(""),
-        other => {
-            if let Some(text) = other.get("text").and_then(|t| t.as_str()) {
-                return Cow::Borrowed(text);
-            }
-            if let Some(content) = other.get("content").and_then(|c| c.as_str()) {
-                return Cow::Borrowed(content);
-            }
-            // pretty-print zeby uniknac podwojnego escapowania JSON
-            Cow::Owned(serde_json::to_string_pretty(other).unwrap_or_default())
-        }
-    }
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow_engine::types::FlowExecutionResult;
+    use crate::flow_engine::envelope::{FinishReason, FlowEnvelope, TokenUsage};
+
+    fn outcome(payload: FlowValue, finish: FinishReason) -> FlowExecutionOutcome {
+        let mut env = FlowEnvelope::empty();
+        env.payload = payload;
+        FlowExecutionOutcome {
+            final_envelope: env,
+            trace: vec![],
+            usage: TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: finish,
+            total_latency_ms: 42,
+            error: None,
+        }
+    }
 
     #[test]
-    fn test_chat_response_completed() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::json!({"text": "Odpowiedz testowa"}),
-            execution_log: vec![],
-            total_latency_ms: 150,
-            total_tokens: 90,
-            prompt_tokens: 30,
-            completion_tokens: 60,
-        };
-
-        let response = flow_result_to_chat_response(&result, "bielik-11b");
-
-        assert_eq!(response["object"], "chat.completion");
-        assert_eq!(response["model"], "bielik-11b");
-        assert_eq!(
-            response["choices"][0]["message"]["content"],
-            "Odpowiedz testowa"
+    fn chat_response_text_payload() {
+        let r = flow_outcome_to_chat_response(
+            &outcome(FlowValue::Text("hi".into()), FinishReason::Stop),
+            "m",
         );
-        assert_eq!(response["choices"][0]["finish_reason"], "stop");
-        assert_eq!(response["usage"]["total_tokens"], 90);
+        match r.choices[0].message.content {
+            Some(MessageContent::Text(ref s)) => assert_eq!(s, "hi"),
+            _ => panic!("expected text content"),
+        }
+        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(r.usage.as_ref().unwrap().total_tokens, 15);
     }
 
     #[test]
-    fn test_chat_response_error_status() {
-        let result = FlowExecutionResult {
-            status: "error".to_string(),
-            output: serde_json::json!({"text": "Blad przetwarzania"}),
-            execution_log: vec![],
-            total_latency_ms: 50,
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        };
-
-        let response = flow_result_to_chat_response(&result, "test-model");
-        assert!(response["choices"][0]["finish_reason"].is_null());
-    }
-
-    #[test]
-    fn test_chat_response_string_output() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::Value::String("Prosty tekst".to_string()),
-            execution_log: vec![],
-            total_latency_ms: 10,
-            total_tokens: 30,
-            prompt_tokens: 10,
-            completion_tokens: 20,
-        };
-
-        let response = flow_result_to_chat_response(&result, "model");
-        assert_eq!(response["choices"][0]["message"]["content"], "Prosty tekst");
-    }
-
-    #[test]
-    fn test_chat_response_null_output() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::Value::Null,
-            execution_log: vec![],
-            total_latency_ms: 0,
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        };
-
-        let response = flow_result_to_chat_response(&result, "model");
-        assert_eq!(response["choices"][0]["message"]["content"], "");
-    }
-
-    #[test]
-    fn test_chat_response_content_field() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::json!({"content": "Z pola content"}),
-            execution_log: vec![],
-            total_latency_ms: 10,
-            total_tokens: 20,
-            prompt_tokens: 7,
-            completion_tokens: 13,
-        };
-
-        let response = flow_result_to_chat_response(&result, "model");
-        assert_eq!(
-            response["choices"][0]["message"]["content"],
-            "Z pola content"
+    fn chat_response_cancelled_finish_is_null() {
+        let r = flow_outcome_to_chat_response(
+            &outcome(FlowValue::Text("x".into()), FinishReason::Cancelled),
+            "m",
         );
+        assert!(r.choices[0].finish_reason.is_none());
     }
 
     #[test]
-    fn test_stream_chunk() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::json!({"text": "Streaming odpowiedz"}),
-            execution_log: vec![],
-            total_latency_ms: 100,
-            total_tokens: 50,
-            prompt_tokens: 15,
-            completion_tokens: 35,
-        };
-
-        let chunk = flow_result_to_stream_chunk(&result, "bielik-11b");
-        assert_eq!(chunk["object"], "chat.completion.chunk");
-        assert_eq!(
-            chunk["choices"][0]["delta"]["content"],
-            "Streaming odpowiedz"
-        );
-        assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
-    }
-
-    #[test]
-    fn test_token_split() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::Value::Null,
-            execution_log: vec![],
-            total_latency_ms: 0,
-            total_tokens: 90,
-            prompt_tokens: 30,
-            completion_tokens: 60,
-        };
-
-        let response = flow_result_to_chat_response(&result, "model");
-        assert_eq!(response["usage"]["prompt_tokens"], 30);
-        assert_eq!(response["usage"]["completion_tokens"], 60);
-        assert_eq!(response["usage"]["total_tokens"], 90);
-    }
-
-    #[test]
-    fn test_output_nested_json_object() {
-        let result = FlowExecutionResult {
-            status: "completed".to_string(),
-            output: serde_json::json!({
-                "data": {
-                    "wynik": "zagniezdony",
-                    "score": 0.95
-                },
-                "meta": {"source": "test"}
-            }),
-            execution_log: vec![],
-            total_latency_ms: 50,
-            total_tokens: 40,
-            prompt_tokens: 15,
-            completion_tokens: 25,
-        };
-
-        // Act
-        let response = flow_result_to_chat_response(&result, "bielik-11b");
-
-        // Assert: bez "text" i "content" powinien zserializowac caly obiekt
-        let content = response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap();
-        assert!(content.contains("zagniezdony"));
-        assert!(content.contains("score"));
-    }
-
-    #[test]
-    fn test_error_status_finish_reason_error() {
-        let result = FlowExecutionResult {
-            status: "error".to_string(),
-            output: serde_json::json!({"text": "Timeout"}),
-            execution_log: vec![],
-            total_latency_ms: 30000,
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        };
-
-        // Act
-        let response = flow_result_to_chat_response(&result, "model");
-
-        // Assert
-        assert!(response["choices"][0]["finish_reason"].is_null());
-        assert_eq!(response["choices"][0]["message"]["content"], "Timeout");
-    }
-
-    #[test]
-    fn test_stream_chunk_error_finish_reason_null() {
-        let result = FlowExecutionResult {
-            status: "error".to_string(),
-            output: serde_json::json!({"text": "Blad"}),
-            execution_log: vec![],
-            total_latency_ms: 100,
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        };
-
-        // Act
-        let chunk = flow_result_to_stream_chunk(&result, "model");
-
-        // Assert
-        assert!(chunk["choices"][0]["finish_reason"].is_null());
+    fn embedding_response_single_vector() {
+        let r = flow_outcome_to_embedding_response(
+            &outcome(FlowValue::Embedding(vec![0.1, 0.2]), FinishReason::Stop),
+            "m",
+        )
+        .unwrap();
+        assert_eq!(r.data.len(), 1);
+        assert_eq!(r.data[0].embedding, vec![0.1, 0.2]);
     }
 }
