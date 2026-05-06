@@ -39,7 +39,7 @@ impl SttDispatcher for SttDispatcherImpl {
             .ok_or_else(|| anyhow!("SttDispatcher: SttRuntime not wired"))?;
 
         let bytes = self.blobs.get(&req.audio).await?;
-        let file: Arc<[u8]> = Arc::from(bytes.to_vec());
+        let file: Arc<[u8]> = bytes.into();
 
         let mime = req.audio.mime.clone();
         let filename = blob_filename(&req.audio.id, &mime);
