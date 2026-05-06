@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::flow_engine::dispatchers::TtsRequest;
 use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "tts";
 
@@ -45,8 +45,21 @@ impl TtsNodeAdapter {
         ))
     }
 
-    fn pick_optional_str(node: &FlowNode, key: &str) -> Option<String> {
-        node.config
+    /// Etap 2: priorytet `node.config` > `envelope.meta`. Pierwsze pasuje gdy
+    /// operator pin'uje konkretne ustawienie w node config flow; drugie gdy
+    /// wartość przyszła z request seed (TTS-as-flow, route_chat audio_input
+    /// w przyszłości itp.).
+    fn pick_optional_str(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<String> {
+        if let Some(s) = node
+            .config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+        envelope
+            .meta
             .get(key)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -70,6 +83,18 @@ impl NodeAdapter for TtsNodeAdapter {
     }
     fn supported_output_ports(&self) -> &[&'static str] {
         &["full"]
+    }
+
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Audio
+    }
+
+    fn produced_artifacts(&self) -> &[(&'static str, FlowDataType)] {
+        &[("source_text", FlowDataType::Text)]
     }
 
     async fn execute(
@@ -99,8 +124,9 @@ impl NodeAdapter for TtsNodeAdapter {
         let req = TtsRequest {
             model: Self::pick_model(node, envelope)?,
             text: text.clone(),
-            voice: Self::pick_optional_str(node, "voice"),
-            format: Self::pick_optional_str(node, "format"),
+            voice: Self::pick_optional_str(node, envelope, "voice"),
+            format: Self::pick_optional_str(node, envelope, "format"),
+            language: Self::pick_optional_str(node, envelope, "language"),
             user_id: ctx.user_id,
             user_role: ctx.user_role.clone(),
         };

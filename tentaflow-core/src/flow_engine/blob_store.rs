@@ -169,9 +169,61 @@ impl BlobStore for FileBlobStore {
         Ok(bytes)
     }
 
-    async fn gc(&self, _retention: Duration) -> Result<u64> {
-        // Stub for stage 1. Scheduler/orphan tracking comes in stage 2.
-        Ok(0)
+    async fn gc(&self, retention: Duration) -> Result<u64> {
+        // Etap 2: walka po sharded layout `<root>/<sha[0:2]>/<sha[2:4]>/*.bin`.
+        // Każdy plik z mtime starszym niż `retention` usuwany. Race vs
+        // concurrent put tego samego content: get-after-delete dostaje
+        // NotFound, caller (TTS adapter) potraktuje jako transient błąd.
+        // Refcount/orphan registry wraz z multi-process scenariuszami
+        // wraca w stage 3.
+        let root = self.root.clone();
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(retention)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let removed = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+            let mut count = 0u64;
+            let shards = match std::fs::read_dir(&root) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(e) => return Err(e),
+            };
+            for shard in shards.flatten() {
+                if !shard.file_type()?.is_dir() {
+                    continue;
+                }
+                for sub in std::fs::read_dir(shard.path())?.flatten() {
+                    if !sub.file_type()?.is_dir() {
+                        continue;
+                    }
+                    for blob in std::fs::read_dir(sub.path())?.flatten() {
+                        let meta = match blob.metadata() {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        if !meta.is_file() {
+                            continue;
+                        }
+                        // Skip *.tmp-* (in-progress put — atomic write rename
+                        // jeszcze się nie wydarzyło).
+                        if let Some(ext) = blob.path().extension().and_then(|s| s.to_str()) {
+                            if ext.starts_with("tmp-") {
+                                continue;
+                            }
+                        }
+                        let modified = meta.modified().unwrap_or_else(|_| std::time::SystemTime::now());
+                        if modified < cutoff {
+                            if std::fs::remove_file(blob.path()).is_ok() {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(count)
+        })
+        .await
+        .map_err(|e| anyhow!("blob gc join: {e}"))??;
+        Ok(removed)
     }
 }
 
@@ -368,6 +420,72 @@ mod tests {
             }
         }
         assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn file_gc_removes_old_blobs_keeps_fresh() {
+        let dir = tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path().to_path_buf());
+
+        // Put two blobs. Backdate one so that mtime jest poza retention.
+        let old = store.put(b"old".to_vec(), "text/plain").await.unwrap();
+        let fresh = store.put(b"fresh".to_vec(), "text/plain").await.unwrap();
+
+        let old_path = dir
+            .path()
+            .join(&old.sha256[0..2])
+            .join(&old.sha256[2..4])
+            .join(format!("{}.bin", old.sha256));
+
+        // Set mtime na 24h wstecz.
+        let backdated = std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        let f = std::fs::File::open(&old_path).unwrap();
+        f.set_modified(backdated).unwrap();
+        drop(f);
+
+        // gc retention=1h: old blob (>24h stary) usunięty, fresh (świeżutki)
+        // zostaje.
+        let removed = store
+            .gc(Duration::from_secs(60 * 60))
+            .await
+            .expect("gc ok");
+        assert_eq!(removed, 1, "exactly old blob removed");
+        assert!(!old_path.exists(), "old blob file deleted");
+        // Fresh nadal czytalny przez get (integrity check przechodzi).
+        let got_fresh = store.get(&fresh).await.expect("fresh still present");
+        assert_eq!(got_fresh, b"fresh");
+    }
+
+    #[tokio::test]
+    async fn file_gc_skips_in_progress_temp_files() {
+        let dir = tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path().to_path_buf());
+        // Symuluj crashed mid-write — plik tmp pod "tmp-*" nie powinien być
+        // dotknięty przez gc (in-progress put).
+        let shard = dir.path().join("aa").join("bb");
+        std::fs::create_dir_all(&shard).unwrap();
+        let tmp = shard.join("aabbccdd.tmp-12345");
+        std::fs::write(&tmp, b"in-progress").unwrap();
+        let backdated = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        std::fs::File::open(&tmp)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+
+        let removed = store.gc(Duration::from_secs(60 * 60)).await.unwrap();
+        assert_eq!(removed, 0);
+        assert!(tmp.exists(), "tmp file untouched by gc");
+
+        // Jednocześnie real .bin starszy niż retention idzie do śmieci.
+        let bin = shard.join("aabbccdd0011.bin");
+        std::fs::write(&bin, b"x").unwrap();
+        std::fs::File::open(&bin)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+        let removed2 = store.gc(Duration::from_secs(60 * 60)).await.unwrap();
+        assert_eq!(removed2, 1);
+        assert!(!bin.exists());
     }
 
     // Minimal recursive iterator to avoid pulling walkdir as a dev-dep just for one test.

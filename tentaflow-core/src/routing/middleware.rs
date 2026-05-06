@@ -26,7 +26,7 @@ pub struct ResolvedRoute {
 }
 
 /// Metadane trasy — serializowane do headera X-TentaFlow-Route
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RouteMetadata {
     pub served_by_node: String,
     pub backend_type: String,
@@ -34,6 +34,22 @@ pub struct RouteMetadata {
     pub fallbacks_tried: u32,
     pub hop_count: u32,
     pub latency_ms: Option<f64>,
+    /// Etap 2: token usage z FlowExecutionOutcome / runtime response — emit
+    /// jako `X-Tentaflow-{Prompt,Completion,Total}-Tokens` gdy klient prosi
+    /// `X-Want-Trailers: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsageMetadata>,
+    /// Etap 2: finish_reason ("stop" / "length" / "tool_calls" / "content_filter"
+    /// / null dla cancelled/error). Emit jako `X-Tentaflow-Finish-Reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TokenUsageMetadata {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// Wynik routingu — odpowiedz + metadane trasy
@@ -266,6 +282,8 @@ mod middleware_tests {
             fallbacks_tried: 1,
             hop_count: 0,
             latency_ms: Some(12.34),
+        usage: None,
+        finish_reason: None,
         };
         let json = serde_json::to_string(&m).expect("serialize");
         assert!(json.contains("\"served_by_node\":\"node-1\""));

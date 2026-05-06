@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const REGEX_SIZE_LIMIT: usize = 1_000_000;
 
@@ -46,6 +46,14 @@ impl NodeAdapter for PiiFilterNodeAdapter {
 
     fn supported_output_ports(&self) -> &[&'static str] {
         OUTPUT_PORTS
+    }
+
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
     }
 
     async fn execute(

@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::flow_engine::node_adapter::AdapterRegistry;
-use crate::flow_engine::types::FlowDefinition;
+use crate::flow_engine::types::{FlowDataType, FlowDefinition};
 
 #[derive(Debug, Clone)]
 pub enum FlowValidationError {
@@ -67,6 +67,23 @@ pub enum FlowValidationError {
     },
     MultipleStreamingBranches {
         count: usize,
+    },
+    /// R8: edge.data_type vs producent/konsument port_type.
+    EdgeTypeMismatch {
+        edge_id: String,
+        side: &'static str,
+        edge_type: FlowDataType,
+        port_type: FlowDataType,
+    },
+    /// R8: producent.output_port_type vs konsument.input_port_type — oba
+    /// konkretne typy, niekompatybilne.
+    EdgePortTypesMismatch {
+        from_node: String,
+        from_port: String,
+        from_type: FlowDataType,
+        to_node: String,
+        to_port: String,
+        to_type: FlowDataType,
     },
 }
 
@@ -129,6 +146,26 @@ impl fmt::Display for FlowValidationError {
             Self::MultipleStreamingBranches { count } => write!(
                 f,
                 "flow has {count} streaming branches; only one allowed"
+            ),
+            Self::EdgeTypeMismatch {
+                edge_id,
+                side,
+                edge_type,
+                port_type,
+            } => write!(
+                f,
+                "edge '{edge_id}' data_type {edge_type:?} incompatible with {side} port type {port_type:?}"
+            ),
+            Self::EdgePortTypesMismatch {
+                from_node,
+                from_port,
+                from_type,
+                to_node,
+                to_port,
+                to_type,
+            } => write!(
+                f,
+                "edge {from_node}.{from_port} (type {from_type:?}) -> {to_node}.{to_port} (type {to_type:?}): incompatible types"
             ),
         }
     }
@@ -209,6 +246,43 @@ pub fn validate(
                 node_type: to_node.node_type.clone(),
                 port: edge.to_port.clone(),
                 available: in_ports.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+
+        // R8: typed edge compatibility. Trzy niezależne pary muszą być
+        // compatible. Edge.data_type to deklaracja, NIE konwerter — gdy
+        // producent Text a konsument Audio, edge.data_type cokolwiek nie
+        // pomoże. `Any` na której kolwiek stronie = wildcard.
+        let from_type = from_adapter.output_port_type(&edge.from_port);
+        let to_type = to_adapter.input_port_type(&edge.to_port);
+        if !from_type.compatible_with(to_type) {
+            return Err(FlowValidationError::EdgePortTypesMismatch {
+                from_node: from_node.id.clone(),
+                from_port: edge.from_port.clone(),
+                from_type,
+                to_node: to_node.id.clone(),
+                to_port: edge.to_port.clone(),
+                to_type,
+            });
+        }
+        let edge_id = edge
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("{}->{}", edge.from, edge.to));
+        if !edge.data_type.compatible_with(from_type) {
+            return Err(FlowValidationError::EdgeTypeMismatch {
+                edge_id: edge_id.clone(),
+                side: "from",
+                edge_type: edge.data_type,
+                port_type: from_type,
+            });
+        }
+        if !edge.data_type.compatible_with(to_type) {
+            return Err(FlowValidationError::EdgeTypeMismatch {
+                edge_id,
+                side: "to",
+                edge_type: edge.data_type,
+                port_type: to_type,
             });
         }
 
@@ -425,6 +499,92 @@ mod tests {
             err,
             FlowValidationError::StreamingOutputModeMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn r8_rejects_text_to_audio_port_mismatch() {
+        // tts adapter ma input_port_type = Text, ale w tym flow podajemy mu
+        // edge z llm.full (Text). Ten przypadek przechodzi (Text → Text).
+        // Negatywny: stt_adapter ma input_port_type = Audio, llm produkuje
+        // Text → mismatch.
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(crate::flow_engine::node_adapters::SttNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"s","type":"stt","config":{"model":"w"}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"s"},
+                    {"from":"s","to":"o"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &r).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::EdgePortTypesMismatch { .. }
+        ), "got {:?}", err);
+    }
+
+    #[test]
+    fn r8_accepts_explicit_data_type_when_matching() {
+        // pii_filter (Text → Text) z explicit edge.data_type = "text" przechodzi.
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new()));
+
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"p","type":"pii_filter","config":{}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"p","data_type":"text"},
+                    {"from":"p","to":"o","data_type":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &r).unwrap();
+    }
+
+    #[test]
+    fn r8_rejects_explicit_edge_type_mismatching_producer() {
+        // pii_filter produkuje Text, ale edge deklaruje Audio.
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new()));
+
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"p","type":"pii_filter","config":{}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"p"},
+                    {"from":"p","to":"o","data_type":"audio"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &r).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::EdgeTypeMismatch { side: "from", .. }
+        ), "got {:?}", err);
     }
 
     #[test]
