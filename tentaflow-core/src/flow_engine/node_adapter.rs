@@ -284,6 +284,13 @@ pub mod test_support {
         async fn synthesize(&self, _req: TtsRequest) -> Result<TtsResponse> {
             panic!("stub TtsDispatcher: synthesize called");
         }
+        async fn stream_synthesize(
+            &self,
+            _req: TtsRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>>
+        {
+            panic!("stub TtsDispatcher: stream_synthesize called");
+        }
     }
 
     pub struct StubPrompts;

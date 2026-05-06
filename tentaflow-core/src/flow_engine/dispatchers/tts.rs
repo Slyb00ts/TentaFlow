@@ -6,8 +6,11 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::stream::BoxStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::flow_engine::blob_store::BlobRef;
+pub use crate::flow_engine::envelope::AudioStreamChunk as TtsStreamChunk;
 
 #[derive(Debug, Clone)]
 pub struct TtsRequest {
@@ -19,6 +22,24 @@ pub struct TtsRequest {
     pub language: Option<String>,
     pub user_id: Option<i64>,
     pub user_role: Option<String>,
+    /// Etap 3c: cancel signal dla stream_synthesize (klient disconnect).
+    /// Blocking `synthesize` ignoruje (nie ma chunked emit do przerwania).
+    pub cancel_token: CancellationToken,
+}
+
+impl Default for TtsRequest {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            text: String::new(),
+            voice: None,
+            format: None,
+            language: None,
+            user_id: None,
+            user_role: None,
+            cancel_token: CancellationToken::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,4 +52,12 @@ pub struct TtsResponse {
 #[async_trait]
 pub trait TtsDispatcher: Send + Sync {
     async fn synthesize(&self, req: TtsRequest) -> Result<TtsResponse>;
+
+    /// Etap 3c: streaming TTS. Backendy native streaming yield chunki w
+    /// czasie syntezy; backendy blocking — chunkowane post-blocking
+    /// (current Router::synthesize_speech_stream pattern).
+    async fn stream_synthesize(
+        &self,
+        req: TtsRequest,
+    ) -> Result<BoxStream<'static, Result<TtsStreamChunk>>>;
 }

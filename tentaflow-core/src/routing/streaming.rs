@@ -77,6 +77,14 @@ fn envelope_stream_to_chunk_stream(
         let model_for_map = model;
         let mapped = stream.map(move |item| match item {
             Ok(EnvelopeDelta::Llm(c)) => Ok(make_chunk(&id_for_map, created, &model_for_map, c)),
+            // Etap 3c: chat streaming bridge nigdy nie powinno dostać
+            // Audio delta (audio leci przez /v1/audio/speech/stream
+            // endpoint, NIE chat stream). Defensywnie mapujemy na error.
+            Ok(EnvelopeDelta::Audio(_)) => Err(crate::error::CoreError::InternalError {
+                message: "chat stream received Audio delta — flow misconfig".into(),
+                source: None,
+            }
+            .into()),
             Err(e) => Err(crate::error::CoreError::InternalError {
                 message: format!("flow stream error: {e}"),
                 source: None,
@@ -118,6 +126,14 @@ fn envelope_stream_to_chunk_stream(
                             },
                         ))
                     }
+                    Some(Ok(EnvelopeDelta::Audio(_))) => Some((
+                        Err(crate::error::CoreError::InternalError {
+                            message: "chat stream received Audio delta — flow misconfig".into(),
+                            source: None,
+                        }
+                        .into()),
+                        SplitState::Done,
+                    )),
                     Some(Err(e)) => Some((
                         Err(crate::error::CoreError::InternalError {
                             message: format!("flow stream error: {e}"),
