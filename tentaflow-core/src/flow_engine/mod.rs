@@ -6,9 +6,13 @@
 // =============================================================================
 
 pub mod adapters;
+pub mod blob_store;
 pub mod cache;
+pub mod cancel_on_drop;
 pub mod converter;
 pub mod dispatcher;
+pub mod dispatchers;
+pub mod envelope;
 pub mod executor_async;
 pub mod resolver;
 pub mod types;
