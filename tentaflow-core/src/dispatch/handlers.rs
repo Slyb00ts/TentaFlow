@@ -3427,6 +3427,12 @@ pub async fn service_manifest_deploy(
         ));
     }
 
+    tracing::info!(
+        target: "tentaflow::deploy",
+        "[manifest-deploy] received: engine_id={} deploy_method={:?} node_id={}",
+        payload.engine_id, payload.deploy_method, payload.node_id
+    );
+
     use crate::services::manifest::runtime_validate::{
         validate_deploy_target, DeployValidationError,
     };

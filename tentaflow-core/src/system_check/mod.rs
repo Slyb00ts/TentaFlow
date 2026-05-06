@@ -73,6 +73,11 @@ pub struct GpuSnapshot {
     pub vulkan_available: bool,
     /// Prefferowany backend do deployu (wygrywa karta z najwieksza VRAM).
     pub preferred_backend: GpuBackend,
+    /// True iff the host is an NVIDIA DGX Spark (or compatible GB10 Grace
+    /// Blackwell SoC, e.g. Acer GN100). PyPI vLLM/PyTorch wheels target
+    /// sm_120 max and crash on sm_121 — Spark needs separate engines
+    /// (`vllm-spark`) built from source with `TORCH_CUDA_ARCH_LIST=12.1a`.
+    pub is_dgx_spark: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -211,6 +216,14 @@ fn detect_gpu() -> GpuSnapshot {
         GpuBackend::Cpu
     };
 
+    // GB10 ships only on aarch64 (Grace CPU) — gating on arch avoids
+    // false positives from vendor strings that happen to contain "GB10"
+    // on x86 hosts.
+    let is_dgx_spark = cfg!(target_arch = "aarch64")
+        && nvidia
+            .iter()
+            .any(|g| g.name.to_ascii_uppercase().contains("GB10"));
+
     GpuSnapshot {
         nvidia,
         amd,
@@ -218,6 +231,7 @@ fn detect_gpu() -> GpuSnapshot {
         metal_available,
         vulkan_available,
         preferred_backend,
+        is_dgx_spark,
     }
 }
 

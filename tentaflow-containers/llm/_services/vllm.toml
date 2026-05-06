@@ -15,6 +15,10 @@ icon = "vllm"
 default_port = 8000
 api = "openai-compatible"
 version = "0.6.3"
+# PyPI vllm 0.20.1 wheels target sm_120 max — na DGX Spark (GB10, sm_121)
+# crashuja w FP8 / Mamba / NVFP4 kernelach. Spark dostaje osobny silnik
+# `vllm-spark` ktory buduje vllm 0.20.1 ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
+dgx_spark = false
 
 [deploy.docker]
 context_path = "llm/docker/vllm"

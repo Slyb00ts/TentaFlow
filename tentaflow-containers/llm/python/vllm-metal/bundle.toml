@@ -27,6 +27,9 @@ args = [
     "--model", "${MODEL}",
     "--dtype", "auto",
     "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+    # Performance baseline — patrz vllm/bundle.toml.
+    "--enable-prefix-caching",
+    "--enable-chunked-prefill",
 ]
 internal_port = 8000
 
