@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, PromptStore, SttDispatcher, TtsDispatcher,
+    MetricsSink, PiiRulesStore, PromptStore, SttDispatcher, TtsCleaningStore, TtsDispatcher,
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::FlowNode;
@@ -83,6 +83,12 @@ pub struct ExecutionContext {
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
 
+    /// Seed envelope dostarczony przez routing (request_id, model, payload,
+    /// initial messages). Plan v4.2 D2: używa go TYLKO trigger.execute().
+    /// Inne adaptery czytają inputs[0]; streaming LLM czyta envelope po
+    /// wszystkich pre-LLM nodach, NIE initial.
+    pub initial_envelope: Arc<FlowEnvelope>,
+
     pub clock: Arc<dyn Clock>,
     pub blobs: Arc<dyn BlobStore>,
 
@@ -95,6 +101,8 @@ pub struct ExecutionContext {
     pub history: Arc<dyn ConversationHistoryStore>,
     pub audit: Arc<dyn AuditSink>,
     pub metrics: Arc<dyn MetricsSink>,
+    pub pii_rules: Arc<dyn PiiRulesStore>,
+    pub tts_cleaning: Arc<dyn TtsCleaningStore>,
 
     pub usage_sink: Arc<UsageSink>,
 }
@@ -188,7 +196,7 @@ impl Default for AdapterRegistry {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub mod test_support {
     //! Stub dispatcherów + builder ExecutionContext dla testów adapterów.
     //! Każdy stub panickuje na call — testy które używają konkretnej
@@ -204,9 +212,10 @@ pub mod test_support {
         MemoryQuery, MemoryRecall, MemoryRecord, MemoryStoreReceipt,
     };
     use crate::flow_engine::dispatchers::metrics::NoopMetrics;
+    use crate::flow_engine::dispatchers::pii_rules::PiiRule;
     use crate::flow_engine::dispatchers::stt::{SttRequest, SttResponse};
     use crate::flow_engine::dispatchers::tts::{TtsRequest, TtsResponse};
-    use crate::flow_engine::envelope::{ChatMessage, LlmStreamChunk};
+    use crate::flow_engine::envelope::{ChatMessage, FlowEnvelope, LlmStreamChunk};
     use anyhow::Result;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -287,6 +296,24 @@ pub mod test_support {
         }
     }
 
+    pub struct StubPiiRules;
+    #[async_trait]
+    impl PiiRulesStore for StubPiiRules {
+        async fn active_rules(&self) -> Result<Vec<PiiRule>> {
+            // Default empty — testy które potrzebują reguł nadpisują pole.
+            Ok(Vec::new())
+        }
+    }
+
+    pub struct StubTtsCleaning;
+    #[async_trait]
+    impl TtsCleaningStore for StubTtsCleaning {
+        async fn clean(&self, text: &str) -> Result<String> {
+            // Default identity — testy które potrzebują cleaningu nadpisują pole.
+            Ok(text.to_string())
+        }
+    }
+
     pub fn stub_ctx() -> ExecutionContext {
         ExecutionContext {
             request_id: "test".into(),
@@ -296,6 +323,7 @@ pub mod test_support {
             user_role: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
+            initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: Arc::new(SystemClock),
             blobs: Arc::new(InMemoryBlobStore::new()) as Arc<dyn BlobStore>,
             llm: Arc::new(StubLlm),
@@ -307,8 +335,18 @@ pub mod test_support {
             history: Arc::new(StubHistory),
             audit: Arc::new(StubAudit),
             metrics: Arc::new(NoopMetrics),
+            pii_rules: Arc::new(StubPiiRules),
+            tts_cleaning: Arc::new(StubTtsCleaning),
             usage_sink: Arc::new(UsageSink::new()),
         }
+    }
+
+    /// Builder ułatwiający test który potrzebuje custom initial envelope —
+    /// np. trigger.execute() musi widzieć określony payload/messages.
+    pub fn stub_ctx_with_initial(initial: FlowEnvelope) -> ExecutionContext {
+        let mut ctx = stub_ctx();
+        ctx.initial_envelope = Arc::new(initial);
+        ctx
     }
 }
 
