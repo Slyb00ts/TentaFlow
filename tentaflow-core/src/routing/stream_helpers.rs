@@ -124,6 +124,7 @@ fn make_chunk(
         transcribed_text: None,
         speaker_id: None,
         speaker_name: None,
+    usage: None,
     }
 }
 

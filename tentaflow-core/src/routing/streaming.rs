@@ -41,73 +41,321 @@ use futures::Stream;
 fn envelope_stream_to_chunk_stream(
     stream_exec: crate::flow_engine::executor::StreamingExecution,
     model: String,
+    include_usage: bool,
 ) -> std::pin::Pin<
     Box<
         dyn futures::Stream<Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>>
             + Send,
     >,
 > {
-    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
-    use crate::flow_engine::envelope::EnvelopeDelta;
+    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta, Usage};
+    use crate::flow_engine::envelope::{EnvelopeDelta, FlowExecutionOutcome};
     use futures::StreamExt;
 
     let crate::flow_engine::executor::StreamingExecution { stream, outcome } = stream_exec;
-    tokio::spawn(async move {
-        match outcome.await {
-            Ok(o) => tracing::info!(
-                latency_ms = o.total_latency_ms,
-                prompt_tokens = o.usage.prompt_tokens,
-                completion_tokens = o.usage.completion_tokens,
-                error = ?o.error,
-                "flow streaming completed"
-            ),
-            Err(_) => tracing::warn!("flow finalizer dropped without outcome"),
-        }
-    });
     let id = format!("flow-{}", uuid::Uuid::new_v4());
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mapped = stream.map(move |item| match item {
-        Ok(EnvelopeDelta::Llm(c)) => {
-            let chunk = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: Delta {
-                        role: None,
-                        content: if c.text_delta.is_empty() {
+
+    if !include_usage {
+        // Pre-Etap-3a path — detached log, brak tail chunk.
+        tokio::spawn(async move {
+            match outcome.await {
+                Ok(o) => tracing::info!(
+                    latency_ms = o.total_latency_ms,
+                    prompt_tokens = o.usage.prompt_tokens,
+                    completion_tokens = o.usage.completion_tokens,
+                    error = ?o.error,
+                    "flow streaming completed"
+                ),
+                Err(_) => tracing::warn!("flow finalizer dropped without outcome"),
+            }
+        });
+        let id_for_map = id;
+        let model_for_map = model;
+        let mapped = stream.map(move |item| match item {
+            Ok(EnvelopeDelta::Llm(c)) => Ok(make_chunk(&id_for_map, created, &model_for_map, c)),
+            Err(e) => Err(crate::error::CoreError::InternalError {
+                message: format!("flow stream error: {e}"),
+                source: None,
+            }
+            .into()),
+        });
+        return Box::pin(mapped);
+    }
+
+    // include_usage=true: po stream EOF awaiting outcome, emit tail chunk z usage
+    // przed `[DONE]`. State machine pilnuje że tail leci dopiero raz, po EOF.
+    let composite = futures::stream::unfold(
+        SplitState::Producing {
+            stream,
+            outcome,
+            id,
+            created,
+            model,
+        },
+        move |state| async move {
+            match state {
+                SplitState::Producing {
+                    mut stream,
+                    outcome,
+                    id,
+                    created,
+                    model,
+                } => match stream.next().await {
+                    Some(Ok(EnvelopeDelta::Llm(c))) => {
+                        let chunk = make_chunk(&id, created, &model, c);
+                        Some((
+                            Ok(chunk),
+                            SplitState::Producing {
+                                stream,
+                                outcome,
+                                id,
+                                created,
+                                model,
+                            },
+                        ))
+                    }
+                    Some(Err(e)) => Some((
+                        Err(crate::error::CoreError::InternalError {
+                            message: format!("flow stream error: {e}"),
+                            source: None,
+                        }
+                        .into()),
+                        SplitState::Done,
+                    )),
+                    None => match outcome.await {
+                        Ok(o) => {
+                            let tail = build_flow_tail_chunk(&o, &id, created, &model);
+                            Some((Ok(tail), SplitState::Done))
+                        }
+                        Err(_) => {
+                            tracing::warn!("flow finalizer dropped without outcome — no usage tail");
                             None
-                        } else {
-                            Some(c.text_delta)
-                        },
-                        reasoning_content: c.reasoning_delta,
-                        tool_calls: None,
+                        }
                     },
-                    finish_reason: c.finish_reason.and_then(|f| f.as_openai_str().map(|s| s.to_string())),
-                    logprobs: None,
-                }],
-                system_fingerprint: None,
-                audio: None,
-                detected_intent: None,
-                detected_tools: None,
-                transcribed_text: None,
-                speaker_id: None,
-                speaker_name: None,
-            };
-            Ok(chunk)
-        }
-        Err(e) => Err(crate::error::CoreError::InternalError {
-            message: format!("flow stream error: {e}"),
-            source: None,
-        }
-        .into()),
-    });
-    Box::pin(mapped)
+                },
+                SplitState::Done => None,
+            }
+        },
+    );
+    Box::pin(composite)
+}
+
+enum SplitState {
+    Producing {
+        stream: futures::stream::BoxStream<
+            'static,
+            crate::error::Result<crate::flow_engine::envelope::EnvelopeDelta>,
+        >,
+        outcome: tokio::sync::oneshot::Receiver<crate::flow_engine::envelope::FlowExecutionOutcome>,
+        id: String,
+        created: u64,
+        model: String,
+    },
+    Done,
+}
+
+fn make_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    c: crate::flow_engine::envelope::LlmStreamChunk,
+) -> crate::api::openai::types::ChatCompletionChunk {
+    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: if c.text_delta.is_empty() {
+                    None
+                } else {
+                    Some(c.text_delta)
+                },
+                reasoning_content: c.reasoning_delta,
+                tool_calls: None,
+            },
+            finish_reason: c
+                .finish_reason
+                .and_then(|f| f.as_openai_str().map(|s| s.to_string())),
+            logprobs: None,
+        }],
+        system_fingerprint: None,
+        audio: None,
+        detected_intent: None,
+        detected_tools: None,
+        transcribed_text: None,
+        speaker_id: None,
+        speaker_name: None,
+        usage: None,
+    }
+}
+
+fn build_flow_tail_chunk(
+    outcome: &crate::flow_engine::envelope::FlowExecutionOutcome,
+    id: &str,
+    created: u64,
+    model: &str,
+) -> crate::api::openai::types::ChatCompletionChunk {
+    use crate::api::openai::types::{ChatCompletionChunk, Usage};
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![],
+        system_fingerprint: None,
+        audio: None,
+        detected_intent: None,
+        detected_tools: None,
+        transcribed_text: None,
+        speaker_id: None,
+        speaker_name: None,
+        usage: Some(Usage {
+            prompt_tokens: outcome.usage.prompt_tokens as u32,
+            completion_tokens: outcome.usage.completion_tokens as u32,
+            total_tokens: outcome.usage.total_tokens as u32,
+        }),
+    }
+}
+
+/// Etap 3a: state machine która patrzy na `chunk.usage` (stemplowane przez
+/// executor.rs::Done arm gdy backend dostarczył DetailedMetrics::Completion).
+/// Decyduje per `include_usage` jak wykorzystać:
+/// - `false` (default, back-compat): strip `usage` z chunk'u przed wireem.
+///   Klient nie prosił, pole nigdy się nie pokazuje.
+/// - `true`: emit chunk z `usage: None` (regular finish chunk per OpenAI
+///   contract), POTEM emit dodatkowy tail chunk z `choices: []` + `usage`.
+///   Dwa chunki z jednego źródłowego (OpenAI requirement).
+///
+/// Wszystkie chunki bez `usage` (regularne content delta) przepuszczane bez
+/// modyfikacji.
+fn apply_include_usage_split<S>(
+    inner: S,
+    include_usage: bool,
+) -> std::pin::Pin<
+    Box<
+        dyn futures::Stream<
+                Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
+            > + Send,
+    >,
+>
+where
+    S: futures::Stream<Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>>
+        + Send
+        + 'static,
+{
+    use crate::api::openai::types::ChatCompletionChunk;
+    use futures::StreamExt;
+
+    let inner = Box::pin(inner)
+        as std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = crate::error::Result<ChatCompletionChunk>,
+                    > + Send,
+            >,
+        >;
+
+    let composite = futures::stream::unfold(
+        UsageSplitState::Active { inner, include_usage },
+        |state| async move {
+            match state {
+                UsageSplitState::Active {
+                    mut inner,
+                    include_usage,
+                } => {
+                    let next = match inner.next().await {
+                        Some(Ok(c)) => c,
+                        Some(Err(e)) => return Some((Err(e), UsageSplitState::Done)),
+                        None => return None,
+                    };
+                    if next.usage.is_none() {
+                        // Regular chunk — przepuszczamy bez zmian.
+                        return Some((
+                            Ok(next),
+                            UsageSplitState::Active { inner, include_usage },
+                        ));
+                    }
+                    // Chunk niesie usage. Decyzja per flag.
+                    if !include_usage {
+                        // Klient nie prosił — strip usage, emit chunk.
+                        let mut stripped = next;
+                        stripped.usage = None;
+                        return Some((
+                            Ok(stripped),
+                            UsageSplitState::Active { inner, include_usage },
+                        ));
+                    }
+                    // include_usage=true: split na finish chunk + tail.
+                    let metrics = next.usage.clone();
+                    let mut finish_chunk = next;
+                    finish_chunk.usage = None;
+                    let tail = ChatCompletionChunk {
+                        id: finish_chunk.id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created: finish_chunk.created,
+                        model: finish_chunk.model.clone(),
+                        choices: vec![],
+                        system_fingerprint: None,
+                        audio: None,
+                        detected_intent: None,
+                        detected_tools: None,
+                        transcribed_text: None,
+                        speaker_id: None,
+                        speaker_name: None,
+                        usage: metrics,
+                    };
+                    Some((
+                        Ok(finish_chunk),
+                        UsageSplitState::EmitTail { tail, inner, include_usage },
+                    ))
+                }
+                UsageSplitState::EmitTail {
+                    tail,
+                    inner,
+                    include_usage,
+                } => Some((
+                    Ok(tail),
+                    UsageSplitState::Active { inner, include_usage },
+                )),
+                UsageSplitState::Done => None,
+            }
+        },
+    );
+    Box::pin(composite)
+}
+
+enum UsageSplitState {
+    Active {
+        inner: std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
+                    > + Send,
+            >,
+        >,
+        include_usage: bool,
+    },
+    EmitTail {
+        tail: crate::api::openai::types::ChatCompletionChunk,
+        inner: std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
+                    > + Send,
+            >,
+        >,
+        include_usage: bool,
+    },
+    Done,
 }
 
 fn wrap_with_pii_streaming(
@@ -149,6 +397,12 @@ fn wrap_with_pii_streaming(
         let outputs: Vec<crate::error::Result<ChatCompletionChunk>> = match chunk_result {
             Err(e) => vec![Err(e)],
             Ok(chunk) => {
+                // Etap 3a: tail chunk z usage (choices.is_empty() && usage.is_some())
+                // przepuszczamy untouched — brak tekstu do filtrowania, OpenAI
+                // contract wymaga że tail leci PRZED [DONE] w czystej formie.
+                if chunk.choices.is_empty() && chunk.usage.is_some() {
+                    return futures::stream::iter(vec![Ok(chunk)]);
+                }
                 {
                     let mut tpl = t_filter.lock().unwrap();
                     if tpl.is_none() {
@@ -404,8 +658,16 @@ impl Router {
             {
                 Ok(Some(stream_exec)) => {
                     let model_for_stream = request.model.clone();
-                    let chunk_stream =
-                        envelope_stream_to_chunk_stream(stream_exec, model_for_stream);
+                    let include_usage = request
+                        .stream_options
+                        .as_ref()
+                        .map(|so| so.include_usage)
+                        .unwrap_or(false);
+                    let chunk_stream = envelope_stream_to_chunk_stream(
+                        stream_exec,
+                        model_for_stream,
+                        include_usage,
+                    );
                     let filtered =
                         wrap_with_pii_streaming(chunk_stream, self.response_middleware.clone());
                     let cancel_wrapped: std::pin::Pin<
@@ -494,6 +756,7 @@ impl Router {
                         transcribed_text: None,
                         speaker_id: None,
                         speaker_name: None,
+                    usage: None,
                     };
 
                     let stream = futures::stream::once(async move { Ok(chunk) });
@@ -556,10 +819,21 @@ impl Router {
             };
             match executor.stream_chat(request.clone(), &mut exec_ctx).await {
                 Ok(stream) => {
+                    // Etap 3a: split usage off finish chunk per
+                    // `stream_options.include_usage`. Executor stempluje
+                    // `chunk.usage = Some(metrics)` na finish chunk gdy
+                    // backend zaraportował tokeny; routing layer decyduje
+                    // jak to wykorzystać (strip back-compat lub split na tail).
+                    let include_usage = request
+                        .stream_options
+                        .as_ref()
+                        .map(|so| so.include_usage)
+                        .unwrap_or(false);
+                    let usage_aware = apply_include_usage_split(stream, include_usage);
                     // Codex H2 + H3 round 2: PII filter + EOF flush — wspolny
                     // helper dla executor + flow streaming paths.
                     let filtered = wrap_with_pii_streaming(
-                        stream,
+                        usage_aware,
                         self.response_middleware.clone(),
                     );
                     let metadata = crate::routing::RouteMetadata {
@@ -593,5 +867,133 @@ impl Router {
             source: None,
         }
         .into())
+    }
+}
+
+#[cfg(test)]
+mod include_usage_tests {
+    use super::*;
+    use crate::api::openai::types::{
+        ChatCompletionChunk, ChunkChoice, Delta, Usage,
+    };
+    use futures::StreamExt;
+
+    fn chunk_with_usage(text: &str, finish: bool, usage: Option<Usage>) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "id1".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: Some(text.into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: if finish {
+                    Some("stop".into())
+                } else {
+                    None
+                },
+                logprobs: None,
+            }],
+            system_fingerprint: None,
+            audio: None,
+            detected_intent: None,
+            detected_tools: None,
+            transcribed_text: None,
+            speaker_id: None,
+            speaker_name: None,
+            usage,
+        }
+    }
+
+    /// include_usage=false strips usage z finish chunk'u (back compat).
+    #[tokio::test]
+    async fn split_false_strips_usage_from_finish_chunk() {
+        let usage = Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        });
+        let chunks = vec![
+            Ok(chunk_with_usage("hello", false, None)),
+            Ok(chunk_with_usage("", true, usage)),
+        ];
+        let inner = futures::stream::iter(chunks);
+        let mut out = apply_include_usage_split(inner, false);
+        let c1 = out.next().await.unwrap().unwrap();
+        assert_eq!(c1.choices[0].delta.content.as_deref(), Some("hello"));
+        assert!(c1.usage.is_none());
+        let c2 = out.next().await.unwrap().unwrap();
+        assert_eq!(c2.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(c2.usage.is_none(), "usage stripped when include_usage=false");
+        assert!(out.next().await.is_none());
+    }
+
+    /// include_usage=true splits finish chunk na regular finish + dodatkowy tail.
+    #[tokio::test]
+    async fn split_true_emits_tail_chunk_with_usage() {
+        let usage = Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        });
+        let chunks = vec![
+            Ok(chunk_with_usage("hi", false, None)),
+            Ok(chunk_with_usage("", true, usage.clone())),
+        ];
+        let inner = futures::stream::iter(chunks);
+        let mut out = apply_include_usage_split(inner, true);
+        // 1: regular content
+        let c1 = out.next().await.unwrap().unwrap();
+        assert_eq!(c1.choices[0].delta.content.as_deref(), Some("hi"));
+        assert!(c1.usage.is_none());
+        // 2: finish chunk z usage=None (split)
+        let c2 = out.next().await.unwrap().unwrap();
+        assert_eq!(c2.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(c2.usage.is_none());
+        // 3: tail chunk z choices:[] + usage:Some
+        let c3 = out.next().await.unwrap().unwrap();
+        assert!(c3.choices.is_empty());
+        assert_eq!(c3.usage.as_ref().unwrap().total_tokens, 15);
+        assert!(out.next().await.is_none());
+    }
+
+    /// Brak usage na chunkach = wszystkie przepuszczone bez zmian.
+    #[tokio::test]
+    async fn split_passthrough_when_no_usage_stamped() {
+        let chunks = vec![
+            Ok(chunk_with_usage("a", false, None)),
+            Ok(chunk_with_usage("", true, None)),
+        ];
+        let inner = futures::stream::iter(chunks);
+        let collected: Vec<_> = apply_include_usage_split(inner, true)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(collected.len(), 2);
+    }
+
+    /// PII filter passes chunks z choices.is_empty()+usage.is_some() untouched.
+    #[tokio::test]
+    async fn pii_filter_bypasses_tail_chunk() {
+        use crate::middleware::response::ResponseMiddleware;
+        // PII middleware z disabled flag — wystarcza dla testu bypass'u tail.
+        let rm = std::sync::Arc::new(ResponseMiddleware::new(false));
+        let usage = Some(Usage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+        });
+        let mut tail = chunk_with_usage("", true, usage);
+        tail.choices = vec![]; // proper tail shape
+        let chunks = vec![Ok(tail.clone())];
+        let inner = futures::stream::iter(chunks);
+        let mut out = wrap_with_pii_streaming(Box::pin(inner), rm);
+        let c = out.next().await.unwrap().unwrap();
+        assert!(c.choices.is_empty());
+        assert!(c.usage.is_some());
     }
 }

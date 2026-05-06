@@ -418,6 +418,7 @@ impl ModelRuntimeExecutor {
                                         transcribed_text: None,
                                         speaker_id: None,
                                         speaker_name: None,
+                                        usage: None,
                                     })),
                                     StreamChunkType::ReasoningDelta(reasoning) => {
                                         Some(Ok(ChatCompletionChunk {
@@ -443,9 +444,18 @@ impl ModelRuntimeExecutor {
                                             transcribed_text: None,
                                             speaker_id: None,
                                             speaker_name: None,
+                                            usage: None,
                                         }))
                                     }
-                                    StreamChunkType::Done { final_metrics: _ } => {
+                                    StreamChunkType::Done { final_metrics } => {
+                                        // Etap 3a: stempluj `usage` na finish chunk gdy
+                                        // backend zaraportował token rollup w
+                                        // `DetailedMetrics::Completion`. Routing layer
+                                        // (apply_include_usage_split) decyduje czy
+                                        // przepuścić to pole na wire (gdy klient
+                                        // poprosił `stream_options.include_usage=true`)
+                                        // czy stripować je back-compat default.
+                                        let usage = extract_completion_usage(final_metrics.as_ref());
                                         Some(Ok(ChatCompletionChunk {
                                             id: chat_id,
                                             object: "chat.completion.chunk".to_string(),
@@ -469,6 +479,7 @@ impl ModelRuntimeExecutor {
                                             transcribed_text: None,
                                             speaker_id: None,
                                             speaker_name: None,
+                                            usage,
                                         }))
                                     }
                                     _ => None,
@@ -1845,6 +1856,29 @@ fn flow_outcome_to_embedding_response(
         )));
     }
     Ok(response)
+}
+
+/// Etap 3a: extract token usage z `ModelMetrics.detailed` gdy backend dostarczył
+/// `DetailedMetrics::Completion`. Inny wariant (np. Embeddings dla embeddings
+/// stream'a) lub brak `final_metrics` zwraca `None` — chunk wtedy bez `usage`,
+/// klient z `include_usage=true` widzi brak (warn'em wpisany w
+/// `apply_include_usage_split`).
+fn extract_completion_usage(
+    metrics: Option<&tentaflow_protocol::ModelMetrics>,
+) -> Option<crate::api::openai::types::Usage> {
+    use tentaflow_protocol::DetailedMetrics;
+    match metrics?.detailed.as_ref()? {
+        DetailedMetrics::Completion {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => Some(crate::api::openai::types::Usage {
+            prompt_tokens: *prompt_tokens,
+            completion_tokens: *completion_tokens,
+            total_tokens: *total_tokens,
+        }),
+        _ => None,
+    }
 }
 
 fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {

@@ -216,6 +216,7 @@ fn tail_chunk_with_text(text: String) -> ChatCompletionChunk {
         transcribed_text: None,
         speaker_id: None,
         speaker_name: None,
+        usage: None,
     }
 }
 
@@ -449,6 +450,7 @@ fn tail_chunk_for_choice(index: u32, text: String) -> ChatCompletionChunk {
         transcribed_text: None,
         speaker_id: None,
         speaker_name: None,
+        usage: None,
     }
 }
 
@@ -585,6 +587,7 @@ mod tests {
             transcribed_text: None,
             speaker_id: None,
             speaker_name: None,
+            usage: None,
         }
     }
 
@@ -737,6 +740,7 @@ mod tests {
             transcribed_text: None,
             speaker_id: None,
             speaker_name: None,
+            usage: None,
         }
     }
 
@@ -764,6 +768,7 @@ mod tests {
             transcribed_text: None,
             speaker_id: None,
             speaker_name: None,
+            usage: None,
         }
     }
 

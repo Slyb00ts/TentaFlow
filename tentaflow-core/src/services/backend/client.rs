@@ -989,6 +989,7 @@ impl BackendClient {
             top_p: None,
             n: None,
             stream: false,
+            stream_options: None,
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
