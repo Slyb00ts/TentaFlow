@@ -230,6 +230,7 @@ fn build_chat_request(req: &LlmRequest, stream: bool) -> ChatCompletionRequest {
             Some(req.stop.clone())
         },
         stream,
+        stream_options: None,
         user: None,
         response_format: None,
         tools: None,

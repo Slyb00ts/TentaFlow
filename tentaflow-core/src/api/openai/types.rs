@@ -100,6 +100,13 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
 
+    /// Etap 3a: opcjonalne pola sterujące zachowaniem streamingu. Dziś
+    /// jedyne pole to `include_usage: bool` — gdy `true`, serwer emituje
+    /// dodatkowy tail chunk z usage przed `[DONE]` (kontrakt OpenAI od
+    /// marca 2024).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
     /// User identifier (dla monitoringu i rate limiting)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -402,6 +409,16 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// Streaming options (Etap 3a). Dziś jedyne pole to `include_usage` —
+/// gdy `true`, serwer emituje przed `[DONE]` dodatkowy chunk z `usage`
+/// (rollup tokenów); regular chunki mają `usage: None`. Klient bez tego
+/// flag'u dostaje pre-Etap-3a zachowanie (no usage information w streamie).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
 /// Chunk w streaming response (SSE)
 ///
 /// Format SSE: `data: {json}\n\n`
@@ -442,6 +459,13 @@ pub struct ChatCompletionChunk {
     /// Nazwa rozpoznanego mowcy
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_name: Option<String>,
+
+    /// Etap 3a: rollup token usage. Niesione TYLKO przez tail chunk
+    /// (gdy klient włączył `stream_options.include_usage=true`). Regular
+    /// chunki w środku stream'u mają `None`. Klient bez flag'u nigdy tego
+    /// pola nie zobaczy (back compat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// Choice w streaming chunk

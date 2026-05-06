@@ -237,7 +237,7 @@ pub async fn dispatch_reverse_request(
                             transcribed_text: None,
                             speaker_id: None,
                             speaker_name: None,
-                        }),
+                                                }),
                         metrics: None,
                     }
                 }
@@ -318,7 +318,7 @@ pub async fn dispatch_reverse_request(
                             transcribed_text: None,
                             speaker_id: None,
                             speaker_name: None,
-                        }),
+                                                }),
                         metrics: None,
                     }
                 }
@@ -377,6 +377,7 @@ fn build_chat_request(
         temperature: payload.temperature,
         max_tokens: payload.max_tokens,
         stream: false,
+        stream_options: None,
         top_p: payload.top_p,
         frequency_penalty: None,
         presence_penalty: payload.presence_penalty,
