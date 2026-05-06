@@ -10,7 +10,7 @@ use crate::api::openai::types::{
 };
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
-use crate::flow_engine::types::FlowExecutionResult;
+use crate::flow_engine::envelope::FlowExecutionOutcome;
 use crate::routing::router::{
     RequestMetrics, Router, VoiceInfo,
 };
@@ -112,11 +112,15 @@ impl Router {
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let ctx = crate::routing::build_flow_context_for_user(&request, false, user.clone());
+            let (initial, meta) =
+                crate::routing::build_initial_envelope_for_user(&request, user.clone());
 
-            match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
-                Ok(Some(result)) => {
-                    let mut response = flow_result_to_chat_response(result, &request.model);
+            match dispatcher
+                .try_dispatch(&request.model, "chat", initial, meta)
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    let mut response = flow_outcome_to_chat_response(outcome, &request.model);
                     // Codex H1 round 2: flow path tez musi przejsc przez
                     // response_middleware — wczesniej tylko direct executor
                     // sciezka aplikowala clean_text, flow zwracal bezposrednio.
@@ -486,54 +490,11 @@ pub(crate) fn catalog_target_accepts_audio(
 }
 
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
-pub(crate) fn flow_result_to_chat_response(
-    result: FlowExecutionResult,
+pub(crate) fn flow_outcome_to_chat_response(
+    outcome: FlowExecutionOutcome,
     model: &str,
 ) -> ChatCompletionResponse {
-    let json_value = converter::flow_result_to_chat_response(&result, model);
-    serde_json::from_value(json_value).unwrap_or_else(|_| {
-        let text = result
-            .output
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| result.output.to_string());
-
-        ChatCompletionResponse {
-            id: format!("flow-{}", uuid::Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model: model.to_string(),
-            choices: vec![Choice {
-                index: 0,
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: Some(MessageContent::Text(text)),
-                    reasoning_content: None,
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                finish_reason: Some("stop".to_string()),
-                logprobs: None,
-            }],
-            usage: Some(Usage {
-                prompt_tokens: result.prompt_tokens as u32,
-                completion_tokens: result.completion_tokens as u32,
-                total_tokens: result.total_tokens as u32,
-            }),
-            system_fingerprint: Some("flow-engine".to_string()),
-            transcribed_text: None,
-            speaker_id: None,
-            speaker_name: None,
-            speaker_confidence: None,
-            detected_intent: None,
-            detected_tools: None,
-        }
-    })
+    converter::flow_outcome_to_chat_response(&outcome, model)
 }
 
 #[cfg(test)]

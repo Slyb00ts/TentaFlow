@@ -12,10 +12,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use super::AddonManager;
-use crate::flow_engine::adapters::NodeAdapter;
-use crate::flow_engine::types::FlowContext;
-
 // =============================================================================
 // Typy bloczkow flow builder z addonu
 // =============================================================================
@@ -361,122 +357,6 @@ impl Default for AddonFlowRegistry {
 }
 
 // =============================================================================
-// AddonNodeAdapter — adapter Flow Engine dla wezlow addon
-// =============================================================================
-
-/// Adapter Flow Engine ktory deleguje wykonanie wezla do addonu WASM.
-/// Rejestrowany w AdapterRegistry flow engine aby obsluzyc bloczki typu "addon.*".
-pub struct AddonNodeAdapter {
-    addon_manager: Arc<AddonManager>,
-    flow_registry: Arc<AddonFlowRegistry>,
-}
-
-impl AddonNodeAdapter {
-    /// Tworzy nowy adapter
-    pub fn new(addon_manager: Arc<AddonManager>, flow_registry: Arc<AddonFlowRegistry>) -> Self {
-        Self {
-            addon_manager,
-            flow_registry,
-        }
-    }
-
-    /// Parsuje typ wezla flow na addon_id i block_type.
-    /// Format: "addon.{addon_id}.{block_type}"
-    fn parse_addon_node_type(node_type: &str) -> Option<(&str, &str)> {
-        let stripped = node_type.strip_prefix("addon.")?;
-        stripped.split_once('.')
-    }
-}
-
-impl NodeAdapter for AddonNodeAdapter {
-    /// Wykonuje wezel addon w flow DAG.
-    ///
-    /// Algorytm:
-    /// 1. Parsuj addon_id i block_type z node_type
-    /// 2. Znajdz definicje bloczka w registry
-    /// 3. Przygotuj parametry z konfiguracji wezla i kontekstu flow
-    /// 4. Wywolaj addon przez AddonManager
-    /// 5. Zapisz wynik w kontekscie flow
-    async fn execute(&self, node_config: &Value, ctx: &mut FlowContext) -> Result<Value> {
-        // Pobierz typ wezla z konfiguracji
-        let node_type = node_config
-            .get("_node_type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Brak _node_type w konfiguracji wezla addon"))?;
-
-        let (addon_id, block_type) = Self::parse_addon_node_type(node_type).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Niepoprawny typ wezla addon: '{}'. Oczekiwany format: 'addon.addon_id.block_type'",
-                node_type
-            )
-        })?;
-
-        info!("Wykonanie bloczka addon: {}.{}", addon_id, block_type);
-
-        // Sprawdz czy bloczek jest zarejestrowany
-        let full_type = format!("addon.{}.{}", addon_id, block_type);
-        let _block_def = self.flow_registry.find_block(&full_type).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Bloczek '{}' nie jest zarejestrowany w flow registry",
-                full_type
-            )
-        })?;
-
-        // Przygotuj parametry — polacz config wezla z danymi wejsciowymi z flow
-        let mut params = node_config.clone();
-        if let Value::Object(ref mut map) = params {
-            // Usun metadane wezla
-            map.remove("_node_type");
-            map.remove("_node_id");
-
-            // Dodaj zmienne z kontekstu flow (jesli referencje w szablonach)
-            for (key, value) in &ctx.variables {
-                if !map.contains_key(key) {
-                    map.insert(key.clone(), value.clone());
-                }
-            }
-
-            // Dodaj input z kontekstu flow
-            if !ctx.input.is_empty() && !map.contains_key("input") {
-                map.insert("input".to_string(), Value::String(ctx.input.clone()));
-            }
-        }
-
-        // User ID — uzywamy 0 jesli brak (systemowe wywolanie)
-        let user_id: i64 = ctx
-            .variables
-            .get("user_id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        // Wywolaj addon
-        let result = self
-            .addon_manager
-            .call_tool(addon_id, block_type, params, user_id)
-            .with_context(|| {
-                format!("Blad wywolania bloczka addon '{}.{}'", addon_id, block_type)
-            })?;
-
-        debug!(
-            "Bloczek addon '{}.{}' zakonczony pomyslnie",
-            addon_id, block_type
-        );
-
-        Ok(result)
-    }
-
-    fn node_type(&self) -> &'static str {
-        // Adapter obsluguje wszystkie wezly z prefixem "addon."
-        // Flow Engine sprawdza prefix, nie dokladne dopasowanie
-        "addon"
-    }
-
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-}
-
-// =============================================================================
 // Testy
 // =============================================================================
 
@@ -544,20 +424,6 @@ mod tests {
     fn test_parse_blocks_json_invalid() {
         let result = parse_blocks_json("broken", "not json");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_addon_node_type() {
-        assert_eq!(
-            AddonNodeAdapter::parse_addon_node_type("addon.teams.send_message"),
-            Some(("teams", "send_message"))
-        );
-        assert_eq!(
-            AddonNodeAdapter::parse_addon_node_type("addon.my_addon.do_thing"),
-            Some(("my_addon", "do_thing"))
-        );
-        assert_eq!(AddonNodeAdapter::parse_addon_node_type("llm"), None);
-        assert_eq!(AddonNodeAdapter::parse_addon_node_type("addon."), None);
     }
 
     #[test]

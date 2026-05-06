@@ -782,21 +782,23 @@ impl ModelRuntimeExecutor {
                 // that is not the one this branch picked.
                 let dispatch_result = {
                     let user = ctx.user.clone();
-                    let flow_ctx = crate::routing::build_flow_context_for_user(
-                        &request, false, user,
+                    let (initial, meta) = crate::routing::build_initial_envelope_for_user(
+                        &request, user,
                     );
-                    dispatcher.dispatch_by_flow_id(*flow_id, flow_ctx).await
+                    dispatcher
+                        .dispatch_by_flow_id(*flow_id, initial, meta)
+                        .await
                 };
                 ctx.leave_flow();
 
-                let result = dispatch_result
+                let outcome = dispatch_result
                     .map_err(|e| ExecutorError::Internal(e.to_string()))?
                     .ok_or_else(|| ExecutorError::FlowEmptyResult {
                         model: published_name.clone(),
                     })?;
 
-                Ok(crate::routing::chat::flow_result_to_chat_response(
-                    result,
+                Ok(crate::routing::chat::flow_outcome_to_chat_response(
+                    outcome,
                     &request.model,
                 ))
             }
@@ -1253,12 +1255,14 @@ impl ModelRuntimeExecutor {
                 // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
                 // Without this `dispatch_by_flow_id` sees `user_id = None`
                 // and skips the per-flow ACL check.
-                let flow_ctx = embeddings_request_to_flow_ctx(&request, ctx.user.clone());
+                let (initial, meta) = embeddings_request_to_initial_envelope(
+                    &request, ctx.user.clone(),
+                );
                 let dispatch_result = dispatcher
-                    .dispatch_by_flow_id(*flow_id, flow_ctx)
+                    .dispatch_by_flow_id(*flow_id, initial, meta)
                     .await;
                 ctx.leave_flow();
-                let result = dispatch_result
+                let outcome = dispatch_result
                     .map_err(|e| ExecutorError::Internal(e.to_string()))?
                     .ok_or_else(|| ExecutorError::FlowEmptyResult {
                         model: published_name.clone(),
@@ -1267,7 +1271,7 @@ impl ModelRuntimeExecutor {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
                 };
-                flow_result_to_embedding_response(result, &request, expected_count)
+                flow_outcome_to_embedding_response(outcome, &request, expected_count)
             }
         }
     }
@@ -1684,118 +1688,53 @@ fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-/// Build a `FlowContext` for an embeddings request. Propagates `user_id` /
-/// `user_role` from the executor context so the dispatcher's per-flow ACL
-/// fires identically to chat dispatch.
-fn embeddings_request_to_flow_ctx(
+/// Buduje seed envelope + per-request meta dla embeddings flow path.
+fn embeddings_request_to_initial_envelope(
     request: &EmbeddingRequest,
     user: Option<crate::auth::acl::UserContext>,
-) -> crate::flow_engine::types::FlowContext {
+) -> (
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+) {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
     let input_text = match &request.input {
         EmbeddingInput::Single(text) => text.clone(),
         EmbeddingInput::Multiple(texts) => texts.join("\n"),
     };
-    let mut ctx = crate::flow_engine::types::FlowContext {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        model: request.model.clone(),
-        input: input_text,
-        stream: false,
-        service_type: "embeddings".to_string(),
-        original_request: serde_json::to_value(request).ok(),
-        ..Default::default()
-    };
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Text(input_text);
+    env.meta.insert(
+        "embeddings_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
     if let Some(u) = user {
-        ctx.user_id = Some(u.user_id);
-        ctx.user_role = Some(u.role);
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
     }
-    ctx
+    (env, meta)
 }
 
-/// Convert a flow's terminal output into an `EmbeddingResponse`. Flow author
-/// is expected to surface either `Vec<f32>` (single input) or `Vec<Vec<f32>>`
-/// (batched) under the `embedding`/`embeddings` key. Cardinality is checked
-/// against `expected_count` so a batched request that comes back with one
-/// vector is rejected — silent collapse would let a flow misconfig hide
-/// behind an OK response.
-fn flow_result_to_embedding_response(
-    result: crate::flow_engine::types::FlowExecutionResult,
+/// Konwertuje FlowExecutionOutcome na EmbeddingResponse z walidacją
+/// cardinality (batch flow z jednym wektorem dla wielu inputów to misconfig).
+fn flow_outcome_to_embedding_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
     request: &EmbeddingRequest,
     expected_count: usize,
 ) -> Result<EmbeddingResponse, ExecutorError> {
-    let extract = |v: &serde_json::Value| -> Option<Vec<Vec<f32>>> {
-        // Try [[f32]] first, then [f32] wrapped in a single batch. Reject
-        // any non-finite floats — NaN/Inf vectors break downstream cosine
-        // similarity and other consumers without a clear error.
-        let parse_finite = |n: &serde_json::Value| -> Option<f32> {
-            let f = n.as_f64()? as f32;
-            if f.is_finite() {
-                Some(f)
-            } else {
-                None
-            }
-        };
-        if let Some(arr) = v.as_array() {
-            if arr.iter().all(|x| x.is_array()) {
-                let mut out = Vec::with_capacity(arr.len());
-                for row in arr {
-                    let inner = row.as_array()?;
-                    let mut floats = Vec::with_capacity(inner.len());
-                    for n in inner {
-                        floats.push(parse_finite(n)?);
-                    }
-                    out.push(floats);
-                }
-                return Some(out);
-            }
-            if arr.iter().all(|x| x.is_number()) {
-                let mut floats = Vec::with_capacity(arr.len());
-                for n in arr {
-                    floats.push(parse_finite(n)?);
-                }
-                return Some(vec![floats]);
-            }
-        }
-        None
-    };
-    let embeddings = result
-        .output
-        .get("embedding")
-        .and_then(extract)
-        .or_else(|| result.output.get("embeddings").and_then(extract))
-        .ok_or_else(|| {
-            ExecutorError::Internal(
-                "flow output missing `embedding`/`embeddings` field with vector payload".into(),
-            )
-        })?;
-
-    if embeddings.len() != expected_count {
+    let response =
+        crate::flow_engine::converter::flow_outcome_to_embedding_response(&outcome, &request.model)
+            .map_err(|e| ExecutorError::Internal(format!("{e}")))?;
+    if response.data.len() != expected_count {
         return Err(ExecutorError::Internal(format!(
             "flow returned {} embedding(s) for {} input(s) — cardinality mismatch",
-            embeddings.len(),
+            response.data.len(),
             expected_count
         )));
     }
-
-    let data = embeddings
-        .into_iter()
-        .enumerate()
-        .map(|(idx, embedding)| EmbeddingData {
-            object: "embedding".to_string(),
-            index: idx as u32,
-            embedding,
-        })
-        .collect();
-    let prompt_tokens = result.prompt_tokens.max(0) as u32;
-    let total_tokens = result.total_tokens.max(prompt_tokens as i64) as u32;
-    Ok(EmbeddingResponse {
-        object: "list".to_string(),
-        data,
-        model: request.model.clone(),
-        usage: EmbeddingUsage {
-            prompt_tokens,
-            total_tokens,
-        },
-    })
+    Ok(response)
 }
 
 fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
@@ -1951,18 +1890,18 @@ mod tests {
         assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
     }
 
-    /// `flow_result_to_embedding_response` accepts both shapes the catalog
-    /// promises a flow can emit: a single `[f32]` (one input, single vector)
-    /// and a `[[f32]]` batch.
-    fn flow_result(output: serde_json::Value) -> crate::flow_engine::types::FlowExecutionResult {
-        crate::flow_engine::types::FlowExecutionResult {
-            status: "ok".into(),
-            output,
-            execution_log: vec![],
+    fn outcome_with_payload(
+        payload: crate::flow_engine::envelope::FlowValue,
+    ) -> crate::flow_engine::envelope::FlowExecutionOutcome {
+        let mut env = crate::flow_engine::envelope::FlowEnvelope::empty();
+        env.payload = payload;
+        crate::flow_engine::envelope::FlowExecutionOutcome {
+            final_envelope: env,
+            trace: vec![],
+            usage: crate::flow_engine::envelope::TokenUsage::default(),
+            finish_reason: crate::flow_engine::envelope::FinishReason::Stop,
             total_latency_ms: 0,
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            error: None,
         }
     }
 
@@ -1978,40 +1917,39 @@ mod tests {
         }
     }
 
+    /// Single-vector outcome trafia do `data[0]` z `index=0`.
     #[test]
-    fn flow_result_extracts_single_embedding_for_single_input() {
+    fn flow_outcome_extracts_single_embedding_for_single_input() {
         let request = make_request("any");
-        let single = flow_result(serde_json::json!({ "embedding": [0.1, 0.2, 0.3] }));
-        let resp = flow_result_to_embedding_response(single, &request, 1).expect("single ok");
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Embedding(
+            vec![0.1, 0.2, 0.3],
+        ));
+        let resp = flow_outcome_to_embedding_response(outcome, &request, 1).expect("single ok");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].embedding.len(), 3);
     }
 
+    /// Batch JSON `{ "embeddings": [[..],[..]] }` mapuje na `data[]` z
+    /// `index` 0..n.
     #[test]
-    fn flow_result_extracts_batched_embeddings_for_batched_input() {
+    fn flow_outcome_extracts_batched_embeddings_for_batched_input() {
         let request = batch_request("any", 2);
-        let batched = flow_result(serde_json::json!({ "embeddings": [[0.1], [0.2]] }));
-        let resp = flow_result_to_embedding_response(batched, &request, 2).expect("batched ok");
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "embeddings": [[0.1], [0.2]] }),
+        ));
+        let resp = flow_outcome_to_embedding_response(outcome, &request, 2).expect("batched ok");
         assert_eq!(resp.data.len(), 2);
     }
 
+    /// Cardinality mismatch (1 wektor dla 3 inputów) zwraca Internal — silent
+    /// collapse byłby ukrytym misconfigiem flow.
     #[test]
-    fn flow_result_missing_field_returns_internal() {
-        let request = make_request("any");
-        let bad = flow_result(serde_json::json!({ "text": "no vectors here" }));
-        let err = flow_result_to_embedding_response(bad, &request, 1)
-            .expect_err("missing embedding field should reject");
-        assert!(matches!(err, ExecutorError::Internal(_)));
-    }
-
-    /// Codex R3b.1 round 2 M3: a batched request that comes back with a
-    /// single vector must be rejected — silent collapse would let a flow
-    /// misconfig hide behind an OK response.
-    #[test]
-    fn flow_result_cardinality_mismatch_returns_internal() {
+    fn flow_outcome_cardinality_mismatch_returns_internal() {
         let request = batch_request("any", 3);
-        let single_result = flow_result(serde_json::json!({ "embeddings": [[0.1]] }));
-        let err = flow_result_to_embedding_response(single_result, &request, 3)
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "embeddings": [[0.1]] }),
+        ));
+        let err = flow_outcome_to_embedding_response(outcome, &request, 3)
             .expect_err("1 embedding for 3 inputs must reject");
         assert!(matches!(err, ExecutorError::Internal(_)));
     }
@@ -2113,13 +2051,12 @@ mod tests {
     /// NaN / Inf in embedding payload break downstream cosine similarity
     /// silently — reject at parse time so the operator sees a clear error.
     #[test]
-    fn flow_result_rejects_non_finite_floats() {
+    fn flow_outcome_rejects_non_numeric_batch_entries() {
         let request = make_request("any");
-        let bad = flow_result(serde_json::json!({ "embedding": [0.1, "NaN", 0.3] }));
-        // String "NaN" doesn't parse as number → extract returns None →
-        // missing-field error path. The finite check covers numeric NaN/Inf
-        // emitted by serde_json::Number with non-finite f64.
-        let err = flow_result_to_embedding_response(bad, &request, 1)
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "embeddings": [[0.1, "NaN", 0.3]] }),
+        ));
+        let err = flow_outcome_to_embedding_response(outcome, &request, 1)
             .expect_err("non-numeric entry rejects");
         assert!(matches!(err, ExecutorError::Internal(_)));
     }

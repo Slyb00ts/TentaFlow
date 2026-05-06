@@ -1,38 +1,72 @@
 // =============================================================================
 // Plik: flow_engine/validation.rs
-// Opis: Walidacja semantyczna FlowDefinition przed zapisem w DB — sprawdza
-//       ze porty na krawedziach pasuja do metadanych adapterow. Daje UI
-//       natychmiastowy feedback zamiast pozniejszego bledu runtime.
+// Opis: Walidacja semantyczna FlowDefinition (plan v4.2). Single source of
+//       truth dla reguł flow — wołane z `CompiledFlow::compile` (defense in
+//       depth dla load z DB) i z `dispatch/handlers.rs` save flow.
+//       Reguły:
+//         R1. każdy edge.from / edge.to wskazuje na istniejący node
+//         R2. każdy node ma adapter w registry
+//         R3. edge.from_port ∈ supported_output_ports producenta;
+//             edge.to_port ∈ supported_input_ports konsumenta
+//         R4. strict 1-input-edge dla każdego non-trigger node'a
+//         R5. dokładnie jeden trigger node
+//         R6. condition edges (from_port "true"/"false") tylko z node'a
+//             "condition"
+//         R7. streaming end-shape — edge `from_port="stream"` musi prowadzić
+//             do node'a "output" z config.mode="stream", bez nodów po LLM
+//             na ścieżce do output. Co najwyżej jedna gałąź streaming na flow.
 // =============================================================================
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::flow_engine::adapters::AdapterRegistry;
+use crate::flow_engine::node_adapter::AdapterRegistry;
 use crate::flow_engine::types::FlowDefinition;
 
-/// Blad walidacji struktury flow.
 #[derive(Debug, Clone)]
 pub enum FlowValidationError {
-    /// Krawedz odwoluje sie do nieistniejacego wezla (po `id`).
     UnknownNode {
-        edge_endpoint: String,
+        edge_endpoint: &'static str,
         node_id: String,
     },
-    /// Typ wezla nie jest zarejestrowany w AdapterRegistry.
-    UnknownAdapter { node_id: String, node_type: String },
-    /// Edge.from_port nie istnieje na liscie portow wyjsciowych adaptera.
+    UnknownAdapter {
+        node_id: String,
+        node_type: String,
+    },
     InvalidOutputPort {
         node_id: String,
         node_type: String,
         port: String,
-        available: Vec<&'static str>,
+        available: Vec<String>,
     },
-    /// Edge.to_port nie istnieje na liscie portow wejsciowych adaptera.
     InvalidInputPort {
         node_id: String,
         node_type: String,
         port: String,
-        available: Vec<&'static str>,
+        available: Vec<String>,
+    },
+    MultipleInputs {
+        node_id: String,
+        actual: usize,
+    },
+    TriggerCount {
+        actual: usize,
+    },
+    ConditionEdgeFromNonCondition {
+        node_id: String,
+        node_type: String,
+        port: String,
+    },
+    StreamingNotToOutput {
+        from_node: String,
+        to_node: String,
+    },
+    StreamingOutputModeMismatch {
+        node_id: String,
+        actual: String,
+    },
+    MultipleStreamingBranches {
+        count: usize,
     },
 }
 
@@ -44,13 +78,11 @@ impl fmt::Display for FlowValidationError {
                 node_id,
             } => write!(
                 f,
-                "edge {} references unknown node id '{}'",
-                edge_endpoint, node_id
+                "edge {edge_endpoint} references unknown node '{node_id}'"
             ),
             Self::UnknownAdapter { node_id, node_type } => write!(
                 f,
-                "node '{}' uses unregistered adapter type '{}'",
-                node_id, node_type
+                "node '{node_id}' uses unregistered adapter type '{node_type}'"
             ),
             Self::InvalidOutputPort {
                 node_id,
@@ -59,8 +91,7 @@ impl fmt::Display for FlowValidationError {
                 available,
             } => write!(
                 f,
-                "node '{}' (type '{}') has no output port '{}', available: {:?}",
-                node_id, node_type, port, available
+                "node '{node_id}' (type '{node_type}') has no output port '{port}', available: {available:?}"
             ),
             Self::InvalidInputPort {
                 node_id,
@@ -69,8 +100,35 @@ impl fmt::Display for FlowValidationError {
                 available,
             } => write!(
                 f,
-                "node '{}' (type '{}') has no input port '{}', available: {:?}",
-                node_id, node_type, port, available
+                "node '{node_id}' (type '{node_type}') has no input port '{port}', available: {available:?}"
+            ),
+            Self::MultipleInputs { node_id, actual } => write!(
+                f,
+                "node '{node_id}' has {actual} incoming edges (1-input-edge rule)"
+            ),
+            Self::TriggerCount { actual } => write!(
+                f,
+                "flow must have exactly one trigger node, found {actual}"
+            ),
+            Self::ConditionEdgeFromNonCondition {
+                node_id,
+                node_type,
+                port,
+            } => write!(
+                f,
+                "edge from_port '{port}' (true/false) only allowed on 'condition' node, got '{node_id}' (type '{node_type}')"
+            ),
+            Self::StreamingNotToOutput { from_node, to_node } => write!(
+                f,
+                "streaming edge from '{from_node}' must lead to an 'output' node, got '{to_node}'"
+            ),
+            Self::StreamingOutputModeMismatch { node_id, actual } => write!(
+                f,
+                "streaming flow output node '{node_id}' must have config.mode='stream', got '{actual}'"
+            ),
+            Self::MultipleStreamingBranches { count } => write!(
+                f,
+                "flow has {count} streaming branches; only one allowed"
             ),
         }
     }
@@ -78,29 +136,62 @@ impl fmt::Display for FlowValidationError {
 
 impl std::error::Error for FlowValidationError {}
 
-/// Waliduje semantyczna poprawnosc flow — kazdy edge musi odwolywac sie do
-/// istniejacych nodes, typ kazdego node'a musi byc zarejestrowany, a porty
-/// (from_port/to_port) musza byc wsrod supported_{output,input}_ports adaptera.
-pub fn validate_flow(
-    flow: &FlowDefinition,
+pub fn validate(
+    def: &FlowDefinition,
     registry: &AdapterRegistry,
 ) -> Result<(), FlowValidationError> {
-    for edge in &flow.edges {
-        let from_node = flow
-            .nodes
-            .iter()
-            .find(|n| n.id == edge.from)
+    let nodes_by_id: HashMap<&str, &crate::flow_engine::types::FlowNode> =
+        def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    // R5 trigger uniqueness
+    let trigger_count = def.nodes.iter().filter(|n| n.node_type == "trigger").count();
+    if trigger_count != 1 {
+        return Err(FlowValidationError::TriggerCount {
+            actual: trigger_count,
+        });
+    }
+
+    // R2 + port shape sanity
+    for node in &def.nodes {
+        if !registry.has(&node.node_type) {
+            return Err(FlowValidationError::UnknownAdapter {
+                node_id: node.id.clone(),
+                node_type: node.node_type.clone(),
+            });
+        }
+    }
+
+    // R1, R3, R4, R6
+    let mut incoming_count: HashMap<&str, usize> = HashMap::new();
+    for edge in &def.edges {
+        let from_node = nodes_by_id
+            .get(edge.from.as_str())
             .ok_or_else(|| FlowValidationError::UnknownNode {
-                edge_endpoint: "from".to_string(),
+                edge_endpoint: "from",
                 node_id: edge.from.clone(),
             })?;
+        let to_node = nodes_by_id
+            .get(edge.to.as_str())
+            .ok_or_else(|| FlowValidationError::UnknownNode {
+                edge_endpoint: "to",
+                node_id: edge.to.clone(),
+            })?;
 
-        let from_adapter = registry.get(&from_node.node_type).ok_or_else(|| {
-            FlowValidationError::UnknownAdapter {
+        let from_adapter = registry.get(&from_node.node_type).expect("R2 enforced above");
+        let to_adapter = registry.get(&to_node.node_type).expect("R2 enforced above");
+
+        // R6: condition-port edges (`true`/`false`) tylko z node'a `condition`.
+        // Sprawdzamy PRZED port-membership żeby błąd był jasny: "to nie jest
+        // condition" zamiast generycznego "port not in list".
+        if matches!(edge.from_port.as_str(), "true" | "false")
+            && from_node.node_type != "condition"
+        {
+            return Err(FlowValidationError::ConditionEdgeFromNonCondition {
                 node_id: from_node.id.clone(),
                 node_type: from_node.node_type.clone(),
-            }
-        })?;
+                port: edge.from_port.clone(),
+            });
+        }
 
         let out_ports = from_adapter.supported_output_ports();
         if !out_ports.contains(&edge.from_port.as_str()) {
@@ -108,203 +199,251 @@ pub fn validate_flow(
                 node_id: from_node.id.clone(),
                 node_type: from_node.node_type.clone(),
                 port: edge.from_port.clone(),
-                available: out_ports.to_vec(),
+                available: out_ports.iter().map(|s| s.to_string()).collect(),
             });
         }
-
-        let to_node = flow.nodes.iter().find(|n| n.id == edge.to).ok_or_else(|| {
-            FlowValidationError::UnknownNode {
-                edge_endpoint: "to".to_string(),
-                node_id: edge.to.clone(),
-            }
-        })?;
-
-        let to_adapter = registry.get(&to_node.node_type).ok_or_else(|| {
-            FlowValidationError::UnknownAdapter {
-                node_id: to_node.id.clone(),
-                node_type: to_node.node_type.clone(),
-            }
-        })?;
-
         let in_ports = to_adapter.supported_input_ports();
         if !in_ports.contains(&edge.to_port.as_str()) {
             return Err(FlowValidationError::InvalidInputPort {
                 node_id: to_node.id.clone(),
                 node_type: to_node.node_type.clone(),
                 port: edge.to_port.clone(),
-                available: in_ports.to_vec(),
+                available: in_ports.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+
+        *incoming_count.entry(to_node.id.as_str()).or_insert(0) += 1;
+    }
+
+    // R4: trigger ma 0 incoming (jest źródłem flow), każdy non-trigger ≤1.
+    for node in &def.nodes {
+        let count = incoming_count.get(node.id.as_str()).copied().unwrap_or(0);
+        if node.node_type == "trigger" {
+            if count > 0 {
+                return Err(FlowValidationError::MultipleInputs {
+                    node_id: node.id.clone(),
+                    actual: count,
+                });
+            }
+            continue;
+        }
+        if count > 1 {
+            return Err(FlowValidationError::MultipleInputs {
+                node_id: node.id.clone(),
+                actual: count,
             });
         }
     }
+
+    // R7: streaming end-shape
+    let stream_edges: Vec<_> = def
+        .edges
+        .iter()
+        .filter(|e| e.from_port == "stream")
+        .collect();
+    if stream_edges.len() > 1 {
+        return Err(FlowValidationError::MultipleStreamingBranches {
+            count: stream_edges.len(),
+        });
+    }
+    if let Some(edge) = stream_edges.first() {
+        let to_node = nodes_by_id[edge.to.as_str()];
+        if to_node.node_type != "output" {
+            return Err(FlowValidationError::StreamingNotToOutput {
+                from_node: edge.from.clone(),
+                to_node: edge.to.clone(),
+            });
+        }
+        let mode = to_node
+            .config
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if mode != "stream" {
+            return Err(FlowValidationError::StreamingOutputModeMismatch {
+                node_id: to_node.id.clone(),
+                actual: mode.to_string(),
+            });
+        }
+    }
+
+    // R7 cont: po stream-producer LLM nie może być żadnego node'a oprócz
+    // tego output. Sprawdzamy że wszystkie outgoing edges z LLM idą tylko do
+    // tego jednego output node'a.
+    if let Some(edge) = stream_edges.first() {
+        let llm_node = edge.from.as_str();
+        let mut llm_outgoing: HashSet<&str> = HashSet::new();
+        for e in &def.edges {
+            if e.from == llm_node {
+                llm_outgoing.insert(e.to.as_str());
+            }
+        }
+        if llm_outgoing.len() > 1 {
+            return Err(FlowValidationError::StreamingNotToOutput {
+                from_node: llm_node.to_string(),
+                to_node: format!("{} branches", llm_outgoing.len()),
+            });
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow_engine::adapters::NodeAdapter;
-    use crate::flow_engine::types::{FlowEdge, FlowNode};
-    use anyhow::Result;
-    use serde_json::Value;
+    use crate::flow_engine::node_adapters::{
+        ConditionNodeAdapter, LlmNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
+    };
+    use std::sync::Arc;
 
-    struct FullOnlyAdapter;
-    impl NodeAdapter for FullOnlyAdapter {
-        fn execute(
-            &self,
-            _node_config: &Value,
-            _ctx: &mut crate::flow_engine::types::FlowContext,
-        ) -> impl std::future::Future<Output = Result<Value>> + Send {
-            async { Ok(Value::Null) }
-        }
-        fn node_type(&self) -> &'static str {
-            "full_only"
-        }
-    }
-
-    struct StreamAdapter;
-    impl NodeAdapter for StreamAdapter {
-        fn execute(
-            &self,
-            _node_config: &Value,
-            _ctx: &mut crate::flow_engine::types::FlowContext,
-        ) -> impl std::future::Future<Output = Result<Value>> + Send {
-            async { Ok(Value::Null) }
-        }
-        fn node_type(&self) -> &'static str {
-            "streamy"
-        }
-        fn supported_output_ports(&self) -> &'static [&'static str] {
-            &["stream", "full"]
-        }
-    }
-
-    fn sample_registry() -> AdapterRegistry {
+    fn registry() -> AdapterRegistry {
         let mut r = AdapterRegistry::new();
-        r.register(FullOnlyAdapter);
-        r.register(StreamAdapter);
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(ConditionNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
         r
     }
 
-    fn node(id: &str, ty: &str) -> FlowNode {
-        FlowNode {
-            id: id.to_string(),
-            node_type: ty.to_string(),
-            config: Value::Null,
-            position: None,
-            label: None,
-        }
-    }
-
-    fn edge(from: &str, to: &str, from_port: &str, to_port: &str) -> FlowEdge {
-        FlowEdge {
-            id: None,
-            from: from.to_string(),
-            to: to.to_string(),
-            label: None,
-            condition: None,
-            from_port: from_port.to_string(),
-            to_port: to_port.to_string(),
-        }
+    fn parse(json: &str) -> FlowDefinition {
+        serde_json::from_str(json).unwrap()
     }
 
     #[test]
-    fn valid_default_ports() {
-        let flow = FlowDefinition {
-            nodes: vec![node("a", "streamy"), node("b", "full_only")],
-            edges: vec![edge("a", "b", "full", "in")],
-        };
-        assert!(validate_flow(&flow, &sample_registry()).is_ok());
-    }
-
-    #[test]
-    fn valid_stream_port() {
-        let flow = FlowDefinition {
-            nodes: vec![node("a", "streamy"), node("b", "full_only")],
-            edges: vec![edge("a", "b", "stream", "in")],
-        };
-        assert!(validate_flow(&flow, &sample_registry()).is_ok());
-    }
-
-    #[test]
-    fn rejects_stream_from_full_only() {
-        let flow = FlowDefinition {
-            nodes: vec![node("a", "full_only"), node("b", "full_only")],
-            edges: vec![edge("a", "b", "stream", "in")],
-        };
-        let err = validate_flow(&flow, &sample_registry()).unwrap_err();
-        match err {
-            FlowValidationError::InvalidOutputPort { port, node_id, .. } => {
-                assert_eq!(port, "stream");
-                assert_eq!(node_id, "a");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_to_port() {
-        let flow = FlowDefinition {
-            nodes: vec![node("a", "streamy"), node("b", "full_only")],
-            edges: vec![edge("a", "b", "full", "ghost")],
-        };
-        let err = validate_flow(&flow, &sample_registry()).unwrap_err();
-        assert!(matches!(err, FlowValidationError::InvalidInputPort { .. }));
-    }
-
-    #[test]
-    fn rejects_unknown_node() {
-        let flow = FlowDefinition {
-            nodes: vec![node("a", "streamy")],
-            edges: vec![edge("a", "missing", "full", "in")],
-        };
-        let err = validate_flow(&flow, &sample_registry()).unwrap_err();
-        assert!(matches!(err, FlowValidationError::UnknownNode { .. }));
-    }
-
-    #[test]
-    fn validate_rejects_stream_port_on_tts_node() {
-        use crate::config::RouterConfig;
-        use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-        use crate::services::runtime::quic_handle::ServiceManager;
-        use std::sync::Arc;
-
-        let config = Arc::new(RouterConfig::default());
-        let service_manager = Arc::new(
-            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
+    fn ok_minimal_flow() {
+        let def = parse(
+            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o"}]}"#,
         );
+        validate(&def, &registry()).unwrap();
+    }
 
-        let mut registry = AdapterRegistry::new();
-        registry.register(FullOnlyAdapter);
-        registry.register(TtsNodeAdapter::new(service_manager, config));
+    #[test]
+    fn rejects_no_trigger() {
+        let def = parse(
+            r#"{"nodes":[{"id":"o","type":"output","config":{}}],"edges":[]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(err, FlowValidationError::TriggerCount { actual: 0 }));
+    }
 
-        let flow = FlowDefinition {
-            nodes: vec![node("t", "tts"), node("sink", "full_only")],
-            edges: vec![edge("t", "sink", "stream", "in")],
-        };
-        let err = validate_flow(&flow, &registry).unwrap_err();
-        match err {
-            FlowValidationError::InvalidOutputPort {
-                node_id,
-                node_type,
-                port,
-                available,
-            } => {
-                assert_eq!(node_id, "t");
-                assert_eq!(node_type, "tts");
-                assert_eq!(port, "stream");
-                assert_eq!(available, vec!["full"]);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+    #[test]
+    fn rejects_two_triggers() {
+        let def = parse(
+            r#"{"nodes":[{"id":"t1","type":"trigger","config":{}},{"id":"t2","type":"trigger","config":{}}],"edges":[]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(err, FlowValidationError::TriggerCount { actual: 2 }));
+    }
+
+    #[test]
+    fn rejects_multi_input_edge() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"c","type":"condition","config":{}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"c"},
+                    {"from":"c","to":"o","from_port":"true"},
+                    {"from":"c","to":"o","from_port":"false"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(err, FlowValidationError::MultipleInputs { .. }));
     }
 
     #[test]
     fn rejects_unknown_adapter() {
-        let flow = FlowDefinition {
-            nodes: vec![node("a", "nope"), node("b", "full_only")],
-            edges: vec![edge("a", "b", "full", "in")],
-        };
-        let err = validate_flow(&flow, &sample_registry()).unwrap_err();
+        let def = parse(
+            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"x","type":"mystery","config":{}}],"edges":[{"from":"t","to":"x"}]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(err, FlowValidationError::UnknownAdapter { .. }));
+    }
+
+    #[test]
+    fn ok_streaming_shape() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"o","from_port":"stream"}
+                ]
+            }"#,
+        );
+        validate(&def, &registry()).unwrap();
+    }
+
+    #[test]
+    fn rejects_streaming_to_non_output() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"c","type":"condition","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"c","from_port":"stream"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::StreamingNotToOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_streaming_without_mode_stream() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"o","from_port":"stream"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::StreamingOutputModeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_condition_port_from_non_condition() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"o","from_port":"true"}
+                ]
+            }"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::ConditionEdgeFromNonCondition { .. }
+        ));
     }
 }

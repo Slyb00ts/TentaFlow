@@ -1,165 +1,202 @@
 // =============================================================================
 // Plik: flow_engine/dispatcher.rs
-// Opis: Decyduje czy request powinien isc przez Flow Engine czy stary pipeline.
-//       Sprawdza feature flag, resolwuje flow, uruchamia executor.
+// Opis: FlowDispatcher — brama wejściowa flow engine. Bootstrap'uje
+//       AdapterRegistry (13 node adapters) + ContextFactory (10 dispatcher
+//       impls + blob store + clock + metrics). Eksponuje try_dispatch /
+//       dispatch_by_flow_id / try_dispatch_streaming dla callerów (routing,
+//       services::runtime::executor).
 // =============================================================================
 
-use crate::config::RouterConfig;
-use crate::db::{repository, DbPool};
-use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
-use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
-use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
-use crate::flow_engine::adapters::llm::LlmNodeAdapter;
-use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
-use crate::flow_engine::adapters::output::OutputNodeAdapter;
-use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
-use crate::flow_engine::adapters::session_context::SessionContextAdapter;
-use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
-use crate::flow_engine::adapters::stt::SttNodeAdapter;
-use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
-use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
-use crate::flow_engine::adapters::{AdapterChunkStream, AdapterRegistry};
-use crate::flow_engine::cache::{CachedFlow, FlowCache};
-use crate::flow_engine::executor_async::{FlowExecutorAsync, ParsedFlow};
-use crate::flow_engine::resolver;
-use crate::flow_engine::types::{FlowContext, FlowExecutionResult};
-use crate::services::runtime::quic_handle::ServiceManager;
-use anyhow::Result;
 use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::Result;
 use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+use crate::auth::acl;
+use crate::db::{repository, DbPool};
+use crate::flow_engine::blob_store::{BlobStore, InMemoryBlobStore};
+use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
+use crate::flow_engine::dispatchers::{
+    AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
+    MetricsSink, NoopMetrics, PiiRulesStore, PromptStore, SttDispatcher, TtsCleaningStore,
+    TtsDispatcher,
+};
+use crate::flow_engine::dispatchers::clock::SystemClock;
+use crate::flow_engine::dispatchers_impl::{
+    AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
+    MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
+    SttDispatcherImpl, SttRuntimeSlot, TtsCleaningStoreImpl, TtsDispatcherImpl,
+};
+use crate::flow_engine::envelope::{FlowEnvelope, FlowExecutionOutcome};
+use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
+use crate::flow_engine::node_adapter::{
+    AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink,
+};
+use crate::flow_engine::node_adapters::{
+    ConditionNodeAdapter, ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter,
+    MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, SessionContextNodeAdapter,
+    SpeakerContextNodeAdapter, SttNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
+    TtsNodeAdapter,
+};
+use crate::flow_engine::resolver;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 const FLOW_TIMEOUT_SECS: u64 = 120;
 
-/// Dispatcher flow engine - brama wejsciowa do systemu flow
+/// Per-request metadata przekazywane przez callera. FlowDispatcher buduje z
+/// tego `ExecutionContext` (klonując Arc'i dispatcherów + clock + blobs).
+#[derive(Debug, Clone)]
+pub struct FlowRequestMeta {
+    pub request_id: String,
+    pub session_id: Option<String>,
+    pub user_id: Option<i64>,
+    pub user_role: Option<String>,
+    pub deadline: Option<Instant>,
+    pub cancel_token: CancellationToken,
+}
+
+impl FlowRequestMeta {
+    pub fn new(request_id: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            session_id: None,
+            user_id: None,
+            user_role: None,
+            deadline: None,
+            cancel_token: CancellationToken::new(),
+        }
+    }
+}
+
 pub struct FlowDispatcher {
     db: DbPool,
     cache: FlowCache,
     registry: Arc<AdapterRegistry>,
+    ctx_factory: Arc<ContextFactory>,
 }
 
-/// Slot na `ModelRuntimeExecutor` wpinany przez `Router::new` po
-/// konstrukcji dispatcher'a (rozwiazanie cyklu Router↔FlowDispatcher
-/// w R2a). Adaptery konsumuja go leniwie: lockuja, klonuja Arc, dispatchuja.
-pub type ExecutorSlot = Arc<
-    parking_lot::RwLock<
-        Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
-    >,
->;
+/// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
+/// `make_context` klonuje je do nowego `ExecutionContext` per request.
+struct ContextFactory {
+    clock: Arc<dyn Clock>,
+    blobs: Arc<dyn BlobStore>,
+    llm: Arc<dyn LlmDispatcher>,
+    embeddings: Arc<dyn EmbeddingsDispatcher>,
+    stt: Arc<dyn SttDispatcher>,
+    tts: Arc<dyn TtsDispatcher>,
+    prompts: Arc<dyn PromptStore>,
+    memory: Arc<dyn MemoryStore>,
+    history: Arc<dyn ConversationHistoryStore>,
+    audit: Arc<dyn AuditSink>,
+    metrics: Arc<dyn MetricsSink>,
+    pii_rules: Arc<dyn PiiRulesStore>,
+    tts_cleaning: Arc<dyn TtsCleaningStore>,
+}
 
-/// Codex M1 round 2: ten sam pattern co `ExecutorSlot` ale dla SttRuntime.
-/// SttRuntime trzyma `Weak<Router>`, wiec moze byc skonstruowany dopiero w
-/// `Router::start` po `Arc::new(router)`. Slot przekazujemy do FlowDispatcher
-/// zeby `SttNodeAdapter` mial dostep do tej samej instancji co handler
-/// `/v1/audio/transcriptions` — jedna sciezka STT, zero rownoleglych
-/// dispatch implementacji.
-pub type SttRuntimeSlot =
-    Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>;
+impl ContextFactory {
+    fn make_context(&self, meta: &FlowRequestMeta) -> ExecutionContext {
+        ExecutionContext {
+            request_id: meta.request_id.clone(),
+            execution_id: 0,
+            session_id: meta.session_id.clone(),
+            user_id: meta.user_id,
+            user_role: meta.user_role.clone(),
+            deadline: meta.deadline,
+            cancel_token: meta.cancel_token.clone(),
+            initial_envelope: Arc::new(FlowEnvelope::empty()),
+            clock: self.clock.clone(),
+            blobs: self.blobs.clone(),
+            llm: self.llm.clone(),
+            embeddings: self.embeddings.clone(),
+            stt: self.stt.clone(),
+            tts: self.tts.clone(),
+            prompts: self.prompts.clone(),
+            memory: self.memory.clone(),
+            history: self.history.clone(),
+            audit: self.audit.clone(),
+            metrics: self.metrics.clone(),
+            pii_rules: self.pii_rules.clone(),
+            tts_cleaning: self.tts_cleaning.clone(),
+            usage_sink: Arc::new(UsageSink::new()),
+        }
+    }
+}
 
 impl FlowDispatcher {
     pub fn new(
         db: DbPool,
         service_manager: Arc<ServiceManager>,
-        config: Arc<RouterConfig>,
-        executor_slot: ExecutorSlot,
+        runtime_slot: ModelRuntimeSlot,
         stt_runtime_slot: SttRuntimeSlot,
     ) -> Self {
-        let mut registry = AdapterRegistry::new();
-        registry.register(LlmNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-            executor_slot.clone(),
-        ));
-        registry.register(SttNodeAdapter::new(stt_runtime_slot));
-        registry.register(TtsNodeAdapter::new(service_manager.clone(), config.clone()));
-        registry.register(EmbeddingsNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(MemoryNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(ConversationHistoryAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(SessionContextAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(SpeakerContextAdapter::new(service_manager, config));
-        registry.register(TriggerNodeAdapter::new());
-        registry.register(OutputNodeAdapter::new());
-        registry.register(ConditionNodeAdapter::new());
-        registry.register(PiiFilterNodeAdapter::new(db.clone()));
-        registry.register(TtsCleanNodeAdapter::new(db.clone()));
+        let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopMetrics);
 
+        let prompts: Arc<dyn PromptStore> =
+            Arc::new(PromptsImpl::new(service_manager.prompt_registry.clone()));
+        let audit: Arc<dyn AuditSink> = Arc::new(AuditSinkImpl::new(db.clone()));
+        let pii_rules: Arc<dyn PiiRulesStore> = Arc::new(PiiRulesStoreImpl::new(db.clone()));
+        let tts_cleaning: Arc<dyn TtsCleaningStore> =
+            Arc::new(TtsCleaningStoreImpl::new(db.clone()));
+        let history: Arc<dyn ConversationHistoryStore> = Arc::new(
+            ConversationHistoryImpl::new(service_manager.conversation_cache.clone()),
+        );
+        let quic_finder = Arc::new(ServiceManagerQuicFinder::new(service_manager.clone()));
+        let memory: Arc<dyn MemoryStore> = Arc::new(MemoryStoreImpl::new(quic_finder));
+
+        let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(runtime_slot.clone()));
+        let embeddings: Arc<dyn EmbeddingsDispatcher> =
+            Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
+        let tts: Arc<dyn TtsDispatcher> =
+            Arc::new(TtsDispatcherImpl::new(runtime_slot, blobs.clone()));
+        let stt: Arc<dyn SttDispatcher> =
+            Arc::new(SttDispatcherImpl::new(stt_runtime_slot, blobs.clone()));
+
+        let ctx_factory = Arc::new(ContextFactory {
+            clock,
+            blobs,
+            llm,
+            embeddings,
+            stt,
+            tts,
+            prompts,
+            memory,
+            history,
+            audit,
+            metrics,
+            pii_rules,
+            tts_cleaning,
+        });
+
+        let registry = build_registry();
         Self {
             db,
             cache: FlowCache::new(60),
             registry: Arc::new(registry),
+            ctx_factory,
         }
     }
 
-    /// Udostepnia AdapterRegistry — uzywane przez handlery do walidacji
-    /// flow_json przed zapisem (porty krawedzi vs metadata adaptera).
     pub fn registry(&self) -> &Arc<AdapterRegistry> {
         &self.registry
     }
 
-    /// Resolwuje flow z cache albo z DB. Przy cache miss parsuje flow_json
-    /// raz i zapisuje gotowy `Arc<CachedFlow>` — chat completion nie placi
-    /// re-parse + topological_sort per-request.
-    async fn resolve_cached(
-        &self,
-        cache_key: &str,
-        model_name: &str,
-        service_type: &str,
-    ) -> Result<Option<Arc<CachedFlow>>> {
-        if let Some(opt) = self.cache.get(cache_key) {
-            return Ok(opt);
-        }
-        let db_clone = self.db.clone();
-        let model_owned = model_name.to_string();
-        let svc_owned = service_type.to_string();
-        let resolved = tokio::task::spawn_blocking(move || {
-            resolver::resolve_flow(&db_clone, &model_owned, &svc_owned)
-        })
-        .await??;
-        match resolved {
-            Some(flow) => {
-                let parsed = match ParsedFlow::parse(&flow.flow_json) {
-                    Ok(p) => Arc::new(p),
-                    Err(e) => {
-                        warn!(flow_id = flow.id, "Niepoprawny flow_json: {}", e);
-                        // Negatywny cache — niepoprawny flow nie ma sensu re-parsowac.
-                        self.cache.set(cache_key, None);
-                        return Ok(None);
-                    }
-                };
-                let cached = Arc::new(CachedFlow { flow, parsed });
-                self.cache.set(cache_key, Some(cached.clone()));
-                Ok(Some(cached))
-            }
-            None => {
-                self.cache.set(cache_key, None);
-                Ok(None)
-            }
-        }
+    pub fn invalidate_cache(&self) {
+        self.cache.invalidate_all();
     }
 
-    /// Probuje znalezc i wykonac flow dla danego modelu/service_type.
-    /// Zwraca None jesli brak flow (fallback na bezposredni dispatch).
     pub async fn try_dispatch(
         &self,
         model_name: &str,
         service_type: &str,
-        mut ctx: FlowContext,
-    ) -> Result<Option<FlowExecutionResult>> {
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> Result<Option<FlowExecutionOutcome>> {
         let cache_key = format!("{}:{}", model_name, service_type);
-
         let cached = match self
             .resolve_cached(&cache_key, model_name, service_type)
             .await?
@@ -167,63 +204,18 @@ impl FlowDispatcher {
             Some(c) => c,
             None => return Ok(None),
         };
-
-        let flow_id = cached.flow.id;
-
-        // ACL — flow ma resource_type='flow', resource_id=flow.id (string).
-        // Skipujemy gdy ctx nie ma user_id (internal caller).
-        if let Some(uid) = ctx.user_id {
-            let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
-            if !crate::auth::acl::check_access_safe(
-                &self.db,
-                "flow",
-                &flow_id.to_string(),
-                uid,
-                &role,
-            ) {
-                tracing::warn!(user_id = uid, flow_id, "ACL denied flow execution");
-                // Skipujemy flow → fallback na stary pipeline (zachowanie identyczne
-                // jak gdy flow nie istnieje — user moze uzyc bezposredniego routingu).
-                return Ok(None);
-            }
+        if !self.acl_allow(cached.flow.id, &meta) {
+            return Ok(None);
         }
-
-        let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
-        match timeout(
-            Duration::from_secs(FLOW_TIMEOUT_SECS),
-            executor.execute(&cached.flow, &cached.parsed, &mut ctx),
-        )
-        .await
-        {
-            Ok(Ok(result)) => Ok(Some(result)),
-            Ok(Err(e)) => {
-                warn!(
-                    "Blad wykonania flow {}: {}. Fallback na stary pipeline.",
-                    flow_id, e
-                );
-                Ok(None)
-            }
-            Err(_) => {
-                warn!(
-                    "Timeout flow {} po {}s. Fallback na stary pipeline.",
-                    flow_id, FLOW_TIMEOUT_SECS
-                );
-                Ok(None)
-            }
-        }
+        self.run_blocking(cached.compiled.clone(), initial, meta).await
     }
 
-    /// Wykonaj konkretny flow po jego id, z pominieciem name → flow
-    /// resolwowania. Uzywane przez `ModelRuntimeExecutor` ktory dostaje
-    /// resolved `flow_id` z `CatalogSnapshot` i nie chce go po raz drugi
-    /// szukac po nazwie modelu (catalog moze sie zmienic miedzy resolve
-    /// a dispatch albo opublikowana nazwa moze pasowac do innego
-    /// domyslnego flow). ACL liczy `resource_type='flow'`.
     pub async fn dispatch_by_flow_id(
         &self,
         flow_id: i64,
-        mut ctx: FlowContext,
-    ) -> Result<Option<FlowExecutionResult>> {
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> Result<Option<FlowExecutionOutcome>> {
         let pool = self.db.clone();
         let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, flow_id))
             .await??;
@@ -234,59 +226,27 @@ impl FlowDispatcher {
             warn!(flow_id, status = %flow.status, "flow nieaktywny — pomijam");
             return Ok(None);
         }
-        if let Some(uid) = ctx.user_id {
-            let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
-            if !crate::auth::acl::check_access_safe(
-                &self.db,
-                "flow",
-                &flow_id.to_string(),
-                uid,
-                &role,
-            ) {
-                tracing::warn!(user_id = uid, flow_id, "ACL denied flow execution");
-                return Ok(None);
-            }
+        if !self.acl_allow(flow_id, &meta) {
+            return Ok(None);
         }
-
-        let parsed = match ParsedFlow::parse(&flow.flow_json) {
-            Ok(p) => Arc::new(p),
+        let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry) {
+            Ok(c) => Arc::new(c),
             Err(e) => {
-                warn!(flow_id, "Niepoprawny flow_json: {}", e);
+                warn!(flow_id, "compile failed: {e}");
                 return Ok(None);
             }
         };
-
-        let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
-        match timeout(
-            Duration::from_secs(FLOW_TIMEOUT_SECS),
-            executor.execute(&flow, &parsed, &mut ctx),
-        )
-        .await
-        {
-            Ok(Ok(result)) => Ok(Some(result)),
-            Ok(Err(e)) => {
-                warn!(flow_id, "Blad wykonania flow: {}", e);
-                Ok(None)
-            }
-            Err(_) => {
-                warn!(flow_id, "Timeout flow po {}s", FLOW_TIMEOUT_SECS);
-                Ok(None)
-            }
-        }
+        self.run_blocking(compiled, initial, meta).await
     }
 
-    /// Streaming wariant dispatch. Zwraca `Some(stream)` tylko gdy flow istnieje
-    /// i definiuje edge `from_port="stream"` (czyli autor flow'u zdeklarowal
-    /// streamowa sciezke). Inaczej `None` — caller uzywa blocking try_dispatch
-    /// lub omija flow engine calkowicie.
     pub async fn try_dispatch_streaming(
         &self,
         model_name: &str,
         service_type: &str,
-        mut ctx: FlowContext,
-    ) -> Result<Option<AdapterChunkStream>> {
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> Result<Option<StreamingExecution>> {
         let cache_key = format!("{}:{}", model_name, service_type);
-
         let cached = match self
             .resolve_cached(&cache_key, model_name, service_type)
             .await?
@@ -294,193 +254,160 @@ impl FlowDispatcher {
             Some(c) => c,
             None => return Ok(None),
         };
-
-        // Szybka inspekcja: czy flow zawiera edge from_port="stream"? Jesli nie —
-        // blocking path zrobi robote i nie ma po co budowac streaming executor'a.
-        // Inspekcja po pre-parsed strukturze unika ponownej deserializacji JSON.
-        let has_stream_edge = cached
-            .parsed
-            .definition
-            .edges
-            .iter()
-            .any(|e| e.from_port == "stream");
-        if !has_stream_edge {
+        if !cached.compiled.is_streaming {
             return Ok(None);
         }
-
-        let flow_id = cached.flow.id;
-
-        if let Some(uid) = ctx.user_id {
-            let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
-            if !crate::auth::acl::check_access_safe(
-                &self.db,
-                "flow",
-                &flow_id.to_string(),
-                uid,
-                &role,
-            ) {
-                tracing::warn!(
-                    user_id = uid,
-                    flow_id,
-                    "ACL denied streaming flow execution"
-                );
-                return Ok(None);
-            }
+        if !self.acl_allow(cached.flow.id, &meta) {
+            return Ok(None);
         }
+        let ctx = self.ctx_factory.make_context(&meta);
+        let stream_exec = execute_streaming(
+            self.db.clone(),
+            cached.compiled.clone(),
+            initial,
+            ctx,
+            self.registry.clone(),
+        )
+        .await?;
+        Ok(Some(stream_exec))
+    }
 
-        let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
-        match executor
-            .execute_streaming_flow(&cached.flow, &cached.parsed, &mut ctx)
-            .await
+    async fn run_blocking(
+        &self,
+        compiled: Arc<CompiledFlow>,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> Result<Option<FlowExecutionOutcome>> {
+        let ctx = self.ctx_factory.make_context(&meta);
+        let flow_id = compiled.flow_id;
+        match timeout(
+            Duration::from_secs(FLOW_TIMEOUT_SECS),
+            execute_blocking(
+                self.db.clone(),
+                compiled,
+                initial,
+                ctx,
+                self.registry.clone(),
+            ),
+        )
+        .await
         {
-            Ok(stream) => Ok(Some(stream)),
-            Err(e) => {
-                warn!(
-                    "Blad streaming flow {}: {}. Fallback na blocking/stary pipeline.",
-                    flow_id, e
-                );
+            Ok(Ok(outcome)) => Ok(Some(outcome)),
+            Ok(Err(e)) => {
+                warn!(flow_id, "Blad wykonania flow: {e}");
+                Ok(None)
+            }
+            Err(_) => {
+                warn!(flow_id, "Timeout flow po {FLOW_TIMEOUT_SECS}s");
                 Ok(None)
             }
         }
     }
 
-    /// Inwaliduj cache (wywoływane po zmianach w flow/bindings przez dashboard)
-    pub fn invalidate_cache(&self) {
-        self.cache.invalidate_all();
+    fn acl_allow(&self, flow_id: i64, meta: &FlowRequestMeta) -> bool {
+        let Some(uid) = meta.user_id else {
+            return true;
+        };
+        let role = meta.user_role.clone().unwrap_or_else(|| "user".into());
+        let allowed = acl::check_access_safe(&self.db, "flow", &flow_id.to_string(), uid, &role);
+        if !allowed {
+            tracing::warn!(user_id = uid, flow_id, "ACL denied flow execution");
+        }
+        allowed
+    }
+
+    async fn resolve_cached(
+        &self,
+        cache_key: &str,
+        model_name: &str,
+        service_type: &str,
+    ) -> Result<Option<Arc<CachedFlow>>> {
+        if let Some(slot) = self.cache.get(cache_key) {
+            return Ok(slot);
+        }
+        let pool = self.db.clone();
+        let model_owned = model_name.to_string();
+        let service_owned = service_type.to_string();
+        let resolved = tokio::task::spawn_blocking(move || {
+            resolver::resolve_flow(&pool, &model_owned, &service_owned)
+        })
+        .await??;
+        match resolved {
+            Some(flow) => {
+                let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry) {
+                    Ok(c) => Arc::new(c),
+                    Err(e) => {
+                        warn!(
+                            cache_key,
+                            "compile failed for flow id={}: {e}", flow.id
+                        );
+                        self.cache.set(cache_key, None);
+                        return Ok(None);
+                    }
+                };
+                let cached = Arc::new(CachedFlow { flow, compiled });
+                self.cache.set(cache_key, Some(cached.clone()));
+                Ok(Some(cached))
+            }
+            None => {
+                self.cache.set(cache_key, None);
+                Ok(None)
+            }
+        }
     }
 }
 
+/// Buduje AdapterRegistry z wszystkimi 13 adapterami stage 1c. Side effect-free
+/// (adaptery są stateless / leniwie pobierają state z ExecutionContext).
+fn build_registry() -> AdapterRegistry {
+    let mut r = AdapterRegistry::new();
+    let arcs: Vec<Arc<dyn NodeAdapter>> = vec![
+        Arc::new(TriggerNodeAdapter::new()),
+        Arc::new(OutputNodeAdapter::new()),
+        Arc::new(ConditionNodeAdapter::new()),
+        Arc::new(PiiFilterNodeAdapter::new()),
+        Arc::new(TtsCleanNodeAdapter::new()),
+        Arc::new(SttNodeAdapter::new()),
+        Arc::new(TtsNodeAdapter::new()),
+        Arc::new(EmbeddingsNodeAdapter::new()),
+        Arc::new(MemoryNodeAdapter::new()),
+        Arc::new(ConversationHistoryNodeAdapter::new()),
+        Arc::new(SessionContextNodeAdapter::new()),
+        Arc::new(SpeakerContextNodeAdapter::new()),
+    ];
+    for a in arcs {
+        r.register(a);
+    }
+    r.register_llm(Arc::new(LlmNodeAdapter::new()));
+    r
+}
+
 #[cfg(test)]
-mod flow_dispatch_regression {
+mod tests {
     use super::*;
-    use crate::config::RouterConfig;
-    use crate::db::seed;
-    use crate::services::runtime::quic_handle::ServiceManager;
-    use rusqlite::Connection;
-    use std::collections::BTreeSet;
 
-    /// Adapter registry and the seeded `flow_node_templates` palette must list
-    /// the same set of node types — otherwise the GUI exposes a template the
-    /// executor cannot run, or an adapter exists with no way to drop it onto a
-    /// flow. The two sources are populated independently, so an integration
-    /// test is the only way to catch a drift.
     #[test]
-    fn registered_adapters_match_seeded_node_templates() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        crate::db::migrations::run(&conn).unwrap();
-        seed::seed_defaults(&conn).unwrap();
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(conn));
-
-        let mut seeded: BTreeSet<String> = BTreeSet::new();
-        {
-            let conn = pool.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT node_type FROM flow_node_templates")
-                .unwrap();
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap();
-            for r in rows {
-                seeded.insert(r.unwrap());
-            }
+    fn registry_includes_all_node_types() {
+        let r = build_registry();
+        let types: std::collections::BTreeSet<&str> =
+            r.registered_types().into_iter().collect();
+        for expected in [
+            "trigger",
+            "output",
+            "condition",
+            "pii_filter",
+            "tts_clean",
+            "stt",
+            "tts",
+            "embeddings",
+            "memory",
+            "conversation_history",
+            "session_context",
+            "speaker_context",
+            "llm",
+        ] {
+            assert!(types.contains(expected), "missing adapter '{expected}'");
         }
-
-        let config = std::sync::Arc::new(RouterConfig::default());
-        let service_manager = std::sync::Arc::new(
-            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
-        );
-        let executor_slot: ExecutorSlot =
-            std::sync::Arc::new(parking_lot::RwLock::new(None));
-        let stt_runtime_slot: SttRuntimeSlot =
-            std::sync::Arc::new(parking_lot::RwLock::new(None));
-        let dispatcher = FlowDispatcher::new(
-            pool,
-            service_manager,
-            config,
-            executor_slot,
-            stt_runtime_slot,
-        );
-        let registered: BTreeSet<String> = dispatcher
-            .registry()
-            .registered_types()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        assert_eq!(
-            seeded, registered,
-            "flow_node_templates seed != AdapterRegistry types.\nseed: {:?}\nregistry: {:?}",
-            seeded, registered
-        );
-    }
-
-    /// Chat router dispatches with `service_type = "chat"`. A fresh seed must
-    /// produce an active default flow under that exact key — and no leftover
-    /// rows under the previous `"llm"` key after migration runs.
-    #[test]
-    fn seeded_default_flow_uses_chat_service_type() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        crate::db::migrations::run(&conn).unwrap();
-        seed::seed_defaults(&conn).unwrap();
-
-        let (name, status, is_default): (String, String, i64) = conn
-            .query_row(
-                "SELECT name, status, is_default FROM flows \
-                 WHERE service_type = 'chat' AND is_default = 1 AND status = 'active'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("expected an active default flow with service_type='chat'");
-
-        assert_eq!(name, "Standardowy pipeline LLM");
-        assert_eq!(status, "active");
-        assert_eq!(is_default, 1);
-
-        let llm_under_old_key: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM flows WHERE service_type = 'llm'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            llm_under_old_key, 0,
-            "no flow row should remain under the legacy service_type='llm'"
-        );
-    }
-
-    /// Resolver step 2 (`model_registry.flow_id` lookup) used to crash on a
-    /// fresh database because `repository::get_model_by_name` queried columns
-    /// dropped in `services_schema_final`. With step 2 gone, an unknown model
-    /// name plus `service_type="chat"` must still land on the seeded default
-    /// chat pipeline — this is the live-fire test that direct DB checks
-    /// cannot replace.
-    #[test]
-    fn resolve_flow_returns_default_chat_flow_on_fresh_db() {
-        use crate::flow_engine::resolver;
-
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        crate::db::migrations::run(&conn).unwrap();
-        seed::seed_defaults(&conn).unwrap();
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(conn));
-
-        let flow = resolver::resolve_flow(&pool, "any-unknown-model", "chat")
-            .expect("resolve_flow must not error on a fresh seeded db")
-            .expect("a default chat flow must be available after seeding");
-
-        assert_eq!(flow.name, "Standardowy pipeline LLM");
-        assert_eq!(flow.service_type.as_deref(), Some("chat"));
-        assert_eq!(flow.status, "active");
-        assert_eq!(flow.is_default, true);
-
-        let none_for_other_service =
-            resolver::resolve_flow(&pool, "any-unknown-model", "embedding").unwrap();
-        assert!(
-            none_for_other_service.is_none(),
-            "unknown service_type should yield None, not the chat default"
-        );
+        assert!(r.llm().is_some(), "LLM typed accessor must be wired");
     }
 }

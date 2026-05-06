@@ -18,6 +18,17 @@ pub mod stt_impl;
 pub mod tts_cleaning_impl;
 pub mod tts_impl;
 
+use std::sync::Arc;
+
+/// Slot na `ModelRuntimeExecutor` — Router::new tworzy slot pusty, później
+/// (po skonstruowaniu executora) wpina przez `slot.write() = Some(...)`. LLM,
+/// embeddings i TTS dispatcher impls czytają slot leniwie przy każdym calls.
+pub type ModelRuntimeSlot = Arc<
+    parking_lot::RwLock<
+        Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
+    >,
+>;
+
 pub use audit_impl::AuditSinkImpl;
 pub use conversation_impl::ConversationHistoryImpl;
 pub use embeddings_impl::EmbeddingsDispatcherImpl;
