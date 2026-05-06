@@ -97,6 +97,21 @@ pub fn ensure_models_dirs() -> std::io::Result<PathBuf> {
 /// layer agree on it.
 pub const CONTAINER_MODELS_PATH: &str = "/data/models";
 
+/// Container path that the host vLLM cache directory is mounted to. vLLM
+/// reads `VLLM_CACHE_ROOT` for compiled Triton kernels, torch.compile
+/// artifacts, and FlashInfer JIT objects. Persisting this across deploys
+/// turns 1-2 min cold starts into seconds.
+pub const CONTAINER_VLLM_CACHE_PATH: &str = "/data/vllm-cache";
+
+/// Shared vLLM cache root. Mirrors the `models_root` pattern: one host
+/// directory both Docker and native deploys point at via `VLLM_CACHE_ROOT`,
+/// so a kernel compiled by docker-vllm is reused by native-vllm and vice
+/// versa. Lives under `cache_dir()` so `TENTAFLOW_CACHE_DIR` redirects it
+/// the same way it redirects bundle templates.
+pub fn vllm_cache_dir() -> PathBuf {
+    cache_dir().join("vllm")
+}
+
 /// Where the extracted `tentaflow-containers/` bundle lives at runtime.
 /// `ensure_app_dirs()` populates this from the embedded tarball; deploy
 /// strategies resolve manifest `context_path` / `binary_path` /
@@ -141,6 +156,7 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(home.join("models").join("vision"))?;
     std::fs::create_dir_all(home.join("models").join("audio"))?;
     std::fs::create_dir_all(cache_dir())?;
+    std::fs::create_dir_all(vllm_cache_dir())?;
 
     let containers_parent = home.join("containers");
     std::fs::create_dir_all(&containers_parent)?;

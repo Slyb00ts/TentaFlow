@@ -42,6 +42,13 @@ pub struct Engine {
     pub requires_model: Option<bool>,
     #[serde(default)]
     pub gpu_supported: Option<bool>,
+    /// Tri-state DGX Spark (GB10 Grace Blackwell) gate.
+    /// `Some(true)`  — engine runs ONLY on Spark hosts (e.g. `vllm-spark`).
+    /// `Some(false)` — engine is incompatible with Spark (PyPI wheels target
+    ///                 sm_120, crash on sm_121).
+    /// `None`        — no constraint.
+    #[serde(default)]
+    pub dgx_spark: Option<bool>,
     pub default_port: u16,
     pub api: ApiKind,
     pub version: String,
@@ -449,4 +456,20 @@ pub struct ModelPreset {
     pub input_modalities: Option<Vec<String>>,
     #[serde(default)]
     pub output_modalities: Option<Vec<String>>,
+    /// HF repo for the matched draft / speculator model used in vLLM
+    /// speculative decoding (`--speculative-config`). When set, the deploy
+    /// wizard pre-fills the Speculative Decoding panel and offers to enable
+    /// it. Example: `RedHatAI/gemma-4-31B-it-speculator.dflash`.
+    #[serde(default)]
+    pub speculator_repo: Option<String>,
+    /// Method passed to vLLM `--speculative-config method` field. Common
+    /// values: `dflash`, `pflash`, `eagle`, `eagle3`, `medusa`, `mtp`,
+    /// `draft_model`, `ngram`. Tentaflow does not validate the value — it
+    /// flows through to vLLM unchanged.
+    #[serde(default)]
+    pub speculator_method: Option<String>,
+    /// Default `num_speculative_tokens` for this preset. Falls back to 8
+    /// when absent.
+    #[serde(default)]
+    pub speculator_num_tokens: Option<u32>,
 }

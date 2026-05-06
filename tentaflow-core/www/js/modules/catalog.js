@@ -252,13 +252,21 @@ function bindTargetPicker() {
     } else {
       const n = nodes.find((x) => (x.node_id || x.id) === id);
       const gpus = Array.isArray(n?.gpus) ? n.gpus : [];
+      const gpuNames = gpus.map((g) => g.name || '').filter(Boolean);
+      const os = String(n?.platform || n?.os || '').toLowerCase();
+      // DGX Spark detection mirrors Rust system_check::detect_gpu():
+      // GB10 in any GPU name + Linux host (GB10 ships only with Grace
+      // aarch64 CPUs, but on the JS side we don't have arch — Linux is
+      // close enough since Spark never ships as Win/macOS).
+      const isDgxSpark = os === 'linux' && gpuNames.some((name) => /GB10/i.test(name));
       target = {
         kind: n?.is_local ? 'local' : 'node',
         id,
         label: n?.hostname || id,
-        os: String(n?.platform || n?.os || '').toLowerCase(),
-        gpuNames: gpus.map((g) => g.name || '').filter(Boolean),
+        os,
+        gpuNames,
         hasNvidia: gpus.some((g) => /nvidia|geforce|rtx|gtx|tesla|a100|h100|h200|l40|dgx|grace|blackwell|hopper|gb10|gh200|b200|b100/i.test(g.name || '')),
+        isDgxSpark,
         nodeRef: n,
       };
     }
@@ -294,7 +302,7 @@ function renderActiveTab() {
 function updateCount() {
   if (!target) return;
   const targetOs = target.os || 'unknown';
-  const total = Manifest.all().filter((s) => Manifest.isEngineCompatible(s, targetOs)).length;
+  const total = Manifest.all().filter((s) => Manifest.isEngineCompatible(s, targetOs, target)).length;
   const tab = document.querySelector('#catalog-tabs tf-tab#tentaflow');
   if (tab) tab.setAttribute('count', String(total));
 }
@@ -316,7 +324,7 @@ function renderTentaflowTab() {
     let groupCount = 0;
     for (const cat of categories) {
       const engines = Manifest.byCategory(cat).filter((e) =>
-        Manifest.isEngineCompatible(e, targetOs) && Manifest.resourceKind(e) === group.id
+        Manifest.isEngineCompatible(e, targetOs, target) && Manifest.resourceKind(e) === group.id
       );
       if (engines.length === 0) continue;
       rendered += engines.length;
@@ -329,7 +337,7 @@ function renderTentaflowTab() {
       groupHtml += `
         <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${engines.length}</span></h3>
         <div class="catalog-grid">
-          ${engines.map((e) => renderEngineCard(e, targetOs)).join('')}
+          ${engines.map((e) => renderEngineCard(e, targetOs, target)).join('')}
         </div>
       `;
     }
@@ -355,12 +363,12 @@ function renderTentaflowTab() {
   return html;
 }
 
-function renderEngineCard(service, targetOs) {
+function renderEngineCard(service, targetOs, host) {
   const e = service?.engine || {};
   const iconKey = e.icon || categoryIconKey[e.category] || 'cpu';
   const iconHtml = renderIcon(iconKey, 28);
   const desc = I18n.getLanguage() === 'pl' ? (e.description_pl || e.description_en) : (e.description_en || e.description_pl);
-  const deployMethods = Manifest.availableDeployMethods(service, targetOs);
+  const deployMethods = Manifest.availableDeployMethods(service, targetOs, host);
   const methodsLabel = deployMethods.map((m) => escapeHtml(I18n.t(`catalog.method_${m}`))).join(' · ') || '—';
   const resourceKind = Manifest.resourceKind(service);
   const resourceBadge = resourceKind === 'infra'

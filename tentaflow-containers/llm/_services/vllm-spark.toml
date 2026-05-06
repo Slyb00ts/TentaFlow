@@ -1,0 +1,55 @@
+# Manifest serwisu vLLM-Spark — vLLM 0.20.1 zbudowany ze zrodel pod
+# NVIDIA DGX Spark / GB10 Grace Blackwell (sm_121, aarch64). Osobny silnik
+# od `vllm.toml` bo PyPI wheels vllm/torch sm_120 max crashuja na sm_121
+# (FP8 / Mamba / NVFP4 kernels). Build from source z TORCH_CUDA_ARCH_LIST=12.1a
+# na chwile obecna jest jedyna droga zeby dostac dokladnie 0.20.1 dzialajace
+# na Sparku — patrz `vllm-spark/Dockerfile` i `python/vllm-spark/bundle.toml`.
+
+[engine]
+id = "vllm-spark"
+category = "llm"
+name = "vLLM (DGX Spark)"
+description_pl = "vLLM 0.20.1 budowane ze zrodel pod DGX Spark (GB10, sm_121a). Dlugi pierwszy build."
+description_en = "vLLM 0.20.1 built from source for DGX Spark (GB10, sm_121a). Slow first build."
+homepage = "https://github.com/vllm-project/vllm"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "0.20.1"
+# Silnik widoczny TYLKO na Sparku — manifest-store filtruje po polu engine.dgx_spark.
+dgx_spark = true
+
+[deploy.docker]
+context_path = "llm/docker/vllm-spark"
+platforms = ["linux"]
+transport = "sidecar-quic"
+
+[deploy.native]
+platforms = ["linux"]
+runtime = "python-bundle"
+bundle_path = "llm/python/vllm-spark"
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B"
+repo = "Qwen/Qwen3.5-0.8B"
+recommended = true
+
+[[model_preset]]
+id = "llama-3-1-8b-instruct"
+display_name = "Llama 3.1 8B Instruct"
+repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+# Gemma 4 31B z parowaniem do speculatora dflash. Ten preset jest punktem
+# testowym speculative decoding na DGX Spark — `RedHatAI/...-speculator.dflash`
+# jest oficjalnym drafterem od Red Hat AI dla Gemma 4 31B Instruct.
+# `vLLM walidacja na sm_121 — pending wg dokumentu RedHatAI`. Wizard
+# pre-fillsuje pole speculatora, ale toggle jest user-opt-in.
+[[model_preset]]
+id = "gemma-4-31b-it"
+display_name = "Gemma 4 31B Instruct (+ dflash speculator)"
+repo = "google/gemma-4-31B-it"
+speculator_repo = "RedHatAI/gemma-4-31B-it-speculator.dflash"
+speculator_method = "dflash"
+speculator_num_tokens = 8
