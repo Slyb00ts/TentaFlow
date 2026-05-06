@@ -113,6 +113,7 @@ recommended = true                         # OPTIONAL, default false
 | `resource_kind` | enum | nie | Wysoki poziom klasy zasobu: `ai` albo `infra`. Brak = `ai`. |
 | `requires_model` | bool | nie | Wymusza pokazanie lub ukrycie kroku wyboru modelu w wizardzie. |
 | `gpu_supported` | bool | nie | Pozwala ukryć krok wyboru GPU dla silników, które nigdy nie używają GPU. |
+| `dgx_spark` | bool | nie | Tri-state gate dla NVIDIA DGX Spark (GB10, sm_121a). `true` = silnik pokazuje się TYLKO na Sparku (np. `vllm-spark`); `false` = silnik jest UKRYTY na Sparku (np. zwykły `vllm`, którego PyPI wheels sm_120 max crashują na sm_121); brak = bez ograniczenia. Detekcja: aarch64 + GPU name zawierający `GB10`. |
 | `default_port` | u16 (1–65535) | tak | Domyślny port silnika. |
 | `api` | enum | tak | Protokół API. Patrz lista poniżej. |
 | `version` | string | tak | Wersja referencyjna silnika. |

@@ -89,26 +89,40 @@ export function deploySections(service) {
   };
 }
 
-export function isEngineCompatible(service, hostOs) {
+/// Tri-state DGX Spark gate. `engine.dgx_spark === true` = silnik dziala
+/// TYLKO na Sparku (vllm-spark); `false` = silnik NIE dziala na Sparku
+/// (PyPI vllm/torch wheels sm_120 max — crash na sm_121); brak/null = brak
+/// ograniczenia. `host.isDgxSpark` przychodzi z catalog.js jako derivative
+/// z gpuNames + os.
+function dgxSparkOk(service, host) {
+  const want = service?.engine?.dgx_spark;
+  if (want === true) return host?.isDgxSpark === true;
+  if (want === false) return host?.isDgxSpark !== true;
+  return true;
+}
+
+export function isEngineCompatible(service, hostOs, host) {
   if (!service || !hostOs) return false;
   const os = String(hostOs).toLowerCase();
   const sec = deploySections(service);
+  if (!dgxSparkOk(service, host)) return false;
   return [sec.docker, sec.native, sec.external].some((s) => s && s.platforms.includes(os));
 }
 
 /// Podzbior `['docker', 'native', 'external']` dostepnych dla hostu.
-export function availableDeployMethods(service, hostOs) {
+export function availableDeployMethods(service, hostOs, host) {
   const sec = deploySections(service);
   const os = String(hostOs || '').toLowerCase();
   const out = [];
+  if (!dgxSparkOk(service, host)) return out;
   if (sec.docker && sec.docker.platforms.includes(os)) out.push('docker');
   if (sec.native && sec.native.platforms.includes(os)) out.push('native');
   if (sec.external && sec.external.platforms.includes(os)) out.push('external');
   return out;
 }
 
-export function compatibleForHost(hostOs) {
-  return services.filter((s) => isEngineCompatible(s, hostOs));
+export function compatibleForHost(hostOs, host) {
+  return services.filter((s) => isEngineCompatible(s, hostOs, host));
 }
 
 /// Lista kategorii z >=1 silnikiem — auto-hide pustych.
