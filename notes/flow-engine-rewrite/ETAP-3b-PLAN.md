@@ -1,6 +1,78 @@
 # Etap 3b — Vision LLM (multimodal text + image)
 
-**Plan v1.0 (do review codex)**
+**Plan v1.1 (po round 1 codex)**
+
+## Zmiany v1.0 → v1.1 (codex round 1)
+
+1. **CRITICAL — modality-aware flow selection.** `resolver::resolve_flow`
+   wybiera flow po `(model, service_type)`; nie wie o multimodalności
+   requestu. Konsekwencja: `vision_llm` flow może zostać uruchomiony dla
+   pure-text request (i runtime'owo paść), a `llm` flow dla request z image
+   (i obraz zostanie zignorowany). Plan v1.1 dodaje:
+   - `flow_model_bindings.modality` kolumna w DB (`text` | `image` | `any`,
+     default `any`).
+   - `resolver::resolve_flow(pool, model, service_type, request_modality)`
+     filtruje binding'i: pasuje wpis z `modality` ∈ {`any`, request_modality}.
+     Tie-break: konkretny `modality` wygrywa nad `any` przy tym samym
+     `model` (np. binding z `image` priorytet nad bindingiem z `any` gdy
+     request niesie image).
+   - `request_modality` derived w `routing/mod.rs::build_initial_envelope_for_user`
+     z parsing OpenAI request: jeśli któraś message ma `Parts(...)` z
+     `image_url`, modality = `image`; inaczej `text`.
+   - `FlowDispatcher::try_dispatch / try_dispatch_streaming` dostają
+     `request_modality` parameter, propagują do resolvera.
+   - GUI flow editor: nowy dropdown "Trigger modality" przy save flow,
+     mapowany na `flow_model_bindings.modality` przy bind'owaniu modelu.
+2. **IMPORTANT — VisionNodeAdapter contract jednoznaczny.** Plan v1.0 mieszał
+   "input edge wymagany" z "artifact-only mode". Plan v1.1 wybiera **input
+   edge wymagany**:
+   - `input_port_type = Image` (R8 wymusza że incoming edge produkuje Image).
+   - Image source tylko z `inputs[0].envelope.payload` (musi być
+     `FlowValue::Image`).
+   - `read_artifact` override w node config WYCIĘTY z 3b. Może wrócić w
+     późniejszym etapie razem z artifact graph routing.
+   - Trigger node, jeśli flow obsługuje vision, produkuje `FlowValue::Image`
+     na payload (routing seedu robi BlobStore.put + payload assignment per
+     v1.0 plan — to nie zmienia się).
+3. **IMPORTANT — ChatMessage migration blast radius.** Zmiana `content:
+   String` → `content: ChatMessageContent` jest wszechobecna. Plan v1.1
+   dorzuca jawną listę call sites + helpery:
+   - **Helper `ChatMessage::text(&self) -> Option<&str>`** — zwraca `Some`
+     gdy content to `Text(s)`, `None` gdy `Parts`. Większość adapterów
+     używa tylko text content; helper czyni migrację zerową dla nich.
+   - **Helper `ChatMessage::text_or_default(&self) -> String`** — zwraca
+     text albo zlepione tekstowe Parts.
+   - Migracja konkretnych call sites:
+     - `flow_engine/node_adapters/conversation_history.rs` — używa
+       `m.content` jako String w `recent` mapping; zmiana na `m.text_or_default()`.
+     - `flow_engine/node_adapters/pii_filter.rs` — porównuje `content`
+       jako String → migracja do `text_or_default()` (PII filter nie
+       działa na image messages, więc dla Parts skipuje).
+     - `flow_engine/node_adapters/llm.rs::build_messages` — append
+       `ChatMessage::user(payload_text)` używa konstruktora który nadal
+       produkuje Text wariant (back compat).
+     - `flow_engine/dispatchers_impl/llm_impl.rs::chat_msg_to_openai` —
+       core mapping, pełna obsługa Parts.
+     - `routing/mod.rs::message_to_chat_message` — konwertuje OpenAI
+       Message na ChatMessage; gdy `MessageContent::Parts(...)`, mapuje
+       na `ChatMessageContent::Parts`.
+   - W każdym z tych miejsc komentarz dlaczego decyzja — text-only vs
+     multimodal-aware.
+4. **IMPORTANT — explicit error surface dla HTTP image URLs.** Plan v1.1:
+   `routing/mod.rs::decode_data_url` zwraca `Err(InvalidRequest)` z
+   message `"image_url.url musi być data URL (data:<mime>;base64,...) —
+   HTTP/HTTPS URL fetch nie jest wspierane w stage 3b. Pobierz obraz po
+   stronie klienta i zakoduj jako data URL."`. Routing layer
+   route_chat_completion_stream / route_chat_completion catch'uje ten
+   error i mapuje na HTTP 400 + OpenAI-compat error body. Klient widzi
+   sensowny komunikat, nie internal/runtime fail.
+5. **NIT — data URL re-encoding cost.** Każdy request z N-image historią
+   robi N blob.get + N base64 encode w `chat_msg_to_openai`. Plan v1.1
+   dokumentuje tradeoff: dla single-image scope (3b) brak optymalizacji.
+   Cardinality / persistent message-encoded-cache zostaje na późniejszy
+   etap razem z multi-image batch.
+
+## Plan v1.0 (do review codex)
 **Codex session ID:** `019dfca1-fef1-7ca1-b154-b73a796670a8`
 **Data:** 2026-05-06
 **Bazuje na:** Etap 3a (commit `606759d`)
@@ -447,7 +519,20 @@ parametr. Routing/chat.rs i routing/streaming.rs przekazują `dispatcher.blobs()
 | Tests | VisionNodeAdapter resolve_image / resolve_prompt; ChatMessage Parts roundtrip; data URL parse; integration | +120 |
 | `Cargo.toml` | `base64 = "0.22"` jeśli brak (sprawdzić) | +1 |
 
-**Razem: ~545 LOC.** Średni sub-stage.
+**Razem: ~545 LOC** w plan v1.0; **v1.1 dorzuca:**
+
+| Plik | Akcja v1.1 | LOC |
+|------|------------|-----|
+| `db/migrations.rs` | + migracja kolumny `flow_model_bindings.modality TEXT DEFAULT 'any'` | +20 |
+| `flow_engine/resolver.rs` | `resolve_flow` przyjmuje `request_modality: &str`, filtruje + tie-break | +40 |
+| `flow_engine/dispatcher.rs` | `try_dispatch / try_dispatch_streaming` przyjmują `request_modality`, propagują | +20 |
+| `routing/mod.rs` | `derive_request_modality` helper z OpenAI request → "text"/"image" | +30 |
+| `flow_engine/envelope.rs` | `ChatMessage::text()`, `text_or_default()` helpery | +25 |
+| `routing/mod.rs::decode_data_url` | explicit `InvalidRequest` error gdy non-data URL | +10 |
+| Migracja call sites (conversation_history, pii_filter, llm) | `text_or_default()` calls | +15 |
+| Tests modality routing + helpery | | +50 |
+
+**Razem v1.1: ~755 LOC.** Większy ale wciąż w jednym sub-stage.
 
 ---
 
