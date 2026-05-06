@@ -107,6 +107,15 @@ export async function openDeployWizard(engineId, opts = {}) {
       kv_cache_dtype: 'auto',
       gpu_memory_utilization: 0.9,
       lockedParam: null,           // 'max_model_len' | 'max_num_seqs' | 'tensor_parallel' | 'gpu_memory_utilization' | null
+      // Speculative decoding via vLLM `--speculative-config`. Pre-fillsuje
+      // sie z presetu (model_preset.speculator_*) jezeli wybrany preset go
+      // ma — patrz `applySpeculatorPreset()`.
+      speculative: {
+        enabled: false,
+        model: '',         // HF repo, np. 'RedHatAI/gemma-4-31B-it-speculator.dflash'
+        method: 'dflash',  // przekazywane do vllm 1:1
+        num_tokens: 8,
+      },
     },
   };
   advancedRecommendation = null;
@@ -135,7 +144,7 @@ export async function openDeployWizard(engineId, opts = {}) {
   }
 
   hostOs = opts.hostOs || pickHostOs(selection.nodeId);
-  availableMethods = Manifest.availableDeployMethods(engineEntry, hostOs);
+  availableMethods = Manifest.availableDeployMethods(engineEntry, hostOs, pickHostCaps(selection.nodeId));
 
   if (availableMethods.length > 0) {
     selection.deployMethod = availableMethods[0];
@@ -148,12 +157,35 @@ export async function openDeployWizard(engineId, opts = {}) {
   const presets = Manifest.modelPresets(engineEntry);
   if (presets.length > 0) {
     const rec = presets.find((p) => p && p.recommended) || presets[0];
-    if (rec) selection.modelPresetId = rec.id;
+    if (rec) {
+      selection.modelPresetId = rec.id;
+      applySpeculatorPreset(rec);
+    }
   } else {
     modelSourceMode = 'hf';
   }
 
   refreshModal();
+}
+
+/// Pre-fillsuje pola Speculative Decoding z `model_preset.speculator_*`.
+/// Wywolywane przy starcie wizardu i przy zmianie presetu — gdy preset NIE
+/// ma sparowanego speculatora, panel zostaje resetowany do disabled (zeby
+/// stary speculator z poprzedniego presetu nie wyciekal).
+function applySpeculatorPreset(preset) {
+  const sp = selection.advanced.speculative;
+  if (preset && preset.speculator_repo) {
+    sp.model = preset.speculator_repo;
+    sp.method = preset.speculator_method || 'dflash';
+    sp.num_tokens = preset.speculator_num_tokens || 8;
+    // Nie wlaczamy automatycznie — to user-opt-in. Pre-fill ma tylko
+    // ulatwic wybor jak user kliknie toggle.
+  } else {
+    sp.enabled = false;
+    sp.model = '';
+    sp.method = 'dflash';
+    sp.num_tokens = 8;
+  }
 }
 
 export function close() {
@@ -196,6 +228,21 @@ function pickHostOs(nodeId) {
   if (!node) return defaultUaOs();
   const os = node.platform || node.os;
   return os ? String(os).toLowerCase() : defaultUaOs();
+}
+
+/// Build the host caps payload that manifest-store uses to gate engines.
+/// Mirrors `target` in `catalog.js`: same DGX Spark detection so wizard
+/// agrees with the catalog tile that opened it.
+function pickHostCaps(nodeId) {
+  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  if (!node) return { isDgxSpark: false };
+  const os = String(node.platform || node.os || '').toLowerCase();
+  const gpuNames = (Array.isArray(node.gpus) ? node.gpus : [])
+    .map((g) => g?.name || '')
+    .filter(Boolean);
+  return {
+    isDgxSpark: os === 'linux' && gpuNames.some((name) => /GB10/i.test(name)),
+  };
 }
 
 function randomSuffix(len = 5) {
@@ -294,7 +341,7 @@ function renderStepBody() {
 function shouldSkipAdvancedStep() {
   const eng = engineEntry?.engine || {};
   const id = String(eng.id || '').toLowerCase();
-  if (!['vllm', 'sglang', 'llama-cpp', 'tensorrt-llm'].includes(id)) return true;
+  if (!['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm'].includes(id)) return true;
   // Bez wybranego modelu nie ma jak liczyc VRAM
   if (!selection.modelRepo && !selection.modelPresetId) return true;
   // Bez wybranych GPU tez nie - kalkulator wymaga at least 1 GPU
@@ -619,6 +666,57 @@ function renderStepAdvanced() {
     ${summaryCard}
     ${vramCard}
     ${modeCard}
+    ${renderSpeculativeCard(adv)}
+  `;
+}
+
+// Speculative Decoding panel — emit `--speculative-config '{...}'` w VLLM_ARGS.
+// Pre-fillsuje sie z `model_preset.speculator_*`, ale toggle jest user-opt-in.
+function renderSpeculativeCard(adv) {
+  const sp = adv?.speculative || {};
+  const tk = (k, params) => I18n.t(`catalog.deploy_wizard.advanced.${k}`, params);
+  const enabled = sp.enabled === true;
+  const tooltipPl = 'Speculative decoding (vLLM --speculative-config). Mały model-drafter predyktuje N tokenów do przodu, target verifuje równolegle. Zysk do 2× szybszy decode bez utraty jakości. Wymaga sparowanego speculatora (np. RedHatAI/...-speculator.dflash).';
+  return `
+    <div class="adv-section">
+      <div class="adv-sec-title">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+        Speculative Decoding
+        <span class="adv-cell-sub" style="margin-left:8px;font-weight:normal;" title="${escapeAttr(tooltipPl)}">vLLM --speculative-config</span>
+      </div>
+      <div class="adv-form-row">
+        <label><tf-toggle id="edw-adv-spec-enabled" ${enabled ? 'checked' : ''}></tf-toggle> <span>Włącz speculative decoding</span></label>
+        <div class="adv-hint">Drafter musi być kompatybilny z modelem (np. ten sam tokenizer / wytrenowany pod target). Brak parowania — startup vLLM zakończy się błędem.</div>
+      </div>
+      <div class="adv-row-2" style="${enabled ? '' : 'display:none;'}" id="edw-adv-spec-fields">
+        <div class="adv-form-row">
+          <label><span>Speculator (HF repo)</span></label>
+          <tf-input id="edw-adv-spec-model" placeholder="RedHatAI/gemma-4-31B-it-speculator.dflash" value="${escapeAttr(sp.model || '')}"></tf-input>
+          <div class="adv-hint">Repo z drafterem (sufix .dflash / .pflash / itd.).</div>
+        </div>
+        <div class="adv-form-row">
+          <label><span>Method</span></label>
+          <tf-select id="edw-adv-spec-method" value="${escapeAttr(sp.method || 'dflash')}">
+            <option value="dflash">dflash</option>
+            <option value="pflash">pflash</option>
+            <option value="eagle">eagle</option>
+            <option value="eagle3">eagle3</option>
+            <option value="medusa">medusa</option>
+            <option value="mtp">mtp</option>
+            <option value="draft_model">draft_model</option>
+            <option value="ngram">ngram</option>
+          </tf-select>
+          <div class="adv-hint">Wartość przekazywana do vLLM 1:1.</div>
+        </div>
+      </div>
+      <div class="adv-row-2" style="${enabled ? '' : 'display:none;'}" id="edw-adv-spec-tokens-row">
+        <div class="adv-form-row">
+          <label><span>num_speculative_tokens</span><span class="v" id="edw-adv-spec-num-val">${sp.num_tokens || 8}</span></label>
+          <input type="range" class="adv-range" id="edw-adv-spec-num" min="1" max="16" step="1" value="${sp.num_tokens || 8}">
+          <div class="adv-hint">Ile tokenów drafter predyktuje per krok. Typowo 4-8. Większa wartość = więcej zgadywania, ale więcej rejectów na trudnych promptach.</div>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -1055,6 +1153,51 @@ function bindAdvancedHandlers() {
     });
   }
 
+  // Speculative Decoding — toggle, model repo, method, num_tokens.
+  // Recompute VRAM nie jest wywolywane bo backend recommender (auto_fit_config)
+  // nie modeluje pamieci speculatora. To swiadomy trade-off — drafter to
+  // mniejszy model (~10-30% targetu), zwykle miesci sie w headroomie po
+  // auto-fit. Jezeli vllm padnie OOM przy starcie, user zmniejszy
+  // max-model-len recznie.
+  const specToggle = document.getElementById('edw-adv-spec-enabled');
+  if (specToggle) {
+    specToggle.addEventListener('change', (e) => {
+      const v = e.detail?.checked ?? specToggle.checked;
+      selection.advanced.speculative.enabled = !!v;
+      const fields = document.getElementById('edw-adv-spec-fields');
+      const tokensRow = document.getElementById('edw-adv-spec-tokens-row');
+      const display = v ? '' : 'none';
+      if (fields) fields.style.display = display;
+      if (tokensRow) tokensRow.style.display = display;
+    });
+  }
+  const specModel = document.getElementById('edw-adv-spec-model');
+  if (specModel) {
+    specModel.addEventListener('change', (e) => {
+      selection.advanced.speculative.model = String(e.detail?.value ?? specModel.value ?? '').trim();
+    });
+    specModel.addEventListener('input', (e) => {
+      selection.advanced.speculative.model = String(e.detail?.value ?? specModel.value ?? '').trim();
+    });
+  }
+  const specMethod = document.getElementById('edw-adv-spec-method');
+  if (specMethod) {
+    specMethod.addEventListener('change', (e) => {
+      selection.advanced.speculative.method = e.detail?.value ?? specMethod.value ?? 'dflash';
+    });
+  }
+  const specNum = document.getElementById('edw-adv-spec-num');
+  const specNumVal = document.getElementById('edw-adv-spec-num-val');
+  if (specNum) {
+    specNum.addEventListener('input', () => {
+      const v = parseInt(specNum.value, 10);
+      if (Number.isFinite(v)) {
+        selection.advanced.speculative.num_tokens = v;
+        if (specNumVal) specNumVal.textContent = String(v);
+      }
+    });
+  }
+
   // "Reset to auto" — czysci wszystkie locki + manualne wartosci, backend
   // dostaje czysty /recommend (bez overrides) i zwraca pelne auto-tuning.
   const resetBtn = document.getElementById('edw-adv-reset-lock');
@@ -1345,7 +1488,9 @@ function bindStepInputs() {
 function bindStepMethodInputs() {
   document.querySelectorAll('.deploy-method-card[data-method]').forEach((btn) => {
     btn.addEventListener('click', () => {
+      console.log('[wizard][method-click] dataset.method=', btn.dataset.method, 'before:', selection.deployMethod);
       selection.deployMethod = btn.dataset.method;
+      console.log('[wizard][method-click] after:', selection.deployMethod);
       refreshModal();
     });
   });
@@ -1354,7 +1499,7 @@ function bindStepMethodInputs() {
     nodeSel.addEventListener('change', (e) => {
       selection.nodeId = e.detail?.value ?? nodeSel.value;
       hostOs = pickHostOs(selection.nodeId);
-      availableMethods = Manifest.availableDeployMethods(engineEntry, hostOs);
+      availableMethods = Manifest.availableDeployMethods(engineEntry, hostOs, pickHostCaps(selection.nodeId));
       if (!availableMethods.includes(selection.deployMethod)) {
         selection.deployMethod = availableMethods[0] || null;
       }
@@ -1381,6 +1526,8 @@ function bindStepModelInputs() {
       selection.modelRepo = null;
       document.querySelectorAll('.model-item[data-preset-id]').forEach((x) => x.classList.remove('selected'));
       it.classList.add('selected');
+      const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
+      if (preset) applySpeculatorPreset(preset);
     });
   });
 
@@ -1410,6 +1557,9 @@ function bindHfResultClicks() {
       selection.modelPresetId = null;
       document.querySelectorAll('.model-item[data-repo]').forEach((x) => x.classList.remove('selected'));
       it.classList.add('selected');
+      // Free-form HF model nie ma sparowanego speculatora w manifescie —
+      // reset, niech user wpisze recznie jak chce.
+      applySpeculatorPreset(null);
     });
   });
 }
@@ -1551,6 +1701,26 @@ async function startDeploy() {
     }
   }
 
+  // Speculative Decoding — append `--speculative-config '{...}'` do VLLM_ARGS.
+  // shlex::split po stronie backendu (python_venv::build_engine_args) honoruje
+  // single-quotes wokol JSON, a docker entrypoint robi to przez shell. Trzeba
+  // tylko zachowac '...' jako quoting (single-quotes nie potrzebuja escapingu
+  // wewnetrznych ", a JSON nie zawiera ' wiec single-quote bezpieczny).
+  const sp = selection.advanced?.speculative;
+  if (!shouldSkipAdvancedStep() && sp && sp.enabled && sp.model) {
+    const cfg = {
+      model: sp.model,
+      num_speculative_tokens: sp.num_tokens || 8,
+      method: sp.method || 'dflash',
+    };
+    const cfgJson = JSON.stringify(cfg);
+    // Sanity: gdyby JSON jakims cudem zawieral apostrof — zabezpieczamy
+    // przez escape (jednak parser JSON go nie wyemituje, ale trzymajmy to
+    // odporne na rozszerzenia metody / przyszle pola).
+    const safeJson = cfgJson.replace(/'/g, "'\\''");
+    vllmArgs = `${vllmArgs ? vllmArgs + ' ' : ''}--speculative-config '${safeJson}'`.trim();
+  }
+
   // Suwak gpu_memory_utilization w panelu Advanced jest wspolny dla obu trybow
   // (auto/manual) — w auto mode `vllmArgs` bierzemy z `recommended_vllm_args`
   // ale nie zawiera on tego co user faktycznie ustawil na suwaku. Wysylamy
@@ -1585,6 +1755,12 @@ async function startDeploy() {
     vllm_args: vllmArgs,
   });
 
+  console.log('[wizard][startDeploy] payload:', {
+    engineId: eng.id,
+    deployMethod: selection.deployMethod,
+    nodeId: selection.nodeId,
+    configJson,
+  });
   try {
     const data = await ApiBinary.action('serviceManifestDeployRequest', {
       engineId: eng.id,

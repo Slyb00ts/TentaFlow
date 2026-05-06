@@ -725,6 +725,9 @@ mod services_manifest_build {
         pub requires_model: Option<bool>,
         #[serde(default)]
         pub gpu_supported: Option<bool>,
+        /// Tri-state DGX Spark gate. Mirror of runtime `Engine.dgx_spark`.
+        #[serde(default)]
+        pub dgx_spark: Option<bool>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,
@@ -871,6 +874,15 @@ mod services_manifest_build {
         pub input_modalities: Option<Vec<String>>,
         #[serde(default)]
         pub output_modalities: Option<Vec<String>>,
+        /// vLLM speculative decoding pairing (mirror of runtime
+        /// `ModelPreset` fields). `speculator_method` flows through to
+        /// `--speculative-config '{"method": ...}'` unchanged.
+        #[serde(default)]
+        pub speculator_repo: Option<String>,
+        #[serde(default)]
+        pub speculator_method: Option<String>,
+        #[serde(default)]
+        pub speculator_num_tokens: Option<u32>,
     }
 
     // Single source of truth for the three wire-string allow-lists is

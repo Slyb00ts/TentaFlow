@@ -1,0 +1,16 @@
+# Pre-cache wheels dla bundla vllm-spark. Faktyczny resolver odpala sie
+# przez `pip install -e .` z klona vllm @ v0.20.1 (source = "git"); ten plik
+# tylko pre-warmuje torcha (najwolniejszy wheel w lancuchu).
+#
+# Wersje torcha bez sufixu `+cu130` — `--extra-index-url` z install_variants
+# (https://download.pytorch.org/whl/nightly/cu130) pcha resolvera w nightly
+# aarch64 wheel. To jedyne wheels ktore obecnie maja sm_121 bytecode dla
+# Grace Blackwell (stable PyPI siedzi na sm_120 max).
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+
+# Build tooling — vllm 0.20.1 build z source wymaga ninja (parallel CUDA
+# kernel compile) i cmake (setuptools-rust niektorych deps).
+ninja
+cmake

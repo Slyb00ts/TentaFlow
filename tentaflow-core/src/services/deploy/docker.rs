@@ -397,11 +397,24 @@ impl DeployStrategy for DockerDeploy {
         // because the container is the one populating the cache.
         let models_host = crate::paths::models_root();
         let _ = std::fs::create_dir_all(&models_host);
-        let binds = vec![(
-            models_host,
-            crate::paths::CONTAINER_MODELS_PATH.to_string(),
-            false,
-        )];
+        // vLLM cache (Triton kernels, torch.compile, FlashInfer JIT). Kept on
+        // the host so a docker rebuild / container restart doesn't trigger a
+        // 1-2 min recompile. Mounted at `CONTAINER_VLLM_CACHE_PATH`, paired
+        // with the `VLLM_CACHE_ROOT` env from `standard_engine_env`.
+        let vllm_cache_host = crate::paths::vllm_cache_dir();
+        let _ = std::fs::create_dir_all(&vllm_cache_host);
+        let binds = vec![
+            (
+                models_host,
+                crate::paths::CONTAINER_MODELS_PATH.to_string(),
+                false,
+            ),
+            (
+                vllm_cache_host,
+                crate::paths::CONTAINER_VLLM_CACHE_PATH.to_string(),
+                false,
+            ),
+        ];
 
         let id = backend::run(
             &docker,
