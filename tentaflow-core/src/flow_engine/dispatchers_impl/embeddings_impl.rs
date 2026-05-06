@@ -11,7 +11,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use super::ModelRuntimeSlot;
+use super::{build_user_context, ModelRuntimeSlot};
 use crate::api::openai::types::{EmbeddingInput, EmbeddingRequest};
 use crate::flow_engine::dispatchers::{EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse};
 use crate::flow_engine::envelope::TokenUsage;
@@ -40,6 +40,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             EmbeddingInput::Multiple(req.inputs.clone())
         };
 
+        let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = EmbeddingRequest {
             model: req.model,
             input,
@@ -48,7 +49,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             user: None,
         };
 
-        let mut rctx = RuntimeContext::new(None);
+        let mut rctx = RuntimeContext::new(user);
         let runtime = self
             .runtime
             .read()

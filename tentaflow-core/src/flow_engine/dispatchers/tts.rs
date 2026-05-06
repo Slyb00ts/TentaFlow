@@ -15,6 +15,8 @@ pub struct TtsRequest {
     pub text: String,
     pub voice: Option<String>,
     pub format: Option<String>, // "wav" | "mp3" | "ogg" — engine-specific
+    pub user_id: Option<i64>,
+    pub user_role: Option<String>,
 }
 
 #[derive(Debug, Clone)]

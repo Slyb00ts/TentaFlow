@@ -93,6 +93,8 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         let req = EmbeddingsRequest {
             model,
             inputs: vec![text],
+            user_id: ctx.user_id,
+            user_role: ctx.user_role.clone(),
         };
 
         let response = ctx

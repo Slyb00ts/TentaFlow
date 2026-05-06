@@ -20,7 +20,7 @@ use crate::api::openai::types::{
 };
 use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
 use crate::flow_engine::envelope::{ChatMessage, ChatRole, FinishReason, LlmStreamChunk, TokenUsage};
-use super::ModelRuntimeSlot;
+use super::{build_user_context, ModelRuntimeSlot};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 
 pub struct LlmDispatcherImpl {
@@ -47,7 +47,8 @@ impl LlmDispatcher for LlmDispatcherImpl {
         let cancel = req.cancel_token.clone();
         let deadline = req.deadline;
         let api_req = build_chat_request(&req, false);
-        let mut rctx = RuntimeContext::new(None);
+        let user = build_user_context(req.user_id, req.user_role.as_deref());
+        let mut rctx = RuntimeContext::new(user);
         // Cancel + deadline są egzekwowane na poziomie wrappera bo
         // ModelRuntimeExecutor::execute_chat nie eksponuje tych pól.
         // select! w pierwszej kolejności sprawdza cancel/deadline, więc
@@ -106,7 +107,8 @@ impl LlmDispatcher for LlmDispatcherImpl {
         let cancel = req.cancel_token.clone();
         let deadline = req.deadline;
         let api_req = build_chat_request(&req, true);
-        let mut rctx = RuntimeContext::new(None);
+        let user = build_user_context(req.user_id, req.user_role.as_deref());
+        let mut rctx = RuntimeContext::new(user);
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
         // resolver/strategy się zacina lub backend nie zdąży otworzyć
         // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.
