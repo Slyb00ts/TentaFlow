@@ -1,6 +1,63 @@
 # Etap 3b — Vision LLM (multimodal text + image)
 
-**Plan v1.1 (po round 1 codex)**
+**Plan v1.2 (po round 2 codex)**
+
+## Zmiany v1.1 → v1.2 (codex round 2)
+
+**IMPORTANT — modality-aware fallback dla default flow.** Plan v1.1 dodał
+filtrowanie po modality tylko w ścieżce `flow_model_bindings`. Resolver ma
+dwie ścieżki: (1) bindings, (2) default flow for service_type. Bez fixu
+ścieżki (2), text request i image request trafiały na ten sam default flow
+dla `service_type="chat"`. Plan v1.2 wybiera **decyzję B**: vision flows
+NIGDY nie używają default fallback — muszą być spięte explicit przez
+`flow_model_bindings`. Konsekwencja:
+
+- Default flow w `resolver::resolve_flow` ścieżka 2 NIE jest filtrowany po
+  modality. Dziedziczy obecne zachowanie: pasuje do każdego request bez
+  bindingu, niezależnie od request_modality.
+- Vision request bez bindingu → resolver zwraca `None` ze ścieżki 1 (bo
+  brak bindingu o `modality=image`/`any` dla tego modelu), default fallback
+  nie pasuje też (default flow ma `vision_llm` node = R8 wymaga Image input,
+  ale request_modality może być text → adapter padnie). Routing widzi
+  `None` z `try_dispatch`, wykonuje bare passthrough do
+  `ModelRuntimeExecutor` który dispatchuje do backendu. Backend native
+  obsługuje image jeśli capable; inaczej zwraca błąd OpenAI-compat.
+- Operator chcąc vision flow MUSI explicit dodać `flow_model_bindings`
+  wpis dla swojego vision modelu. Seed nie tworzy default vision flow.
+
+To jest też zgodne z product semantyką: text default flow obsługuje 99%
+chatów, vision to operator-side configuration choice.
+
+Plan v1.2 dorzuca w resolver.rs:
+
+```rust
+pub fn resolve_flow(
+    pool: &DbPool,
+    model_name: &str,
+    service_type: &str,
+    request_modality: &str, // "text" | "image"
+) -> Result<Option<DbFlow>> {
+    // Krok 1: flow_model_bindings z filtrem modality.
+    // SELECT ... WHERE model_pattern matches model AND
+    //   (modality = request_modality OR modality = 'any')
+    // ORDER BY (modality = request_modality) DESC  -- konkretny wygrywa nad any
+    if let Some(flow) = bindings_match(pool, model_name, service_type, request_modality)? {
+        return Ok(Some(flow));
+    }
+    // Krok 2: default flow dla service_type — NIE filtrujemy po modality.
+    // Vision request, jeśli operator nie ustawił bindingu, idzie do bare
+    // passthrough (resolver zwraca None z całego resolve_flow gdy default
+    // nie ma vision_llm node — sprawdzamy validation R8).
+    // (existing code without modality filter)
+    default_flow_for_service(pool, service_type)
+}
+```
+
+Plus jawna decyzja `flow_model_bindings.modality` defaults: `"any"` (binding
+działa dla obu typów request); operator może ustawić `"image"` żeby vision
+binding nie pasował do text request (np. operator ma osobny text model).
+
+## Zmiany v1.0 → v1.1 (codex round 1)
 
 ## Zmiany v1.0 → v1.1 (codex round 1)
 
