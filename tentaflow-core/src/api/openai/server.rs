@@ -196,6 +196,11 @@ pub async fn handle_request(
         // Audio TTS
         ("POST", "/v1/audio/speech") => handle_audio_tts(req, router).await,
 
+        // Audio TTS streaming (TentaFlow-specific, NIE OpenAI-compatible)
+        ("POST", "/v1/audio/speech/stream") => {
+            handle_audio_tts_stream(req, router).await
+        }
+
         // Audio STT (Whisper)
         ("POST", "/v1/audio/transcriptions") => handle_audio_transcriptions(req, router).await,
 
@@ -548,6 +553,143 @@ async fn handle_audio_tts(
             ))
         }
     }
+}
+
+/// Etap 3c: TentaFlow-specific (NIE OpenAI-compatible) endpoint streaming
+/// TTS. Klient POST'uje tę samą strukturę co `/v1/audio/speech`
+/// (`TTSRequest` JSON), dostaje `text/event-stream` z audio chunks:
+/// `data: { audio_chunk: "<base64>", mime, sample_rate, finish_reason }\n\n`.
+/// Stream kończy `data: [DONE]\n\n`. Cancel propaguje przez
+/// `CancelOnDropStream` — klient disconnect zatrzymuje emisję
+/// kolejnych chunków (limit: backend blocking syntezę i tak skończy
+/// przed cancel — full backend abort wraca z native streaming).
+async fn handle_audio_tts_stream(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+) -> std::result::Result<
+    Response<
+        StreamBody<
+            std::pin::Pin<
+                Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+            >,
+        >,
+    >,
+    hyper::Error,
+> {
+    let user_ctx = req
+        .extensions()
+        .get::<crate::auth::acl::UserContext>()
+        .cloned();
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("Nie udalo sie odczytac body: {}", e),
+            ));
+        }
+    };
+    let api_request: crate::api::openai::types::TTSRequest =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("invalid JSON: {}", e),
+                ));
+            }
+        };
+
+    let dispatcher = match router.flow_dispatcher.as_ref() {
+        Some(d) => d.clone(),
+        None => {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "flow dispatcher not wired".to_string(),
+            ));
+        }
+    };
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let user = build_user_context(user_ctx);
+    let req_dto = crate::flow_engine::dispatchers::TtsRequest {
+        model: api_request.model.clone(),
+        text: api_request.input.clone(),
+        voice: Some(api_request.voice.clone()),
+        format: api_request.response_format.clone(),
+        language: api_request.language.clone(),
+        user_id: user.as_ref().map(|u| u.user_id),
+        user_role: user.as_ref().map(|u| u.role.clone()),
+        cancel_token: cancel.clone(),
+    };
+
+    let chunk_stream = match dispatcher.tts().stream_synthesize(req_dto).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("TTS stream init: {}", e);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backend_error",
+                format!("TTS stream init: {}", e),
+            ));
+        }
+    };
+
+    use base64::Engine;
+    use futures::StreamExt;
+    let sse_chunks = chunk_stream.flat_map(|res| {
+        let frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> = match res {
+            Ok(chunk) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk.bytes_delta);
+                let json = serde_json::json!({
+                    "audio_chunk": b64,
+                    "mime": chunk.mime,
+                    "sample_rate": chunk.sample_rate,
+                    "finish_reason": chunk
+                        .finish_reason
+                        .and_then(|f| f.as_openai_str().map(|s| s.to_string())),
+                });
+                let line = format!("data: {}\n\n", json);
+                vec![Ok(Frame::data(Bytes::from(line)))]
+            }
+            Err(e) => {
+                let json = serde_json::json!({ "error": format!("{e}") });
+                let line = format!("data: {}\n\n", json);
+                vec![Ok(Frame::data(Bytes::from(line)))]
+            }
+        };
+        futures::stream::iter(frames)
+    });
+    let done = futures::stream::once(async {
+        Ok::<_, std::io::Error>(Frame::data(Bytes::from("data: [DONE]\n\n")))
+    });
+    let combined = sse_chunks.chain(done);
+
+    // CancelOnDropStream: hyper drop body → cancel.cancel() → take_while
+    // w `stream_synthesize` widzi cancelled, EOF.
+    let wrapped = crate::flow_engine::cancel_on_drop::CancelOnDropStream::new(combined, cancel);
+
+    let body: std::pin::Pin<
+        Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+    > = Box::pin(wrapped);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(StreamBody::new(body))
+        .unwrap())
+}
+
+fn build_user_context(
+    user_ctx: Option<crate::auth::acl::UserContext>,
+) -> Option<crate::auth::acl::UserContext> {
+    user_ctx
 }
 
 /// Handler dla /v1/audio/transcriptions (Speech-to-Text, Whisper)

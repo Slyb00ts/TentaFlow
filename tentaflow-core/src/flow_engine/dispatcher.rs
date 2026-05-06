@@ -193,6 +193,13 @@ impl FlowDispatcher {
         self.ctx_factory.blobs.clone()
     }
 
+    /// Etap 3c: TtsDispatcher handle — używane przez
+    /// `/v1/audio/speech/stream` endpoint do uruchomienia
+    /// `stream_synthesize` poza flow path.
+    pub fn tts(&self) -> Arc<dyn TtsDispatcher> {
+        self.ctx_factory.tts.clone()
+    }
+
     pub fn invalidate_cache(&self) {
         self.cache.invalidate_all();
     }
