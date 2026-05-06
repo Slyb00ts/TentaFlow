@@ -8,11 +8,10 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::time::Instant;
 
 use crate::flow_engine::dispatchers::LlmRequest;
 use crate::flow_engine::envelope::{
-    ArtifactProvenance, ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput,
+    ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput,
 };
 use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter};
 use crate::flow_engine::types::FlowNode;
@@ -146,8 +145,11 @@ impl NodeAdapter for LlmNodeAdapter {
         &["in"]
     }
     fn supported_output_ports(&self) -> &[&'static str] {
-        // "stream" jest egzekwowany przez executor (nie adapter); blocking
-        // path produkuje "full". Validation sprawdza streaming end-shape.
+        // Adapter umie wyprodukować obie formy outputu — streaming
+        // (przez prepare_llm_request + ctx.llm.stream_chat) i blocking
+        // (execute → ctx.llm.execute_chat). Wybór ścieżki zależy od
+        // executora (compiled.is_streaming); end-shape validation
+        // przyjdzie razem z executor rewrite w stage 1d.
         &["stream", "full"]
     }
 
@@ -172,20 +174,14 @@ impl NodeAdapter for LlmNodeAdapter {
         ctx.usage_sink.record(&node.id, response.usage);
 
         // Output envelope: klon input + nadpisany payload + dopisana
-        // assistant message + provenance dla payload artifact.
+        // assistant message. Provenance trzymamy tylko dla artifacts
+        // bag (envelope.artifacts) — payload jest głównym slotem flow,
+        // jego pochodzenie wynika z trace (executor produkuje TraceStep).
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Text(response.content.clone());
         out.context
             .messages
             .push(ChatMessage::assistant(response.content));
-        out.provenance.insert(
-            "payload".into(),
-            ArtifactProvenance {
-                producer_node_id: node.id.clone(),
-                producer_node_type: NODE_TYPE.to_string(),
-                timestamp_ms: now_ms(ctx.clock.as_ref()),
-            },
-        );
         Ok(out)
     }
 }
@@ -220,15 +216,6 @@ impl LlmAdapter for LlmNodeAdapter {
             cancel_token: ctx.cancel_token.clone(),
         })
     }
-}
-
-fn now_ms(clock: &dyn crate::flow_engine::dispatchers::Clock) -> u64 {
-    let _ = clock; // Clock trait używamy później (jeśli dodamy now_ms metodę);
-    let _ = Instant::now();
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
