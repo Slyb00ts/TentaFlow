@@ -95,11 +95,23 @@ impl NodeAdapter for MemoryNodeAdapter {
         let envelope = &input.envelope;
         let mode = Self::pick_mode(node);
         let session = Self::pick_session(node, ctx)?;
+        // person_id: node config > envelope.meta > None. Speaker/STT
+        // pipeline wstrzykuje rozpoznanego mówcę do meta['person_id'],
+        // więc fallback z meta jest tym, co pozwala memory engine'owi
+        // partycjonować recall/store po faktycznej osobie zamiast po
+        // statycznej konfiguracji.
         let person_id = node
             .config
             .get("person_id")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .or_else(|| {
+                envelope
+                    .meta
+                    .get("person_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
 
         let query_text = Self::payload_text(envelope)?;
 
