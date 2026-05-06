@@ -61,12 +61,16 @@ impl Router {
                 }
             }
         }
-        self.synthesize_speech(request).await
+        // Propaguj user dalej — Etap 2 odblokował TTS-as-flow, więc
+        // FlowDispatcher::acl_allow musi widzieć rzeczywistego callera, a
+        // resolver/strategy w ModelRuntimeExecutor mogą gateować per-user.
+        self.synthesize_speech(request, user).await
     }
 
     pub async fn synthesize_speech(
         &self,
         request: &crate::api::openai::types::TTSRequest,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<TtsBytes>> {
         // Strip emoji + apply DB-driven `tts_cleaning_rules` BEFORE
         // dispatch. Without this the TTS engine has to pronounce raw
@@ -98,7 +102,10 @@ impl Router {
             use crate::services::runtime::context::ExecutionContext;
             use crate::services::runtime::executor::ExecutorError;
 
-            let mut exec_ctx = ExecutionContext::default();
+            let mut exec_ctx = ExecutionContext {
+                user: user.clone(),
+                ..ExecutionContext::default()
+            };
             match executor
                 .execute_tts(cleaned_request.clone(), &mut exec_ctx)
                 .await
@@ -208,12 +215,13 @@ impl Router {
     pub async fn synthesize_speech_stream<F>(
         &self,
         request: &crate::api::openai::types::TTSRequest,
+        user: Option<crate::auth::acl::UserContext>,
         mut chunk_sink: F,
     ) -> Result<()>
     where
         F: FnMut(Vec<u8>) -> Result<()>,
     {
-        let route_result = self.synthesize_speech(request).await?;
+        let route_result = self.synthesize_speech(request, user).await?;
         let mut audio_bytes = route_result.response.bytes;
 
         // Strip WAV header gdy backend zignorowal `format=pcm` i zwrocil
