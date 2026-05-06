@@ -88,14 +88,15 @@ impl NodeAdapter for ConversationHistoryNodeAdapter {
         out.context.messages = new_msgs;
 
         // Po wstrzyknięciu — zapis bieżącego user input do historii. Tylko
-        // gdy payload to niepusty Text. Tag user'a w meta['user_role']
-        // (jeśli jest) idzie do `name`, żeby downstream mógł rozróżnić
-        // wielomówców w jednej sesji.
+        // gdy payload to niepusty Text. `name` zostawiamy `None`; legacy
+        // ConversationCache trzyma tylko (role, content), więc dodatkowe
+        // pola i tak są dropowane na append. Multi-speaker tagging
+        // zostaje na późniejszy etap razem z storage rewrite.
         if let FlowValue::Text(t) = &envelope.payload {
             if !t.is_empty() {
-                let mut msg = ChatMessage::user(t.clone());
-                msg.name = ctx.user_role.clone();
-                ctx.history.append(&session, msg).await?;
+                ctx.history
+                    .append(&session, ChatMessage::user(t.clone()))
+                    .await?;
             }
         }
         Ok(out)
