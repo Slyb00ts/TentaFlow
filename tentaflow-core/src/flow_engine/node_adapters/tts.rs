@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::TtsRequest;
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
 use crate::flow_engine::types::FlowNode;
 
@@ -91,7 +91,7 @@ impl NodeAdapter for TtsNodeAdapter {
             other => {
                 return Err(anyhow!(
                     "tts adapter: payload must be Text, got {}",
-                    payload_kind(other)
+                    other.kind()
                 ));
             }
         };
@@ -115,21 +115,17 @@ impl NodeAdapter for TtsNodeAdapter {
             mime: response.mime,
             sample_rate: response.sample_rate,
         };
-        out.artifacts
-            .insert("source_text".into(), FlowValue::Text(text));
+        out.put_artifact(
+            "source_text",
+            FlowValue::Text(text),
+            ArtifactProvenance {
+                producer_node_id: node.id.clone(),
+                producer_node_type: NODE_TYPE.to_string(),
+                timestamp_ms: ctx.clock.now_ms(),
+            },
+        )
+        .map_err(|e| anyhow!("tts adapter: {e}"))?;
         Ok(out)
-    }
-}
-
-fn payload_kind(v: &FlowValue) -> &'static str {
-    match v {
-        FlowValue::Empty => "Empty",
-        FlowValue::Text(_) => "Text",
-        FlowValue::Json(_) => "Json",
-        FlowValue::Audio { .. } => "Audio",
-        FlowValue::Image { .. } => "Image",
-        FlowValue::Video { .. } => "Video",
-        FlowValue::Embedding(_) => "Embedding",
     }
 }
 

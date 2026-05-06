@@ -53,7 +53,7 @@ impl EmbeddingsNodeAdapter {
             }
             other => Err(anyhow!(
                 "embeddings adapter: payload must be Text, got {}",
-                payload_kind(other)
+                other.kind()
             )),
         }
     }
@@ -119,18 +119,6 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Embedding(vector);
         Ok(out)
-    }
-}
-
-fn payload_kind(v: &FlowValue) -> &'static str {
-    match v {
-        FlowValue::Empty => "Empty",
-        FlowValue::Text(_) => "Text",
-        FlowValue::Json(_) => "Json",
-        FlowValue::Audio { .. } => "Audio",
-        FlowValue::Image { .. } => "Image",
-        FlowValue::Video { .. } => "Video",
-        FlowValue::Embedding(_) => "Embedding",
     }
 }
 
