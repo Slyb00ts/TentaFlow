@@ -14,6 +14,8 @@ use crate::flow_engine::envelope::TokenUsage;
 pub struct EmbeddingsRequest {
     pub model: String,
     pub inputs: Vec<String>,
+    pub user_id: Option<i64>,
+    pub user_role: Option<String>,
 }
 
 #[derive(Debug, Clone)]

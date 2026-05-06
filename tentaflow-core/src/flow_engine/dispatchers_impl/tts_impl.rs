@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::ModelRuntimeSlot;
+use super::{build_user_context, ModelRuntimeSlot};
 use crate::api::openai::types::TTSRequest;
 use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::dispatchers::{TtsDispatcher, TtsRequest, TtsResponse};
@@ -36,6 +36,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
             return Err(anyhow!("TtsDispatcher: empty text"));
         }
 
+        let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = TTSRequest {
             model: req.model,
             input: req.text,
@@ -45,7 +46,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
             language: None,
         };
 
-        let mut rctx = RuntimeContext::new(None);
+        let mut rctx = RuntimeContext::new(user);
         let runtime = self
             .runtime
             .read()

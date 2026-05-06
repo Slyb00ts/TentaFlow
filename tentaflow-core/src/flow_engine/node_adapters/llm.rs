@@ -126,6 +126,8 @@ impl LlmNodeAdapter {
             stop: Self::pick_stop(node),
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
+            user_id: ctx.user_id,
+            user_role: ctx.user_role.clone(),
         })
     }
 }
@@ -214,6 +216,8 @@ impl LlmAdapter for LlmNodeAdapter {
             stop: Self::pick_stop(node),
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
+            user_id: ctx.user_id,
+            user_role: ctx.user_role.clone(),
         })
     }
 }

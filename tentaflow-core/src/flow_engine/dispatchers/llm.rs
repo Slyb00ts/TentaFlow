@@ -22,6 +22,11 @@ pub struct LlmRequest {
     pub stop: Vec<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
+    /// User context propagated z `ExecutionContext.user_id` / `user_role`.
+    /// Wrapper przekazuje to do `RuntimeContext` żeby resolver/strategy nie
+    /// widziały `user=None` mimo że request przyszedł od zalogowanego usera.
+    pub user_id: Option<i64>,
+    pub user_role: Option<String>,
 }
 
 impl LlmRequest {
@@ -34,6 +39,8 @@ impl LlmRequest {
             stop: Vec::new(),
             deadline: None,
             cancel_token: CancellationToken::new(),
+            user_id: None,
+            user_role: None,
         }
     }
 }

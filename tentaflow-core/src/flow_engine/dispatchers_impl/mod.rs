@@ -29,6 +29,20 @@ pub type ModelRuntimeSlot = Arc<
     >,
 >;
 
+/// Buduje `UserContext` z opcjonalnych pól request DTO. Brak `user_id` =
+/// `None` (wewnętrzny / addon / mesh-reverse caller — ACL fail-open).
+/// Brak `role` przy obecnym `user_id` defaultuje na "user" (najściślejsza
+/// rola, ACL i tak gateuje wcześniej w FlowDispatcher::acl_allow).
+pub(crate) fn build_user_context(
+    user_id: Option<i64>,
+    user_role: Option<&str>,
+) -> Option<crate::auth::acl::UserContext> {
+    user_id.map(|uid| crate::auth::acl::UserContext {
+        user_id: uid,
+        role: user_role.unwrap_or("user").to_string(),
+    })
+}
+
 pub use audit_impl::AuditSinkImpl;
 pub use conversation_impl::ConversationHistoryImpl;
 pub use embeddings_impl::EmbeddingsDispatcherImpl;

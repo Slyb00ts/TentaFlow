@@ -101,6 +101,8 @@ impl NodeAdapter for TtsNodeAdapter {
             text: text.clone(),
             voice: Self::pick_optional_str(node, "voice"),
             format: Self::pick_optional_str(node, "format"),
+            user_id: ctx.user_id,
+            user_role: ctx.user_role.clone(),
         };
 
         let response = ctx
