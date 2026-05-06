@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::auth::acl;
 use crate::db::{repository, DbPool};
-use crate::flow_engine::blob_store::{BlobStore, InMemoryBlobStore};
+use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
 use crate::flow_engine::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
@@ -131,8 +131,8 @@ impl FlowDispatcher {
         service_manager: Arc<ServiceManager>,
         runtime_slot: ModelRuntimeSlot,
         stt_runtime_slot: SttRuntimeSlot,
+        blobs: Arc<dyn BlobStore>,
     ) -> Self {
-        let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let metrics: Arc<dyn MetricsSink> = Arc::new(NoopMetrics);
 
@@ -183,6 +183,13 @@ impl FlowDispatcher {
 
     pub fn registry(&self) -> &Arc<AdapterRegistry> {
         &self.registry
+    }
+
+    /// Etap 2: BlobStore handle — używane przez TTS-as-flow path w
+    /// services/runtime/executor.rs do pobrania bytes audio po BlobRef
+    /// po zakończeniu flow.
+    pub fn blobs(&self) -> Arc<dyn BlobStore> {
+        self.ctx_factory.blobs.clone()
     }
 
     pub fn invalidate_cache(&self) {

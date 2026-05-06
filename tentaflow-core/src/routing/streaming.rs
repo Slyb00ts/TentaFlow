@@ -428,6 +428,8 @@ impl Router {
                         fallbacks_tried: 0,
                         hop_count: 0,
                         latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                    usage: None,
+                    finish_reason: None,
                     };
                     return Ok(crate::routing::RouteResult {
                         response: filtered,
@@ -502,6 +504,8 @@ impl Router {
                         fallbacks_tried: 0,
                         hop_count: 0,
                         latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                    usage: None,
+                    finish_reason: None,
                     };
                     return Ok(crate::routing::RouteResult {
                         response: Box::pin(stream),
@@ -571,6 +575,8 @@ impl Router {
                         fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
                         hop_count: 0,
                         latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                    usage: None,
+                    finish_reason: None,
                     };
                     return Ok(crate::routing::RouteResult {
                         response: filtered,

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct TtsCleanNodeAdapter;
 
@@ -41,6 +41,14 @@ impl NodeAdapter for TtsCleanNodeAdapter {
 
     fn supported_output_ports(&self) -> &[&'static str] {
         OUTPUT_PORTS
+    }
+
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
     }
 
     async fn execute(

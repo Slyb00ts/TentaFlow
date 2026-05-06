@@ -189,6 +189,13 @@ impl DeployStrategy for PythonBundleDeploy {
         if let Some(model) = model_repo {
             env.insert("MODEL".into(), model);
         }
+        // VLLM_ARGS / gpu_memory_utilization sa pojeciami specyficznymi dla
+        // vllm. Inne python-bundle silniki (qwen-asr, parakeet, xtts itd.)
+        // odpalaja przez uvicorn lub wlasny entrypoint, ktore nie znaja
+        // `--gpu-memory-utilization` — bez tego guarda flaga byla appendowana
+        // do uvicorn argv przez `build_engine_args` (rozwija VLLM_ARGS env
+        // dla kazdego engine'a) i serwis padal na `No such option`.
+        let is_vllm = engine_id == "vllm";
         // Single source of truth dla --gpu-memory-utilization.
         //   - Manual mode: wizard wysyla user's value (top-level
         //     `gpu_memory_utilization` lub w `vllm_args`). Backend ją honoruje
@@ -201,15 +208,19 @@ impl DeployStrategy for PythonBundleDeploy {
         //     zeby vllm wstal niezaleznie od stanu hosta.
         // Niezaleznie od trybu, finalnie w VLLM_ARGS jest **dokladnie jedna**
         // flaga --gpu-memory-utilization — wszystkie poprzednie sa wyciete.
-        let user_explicit_ratio = env
-            .get("GPU_MEMORY_UTILIZATION")
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| {
-                self.user_config
-                    .get("gpu_memory_utilization")
-                    .and_then(|v| v.as_f64())
-            });
-        let from_vllm_args = env.get("VLLM_ARGS").and_then(|raw| {
+        let user_explicit_ratio = if !is_vllm {
+            None
+        } else {
+            env
+                .get("GPU_MEMORY_UTILIZATION")
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| {
+                    self.user_config
+                        .get("gpu_memory_utilization")
+                        .and_then(|v| v.as_f64())
+                })
+        };
+        let from_vllm_args = if !is_vllm { None } else { env.get("VLLM_ARGS").and_then(|raw| {
             let mut iter = raw.split_whitespace();
             while let Some(tok) = iter.next() {
                 if tok == "--gpu-memory-utilization" {
@@ -220,15 +231,19 @@ impl DeployStrategy for PythonBundleDeploy {
                 }
             }
             None
-        });
+        }) };
         // Wybor finalnej wartosci:
         //   1. user explicit (osobne pole) — zawsze wygrywa, manual mode
         //   2. wartosc w vllm_args (gdy wizard manual jeszcze nie laduje
         //      do osobnego pola) — manual mode legacy
         //   3. auto-safe z aktualnego free VRAM — auto mode / no-input
-        let final_ratio: Option<f64> = user_explicit_ratio
-            .or(from_vllm_args)
-            .or_else(auto_gpu_memory_utilization);
+        let final_ratio: Option<f64> = if !is_vllm {
+            None
+        } else {
+            user_explicit_ratio
+                .or(from_vllm_args)
+                .or_else(auto_gpu_memory_utilization)
+        };
         if let Some(ratio) = final_ratio {
             // Wytnij ewentualne stare wystapienia flagi z VLLM_ARGS.
             let cleaned = match env.get("VLLM_ARGS") {

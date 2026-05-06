@@ -19,7 +19,7 @@ use super::dispatchers::{
     MetricsSink, PiiRulesStore, PromptStore, SttDispatcher, TtsCleaningStore, TtsDispatcher,
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
-use super::types::FlowNode;
+use super::types::{FlowDataType, FlowNode};
 use crate::flow_engine::blob_store::BlobStore;
 
 /// Akumulator usage per-node — adaptery LLM/Embeddings pushują tu wynik,
@@ -122,6 +122,34 @@ pub trait NodeAdapter: Send + Sync {
         inputs: &[NodeInput],
         ctx: &ExecutionContext,
     ) -> Result<FlowEnvelope>;
+
+    /// Etap 2: typ danych przyjmowanych na danym input port. Default `Any`
+    /// (passthrough adaptery: trigger, output, condition, conversation_history,
+    /// session_context, speaker_context). Walidacja R8 sprawdza zgodność z
+    /// `edge.data_type` i z `output_port_type` producenta.
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Any
+    }
+
+    /// Etap 2: typ danych emitowanych na danym output port. Default `Any`.
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Any
+    }
+
+    /// Etap 2: ArtifactKey deklaracje — klucze które adapter MOŻE wyprodukować
+    /// w `envelope.artifacts`. Etap 2 używa to tylko jako dokumentacji i hint
+    /// dla GUI; walidacja R9 (consumer ↔ producent typu artefaktu) zostaje na
+    /// Etap 3.
+    fn produced_artifacts(&self) -> &[(&'static str, FlowDataType)] {
+        &[]
+    }
+
+    /// Etap 2: ArtifactKey deklaracje — klucze które adapter CZYTA z
+    /// `envelope.artifacts` (przez node config `read_artifact = "key"` albo
+    /// dedykowany input port w przyszłości). Etap 2 — same dokumentacja.
+    fn consumed_artifact_types(&self) -> &[(&'static str, FlowDataType)] {
+        &[]
+    }
 }
 
 /// Marker trait dla LLM adaptera — executor potrzebuje typed accessor żeby

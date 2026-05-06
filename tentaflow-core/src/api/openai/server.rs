@@ -248,6 +248,10 @@ async fn handle_chat_completions(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    // Etap 2: trailers opt-in. Klient z `X-Want-Trailers: true` dostaje
+    // dodatkowe `X-Tentaflow-{Latency-Ms,*Tokens,Finish-Reason}` headery
+    // wyciągnięte z `RouteMetadata` po blocking response.
+    let want_trailers = wants_trailers(req.headers());
     let user_ctx = req
         .extensions()
         .get::<crate::auth::acl::UserContext>()
@@ -370,6 +374,9 @@ async fn handle_chat_completions(
                                 .unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
                         );
                     }
+                }
+                if want_trailers {
+                    emit_trailer_headers(resp.headers_mut(), &route_result.metadata);
                 }
                 Ok(resp)
             }
@@ -1017,4 +1024,44 @@ fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -
         .map_or(false, |v| v == "true");
     let has_query = uri.query().map_or(false, |q| q.contains("debug=route"));
     has_header || has_query
+}
+
+/// Etap 2: czy klient prosi o trailery (`X-Want-Trailers: true`)? Streaming
+/// SSE ignoruje to dziś (HTTP/2 trailers wraca w stage 3) — używane tylko
+/// dla blocking response (chat / embeddings non-stream).
+fn wants_trailers(headers: &hyper::header::HeaderMap) -> bool {
+    headers
+        .get("x-want-trailers")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Emituje `X-Tentaflow-*` trailer-friendly headery z `RouteMetadata` na
+/// response. Używane tylko gdy `wants_trailers(req)` zwróci true.
+fn emit_trailer_headers(
+    headers: &mut hyper::header::HeaderMap,
+    metadata: &crate::routing::RouteMetadata,
+) {
+    if let Some(latency) = metadata.latency_ms {
+        if let Ok(v) = (latency as u64).to_string().parse() {
+            headers.insert("x-tentaflow-latency-ms", v);
+        }
+    }
+    if let Some(usage) = metadata.usage.as_ref() {
+        if let Ok(v) = usage.prompt_tokens.to_string().parse() {
+            headers.insert("x-tentaflow-prompt-tokens", v);
+        }
+        if let Ok(v) = usage.completion_tokens.to_string().parse() {
+            headers.insert("x-tentaflow-completion-tokens", v);
+        }
+        if let Ok(v) = usage.total_tokens.to_string().parse() {
+            headers.insert("x-tentaflow-total-tokens", v);
+        }
+    }
+    if let Some(fr) = metadata.finish_reason.as_deref() {
+        if let Ok(v) = fr.parse() {
+            headers.insert("x-tentaflow-finish-reason", v);
+        }
+    }
 }

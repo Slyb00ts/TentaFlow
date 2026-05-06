@@ -15,6 +15,8 @@ pub struct TtsRequest {
     pub text: String,
     pub voice: Option<String>,
     pub format: Option<String>, // "wav" | "mp3" | "ogg" — engine-specific
+    /// ISO-639-1 (np. "en", "pl") — backend wybiera locale syntezy. Etap 2.
+    pub language: Option<String>,
     pub user_id: Option<i64>,
     pub user_role: Option<String>,
 }

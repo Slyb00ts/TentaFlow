@@ -51,6 +51,36 @@ fn build_initial_envelope_inner(request: &ChatCompletionRequest) -> (FlowEnvelop
     env.meta
         .insert("model".into(), serde_json::Value::String(request.model.clone()));
 
+    // Etap 2: request seed params trafiają do envelope.meta. LlmNodeAdapter
+    // czyta je przez fallback `node.config -> envelope.meta`, więc operator
+    // może override'ować temperature etc. w node config flow, a brak override
+    // = użyj wartości z requestu.
+    if let Some(t) = request.temperature {
+        if let Some(num) = serde_json::Number::from_f64(t as f64) {
+            env.meta.insert("temperature".into(), serde_json::Value::Number(num));
+        }
+    }
+    if let Some(mt) = request.max_tokens {
+        env.meta.insert("max_tokens".into(), serde_json::Value::Number(mt.into()));
+    }
+    if let Some(tp) = request.top_p {
+        if let Some(num) = serde_json::Number::from_f64(tp as f64) {
+            env.meta.insert("top_p".into(), serde_json::Value::Number(num));
+        }
+    }
+    if let Some(fp) = request.frequency_penalty {
+        if let Some(num) = serde_json::Number::from_f64(fp as f64) {
+            env.meta
+                .insert("frequency_penalty".into(), serde_json::Value::Number(num));
+        }
+    }
+    if let Some(pp) = request.presence_penalty {
+        if let Some(num) = serde_json::Number::from_f64(pp as f64) {
+            env.meta
+                .insert("presence_penalty".into(), serde_json::Value::Number(num));
+        }
+    }
+
     let payload_text = request
         .messages
         .last()

@@ -14,7 +14,7 @@ use crate::flow_engine::envelope::{
     ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput,
 };
 use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "llm";
 
@@ -50,12 +50,22 @@ impl LlmNodeAdapter {
         ))
     }
 
-    fn pick_optional_f32(node: &FlowNode, key: &str) -> Option<f32> {
-        node.config.get(key).and_then(|v| v.as_f64()).map(|f| f as f32)
+    /// `node.config[key]` ma priorytet, fallback do `envelope.meta[key]`
+    /// (request seed). Etap 2 — symetrycznie do `pick_model`.
+    fn pick_optional_f32(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<f32> {
+        node.config
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .or_else(|| envelope.meta.get(key).and_then(|v| v.as_f64()))
+            .map(|f| f as f32)
     }
 
-    fn pick_optional_u32(node: &FlowNode, key: &str) -> Option<u32> {
-        node.config.get(key).and_then(|v| v.as_u64()).map(|u| u as u32)
+    fn pick_optional_u32(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<u32> {
+        node.config
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .or_else(|| envelope.meta.get(key).and_then(|v| v.as_u64()))
+            .map(|u| u as u32)
     }
 
     fn pick_stop(node: &FlowNode) -> Vec<String> {
@@ -121,8 +131,8 @@ impl LlmNodeAdapter {
         Ok(LlmRequest {
             model,
             messages,
-            temperature: Self::pick_optional_f32(node, "temperature"),
-            max_tokens: Self::pick_optional_u32(node, "max_tokens"),
+            temperature: Self::pick_optional_f32(node, envelope, "temperature"),
+            max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
             stop: Self::pick_stop(node),
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),
@@ -153,6 +163,16 @@ impl NodeAdapter for LlmNodeAdapter {
         // executora (compiled.is_streaming); end-shape validation
         // przyjdzie razem z executor rewrite w stage 1d.
         &["stream", "full"]
+    }
+
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        // Zarówno `stream` jak i `full` produkują Text. Multimodal LLM
+        // (Vision/Omni) jest osobnym node type w Etap 3.
+        FlowDataType::Text
     }
 
     async fn execute(
@@ -211,8 +231,8 @@ impl LlmAdapter for LlmNodeAdapter {
         Self::build_llm_request(node, envelope, ctx).unwrap_or_else(|_| LlmRequest {
             model: String::new(),
             messages: Self::build_messages(node, envelope),
-            temperature: Self::pick_optional_f32(node, "temperature"),
-            max_tokens: Self::pick_optional_u32(node, "max_tokens"),
+            temperature: Self::pick_optional_f32(node, envelope, "temperature"),
+            max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
             stop: Self::pick_stop(node),
             deadline: ctx.deadline,
             cancel_token: ctx.cancel_token.clone(),

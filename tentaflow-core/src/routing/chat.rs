@@ -120,6 +120,18 @@ impl Router {
                 .await
             {
                 Ok(Some(outcome)) => {
+                    // Etap 2: pull usage/finish_reason from outcome BEFORE
+                    // converting to ChatCompletionResponse (response only
+                    // carries them as Option<Usage> + choices.finish_reason).
+                    let usage = crate::routing::middleware::TokenUsageMetadata {
+                        prompt_tokens: outcome.usage.prompt_tokens,
+                        completion_tokens: outcome.usage.completion_tokens,
+                        total_tokens: outcome.usage.total_tokens,
+                    };
+                    let finish_reason = outcome
+                        .finish_reason
+                        .as_openai_str()
+                        .map(|s| s.to_string());
                     let mut response = flow_outcome_to_chat_response(outcome, &request.model);
                     // Codex H1 round 2: flow path tez musi przejsc przez
                     // response_middleware — wczesniej tylko direct executor
@@ -134,6 +146,8 @@ impl Router {
                         fallbacks_tried: 0,
                         hop_count: 0,
                         latency_ms: None,
+                        usage: Some(usage),
+                        finish_reason,
                     };
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
@@ -171,6 +185,17 @@ impl Router {
                         // is middleware-agnostic in MVP, so the caller
                         // gates here.
                         self.apply_response_middleware(&mut response)?;
+                        let usage = response.usage.as_ref().map(|u| {
+                            crate::routing::middleware::TokenUsageMetadata {
+                                prompt_tokens: u.prompt_tokens as u64,
+                                completion_tokens: u.completion_tokens as u64,
+                                total_tokens: u.total_tokens as u64,
+                            }
+                        });
+                        let finish_reason = response
+                            .choices
+                            .first()
+                            .and_then(|c| c.finish_reason.clone());
                         let route_metadata = crate::routing::RouteMetadata {
                             served_by_node: exec_ctx
                                 .route_metadata
@@ -188,6 +213,8 @@ impl Router {
                             fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
                             hop_count: 0,
                             latency_ms: Some(t2.elapsed().as_secs_f64() * 1000.0),
+                            usage,
+                            finish_reason,
                         };
                         crate::routing::RouteResult {
                             response,

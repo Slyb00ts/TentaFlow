@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "embeddings";
 
@@ -77,6 +77,16 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         &["full"]
     }
 
+    fn input_port_type(&self, _port: &str) -> FlowDataType {
+        FlowDataType::Text
+    }
+
+    fn output_port_type(&self, _port: &str) -> FlowDataType {
+        // Single-input case zwraca Embedding. Batch case (Json) wraca w
+        // Etap 3 razem z cardinality > 1.
+        FlowDataType::Embedding
+    }
+
     async fn execute(
         &self,
         node: &FlowNode,
@@ -90,9 +100,29 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
 
         let model = Self::pick_model(node, envelope)?;
         let text = Self::payload_text(envelope)?;
+        let dimensions = node
+            .config
+            .get("dimensions")
+            .and_then(|v| v.as_u64())
+            .or_else(|| envelope.meta.get("dimensions").and_then(|v| v.as_u64()))
+            .map(|n| n as u32);
+        let encoding_format = node
+            .config
+            .get("encoding_format")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                envelope
+                    .meta
+                    .get("encoding_format")
+                    .and_then(|v| v.as_str())
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let req = EmbeddingsRequest {
             model,
             inputs: vec![text],
+            dimensions,
+            encoding_format,
             user_id: ctx.user_id,
             user_role: ctx.user_role.clone(),
         };
