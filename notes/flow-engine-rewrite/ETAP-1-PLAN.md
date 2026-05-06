@@ -1091,6 +1091,30 @@ rm /home/critix/repos/rust/TentaFlow/tentaflow/target/debug/data/router.db*
 
 ---
 
+## Stage 1d todo (codex sanity check po 1c)
+
+Stage 1c (10 dispatcher impls + 13 node adapters) ukończone i przeszło codex review iteracyjnie. Codex zostawił 5 rzeczy do dopisania do planu 1d (executor rewrite + AdapterRegistry bootstrap), żeby nie były cichym debt'em:
+
+1. **Streaming end-shape validation** — sam membership portów nie wystarczy. `CompiledFlow::compile` (lub `validation::validate`) musi sprawdzać, że flow streaming ma dokładnie jednego producenta streamu (LLM z `from_port == "stream"`) i poprawny downstream shape (output node `mode == "stream"`, brak innych nodów po LLM na ścieżce do output).
+
+2. **Cancel/deadline semantics poza LLM** — dziś realnie honoruje je tylko `LlmDispatcherImpl` (wrapper). Stage 1d musi zdecydować: czy STT/TTS/embeddings/memory też mają być przerywalne na poziomie wrappera (mirror LLM pattern), czy executor przerywa topo-loop między node'ami i `cancel_token` w `ExecutionContext` przepływa przez adaptery wprost.
+
+3. **Usage/trace/finalizer contract** — executor musi precyzyjnie spiąć:
+   - `usage_sink.drain()` per node → `TraceStep.usage`,
+   - aggregate usage per flow → `FlowExecutionOutcome.usage`,
+   - `finish_reason`: ostatni LLM stream chunk dostarcza wartość; cancel/error z finalizera nadpisują;
+   - payload provenance przez trace (skoro payload nie siedzi w `artifacts`, jego "kto produkował" wynika z `TraceStep` w kolejności toposort).
+
+4. **ACL / user-context boundary** — wrappery runtime (`LlmDispatcherImpl`, `EmbeddingsDispatcherImpl`, `TtsDispatcherImpl`) robią dziś `RuntimeContext::new(None)`. Stage 1d musi nazwać wprost: gdzie ACL jest egzekwowane (handler? executor? wrapper?), co liczy się jako trusted internal call, i czy executor flow przekazuje user context (`ExecutionContext.user_id` / `user_role`) do `RuntimeContext` zamiast `None`.
+
+5. **Bootstrap invariants dla AdapterRegistry / ExecutionContext** — twarde wymagania startowe:
+   - wszystkie 13 adapterów zarejestrowane (sanity-check przy `Router::new` lub `cargo test` startowy),
+   - wszystkie 10 dispatcher implów wstrzyknięte do `ExecutionContext`,
+   - `initial_envelope`, `session_id`, `execution_id`, `cancel_token` ustawione na wejściu każdego execution path (`execute_blocking` / `execute_streaming`).
+   Bez tego połowa błędów wychodzi dopiero runtime'owo.
+
+---
+
 ## Otwarte ryzyka (świadomie zaakceptowane)
 
 1. **Brak replay determinism** — adaptery czytają live DB. OK w v1.
