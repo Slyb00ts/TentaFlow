@@ -7,15 +7,21 @@
 // =============================================================================
 
 pub mod condition;
+pub mod embeddings;
 pub mod llm;
 pub mod output;
 pub mod pii_filter;
+pub mod stt;
 pub mod trigger;
+pub mod tts;
 pub mod tts_clean;
 
 pub use condition::ConditionNodeAdapter;
+pub use embeddings::EmbeddingsNodeAdapter;
 pub use llm::LlmNodeAdapter;
 pub use output::OutputNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
+pub use stt::SttNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
+pub use tts::TtsNodeAdapter;
 pub use tts_clean::TtsCleanNodeAdapter;
