@@ -7,20 +7,28 @@
 // =============================================================================
 
 pub mod condition;
+pub mod conversation_history;
 pub mod embeddings;
 pub mod llm;
+pub mod memory;
 pub mod output;
 pub mod pii_filter;
+pub mod session_context;
+pub mod speaker_context;
 pub mod stt;
 pub mod trigger;
 pub mod tts;
 pub mod tts_clean;
 
 pub use condition::ConditionNodeAdapter;
+pub use conversation_history::ConversationHistoryNodeAdapter;
 pub use embeddings::EmbeddingsNodeAdapter;
 pub use llm::LlmNodeAdapter;
+pub use memory::MemoryNodeAdapter;
 pub use output::OutputNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
+pub use session_context::SessionContextNodeAdapter;
+pub use speaker_context::SpeakerContextNodeAdapter;
 pub use stt::SttNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
 pub use tts::TtsNodeAdapter;
