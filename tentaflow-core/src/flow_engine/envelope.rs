@@ -49,6 +49,21 @@ impl FlowValue {
             _ => None,
         }
     }
+
+    /// Krótki tag wariantu używany w komunikatach błędu adapterów —
+    /// "Audio", "Text", "Empty" itd. Pozwala adapterowi powiedzieć
+    /// dokładnie co dostał gdy spodziewał się innego wariantu.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            FlowValue::Empty => "Empty",
+            FlowValue::Text(_) => "Text",
+            FlowValue::Json(_) => "Json",
+            FlowValue::Audio { .. } => "Audio",
+            FlowValue::Image { .. } => "Image",
+            FlowValue::Video { .. } => "Video",
+            FlowValue::Embedding(_) => "Embedding",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

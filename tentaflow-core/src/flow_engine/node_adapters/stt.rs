@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::SttRequest;
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
 use crate::flow_engine::types::FlowNode;
 
@@ -92,7 +92,7 @@ impl NodeAdapter for SttNodeAdapter {
             other => {
                 return Err(anyhow!(
                     "stt adapter: payload must be Audio, got {}",
-                    payload_kind(other)
+                    other.kind()
                 ));
             }
         };
@@ -117,31 +117,25 @@ impl NodeAdapter for SttNodeAdapter {
         // do niego dostęp). Wykryty język w meta['detected_language'].
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Text(response.text);
-        out.artifacts.insert(
-            "source_audio".into(),
+        out.put_artifact(
+            "source_audio",
             FlowValue::Audio {
                 blob_ref,
                 mime: audio_mime,
                 sample_rate,
             },
-        );
+            ArtifactProvenance {
+                producer_node_id: node.id.clone(),
+                producer_node_type: NODE_TYPE.to_string(),
+                timestamp_ms: ctx.clock.now_ms(),
+            },
+        )
+        .map_err(|e| anyhow!("stt adapter: {e}"))?;
         if let Some(lang) = response.detected_language {
             out.meta
                 .insert("detected_language".into(), serde_json::Value::String(lang));
         }
         Ok(out)
-    }
-}
-
-fn payload_kind(v: &FlowValue) -> &'static str {
-    match v {
-        FlowValue::Empty => "Empty",
-        FlowValue::Text(_) => "Text",
-        FlowValue::Json(_) => "Json",
-        FlowValue::Audio { .. } => "Audio",
-        FlowValue::Image { .. } => "Image",
-        FlowValue::Video { .. } => "Video",
-        FlowValue::Embedding(_) => "Embedding",
     }
 }
 
