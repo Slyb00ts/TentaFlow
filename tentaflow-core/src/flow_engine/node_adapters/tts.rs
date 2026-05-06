@@ -207,9 +207,16 @@ mod tests {
         }
         async fn stream_synthesize(
             &self,
-            _req: TtsRequest,
+            req: TtsRequest,
         ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>> {
-            unimplemented!("FakeTts: stream_synthesize not used in TTS adapter tests")
+            *self.last.lock().unwrap() = Some(req);
+            let chunk = crate::flow_engine::dispatchers::TtsStreamChunk {
+                bytes_delta: vec![0u8; 8],
+                mime: "audio/wav".into(),
+                sample_rate: Some(22_050),
+                finish_reason: Some(crate::flow_engine::envelope::FinishReason::Stop),
+            };
+            Ok(Box::pin(futures::stream::once(async move { Ok(chunk) })))
         }
     }
 
