@@ -3,18 +3,17 @@
 //
 // Single owner STT path (D.3). Handler `/v1/audio/transcriptions`,
 // flow STT adapter i `executor.execute_stt` wszystkie deleguja przez
-// ten module. R5f (Codex blocker fix): owned dispatch — pre-R5f
-// SttRuntime delegowal do `Router.route_audio_transcription` ktore
-// po R3b.6 cutover stalo sie stub'em zwracajacym `AllBackendsUnavailable`,
-// wiec Whisper STT byl wylaczony. Logika z dawnego `LocalSttHandler`
-// przeniesiona tutaj jako primary backend.
+// ten module.
 //
-// Dispatch order:
-// 1. Local Whisper (`SttManager`) — jezeli engine zaladowany.
-// 2. (Future) QUIC sidecar — gdy `service_type=stt` i quic backend.
-// 3. (Future) Mesh forward przez executor / mesh manager.
+// Dispatch:
+//   * `transcribe_for_service(service_id, request)` — gdy service_id ma
+//     zarejestrowany Http backend (qwen-asr / parakeet / kyutai-tts
+//     przez python-bundle), uzywa go. Inaczej fallback do default local.
+//   * `transcribe(request)` — short-cut dla legacy/handler bez service
+//     selection; uzywa default local.
 // =============================================================================
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -23,26 +22,59 @@ use crate::api::openai::types::{
     TranscriptionRequest, TranscriptionResponse, TranscriptionSegment,
 };
 use crate::error::{CoreError, Result};
+use crate::services::backend::client::BackendClient;
 use crate::stt::{SttManager, TranscribeParams};
 
 use tracing::debug;
 
-/// Single owner STT dispatch.
+/// Backend dla pojedynczego STT service. Local = embedded Whisper przez
+/// shared SttManager (singleton). Http = python-bundle wrapper przez
+/// BackendClient (multipart `/v1/audio/transcriptions`).
+pub enum SttBackend {
+    Local(Arc<RwLock<SttManager>>),
+    Http(Arc<BackendClient>),
+}
+
+/// Single owner STT dispatch z rejestracja per-service backendow.
 pub struct SttRuntime {
-    stt_manager: Arc<RwLock<SttManager>>,
+    /// Default fallback dla legacy callerow / handler-only scenarios.
+    /// Wskazuje na global `shared_stt_manager()` singleton.
+    default_local: Arc<RwLock<SttManager>>,
+    /// Mapa service_id → backend. Supervisor reconcile rejestruje
+    /// `Http(BackendClient)` dla zywych python-bundle / docker STT
+    /// services, plus `Local(SttManager)` dla embedded.
+    backends: tokio::sync::RwLock<HashMap<i64, SttBackend>>,
 }
 
 impl SttRuntime {
     pub fn new() -> Self {
         Self {
-            stt_manager: crate::stt::shared_stt_manager(),
+            default_local: crate::stt::shared_stt_manager(),
+            backends: tokio::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Field accessor dla legacy callerow (testy, sync probes).
+    pub fn stt_manager(&self) -> Arc<RwLock<SttManager>> {
+        self.default_local.clone()
+    }
+
+    /// Rejestruje backend dla service_id. Wywolywane przez supervisor
+    /// reconcile po starcie / restart STT service. Nadpisuje istniejacy
+    /// wpis (bezpieczne dla redeploy z nowa konfiguracja).
+    pub async fn register_backend(&self, service_id: i64, backend: SttBackend) {
+        self.backends.write().await.insert(service_id, backend);
+    }
+
+    /// Usuwa backend dla service_id (przy stop / delete).
+    pub async fn unregister_backend(&self, service_id: i64) {
+        self.backends.write().await.remove(&service_id);
     }
 
     /// Czy jest zaladowany jakikolwiek model STT (sync probe — uzywa
     /// try_read na RwLock, fallback do `false` gdy lock zajety).
     pub fn is_available_sync(&self) -> bool {
-        match self.stt_manager.try_read() {
+        match self.default_local.try_read() {
             Ok(mgr) => mgr.active_engine().map(|e| e.is_loaded()).unwrap_or(false),
             Err(_) => false,
         }
@@ -85,7 +117,7 @@ impl SttRuntime {
         };
 
         let result = {
-            let mgr = self.stt_manager.read().await;
+            let mgr = self.default_local.read().await;
             let engine = mgr.active_engine().ok_or_else(|| CoreError::InternalError {
                 message: "no STT engine loaded".to_string(),
                 source: None,
@@ -177,6 +209,36 @@ impl SttRuntime {
             segments,
             speakers: None,
         })
+    }
+
+    /// Transcribe z wyborem backendu po `service_id`. Gdy supervisor
+    /// zarejestrowal `Http(BackendClient)` (qwen-asr / parakeet python-
+    /// bundle), wywoluje `audio_transcription` przez HTTP. Inaczej
+    /// fallback do `Local(SttManager)` (embedded whisper).
+    pub async fn transcribe_for_service(
+        &self,
+        service_id: i64,
+        request: TranscriptionRequest,
+    ) -> Result<TranscriptionResponse> {
+        let backend_kind = {
+            let backends = self.backends.read().await;
+            match backends.get(&service_id) {
+                Some(SttBackend::Http(client)) => Some(client.clone()),
+                _ => None,
+            }
+        };
+        if let Some(client) = backend_kind {
+            return client
+                .audio_transcription(request)
+                .await
+                .map_err(|e| CoreError::InternalError {
+                    message: format!("audio_transcription HTTP backend: {}", e),
+                    source: None,
+                }
+                .into());
+        }
+        // Local fallback (embedded whisper przez default_local).
+        self.transcribe(request).await
     }
 }
 

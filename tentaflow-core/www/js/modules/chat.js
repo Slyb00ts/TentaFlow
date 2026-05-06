@@ -213,6 +213,17 @@ function renderConvList() {
 
 // ---- Bubble rendering ----------------------------------------------------
 
+// Persistowany stan rozwiniecia <think> blokow per (msgId, blockIdx). Mapa
+// zyje przez cala sesje GUI — virtualizer re-renderuje bubble przy scrollu,
+// bez tej mapy `<details>` traci `open` po wyjsciu z viewport. Klucz to
+// `${msgId}-${blockIdx}`. Brak wpisu = uzyj defaultu (streaming -> open).
+const thinkOpenState = new Map();
+
+function getThinkOpenState(key) {
+  if (!key) return undefined;
+  return thinkOpenState.has(key) ? thinkOpenState.get(key) : undefined;
+}
+
 function renderBubble(msg) {
   const isUser = msg.role === 'user';
   const isSystem = msg.role === 'system';
@@ -221,7 +232,11 @@ function renderBubble(msg) {
 
   const bubbleHtml = isUser
     ? escapeHtml(msg.text || '').replaceAll('\n', '<br>')
-    : renderMarkdown(msg.text || '', { streaming: isStreaming });
+    : renderMarkdown(msg.text || '', {
+        streaming: isStreaming,
+        thinkKeyPrefix: String(msg.id || ''),
+        getThinkOpen: getThinkOpenState,
+      });
   const streamCaret = isStreaming && !isUser ? '<span class="streaming-caret"></span>' : '';
 
   const avatar = isUser
@@ -306,14 +321,36 @@ function itemHeight(msg) {
   const text = msg.text || '';
 
   let extra = 0;
+  let measuredText = text;
   if (!isUser) {
     const fenceMatches = text.match(/```/g) || [];
     extra += Math.floor(fenceMatches.length / 2) * FENCE_HEADER_PX;
-    const thinkMatches = text.match(/<think(?:ing)?>/gi) || [];
-    extra += thinkMatches.length * THINK_COLLAPSED_PX;
+    // Thinking block jest collapsed w DOM (md-lite renderuje <details>), wiec
+    // jego dlugosc tekstu NIE liczy sie do wysokosci bubble — zliczamy tylko
+    // chip (THINK_COLLAPSED_PX). Detekcja implicit-open: jezeli widzimy
+    // </think> bez wczesniejszego <think>, calosc PRZED tagiem to thinking.
+    const closingRe = /<\/think(?:ing)?>/gi;
+    const explicitRe = /<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi;
+    let stripped = text;
+    let blockCount = 0;
+    stripped = stripped.replace(explicitRe, () => {
+      blockCount += 1;
+      return '';
+    });
+    const closes = stripped.match(closingRe);
+    if (closes && closes.length > 0) {
+      const lastClose = stripped.search(/<\/think(?:ing)?>[^<]*$/i);
+      if (lastClose >= 0) {
+        const tagEnd = stripped.indexOf('>', lastClose) + 1;
+        stripped = stripped.slice(tagEnd);
+        blockCount += 1;
+      }
+    }
+    extra += blockCount * THINK_COLLAPSED_PX;
+    measuredText = stripped;
   }
 
-  const txtHeight = measureBubbleHeight(text, bubbleMax);
+  const txtHeight = measureBubbleHeight(measuredText, bubbleMax);
   // Bubble padding (24) + meta row (18) + row gap (20) + actions (28).
   return Math.max(60, txtHeight + extra + 90);
 }
@@ -329,9 +366,26 @@ function computeInnerWidth(host) {
   return Math.max(80, host.clientWidth - pl - pr);
 }
 
+// Delegated `toggle` listener na <details data-think-key>. Mountowany raz
+// per host przez `dataset.thinkToggleBound`, zeby remount listy nie podpinal
+// drugiej kopii. `toggle` event bublu, capture=true zlapie go z dowolnego
+// rozwinietego/zwinietego details w drzewie.
+function ensureThinkToggleListener(host) {
+  if (!host || host.dataset.thinkToggleBound === '1') return;
+  host.dataset.thinkToggleBound = '1';
+  host.addEventListener('toggle', (e) => {
+    const det = e.target;
+    if (!(det instanceof HTMLDetailsElement)) return;
+    const key = det.getAttribute('data-think-key');
+    if (!key) return;
+    thinkOpenState.set(key, det.open);
+  }, true);
+}
+
 function mountVList() {
   const host = byId('chat-body');
   if (!host) return;
+  ensureThinkToggleListener(host);
   listWidth = computeInnerWidth(host);
   const conv = activeConv();
   const messages = conv ? conv.messages : [];

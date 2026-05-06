@@ -10,16 +10,16 @@ path = "src/lib.rs"
 
 [dependencies]
 # ONNX protobuf parser — tylko do wyciagania tensorow po nazwach z pliku modelu
-prost = "0.13"
+prost = "0.14.3"
 
 # SIMD portable — SSE/AVX/NEON dla conv1d, matmul, batch norm hot loops
-wide = "0.7"
+wide = "1.3.0"
 
 # FFT dla fbank features (pure Rust, no C deps)
 rustfft = "6.2"
 
 # Parallelizacja hot loops (Conv1D po out_channels) — CPU multi-core
-rayon = "1.10"
+rayon = "1.12.0"
 
 # Error handling
 thiserror = "2"
@@ -29,7 +29,7 @@ tracing = "0.1"
 
 [build-dependencies]
 # Generuje struct Rust z .proto schemy ONNX
-prost-build = "0.13"
+prost-build = "0.14.3"
 
 # protobuf-src fallback dostarcza protoc zbudowanego z sourca gdy system go
 # nie ma. NIE WLACZAMY na Windows — MSVC link ma problemy z UCRT vs CRT
@@ -40,7 +40,7 @@ protobuf-src = "2"
 
 [dev-dependencies]
 # Benchmarki
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 anyhow = "1"
 
 [[bench]]

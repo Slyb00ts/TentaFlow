@@ -68,7 +68,12 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///     Pole `speakers` jest `Option` z `skip_serializing_if` zeby starsi
 ///     klienci nie crashowali — ale brak guarantee dla TranscriptionRequest
 ///     jezeli ktokolwiek deserialize'owalby przez rkyv (REST multipart only).
-pub const SCHEMA_VERSION: u16 = 12;
+// v13 changes: ServiceInfo niesie typed `request_time_parameters`
+// (RequestTimeParameters + KeyValue), AudioOperation::STT pole
+// `extra_params: Option<String>` (typed JSON dla sidecar multipart
+// `data` field). Wire layout zmieniony — old/new node mix odrzucany
+// przy handshake.
+pub const SCHEMA_VERSION: u16 = 13;
 
 // =============================================================================
 // Message kind discriminants

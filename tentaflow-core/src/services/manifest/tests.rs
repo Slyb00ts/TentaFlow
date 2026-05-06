@@ -112,6 +112,7 @@ fn make_manifest(engine: Engine, deploy: DeploySection) -> ServiceManifest {
         engine,
         deploy,
         model_presets: Vec::new(),
+        parameters: Vec::new(),
         docker_source_hash: String::new(),
         native_source_hash: String::new(),
     }
@@ -954,6 +955,7 @@ mod capability_axes {
             engine,
             deploy: external_deploy(),
             model_presets: vec![],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }
@@ -966,6 +968,7 @@ mod capability_axes {
             engine,
             deploy: external_deploy(),
             model_presets: vec![preset],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }
@@ -1128,5 +1131,326 @@ mod capability_axes {
                 m
             );
         }
+    }
+}
+
+// =============================================================================
+// GRUPA F: Parsowanie [[parameter]] schemy
+// =============================================================================
+
+#[cfg(test)]
+mod parameter_schema_tests {
+    use super::*;
+
+    /// F1: Manifest bez sekcji [[parameter]] parsuje się z pustą listą.
+    /// To no-op invariant — wszystkie 28 obecnych manifestów musi działać.
+    #[test]
+    fn parse_manifest_without_parameters_section() {
+        let toml_src = r#"
+[engine]
+id = "no-params"
+category = "llm"
+name = "No Params"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "MIT"
+default_port = 8000
+api = "openai-compatible"
+version = "0.1.0"
+
+[deploy.docker]
+context_path = "llm/docker/no-params"
+platforms = ["linux"]
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse manifest");
+        assert!(parsed.parameters.is_empty());
+    }
+
+    /// F2: Pełen parametr z env binding.
+    #[test]
+    fn parse_parameter_with_env_binding() {
+        let toml_src = r#"
+[engine]
+id = "vllm-test"
+category = "llm"
+name = "Vllm Test"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "Apache-2.0"
+default_port = 8000
+api = "openai-compatible"
+version = "0.1.0"
+
+[deploy.docker]
+context_path = "llm/docker/vllm-test"
+platforms = ["linux"]
+
+[[parameter]]
+key = "gpu_memory_utilization"
+label_pl = "Wykorzystanie VRAM"
+label_en = "GPU memory utilization"
+kind = "float"
+range = { min = 0.1, max = 0.95, step = 0.05 }
+default = 0.9
+
+[[parameter.bindings]]
+when = "docker"
+type = "env"
+name = "GPU_MEMORY_UTILIZATION"
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse manifest");
+        assert_eq!(parsed.parameters.len(), 1);
+        let p = &parsed.parameters[0];
+        assert_eq!(p.key, "gpu_memory_utilization");
+        assert_eq!(p.kind, ParameterKind::Float);
+        let range = p.range.expect("range");
+        assert!((range.min - 0.1).abs() < 1e-9);
+        assert!((range.max - 0.95).abs() < 1e-9);
+        assert!((range.step.unwrap() - 0.05).abs() < 1e-9);
+        assert_eq!(p.bindings.len(), 1);
+        assert_eq!(p.bindings[0].when, DeployTarget::Docker);
+        match &p.bindings[0].target {
+            BindingTarget::Env { name } => assert_eq!(name, "GPU_MEMORY_UTILIZATION"),
+            other => panic!("expected env binding, got {:?}", other),
+        }
+    }
+
+    /// F3: Parametr z dual binding (embedded llamacpp_field + docker env).
+    /// Reprezentuje llama-cpp ctx_size.
+    #[test]
+    fn parse_parameter_with_dual_binding() {
+        let toml_src = r#"
+[engine]
+id = "llama-cpp-test"
+category = "llm"
+name = "Llama CPP Test"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "MIT"
+default_port = 8000
+api = "openai-compatible"
+version = "0.1.0"
+
+[deploy.docker]
+context_path = "llm/docker/llama-cpp-test"
+platforms = ["linux"]
+
+[[parameter]]
+key = "ctx_size"
+label_pl = "Kontekst"
+label_en = "Context"
+kind = "int"
+range = { min = 512, max = 131072, step = 512 }
+default = 8192
+
+[[parameter.bindings]]
+when = "native_embedded"
+type = "llamacpp_field"
+field = "ctx_size"
+
+[[parameter.bindings]]
+when = "docker"
+type = "env"
+name = "CTX_SIZE"
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse manifest");
+        let p = &parsed.parameters[0];
+        assert_eq!(p.bindings.len(), 2);
+        assert_eq!(p.bindings[0].when, DeployTarget::NativeEmbedded);
+        match &p.bindings[0].target {
+            BindingTarget::LlamacppField { field } => assert_eq!(field, "ctx_size"),
+            other => panic!("expected llamacpp_field, got {:?}", other),
+        }
+        assert_eq!(p.bindings[1].when, DeployTarget::Docker);
+        match &p.bindings[1].target {
+            BindingTarget::Env { name } => assert_eq!(name, "CTX_SIZE"),
+            other => panic!("expected env, got {:?}", other),
+        }
+    }
+
+    /// F4: Whisper field z request_override flag.
+    #[test]
+    fn parse_whisper_field_with_request_override() {
+        let toml_src = r#"
+[engine]
+id = "whisper-test"
+category = "stt"
+name = "Whisper Test"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "MIT"
+default_port = 8000
+api = "openai-compatible"
+version = "0.1.0"
+
+[deploy.native]
+runtime = "embedded"
+platforms = ["linux"]
+feature_flag = "inference-whisper"
+
+[[parameter]]
+key = "beam_size"
+label_pl = "Beam"
+label_en = "Beam"
+kind = "int"
+range = { min = 1, max = 16 }
+default = 5
+
+[[parameter.bindings]]
+when = "native_embedded"
+type = "whisper_field"
+field = "default_beam_size"
+request_override = true
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse");
+        let p = &parsed.parameters[0];
+        match &p.bindings[0].target {
+            BindingTarget::WhisperField {
+                field,
+                request_override,
+            } => {
+                assert_eq!(field, "default_beam_size");
+                assert!(*request_override);
+            }
+            other => panic!("expected whisper_field, got {:?}", other),
+        }
+    }
+
+    /// F5: Bool kind + ollama_options binding.
+    #[test]
+    fn parse_bool_with_ollama_options() {
+        let toml_src = r#"
+[engine]
+id = "ollama-test"
+category = "llm"
+name = "Ollama Test"
+description_pl = "p"
+description_en = "e"
+homepage = "https://ollama.ai"
+license = "MIT"
+default_port = 11434
+api = "ollama-native"
+version = "0.1.0"
+
+[deploy.external]
+detection_binary = "ollama"
+detection_endpoint = "http://localhost:11434"
+detection_health_path = "/api/tags"
+platforms = ["linux", "macos"]
+
+[[parameter]]
+key = "context_size"
+label_pl = "Kontekst"
+label_en = "Context"
+kind = "int"
+range = { min = 512, max = 131072 }
+default = 8192
+
+[[parameter.bindings]]
+when = "external"
+type = "ollama_options"
+key = "num_ctx"
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse");
+        let p = &parsed.parameters[0];
+        match &p.bindings[0].target {
+            BindingTarget::OllamaOptions { key } => assert_eq!(key, "num_ctx"),
+            other => panic!("expected ollama_options, got {:?}", other),
+        }
+    }
+
+    /// F6: Enum kind z options.
+    #[test]
+    fn parse_enum_with_options() {
+        let toml_src = r#"
+[engine]
+id = "enum-test"
+category = "llm"
+name = "Enum Test"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "MIT"
+default_port = 8000
+api = "openai-compatible"
+version = "0.1.0"
+
+[deploy.docker]
+context_path = "llm/docker/enum-test"
+platforms = ["linux"]
+
+[[parameter]]
+key = "kv_cache_dtype"
+label_pl = "KV cache dtype"
+label_en = "KV cache dtype"
+kind = "enum"
+options = ["auto", "fp8", "fp8_e5m2", "fp8_e4m3"]
+default = "auto"
+
+[[parameter.bindings]]
+when = "docker"
+type = "env"
+name = "KV_CACHE_DTYPE"
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse");
+        let p = &parsed.parameters[0];
+        assert_eq!(p.kind, ParameterKind::Enum);
+        let opts = p.options.as_ref().expect("options");
+        assert_eq!(opts.len(), 4);
+        assert_eq!(opts[0], "auto");
+    }
+
+    /// Sanity check: lista wymaganych pol w runtime EngineParameter
+    /// musi byc spelniona — gdy ktos doda pole (np. `description_pl`),
+    /// ten test przypomina by dorzucic je tez do build.rs mirror'a.
+    /// `build.rs` rejestruje wlasna kopie typow w `services_manifest_build`
+    /// (linia ~641) — sync jest manualny, zgodnie z komentarzem tam.
+    #[test]
+    fn engine_parameter_required_fields_present() {
+        let toml_src = r#"
+[engine]
+id = "parity-test"
+category = "llm"
+name = "Parity"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "MIT"
+default_port = 8000
+api = "openai-compatible"
+version = "0.1.0"
+
+[deploy.docker]
+context_path = "llm/docker/parity-test"
+platforms = ["linux"]
+
+[[parameter]]
+key = "k"
+label_pl = "K"
+label_en = "K"
+kind = "int"
+range = { min = 1, max = 100 }
+default = 50
+[[parameter.bindings]]
+when = "docker"
+type = "env"
+name = "K"
+"#;
+        let parsed: ServiceManifest = toml::from_str(toml_src).expect("runtime parser");
+        assert_eq!(parsed.parameters.len(), 1);
+        let p = &parsed.parameters[0];
+        // Wymagane pola — kazdy musi byc obecny w obu typach (runtime + build.rs).
+        assert_eq!(p.key, "k");
+        assert_eq!(p.label_pl, "K");
+        assert_eq!(p.label_en, "K");
+        assert_eq!(p.kind, ParameterKind::Int);
+        assert!(p.range.is_some());
+        assert!(p.options.is_none());
+        assert_eq!(p.default, serde_json::json!(50));
+        assert_eq!(p.bindings.len(), 1);
     }
 }

@@ -64,6 +64,19 @@ pub struct BackendClient {
     /// Pre-built URL dla /audio/transcriptions
     audio_transcriptions_url: String,
     audio_speech_url: String,
+
+    /// Typed request-time parameters z `services.config_json` propagowane
+    /// przez `LiveHandlesCache`. Backend materializuje je przy kazdym
+    /// requestcie:
+    ///   * `ollama_options` → pole `options` w POST body do `/api/generate`/
+    ///     `/api/chat`.
+    ///   * `python_request` → ekstra fields w POST body do generic Python
+    ///     wrappera (qwen-asr, kyutai-tts, xtts itd.). Multipart audio
+    ///     dostaje to jako pole `data=<json>`.
+    ///   * `whisper_overridable` / `mlx_overridable` — deploy defaults z
+    ///     `request_override = true`; konsumowane przez embedded loader, nie
+    ///     przez BackendClient (dla HTTP/QUIC trafia przez python_request).
+    request_overrides: tentaflow_protocol::RequestTimeParameters,
 }
 
 impl BackendClient {
@@ -81,6 +94,21 @@ impl BackendClient {
     pub fn new(
         config: ServiceBackend,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
+    ) -> Result<Self> {
+        Self::with_overrides(
+            config,
+            circuit_breaker_config,
+            tentaflow_protocol::RequestTimeParameters::default(),
+        )
+    }
+
+    /// Wariant `new` przyjmujacy typed request-time overrides z
+    /// `LiveHandlesCache`. Wartosci sa serializowane do request body przy
+    /// kazdym chat/transcription/speech callu.
+    pub fn with_overrides(
+        config: ServiceBackend,
+        circuit_breaker_config: Option<CircuitBreakerConfig>,
+        request_overrides: tentaflow_protocol::RequestTimeParameters,
     ) -> Result<Self> {
         use crate::config::ConnectionType;
 
@@ -173,6 +201,7 @@ impl BackendClient {
             embeddings_url,
             audio_transcriptions_url,
             audio_speech_url,
+            request_overrides,
         })
     }
 
@@ -197,6 +226,58 @@ impl BackendClient {
         }
     }
 
+    /// Wstrzykuje typed request-time overrides do body chat completion:
+    ///   * `ollama_options` → `body.options[key] = value`. Ollama API
+    ///     czyta options z root POST body do `/api/generate`/`/api/chat`.
+    ///   * `python_request` → top-level `body[key] = value`. Generic
+    ///     Python wrappery oczekuja zaplanowanych pol w glownym body.
+    /// Whisper/mlx overridable NIE ida tu — tylko przez audio paths
+    /// (transcribe).
+    fn apply_chat_overrides(&self, body: &mut serde_json::Value) {
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        if !self.request_overrides.ollama_options.is_empty() {
+            let options = obj
+                .entry("options")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(opts) = options.as_object_mut() {
+                for kv in &self.request_overrides.ollama_options {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&kv.value_json) {
+                        opts.insert(kv.key.clone(), v);
+                    }
+                }
+            }
+        }
+        for kv in &self.request_overrides.python_request {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&kv.value_json) {
+                obj.insert(kv.key.clone(), v);
+            }
+        }
+    }
+
+    /// Wariant dla audio multipart: zwraca pole `data=<json>` ktore
+    /// nalezy dolepic do `multipart::Form` gdy `python_request` jest
+    /// niepusty. Wrappery Python parsuja `data` jako JSON i applikuja
+    /// wartosci do request handler. Pusty Vec → None (brak field do
+    /// dolepienia).
+    fn audio_overrides_data_field(&self) -> Option<String> {
+        if self.request_overrides.python_request.is_empty() {
+            return None;
+        }
+        let mut map = serde_json::Map::new();
+        for kv in &self.request_overrides.python_request {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&kv.value_json) {
+                map.insert(kv.key.clone(), v);
+            }
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map).to_string())
+        }
+    }
+
     /// Wysyla chat completion request do backendu.
     ///
     /// Parsuje request do JSON, wysyla POST do /v1/chat/completions,
@@ -211,30 +292,33 @@ impl BackendClient {
         let url = &self.chat_completions_url;
         debug!("Wysylanie chat completion do: {}", url);
 
-        // Wyslij POST request (dla formatu openai bezposrednia serializacja, inaczej transformacja)
-        let response = if self.needs_transform() {
-            let request_body = self.transform_request(&request)?;
-            self.client
-                .post(url)
-                .header("Authorization", self.auth_header_value.as_str())
-                .header("Content-Type", "application/json")
-                .json(&request_body)
-                .send()
-                .await
+        // Buduj body: priorytet ma `transform_request` dla non-OpenAI
+        // formatow, w przeciwnym razie OpenAI-spec request. Po wybraniu
+        // bazowego body wstrzykujemy `request_overrides` (Ollama options,
+        // python_request extra fields).
+        let mut body = if self.needs_transform() {
+            self.transform_request(&request)?
         } else {
-            self.client
-                .post(url)
-                .header("Authorization", self.auth_header_value.as_str())
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-        }
-        .map_err(|e| {
-            let error = self.map_reqwest_error(e);
-            self.circuit_breaker.record_failure();
-            error
-        })?;
+            serde_json::to_value(&request).map_err(|e| CoreError::InternalError {
+                message: "serializacja chat request".to_string(),
+                source: Some(e.into()),
+            })?
+        };
+        self.apply_chat_overrides(&mut body);
+
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", self.auth_header_value.as_str())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                let error = self.map_reqwest_error(e);
+                self.circuit_breaker.record_failure();
+                error
+            })?;
 
         let status = response.status();
         debug!("Response status: {}", status);
@@ -302,13 +386,19 @@ impl BackendClient {
         let url = &self.chat_completions_url;
         debug!("Wysylanie streaming chat completion do: {}", url);
 
-        // Wyslij POST request
+        // Buduj body z typed request-time overrides (jak chat_completion).
+        let mut body = serde_json::to_value(&request).map_err(|e| CoreError::InternalError {
+            message: "serializacja stream request".to_string(),
+            source: Some(e.into()),
+        })?;
+        self.apply_chat_overrides(&mut body);
+
         let response = self
             .client
             .post(url)
             .header("Authorization", self.auth_header_value.as_str())
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| {
@@ -691,6 +781,13 @@ impl BackendClient {
             }
         }
 
+        // Typed request-time overrides z LiveHandlesCache (python_request).
+        // Wrappery Python (qwen-asr, parakeet) parsuja pole `data` jako
+        // JSON i applikuja wartosci po deserializacji.
+        if let Some(data_json) = self.audio_overrides_data_field() {
+            form = form.text("data", data_json);
+        }
+
         // Wyslij POST request
         let response = self
             .client
@@ -775,6 +872,10 @@ impl BackendClient {
         if let Some(override_name) = self.config.model_name_override.as_deref() {
             body["model"] = serde_json::Value::String(override_name.to_string());
         }
+        // Typed request-time overrides — TTS wrappery (kyutai-tts,
+        // chatterbox, xtts itd.) konsumuja extra fields w body POST do
+        // `/v1/audio/speech`.
+        self.apply_chat_overrides(&mut body);
 
         debug!(
             "audio_speech POST {} (model={}, input_len={}, voice={})",

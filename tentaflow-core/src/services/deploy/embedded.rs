@@ -236,10 +236,31 @@ impl EmbeddedDeploy {
             );
         }
 
+        // Typed deploy params z manifest schema. apply_parameters_deploy
+        // produkuje `app.llamacpp` / `app.mlx` mapy (load-time tunables
+        // jak ctx_size/n_gpu_layers/threads/batch_size dla llama-cpp;
+        // request-time defaults dla mlx). DeployTarget::NativeEmbedded
+        // dla wszystkich embedded LLM/STT.
+        let (app, _req_time) = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::NativeEmbedded,
+        )
+        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+        // _req_time intentionally dropped here — `prepare()` re-runs
+        // apply_parameters_deploy gdy serializuje config_json zeby
+        // request_time_parameters byly persystowane (snapshot_builder
+        // potem czyta z config_json).
+
+        let deploy_params = crate::inference::DeployParamsSnapshot {
+            llamacpp: app.llamacpp.clone(),
+            mlx: app.mlx.clone(),
+        };
+
         let shared = crate::inference::shared_inference_manager();
         let mut manager = shared.write().await;
         let info = manager
-            .load_model(&load_path, None, Some(preferred_backend))
+            .load_model(&load_path, deploy_params, Some(preferred_backend))
             .await
             .map_err(|e| {
                 DeployError::Other(format!(
@@ -340,7 +361,18 @@ impl DeployStrategy for EmbeddedDeploy {
                 serde_json::Value::String(path.to_string_lossy().to_string()),
             );
         }
-        let config_json = serde_json::to_string(&persisted_config)
+        // Re-aplikuj typed parametry zeby request_time trafilo do config_json.
+        // Dla embedded vision (Category::Vision) `parameters` jest puste i
+        // RequestTimeParameters::default() — no-op. Embedded LLM/STT z
+        // parametrami dorzucamy faktyczne wartosci.
+        let request_time = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::NativeEmbedded,
+        )
+        .map(|(_, req)| req)
+        .unwrap_or_default();
+        let config_json = super::merge_config_json(&persisted_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
         Ok(PreparedDeploy {
@@ -419,6 +451,7 @@ mod tests {
                 input_modalities: None,
                 output_modalities: None,
             }],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }

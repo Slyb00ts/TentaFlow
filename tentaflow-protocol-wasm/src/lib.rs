@@ -4663,6 +4663,15 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 .unwrap_or_else(|_| "{}".to_string());
             set(&obj, "json", json.into());
         }
+        MessageBody::EngineRecommendRequestBody(_) => {
+            set(&obj, "variant", "EngineRecommendRequest".into());
+        }
+        MessageBody::EngineRecommendResponseBody(payload) => {
+            set(&obj, "variant", "EngineRecommendResponse".into());
+            let json = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{}".to_string());
+            set(&obj, "json", json.into());
+        }
     }
     Ok(obj.into())
 }

@@ -39,6 +39,8 @@ class SpeechRequest(BaseModel):
     language: Optional[str] = None  # "Polish", "English", ...
     response_format: Optional[str] = "wav"
     speed: Optional[float] = 1.0
+    # Pozwol na typed request-time overrides z BackendClient.
+    model_config = {"extra": "allow"}
 
 
 app = FastAPI(title="Chatterbox MLX (mlx-audio)", version="0.4.2")

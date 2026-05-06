@@ -12,17 +12,17 @@ path = "src/main.rs"
 # Protokol i transport iroh
 tentaflow-protocol = { path = "../../../../tentaflow-protocol" }
 tentaflow-transport = { path = "../../../../tentaflow-transport" }
-iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
+iroh = { version = "0.98.2", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.52.2", features = ["full"] }
 
 # Automatyzacja przegladarki
 chromiumoxide = "0.9"
 futures = "0.3"
 
 # WebSocket serwer localhost — most audio miedzy Chromium (JS) a Rust
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29.0"
 
 # Lock-free atomic snapshot — uzywany dla roster JSON cache (dom_observer ->
 # STT hot path). Pozwala uniknac async RwLock + serde_json::to_string per
@@ -34,7 +34,7 @@ tentaflow-voice = { path = "../../../../tentaflow-voice" }
 parking_lot = "0.12"
 
 # Konfiguracja
-toml = "0.8"
+toml = "1.1.2+spec-1.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -56,7 +56,7 @@ bytemuck = "1"
 base64 = "0.22.1"
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
 name = "noop"

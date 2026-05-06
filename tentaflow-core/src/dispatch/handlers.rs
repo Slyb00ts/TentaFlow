@@ -3848,6 +3848,198 @@ pub async fn deploy_vllm_recommend(
     ))
 }
 
+/// Generyczny auto-tuner — zwraca typed `parameters` mape per silnik.
+/// Wizard JS pre-filluje formularz (`tf-parameter-form`) z tej mapy.
+/// Dispatch po `engine_id`:
+///   * vllm/vllm-metal/sglang/tensorrt-llm — uzywa `auto_fit_config` jako
+///     core, mapuje pola na kanoniczne klucze schema parametrow.
+///   * llama-cpp — `ctx_size` z HF max_position_embeddings (clamp 32k),
+///     `n_gpu_layers=999`, `threads=cpus/2`.
+///   * ollama — defaultowe wartosci context_size/num_gpu/num_thread/num_batch.
+///   * whisper/mlx-whisper — beam_size=5, n_threads=cpus/2.
+///   * mlx — defaultowe max_tokens/temperature/top_p.
+///   * pozostale — pusta mapa.
+#[handler(variant = "EngineRecommendRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn engine_recommend(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::EngineRecommendRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected EngineRecommendRequest",
+            ))
+        }
+    };
+
+    let engine_id = payload.engine_id.trim();
+    if engine_id.is_empty() {
+        return Err(ProtocolError::bad_request("engine_id wymagany"));
+    }
+
+    let mut parameters: Vec<tentaflow_protocol::KeyValue> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let push = |params: &mut Vec<tentaflow_protocol::KeyValue>,
+                key: &str,
+                value: serde_json::Value| {
+        params.push(tentaflow_protocol::KeyValue {
+            key: key.to_string(),
+            value_json: value.to_string(),
+        });
+    };
+
+    match engine_id {
+        "vllm" | "vllm-metal" | "sglang" | "tensorrt-llm" => {
+            // Reuse auto_fit_config — to samo co stary deploy_vllm_recommend
+            // ale wyciagamy tylko typed pola (bez recommended_vllm_args
+            // raw stringa). Wymaga tych samych preconditions: model + GPU.
+            if payload.model_repo.trim().is_empty() {
+                return Err(ProtocolError::bad_request("model_repo wymagany"));
+            }
+            if payload.gpus.is_empty() {
+                return Err(ProtocolError::bad_request(
+                    "co najmniej jeden GPU wymagany dla rodziny vllm",
+                ));
+            }
+            use crate::deploy::vram_calculator::{
+                auto_fit_config, fetch_hf_config, parse_hf_config_with_override, AutoFitRequest,
+            };
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| ProtocolError::internal(format!("reqwest client: {e}")))?;
+            let config_json =
+                fetch_hf_config(&client, &payload.model_repo, payload.hf_token.as_deref())
+                    .await
+                    .map_err(|e| {
+                        ProtocolError::not_found(format!(
+                            "Nie udalo sie pobrac config.json z HF: {e}"
+                        ))
+                    })?;
+            let spec =
+                parse_hf_config_with_override(&config_json, &payload.model_repo, None)
+                    .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+
+            let gpu_count = payload.gpus.len() as u32;
+            let gpu_memory_gb = payload
+                .gpus
+                .iter()
+                .map(|g| g.memory_gb)
+                .fold(f64::INFINITY, f64::min);
+
+            let req_fit = AutoFitRequest {
+                gpu_count,
+                gpu_memory_gb_each: gpu_memory_gb,
+                kv_cache_dtype: "auto".to_string(),
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+            };
+            let outcome = auto_fit_config(&spec, &req_fit);
+            let cfg = outcome.applied;
+            if let Some(err) = outcome.error {
+                warnings.push(err);
+            }
+
+            // Mapowanie kanonicznych pol na klucze per silnik. Bindings z
+            // manifestu dorzucaja te klucze do env / API options przy deploy.
+            match engine_id {
+                "vllm" | "vllm-metal" => {
+                    push(&mut parameters, "gpu_memory_utilization",
+                        serde_json::json!(cfg.gpu_memory_utilization));
+                    push(&mut parameters, "max_model_len", serde_json::json!(cfg.max_model_len));
+                    push(&mut parameters, "max_num_seqs", serde_json::json!(cfg.max_num_seqs));
+                    push(&mut parameters, "max_num_batched_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)));
+                    push(&mut parameters, "tensor_parallel_size",
+                        serde_json::json!(cfg.tensor_parallel));
+                    push(&mut parameters, "pipeline_parallel_size",
+                        serde_json::json!(cfg.pipeline_parallel));
+                    push(&mut parameters, "kv_cache_dtype",
+                        serde_json::json!(cfg.kv_cache_dtype));
+                    push(&mut parameters, "dtype", serde_json::json!("auto"));
+                    push(&mut parameters, "enable_chunked_prefill", serde_json::json!(true));
+                }
+                "sglang" => {
+                    push(&mut parameters, "tp", serde_json::json!(cfg.tensor_parallel));
+                    push(&mut parameters, "mem_fraction",
+                        serde_json::json!(cfg.gpu_memory_utilization));
+                    push(&mut parameters, "max_total_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)));
+                    push(&mut parameters, "max_batch_size",
+                        serde_json::json!(cfg.max_num_seqs));
+                }
+                "tensorrt-llm" => {
+                    push(&mut parameters, "tp", serde_json::json!(cfg.tensor_parallel));
+                    push(&mut parameters, "max_batch_size",
+                        serde_json::json!(cfg.max_num_seqs));
+                    push(&mut parameters, "max_seq_len", serde_json::json!(cfg.max_model_len));
+                    push(&mut parameters, "free_gpu_memory_fraction",
+                        serde_json::json!(cfg.gpu_memory_utilization));
+                    push(&mut parameters, "max_num_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)));
+                }
+                _ => unreachable!(),
+            }
+        }
+        "llama-cpp" => {
+            // llama-cpp: load-time params (ctx_size/n_gpu_layers/threads/batch_size).
+            // Bez fetch HF config — uzywamy konserwatywnych defaultow.
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            push(&mut parameters, "ctx_size", serde_json::json!(8192));
+            push(&mut parameters, "n_gpu_layers", serde_json::json!(999));
+            push(&mut parameters, "threads",
+                serde_json::json!((cpus / 2).max(2)));
+            push(&mut parameters, "batch_size", serde_json::json!(512));
+        }
+        "ollama" => {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            push(&mut parameters, "context_size", serde_json::json!(8192));
+            push(&mut parameters, "num_gpu", serde_json::json!(999));
+            push(&mut parameters, "num_thread",
+                serde_json::json!((cpus / 2).max(2)));
+            push(&mut parameters, "num_batch", serde_json::json!(512));
+        }
+        "whisper" | "mlx-whisper" => {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            push(&mut parameters, "default_beam_size", serde_json::json!(5));
+            push(&mut parameters, "n_threads",
+                serde_json::json!((cpus / 2).max(2)));
+        }
+        "mlx" => {
+            push(&mut parameters, "default_max_tokens", serde_json::json!(2048));
+            push(&mut parameters, "default_temperature", serde_json::json!(0.7));
+            push(&mut parameters, "default_top_p", serde_json::json!(0.95));
+        }
+        _ => {
+            // Silnik bez schema parametrow albo bez auto-recommend logic.
+            // Zwracamy pusta mape — wizard fallback do manifest.parameters[].default.
+        }
+    }
+
+    Ok(MessageBody::EngineRecommendResponseBody(
+        tentaflow_protocol::EngineRecommendResponse {
+            parameters,
+            warnings,
+        },
+    ))
+}
+
 // =============================================================================
 // Deployments — status + list (stream handler w stream_handlers.rs)
 // =============================================================================

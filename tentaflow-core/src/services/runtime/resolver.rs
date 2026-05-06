@@ -299,6 +299,7 @@ impl AliasResolver {
                 if let Some(handle) = self.handles.get(&inst.node_id, inst.service_id) {
                     out.push(ResolvedExecutionTarget::Local {
                         model_name: model_name.to_string(),
+                        service_id: inst.service_id,
                         handle,
                     });
                 }

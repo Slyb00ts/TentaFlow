@@ -38,7 +38,8 @@ impl LocalInferenceHandler {
         request: &ChatCompletionRequest,
     ) -> anyhow::Result<ChatCompletionResponse> {
         let template = self.get_chat_template().await;
-        let params = Self::request_to_generate_params(request, &template);
+        let deploy_params = self.inference_manager.read().await.get_deploy_params();
+        let params = Self::request_to_generate_params(request, &template, &deploy_params);
         let model_name = self
             .loaded_model_name()
             .await
@@ -70,7 +71,8 @@ impl LocalInferenceHandler {
         request: &ChatCompletionRequest,
     ) -> anyhow::Result<mpsc::Receiver<ChatCompletionChunk>> {
         let template = self.get_chat_template().await;
-        let params = Self::request_to_generate_params(request, &template);
+        let deploy_params = self.inference_manager.read().await.get_deploy_params();
+        let params = Self::request_to_generate_params(request, &template, &deploy_params);
         let model_name = self
             .loaded_model_name()
             .await
@@ -201,6 +203,7 @@ impl LocalInferenceHandler {
     fn request_to_generate_params(
         request: &ChatCompletionRequest,
         template: &ChatTemplate,
+        deploy_params: &super::DeployParamsSnapshot,
     ) -> GenerateParams {
         // Konwertuj wiadomosci OpenAI na ChatMessage
         let chat_messages: Vec<ChatMessage> = request
@@ -237,7 +240,12 @@ impl LocalInferenceHandler {
         let mut stop_sequences = request.stop.clone().unwrap_or_default();
         stop_sequences.extend(template.stop_tokens());
 
-        let defaults = GenerateParams::default();
+        // Deploy-time defaults (z manifest [[parameter]] z bindingiem
+        // mlx_field) jako baseline. Request override z OpenAI API (max_tokens,
+        // temperature, top_p) ma priorytet. Llama-cpp deploy params idą
+        // load-time przez `LlamaCppEngine::load_model`, tu czytamy tylko
+        // `mlx` mape — llama-cpp request-time używa `Default::default()`.
+        let defaults = GenerateParams::from_mlx_deploy_defaults(&deploy_params.mlx);
 
         debug!(
             "Sformatowano prompt szablonem {:?}: {} znakow, {} stop sequences",

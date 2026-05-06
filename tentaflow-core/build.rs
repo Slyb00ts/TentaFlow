@@ -624,6 +624,10 @@ mod services_manifest_build {
         pub deploy: DeploySection,
         #[serde(default, rename = "model_preset")]
         pub model_presets: Vec<ModelPreset>,
+        /// Typed parameter schema dla wizard formularza i auto-tunera.
+        /// Mirror runtime types z `services/manifest/types.rs::EngineParameter`.
+        #[serde(default, rename = "parameter")]
+        pub parameters: Vec<EngineParameter>,
         /// Sha256 of the docker build context tree; empty string when the
         /// manifest has no [deploy.docker] or uses compose_path only.
         #[serde(default)]
@@ -632,6 +636,76 @@ mod services_manifest_build {
         /// embedded/external runtimes.
         #[serde(default)]
         pub native_source_hash: String,
+    }
+
+    /// Mirror runtime `EngineParameter`. Build-time type — synchronizowany
+    /// ręcznie z `services/manifest/types.rs`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct EngineParameter {
+        pub key: String,
+        pub label_pl: String,
+        pub label_en: String,
+        pub kind: ParameterKind,
+        #[serde(default)]
+        pub range: Option<NumRange>,
+        #[serde(default)]
+        pub options: Option<Vec<String>>,
+        pub default: serde_json::Value,
+        pub bindings: Vec<ParameterBinding>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ParameterKind {
+        Float,
+        Int,
+        Bool,
+        Enum,
+        String,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    pub struct NumRange {
+        pub min: f64,
+        pub max: f64,
+        #[serde(default)]
+        pub step: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ParameterBinding {
+        pub when: DeployTarget,
+        #[serde(flatten)]
+        pub target: BindingTarget,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DeployTarget {
+        Docker,
+        NativeEmbedded,
+        NativePythonBundle,
+        NativeBinary,
+        External,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum BindingTarget {
+        Env { name: String },
+        LlamacppField { field: String },
+        WhisperField {
+            field: String,
+            #[serde(default)]
+            request_override: bool,
+        },
+        MlxField {
+            field: String,
+            #[serde(default)]
+            request_override: bool,
+        },
+        OllamaOptions { key: String },
+        PythonRequestBody { field: String },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1014,11 +1088,195 @@ mod services_manifest_build {
             );
         }
 
+        validate_parameters(manifest, &mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
         }
+    }
+
+    /// Walidacja semantyczna sekcji [[parameter]]:
+    ///   - klucze unikalne w obrebie engine,
+    ///   - kind/range/options spojne (range dla float|int, options dla enum),
+    ///   - default zgodny z kind i (gdy enum) z options,
+    ///   - bindings niepusta,
+    ///   - binding.when wskazuje na deploy section ktory manifest realnie ma,
+    ///   - binding.target.Env.name pasuje do regex `^[A-Z][A-Z0-9_]*$`,
+    ///   - binding.target.*Field/Options.field/key niepuste.
+    fn validate_parameters(manifest: &ServiceManifest, errors: &mut Vec<String>) {
+        let eid = &manifest.engine.id;
+        let mut seen_keys: std::collections::HashSet<&str> = Default::default();
+        for p in &manifest.parameters {
+            // Klucz unikalny.
+            if !seen_keys.insert(p.key.as_str()) {
+                errors.push(format!(
+                    "engine '{}': parameter.key '{}' zduplikowany",
+                    eid, p.key
+                ));
+                continue;
+            }
+            // kind ↔ range/options spojnosc.
+            match p.kind {
+                ParameterKind::Float | ParameterKind::Int => {
+                    if p.range.is_none() {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' kind={:?} wymaga range",
+                            eid, p.key, p.kind
+                        ));
+                    }
+                    if p.options.is_some() {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' kind={:?} nie powinien miec options",
+                            eid, p.key, p.kind
+                        ));
+                    }
+                }
+                ParameterKind::Enum => {
+                    let Some(opts) = &p.options else {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' kind=enum wymaga options",
+                            eid, p.key
+                        ));
+                        continue;
+                    };
+                    if opts.is_empty() {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' kind=enum wymaga niepustej listy options",
+                            eid, p.key
+                        ));
+                    }
+                }
+                ParameterKind::Bool | ParameterKind::String => {
+                    if p.range.is_some() {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' kind={:?} nie powinien miec range",
+                            eid, p.key, p.kind
+                        ));
+                    }
+                    if p.options.is_some() && p.kind == ParameterKind::Bool {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' kind=bool nie powinien miec options",
+                            eid, p.key
+                        ));
+                    }
+                }
+            }
+            // Default zgodny z kind.
+            let default_ok = match p.kind {
+                ParameterKind::Float => p.default.is_f64() || p.default.is_i64(),
+                ParameterKind::Int => p.default.is_i64() || p.default.is_u64(),
+                ParameterKind::Bool => p.default.is_boolean(),
+                ParameterKind::Enum => p.default.is_string()
+                    && p.options
+                        .as_ref()
+                        .is_some_and(|opts| {
+                            opts.iter()
+                                .any(|o| Some(o.as_str()) == p.default.as_str())
+                        }),
+                ParameterKind::String => p.default.is_string(),
+            };
+            if !default_ok {
+                errors.push(format!(
+                    "engine '{}': parameter '{}' default '{}' niezgodny z kind={:?}",
+                    eid, p.key, p.default, p.kind
+                ));
+            }
+            // Default w zakresie (gdy range).
+            if let Some(range) = p.range {
+                let value = p.default.as_f64().or_else(|| p.default.as_i64().map(|v| v as f64));
+                if let Some(v) = value {
+                    if v < range.min || v > range.max {
+                        errors.push(format!(
+                            "engine '{}': parameter '{}' default {} poza zakresem [{}, {}]",
+                            eid, p.key, v, range.min, range.max
+                        ));
+                    }
+                }
+            }
+            // Bindings niepusta.
+            if p.bindings.is_empty() {
+                errors.push(format!(
+                    "engine '{}': parameter '{}' wymaga przynajmniej jednego binding",
+                    eid, p.key
+                ));
+                continue;
+            }
+            // Walidacja per binding.
+            for (i, b) in p.bindings.iter().enumerate() {
+                // when musi pasowac do deklarowanej deploy section.
+                let target_present = match b.when {
+                    DeployTarget::Docker => manifest.deploy.docker.is_some(),
+                    DeployTarget::NativeEmbedded => manifest
+                        .deploy
+                        .native
+                        .as_ref()
+                        .is_some_and(|n| n.runtime == NativeRuntime::Embedded),
+                    DeployTarget::NativePythonBundle => manifest
+                        .deploy
+                        .native
+                        .as_ref()
+                        .is_some_and(|n| n.runtime == NativeRuntime::PythonBundle),
+                    DeployTarget::NativeBinary => manifest
+                        .deploy
+                        .native
+                        .as_ref()
+                        .is_some_and(|n| n.runtime == NativeRuntime::Binary),
+                    DeployTarget::External => manifest.deploy.external.is_some(),
+                };
+                if !target_present {
+                    errors.push(format!(
+                        "engine '{}': parameter '{}' binding[{}] when={:?} \
+                         wskazuje na deploy method ktorej manifest nie deklaruje",
+                        eid, p.key, i, b.when
+                    ));
+                }
+                // Walidacja pol target.
+                match &b.target {
+                    BindingTarget::Env { name } => {
+                        if !is_valid_env_name(name) {
+                            errors.push(format!(
+                                "engine '{}': parameter '{}' binding[{}] env.name '{}' \
+                                 niezgodny z regex '^[A-Z][A-Z0-9_]*$'",
+                                eid, p.key, i, name
+                            ));
+                        }
+                    }
+                    BindingTarget::LlamacppField { field }
+                    | BindingTarget::WhisperField { field, .. }
+                    | BindingTarget::MlxField { field, .. }
+                    | BindingTarget::PythonRequestBody { field } => {
+                        if field.trim().is_empty() {
+                            errors.push(format!(
+                                "engine '{}': parameter '{}' binding[{}] field jest pusty",
+                                eid, p.key, i
+                            ));
+                        }
+                    }
+                    BindingTarget::OllamaOptions { key } => {
+                        if key.trim().is_empty() {
+                            errors.push(format!(
+                                "engine '{}': parameter '{}' binding[{}] ollama_options.key jest pusty",
+                                eid, p.key, i
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_valid_env_name(name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let mut chars = name.chars();
+        let first = chars.next().unwrap();
+        if !first.is_ascii_uppercase() {
+            return false;
+        }
+        chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     }
 
     fn validate_enum_list(
@@ -1508,16 +1766,23 @@ fn build_protocol_wasm_bindings() {
             );
         }
         Ok(s) => {
-            println!(
-                "cargo:warning=tentaflow-protocol-wasm: wasm-bindgen zakonczone kodem {}, glue moze byc stale",
+            // Fail hard zamiast cichego warning. Pre-existing zachowanie:
+            // gdy wasm-bindgen pad (np. CLI vs library version mismatch),
+            // build.rs wracal warning a JS glue zostawal stary — klient
+            // dashboard mial schema_version=stary, server=nowy, WS dropped
+            // co tickem. Hard fail przy starcie build wymusza fix
+            // (zaktualizuj wasm-bindgen-cli do wersji z Cargo.toml).
+            panic!(
+                "wasm-bindgen zakonczone kodem {} — JS glue moze byc niespojny z .wasm. \
+                 Sprawdz czy `wasm-bindgen --version` zgadza sie z Cargo.toml \
+                 (`tentaflow-protocol-wasm/Cargo.toml`). Reinstall: \
+                 `cargo install wasm-bindgen-cli --version <X.Y.Z> --locked` gdzie \
+                 X.Y.Z to wersja z Cargo.toml.",
                 s
             );
         }
         Err(e) => {
-            println!(
-                "cargo:warning=tentaflow-protocol-wasm: nie udalo sie uruchomic wasm-bindgen: {}",
-                e
-            );
+            panic!("nie udalo sie uruchomic wasm-bindgen: {}", e);
         }
     }
 }

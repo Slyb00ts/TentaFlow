@@ -10,9 +10,41 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use tentaflow_protocol::{ServiceInfo, ServiceModelEntry};
+use tentaflow_protocol::{KeyValue, RequestTimeParameters, ServiceInfo, ServiceModelEntry};
 
 use crate::services_repo;
+
+/// Wyciagniecie typed `request_time_parameters` z `services.config_json`.
+/// Format: `{ "request_time_parameters": { "ollama_options": { ... },
+/// "python_request": { ... }, "whisper_overridable": { ... },
+/// "mlx_overridable": { ... } } }`. Brak pola → puste mapy. Pojedyncze
+/// brakujace pod-mapy → puste vec'y.
+fn parse_request_time_parameters(config_json: &str) -> RequestTimeParameters {
+    let value: serde_json::Value =
+        serde_json::from_str(config_json).unwrap_or(serde_json::Value::Null);
+    let Some(rtp) = value.get("request_time_parameters") else {
+        return RequestTimeParameters::default();
+    };
+    let extract = |key: &str| -> Vec<KeyValue> {
+        rtp.get(key)
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| KeyValue {
+                        key: k.clone(),
+                        value_json: v.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    RequestTimeParameters {
+        ollama_options: extract("ollama_options"),
+        python_request: extract("python_request"),
+        whisper_overridable: extract("whisper_overridable"),
+        mlx_overridable: extract("mlx_overridable"),
+    }
+}
 
 /// Convert a JSON-encoded capabilities column into a `Vec<String>`. Returns
 /// an empty vec when the column is null / not a JSON array — same behaviour
@@ -52,6 +84,8 @@ pub fn project_service_row(
         })
         .collect();
 
+    let request_time_parameters = parse_request_time_parameters(&svc.config_json);
+
     Ok(ServiceInfo {
         id: svc.id,
         node_id: local_node_id.to_string(),
@@ -72,6 +106,7 @@ pub fn project_service_row(
         models,
         created_at: svc.created_at,
         updated_at: svc.updated_at,
+        request_time_parameters,
     })
 }
 

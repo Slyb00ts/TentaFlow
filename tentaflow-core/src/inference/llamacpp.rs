@@ -314,10 +314,23 @@ impl InferenceEngine for LlamaCppEngine {
         vec!["gguf".to_string()]
     }
 
-    async fn load_model(&self, model_path: &Path, gpu_layers: Option<u32>) -> Result<ModelInfo> {
+    async fn load_model(
+        &self,
+        model_path: &Path,
+        deploy_params: &super::DeployParamsSnapshot,
+    ) -> Result<ModelInfo> {
         let path = model_path.to_path_buf();
-        let layers = gpu_layers.unwrap_or(DEFAULT_GPU_LAYERS);
-        let ctx_size = DEFAULT_CTX_SIZE;
+        let llamacpp = &deploy_params.llamacpp;
+        let layers = llamacpp
+            .get("n_gpu_layers")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as u32)
+            .unwrap_or(DEFAULT_GPU_LAYERS);
+        let ctx_size = llamacpp
+            .get("ctx_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(DEFAULT_CTX_SIZE);
 
         info!(
             "Ladowanie modelu: {} (gpu_layers={}, ctx={})",

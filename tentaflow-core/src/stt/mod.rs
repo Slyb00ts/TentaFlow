@@ -102,6 +102,38 @@ pub struct TranscribeChunk {
     pub segment: Option<TranscribeSegment>,
 }
 
+/// Snapshot deploy-time parametrow dla STT enginow. Ustawiane raz przy
+/// `load_model`, czytane potem przez `transcribe` jako baseline gdy
+/// `TranscribeParams` per-request nie ma wartosci.
+#[derive(Debug, Default, Clone)]
+pub struct WhisperDeployParams {
+    pub n_threads: Option<i32>,
+    pub default_beam_size: Option<i32>,
+    pub default_language: Option<String>,
+    pub default_translate: Option<bool>,
+}
+
+impl WhisperDeployParams {
+    /// Zbuduj z `app.whisper` mapy z `apply_parameters_deploy`. Klucze:
+    /// `n_threads`, `default_beam_size`, `default_language`, `default_translate`.
+    pub fn from_json_map(map: &std::collections::HashMap<String, serde_json::Value>) -> Self {
+        let mut p = Self::default();
+        if let Some(v) = map.get("n_threads").and_then(|v| v.as_i64()) {
+            p.n_threads = Some(v as i32);
+        }
+        if let Some(v) = map.get("default_beam_size").and_then(|v| v.as_i64()) {
+            p.default_beam_size = Some(v as i32);
+        }
+        if let Some(v) = map.get("default_language").and_then(|v| v.as_str()) {
+            p.default_language = Some(v.to_string());
+        }
+        if let Some(v) = map.get("default_translate").and_then(|v| v.as_bool()) {
+            p.default_translate = Some(v);
+        }
+        p
+    }
+}
+
 /// Interfejs silnika STT — implementowany przez backendy (Whisper, itp.)
 #[async_trait]
 pub trait SttEngine: Send + Sync {
@@ -111,11 +143,15 @@ pub trait SttEngine: Send + Sync {
     /// Lista obslugiwanych formatow audio
     fn supported_formats(&self) -> Vec<String>;
 
-    /// Zaladuj model z podanej sciezki
+    /// Zaladuj model z podanej sciezki. `deploy_params` niesie typed
+    /// load-time defaults (n_threads dla whisper.cpp) plus request-time
+    /// fallback (default_beam_size/language/translate uzywane gdy
+    /// `TranscribeParams` per-call nie podala wartosci).
     async fn load_model(
         &self,
         model_path: &Path,
         device: Option<&str>,
+        deploy_params: &WhisperDeployParams,
     ) -> anyhow::Result<SttModelInfo>;
 
     /// Wyladuj model z pamieci
@@ -156,10 +192,14 @@ pub struct WhisperModelStatus {
     pub loaded: bool,
 }
 
-/// Manager silnikow STT — wybiera odpowiedni backend
+/// Manager silnikow STT — wybiera odpowiedni backend.
+/// **Singleton invariant:** jeden active embedded STT engine per host
+/// (jak `InferenceManager`). Deploy drugiego embedded STT podmienia
+/// active_engine + active_deploy_params.
 pub struct SttManager {
     engines: Vec<Box<dyn SttEngine>>,
     active_engine: Option<usize>,
+    active_deploy_params: WhisperDeployParams,
 }
 
 impl SttManager {
@@ -180,6 +220,7 @@ impl SttManager {
         Self {
             engines,
             active_engine: None,
+            active_deploy_params: WhisperDeployParams::default(),
         }
     }
 
@@ -197,12 +238,15 @@ impl SttManager {
             .and_then(|i| self.engines.get(i).map(|e| e.as_ref()))
     }
 
-    /// Zaladuj model — automatycznie wybierze backend
+    /// Zaladuj model — automatycznie wybierze backend.
+    /// `deploy_params` niesie typed defaults (n_threads dla whisper.cpp,
+    /// per-request fallbacki dla beam_size/language/translate).
     pub async fn load_model(
         &mut self,
         model_path: &Path,
         device: Option<&str>,
         preferred_backend: Option<&str>,
+        deploy_params: WhisperDeployParams,
     ) -> anyhow::Result<SttModelInfo> {
         let engine_idx = if let Some(backend) = preferred_backend {
             self.engines
@@ -217,17 +261,27 @@ impl SttManager {
         };
 
         let info = self.engines[engine_idx]
-            .load_model(model_path, device)
+            .load_model(model_path, device, &deploy_params)
             .await?;
         self.active_engine = Some(engine_idx);
+        self.active_deploy_params = deploy_params;
         Ok(info)
     }
 
-    /// Wyladuj model
+    /// Snapshot aktualnych deploy params. `transcribe` callerzy moga je
+    /// przeczytac jezeli chca dodac defaulty na poziomie wyzszym (np.
+    /// HTTP handler lub flow adapter). WhisperEngine sam takze ich uzywa
+    /// jako fallback dla per-call `TranscribeParams`.
+    pub fn deploy_params(&self) -> &WhisperDeployParams {
+        &self.active_deploy_params
+    }
+
+    /// Wyladuj model. Czysci tez `active_deploy_params`.
     pub async fn unload_model(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.active_engine {
             self.engines[idx].unload_model().await?;
             self.active_engine = None;
+            self.active_deploy_params = WhisperDeployParams::default();
         }
         Ok(())
     }
@@ -291,6 +345,7 @@ impl SttManager {
             );
         }
 
-        self.load_model(&model_path, device, None).await
+        self.load_model(&model_path, device, None, WhisperDeployParams::default())
+            .await
     }
 }

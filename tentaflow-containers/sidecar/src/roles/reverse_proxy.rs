@@ -442,7 +442,7 @@ impl ReverseProxyHandler {
                     metrics: None,
                 }))
             }
-            AudioOperation::STT { model, audio_data, language, response_format, prompt, temperature, .. } => {
+            AudioOperation::STT { model, audio_data, language, response_format, prompt, temperature, extra_params, .. } => {
                 let url = format!(
                     "{}/audio/transcriptions",
                     self.upstream.trim_end_matches('/')
@@ -457,6 +457,14 @@ impl ReverseProxyHandler {
                 if let Some(rf) = response_format { form = form.text("response_format", rf.clone()); }
                 if let Some(p) = prompt { form = form.text("prompt", p.clone()); }
                 if let Some(t) = temperature { form = form.text("temperature", t.to_string()); }
+                // Typed request-time overrides z BackendClient propagowane przez
+                // QUIC do sidecar. Dolepiamy jako pole `data=<json>` zeby
+                // Python wrappery (qwen-asr/parakeet) mogly je sparsowac.
+                if let Some(extra_json) = extra_params {
+                    if !extra_json.trim().is_empty() {
+                        form = form.text("data", extra_json.clone());
+                    }
+                }
 
                 let resp = self.client.post(&url).multipart(form).send().await
                     .map_err(|e| if e.is_timeout() { HandleError::Timeout } else { HandleError::UpstreamUnavailable(e.to_string()) })?;

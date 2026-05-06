@@ -8,4 +8,18 @@
 
 mod runtime;
 
-pub use runtime::SttRuntime;
+pub use runtime::{SttBackend, SttRuntime};
+
+use std::sync::{Arc, OnceLock};
+
+/// Globalny wspoldzielony `SttRuntime` — jeden per proces. Singleton
+/// invariant zgodny z `shared_stt_manager()`. Router/handler/executor/
+/// supervisor wszyscy biora ten sam Arc, dzieki czemu reconcile rejestracja
+/// HTTP backendow STT jest widoczna z `transcribe_for_service`.
+static SHARED_STT_RUNTIME: OnceLock<Arc<SttRuntime>> = OnceLock::new();
+
+pub fn shared_stt_runtime() -> Arc<SttRuntime> {
+    SHARED_STT_RUNTIME
+        .get_or_init(|| Arc::new(SttRuntime::new()))
+        .clone()
+}

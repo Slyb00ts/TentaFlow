@@ -77,7 +77,10 @@ pub struct ServiceModelEntry {
 }
 
 /// Runtime view of one deployed service. Aggregates the `services` row with
-/// its attached `model_registry` rows.
+/// its attached `model_registry` rows. Niesie tez `request_time_parameters`
+/// — typed mape wartosci ktore BackendClient materializuje przy kazdym
+/// requestcie (Ollama options, python wrapper extra fields, whisper/mlx
+/// deploy defaults z opcjonalnym per-request override).
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[rkyv(derive(Debug))]
 pub struct ServiceInfo {
@@ -107,6 +110,40 @@ pub struct ServiceInfo {
     pub models: Vec<ServiceModelEntry>,
     pub created_at: String,
     pub updated_at: String,
+    /// Typed request-time parameters z `services.config_json.parameters`,
+    /// propagowane do BackendClient przez handles_cache. Puste mapy gdy
+    /// service nie ma konfigurowalnych parametrow.
+    pub request_time_parameters: RequestTimeParameters,
+}
+
+/// Wartosci parametrow konsumowane przy kazdym requestcie do silnika.
+/// Per-target storage:
+///   * `ollama_options` → klucz=wartosc dla Ollama API `options` mapy w
+///     POST `/api/generate`/`/api/chat`.
+///   * `python_request` → pola POST body dla generic Python wrapperow
+///     (qwen-asr, kyutai-tts, xtts, voxcpm, chatterbox).
+///   * `whisper_overridable` → deploy defaults dla whisper z
+///     `request_override = true`; backend uzywa jako baseline, klient API
+///     moze nadpisac per request.
+///   * `mlx_overridable` → analogicznie dla MLX engine.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+#[rkyv(derive(Debug))]
+pub struct RequestTimeParameters {
+    pub ollama_options: Vec<KeyValue>,
+    pub python_request: Vec<KeyValue>,
+    pub whisper_overridable: Vec<KeyValue>,
+    pub mlx_overridable: Vec<KeyValue>,
+}
+
+/// Generic key-value pair dla typed parametrow propagowanych przez wire.
+/// Wartosc jako serialized JSON string (rkyv nie obsluguje natywnie
+/// `serde_json::Value`).
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[rkyv(derive(Debug))]
+pub struct KeyValue {
+    pub key: String,
+    /// JSON-serialized value. Konsument deserializuje przez `serde_json::from_str`.
+    pub value_json: String,
 }
 
 /// Incremental change applied to one entry in the mesh services registry. Used
@@ -1777,6 +1814,27 @@ pub struct DeployVllmRecommendResponse {
     pub applied: DeployVllmConfig,
     pub auto_adjusted: Vec<String>,
     pub at_limit: bool,
+}
+
+/// Generyczne wywolanie auto-tunera dla dowolnego silnika z `[[parameter]]`
+/// schema w manifescie. Backend dispatchuje per `engine_id` (vllm/sglang/
+/// tensorrt-llm uzywaja `auto_fit_config` z mapowaniem do typed pol; inne
+/// silniki maja proste defaulty per kategoria). Zwraca typed mape
+/// `parameter.key → JSON value` ktora wizard pre-filluje do formularza.
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct EngineRecommendRequest {
+    pub engine_id: String,
+    pub model_repo: String,
+    pub gpus: Vec<DeployVllmGpuInfo>,
+    pub hf_token: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+pub struct EngineRecommendResponse {
+    /// JSON-serialized values per parameter key. Wizard JS deserializuje
+    /// zgodnie z `parameter.kind` z manifestu.
+    pub parameters: Vec<KeyValue>,
+    pub warnings: Vec<String>,
 }
 
 /// Request: deploy engine described by Service Manifest (Admin).
@@ -3556,6 +3614,8 @@ pub enum MessageBody {
     NimCatalogListResponseBody(NimCatalogListResponse),
     DeployVllmRecommendRequestBody(DeployVllmRecommendRequest),
     DeployVllmRecommendResponseBody(DeployVllmRecommendResponse),
+    EngineRecommendRequestBody(EngineRecommendRequest),
+    EngineRecommendResponseBody(EngineRecommendResponse),
     // ServiceManifestDeployRequest/Response przeniesione do DeploymentPayload
     // (ReqStart/ResStart). Oszczędza 1 slot w 256-variant limicie rkyv.
 
