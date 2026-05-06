@@ -9,7 +9,12 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
+use tokio::time::sleep_until;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, Message, MessageContent,
@@ -32,13 +37,22 @@ impl LlmDispatcherImpl {
 #[async_trait]
 impl LlmDispatcher for LlmDispatcherImpl {
     async fn execute_chat(&self, req: LlmRequest) -> Result<LlmResponse> {
+        let cancel = req.cancel_token.clone();
+        let deadline = req.deadline;
         let api_req = build_chat_request(&req, false);
         let mut rctx = RuntimeContext::new(None);
-        let response = self
-            .runtime
-            .execute_chat(api_req, &mut rctx)
-            .await
-            .map_err(|e| anyhow!("LlmDispatcher execute_chat: {e}"))?;
+        // Cancel + deadline są egzekwowane na poziomie wrappera bo
+        // ModelRuntimeExecutor::execute_chat nie eksponuje tych pól.
+        // select! w pierwszej kolejności sprawdza cancel/deadline, więc
+        // klient disconnect / timeout abort'uje request natychmiast nawet
+        // jeśli backend nie odpowiada.
+        let response = run_with_deadline_and_cancel(
+            self.runtime.execute_chat(api_req, &mut rctx),
+            deadline,
+            cancel,
+        )
+        .await
+        .map_err(|e| anyhow!("LlmDispatcher execute_chat: {e}"))?;
 
         let choice = response
             .choices
@@ -81,23 +95,112 @@ impl LlmDispatcher for LlmDispatcherImpl {
         &self,
         req: LlmRequest,
     ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
+        let cancel = req.cancel_token.clone();
+        let deadline = req.deadline;
         let api_req = build_chat_request(&req, true);
         let mut rctx = RuntimeContext::new(None);
-        let stream = self
-            .runtime
-            .stream_chat(api_req, &mut rctx)
-            .await
-            .map_err(|e| anyhow!("LlmDispatcher stream_chat: {e}"))?;
+        // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
+        // resolver/strategy się zacina lub backend nie zdąży otworzyć
+        // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.
+        let stream = run_with_deadline_and_cancel(
+            self.runtime.stream_chat(api_req, &mut rctx),
+            deadline,
+            cancel.clone(),
+        )
+        .await
+        .map_err(|e| anyhow!("LlmDispatcher stream_chat: {e}"))?;
 
-        // ExecutorChunkStream → BoxStream<Result<LlmStreamChunk>>.
-        // Każdy ChatCompletionChunk producent zwraca albo text delta, albo
-        // reasoning delta, albo terminal chunk z finish_reason. Mapujemy
-        // 1:1 — backpressure i finalizacja zostają u callera (executor).
+        // Post-handoff: każdy chunk podlega cancel + deadline. Gdy executor
+        // (lub klient) anuluje request, stream kończy się przy najbliższym
+        // poll'u. Stream EOF i tak zatrzyma backend producer.
+        let cancel_for_stream = cancel;
         let mapped = stream.map(|item| match item {
             Ok(chunk) => Ok(chat_chunk_to_llm_chunk(chunk)),
             Err(e) => Err(anyhow!("LlmDispatcher stream chunk: {e}")),
         });
-        Ok(Box::pin(mapped))
+        let bounded = StreamBoundary::new(Box::pin(mapped), deadline, cancel_for_stream);
+        Ok(Box::pin(bounded))
+    }
+}
+
+/// Wykonuje future z deadline (`tokio::time::timeout`) + cancel
+/// (`select!` z `cancel.cancelled()`). Te dwa pola żyją w `LlmRequest`
+/// ale `ModelRuntimeExecutor` ich nie czyta — wrapper musi sam je honorować.
+async fn run_with_deadline_and_cancel<F, T, E>(
+    fut: F,
+    deadline: Option<Instant>,
+    cancel: CancellationToken,
+) -> Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    tokio::pin!(fut);
+    if let Some(dl) = deadline {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow!("cancelled")),
+            _ = sleep_until(dl.into()) => Err(anyhow!("deadline exceeded")),
+            res = &mut fut => res.map_err(|e| anyhow!("{e}")),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow!("cancelled")),
+            res = &mut fut => res.map_err(|e| anyhow!("{e}")),
+        }
+    }
+}
+
+/// Stream wrapper który przerywa kolejne `poll_next` gdy cancel albo
+/// deadline minęły. Sam adapter_stream może być nieświadomy cancel'a —
+/// my zatrzymujemy konsumpcję na granicy chunka, a backend zauważy
+/// rozłączenie po EOF.
+struct StreamBoundary<S> {
+    inner: Pin<Box<S>>,
+    deadline: Option<Instant>,
+    cancel: CancellationToken,
+    finished: bool,
+}
+
+impl<S> StreamBoundary<S> {
+    fn new(inner: Pin<Box<S>>, deadline: Option<Instant>, cancel: CancellationToken) -> Self {
+        Self {
+            inner,
+            deadline,
+            cancel,
+            finished: false,
+        }
+    }
+}
+
+impl<S> futures::Stream for StreamBoundary<S>
+where
+    S: futures::Stream<Item = Result<LlmStreamChunk>> + Send,
+{
+    type Item = Result<LlmStreamChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self.cancel.is_cancelled() {
+            self.finished = true;
+            return Poll::Ready(Some(Err(anyhow!("cancelled"))));
+        }
+        if let Some(dl) = self.deadline {
+            if Instant::now() >= dl {
+                self.finished = true;
+                return Poll::Ready(Some(Err(anyhow!("deadline exceeded"))));
+            }
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(None) => {
+                self.finished = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
     }
 }
 
