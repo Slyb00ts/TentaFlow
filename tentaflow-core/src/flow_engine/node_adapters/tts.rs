@@ -129,6 +129,7 @@ impl NodeAdapter for TtsNodeAdapter {
             language: Self::pick_optional_str(node, envelope, "language"),
             user_id: ctx.user_id,
             user_role: ctx.user_role.clone(),
+            cancel_token: ctx.cancel_token.clone(),
         };
 
         let response = ctx
@@ -203,6 +204,12 @@ mod tests {
                 mime: "audio/wav".into(),
                 sample_rate: Some(22_050),
             })
+        }
+        async fn stream_synthesize(
+            &self,
+            _req: TtsRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>> {
+            unimplemented!("FakeTts: stream_synthesize not used in TTS adapter tests")
         }
     }
 

@@ -383,11 +383,28 @@ pub struct ToolCallDelta {
     pub arguments_delta: Option<String>,
 }
 
-/// Streamingowy delta — single-variant dziś, otwarte na przyszłą rozbudowę.
-/// Terminal state nigdy nie idzie tym kanałem — wraca przez `outcome_receiver`.
+/// Streamingowy delta — multi-variant po Etap 3c. Terminal state dla LLM
+/// wraca przez `outcome_receiver`; dla audio terminal jest niesiony w
+/// `AudioStreamChunk.finish_reason` na ostatnim chunk'u.
 #[derive(Debug, Clone)]
 pub enum EnvelopeDelta {
     Llm(LlmStreamChunk),
+    /// Etap 3c: streaming TTS audio. Bytes_delta to surowe bytes audio
+    /// w formacie `mime`. Klient łączy chunki przez konkatenację.
+    /// Pierwszy chunk niesie nagłówek kontenera (RIFF dla WAV); kolejne
+    /// to czysty payload. Streaming TTS w stage 3c idzie przez Router
+    /// endpoint, NIE przez flow executor (TTS-as-flow streaming wraca
+    /// w 3e+).
+    Audio(AudioStreamChunk),
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioStreamChunk {
+    pub bytes_delta: Vec<u8>,
+    pub mime: String,
+    pub sample_rate: Option<u32>,
+    /// Niesione tylko w terminalnym chunk'u. `None` dla mid-stream.
+    pub finish_reason: Option<FinishReason>,
 }
 
 #[cfg(test)]

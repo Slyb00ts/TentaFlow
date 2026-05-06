@@ -31,5 +31,5 @@ pub use metrics::{MetricsSink, NoopMetrics};
 pub use pii_rules::{PiiRule, PiiRulesStore};
 pub use prompts::PromptStore;
 pub use stt::{SttDispatcher, SttRequest, SttResponse};
-pub use tts::{TtsDispatcher, TtsRequest, TtsResponse};
+pub use tts::{TtsDispatcher, TtsRequest, TtsResponse, TtsStreamChunk};
 pub use tts_cleaning::TtsCleaningStore;
