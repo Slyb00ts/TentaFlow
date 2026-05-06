@@ -7,12 +7,14 @@
 // =============================================================================
 
 pub mod condition;
+pub mod llm;
 pub mod output;
 pub mod pii_filter;
 pub mod trigger;
 pub mod tts_clean;
 
 pub use condition::ConditionNodeAdapter;
+pub use llm::LlmNodeAdapter;
 pub use output::OutputNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
