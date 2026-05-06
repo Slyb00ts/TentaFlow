@@ -171,13 +171,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.context.messages.len(), 3);
-        assert_eq!(out.context.messages[0].content, "old1");
-        assert_eq!(out.context.messages[1].content, "old1-reply");
-        assert_eq!(out.context.messages[2].content, "now");
+        assert_eq!(out.context.messages[0].text(), Some("old1"));
+        assert_eq!(out.context.messages[1].text(), Some("old1-reply"));
+        assert_eq!(out.context.messages[2].text(), Some("now"));
         let ap = fake.appended.lock().unwrap();
         assert_eq!(ap.len(), 1);
         assert_eq!(ap[0].0, "s1");
-        assert_eq!(ap[0].1.content, "now");
+        assert_eq!(ap[0].1.text(), Some("now"));
     }
 
     #[tokio::test]

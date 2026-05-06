@@ -19,6 +19,7 @@ pub mod stt;
 pub mod trigger;
 pub mod tts;
 pub mod tts_clean;
+pub mod vision_llm;
 
 pub use condition::ConditionNodeAdapter;
 pub use conversation_history::ConversationHistoryNodeAdapter;
@@ -33,3 +34,4 @@ pub use stt::SttNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
 pub use tts::TtsNodeAdapter;
 pub use tts_clean::TtsCleanNodeAdapter;
+pub use vision_llm::VisionNodeAdapter;

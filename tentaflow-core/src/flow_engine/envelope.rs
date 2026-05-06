@@ -86,18 +86,54 @@ pub struct ConversationContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: ChatRole,
-    pub content: String,
+    pub content: ChatMessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
+/// Etap 3b: content multimodal. Pre-3b każdy adapter trzymał `String` —
+/// `Text(s)` jest back-compat path. `Parts(...)` używane przez vision
+/// adapter / OpenAI request z image_url.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<MessagePart>),
+}
+
+impl Default for ChatMessageContent {
+    fn default() -> Self {
+        ChatMessageContent::Text(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessagePart {
+    Text {
+        text: String,
+    },
+    /// Image przez `BlobRef` — `LlmDispatcherImpl::chat_msg_to_openai`
+    /// rozwiązuje BlobRef → bytes → base64 data URL przed wysłaniem do
+    /// backendu. `detail` zgodne z OpenAI vision spec ("auto"/"low"/"high").
+    Image {
+        blob_ref: crate::flow_engine::blob_store::BlobRef,
+        #[serde(default = "default_image_detail")]
+        detail: String,
+    },
+}
+
+fn default_image_detail() -> String {
+    "auto".to_string()
+}
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::System,
-            content: content.into(),
+            content: ChatMessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
         }
@@ -106,7 +142,7 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::User,
-            content: content.into(),
+            content: ChatMessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
         }
@@ -115,9 +151,46 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::Assistant,
-            content: content.into(),
+            content: ChatMessageContent::Text(content.into()),
             name: None,
             tool_call_id: None,
+        }
+    }
+
+    /// Etap 3b: vision-aware konstruktor dla user message z multimodal Parts.
+    pub fn user_multimodal(parts: Vec<MessagePart>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: ChatMessageContent::Parts(parts),
+            name: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Helper Etap 3b: zwraca `Some(&str)` gdy content to czysty Text,
+    /// inaczej `None` (Parts). Adaptery które operują tylko na tekście
+    /// skipują obrazy używając tego helpera.
+    pub fn text(&self) -> Option<&str> {
+        match &self.content {
+            ChatMessageContent::Text(t) => Some(t.as_str()),
+            ChatMessageContent::Parts(_) => None,
+        }
+    }
+
+    /// Helper Etap 3b: zwraca text — dla Text(s) bezpośrednio, dla
+    /// Parts'ów konkatenuje wszystkie text parts (image parts pomijane).
+    /// Używane przez adaptery legacy które potrzebują String reprezentacji.
+    pub fn text_or_default(&self) -> String {
+        match &self.content {
+            ChatMessageContent::Text(t) => t.clone(),
+            ChatMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::Text { text } => Some(text.as_str()),
+                    MessagePart::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         }
     }
 }

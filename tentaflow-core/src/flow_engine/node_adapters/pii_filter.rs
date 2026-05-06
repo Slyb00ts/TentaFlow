@@ -115,7 +115,21 @@ impl NodeAdapter for PiiFilterNodeAdapter {
             .rev()
             .find(|m| matches!(m.role, crate::flow_engine::envelope::ChatRole::User))
         {
-            last_user.content = text.clone();
+            // Etap 3b: PII filter operuje wyłącznie na tekście. Multimodal
+            // (Parts) message — zostawiamy parts text bez zmiany; image
+            // parts nie podlegają regex'om PII.
+            use crate::flow_engine::envelope::{ChatMessageContent, MessagePart};
+            match &mut last_user.content {
+                ChatMessageContent::Text(s) => *s = text.clone(),
+                ChatMessageContent::Parts(parts) => {
+                    for p in parts.iter_mut() {
+                        if let MessagePart::Text { text: t } = p {
+                            *t = text.clone();
+                            break; // jedna text part w typowym multimodal
+                        }
+                    }
+                }
+            }
         }
 
         out.payload = FlowValue::Text(text);
@@ -215,7 +229,7 @@ mod tests {
             .rev()
             .find(|m| matches!(m.role, ChatRole::User))
             .unwrap();
-        assert_eq!(last_user.content, "[EMAIL]");
+        assert_eq!(last_user.text(), Some("[EMAIL]"));
     }
 
     #[tokio::test]

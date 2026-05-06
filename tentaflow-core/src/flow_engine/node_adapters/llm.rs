@@ -109,9 +109,12 @@ impl LlmNodeAdapter {
 
         if let FlowValue::Text(t) = &envelope.payload {
             if !t.is_empty() {
+                // Etap 3b: porównanie tylko gdy ostatnia message to czysty
+                // Text. Parts (multimodal) zawsze potraktowane jako "różne"
+                // — payload.Text będzie dodany jako kolejny user message.
                 let last_matches = out
                     .last()
-                    .map(|m| m.role == ChatRole::User && m.content == *t)
+                    .map(|m| m.role == ChatRole::User && m.text() == Some(t.as_str()))
                     .unwrap_or(false);
                 if !last_matches {
                     out.push(ChatMessage::user(t.clone()));
@@ -285,11 +288,11 @@ mod tests {
         let msgs = LlmNodeAdapter::build_messages(&n, &env);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, ChatRole::System);
-        assert_eq!(msgs[0].content, "sp1");
+        assert_eq!(msgs[0].text(), Some("sp1"));
         assert_eq!(msgs[1].role, ChatRole::System);
-        assert_eq!(msgs[1].content, "sp2");
+        assert_eq!(msgs[1].text(), Some("sp2"));
         assert_eq!(msgs[2].role, ChatRole::System);
-        assert_eq!(msgs[2].content, "inline");
+        assert_eq!(msgs[2].text(), Some("inline"));
         assert_eq!(msgs[3].role, ChatRole::User);
     }
 
@@ -300,7 +303,7 @@ mod tests {
         env.payload = FlowValue::Text("new question".into());
         let msgs = LlmNodeAdapter::build_messages(&node(json!({})), &env);
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[1].content, "new question");
+        assert_eq!(msgs[1].text(), Some("new question"));
     }
 
     #[test]

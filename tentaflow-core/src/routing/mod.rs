@@ -154,7 +154,33 @@ fn message_to_chat_message(m: &Message) -> Option<ChatMessage> {
         "tool" => ChatRole::Tool,
         _ => return None,
     };
-    let content = m.content.as_ref().map(message_content_to_text).unwrap_or_default();
+    use crate::flow_engine::envelope::{ChatMessageContent, MessagePart};
+    let content = match m.content.as_ref() {
+        Some(MessageContent::Text(t)) => ChatMessageContent::Text(t.clone()),
+        Some(MessageContent::Parts(parts)) => {
+            // Etap 3b: konwersja OpenAI Parts → ChatMessageContent::Parts.
+            // ImageUrl z data: URL ekstraktujemy w build_initial_envelope_inner
+            // (przy pierwszym napotkaniu), żeby payload był FlowValue::Image.
+            // Tu zostawiamy text parts; image parts pomijamy (są już w
+            // payload). HTTP/HTTPS image URLs odrzucone wcześniej w
+            // decode_data_url.
+            let text_parts: Vec<MessagePart> = parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(MessagePart::Text {
+                        text: text.clone(),
+                    }),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect();
+            if text_parts.is_empty() {
+                ChatMessageContent::Text(String::new())
+            } else {
+                ChatMessageContent::Parts(text_parts)
+            }
+        }
+        None => ChatMessageContent::Text(String::new()),
+    };
     Some(ChatMessage {
         role,
         content,
