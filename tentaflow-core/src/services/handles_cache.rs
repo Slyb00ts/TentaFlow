@@ -207,8 +207,15 @@ pub fn build_handle(svc: &ServiceInfo) -> Result<BackendHandle> {
                 model_name_override: None,
                 health_check_path: None,
             };
-            let client = BackendClient::new(backend, None::<CircuitBreakerConfig>)
-                .map_err(|e| anyhow!("BackendClient init failed: {}", e))?;
+            // Typed request-time overrides z services.config_json
+            // propagowane do BackendClient zeby kazdy chat/transcription
+            // /tts request je materializowal.
+            let client = BackendClient::with_overrides(
+                backend,
+                None::<CircuitBreakerConfig>,
+                svc.request_time_parameters.clone(),
+            )
+            .map_err(|e| anyhow!("BackendClient init failed: {}", e))?;
             Ok(BackendHandle::Http(Arc::new(client)))
         }
         Transport::SidecarQuic => {
@@ -351,6 +358,7 @@ mod tests {
             }],
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
+            request_time_parameters: Default::default(),
         }
     }
 

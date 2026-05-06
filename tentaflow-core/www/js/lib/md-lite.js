@@ -16,12 +16,12 @@ function b64encode(str) {
   }
 }
 
-function renderThinkingBlock(inner, isStreaming) {
+function renderThinkingBlock(inner, isOpen, key) {
   const charCount = inner.length;
   const escaped = escapeHtml(inner).replaceAll('\n', '<br>');
-  // Streaming → expanded so user can watch the thought stream live.
-  const openAttr = isStreaming ? ' open' : '';
-  return `<details class="thinking"${openAttr}>` +
+  const openAttr = isOpen ? ' open' : '';
+  const keyAttr = key ? ` data-think-key="${escapeHtml(key)}"` : '';
+  return `<details class="thinking"${openAttr}${keyAttr}>` +
     `<summary class="thinking-head">` +
       `<svg class="icon icon-think" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">` +
         `<path d="M12 2a7 7 0 0 0-4 12.7V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.3A7 7 0 0 0 12 2z"/>` +
@@ -95,16 +95,45 @@ function paragraphize(escapedHtml) {
 }
 
 /// Render a markdown-flavored string as sanitized HTML.
-/// `opts.streaming` toggles the default-open state of <think> blocks.
+///   `opts.streaming` — domyslny stan otwarcia <think> bloku, gdy chat nie
+///                      utrwala wyboru usera.
+///   `opts.thinkKeyPrefix` — prefix do `data-think-key`; chat passuje msg.id,
+///                           kazdy blok dostaje `${prefix}-${idx}`.
+///   `opts.getThinkOpen(key)` — funkcja czytajaca persisted stan; gdy zwroci
+///                              undefined, fallback do `streaming` defaultu.
 export function renderMarkdown(text, opts = {}) {
   if (!text) return '';
   const streaming = opts.streaming === true;
+  const keyPrefix = opts.thinkKeyPrefix || '';
+  const getThinkOpen = typeof opts.getThinkOpen === 'function' ? opts.getThinkOpen : null;
+  let thinkIdx = 0;
 
-  // 1) Extract thinking blocks (both <think> and <thinking>).
+  // 1) Extract thinking blocks. Obslugujemy trzy warianty:
+  //    a) standardowe pary <think>...</think> / <thinking>...</thinking>
+  //    b) implicit-open: model zaczyna reasoning bez tagu otwierajacego
+  //       (Gemini / niektore Qwen reasoning trybow), ale konczy </think>.
+  //       Wtedy traktujemy caly prefix do pierwszego </think> jako thinking.
+  //    c) streaming bez tagu zamykajacego (jeszcze nie doszedl) — zostawiamy
+  //       jak jest, blok pojawi sie dopiero po dotarciu </think>.
+  let preprocessed = text;
+  const closingMatch = preprocessed.match(/<\/think(?:ing)?>/i);
+  if (closingMatch) {
+    const closeIdx = closingMatch.index;
+    const before = preprocessed.slice(0, closeIdx);
+    if (!/<think(?:ing)?>/i.test(before)) {
+      preprocessed = '<think>' + preprocessed;
+    }
+  }
   const thinkRegex = /<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi;
-  const { text: t1, slots: thinkSlots } = withPlaceholders(text, 'THINK', {
+  const { text: t1, slots: thinkSlots } = withPlaceholders(preprocessed, 'THINK', {
     regex: thinkRegex,
-    handler: (_m, inner) => renderThinkingBlock(inner.trim(), streaming),
+    handler: (_m, inner) => {
+      const key = keyPrefix ? `${keyPrefix}-${thinkIdx}` : '';
+      thinkIdx += 1;
+      const persisted = getThinkOpen && key ? getThinkOpen(key) : undefined;
+      const isOpen = persisted === undefined ? streaming : persisted;
+      return renderThinkingBlock(inner.trim(), isOpen, key);
+    },
   });
 
   // 2) Extract code fences. ```lang[:filename]\n...\n```

@@ -73,7 +73,7 @@ mod tests {
     use crate::services::handles_cache::BackendHandle;
 
     fn target(name: &str) -> ResolvedExecutionTarget {
-        ResolvedExecutionTarget::Local {
+        ResolvedExecutionTarget::Local { service_id: 1,
             model_name: name.to_string(),
             handle: BackendHandle::Embedded {
                 model_name: name.to_string(),

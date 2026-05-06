@@ -1,38 +1,37 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: vLLM jako PyPI pinned (0.20.0, kwiecien 2026). Dla macOS Apple
+# Opis: vLLM jako PyPI pinned (0.20.1, kwiecien 2026). Dla macOS Apple
 #       Silicon uzywamy osobnego silnika `vllm-metal` (bundle
 #       ../vllm-metal/bundle.toml) — plugin MLX, inny flow instalacji.
 # =============================================================================
 
 [bundle]
 engine = "vllm"
-description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.20.0)"
+description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.20.1)"
 python_version = "3.12"
-# Pinned na 0.20.0 (2026-04-27): NVFP4 emulacja, Gemma 4 quantized MoE,
+# Pinned na 0.20.1 (2026-04-27): NVFP4 emulacja, Gemma 4 quantized MoE,
 # PyTorch 2.11 + CUDA 13.0 default. Switch z git HEAD na PyPI dla
 # reproducibility — git main moze rozjechac sie z innymi deps.
 source = "pypi"
-pypi_package = "vllm==0.20.0"
+pypi_package = "vllm==0.20.1"
 
 [launch]
 command = "python"
-# Defaulty zgodne z docker entrypoint vllm:
-# --max-num-batched-tokens 8192 jest WYMAGANE dla multimodalnych modeli
-# (Gemma 4 31B-VL ma max_tokens_per_mm_item = 2496, default vllm 2048
-# powoduje crash MultiModalBudget). User moze nadpisac wszystkie te wartosci
-# poprzez VLLM_ARGS env z deploy wizard Advanced section (build_engine_args
-# w spawn_engine appenduje VLLM_ARGS post tych args). Auto-detect TP/PP
-# jest robione w docker entrypoint przez nvidia-smi -L; dla bundle native
-# user musi explicit ustawic --tensor-parallel-size przez VLLM_ARGS gdy
-# chce uzyc multi-GPU (deploy wizard Advanced robi to automatycznie).
+# Bundle dostarcza identity flags (model + transport) i bezpieczne baseline
+# defaults dla flag, ktore vllm bez explicit wartosci dobiera nieoptymalnie
+# albo crashuje (np. multimodal Gemma 4 31B-VL wymaga --max-num-batched-tokens
+# >= 2496). `--gpu-memory-utilization` celowo NIE jest tu — backend
+# (`python_bundle.rs::prepare`) zarzadza ta jedyna flaga (auto-clamp wzgledem
+# free VRAM / user explicit z wizarda) i appenduje do VLLM_ARGS jako
+# pojedyncze wystapienie. VLLM_ARGS z wizarda Advanced jest appendowane PO
+# tych flagach przez `build_engine_args`, wiec last-wins dla flag pokrywanych
+# przez wizard.
 args = [
     "-m", "vllm.entrypoints.openai.api_server",
     "--host", "127.0.0.1",
     "--port", "${PORT:-8000}",
     "--model", "${MODEL}",
     "--dtype", "auto",
-    "--gpu-memory-utilization", "${GPU_MEMORY_UTILIZATION:-0.9}",
     "--max-model-len", "${MAX_MODEL_LEN:-8192}",
     "--max-num-batched-tokens", "${MAX_NUM_BATCHED_TOKENS:-8192}",
 ]

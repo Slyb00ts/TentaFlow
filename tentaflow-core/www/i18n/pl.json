@@ -2874,6 +2874,8 @@
     "containerName": "Nazwa kontenera",
     "stackName": "Nazwa stacka",
     "port": "Port",
+    "portDockerHint": "Host port mapowany na port wewnętrzny kontenera. Konflikt z innym kontenerem powoduje błąd przy starcie.",
+    "portAutoAllocated": "Alokowany automatycznie z puli 5000–6000 przy starcie",
     "modelLabel": "Model",
     "method": {
       "docker": "Docker",

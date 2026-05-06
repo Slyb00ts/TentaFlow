@@ -926,6 +926,12 @@ pub enum AudioOperation {
         /// Segmenty z compression_ratio > threshold zostaną odfiltrowane
         /// None = brak filtrowania (typowo: 2.4)
         compression_ratio_threshold: Option<f32>,
+
+        /// Typed request-time parameters (qwen-asr/parakeet/kyutai-tts
+        /// wrappery) propagowane przez QUIC do sidecar. Sidecar dolepia
+        /// je jako pole `data=<json>` do multipart form. Pusty string =
+        /// brak overrides. Format: `{"max_new_tokens": 512, ...}`.
+        extra_params: Option<String>,
     },
 
     // =========================================================================

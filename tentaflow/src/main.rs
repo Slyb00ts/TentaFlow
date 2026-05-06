@@ -623,6 +623,20 @@ async fn run_server(args: Args) -> Result<()> {
     wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
+    // Zatrzymaj wszystkie supervised services (native python-bundle / native
+    // binary / docker) zanim router shutdown zwolni RwLocki. Bez tego vLLM /
+    // sglang subprocessy zostawaly zombie po Ctrl+C — trzymaly VRAM (~15 GiB
+    // dla 9B modelu) i nastepny deploy konkurowal o pamiec z poprzedniej
+    // instancji.
+    if let Some(ports) = services_port_allocator.clone() {
+        let errors =
+            tentaflow_core::services::deploy::stop_all_supervised(&db, ports).await;
+        if !errors.is_empty() {
+            for (id, msg) in &errors {
+                tracing::warn!("shutdown stop service id={}: {}", id, msg);
+            }
+        }
+    }
     router.shutdown();
 
     // Graceful shutdown mesh — zamyka QUIC endpoint (zwalnia port UDP) i wyrejestruje mDNS

@@ -9,6 +9,11 @@ pub struct ServiceManifest {
     pub deploy: DeploySection,
     #[serde(default, rename = "model_preset")]
     pub model_presets: Vec<ModelPreset>,
+    /// Typed parameter schema dla wizard formularza i auto-tunera.
+    /// Pusta lista = silnik bez konfigurowalnych parametrów (wizard
+    /// step "Advanced" jest skipowany). Domyślnie pusta.
+    #[serde(default, rename = "parameter")]
+    pub parameters: Vec<EngineParameter>,
     /// Sha256 of the docker build context tree at compile time. Empty when
     /// the manifest has no buildable docker context. Populated by build.rs.
     #[serde(default)]
@@ -55,6 +60,110 @@ pub struct Engine {
     /// "image"]`). Same fallback rules as the input list.
     #[serde(default)]
     pub output_modalities: Option<Vec<String>>,
+}
+
+/// Pojedynczy parametr silnika — wizard renderuje formularz na podstawie
+/// tej listy, auto-tuner zwraca typed wartości z tej samej schemy.
+/// Każdy parametr musi mieć przynajmniej jeden binding (per deploy method).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineParameter {
+    /// Stabilny klucz używany przez wizard payload i `apply_parameters_deploy`.
+    pub key: String,
+    pub label_pl: String,
+    pub label_en: String,
+    pub kind: ParameterKind,
+    /// Wymagane dla `kind = float | int`. UI hint zakresu suwaka.
+    #[serde(default)]
+    pub range: Option<NumRange>,
+    /// Wymagane dla `kind = enum`. Lista dopuszczalnych wartości.
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+    /// Wartość domyślna gdy wizard nie wysłał nadpisania.
+    pub default: serde_json::Value,
+    /// Lista bindingów per deploy method. Backend wybiera ten z
+    /// dopasowanym `when` na podstawie aktywnego deployu.
+    pub bindings: Vec<ParameterBinding>,
+}
+
+/// Typ wartości parametru — determinuje kontrolkę w wizardzie i parsowanie
+/// po stronie backendu.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterKind {
+    Float,
+    Int,
+    Bool,
+    /// Wybór z listy — wymaga `options`.
+    Enum,
+    String,
+}
+
+/// Zakres numeryczny dla `kind = float | int`. UI hint, nie hard constraint
+/// (user może wpisać dowolną wartość w zakresie, walidacja sprawdza tylko
+/// min/max).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct NumRange {
+    pub min: f64,
+    pub max: f64,
+    /// Krok dla suwaka (UI hint). Niewymagany.
+    #[serde(default)]
+    pub step: Option<f64>,
+}
+
+/// Pojedynczy binding parametru — opisuje JAK wartość trafia do silnika
+/// dla konkretnej deploy method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterBinding {
+    /// Filtr deploy method, zgodny z `services_repo::DeployMethod`.
+    pub when: DeployTarget,
+    /// Konkretny mechanizm konsumpcji (env var, pole struktury, opcja API).
+    #[serde(flatten)]
+    pub target: BindingTarget,
+}
+
+/// Deploy method dla bindingu — odpowiada wariantom
+/// `services_repo::services::DeployMethod`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployTarget {
+    Docker,
+    NativeEmbedded,
+    NativePythonBundle,
+    NativeBinary,
+    External,
+}
+
+/// Mechanizm konsumpcji wartości parametru. Każdy wariant odpowiada
+/// jednemu kanałowi runtime (env var, pole loadera, opcja API).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BindingTarget {
+    /// Bundle.toml `${ENV}` substitution lub docker `-e ENV=value`.
+    /// Konsumowane raz przy spawnie procesu.
+    Env { name: String },
+    /// Pole w `LlamaCppDeployParams` struct (Rust). Konsumowane przy
+    /// load modelu.
+    LlamacppField { field: String },
+    /// Pole w `WhisperDeployParams` struct. Może też być nadpisywane
+    /// per request gdy `request_override = true`.
+    WhisperField {
+        field: String,
+        #[serde(default)]
+        request_override: bool,
+    },
+    /// Pole w `MlxDeployParams` struct (deploy-time default), opcjonalnie
+    /// nadpisywane per request.
+    MlxField {
+        field: String,
+        #[serde(default)]
+        request_override: bool,
+    },
+    /// Klucz w `options` mapie POST do Ollama API. Konsumowane przy
+    /// każdym chat completion request.
+    OllamaOptions { key: String },
+    /// Pole w POST body do generic Python wrapper (qwen-asr, kyutai-tts,
+    /// xtts itd.). Konsumowane przy każdym audio request.
+    PythonRequestBody { field: String },
 }
 
 /// Engine category aligned with the `tentaflow-containers/` directory layout.

@@ -240,7 +240,15 @@ export class FlowCanvas {
   // Dane
   // -------------------------------------------------------------------------
   setData(nodes, edges, { reset = true } = {}) {
-    this.nodes = (nodes || []).map((n) => ({ ...n, config: n.config || {} }));
+    // Seed/backend pisze pozycje jako `{position: {x, y}}` (zagniezdzone),
+    // canvas renderuje przez flat `n.x`/`n.y`. Bez tej normalizacji wszystkie
+    // nodes lecialy na (0,0) — w GUI wygladalo to jak pojedynczy node.
+    this.nodes = (nodes || []).map((n) => {
+      const pos = n.position || {};
+      const x = typeof n.x === 'number' ? n.x : (typeof pos.x === 'number' ? pos.x : 0);
+      const y = typeof n.y === 'number' ? n.y : (typeof pos.y === 'number' ? pos.y : 0);
+      return { ...n, x, y, config: n.config || {} };
+    });
     this.edges = (edges || []).map((e) => ({ ...e }));
     this._normalizeNodeLabels();
     this._normalizeEdgePorts();
@@ -261,7 +269,18 @@ export class FlowCanvas {
     // dzieki serde(default). Dzieki temu edge tak jak przed S4a round-trippuje
     // do bajtowo identycznego JSONu.
     return {
-      nodes: this.nodes.map((n) => ({ ...n, config: { ...n.config } })),
+      nodes: this.nodes.map((n) => {
+        // Backend FlowNode oczekuje `position: {x, y}` (custom deserializer
+        // akceptuje tez tablicowy `[x,y]`, ale nie ma flat `x`/`y`). Bez
+        // konwersji round-trip gubi pozycje — node po save'ie wraca bez
+        // wspolrzednych i renderuje sie na (0,0).
+        const { x, y, ...rest } = n;
+        return {
+          ...rest,
+          position: { x: Number(x) || 0, y: Number(y) || 0 },
+          config: { ...n.config },
+        };
+      }),
       edges: this.edges.map((e) => {
         const out = { ...e };
         if (out.from_port === 'full') delete out.from_port;
@@ -419,6 +438,15 @@ export class FlowCanvas {
   updateNodeConfig(nodeId, patch) {
     const n = this.nodes.find((x) => x.id === nodeId);
     if (!n) return;
+    // Custom elementy (tf-toggle/tf-select/tf-input) potrafia odpalic `change`
+    // przy initial populate w FlowConfig.show — bez no-op guardu to
+    // triggerowalo `_pushHistory + _renderSingleNode + onChange`, ktore
+    // odbudowywaly DOM node'a i zrywaly selection ~sekunde po kliknieciu.
+    let changed = false;
+    for (const k of Object.keys(patch)) {
+      if (n.config?.[k] !== patch[k]) { changed = true; break; }
+    }
+    if (!changed) return;
     n.config = { ...n.config, ...patch };
     this._pushHistory();
     this._renderSingleNode(n);
@@ -428,6 +456,7 @@ export class FlowCanvas {
   updateNodeLabel(nodeId, label) {
     const n = this.nodes.find((x) => x.id === nodeId);
     if (!n) return;
+    if ((n.label || '') === (label || '')) return;
     n.label = label;
     this._pushHistory();
     this._renderSingleNode(n);

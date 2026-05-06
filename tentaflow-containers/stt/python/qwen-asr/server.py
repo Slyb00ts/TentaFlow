@@ -53,19 +53,34 @@ async def transcribe(
     model: str = Form("qwen-asr"),
     language: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
+    data: Optional[str] = Form(None),
 ):
-    data = await file.read()
-    audio, sr = sf.read(io.BytesIO(data))
+    audio_bytes = await file.read()
+    audio, sr = sf.read(io.BytesIO(audio_bytes))
     if sr != 16000:
         audio = librosa.resample(audio.astype("float32"), orig_sr=sr, target_sr=16000)
         sr = 16000
+
+    # Typed request-time overrides z BackendClient (multipart `data=<json>`).
+    # Klucze: max_new_tokens (default 512). Wartosci spoza zakresu / typu sa
+    # ignorowane defensywnie — wrapper nie powinien blokowac requestow.
+    overrides = {}
+    if data:
+        try:
+            import json as _json
+            overrides = _json.loads(data)
+            if not isinstance(overrides, dict):
+                overrides = {}
+        except Exception:
+            overrides = {}
+    max_new_tokens = int(overrides.get("max_new_tokens", 512))
 
     model_obj, processor = get_model()
     inputs = processor(audios=audio, sampling_rate=sr, return_tensors="pt").to(DEVICE)
     if DEVICE == "cuda":
         inputs = {k: v.to(DTYPE) if v.is_floating_point() else v for k, v in inputs.items()}
     with torch.inference_mode():
-        out = model_obj.generate(**inputs, max_new_tokens=512)
+        out = model_obj.generate(**inputs, max_new_tokens=max_new_tokens)
     text = processor.batch_decode(out, skip_special_tokens=True)[0]
 
     if response_format == "text":

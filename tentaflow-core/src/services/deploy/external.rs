@@ -111,7 +111,16 @@ impl DeployStrategy for ExternalDeploy {
         }
 
         let models = models_from_manifest(&self.manifest, &self.user_config);
-        let config_json = serde_json::to_string(&self.user_config)
+        // Typed schema params + request_time → config_json. Dla external
+        // (Ollama) `apply_parameters_deploy` produkuje `req.ollama_options`
+        // ktore BackendClient materializuje przy kazdym chat completion.
+        let (_param_app, request_time) = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::External,
+        )
+        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+        let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
         let runtime = RuntimeHandle {
@@ -193,6 +202,7 @@ mod tests {
                 input_modalities: None,
                 output_modalities: None,
             }],
+            parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
         }

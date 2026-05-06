@@ -1117,13 +1117,29 @@ function renderStepRuntime() {
     `;
   }
 
-  const portField = composeMode ? '' : `
-    <div class="form-group">
-      <tf-input type="number" id="edw-port"
-        label="${escapeAttr(I18n.t('wizard.port'))}"
-        value="${escapeAttr(String(port))}"></tf-input>
-    </div>
-  `;
+  // Pole portu pokazujemy TYLKO dla docker (single-container) — host port w
+  // mapowaniu host:container jest editable i ma sens uzytkownikowi. Dla
+  // native (python-bundle / binary / embedded) i compose backend zawsze sam
+  // alokuje port z puli (config.services_runtime.port_range, domyslnie
+  // 5000-6000) — pokazywanie pola wprowadzaloby w blad bo wartosc i tak
+  // jest ignorowana przez `python_bundle.rs::prepare`. Zamiast tego
+  // pokazujemy informacyjny opis.
+  const isDockerSingle = selection.deployMethod === 'docker' && !composeMode;
+  const portField = isDockerSingle
+    ? `
+      <div class="form-group">
+        <tf-input type="number" id="edw-port"
+          label="${escapeAttr(I18n.t('wizard.port'))}"
+          value="${escapeAttr(String(port))}"></tf-input>
+        <span class="form-hint">${escapeHtml(I18n.t('wizard.portDockerHint'))}</span>
+      </div>
+    `
+    : `
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('wizard.port'))}</label>
+        <div class="form-readout">${escapeHtml(I18n.t('wizard.portAutoAllocated'))}</div>
+      </div>
+    `;
 
   return `
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.configureRuntime'))}</h4>
@@ -1508,7 +1524,12 @@ async function startDeploy() {
   let vllmArgs = null;
   if (!shouldSkipAdvancedStep() && advancedRecommendation && !advancedRecommendation.error) {
     if (selection.advanced.mode === 'auto') {
-      vllmArgs = advancedRecommendation.recommended_vllm_args || null;
+      // recommended_vllm_args z kalkulatora zawiera m.in. `--gpu-memory-utilization`
+      // ktore backend traktuje jako "user explicit" i nadpisuje auto-clamp z
+      // free VRAM. W trybie auto user nie wybral tej wartosci — wycinamy ja
+      // ze stringa, zeby backend mogl ja policzyc z aktualnego stanu karty.
+      const raw = advancedRecommendation.recommended_vllm_args || '';
+      vllmArgs = raw.replace(/--gpu-memory-utilization(?:=|\s+)[^\s]+/g, '').replace(/\s+/g, ' ').trim() || null;
     } else {
       const a = selection.advanced;
       const r = advancedRecommendation.recommended || {};
@@ -1530,13 +1551,37 @@ async function startDeploy() {
     }
   }
 
+  // Suwak gpu_memory_utilization w panelu Advanced jest wspolny dla obu trybow
+  // (auto/manual) — w auto mode `vllmArgs` bierzemy z `recommended_vllm_args`
+  // ale nie zawiera on tego co user faktycznie ustawil na suwaku. Wysylamy
+  // wartosc jako osobne pole, zeby backend zaklemowal ja przeciwko aktualnie
+  // wolnemu VRAM (`min(user, auto_safe)`) niezaleznie od trybu i wpisu w
+  // vllm_args. Jezeli Advanced step nie jest aktywny dla tego silnika,
+  // `selection.advanced.gpu_memory_utilization` nadal istnieje (default state),
+  // ale wtedy `shouldSkipAdvancedStep()` jest prawdziwe i wartosc nie ma
+  // znaczenia — wysylamy mimo to bo to tylko hint, backend zdecyduje.
+  const advActive = !shouldSkipAdvancedStep();
   const configJson = JSON.stringify({
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
-    port: usesDockerCompose() ? null : (selection.port || eng.default_port),
+    // Native (python-bundle / binary / embedded) zawsze dostaje port z
+    // PortAllocatora — wartosc z formularza i tak jest ignorowana po
+    // stronie backendu, wiec wysylamy null zeby uniknac mylacych logow.
+    // Docker single-container honoruje user-provided host port; compose
+    // sterujemy z bundlu, tu null.
+    port: (selection.deployMethod === 'docker' && !usesDockerCompose())
+      ? (selection.port || eng.default_port)
+      : null,
     container_name: selection.containerName || null,
     gpu_select_mode: selection.gpuSelectMode,
     gpu_ids: selection.gpuSelectMode === 'specific' ? selection.gpuIds : null,
+    // gpu_memory_utilization wysylamy TYLKO gdy user explicit dotknal panelu
+    // Advanced (mode === 'manual'). W trybie 'auto' wartosc w state ma default
+    // 0.9 ktorego user nie wybieral — wysylanie jej kazaloby backendowi
+    // traktowac to jako 'user explicit' i nadpisalo auto-clamp z free VRAM.
+    gpu_memory_utilization: (advActive && selection.advanced.mode === 'manual')
+      ? selection.advanced.gpu_memory_utilization
+      : null,
     vllm_args: vllmArgs,
   });
 

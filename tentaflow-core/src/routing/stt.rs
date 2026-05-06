@@ -47,8 +47,13 @@ impl Router {
         // `routing/*` -> `services/runtime` -> backend layering uniform.
         let executor_snapshot = self.executor.read().clone();
         if let Some(executor) = executor_snapshot {
+            use crate::services::runtime::context::ExecutionContext;
             use crate::services::runtime::executor::ExecutorError;
-            match executor.execute_stt(request.clone()).await {
+            let mut exec_ctx = ExecutionContext {
+                user: user.clone(),
+                ..ExecutionContext::default()
+            };
+            match executor.execute_stt(request.clone(), &mut exec_ctx).await {
                 Ok(response) => {
                     return Ok(crate::routing::RouteResult {
                         response,
@@ -188,6 +193,7 @@ impl Router {
                 no_speech_threshold,
                 avg_logprob_threshold,
                 compression_ratio_threshold,
+                extra_params: _,
             } => {
                 debug!(
                     "Audio STT: model={}, rozmiar_audio={} bajtow, response_format={:?}",
@@ -233,8 +239,10 @@ impl Router {
                 let executor_snapshot = self.executor.read().clone();
                 let stt_dispatch = match executor_snapshot {
                     Some(executor) => {
+                        use crate::services::runtime::context::ExecutionContext;
                         use crate::services::runtime::executor::ExecutorError;
-                        match executor.execute_stt(request.clone()).await {
+                        let mut exec_ctx = ExecutionContext::default();
+                        match executor.execute_stt(request.clone(), &mut exec_ctx).await {
                             Ok(response) => Ok(crate::routing::RouteResult {
                                 response,
                                 metadata: crate::routing::RouteMetadata {

@@ -84,6 +84,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             input_modalities: None,
             output_modalities: None,
         }],
+        parameters: vec![],
         docker_source_hash: String::new(),
         native_source_hash: String::new(),
     }

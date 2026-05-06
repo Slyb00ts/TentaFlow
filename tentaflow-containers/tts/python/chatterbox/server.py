@@ -56,6 +56,8 @@ class SpeechRequest(BaseModel):
     audio_prompt_path: Optional[str] = None
     exaggeration: Optional[float] = 0.5
     cfg_weight: Optional[float] = 0.5
+    # Pozwol na typed request-time overrides z BackendClient.
+    model_config = {"extra": "allow"}
 
 
 app = FastAPI(title="Chatterbox Multilingual TTS", version="1.0.0")

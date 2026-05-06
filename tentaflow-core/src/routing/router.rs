@@ -429,9 +429,10 @@ impl Router {
         // (bezposrednio przez SttManager). Pre-R5f trzymal Weak<Router>
         // i loopowal przez `Router.route_audio_transcription` ktore po
         // R3b.6 cutover stalo sie stub'em — STT byl wylaczony.
-        *self.stt_runtime.write() = Some(Arc::new(
-            crate::services::stt::SttRuntime::new(),
-        ));
+        // Singleton (shared_stt_runtime) — supervisor reconcile uzywa tego
+        // samego Arc do `register_backend(SttBackend::Http)` dla python-bundle
+        // STT services (qwen-asr/parakeet/kyutai-tts).
+        *self.stt_runtime.write() = Some(crate::services::stt::shared_stt_runtime());
 
         // R3e (F10): subscribe na mutacje mesh registry. Wczesniej peer
         // announce/remove/update aktualizowal registry, ale `/v1/models` /

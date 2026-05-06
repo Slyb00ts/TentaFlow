@@ -219,6 +219,11 @@ pub struct Supervisor {
     /// peer announce/disconnect propagate to `/v1/models` without an
     /// explicit alias mutation.
     catalog_provider: Option<Arc<crate::services::catalog::CatalogProvider>>,
+    /// Optional STT runtime. Reconcile rejestruje per-service backendow
+    /// (`SttBackend::Http(BackendClient)` dla python-bundle wrapperow STT
+    /// jak qwen-asr/parakeet) zeby `transcribe_for_service(service_id)`
+    /// trafialo na wlasciwy backend zamiast default local whisper.
+    stt_runtime: Option<Arc<crate::services::stt::SttRuntime>>,
 }
 
 impl Supervisor {
@@ -252,6 +257,10 @@ impl Supervisor {
             live_handles,
             reconnect_tasks: Arc::new(Mutex::new(HashMap::new())),
             catalog_provider: None,
+            // Shared singleton zgodny z router/handler/executor/flow_engine.
+            // reconcile uzywa go do rejestrowania HTTP backendow STT services
+            // (qwen-asr/parakeet python-bundle).
+            stt_runtime: Some(crate::services::stt::shared_stt_runtime()),
         };
         (supervisor, rx)
     }
@@ -658,6 +667,14 @@ impl Supervisor {
             if let Some(task) = tasks.remove(&(node_id.clone(), service_id)) {
                 task.abort();
             }
+            // Wyrejestruj backend STT (jezeli byl) — bez tego
+            // `transcribe_for_service(service_id)` po stop deploy nadal
+            // bralby stary BackendClient z mapy.
+            if node_id == self.local_node_id {
+                if let Some(rt) = self.stt_runtime.as_ref() {
+                    rt.unregister_backend(service_id).await;
+                }
+            }
         }
 
         // (4) Insert handles for new pairs.
@@ -684,6 +701,21 @@ impl Supervisor {
                 BackendHandle::Quic(h) => Some(h.clone()),
                 _ => None,
             };
+            // Zarejestruj backend STT dla lokalnego service category=stt z
+            // HTTP transport (qwen-asr/parakeet/kyutai-tts python-bundle).
+            // Inne kategorie (chat/embeddings/itd.) ida przez ResolvedExecutionTarget
+            // → live_handles i nie potrzebuja STT-specific rejestracji.
+            if node_id == self.local_node_id && svc.category == "stt" {
+                if let Some(rt) = self.stt_runtime.as_ref() {
+                    if let BackendHandle::Http(client) = &handle {
+                        rt.register_backend(
+                            service_id,
+                            crate::services::stt::SttBackend::Http(client.clone()),
+                        )
+                        .await;
+                    }
+                }
+            }
             self.live_handles
                 .insert(node_id.clone(), service_id, handle);
             if let Some(qh) = quic_inner {
@@ -857,11 +889,18 @@ impl Supervisor {
 
 async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
     // Engines speak OpenAI-compatible APIs in the dominant case, so probe the
-    // /v1/models endpoint when no explicit health URL is provided.
-    let probe_url = if url.ends_with('/') || url.contains("/v1/") || url.contains("/health") {
+    // /v1/models endpoint. `endpoint_url` z `build_endpoint_url` jest baza API
+    // (np. http://127.0.0.1:5001/v1) — strip ewentualny trailing /v1 i
+    // dolep /v1/models. Bez tego probe trafiał w bare /v1 → 404 na vllm
+    // i restart loop.
+    let trimmed = url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1/models")
+        .trim_end_matches("/v1");
+    let probe_url = if url.contains("/health") {
         url.to_string()
     } else {
-        format!("{}/v1/models", url.trim_end_matches('/'))
+        format!("{}/v1/models", trimmed)
     };
 
     let client = match reqwest::Client::builder().timeout(timeout).build() {
@@ -876,8 +915,7 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
                 HealthStatus::Ok
             } else if status.as_u16() == 404 && !probe_url.ends_with("/health") {
                 // Fallback: try /health if /v1/models is not exposed.
-                let base = url.trim_end_matches('/').trim_end_matches("/v1/models");
-                let fallback = format!("{}/health", base);
+                let fallback = format!("{}/health", trimmed);
                 match client.get(&fallback).send().await {
                     Ok(r2) if r2.status().is_success() => HealthStatus::Ok,
                     Ok(r2) => HealthStatus::Degraded(format!("http {}", r2.status())),
@@ -1626,6 +1664,7 @@ mod tests {
             }],
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
+            request_time_parameters: Default::default(),
         };
         registry.replace_node("peerB".into(), vec![remote_svc]);
 

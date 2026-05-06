@@ -23,6 +23,10 @@ pub enum ResolvedExecutionTarget {
         /// Original model name as seen by the client. Carried through so
         /// telemetry can report the requested id, not just the handle.
         model_name: String,
+        /// Lokalny service_id z `services` tabeli — uzywany przez
+        /// `SttRuntime::transcribe_for_service` zeby wybrac per-service
+        /// backend (Local/Http) zarejestrowany przy deployu.
+        service_id: i64,
         handle: BackendHandle,
     },
     /// Forward the request to a peer that owns the model. The executor
@@ -100,6 +104,15 @@ impl ResolvedExecutionTarget {
         }
     }
 
+    /// Lokalny service_id (gdy target=Local). `None` dla mesh forward i
+    /// flow (te nie maja lokalnego service ownera).
+    pub fn local_service_id(&self) -> Option<i64> {
+        match self {
+            Self::Local { service_id, .. } => Some(*service_id),
+            _ => None,
+        }
+    }
+
     /// Originally requested model id. Useful for telemetry + error
     /// messages where we want to report the user-facing name, not the
     /// resolved target's internal identity.
@@ -126,7 +139,7 @@ mod tests {
 
     #[test]
     fn telemetry_tags_cover_every_variant() {
-        let local = ResolvedExecutionTarget::Local {
+        let local = ResolvedExecutionTarget::Local { service_id: 1,
             model_name: "m".into(),
             handle: embedded("m"),
         };
@@ -157,7 +170,7 @@ mod tests {
 
     #[test]
     fn embedded_local_is_always_alive() {
-        let t = ResolvedExecutionTarget::Local {
+        let t = ResolvedExecutionTarget::Local { service_id: 1,
             model_name: "m".into(),
             handle: embedded("m"),
         };

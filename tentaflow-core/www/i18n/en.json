@@ -2882,6 +2882,8 @@
     "containerName": "Container name",
     "stackName": "Stack name",
     "port": "Port",
+    "portDockerHint": "Host port mapped to the container's internal port. A clash with another container fails startup.",
+    "portAutoAllocated": "Auto-allocated from the 5000–6000 pool at start",
     "modelLabel": "Model",
     "method": {
       "docker": "Docker",

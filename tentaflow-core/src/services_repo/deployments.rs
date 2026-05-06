@@ -56,8 +56,12 @@ pub struct DeploymentRow {
     pub log_tail: String,
 }
 
+// Schema deployments uzywa nazw `deploy_id` i `error_message` (zgodnie z
+// `db::repository::deployments`). Ten modul zachowuje stare aliasy w
+// strukturze (slug/error_text) zeby nie psuc callerow, ale w SQL siegamy do
+// rzeczywistych nazw kolumn.
 const COLS: &str = "id, engine_id, deploy_method, status, started_at, finished_at, \
-    error_text, config_json, slug, log_tail";
+    error_message AS error_text, config_json, deploy_id AS slug, log_tail";
 
 /// Maximum number of log lines kept in `log_tail`. Older lines are dropped
 /// FIFO-style when this limit is exceeded so the column stays bounded.
@@ -83,14 +87,19 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
 }
 
 pub fn insert(conn: &Connection, new: &NewDeployment) -> Result<i64> {
+    // `deploy_id` jest NOT NULL UNIQUE w schemie. Caller niepodajacy slug-a
+    // dostaje wygenerowany UUID — wpis i tak musi miec stable handle
+    // (log streamowanie, status update przez log_bus klucza po deploy_id).
+    let deploy_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO deployments (engine_id, deploy_method, status, config_json) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO deployments (deploy_id, engine_id, deploy_method, status, config_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
+            deploy_id,
             new.engine_id,
             new.deploy_method,
             new.status.as_db_tag(),
-            new.config_json,
+            new.config_json.clone().unwrap_or_else(|| "{}".to_string()),
         ],
     )
     .context("insert deployments")?;
@@ -107,7 +116,7 @@ pub fn create_with_slug(
     slug: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO deployments (engine_id, deploy_method, status, slug) \
+        "INSERT INTO deployments (engine_id, deploy_method, status, deploy_id) \
          VALUES (?1, ?2, 'running', ?3)",
         params![engine_id, deploy_method, slug],
     )
@@ -123,7 +132,7 @@ pub fn append_log_line(db: &DbPool, slug: &str, line: &str) -> Result<()> {
         .map_err(|e| anyhow!("pool lock poisoned: {}", e))?;
     let current: Option<String> = conn
         .query_row(
-            "SELECT log_tail FROM deployments WHERE slug = ?1",
+            "SELECT log_tail FROM deployments WHERE deploy_id = ?1",
             params![slug],
             |r| r.get(0),
         )
@@ -146,7 +155,7 @@ pub fn append_log_line(db: &DbPool, slug: &str, line: &str) -> Result<()> {
     };
 
     conn.execute(
-        "UPDATE deployments SET log_tail = ?2 WHERE slug = ?1",
+        "UPDATE deployments SET log_tail = ?2 WHERE deploy_id = ?1",
         params![slug, new_tail],
     )?;
     Ok(())
@@ -159,7 +168,7 @@ pub fn get_by_slug(db: &DbPool, slug: &str) -> Result<Option<DeploymentRow>> {
     let conn = db
         .lock()
         .map_err(|e| anyhow!("pool lock poisoned: {}", e))?;
-    let sql = format!("SELECT {} FROM deployments WHERE slug = ?1", COLS);
+    let sql = format!("SELECT {} FROM deployments WHERE deploy_id = ?1", COLS);
     Ok(conn
         .query_row(&sql, params![slug], map_row)
         .optional()
@@ -174,7 +183,7 @@ pub fn mark_finished(
 ) -> Result<()> {
     let n = conn.execute(
         "UPDATE deployments SET status = ?2, finished_at = CURRENT_TIMESTAMP, \
-         error_text = ?3 WHERE id = ?1",
+         error_message = ?3 WHERE id = ?1",
         params![id, status.as_db_tag(), error_text],
     )?;
     if n == 0 {

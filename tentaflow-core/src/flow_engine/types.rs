@@ -61,9 +61,9 @@ where
 pub struct FlowEdge {
     #[serde(default)]
     pub id: Option<String>,
-    #[serde(alias = "source", alias = "from_node")]
+    #[serde(rename = "from_node", alias = "from", alias = "source")]
     pub from: String,
-    #[serde(alias = "target", alias = "to_node")]
+    #[serde(rename = "to_node", alias = "to", alias = "target")]
     pub to: String,
     #[serde(default)]
     pub label: Option<String>,
