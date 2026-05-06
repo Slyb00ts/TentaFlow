@@ -18,7 +18,10 @@ use crate::flow_engine::dispatchers::{TtsDispatcher, TtsRequest, TtsResponse, Tt
 use crate::flow_engine::envelope::FinishReason;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 
-const TTS_STREAM_CHUNK_BYTES: usize = 16_000;
+/// Etap 3c: 100 ms PCM @ 16 kHz mono i16 = 16_000 * 0.1 * 2 bajty = 3200.
+/// Spójne z legacy `routing/tts.rs::TTS_STREAM_CHUNK_BYTES`. Mniejsze
+/// chunki = niższa first-audible latency, większy overhead per frame.
+const TTS_STREAM_CHUNK_BYTES: usize = 3_200;
 
 const DEFAULT_VOICE: &str = "alloy";
 
@@ -88,7 +91,8 @@ impl TtsDispatcher for TtsDispatcherImpl {
 
         // WAV header strip — pierwszy chunk z RIFF nagłówkiem byłby zaszumiony
         // gdyby klient łączył chunki bez separowania nagłówka. Etap 3c
-        // wpina ten sam preprocessing co legacy synthesize_speech_stream.
+        // wpina ten sam preprocessing co blocking synthesize: pierwszy chunk
+        // musi być czystym PCM, inaczej klient słyszy klik z RIFF nagłówka.
         if bytes.len() >= 12
             && &bytes[0..4] == b"RIFF"
             && &bytes[8..12] == b"WAVE"
@@ -189,17 +193,17 @@ mod tests {
     /// instantiation z slot pattern, więc używamy synthesize stub.
     #[tokio::test]
     async fn stream_chunks_when_buffer_exceeds_chunk_size() {
-        // Direct chunking test: weryfikujemy że TTS_STREAM_CHUNK_BYTES
-        // = 16_000, więc 40k bytes payloadu produkuje 3 chunki.
+        // 100 ms PCM @ 16 kHz mono i16 = 3200 bajtów. 40_000 / 3_200 = 12.5
+        // → 13 chunków: 12 pełnych po 3200 + 1 ogonowy 1600 bajtów.
+        assert_eq!(TTS_STREAM_CHUNK_BYTES, 3_200);
         let big_payload = vec![0u8; 40_000];
         let chunks: Vec<Vec<u8>> = big_payload
             .chunks(TTS_STREAM_CHUNK_BYTES)
             .map(|c| c.to_vec())
             .collect();
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 13);
         assert_eq!(chunks[0].len(), TTS_STREAM_CHUNK_BYTES);
-        assert_eq!(chunks[1].len(), TTS_STREAM_CHUNK_BYTES);
-        assert_eq!(chunks[2].len(), 40_000 - 2 * TTS_STREAM_CHUNK_BYTES);
+        assert_eq!(chunks[12].len(), 40_000 - 12 * TTS_STREAM_CHUNK_BYTES);
     }
 
     #[tokio::test]

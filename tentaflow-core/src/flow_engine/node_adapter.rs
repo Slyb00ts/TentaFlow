@@ -289,7 +289,7 @@ pub mod test_support {
             _req: TtsRequest,
         ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>>
         {
-            panic!("stub TtsDispatcher: stream_synthesize called");
+            Ok(Box::pin(futures::stream::empty()))
         }
     }
 

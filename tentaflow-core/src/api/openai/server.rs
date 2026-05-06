@@ -614,28 +614,66 @@ async fn handle_audio_tts_stream(
         }
     };
 
+    // Etap 3c CRITICAL fix: model-level ACL gate przed dispatchem.
+    // Mirror /v1/audio/speech sciezka (routing/tts.rs:41).
+    if let Some(ref u) = user_ctx {
+        if let Some(ref db) = router.db {
+            if !crate::auth::acl::check_access_safe(
+                db,
+                "model",
+                &api_request.model,
+                u.user_id,
+                &u.role,
+            ) {
+                tracing::warn!(
+                    user_id = u.user_id,
+                    model = %api_request.model,
+                    "ACL denied TTS stream model"
+                );
+                return Ok(error_response(
+                    StatusCode::NOT_FOUND,
+                    "model_not_found",
+                    format!("model '{}' not found", api_request.model),
+                ));
+            }
+        }
+    }
+
+    if api_request.input.is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "TTSRequest.input must not be empty".to_string(),
+        ));
+    }
+
     let cancel = tokio_util::sync::CancellationToken::new();
-    let user = build_user_context(user_ctx);
     let req_dto = crate::flow_engine::dispatchers::TtsRequest {
         model: api_request.model.clone(),
         text: api_request.input.clone(),
         voice: Some(api_request.voice.clone()),
         format: api_request.response_format.clone(),
         language: api_request.language.clone(),
-        user_id: user.as_ref().map(|u| u.user_id),
-        user_role: user.as_ref().map(|u| u.role.clone()),
+        user_id: user_ctx.as_ref().map(|u| u.user_id),
+        user_role: user_ctx.as_ref().map(|u| u.role.clone()),
         cancel_token: cancel.clone(),
     };
 
     let chunk_stream = match dispatcher.tts().stream_synthesize(req_dto).await {
         Ok(s) => s,
         Err(e) => {
+            // Map common error types to typed HTTP status. Default Internal
+            // pokrywa nieznane błędy backendu.
+            let msg = e.to_string();
+            let (status, code) = if msg.contains("not wired") {
+                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+            } else if msg.contains("empty text") || msg.contains("not found") {
+                (StatusCode::BAD_REQUEST, "invalid_request")
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "backend_error")
+            };
             error!("TTS stream init: {}", e);
-            return Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "backend_error",
-                format!("TTS stream init: {}", e),
-            ));
+            return Ok(error_response(status, code, msg));
         }
     };
 
@@ -684,12 +722,6 @@ async fn handle_audio_tts_stream(
         .header("Connection", "keep-alive")
         .body(StreamBody::new(body))
         .unwrap())
-}
-
-fn build_user_context(
-    user_ctx: Option<crate::auth::acl::UserContext>,
-) -> Option<crate::auth::acl::UserContext> {
-    user_ctx
 }
 
 /// Handler dla /v1/audio/transcriptions (Speech-to-Text, Whisper)
