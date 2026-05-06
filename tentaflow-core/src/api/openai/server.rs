@@ -664,10 +664,20 @@ async fn handle_audio_tts_stream(
         Err(e) => {
             // Map common error types to typed HTTP status. Default Internal
             // pokrywa nieznane błędy backendu.
+            // Mapowanie typowane na podstawie podstringów wytwarzanych
+            // przez TtsDispatcherImpl/runtime. "not wired" → backend nie
+            // gotowy; "not found" / "unknown model" → 404; "empty text"
+            // / "no candidate" / "capability" → 400; reszta → 500.
             let msg = e.to_string();
-            let (status, code) = if msg.contains("not wired") {
+            let lower = msg.to_ascii_lowercase();
+            let (status, code) = if lower.contains("not wired") {
                 (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
-            } else if msg.contains("empty text") || msg.contains("not found") {
+            } else if lower.contains("not found") || lower.contains("unknown model") {
+                (StatusCode::NOT_FOUND, "model_not_found")
+            } else if lower.contains("empty text")
+                || lower.contains("no candidate")
+                || lower.contains("capability")
+            {
                 (StatusCode::BAD_REQUEST, "invalid_request")
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, "backend_error")
