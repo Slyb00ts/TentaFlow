@@ -1,6 +1,35 @@
 # Etap 3a — Streaming usage w SSE (`stream_options.include_usage`)
 
-**Plan v1.0 (do review codex)**
+**Plan v1.1 (po round 1 codex)**
+
+## Zmiany v1.0 → v1.1 (codex round 1)
+
+1. **CRITICAL `wrap_with_pii_streaming` drops `choices: []`** — obecny PII
+   streaming filter wyrzuca chunki bez choices, co połknęłoby tail chunk
+   natychmiast. Plan v1.1 dodaje explicit bypass: chunk z `choices.is_empty()`
+   AND `usage.is_some()` przepuszczany untouched. Dotyczy też przyszłego
+   bare passthrough z usage tail.
+2. **IMPORTANT bare passthrough emit dwóch chunków** — plan v1.0 mówił że
+   `Done` arm produkuje tail chunk, ale obecny `filter_map` w
+   `executor.rs:448` emituje finish_reason chunk i nic więcej. 1→2 nie pasuje
+   do `filter_map`. Plan v1.1 redesign:
+   - Executor ZAWSZE stempluje `chunk.usage = Some(metrics)` na finish_reason
+     chunk gdy `final_metrics.is_some()` (jeden chunk, ekstra pole — back
+     compat OK bo Etap 3a dodaje pole `usage` do `ChatCompletionChunk`).
+   - **Routing layer w `routing/streaming.rs`** decyduje per `include_usage`:
+     - `false`: strip `usage` z finish chunk'u (back compat, klient nie
+       prosił), emit chunk.
+     - `true`: emit chunk z `usage: None` + emit tail chunk z `choices: []`
+       i `usage: Some(metrics)`.
+   - Decyzja per-flag siedzi w jednym miejscu (routing), executor jest agnostic.
+3. **NIT tail latency coupled to finalizer** — plan v1.1 stwierdza explicit że
+   tail chunk czeka na pełny finalizer flush (włącznie z DB persist). To
+   intentional tradeoff (klient otrzyma usage dopiero po realnym zakończeniu
+   trace persist). Dla embedded backendów persist jest sub-millisecond; dla
+   distributed db może być powolniej. Etap 3d przeniesie persist do detached
+   task'a osobno od outcome flush.
+
+## Plan v1.0 (do review codex)
 **Codex session ID:** `019dfca1-fef1-7ca1-b154-b73a796670a8`
 **Data:** 2026-05-06
 **Bazuje na:** Etap 2 (zamknięty, commit `b63c096`)
@@ -244,53 +273,129 @@ persist.
 
 `routing/streaming.rs` ma drugą ścieżkę przez `executor.stream_chat` →
 `ExecutorChunkStream` (`Pin<Box<dyn Stream<Item=Result<ChatCompletionChunk>>>>`).
-Backend (QUIC/HTTP/Local) produkuje `ChatCompletionChunk`-i. Etap 3a:
+Backend (QUIC/HTTP/Local) produkuje `ChatCompletionChunk`-i.
 
-1. Jeśli klient nie poprosił `include_usage=true` → passthrough bez zmian.
-2. Jeśli poprosił:
-   - sprawdzamy ostatni chunk source — jeśli ma `usage: Some(_)`, dispatcher już
-     dorzucił rollup (np. niektóre OpenAI-compat backendy to robią) →
-     passthrough.
-   - jeśli nie — `ExecutorChunkStream` przy `StreamChunkType::Done { final_metrics }`
-     trzeba mapować na `ChatCompletionChunk { choices: [], usage: Some(metrics) }`.
-     `services/runtime/executor.rs:398` dziś ignoruje `final_metrics` —
-     Etap 3a to rozszerza:
+### Etap 3a redesign: stempel + split
+
+**Krok 1 — executor stempluje:** `services/runtime/executor.rs:448` w arm
+`StreamChunkType::Done { final_metrics }` ZAWSZE wstawia `usage: final_metrics`
+na finish_reason chunk (jeden chunk, ekstra pole). Bez patrzenia na
+`include_usage`. Back compat: pole `usage` na `ChatCompletionChunk` jest
+nowe (Etap 3a dodaje), więc dotychczasowi klienci nie zauważą.
 
 ```rust
 // services/runtime/executor.rs ~ line 448
 StreamChunkType::Done { final_metrics } => {
-    // Etap 3a: jeśli backend dostarczył usage, emit jako tail.
-    if let Some(metrics) = final_metrics {
-        Some(Ok(ChatCompletionChunk {
-            id: chat_id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created: created_ts,
-            model: model_name_for_chunks.clone(),
-            choices: vec![],
-            usage: Some(Usage {
-                prompt_tokens: metrics.prompt_tokens.unwrap_or(0) as u32,
-                completion_tokens: metrics.completion_tokens.unwrap_or(0) as u32,
-                total_tokens: metrics.total_tokens.unwrap_or(0) as u32,
-            }),
-            system_fingerprint: None,
-            audio: None,
-            detected_intent: None,
-            detected_tools: None,
-            transcribed_text: None,
-            speaker_id: None,
-            speaker_name: None,
-        }))
-    } else {
-        None
-    }
+    let usage = final_metrics.map(|m| Usage {
+        prompt_tokens: m.prompt_tokens.unwrap_or(0) as u32,
+        completion_tokens: m.completion_tokens.unwrap_or(0) as u32,
+        total_tokens: m.total_tokens.unwrap_or(0) as u32,
+    });
+    Some(Ok(ChatCompletionChunk {
+        id: chat_id.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created: created_ts,
+        model: model_name_for_chunks.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta { role: None, content: None, reasoning_content: None, tool_calls: None },
+            finish_reason: Some("stop".to_string()),
+            logprobs: None,
+        }],
+        usage, // Etap 3a: rollup z final_metrics gdy backend zaraportował
+        system_fingerprint: None,
+        audio: None,
+        detected_intent: None,
+        detected_tools: None,
+        transcribed_text: None,
+        speaker_id: None,
+        speaker_name: None,
+    }))
 }
 ```
 
-3. Filter middleware (`wrap_with_pii_streaming`) musi przepuszczać tail chunk
-   (`choices: []`) bez modyfikacji — tail nie ma tekstu do filtrowania.
+**Krok 2 — routing layer split per flag:** w `route_chat_completion_stream`
+po executor'ze, dodajemy `apply_include_usage_split(stream, include_usage)`
+który:
+- Gdy `include_usage=false`: scan stream, jeśli widzi `usage: Some` na chunku
+  z `finish_reason: Some(_)`, czyści `chunk.usage = None` przed forwardem.
+  Klient nie prosił, więc Etap 3a nie dorzuca pola w response.
+- Gdy `include_usage=true`: scan stream, gdy widzi finish chunk z
+  `usage: Some(metrics)`:
+  - emit chunk z `usage: None` (regular finish chunk, OpenAI contract)
+  - emit dodatkowy tail chunk: `choices: vec![]`, `usage: Some(metrics)`
+  - usuwa `usage` z dalszych chunków (powinno nie być, ale defensywnie)
 
-`StreamingProcessor::process_token` skip'uje gdy `choice.delta.content.is_none()`
-i `choices.is_empty()` → już safe (sprawdzić w testach).
+State machine:
+
+```rust
+enum SplitState {
+    Active,
+    EmittingTail { tail: ChatCompletionChunk },
+    Done,
+}
+
+fn apply_include_usage_split<S>(
+    inner: S,
+    include_usage: bool,
+) -> impl Stream<Item = Result<ChatCompletionChunk>>
+where S: Stream<Item = Result<ChatCompletionChunk>> + Send + Unpin
+{
+    futures::stream::unfold(
+        (inner, SplitState::Active, include_usage),
+        |(mut s, state, flag)| async move {
+            match state {
+                SplitState::EmittingTail { tail } => {
+                    Some((Ok(tail), (s, SplitState::Done, flag)))
+                }
+                SplitState::Done => None,
+                SplitState::Active => {
+                    let chunk = match s.next().await {
+                        Some(Ok(c)) => c,
+                        Some(Err(e)) => return Some((Err(e), (s, SplitState::Done, flag))),
+                        None => return None,
+                    };
+                    let has_finish = chunk.choices.iter()
+                        .any(|c| c.finish_reason.is_some());
+                    if has_finish && chunk.usage.is_some() {
+                        if flag {
+                            // Split: emit chunk z usage=None, tail jako separate.
+                            let metrics = chunk.usage.clone();
+                            let mut finish_chunk = chunk;
+                            finish_chunk.usage = None;
+                            let tail = build_tail_from_metrics(
+                                &finish_chunk,
+                                metrics.unwrap(),
+                            );
+                            Some((Ok(finish_chunk), (s, SplitState::EmittingTail { tail }, flag)))
+                        } else {
+                            // No flag: strip usage, emit chunk.
+                            let mut stripped = chunk;
+                            stripped.usage = None;
+                            Some((Ok(stripped), (s, SplitState::Active, flag)))
+                        }
+                    } else {
+                        Some((Ok(chunk), (s, SplitState::Active, flag)))
+                    }
+                }
+            }
+        }
+    )
+}
+```
+
+**Krok 3 — PII filter bypass:** `wrap_with_pii_streaming` filter dziś dropuje
+chunki z `choices: []`. Etap 3a dodaje explicit bypass:
+
+```rust
+// routing/streaming.rs::wrap_with_pii_streaming, w pętli per chunk:
+if chunk.choices.is_empty() && chunk.usage.is_some() {
+    // Tail chunk z usage — przepuszczamy untouched, brak tekstu do filtrowania.
+    return Some(Ok(chunk));
+}
+```
+
+To naprawia issue z plan v1.0 (CRITICAL z codex round 1).
 
 ### Flag propagation
 
@@ -330,10 +435,12 @@ Etap 3d może dodać tiktoken-based estymację router-side jako fallback.
 | `api/openai/types.rs` | + `StreamOptions`, `ChatCompletionRequest.stream_options`, `ChatCompletionChunk.usage` | +60 |
 | `routing/streaming.rs` | `envelope_stream_to_chunk_stream` parametryzacja + `StreamState` machine + `build_tail_chunk` | +120 |
 | `routing/streaming.rs` | `route_chat_completion_stream` reads `request.stream_options.include_usage`, forwards | +10 |
-| `services/runtime/executor.rs` | `Done { final_metrics }` arm produkuje tail chunk gdy include_usage | +60 |
-| Tests w `routing/streaming.rs` / `services/runtime/executor.rs` | tail emission, flow + bare paths | +80 |
+| `services/runtime/executor.rs` | `Done { final_metrics }` arm stempluje `chunk.usage = Some(metrics)` zawsze | +30 |
+| `routing/streaming.rs` | `apply_include_usage_split` state machine (false: strip usage, true: emit + tail) | +90 |
+| `routing/streaming.rs` | `wrap_with_pii_streaming` bypass dla chunk z `choices.is_empty() && usage.is_some()` | +10 |
+| Tests w `routing/streaming.rs` / `services/runtime/executor.rs` | tail emission, flow + bare paths, PII bypass | +100 |
 
-**Razem: ~330 LOC.** Małe sub-stage.
+**Razem: ~420 LOC** (po round 1 fixach: split state machine + PII bypass).
 
 ---
 
@@ -359,10 +466,12 @@ Etap 3d może dodać tiktoken-based estymację router-side jako fallback.
 
 ## Otwarte ryzyka
 
-1. **`outcome.await` blokuje tail emission** — finalizer flush'uje outcome zaraz
-   po EOF, więc latency dodatkowa = persist time. Jeśli persist DB jest powolny
-   (>100ms), klient widzi tail z opóźnieniem. Mitygacja: persist jest spawn'owany
-   w background task, outcome leci do oneshot natychmiast po build.
+1. **`outcome.await` blokuje tail emission — intentional tradeoff.** Finalizer
+   flush'uje outcome dopiero PO `update_flow_execution` DB persist. Tail chunk
+   widziany przez klienta = całe trace persistowane. Dla embedded SQLite
+   sub-millisecond, dla distributed db (gdyby kiedyś) latency rośnie. Etap 3d
+   może rozdzielić outcome flush od persist (oneshot wcześniej, persist w
+   background) — ale w Etap 3a zostawiamy spójne z Etap 1 finalizer contractem.
 2. **Backend już dorzuca `usage` w chunk'u** — duplikat. Dziś żaden backend
    tego nie robi (sprawdzone), ale jakby ktoś włączył, klient dostałby 2 tail
    chunki. Mitygacja: w Etap 3d dodajemy idempotent dedup gdy widzimy
