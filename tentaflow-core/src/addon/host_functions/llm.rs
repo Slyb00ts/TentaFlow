@@ -178,6 +178,7 @@ pub fn llm_generate(
         presence_penalty: None,
         stop: None,
         stream: false,
+        stream_options: None,
         user: Some(format!("addon:{}", addon_id)),
         response_format: None,
         tools: None,

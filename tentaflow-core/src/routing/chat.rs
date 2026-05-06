@@ -377,6 +377,7 @@ impl Router {
             top_p: None,
             n: None,
             stream: false,
+            stream_options: None,
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
@@ -426,7 +427,7 @@ impl Router {
                         transcribed_text: None,
                         speaker_id: None,
                         speaker_name: None,
-                    }),
+                                        }),
                     metrics,
                 })
             }
