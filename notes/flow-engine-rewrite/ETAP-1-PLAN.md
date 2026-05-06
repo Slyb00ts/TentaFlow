@@ -1091,6 +1091,25 @@ rm /home/critix/repos/rust/TentaFlow/tentaflow/target/debug/data/router.db*
 
 ---
 
+## Stage 1d — zasada przewodnia: ZERO parallel install
+
+**Decyzja użytkownika (2026-05-06):** Stage 1d to twardy refactor — wszystko nowe pisane "jakby od zera". Nie zostaje legacy stack, nie ma `_v2`, nie ma BC shimów, nie ma okresowej koegzystencji nowego/starego po kilku commit'ach.
+
+Każdy commit stage 1d:
+- **Zastępuje plik w miejscu** albo usuwa go całkowicie. Nowe moduły mogą żyć krótkotrwale obok starych w tym samym commicie tylko jeżeli ten commit *finalizuje delete* legacy w tym samym diff.
+- **Aktualizuje wszystkie call sites razem** z usunięciem legacy. Build zielony po każdym commicie.
+- **Nie utrzymuje** żadnego `flow_engine/adapters/` (legacy NodeAdapter), `executor_async.rs`, `ParsedFlow`, `FlowContext`, `FlowExecutionResult`, ani odpowiadających metod w `dispatcher.rs` po finalnym commicie 1d.
+
+**Plan B (zaakceptowany)** — 3 commity layer-by-layer:
+
+1. **Core flow_engine rewrite (~2000 LOC):** `cache.rs` (CompiledFlow zamiast ParsedFlow), nowy `executor.rs` (`execute_blocking` + `execute_streaming` + finalizer), nowy `validation.rs` (5 reguł + streaming end-shape), nowy `converter.rs` (`flow_outcome_to_*`), `dispatcher.rs` przepisany na nowy stack. W tym samym commicie usuwamy `flow_engine/executor_async.rs` i `flow_engine/adapters/`.
+2. **Call site migration:** `routing/chat.rs`, `routing/streaming.rs`, `services/runtime/executor.rs` (3 dispatch_by_flow_id call sites) — na `FlowExecutionOutcome`. `routing/mod.rs::build_flow_context_inner` zastąpione `build_initial_envelope` zwracającym `FlowEnvelope`.
+3. **Cleanup:** `addon/flow_blocks.rs` (legacy NodeAdapter w addon — prawdopodobnie stub przerobiony albo usunięty), `db/seed.rs` (registry do walidacji seedowanych flows używa nowego AdapterRegistry).
+
+Codex review po każdym commicie. Iteracja fixami aż codex passuje (jak w stage 1c).
+
+---
+
 ## Stage 1d todo (codex sanity check po 1c)
 
 Stage 1c (10 dispatcher impls + 13 node adapters) ukończone i przeszło codex review iteracyjnie. Codex zostawił 5 rzeczy do dopisania do planu 1d (executor rewrite + AdapterRegistry bootstrap), żeby nie były cichym debt'em:
