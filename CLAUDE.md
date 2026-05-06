@@ -93,7 +93,7 @@ mlx-models (Apple MLX inference bindings)
 - **services/manifest/** — Service Manifest registry: ładowanie wygenerowanego rejestru z `services_generated.rs`, walidacja semantyczna (4 reguły), katalog silników udostępniany przez `/api/services/manifest`. Patrz sekcja `## Service Manifest`.
 - **license/** — Sprawdzanie tieru licencji (Free/Pro/Enterprise), gating opcji `download` w manifestach
 - **api/** — HTTP: OpenAI-compatible `/v1/*`, Dashboard `/api/*` (JWT), WebSocket metrics
-- **flow_engine/** — DAG-based workflow execution with typed adapters
+- **flow_engine/** — DAG workflow executor (plan v4.2). Typed `FlowEnvelope` (payload + artifacts + provenance + ConversationContext + meta + trace), narrow capability dispatchers (`LlmDispatcher`, `EmbeddingsDispatcher`, `TtsDispatcher`, `SttDispatcher`, `MemoryStore`, `PromptStore`, `AuditSink`, `PiiRulesStore`, `TtsCleaningStore`, `ConversationHistoryStore`, `Clock`, `BlobStore`, `MetricsSink`), 13 node adapters in `node_adapters/`, 10 wrapper impls in `dispatchers_impl/`. Two execution paths: `execute_blocking` (full topo, FlowExecutionOutcome) and `execute_streaming` (pre-LLM topo + LLM stream + cancel/disconnect-resilient finalizer). Strict 1-input-edge per node, single trigger, streaming end-shape validated at compile time
 - **inference/** — LLM backends: llama.cpp, MLX, model manager
 - **net/quic/** — QUIC client/server with TLS 1.3
 - **db/** — SQLite (rusqlite, bundled), migrations, repository pattern
@@ -324,66 +324,137 @@ Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z G
 - `nsight.start` — przy starcie sesji (lokalnej lub zdalnej).
 - `nsight.stop` — przy ręcznym lub automatycznym (timeout) zakończeniu.
 
-## Chat pipeline po cleanup
+## Flow engine (plan v4.2 — Etap 1 zakończony)
 
-Router chat obsługuje dokładnie dwie ścieżki:
+Single executor stack po stage 1d (zero parallel install). Layout:
 
-1. **Flow-engine driven** — jeśli request model ma przypisany flow w `flow_model_bindings`
-   (albo jest domyślny flow dla `service_type="chat"`), request idzie przez `FlowDispatcher`
-   → `execute_flow` (blocking) albo `execute_streaming_flow` (dla SSE). Adaptery wykonują
-   pipeline krok po kroku. Streaming: tylko `llm` adapter eksponuje port `stream` (QUIC
-   `send_request_stream` lub HTTP `chat_completion_stream`); pozostałe node types pracują
-   w full/blocking mode.
+```
+flow_engine/
+├── envelope.rs           # FlowEnvelope, FlowValue, NodeInput, FlowExecutionOutcome,
+│                         # ChatMessage, TraceStep, TokenUsage, FinishReason,
+│                         # EnvelopeDelta::Llm, LlmStreamChunk, ToolCallDelta
+├── types.rs              # FlowDefinition, FlowNode, FlowEdge (DAG types tylko)
+├── blob_store.rs         # BlobStore trait + InMemoryBlobStore + FileBlobStore stub
+├── cancel_on_drop.rs     # CancelOnDropStream — wpięty w SSE response w routing/streaming.rs
+├── cache.rs              # CompiledFlow + FlowCache. CompiledFlow::compile woła
+│                         # validation::validate, buduje toposort + adjacency +
+│                         # is_streaming detection
+├── validation.rs         # 7 strict rules (R1–R7), w tym streaming end-shape (R7)
+├── converter.rs          # flow_outcome_to_chat_response, flow_outcome_to_embedding_response
+├── executor.rs           # execute_blocking + execute_streaming + finalizer
+├── dispatcher.rs         # FlowDispatcher (bootstrap registry + ContextFactory),
+│                         # FlowRequestMeta DTO
+├── resolver.rs           # resolve_flow(model, service_type) → DbFlow
+├── node_adapter.rs       # NodeAdapter + LlmAdapter (typed) + AdapterRegistry +
+│                         # ExecutionContext + UsageSink
+├── node_adapters/        # 13 adapter implementations
+├── dispatchers/          # 10 capability traits + DTO
+└── dispatchers_impl/     # 10 wrapperów + QuicClientFinder + slot type aliases
+```
 
-2. **Bare passthrough** — jeśli żaden flow nie pasuje, chat.rs/streaming.rs wywołuje
-   bezpośrednio backend LLM (QUIC/HTTP/local inference) bez żadnego pre/post-processingu
-   request'a.
+### Architektura egzekucji
 
-Usunięte moduły (były częścią starego "jarvis" pipeline'u):
-- `routing/memory_integration.rs` — wstrzykiwanie memory context, conversation cache,
-  voice-based personalization. Funkcjonalność można odtworzyć przez user-defined flow
-  z node'ami `conversation_history` + `memory` + `speaker_context`.
-- `memory_analyzer/` — LLM-based decision "czy odpytać memory engine". Obecnie: flow
-  user-defined albo brak.
-- `intent_analyzer/` — LLM-based klasyfikacja intencji + speaker enrollment trigger.
-  Obecnie: flow user-defined albo enrollment manualny przez dashboard.
-- 19 hardcoded prompt stałych w `prompt_registry/mod.rs` + 3 pliki `.txt` → prompty
-  dodawane przez dashboard (CRUD) i/lub seed pod konkretne use-case (obecnie jeden:
-  `transcription_summarization` w 5 językach).
+1. **Trigger seed** — routing buduje `FlowEnvelope` z `ChatCompletionRequest` przez
+   `routing::build_initial_envelope_for_user`. Wynik: payload `FlowValue::Text(last_message)`,
+   `meta["model"]`, `context.messages` (pełna historia ChatMessage).
+2. **Compile** — `CompiledFlow::compile(flow_id, definition, registry)` waliduje 7 reguł,
+   robi toposort, wykrywa `is_streaming` (`from_port == "stream"` na którymś edge'u),
+   cache'owany w `FlowCache`.
+3. **Bootstrap context** — `FlowDispatcher::ContextFactory` klonuje Arc'i wszystkich
+   capability dispatcherów per call, dorzuca `BlobStore`, `Clock`, `UsageSink`,
+   `CancellationToken`, `deadline`. Surface taki sam dla blocking i streaming.
+4. **Topo loop** — `execute_blocking` lub `execute_streaming` walka per `execution_order`:
+   - Cancel + deadline check between nodes (klient disconnect / operator timeout).
+   - `inputs` budowane z `outputs[from_pos]` (max 1 element przez R4).
+   - `adapter.execute(node, &inputs, &ctx)` → `FlowEnvelope` przekazywany dalej.
+   - `continue_on_error` z `trigger.config` decyduje czy błąd przerywa flow.
+5. **Streaming finalizer** — `execute_streaming` po pre-LLM nodach woła
+   `LlmAdapter::prepare_llm_request` (typed accessor), dispatchuje
+   `ctx.llm.stream_chat`, spawnuje finalizer z biased `select!` (cancel ↔ adapter_stream),
+   buduje `FlowExecutionOutcome` po EOF/cancel/error, persist po `execution_id`.
+6. **Disconnect bridge** — `routing/streaming.rs` owija filtered chunk stream w
+   `CancelOnDropStream(stream, meta.cancel_token)` przed return; gdy hyper droppuje SSE
+   body, Drop puszcza `cancel_token.cancel()`, executor finalizer widzi to przez
+   biased select.
 
-### Zarejestrowane node types i porty
+### Hard rules (egzekwowane przez validation.rs)
 
-FlowDispatcher (`tentaflow-core/src/flow_engine/dispatcher.rs`) rejestruje adaptery dla
-wszystkich node types używanych w seedowanych flows. Walidacja flow_json przy save
-(`validate_flow_json_str` w `dispatch/handlers.rs`) odrzuca flows odwołujące się do
-niezarejestrowanych typów lub nieistniejących portów — więc każdy typ obecny w seed
-musi mieć adapter.
+| Reguła | Opis |
+|--------|------|
+| R1 | każdy edge.from / edge.to wskazuje na istniejący node |
+| R2 | każdy node ma adapter w registry |
+| R3 | edge.from_port ∈ supported_output_ports producenta; edge.to_port ∈ supported_input_ports konsumenta |
+| R4 | trigger ma 0 incoming (źródło flow); każdy non-trigger ma ≤1 incoming |
+| R5 | dokładnie jeden trigger node w flow |
+| R6 | edge `from_port="true"`/`"false"` tylko z node'a `condition` |
+| R7 | streaming end-shape — co najwyżej 1 edge `from_port="stream"`, target musi być `output` z `config.mode="stream"`, LLM nie ma żadnego innego outgoing edge |
 
-| Node type | Adapter | supported_output_ports | Źródło |
-|-----------|---------|------------------------|--------|
-| `trigger` | `TriggerNodeAdapter` | `["full"]` | `adapters/trigger.rs` |
-| `output` | `OutputNodeAdapter` | `["full"]` | `adapters/output.rs` |
-| `condition` | `ConditionNodeAdapter` | `["full"]` | `adapters/condition.rs` |
-| `pii_filter` | `PiiFilterNodeAdapter` | `["full"]` | `adapters/pii_filter.rs` (reguły z `pii_rules`) |
-| `tts_clean` | `TtsCleanNodeAdapter` | `["full"]` | `adapters/tts_clean.rs` (reguły z `tts_cleaning_rules`) |
-| `llm` | `LlmNodeAdapter` | `["stream", "full"]` | `adapters/llm.rs` — real streaming |
-| `stt`, `tts`, `embeddings`, `memory`, `conversation_history`, `session_context`, `speaker_context` | odpowiednie `*NodeAdapter` | `["full"]` | `adapters/*.rs` |
+### Node adapters (13)
 
-> Path RAG zostal w calosci usuniety; nowa implementacja RAG bedzie zaprojektowana od zera.
+| Node type | Adapter | output_ports | input_ports |
+|-----------|---------|--------------|-------------|
+| `trigger` | `TriggerNodeAdapter` | `["full"]` | (brak — źródło) |
+| `output` | `OutputNodeAdapter` | `["full"]` | `["in"]` |
+| `condition` | `ConditionNodeAdapter` | `["true", "false"]` | `["in"]` |
+| `pii_filter` | `PiiFilterNodeAdapter` | `["full"]` | `["in"]` |
+| `tts_clean` | `TtsCleanNodeAdapter` | `["full"]` | `["in"]` |
+| `llm` | `LlmNodeAdapter` (impl `LlmAdapter`) | `["stream", "full"]` | `["in"]` |
+| `stt` | `SttNodeAdapter` | `["full"]` | `["in"]` |
+| `tts` | `TtsNodeAdapter` | `["full"]` | `["in"]` |
+| `embeddings` | `EmbeddingsNodeAdapter` | `["full"]` | `["in"]` |
+| `memory` | `MemoryNodeAdapter` (mode `query`/`store`) | `["full"]` | `["in"]` |
+| `conversation_history` | `ConversationHistoryNodeAdapter` | `["full"]` | `["in"]` |
+| `session_context` | `SessionContextNodeAdapter` | `["full"]` | `["in"]` |
+| `speaker_context` | `SpeakerContextNodeAdapter` | `["full"]` | `["in"]` |
 
-Logika `trigger`/`output`/`condition`/`pii_filter`/`tts_clean` żyje w modułach adapterów
-jako `pub fn build_*` / `apply_*` — executor_async woła je dla szybkiej ścieżki
-wewnętrznej; adaptery wywołują te same funkcje. Zero duplikacji.
+### Capability dispatchers + impls
 
-`FlowEdge.from_port` i `to_port` (default `"full"` / `"in"`) określają który port
-node'a jest podpięty. Walidacja sprawdza że `from_port` ∈ `supported_output_ports` i
-`to_port` ∈ `supported_input_ports` po obu stronach edge'a.
+Adaptery widzą wyłącznie wąskie traits (`flow_engine/dispatchers/`); implementacje
+(`flow_engine/dispatchers_impl/`) wywołują runtime/registry/DB. Każdy impl trzyma
+najwęższe dependency (slot, Arc<DbPool>, registry) — żaden nie holduje
+`Arc<ServiceManager>` (D4 invariant).
 
-Seedowane flows (`db/seed.rs`): `Standardowy pipeline LLM`, `Standardowy pipeline TTS`,
-`teams-flow`. Test `seeded_flows_pass_adapter_validation` egzekwuje że każdy z nich
-parsuje i przechodzi walidację przy świeżej bazie.
+| Trait | Impl | Wraps |
+|-------|------|-------|
+| `LlmDispatcher` | `LlmDispatcherImpl` | `ModelRuntimeExecutor::execute_chat` / `stream_chat` (slot pattern) |
+| `EmbeddingsDispatcher` | `EmbeddingsDispatcherImpl` | `ModelRuntimeExecutor::execute_embeddings` |
+| `TtsDispatcher` | `TtsDispatcherImpl` | `ModelRuntimeExecutor::execute_tts` + `BlobStore` |
+| `SttDispatcher` | `SttDispatcherImpl` | `SttRuntime::transcribe` (slot pattern) + `BlobStore` |
+| `PromptStore` | `PromptsImpl` | `SharedPromptRegistry::get_content` |
+| `MemoryStore` | `MemoryStoreImpl` | rkyv `MemoryPayload` przez `QuicClientFinder` |
+| `ConversationHistoryStore` | `ConversationHistoryImpl` | `ConversationCache` |
+| `AuditSink` | `AuditSinkImpl` | `repository::log_audit` |
+| `PiiRulesStore` | `PiiRulesStoreImpl` | `repository::list_pii_rules_active` |
+| `TtsCleaningStore` | `TtsCleaningStoreImpl` | `tts::clean_cache::clean` |
+| `Clock` | `SystemClock` | `SystemTime::now` |
+| `MetricsSink` | `NoopMetrics` | placeholder |
+| `BlobStore` | `InMemoryBlobStore` | bootstrap default; `FileBlobStore` w stage 2 |
 
-Test reference: `cargo test --lib seeded_flows_pass_adapter_validation`.
+### Słowo o bypass'ach
+
+- **Bare passthrough** w `routing/chat.rs` / `routing/streaming.rs` — gdy żaden flow nie
+  pasuje (resolver zwraca `None`), request idzie bezpośrednio do `ModelRuntimeExecutor`
+  bez flow_engine.
+- **Direct executor path** w `services/runtime/executor.rs` (`dispatch_by_flow_id`) —
+  używane gdy `CatalogSnapshot` ma `flow_id` przypiętą do publikowanego modelu.
+  Buduje `FlowEnvelope` przez `embeddings_request_to_initial_envelope` /
+  `build_initial_envelope_for_user`.
+
+### Zmiany w stosunku do legacy
+
+Po stage 1d całkowicie usunięte: `flow_engine/adapters/` (legacy `NodeAdapter` z
+`FlowContext` + `serde_json::Value`), `flow_engine/executor_async.rs`
+(`FlowExecutorAsync` + `ParsedFlow`), `FlowContext`/`FlowExecutionResult`/`FlowStepLog`
+z `types.rs`, `AddonNodeAdapter` z `addon/flow_blocks.rs` (dead code), `routing/
+memory_integration.rs`, `memory_analyzer/`, `intent_analyzer/`, hardkodowane prompt
+stałe.
+
+Seedowane flows (`db/seed.rs`): `Standardowy pipeline LLM`, `teams-flow`. Test
+`seeded_flows_pass_adapter_validation` używa nowego `AdapterRegistry` z
+`node_adapter.rs` (`registry.register_llm` + 12× `register`).
+
+Test reference: `cargo test --lib --features dashboard-api flow_engine` (96 testów),
+`cargo test --lib --features dashboard-api seeded_flows_pass_adapter_validation`.
 
 ## Configuration
 
