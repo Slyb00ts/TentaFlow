@@ -1,9 +1,33 @@
 # Etap 2 — Typed porty + ArtifactKey + TTS-as-flow + trailers + FileBlobStore
 
-**Plan v1.1 (po round 1 codex)**
+**Plan v1.2 (po round 2 codex)**
 **Codex session ID:** `019dfca1-fef1-7ca1-b154-b73a796670a8` (kontynuacja po Etapie 1)
 **Data:** 2026-05-06
 **Bazuje na:** Etap 1 v4.2 (zamknięty, commits do `400baa0`)
+
+## Zmiany v1.1 → v1.2 (codex round 2)
+
+1. **Brakujący seeder meta dla LLM/embeddings** — plan v1.1 dodał fallback `node.
+   config -> envelope.meta` w adapterach, ale nie dopiął miejsca które *zapisuje*
+   te pola do `envelope.meta`. Bez tego połowa osi #1 jest martwa. Plan v1.2
+   rozszerza:
+   - `routing/mod.rs::build_initial_envelope_for_user` — seeduje `meta["temperature"]`,
+     `meta["max_tokens"]`, `meta["top_p"]`, `meta["frequency_penalty"]`,
+     `meta["presence_penalty"]` z `ChatCompletionRequest`. Adapter LLM ma fallback
+     `node.config -> envelope.meta`.
+   - `services/runtime/executor.rs::embeddings_request_to_initial_envelope` —
+     seeduje `meta["dimensions"]`, `meta["encoding_format"]` z `EmbeddingRequest`.
+     Adapter embeddings ma fallback.
+   - `services/runtime/executor.rs::tts_request_to_initial_envelope` (NEW) —
+     seeduje `voice`, `format`, `language` jak opisano (już w v1.1 ale nie był
+     w call-site mapie).
+2. **`mime_to_format` unknown → "wav"** był fałszywą etykietą formatu. Plan v1.2
+   zmienia: `flow_outcome_to_tts_result` zwraca `Err(ExecutorError::Internal)` gdy
+   mime jest nieznany. To zatrzymuje request — operator naprawia flow albo doda
+   nową mapę MIME. Lepiej fail loud niż HTTP zwracał `Content-Type: audio/wav`
+   gdy bytes są MP3.
+3. **Test strategy: `delete()` zniknął** — przepisana lista testów BlobStore (NIT
+   round 2).
 
 ## Zmiany v1.0 → v1.1 (codex round 1)
 
@@ -419,16 +443,20 @@ async fn flow_outcome_to_tts_result(
     }
 }
 
-fn mime_to_format(mime: &str) -> String {
-    match mime {
-        "audio/wav" | "audio/x-wav" => "wav".into(),
-        "audio/mpeg" => "mp3".into(),
-        "audio/opus" => "opus".into(),
-        "audio/aac" => "aac".into(),
-        "audio/flac" => "flac".into(),
-        "audio/ogg" => "ogg".into(),
-        _ => "wav".into(), // konserwatywny fallback
+fn mime_to_format(mime: &str) -> Result<String, ExecutorError> {
+    Ok(match mime {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/opus" => "opus",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
+        "audio/ogg" => "ogg",
+        other => return Err(ExecutorError::Internal(format!(
+            "tts flow output mime '{other}' nie ma mapowania format — \
+             dodaj entry w mime_to_format albo popraw flow"
+        ))),
     }
+    .to_string())
 }
 ```
 
@@ -650,12 +678,15 @@ brak — Etap 2 używa standard library + istniejących crate'ów.
 | `services/runtime/executor.rs` | TTS Flow arm, `tts_request_to_initial_envelope` | +80 |
 | `routing/middleware.rs` | + `usage`/`finish_reason` w `RouteMetadata` | +30 |
 | `routing/chat.rs` | populate metadata.usage/finish_reason | +30 |
+| `routing/mod.rs::build_initial_envelope_for_user` | seed `temperature`/`max_tokens`/`top_p`/`frequency_penalty`/`presence_penalty` w `envelope.meta` | +25 |
+| `services/runtime/executor.rs::embeddings_request_to_initial_envelope` | seed `dimensions`/`encoding_format` | +10 |
+| `services/runtime/executor.rs::tts_request_to_initial_envelope` | NEW helper z `voice`/`format`/`language` | +30 |
 | `api/openai/server.rs` | want-trailers parsing + header emit | +50 |
 | `routing/router.rs` | wire `FileBlobStore` → `FlowDispatcher::new` | +30 |
 | `Cargo.toml` | `sha2` / `hex` deps (jeśli brak) | +2 |
 
-**Razem: ~780 LOC** (po ścięciu FileBlobStore z plan v1.0). Mieści się w jednej
-sesji bez problemu.
+**Razem: ~845 LOC** (v1.2 dodał ~65 LOC na meta seeding). Mieści się w jednej
+sesji.
 
 ---
 
@@ -668,9 +699,11 @@ sesji bez problemu.
 - Adapter `input_port_type`/`output_port_type` per node type — egzekwują tabelę
 - `validation::validate` R8 — pozytywne/negatywne (Text→Audio mismatch, Any
   bridge, dwie konkretne na portach z Any edge)
-- `FileBlobStore::{put,get,delete}` — round-trip
-- `FileBlobStore::put` deduplikacja sha (drugi put tego samego content nie psuje)
-- `FileBlobStore::gc` — usuwa stare pliki, zostawia świeże
+- `FileBlobStore::{put,get}` — round-trip (delete świadomie nieobecny w trait)
+- `FileBlobStore::put` deduplikacja sha (drugi put tego samego content reuse'uje plik)
+- `FileBlobStore::get` integrity check — corrupted file rzuca błąd
+- `FileBlobStore::gc(retention)` — usuwa pliki z mtime < cutoff, zostawia świeże;
+  empty dirs po gc nie blokują kolejnych put
 - `flow_outcome_to_tts_result` — Audio payload OK, Text payload Err
 
 ### Integration
