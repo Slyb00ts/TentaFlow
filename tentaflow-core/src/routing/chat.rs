@@ -112,8 +112,13 @@ impl Router {
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let (initial, meta) =
-                crate::routing::build_initial_envelope_for_user(&request, user.clone());
+            let blobs = dispatcher.blobs();
+            let (initial, meta) = crate::routing::build_initial_envelope_for_user(
+                &request,
+                user.clone(),
+                &blobs,
+            )
+            .await?;
 
             match dispatcher
                 .try_dispatch(&request.model, "chat", initial, meta)

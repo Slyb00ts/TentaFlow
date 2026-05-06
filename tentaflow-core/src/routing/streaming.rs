@@ -644,9 +644,15 @@ impl Router {
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
+            let blobs = dispatcher.blobs();
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
             let (initial_stream, meta_stream) =
-                crate::routing::build_initial_envelope_for_user(&request, user.clone());
+                crate::routing::build_initial_envelope_for_user(
+                    &request,
+                    user.clone(),
+                    &blobs,
+                )
+                .await?;
             // Disconnect bridge: ten sam cancel_token co w meta dostaje
             // CancelOnDropStream poniżej, więc gdy hyper droppuje SSE body
             // (klient się rozłączył), token zostaje cancelled i finalizer
@@ -708,7 +714,12 @@ impl Router {
             }
 
             let (initial, meta) =
-                crate::routing::build_initial_envelope_for_user(&request, user.clone());
+                crate::routing::build_initial_envelope_for_user(
+                    &request,
+                    user.clone(),
+                    &blobs,
+                )
+                .await?;
             match dispatcher
                 .try_dispatch(&request.model, "chat", initial, meta)
                 .await
