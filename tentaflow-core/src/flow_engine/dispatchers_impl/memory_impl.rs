@@ -41,11 +41,15 @@ impl MemoryStoreImpl {
 impl MemoryStore for MemoryStoreImpl {
     async fn recall(&self, query: MemoryQuery) -> Result<MemoryRecall> {
         let client = self.client().await?;
+        // Stabilność partycji: brak session_id/person_id == błąd. Wrapper nie
+        // generuje losowego uuid, bo dwa kolejne calls (store + recall) w tym
+        // samym flow trafiałyby w różne bucket'y. Adapter wypełnia z
+        // ExecutionContext.session_id przed wywołaniem.
         let session_id = query
             .session_id
             .clone()
             .or_else(|| query.person_id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .ok_or_else(|| anyhow!("MemoryStore::recall requires session_id or person_id"))?;
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let request = ModelRequest {
@@ -97,7 +101,7 @@ impl MemoryStore for MemoryStoreImpl {
             .session_id
             .clone()
             .or_else(|| record.person_id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .ok_or_else(|| anyhow!("MemoryStore::store requires session_id or person_id"))?;
 
         // Stage-1 mapping: cały content trafia jako jeden fakt
         // (subject="context", relation="contains", object=content). Tagi
