@@ -93,7 +93,7 @@ mlx-models (Apple MLX inference bindings)
 - **services/manifest/** — Service Manifest registry: ładowanie wygenerowanego rejestru z `services_generated.rs`, walidacja semantyczna (4 reguły), katalog silników udostępniany przez `/api/services/manifest`. Patrz sekcja `## Service Manifest`.
 - **license/** — Sprawdzanie tieru licencji (Free/Pro/Enterprise), gating opcji `download` w manifestach
 - **api/** — HTTP: OpenAI-compatible `/v1/*`, Dashboard `/api/*` (JWT), WebSocket metrics
-- **flow_engine/** — DAG workflow executor (plan v4.2). Typed `FlowEnvelope` (payload + artifacts + provenance + ConversationContext + meta + trace), narrow capability dispatchers (`LlmDispatcher`, `EmbeddingsDispatcher`, `TtsDispatcher`, `SttDispatcher`, `MemoryStore`, `PromptStore`, `AuditSink`, `PiiRulesStore`, `TtsCleaningStore`, `ConversationHistoryStore`, `Clock`, `BlobStore`, `MetricsSink`), 13 node adapters in `node_adapters/`, 10 wrapper impls in `dispatchers_impl/`. Two execution paths: `execute_blocking` (full topo, FlowExecutionOutcome) and `execute_streaming` (pre-LLM topo + LLM stream + cancel/disconnect-resilient finalizer). Strict 1-input-edge per node, single trigger, streaming end-shape validated at compile time
+- **flow_engine/** — DAG workflow executor (plan v4.2). Typed `FlowEnvelope` (payload + artifacts + provenance + ConversationContext + meta + trace), `FlowDataType` typed ports (Etap 2), narrow capability dispatchers (`LlmDispatcher`, `EmbeddingsDispatcher`, `TtsDispatcher`, `SttDispatcher`, `MemoryStore`, `PromptStore`, `AuditSink`, `PiiRulesStore`, `TtsCleaningStore`, `ConversationHistoryStore`, `Clock`, `BlobStore`, `MetricsSink`), 13 node adapters in `node_adapters/`, 10 wrapper impls in `dispatchers_impl/`. Two execution paths: `execute_blocking` (full topo, FlowExecutionOutcome) and `execute_streaming` (pre-LLM topo + LLM stream + cancel/disconnect-resilient finalizer). 8 hard rules egzekwowane przy compile (R1-R8: 1-input-edge, single trigger, streaming end-shape, typed edge compatibility). FileBlobStore default w `<TENTAFLOW_HOME>/blobs`. TTS-as-flow działa przez `dispatch_by_flow_id` z output `FlowValue::Audio`. Non-streaming trailers (`X-Want-Trailers: true` → `X-Tentaflow-*` headery)
 - **inference/** — LLM backends: llama.cpp, MLX, model manager
 - **net/quic/** — QUIC client/server with TLS 1.3
 - **db/** — SQLite (rusqlite, bundled), migrations, repository pattern
@@ -324,22 +324,28 @@ Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z G
 - `nsight.start` — przy starcie sesji (lokalnej lub zdalnej).
 - `nsight.stop` — przy ręcznym lub automatycznym (timeout) zakończeniu.
 
-## Flow engine (plan v4.2 — Etap 1 zakończony)
+## Flow engine (plan v4.2 — Etap 1 + Etap 2 zakończone)
 
-Single executor stack po stage 1d (zero parallel install). Layout:
+Single executor stack. Etap 1 = clean rewrite (typed envelope, narrow dispatchers,
+13 adapters, executor + finalizer); Etap 2 = typed porty + ArtifactKey deklaracje +
+TTS-as-flow + non-streaming trailers + FileBlobStore wpięty. Layout:
 
 ```
 flow_engine/
 ├── envelope.rs           # FlowEnvelope, FlowValue, NodeInput, FlowExecutionOutcome,
 │                         # ChatMessage, TraceStep, TokenUsage, FinishReason,
 │                         # EnvelopeDelta::Llm, LlmStreamChunk, ToolCallDelta
-├── types.rs              # FlowDefinition, FlowNode, FlowEdge (DAG types tylko)
-├── blob_store.rs         # BlobStore trait + InMemoryBlobStore + FileBlobStore stub
+├── types.rs              # FlowDefinition, FlowNode, FlowEdge (data_type field z Etap 2),
+│                         # FlowDataType enum (Any/Text/Audio/Image/Video/Embedding/Json)
+├── blob_store.rs         # BlobStore trait + InMemoryBlobStore (testy) +
+│                         # FileBlobStore (default w Router::new — atomic write,
+│                         # dedup verify-on-disk, sha256 integrity check, gc)
 ├── cancel_on_drop.rs     # CancelOnDropStream — wpięty w SSE response w routing/streaming.rs
 ├── cache.rs              # CompiledFlow + FlowCache. CompiledFlow::compile woła
 │                         # validation::validate, buduje toposort + adjacency +
 │                         # is_streaming detection
-├── validation.rs         # 7 strict rules (R1–R7), w tym streaming end-shape (R7)
+├── validation.rs         # 8 strict rules (R1–R8), w tym streaming end-shape (R7) +
+│                         # typed edge compatibility (R8)
 ├── converter.rs          # flow_outcome_to_chat_response, flow_outcome_to_embedding_response
 ├── executor.rs           # execute_blocking + execute_streaming + finalizer
 ├── dispatcher.rs         # FlowDispatcher (bootstrap registry + ContextFactory),
@@ -388,24 +394,46 @@ flow_engine/
 | R5 | dokładnie jeden trigger node w flow |
 | R6 | edge `from_port="true"`/`"false"` tylko z node'a `condition` |
 | R7 | streaming end-shape — co najwyżej 1 edge `from_port="stream"`, target musi być `output` z `config.mode="stream"`, LLM nie ma żadnego innego outgoing edge |
+| R8 (Etap 2) | typed edge compatibility — 3 niezależne pary: producent.output_port_type vs konsument.input_port_type, edge.data_type vs producent, edge.data_type vs konsument. `Any` na której kolwiek stronie = wildcard. Edge.data_type to deklaracja, NIE konwerter — Text↔Audio incompatible niezależnie od edge declaration. Seedowane flowy mają `data_type=Any` defaultowo, więc R8 chroni dopiero gdy GUI zacznie zapisywać konkretne typy |
 
 ### Node adapters (13)
 
-| Node type | Adapter | output_ports | input_ports |
-|-----------|---------|--------------|-------------|
-| `trigger` | `TriggerNodeAdapter` | `["full"]` | (brak — źródło) |
-| `output` | `OutputNodeAdapter` | `["full"]` | `["in"]` |
-| `condition` | `ConditionNodeAdapter` | `["true", "false"]` | `["in"]` |
-| `pii_filter` | `PiiFilterNodeAdapter` | `["full"]` | `["in"]` |
-| `tts_clean` | `TtsCleanNodeAdapter` | `["full"]` | `["in"]` |
-| `llm` | `LlmNodeAdapter` (impl `LlmAdapter`) | `["stream", "full"]` | `["in"]` |
-| `stt` | `SttNodeAdapter` | `["full"]` | `["in"]` |
-| `tts` | `TtsNodeAdapter` | `["full"]` | `["in"]` |
-| `embeddings` | `EmbeddingsNodeAdapter` | `["full"]` | `["in"]` |
-| `memory` | `MemoryNodeAdapter` (mode `query`/`store`) | `["full"]` | `["in"]` |
-| `conversation_history` | `ConversationHistoryNodeAdapter` | `["full"]` | `["in"]` |
-| `session_context` | `SessionContextNodeAdapter` | `["full"]` | `["in"]` |
-| `speaker_context` | `SpeakerContextNodeAdapter` | `["full"]` | `["in"]` |
+Kolumny `input_type` / `output_type` (Etap 2) deklarują `FlowDataType` portu —
+walidacja R8 sprawdza zgodność z `edge.data_type`. Adaptery z `Any` na in/out są
+passthrough type-wise (mutują context/meta, nie payload).
+
+| Node type | Adapter | input_ports → type | output_ports → type | Produced artifacts |
+|-----------|---------|---------------------|----------------------|---------------------|
+| `trigger` | `TriggerNodeAdapter` | (brak — źródło) | `["full"]` → `Any` | — |
+| `output` | `OutputNodeAdapter` | `["in"]` → `Any` | `["full"]` → `Any` | — |
+| `condition` | `ConditionNodeAdapter` | `["in"]` → `Any` | `["true", "false"]` → `Any` | — |
+| `pii_filter` | `PiiFilterNodeAdapter` | `["in"]` → `Text` | `["full"]` → `Text` | — |
+| `tts_clean` | `TtsCleanNodeAdapter` | `["in"]` → `Text` | `["full"]` → `Text` | — |
+| `llm` | `LlmNodeAdapter` (impl `LlmAdapter`) | `["in"]` → `Text` | `["stream", "full"]` → `Text` | — |
+| `stt` | `SttNodeAdapter` | `["in"]` → `Audio` | `["full"]` → `Text` | `source_audio: Audio` |
+| `tts` | `TtsNodeAdapter` | `["in"]` → `Text` | `["full"]` → `Audio` | `source_text: Text` |
+| `embeddings` | `EmbeddingsNodeAdapter` | `["in"]` → `Text` | `["full"]` → `Embedding` | — |
+| `memory` | `MemoryNodeAdapter` (mode `query`/`store`) | `["in"]` → `Text` | `["full"]` → `Text` | — |
+| `conversation_history` | `ConversationHistoryNodeAdapter` | `["in"]` → `Any` | `["full"]` → `Any` | — |
+| `session_context` | `SessionContextNodeAdapter` | `["in"]` → `Any` | `["full"]` → `Any` | — |
+| `speaker_context` | `SpeakerContextNodeAdapter` | `["in"]` → `Any` | `["full"]` → `Any` | — |
+
+`produced_artifacts` to deklaracja Etap 2 — GUI może po niej kolorować klucze i
+podpowiadać typ. Walidacja konsument↔producent typu artifaktu (R9) wraca w Etap 3.
+
+### Adapter envelope-meta fallback (Etap 2)
+
+Adaptery LLM / Embeddings / TTS czytają opcjonalne sampling/option params z
+`pick_optional_*(node, envelope, key)` — `node.config[key]` ma priorytet,
+fallback `envelope.meta[key]`. Routing seeduje `meta` z requestu:
+
+| Adapter | Pola czytane (priorytet: node.config → envelope.meta) | Source seed |
+|---------|------------------------------------------------------|-------------|
+| `llm` | `model`, `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, `presence_penalty`, `system_prompt`, `stop` | `routing/mod.rs::build_initial_envelope_for_user` |
+| `embeddings` | `model`, `dimensions`, `encoding_format` | `routing/mod.rs` + `services/runtime/executor.rs::embeddings_request_to_initial_envelope` |
+| `tts` | `model`, `voice`, `format`, `language` | `services/runtime/executor.rs::tts_request_to_initial_envelope` (TTS-as-flow path) |
+
+Operator override w node config wygrywa, brak override = użyj wartości z requestu.
 
 ### Capability dispatchers + impls
 
@@ -428,7 +456,7 @@ najwęższe dependency (slot, Arc<DbPool>, registry) — żaden nie holduje
 | `TtsCleaningStore` | `TtsCleaningStoreImpl` | `tts::clean_cache::clean` |
 | `Clock` | `SystemClock` | `SystemTime::now` |
 | `MetricsSink` | `NoopMetrics` | placeholder |
-| `BlobStore` | `InMemoryBlobStore` | bootstrap default; `FileBlobStore` w stage 2 |
+| `BlobStore` | `FileBlobStore` (default) / `InMemoryBlobStore` (testy) | filesystem `<TENTAFLOW_HOME>/blobs/<sha[0:2]>/<sha[2:4]>/<sha>.bin`; override `TENTAFLOW_BLOB_STORE=memory` |
 
 ### Słowo o bypass'ach
 
@@ -437,8 +465,27 @@ najwęższe dependency (slot, Arc<DbPool>, registry) — żaden nie holduje
   bez flow_engine.
 - **Direct executor path** w `services/runtime/executor.rs` (`dispatch_by_flow_id`) —
   używane gdy `CatalogSnapshot` ma `flow_id` przypiętą do publikowanego modelu.
-  Buduje `FlowEnvelope` przez `embeddings_request_to_initial_envelope` /
-  `build_initial_envelope_for_user`.
+  Buduje `FlowEnvelope` przez `build_initial_envelope_for_user` (chat),
+  `embeddings_request_to_initial_envelope` (embeddings) lub
+  `tts_request_to_initial_envelope` (TTS-as-flow — Etap 2).
+- **TTS-as-flow** (Etap 2): `executor.rs::dispatch_tts_blocking::Flow` arm woła
+  `dispatcher.dispatch_by_flow_id`, output flow musi mieć `payload =
+  FlowValue::Audio { blob_ref, mime, .. }`. `flow_outcome_to_tts_result` pulluje
+  bytes z `BlobStore` przez `dispatcher.blobs()` accessor. Nieznany MIME → Err
+  (no fake "wav" fallback).
+
+### Non-streaming trailers (Etap 2)
+
+Klient z header `X-Want-Trailers: true` dostaje na blocking response (chat /
+TTS / STT / embeddings non-stream) dodatkowe headery:
+- `X-Tentaflow-Latency-Ms` — `RouteMetadata.latency_ms`
+- `X-Tentaflow-Prompt-Tokens` / `-Completion-Tokens` / `-Total-Tokens` —
+  z `RouteMetadata.usage` (zaczerpane z `FlowExecutionOutcome.usage` na flow
+  path lub `response.usage` na executor path)
+- `X-Tentaflow-Finish-Reason` — `stop` / `length` / `tool_calls` /
+  `content_filter` (cancelled/error → header pominięty)
+
+Streaming SSE ignoruje ten header — HTTP/2 trailers post-EOF wraca w Etap 3.
 
 ### Zmiany w stosunku do legacy
 
@@ -453,7 +500,7 @@ Seedowane flows (`db/seed.rs`): `Standardowy pipeline LLM`, `teams-flow`. Test
 `seeded_flows_pass_adapter_validation` używa nowego `AdapterRegistry` z
 `node_adapter.rs` (`registry.register_llm` + 12× `register`).
 
-Test reference: `cargo test --lib --features dashboard-api flow_engine` (96 testów),
+Test reference: `cargo test --lib --features dashboard-api flow_engine` (101 testów po Etap 2),
 `cargo test --lib --features dashboard-api seeded_flows_pass_adapter_validation`.
 
 ## Configuration
