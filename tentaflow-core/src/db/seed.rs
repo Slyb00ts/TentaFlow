@@ -544,9 +544,9 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
         ),
         (
             "Default Chat",
-            "Najprostszy chat pipeline: trigger -> LLM -> output. Bez PII.",
+            "Najprostszy chat pipeline: trigger -> LLM -> pii_filter -> output (R-SAFETY).",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
             0,
         ),
         (
@@ -558,9 +558,9 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
         ),
         (
             "Audio Chat",
-            "Voice conversation: STT (z diarization) -> LLM -> output. Wlaczany dla audio_input.",
+            "Voice conversation: STT (z diarization) -> LLM -> pii_filter -> output (R-SAFETY). Wlaczany dla audio_input.",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"s1"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":600,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":800,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"s1"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
             0,
         ),
         (
@@ -742,14 +742,18 @@ mod tests {
         assert_eq!(st, "tts");
         assert_eq!(def, 1);
 
-        let (st, def) = assert_dag("Default Chat", &["trigger", "llm", "output"], 2);
+        let (st, def) = assert_dag(
+            "Default Chat",
+            &["trigger", "llm", "pii_filter", "output"],
+            3,
+        );
         assert_eq!(st, "chat");
         assert_eq!(def, 0, "Default Chat nie jest default w db (Standardowy pipeline LLM jest)");
 
         let (st, def) = assert_dag(
             "Audio Chat",
-            &["trigger", "stt", "llm", "output"],
-            3,
+            &["trigger", "stt", "llm", "pii_filter", "output"],
+            4,
         );
         assert_eq!(st, "chat");
         assert_eq!(def, 0, "Audio Chat jest opt-in (wymaga audio_input)");
