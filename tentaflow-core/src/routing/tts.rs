@@ -142,14 +142,20 @@ impl Router {
                     });
                 }
                 Ok(None) => {
-                    // CompileFailed user-defined flow — log warn, fallback
-                    // do executor direct (backward-compat). Synthetic NIE
-                    // aktywuje się dla CompileFailed (admin chciał konkretny
-                    // flow — niech naprawi flow_json).
-                    tracing::warn!(
-                        model = %cleaned_request.model,
-                        "tts flow_dispatch returned None — fallback to executor direct"
-                    );
+                    // Stage 3d-0b-final: Ok(None) = CompileFailed albo
+                    // unsupported service_type. Brak fallback do executor —
+                    // klient dostaje 500. Admin musi naprawić flow_json
+                    // albo sprawdzić synthetic builder.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!(
+                            "flow_dispatcher returned no result for tts model '{}' — \
+                             user-defined flow nie kompiluje się albo synthetic builder \
+                             nie wspiera service_type='tts'",
+                            cleaned_request.model
+                        ),
+                        source: None,
+                    }
+                    .into());
                 }
                 Err(e) => {
                     self.log_tts_dispatch_diagnostics(&tts_model);
@@ -162,77 +168,19 @@ impl Router {
             }
         }
 
-        let executor_snapshot = self.executor.read().clone();
-        if let Some(executor) = executor_snapshot {
-            use crate::services::runtime::context::ExecutionContext;
-            use crate::services::runtime::executor::ExecutorError;
-
-            let mut exec_ctx = ExecutionContext {
-                user: user.clone(),
-                ..ExecutionContext::default()
-            };
-            match executor
-                .execute_tts(cleaned_request.clone(), &mut exec_ctx)
-                .await
-            {
-                Ok(result) => {
-                    if let Some(req_fmt) = cleaned_request.response_format.as_deref() {
-                        if req_fmt.eq_ignore_ascii_case(&result.format) == false {
-                            tracing::warn!(
-                                requested = %req_fmt,
-                                actual = %result.format,
-                                model = %cleaned_request.model,
-                                "TTS backend returned different format than requested — caller's Content-Type may be misleading"
-                            );
-                        }
-                    }
-                    let metadata = crate::routing::RouteMetadata {
-                        served_by_node: exec_ctx
-                            .route_metadata
-                            .served_by_node
-                            .unwrap_or_else(|| {
-                                hostname::get()
-                                    .map(|h| h.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| "unknown".to_string())
-                            }),
-                        backend_type: exec_ctx
-                            .route_metadata
-                            .backend_type
-                            .unwrap_or_else(|| "executor".to_string()),
-                        strategy_used: "executor".to_string(),
-                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
-                        hop_count: 0,
-                        latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
-                    usage: None,
-                    finish_reason: None,
-                    };
-                    return Ok(crate::routing::RouteResult {
-                        response: TtsBytes {
-                            bytes: result.bytes,
-                            format: result.format,
-                        },
-                        metadata,
-                    });
-                }
-                Err(ExecutorError::TransportPendingCutover(_)) => {
-                    debug!(
-                        "executor returned TransportPendingCutover for TTS — falling back to legacy mesh dispatch"
-                    );
-                    // fall through
-                }
-                Err(e) => {
-                    self.log_tts_dispatch_diagnostics(&tts_model);
-                    return Err(map_tts_executor_err(e, &tts_model).into());
-                }
-            }
-        }
-
-        // Executor not wired (DB-less router). After R3b.8 the legacy
-        // mesh fallback is gone — without an executor we surface a typed
-        // error instead of doing duplicate dispatch.
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Direct executor.execute_tts fallback wycięty. Plan v1.5 wymaga
+        // że KAŻDY TTS request przechodzi przez flow_engine (synthetic
+        // albo user-defined).
+        let _ = t;
         self.log_tts_dispatch_diagnostics(&tts_model);
-        Err(CoreError::AllBackendsUnavailable {
-            model_name: tts_model,
+        Err(crate::error::CoreError::InternalError {
+            message: format!(
+                "flow_dispatcher not wired for tts model '{}' — DB-less router \
+                 nie wspiera Universal Flow Gateway",
+                tts_model
+            ),
+            source: None,
         }
         .into())
     }

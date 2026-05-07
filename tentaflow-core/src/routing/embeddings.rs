@@ -104,10 +104,18 @@ impl Router {
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
                 Ok(None) => {
-                    tracing::warn!(
-                        model = %request.model,
-                        "embeddings flow_dispatch returned None — fallback to executor direct"
-                    );
+                    // Stage 3d-0b-final: Ok(None) = CompileFailed albo
+                    // unsupported service_type. Brak fallback do executor.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!(
+                            "flow_dispatcher returned no result for embeddings model '{}' — \
+                             user-defined flow nie kompiluje się albo synthetic builder \
+                             nie wspiera service_type='embeddings'",
+                            request.model
+                        ),
+                        source: None,
+                    }
+                    .into());
                 }
                 Err(e) => {
                     return Err(crate::error::CoreError::InternalError {
@@ -119,50 +127,16 @@ impl Router {
             }
         }
 
-        let executor_snapshot = self.executor.read().clone();
-        if let Some(executor) = executor_snapshot {
-            use crate::services::runtime::context::ExecutionContext;
-            
-
-            let mut exec_ctx = ExecutionContext {
-                user: user.clone(),
-                ..ExecutionContext::default()
-            };
-            match executor
-                .execute_embeddings(request.clone(), &mut exec_ctx)
-                .await
-            {
-                Ok(response) => {
-                    let metadata = crate::routing::RouteMetadata {
-                        served_by_node: exec_ctx
-                            .route_metadata
-                            .served_by_node
-                            .unwrap_or_else(|| {
-                                hostname::get()
-                                    .map(|h| h.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| "unknown".to_string())
-                            }),
-                        backend_type: exec_ctx
-                            .route_metadata
-                            .backend_type
-                            .unwrap_or_else(|| "executor".to_string()),
-                        strategy_used: "executor".to_string(),
-                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
-                        hop_count: 0,
-                        latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
-                    usage: None,
-                    finish_reason: None,
-                    };
-                    return Ok(crate::routing::RouteResult { response, metadata });
-                }
-                Err(e) => return Err(executor_err_to_core(e, &request.model).into()),
-            }
-        }
-        // Executor not wired (DB-less router). After R3b.8 the legacy
-        // `BackendHandle` dispatch path is gone — without an executor we
-        // surface a typed error instead of doing duplicate dispatch.
-        Err(crate::error::CoreError::AllBackendsUnavailable {
-            model_name: request.model.clone(),
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Direct executor.execute_embeddings fallback wycięty.
+        let _ = t;
+        Err(crate::error::CoreError::InternalError {
+            message: format!(
+                "flow_dispatcher not wired for embeddings model '{}' — DB-less router \
+                 nie wspiera Universal Flow Gateway",
+                request.model
+            ),
+            source: None,
         }
         .into())
     }
