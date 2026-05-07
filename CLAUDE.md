@@ -463,8 +463,9 @@ najwęższe dependency (slot, Arc<DbPool>, registry) — żaden nie holduje
 **Wszystkie 5 default HTTP paths** (`/v1/chat/completions` blocking +
 streaming, `/v1/audio/speech`, `/v1/audio/transcriptions`,
 `/v1/embeddings`) lecą **wyłącznie** przez `FlowDispatcher::try_dispatch*`.
-Direct executor fallback (legacy "bare passthrough") wycięty w stage
-3d-0b-final.
+Każdy chat/tts/stt/embeddings request — niezależnie czy przez OpenAI
+HTTP API, klient SDK, teams bot, czy inny entrypoint — przechodzi przez
+flow_engine.
 
 - **Synthetic ad-hoc flow** — gdy admin nie skonfigurował user-defined
   flow dla modelu (resolver `None`), runtime buduje minimalny flow w
@@ -495,7 +496,7 @@ TTS / STT / embeddings non-stream) dodatkowe headery:
 - `X-Tentaflow-Latency-Ms` — `RouteMetadata.latency_ms`
 - `X-Tentaflow-Prompt-Tokens` / `-Completion-Tokens` / `-Total-Tokens` —
   z `RouteMetadata.usage` (po stage 3d Universal Flow Gateway zawsze z
-  `FlowExecutionOutcome.usage` — direct executor path wycięty)
+  `FlowExecutionOutcome.usage` po stage 3d Universal Flow Gateway)
 - `X-Tentaflow-Finish-Reason` — `stop` / `length` / `tool_calls` /
   `content_filter` (cancelled/error → header pominięty)
 
