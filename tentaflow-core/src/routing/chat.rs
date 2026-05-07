@@ -511,10 +511,10 @@ mod audio_policy_tests {
         assert!(catalog_target_accepts_audio(&snap, "qwen-omni"));
     }
 
-    /// Text-only target rejects audio. This is the legacy bypass
-    /// the guard exists to plug — pre-fix the chat path silently
-    /// transcribed and forwarded text, dropping speaker and timing
-    /// metadata along the way.
+    /// Text-only target rejects audio. Guard egzekwuje że chat path
+    /// nie próbuje silently transkrybować audio_input dla modeli bez
+    /// audio_input capability — request musi albo iść do audio-capable
+    /// modelu, albo eksplicitnie do `/v1/audio/transcriptions`.
     #[test]
     fn text_only_target_rejects_audio() {
         let snap =

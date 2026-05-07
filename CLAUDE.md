@@ -478,10 +478,11 @@ flow_engine.
   → ModelRuntimeExecutor::execute_* → backend`. Single source of truth.
 - **Mesh inbound EXEMPT-MESH-INBOUND** — 3 callsites zachowują direct
   executor żeby utrzymać ultra-low latency LAN budget (1-5ms baseline):
-  `mesh/inference_proxy.rs:190` (chat), `routing/stt.rs:301`
-  (route_audio_via_protocol), `routing/embeddings.rs:222`
-  (route_embeddings_via_quic). Mesh peer-to-peer = remote backend
-  call, flow żyje po stronie inicjatora.
+  `mesh/inference_proxy.rs::handle_inference_request` (chat),
+  `routing/stt.rs::route_audio_via_protocol`,
+  `routing/embeddings.rs::route_embeddings_via_quic`.
+  Mesh peer-to-peer = remote backend call, flow żyje po stronie inicjatora.
+  Aktualne miejsca: `rg -n 'EXEMPT-MESH-INBOUND' tentaflow-core/src`.
 - **TTS-as-flow** (Etap 2): blocking TTS path `routing/tts.rs::
   synthesize_speech` woła `dispatcher.try_dispatch(model, "tts", ...)`.
   Synthetic albo user-defined flow musi mieć `payload =
