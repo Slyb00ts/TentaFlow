@@ -592,15 +592,21 @@ fn wrap_blocking_as_stream(outcome: FlowExecutionOutcome) -> StreamingExecution 
     }
 }
 
-/// Buduje AdapterRegistry z wszystkimi 13 adapterami stage 1c. Side effect-free
-/// (adaptery są stateless / leniwie pobierają state z ExecutionContext).
+/// Buduje AdapterRegistry z wszystkimi 14 adapterami (13 stage 1c +
+/// tts_stream_bridge stage 3d Krok 2b). Side effect-free.
+///
+/// Streaming-aware adaptery (`pii_filter`, `tts_stream_bridge`)
+/// rejestrowane przez `register_streaming<T>` — landują w obu slotach
+/// (blocking + streaming). Czysta NodeAdapter rejestracja przez
+/// `register` dla nodów które nie mają stream variant'a.
 fn build_registry() -> AdapterRegistry {
+    use crate::flow_engine::node_adapters::TtsStreamBridgeNodeAdapter;
+
     let mut r = AdapterRegistry::new();
     let arcs: Vec<Arc<dyn NodeAdapter>> = vec![
         Arc::new(TriggerNodeAdapter::new()),
         Arc::new(OutputNodeAdapter::new()),
         Arc::new(ConditionNodeAdapter::new()),
-        Arc::new(PiiFilterNodeAdapter::new()),
         Arc::new(TtsCleanNodeAdapter::new()),
         Arc::new(SttNodeAdapter::new()),
         Arc::new(TtsNodeAdapter::new()),
@@ -615,6 +621,10 @@ fn build_registry() -> AdapterRegistry {
         r.register(a);
     }
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
+    // Stage 3d Krok 2c: streaming-aware adaptery (dual-trait NodeAdapter
+    // + StreamingNodeAdapter) trafiają do obu slotów przez register_streaming.
+    r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
+    r.register_streaming(Arc::new(TtsStreamBridgeNodeAdapter::new()));
     r
 }
 
@@ -641,10 +651,21 @@ mod tests {
             "session_context",
             "speaker_context",
             "llm",
+            "tts_stream_bridge",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
         assert!(r.llm().is_some(), "LLM typed accessor must be wired");
+        // Stage 3d Krok 2c: streaming-aware adaptery dostępne też w
+        // streaming slot rejestru.
+        assert!(
+            r.streaming_adapter("pii_filter").is_some(),
+            "pii_filter must be registered in streaming slot"
+        );
+        assert!(
+            r.streaming_adapter("tts_stream_bridge").is_some(),
+            "tts_stream_bridge must be registered in streaming slot"
+        );
     }
 
     #[test]
