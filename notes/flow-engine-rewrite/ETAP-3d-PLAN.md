@@ -119,22 +119,24 @@ brak flow = brak ochrony (jednoznaczne, log warn na load-time).
 Jeśli admin chce PII na danym modelu — definiuje flow w DB z
 `pii_filter`. Synthetic to fallback minimalny.
 
-### Kasujemy bypass paths (8 callsites)
+### Kasujemy bypass paths (6 callsites)
 
 | # | Plik:linia | Co wycinamy |
 |---|---|---|
 | 1 | `routing/chat.rs:187` | DEL `else { executor.execute_chat }` branch. Cała chat path leci wyłącznie przez `dispatcher.try_dispatch`. |
-| 2 | `routing/streaming.rs:739–740` | DEL fallback do blocking `try_dispatch` po stream None. `try_dispatch_streaming` ma wewnętrzny wrapper sync→stream (sekcja niżej). |
+| 2 | `routing/streaming.rs:739–740` + `:847` | DEL fallback do blocking `try_dispatch` po stream None + DEL `executor.stream_chat` direct. `try_dispatch_streaming` ma wewnętrzny wrapper sync→stream (sekcja niżej). |
 | 3 | `routing/tts.rs:102` | DEL `executor.execute_tts` direct. `synthesize_speech` woła `dispatcher.try_dispatch(model, "tts", ...)`. |
-| 4 | `routing/stt.rs:56` | DEL pierwszy `executor.execute_stt` direct (default path). |
-| 5 | ~~`routing/stt.rs:249`~~ | **NIE wycinamy** — protocol-native AudioOperation::STT to mesh inbound (route_audio_via_protocol), oznaczone `EXEMPT-MESH-INBOUND`. |
-| 6 | `routing/embeddings.rs:71` | DEL `executor.execute_embeddings` direct (default path). |
-| 7 | ~~`routing/embeddings.rs:161`~~ | **NIE wycinamy** — `route_embeddings_via_quic` to mesh inbound, oznaczone `EXEMPT-MESH-INBOUND`. |
-| 8 | `flow_engine/dispatchers_impl/stt_impl.rs:30` | REFACTOR: `SttDispatcherImpl::transcribe` woła `executor.execute_stt` zamiast `SttRuntime::transcribe` direct. D4 invariant relaxed (rationale w sekcji niżej). |
+| 4 | `routing/stt.rs:56` | DEL `executor.execute_stt` direct (default path). |
+| 5 | `routing/embeddings.rs:71` | DEL `executor.execute_embeddings` direct (default path). |
+| 6 | `flow_engine/dispatchers_impl/stt_impl.rs:30` | REFACTOR: `SttDispatcherImpl::transcribe` woła `executor.execute_stt` zamiast `SttRuntime::transcribe` direct. D4 invariant relaxed (rationale w sekcji niżej). |
 
-**Mesh inbound paths NIE wycinamy** (3 callsites: `mesh/inference_proxy.rs:190`,
-`routing/stt.rs:301`, `routing/embeddings.rs:222`) — zostają z komentarzami
-`EXEMPT-MESH-INBOUND` (sekcja Mesh exception powyżej).
+**Mesh inbound paths zostają jako EXEMPT-MESH-INBOUND** (3 callsites,
+nie wymienione w tabeli powyżej bo są celowo zachowane):
+- `mesh/inference_proxy.rs:190` — chat reverse z mesh peer
+- `routing/stt.rs:301` (route_audio_via_protocol) — STT mesh reverse
+- `routing/embeddings.rs:222` (route_embeddings_via_quic) — embeddings mesh reverse
+
+Rationale w sekcji "Mesh exception" powyżej.
 
 Po cięciach: `routing/*` ma **jedyne** wywołanie do `flow_engine` —
 brak direct executor calls. `ModelRuntimeExecutor::execute_*` wołane

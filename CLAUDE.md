@@ -458,21 +458,35 @@ najwęższe dependency (slot, Arc<DbPool>, registry) — żaden nie holduje
 | `MetricsSink` | `NoopMetrics` | placeholder |
 | `BlobStore` | `FileBlobStore` (default) / `InMemoryBlobStore` (testy) | filesystem `<TENTAFLOW_HOME>/blobs/<sha[0:2]>/<sha[2:4]>/<sha>.bin`; override `TENTAFLOW_BLOB_STORE=memory` |
 
-### Słowo o bypass'ach
+### Universal Flow Gateway (stage 3d-0b-final)
 
-- **Bare passthrough** w `routing/chat.rs` / `routing/streaming.rs` — gdy żaden flow nie
-  pasuje (resolver zwraca `None`), request idzie bezpośrednio do `ModelRuntimeExecutor`
-  bez flow_engine.
-- **Direct executor path** w `services/runtime/executor.rs` (`dispatch_by_flow_id`) —
-  używane gdy `CatalogSnapshot` ma `flow_id` przypiętą do publikowanego modelu.
-  Buduje `FlowEnvelope` przez `build_initial_envelope_for_user` (chat),
-  `embeddings_request_to_initial_envelope` (embeddings) lub
-  `tts_request_to_initial_envelope` (TTS-as-flow — Etap 2).
-- **TTS-as-flow** (Etap 2): `executor.rs::dispatch_tts_blocking::Flow` arm woła
-  `dispatcher.dispatch_by_flow_id`, output flow musi mieć `payload =
-  FlowValue::Audio { blob_ref, mime, .. }`. `flow_outcome_to_tts_result` pulluje
-  bytes z `BlobStore` przez `dispatcher.blobs()` accessor. Nieznany MIME → Err
-  (no fake "wav" fallback).
+**Wszystkie 5 default HTTP paths** (`/v1/chat/completions` blocking +
+streaming, `/v1/audio/speech`, `/v1/audio/transcriptions`,
+`/v1/embeddings`) lecą **wyłącznie** przez `FlowDispatcher::try_dispatch*`.
+Direct executor fallback (legacy "bare passthrough") wycięty w stage
+3d-0b-final.
+
+- **Synthetic ad-hoc flow** — gdy admin nie skonfigurował user-defined
+  flow dla modelu (resolver `None`), runtime buduje minimalny flow w
+  `flow_engine/synthetic.rs`: `trigger → llm/tts/stt/embeddings(model)
+  → output`. Synthetic kompilowany z `ValidationSource::Synthetic`
+  (R-SAFETY skip), cache w `FlowCache::synthetic` z LRU eviction
+  (default 256).
+- **Capability dispatcher chain**: `routing/* → FlowDispatcher →
+  flow_engine adapter → ctx.{llm|tts|stt|embeddings} → DispatcherImpl
+  → ModelRuntimeExecutor::execute_* → backend`. Single source of truth.
+- **Mesh inbound EXEMPT-MESH-INBOUND** — 3 callsites zachowują direct
+  executor żeby utrzymać ultra-low latency LAN budget (1-5ms baseline):
+  `mesh/inference_proxy.rs:190` (chat), `routing/stt.rs:301`
+  (route_audio_via_protocol), `routing/embeddings.rs:222`
+  (route_embeddings_via_quic). Mesh peer-to-peer = remote backend
+  call, flow żyje po stronie inicjatora.
+- **TTS-as-flow** (Etap 2): blocking TTS path `routing/tts.rs::
+  synthesize_speech` woła `dispatcher.try_dispatch(model, "tts", ...)`.
+  Synthetic albo user-defined flow musi mieć `payload =
+  FlowValue::Audio { blob_ref, mime, .. }` na output;
+  `flow_outcome_to_tts_result` pulluje bytes z `BlobStore`. Nieznany
+  MIME → Err (no fake "wav" fallback).
 
 ### Non-streaming trailers (Etap 2)
 
@@ -480,8 +494,8 @@ Klient z header `X-Want-Trailers: true` dostaje na blocking response (chat /
 TTS / STT / embeddings non-stream) dodatkowe headery:
 - `X-Tentaflow-Latency-Ms` — `RouteMetadata.latency_ms`
 - `X-Tentaflow-Prompt-Tokens` / `-Completion-Tokens` / `-Total-Tokens` —
-  z `RouteMetadata.usage` (zaczerpane z `FlowExecutionOutcome.usage` na flow
-  path lub `response.usage` na executor path)
+  z `RouteMetadata.usage` (po stage 3d Universal Flow Gateway zawsze z
+  `FlowExecutionOutcome.usage` — direct executor path wycięty)
 - `X-Tentaflow-Finish-Reason` — `stop` / `length` / `tool_calls` /
   `content_filter` (cancelled/error → header pominięty)
 
