@@ -463,7 +463,8 @@ mod tests {
                 {"from":"l","to":"o","from_port":"stream"}
             ]
         }"#;
-        let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
+        // Synthetic source — testujemy R7 streaming end-shape, nie R-SAFETY.
+        let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::Synthetic).unwrap();
         assert!(cf.is_streaming);
         assert_eq!(cf.streaming_llm_run_idx(), Some(1));
         // Stage 3d Krok 2c: chain pusty dla direct LLM → output (output
