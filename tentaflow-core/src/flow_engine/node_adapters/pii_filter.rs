@@ -526,8 +526,10 @@ mod tests {
         assert!(out.next().await.is_none());
     }
 
-    /// Stage 3d Krok 2a fix: max_buffer_chars wymusza flush nawet bez
+    /// Stage 3d Krok 2a fix v2: max_buffer_chars wymusza flush nawet bez
     /// sentence terminator'a. Konfiguralnie przez node.config.
+    /// Test używa 3 chunków bez terminatora — pierwsze 2 gromadzą się
+    /// w buforze, trzeci przekracza cap → flush BEFORE EOF.
     #[tokio::test]
     async fn pii_filter_streaming_max_buffer_flush() {
         use crate::flow_engine::envelope::FlowEnvelope;
@@ -537,11 +539,22 @@ mod tests {
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![]));
 
+        // Każdy delta 8 znaków, 3 razy = 24 chars, cap = 20.
+        // Po 3-cim chunk'u bufor osiągnie 24 ≥ 20 → flush.
         let upstream = futures::stream::iter(vec![
             Ok(EnvelopeDelta::Llm(LlmStreamChunk {
                 choice_index: 0,
-                // 50 znaków bez sentence terminatora — przekracza max=20.
-                text_delta: "abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJ".into(),
+                text_delta: "abcdefgh".into(), // bufor=8, no flush
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "ijklmnop".into(), // bufor=16, no flush
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "qrstuvwx".into(), // bufor=24 ≥ cap → FLUSH
                 ..Default::default()
             })),
         ])
@@ -556,11 +569,106 @@ mod tests {
             .await
             .unwrap();
 
+        // Flush triggerowany przez over_cap PRZED EOF — pierwszy chunk
+        // wyemitowany w środku stream'u.
         let chunk = out.next().await.unwrap().unwrap();
         let EnvelopeDelta::Llm(c) = chunk else {
             panic!("expected Llm");
         };
-        assert!(c.text_delta.len() >= 20, "should flush over cap, got {}", c.text_delta.len());
+        assert_eq!(c.text_delta, "abcdefghijklmnopqrstuvwx");
+        assert_eq!(c.choice_index, 0);
+        assert!(out.next().await.is_none(), "stream should EOF after over_cap flush");
+    }
+
+    /// Codex review Krok 2a v2 P2: finish_reason w środku stream'u +
+    /// buffered content (bez sentence terminator) → forced flush
+    /// emituje cleaned content + finish_reason w 1 chunku. Klient
+    /// nigdy nie widzi finish PRZED ostatnim content delta.
+    #[tokio::test]
+    async fn pii_filter_streaming_finish_reason_flushes_buffered_content() {
+        use crate::flow_engine::envelope::{FinishReason, FlowEnvelope};
+        use futures::stream::StreamExt;
+
+        let mut ctx = stub_ctx();
+        ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
+            id: 1,
+            name: "secret".into(),
+            category: "pii".into(),
+            pattern: r"top_secret".into(),
+            replacement: "[REDACTED]".into(),
+        }]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "Mam top_".into(), // bufor partial PII, no terminator
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "secret".into(), // dalej partial, no terminator
+                finish_reason: Some(FinishReason::Stop), // → forced flush
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = PiiFilterNodeAdapter
+            .process_stream(&pii_node(), upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        let chunk = out.next().await.unwrap().unwrap();
+        let EnvelopeDelta::Llm(c) = chunk else {
+            panic!("expected Llm");
+        };
+        // Cleaned content "Mam [REDACTED]" + finish_reason w jednym chunku.
+        assert_eq!(c.text_delta, "Mam [REDACTED]");
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+        assert!(out.next().await.is_none());
+    }
+
+    /// Codex review Krok 2a v2 P2: content + reasoning w tym samym
+    /// chunku (LLM emit oba kanały razem). Flush emituje oba pola
+    /// cleaned w 1 chunku — bez gubienia żadnego.
+    #[tokio::test]
+    async fn pii_filter_streaming_flushes_content_and_reasoning_together() {
+        use crate::flow_engine::envelope::FlowEnvelope;
+        use futures::stream::StreamExt;
+
+        let mut ctx = stub_ctx();
+        ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
+            id: 1,
+            name: "secret".into(),
+            category: "pii".into(),
+            pattern: r"top_secret".into(),
+            replacement: "[REDACTED]".into(),
+        }]));
+
+        let upstream = futures::stream::iter(vec![Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+            choice_index: 0,
+            text_delta: "Powiem ci top_secret.".into(), // sentence terminator
+            reasoning_delta: Some("Myślę o top_secret.".into()), // reasoning też
+            ..Default::default()
+        }))])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = PiiFilterNodeAdapter
+            .process_stream(&pii_node(), upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        let chunk = out.next().await.unwrap().unwrap();
+        let EnvelopeDelta::Llm(c) = chunk else {
+            panic!("expected Llm");
+        };
+        assert_eq!(c.text_delta, "Powiem ci [REDACTED].");
+        assert_eq!(
+            c.reasoning_delta.as_deref(),
+            Some("Myślę o [REDACTED].")
+        );
     }
 
     /// Stage 3d Krok 2a P1 fix: reasoning_delta też filtrowany przez PII
