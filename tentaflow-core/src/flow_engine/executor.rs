@@ -591,3 +591,300 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
     })
     .await;
 }
+
+#[cfg(test)]
+mod chain_integration_tests {
+    //! Krok 8 items 33/34: end-to-end execute_streaming chain integration.
+    //!
+    //! Test 33: trigger → llm → pii_filter → output(stream) — fake LLM emit
+    //! 2 stream chunki, output stream zawiera EnvelopeDelta::Llm po
+    //! przejściu przez pii_filter (z empty rules pii_filter jest identity,
+    //! ale chain'owe pipe'owanie weryfikujemy).
+    //!
+    //! Test 34: trigger → llm → pii_filter → tts_stream_bridge → output(stream)
+    //! — fake LLM emit zdanie, tts bridge syntetyzuje audio per zdanie,
+    //! output stream zawiera EnvelopeDelta::Audio z bytes z BlobStore.
+    //!
+    //! flow_id=0 → executor pomija create_execution_record + persist_execution
+    //! (synthetic-style audit skip), więc nie potrzebujemy realnej tabeli flows.
+    use super::*;
+    use crate::flow_engine::blob_store::{BlobRef, BlobStore, InMemoryBlobStore};
+    use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, TtsDispatcher, TtsRequest, TtsResponse};
+    use crate::flow_engine::envelope::{
+        AudioStreamChunk, EnvelopeDelta, FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk,
+        TokenUsage,
+    };
+    use crate::flow_engine::node_adapter::{test_support::stub_ctx, AdapterRegistry};
+    use crate::flow_engine::node_adapters::{
+        LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
+        TtsStreamBridgeNodeAdapter,
+    };
+    use crate::flow_engine::validation::ValidationSource;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use futures::stream::{BoxStream, StreamExt};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Fake LLM dispatcher emitujący predefiniowaną sekwencję chunków.
+    /// `execute_chat` panikuje — chain testy używają wyłącznie streaming path.
+    struct FakeStreamingLlm {
+        chunks: Mutex<Option<Vec<LlmStreamChunk>>>,
+    }
+
+    impl FakeStreamingLlm {
+        fn new(chunks: Vec<LlmStreamChunk>) -> Self {
+            Self {
+                chunks: Mutex::new(Some(chunks)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmDispatcher for FakeStreamingLlm {
+        async fn execute_chat(
+            &self,
+            _req: LlmRequest,
+        ) -> Result<crate::flow_engine::dispatchers::LlmResponse> {
+            panic!("FakeStreamingLlm::execute_chat not used in chain tests");
+        }
+        async fn stream_chat(
+            &self,
+            _req: LlmRequest,
+        ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
+            let chunks = self
+                .chunks
+                .lock()
+                .unwrap()
+                .take()
+                .expect("FakeStreamingLlm::stream_chat called twice");
+            Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    /// Fake TTS dispatcher liczący wywołania synthesize i zwracający blob_ref
+    /// wskazujący na wstępnie wgrane bajty w `ctx.blobs`.
+    struct FakeTts {
+        blob_ref: BlobRef,
+        bytes: Vec<u8>,
+        synthesized: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl TtsDispatcher for FakeTts {
+        async fn synthesize(&self, req: TtsRequest) -> Result<TtsResponse> {
+            self.synthesized.lock().unwrap().push(req.text);
+            Ok(TtsResponse {
+                audio: self.blob_ref.clone(),
+                mime: "audio/wav".into(),
+                sample_rate: Some(22_050),
+            })
+        }
+        async fn stream_synthesize(
+            &self,
+            _req: TtsRequest,
+        ) -> Result<BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>>
+        {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn registry_with_chain() -> AdapterRegistry {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
+        r.register_streaming(Arc::new(TtsStreamBridgeNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+        r
+    }
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("in-memory db")
+    }
+
+    /// Krok 8 item 33: chain LLM → pii_filter → output(stream).
+    ///
+    /// FakeLlm emit 2 chunki: "Hello world." + "Done.". Sentence flush w
+    /// pii_filter wypycha cleaned tekst (z empty PII rules = identity).
+    /// Verify że stream wyjściowy zawiera EnvelopeDelta::Llm chunki z
+    /// nie-pustym text_delta i sumarycznie cały tekst.
+    #[tokio::test]
+    async fn streaming_chain_llm_pii_output() {
+        let registry = Arc::new(registry_with_chain());
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"l1","type":"llm","config":{"model":"qwen3.5-0.8b"}},
+                {"id":"p1","type":"pii_filter","config":{}},
+                {"id":"o1","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges":[
+                {"from":"t1","to":"l1"},
+                {"from":"l1","to":"p1","from_port":"stream"},
+                {"from":"p1","to":"o1","from_port":"stream"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json(
+                0,
+                flow_json,
+                &registry,
+                ValidationSource::UserDefined,
+            )
+            .expect("compile"),
+        );
+
+        let llm_chunks = vec![
+            LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "Hello world.".into(),
+                ..Default::default()
+            },
+            LlmStreamChunk {
+                choice_index: 0,
+                text_delta: " Done.".into(),
+                finish_reason: Some(FinishReason::Stop),
+                ..Default::default()
+            },
+        ];
+        let mut ctx = stub_ctx();
+        ctx.llm = Arc::new(FakeStreamingLlm::new(llm_chunks));
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let exec = execute_streaming(fresh_db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+
+        let mut deltas: Vec<EnvelopeDelta> = Vec::new();
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            deltas.push(item.expect("delta ok"));
+        }
+
+        assert!(!deltas.is_empty(), "chain output stream empty");
+        let mut concat = String::new();
+        let mut saw_finish = false;
+        for d in &deltas {
+            let EnvelopeDelta::Llm(c) = d else {
+                panic!("expected Llm delta, got Audio");
+            };
+            concat.push_str(&c.text_delta);
+            if c.finish_reason == Some(FinishReason::Stop) {
+                saw_finish = true;
+            }
+        }
+        assert!(
+            concat.contains("Hello world.") && concat.contains("Done."),
+            "chain wycisnął tekst niepełny: {concat:?}"
+        );
+        assert!(saw_finish, "klient nie dostał finish_reason=Stop");
+
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// Krok 8 item 34: chain LLM → pii_filter → tts_stream_bridge →
+    /// output(stream). LLM emit 1 zdanie kończące się kropką → pii_filter
+    /// flush → tts_bridge syntetyzuje audio → output stream zawiera
+    /// EnvelopeDelta::Audio z prawdziwymi bajtami z BlobStore.
+    #[tokio::test]
+    async fn streaming_chain_llm_pii_tts_audio_output() {
+        let registry = Arc::new(registry_with_chain());
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"l1","type":"llm","config":{"model":"qwen3.5-0.8b"}},
+                {"id":"p1","type":"pii_filter","config":{}},
+                {"id":"b1","type":"tts_stream_bridge","config":{"model":"voxcpm"}},
+                {"id":"o1","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges":[
+                {"from":"t1","to":"l1"},
+                {"from":"l1","to":"p1","from_port":"stream"},
+                {"from":"p1","to":"b1","from_port":"stream"},
+                {"from":"b1","to":"o1","from_port":"stream"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json(
+                0,
+                flow_json,
+                &registry,
+                ValidationSource::UserDefined,
+            )
+            .expect("compile"),
+        );
+
+        let audio_bytes = vec![0xAA, 0xBB, 0xCC];
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let blob_ref = blobs
+            .put(audio_bytes.clone(), "audio/wav")
+            .await
+            .expect("put audio");
+
+        let llm_chunks = vec![LlmStreamChunk {
+            choice_index: 0,
+            text_delta: "Hello world.".into(),
+            finish_reason: Some(FinishReason::Stop),
+            ..Default::default()
+        }];
+
+        let fake_tts = Arc::new(FakeTts {
+            blob_ref: blob_ref.clone(),
+            bytes: audio_bytes.clone(),
+            synthesized: Mutex::new(Vec::new()),
+        });
+
+        let mut ctx = stub_ctx();
+        ctx.llm = Arc::new(FakeStreamingLlm::new(llm_chunks));
+        ctx.tts = fake_tts.clone();
+        ctx.blobs = blobs.clone() as Arc<dyn BlobStore>;
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let exec = execute_streaming(fresh_db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+
+        let mut audio_chunks: Vec<AudioStreamChunk> = Vec::new();
+        let mut saw_finish = false;
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            match item.expect("delta ok") {
+                EnvelopeDelta::Audio(a) => {
+                    if a.finish_reason == Some(FinishReason::Stop) {
+                        saw_finish = true;
+                    }
+                    audio_chunks.push(a);
+                }
+                EnvelopeDelta::Llm(_) => panic!("audio chain emitted Llm delta"),
+            }
+        }
+
+        assert!(!audio_chunks.is_empty(), "audio chain empty");
+        let synthesized = fake_tts.synthesized.lock().unwrap().clone();
+        assert_eq!(
+            synthesized.len(),
+            1,
+            "FakeTts.synthesize wywołane {} razy zamiast 1",
+            synthesized.len()
+        );
+        assert!(
+            synthesized[0].contains("Hello world."),
+            "tts dostał obcięty tekst: {:?}",
+            synthesized[0]
+        );
+        // Pierwszy audio chunk niesie bajty syntezy; ostatni może być
+        // pustym terminalnym z finish_reason=Stop (parytet z bridge tests).
+        assert_eq!(audio_chunks[0].bytes_delta, audio_bytes);
+        assert_eq!(audio_chunks[0].mime, "audio/wav");
+        assert!(saw_finish, "klient nie dostał finish_reason=Stop dla audio");
+
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+}
