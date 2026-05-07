@@ -19,7 +19,6 @@ pub mod inference;
 pub mod memory;
 pub mod mesh;
 pub mod metrics;
-pub mod middleware;
 pub mod net;
 pub mod prompt_registry;
 pub mod routing;

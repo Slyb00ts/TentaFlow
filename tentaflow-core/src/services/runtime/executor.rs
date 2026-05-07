@@ -29,7 +29,6 @@ use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::services::catalog::{CatalogProvider, InputModality, OutputModality, ServiceSurface};
 use crate::services::handles_cache::BackendHandle;
 use crate::services::runtime::context::ExecutionContext;
-use crate::services::runtime::middleware::StreamMiddlewareFactory;
 use crate::services::runtime::resolver::{AliasResolver, ResolveError, ResolveRequest};
 use crate::services::runtime::strategy::{rank, StrategyState};
 use crate::services::runtime::target::ResolvedExecutionTarget;
@@ -128,7 +127,6 @@ pub struct ModelRuntimeExecutor {
     mesh_manager: Arc<
         parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
     >,
-    middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     /// Per-alias round-robin state keyed by alias name. `DashMap` so we
     /// can mutate per-key without serialising the whole map.
     strategy_state: Arc<dashmap::DashMap<String, Arc<StrategyState>>>,
@@ -144,7 +142,6 @@ impl ModelRuntimeExecutor {
         mesh_manager: Arc<
             parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
         >,
-        middleware: Vec<Arc<dyn StreamMiddlewareFactory>>,
     ) -> Self {
         Self {
             catalog,
@@ -153,7 +150,6 @@ impl ModelRuntimeExecutor {
             local_inference,
             stt_runtime,
             mesh_manager,
-            middleware,
             strategy_state: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -888,8 +884,8 @@ impl ModelRuntimeExecutor {
     /// `TransportPendingCutover`; teraz buduje `ModelRequest::Completion`,
     /// wysyla przez `Arc<QuicClient>` z handle'u, mapuje response na
     /// `ChatCompletionResponse`. Logika lustro `chat.rs::route_to_quic_llm`
-    /// bez aplikacji `response_middleware` — to robi caller (api handler /
-    /// chat.rs) zeby executor pozostal middleware-agnostic.
+    /// — PII cleaning idzie przez flow_engine `pii_filter` node, executor
+    /// pozostaje agnostic.
     async fn dispatch_chat_quic(
         handle: &Arc<crate::services::runtime::quic_handle::QuicServiceHandle>,
         request: ChatCompletionRequest,
@@ -984,14 +980,6 @@ impl ModelRuntimeExecutor {
                 "QUIC LLM returned unexpected result type".to_string(),
             )),
         }
-    }
-
-    /// Public accessor for the configured middleware factory list. The
-    /// streaming entry points walk this list and call `start_session`
-    /// per request to materialise an isolated stack — never share the
-    /// returned `Vec` itself across streams.
-    pub fn middleware_factories(&self) -> &[Arc<dyn StreamMiddlewareFactory>] {
-        &self.middleware
     }
 
     // =========================================================================
@@ -2108,7 +2096,6 @@ mod tests {
             local_inference,
             stt_slot,
             mesh_slot,
-            Vec::new(),
         )
     }
 
