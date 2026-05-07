@@ -234,7 +234,14 @@ impl FlowDispatcher {
         {
             ResolvedFlow::Found(cached) => {
                 if !self.acl_allow(cached.flow.id, &meta) {
-                    return Ok(None);
+                    // Plan v1.5 fail-closed: ACL deny propaguje jako Err
+                    // żeby caller (routing/*) wiedział że to NIE jest sytuacja
+                    // "no flow attached" — admin jawnie odmówił dostępu, klient
+                    // musi dostać 403/404 zamiast fallbacku do executor direct.
+                    return Err(anyhow::anyhow!(
+                        "flow {} ACL denied for user",
+                        cached.flow.id
+                    ));
                 }
                 self.run_blocking(cached.compiled.clone(), initial, meta).await
             }
@@ -244,10 +251,15 @@ impl FlowDispatcher {
                 // i wykonuje przez tę samą ścieżkę co user flow.
                 let compiled = match self.compile_synthetic_blocking(service_type, model_name) {
                     Some(c) => c,
-                    None => return Ok(None), // unsupported service_type
+                    None => return Ok(None), // unsupported service_type — caller fallback
                 };
                 self.run_blocking(compiled, initial, meta).await
             }
+            // Negative cache: user-defined flow ma broken flow_json. Ok(None)
+            // żeby caller wiedział że to recoverable (admin może naprawić +
+            // invalidate). Plan v1.5 mówi że to powinno być Err(Compile),
+            // ale zmiana sygnatury Result<Option<...>> → Result<Outcome,
+            // DispatchError> jest invasive — zostaje na finalnym 0b commit.
             ResolvedFlow::CompileFailed => Ok(None),
         }
     }
@@ -269,7 +281,8 @@ impl FlowDispatcher {
             return Ok(None);
         }
         if !self.acl_allow(flow_id, &meta) {
-            return Ok(None);
+            // Plan v1.5 fail-closed: ACL deny → Err (caller mapuje na 403/404).
+            return Err(anyhow::anyhow!("flow {flow_id} ACL denied for user"));
         }
         let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry, crate::flow_engine::validation::ValidationSource::UserDefined) {
             Ok(c) => Arc::new(c),
@@ -296,7 +309,10 @@ impl FlowDispatcher {
         {
             ResolvedFlow::Found(cached) => {
                 if !self.acl_allow(cached.flow.id, &meta) {
-                    return Ok(None);
+                    return Err(anyhow::anyhow!(
+                        "flow {} ACL denied for user",
+                        cached.flow.id
+                    ));
                 }
                 if !cached.compiled.is_streaming {
                     // User-defined blocking-only flow — wykonaj blocking
@@ -352,12 +368,17 @@ impl FlowDispatcher {
         {
             Ok(Ok(outcome)) => Ok(Some(outcome)),
             Ok(Err(e)) => {
+                // Plan v1.5 fail-closed: runtime error propaguje jako Err.
+                // Routing/* nie ma fallbackować do executor direct — flow
+                // failure powinien być 500 dla klienta, nie cichy bypass.
                 warn!(flow_id, "Blad wykonania flow: {e}");
-                Ok(None)
+                Err(e)
             }
             Err(_) => {
                 warn!(flow_id, "Timeout flow po {FLOW_TIMEOUT_SECS}s");
-                Ok(None)
+                Err(anyhow::anyhow!(
+                    "flow {flow_id} timeout after {FLOW_TIMEOUT_SECS}s"
+                ))
             }
         }
     }
