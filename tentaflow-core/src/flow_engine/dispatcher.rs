@@ -49,6 +49,31 @@ use crate::services::runtime::quic_handle::ServiceManager;
 
 const FLOW_TIMEOUT_SECS: u64 = 120;
 
+/// Stage 3d-0b-final: typed dispatch error żeby routing layer mógł
+/// mapować na precyzyjne HTTP status codes:
+/// - `Denied` → 404 model_not_found (plan v1.5: nie ujawniamy istnienia
+///   modelu klientom bez ACL).
+/// - `CompileFailed` → 500 z msg ("user-defined flow nie kompiluje się").
+/// - `Unsupported` → 500 z msg ("synthetic builder nie wspiera service_type").
+/// - `Internal` → 500 (runtime err / timeout / inne).
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("flow {flow_id} ACL denied for user")]
+    Denied { flow_id: i64 },
+    #[error("flow {flow_id} compile failed: {msg}")]
+    CompileFailed { flow_id: i64, msg: String },
+    #[error("synthetic dispatch unsupported for service_type='{service_type}', model='{model}'")]
+    Unsupported { service_type: String, model: String },
+    #[error("flow dispatch internal: {0}")]
+    Internal(String),
+}
+
+impl From<anyhow::Error> for DispatchError {
+    fn from(e: anyhow::Error) -> Self {
+        DispatchError::Internal(e.to_string())
+    }
+}
+
 /// Wynik resolve_cached — rozróżnia 3 stany żeby caller wiedział czy aktywować
 /// synthetic fallback (NotFound) czy zwrócić błąd kompilacji (CompileFailed).
 enum ResolvedFlow {
@@ -225,42 +250,40 @@ impl FlowDispatcher {
         service_type: &str,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
-    ) -> Result<Option<FlowExecutionOutcome>> {
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let modality = derive_modality(&initial);
         let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
         match self
             .resolve_cached(&cache_key, model_name, service_type, modality)
-            .await?
+            .await
+            .map_err(DispatchError::from)?
         {
             ResolvedFlow::Found(cached) => {
                 if !self.acl_allow(cached.flow.id, &meta) {
-                    // Plan v1.5 fail-closed: ACL deny propaguje jako Err
-                    // żeby caller (routing/*) wiedział że to NIE jest sytuacja
-                    // "no flow attached" — admin jawnie odmówił dostępu, klient
-                    // musi dostać 403/404 zamiast fallbacku do executor direct.
-                    return Err(anyhow::anyhow!(
-                        "flow {} ACL denied for user",
-                        cached.flow.id
-                    ));
+                    return Err(DispatchError::Denied {
+                        flow_id: cached.flow.id,
+                    });
                 }
-                self.run_blocking(cached.compiled.clone(), initial, meta).await
+                self.run_blocking(cached.compiled.clone(), initial, meta)
+                    .await
+                    .map_err(DispatchError::from)
             }
             ResolvedFlow::NotFound => {
-                // Universal Flow Gateway — admin nie skonfigurował user-defined flow,
-                // runtime buduje synthetic ad-hoc (trigger → capability(model) → output)
-                // i wykonuje przez tę samą ścieżkę co user flow.
-                let compiled = match self.compile_synthetic_blocking(service_type, model_name) {
-                    Some(c) => c,
-                    None => return Ok(None), // unsupported service_type — caller fallback
-                };
-                self.run_blocking(compiled, initial, meta).await
+                // Universal Flow Gateway — synthetic ad-hoc fallback.
+                let compiled = self
+                    .compile_synthetic_blocking(service_type, model_name)
+                    .ok_or_else(|| DispatchError::Unsupported {
+                        service_type: service_type.to_string(),
+                        model: model_name.to_string(),
+                    })?;
+                self.run_blocking(compiled, initial, meta)
+                    .await
+                    .map_err(DispatchError::from)
             }
-            // Negative cache: user-defined flow ma broken flow_json. Ok(None)
-            // żeby caller wiedział że to recoverable (admin może naprawić +
-            // invalidate). Plan v1.5 mówi że to powinno być Err(Compile),
-            // ale zmiana sygnatury Result<Option<...>> → Result<Outcome,
-            // DispatchError> jest invasive — zostaje na finalnym 0b commit.
-            ResolvedFlow::CompileFailed => Ok(None),
+            ResolvedFlow::CompileFailed => Err(DispatchError::CompileFailed {
+                flow_id: 0,
+                msg: format!("user-defined flow for '{model_name}/{service_type}'"),
+            }),
         }
     }
 
@@ -269,29 +292,39 @@ impl FlowDispatcher {
         flow_id: i64,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
-    ) -> Result<Option<FlowExecutionOutcome>> {
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let pool = self.db.clone();
         let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, flow_id))
-            .await??;
-        let Some(flow) = flow_opt else {
-            return Ok(None);
-        };
+            .await
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+            .map_err(|e| DispatchError::Internal(e.to_string()))?;
+        let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+            flow_id,
+            msg: "flow id nie istnieje w DB".to_string(),
+        })?;
         if flow.status != "active" {
             warn!(flow_id, status = %flow.status, "flow nieaktywny — pomijam");
-            return Ok(None);
+            return Err(DispatchError::CompileFailed {
+                flow_id,
+                msg: format!("flow status='{}' (nie active)", flow.status),
+            });
         }
         if !self.acl_allow(flow_id, &meta) {
-            // Plan v1.5 fail-closed: ACL deny → Err (caller mapuje na 403/404).
-            return Err(anyhow::anyhow!("flow {flow_id} ACL denied for user"));
+            return Err(DispatchError::Denied { flow_id });
         }
         let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry, crate::flow_engine::validation::ValidationSource::UserDefined) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 warn!(flow_id, "compile failed: {e}");
-                return Ok(None);
+                return Err(DispatchError::CompileFailed {
+                    flow_id,
+                    msg: e.to_string(),
+                });
             }
         };
-        self.run_blocking(compiled, initial, meta).await
+        self.run_blocking(compiled, initial, meta)
+            .await
+            .map_err(DispatchError::from)
     }
 
     pub async fn try_dispatch_streaming(
@@ -300,39 +333,45 @@ impl FlowDispatcher {
         service_type: &str,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
-    ) -> Result<Option<StreamingExecution>> {
+    ) -> std::result::Result<StreamingExecution, DispatchError> {
         let modality = derive_modality(&initial);
         let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
         let compiled = match self
             .resolve_cached(&cache_key, model_name, service_type, modality)
-            .await?
+            .await
+            .map_err(DispatchError::from)?
         {
             ResolvedFlow::Found(cached) => {
                 if !self.acl_allow(cached.flow.id, &meta) {
-                    return Err(anyhow::anyhow!(
-                        "flow {} ACL denied for user",
-                        cached.flow.id
-                    ));
+                    return Err(DispatchError::Denied {
+                        flow_id: cached.flow.id,
+                    });
                 }
                 if !cached.compiled.is_streaming {
                     // User-defined blocking-only flow — wykonaj blocking
-                    // i opakuj outcome jako single-chunk stream (parity z
-                    // streaming end-shape contract dla callera).
+                    // i opakuj outcome jako single-chunk stream.
                     let outcome = self
                         .run_blocking(cached.compiled.clone(), initial, meta)
-                        .await?;
-                    return Ok(outcome.map(wrap_blocking_as_stream));
+                        .await
+                        .map_err(DispatchError::from)?;
+                    return Ok(wrap_blocking_as_stream(outcome));
                 }
                 cached.compiled.clone()
             }
-            ResolvedFlow::NotFound => {
-                // Synthetic streaming flow — chat path streamuje z LLM.
-                match self.compile_synthetic_streaming(service_type, model_name) {
-                    Some(c) => c,
-                    None => return Ok(None),
-                }
+            ResolvedFlow::NotFound => self
+                .compile_synthetic_streaming(service_type, model_name)
+                .ok_or_else(|| DispatchError::Unsupported {
+                    service_type: service_type.to_string(),
+                    model: model_name.to_string(),
+                })?,
+            ResolvedFlow::CompileFailed => {
+                return Err(DispatchError::CompileFailed {
+                    flow_id: 0,
+                    msg: format!(
+                        "user-defined streaming flow for '{model_name}/{service_type}'"
+                    ),
+                });
             }
-            ResolvedFlow::CompileFailed => return Ok(None),
         };
         let ctx = self.ctx_factory.make_context(&meta);
         let stream_exec = execute_streaming(
@@ -342,8 +381,9 @@ impl FlowDispatcher {
             ctx,
             self.registry.clone(),
         )
-        .await?;
-        Ok(Some(stream_exec))
+        .await
+        .map_err(DispatchError::from)?;
+        Ok(stream_exec)
     }
 
     async fn run_blocking(
@@ -351,7 +391,7 @@ impl FlowDispatcher {
         compiled: Arc<CompiledFlow>,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
-    ) -> Result<Option<FlowExecutionOutcome>> {
+    ) -> Result<FlowExecutionOutcome> {
         let ctx = self.ctx_factory.make_context(&meta);
         let flow_id = compiled.flow_id;
         match timeout(
@@ -366,11 +406,8 @@ impl FlowDispatcher {
         )
         .await
         {
-            Ok(Ok(outcome)) => Ok(Some(outcome)),
+            Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(e)) => {
-                // Plan v1.5 fail-closed: runtime error propaguje jako Err.
-                // Routing/* nie ma fallbackować do executor direct — flow
-                // failure powinien być 500 dla klienta, nie cichy bypass.
                 warn!(flow_id, "Blad wykonania flow: {e}");
                 Err(e)
             }

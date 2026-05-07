@@ -19,6 +19,35 @@ pub mod video_pipeline;
 
 // Re-eksporty publicznych typow
 pub use middleware::{ResolvedRoute, RouteMetadata, RouteResult};
+
+/// Stage 3d-0b-final: mapowanie typed `DispatchError` → `CoreError`.
+/// Plan v1.5: `Denied` → 404 (nie ujawniamy istnienia modelu klientom
+/// bez ACL); pozostałe → 500 z czytelnym message.
+pub(crate) fn dispatch_error_to_core(
+    err: crate::flow_engine::dispatcher::DispatchError,
+    model: &str,
+) -> crate::error::CoreError {
+    use crate::flow_engine::dispatcher::DispatchError;
+    match err {
+        DispatchError::Denied { .. } => crate::error::CoreError::ModelNotFound {
+            model_name: model.to_string(),
+        },
+        DispatchError::CompileFailed { flow_id, msg } => crate::error::CoreError::InternalError {
+            message: format!("flow {flow_id} compile failed: {msg}"),
+            source: None,
+        },
+        DispatchError::Unsupported { service_type, model } => crate::error::CoreError::InternalError {
+            message: format!(
+                "synthetic dispatch unsupported for service_type='{service_type}', model='{model}'"
+            ),
+            source: None,
+        },
+        DispatchError::Internal(msg) => crate::error::CoreError::InternalError {
+            message: format!("flow dispatch: {msg}"),
+            source: None,
+        },
+    }
+}
 pub use router::{
     BackendMetric, DiarizedSpeaker, Router, RouterMetrics, SpeakerIdentifyResult,
     SttWithDiarization, VoiceInfo,
