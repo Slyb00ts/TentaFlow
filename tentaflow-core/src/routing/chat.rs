@@ -12,7 +12,7 @@ use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::envelope::FlowExecutionOutcome;
 use crate::routing::router::{
-    RequestMetrics, Router, VoiceInfo,
+    Router, VoiceInfo,
 };
 
 use tracing::{debug, error, info, warn};
@@ -34,8 +34,6 @@ impl Router {
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
-        let mut metrics = RequestMetrics::new();
-
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
                 if !crate::auth::acl::check_access_safe(
@@ -611,47 +609,3 @@ mod audio_policy_tests {
     }
 }
 
-/// Map executor errors onto typed `CoreError` variants so the OpenAI
-/// HTTP layer can serve a precise status code (404 / 400 / 503) instead
-/// of a catch-all 500. Codex R3b.8: chat/stream had been flattening
-/// every executor error to `InternalError`; mirror of `embeddings.rs`
-/// + `tts.rs` mappers so all four surfaces map errors consistently.
-pub(crate) fn executor_err_to_core(
-    err: crate::services::runtime::executor::ExecutorError,
-    model: &str,
-) -> crate::error::CoreError {
-    use crate::services::runtime::executor::ExecutorError;
-    use crate::services::runtime::resolver::ResolveError;
-    match err {
-        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
-            crate::error::CoreError::ModelNotFound { model_name: m }
-        }
-        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
-            crate::error::CoreError::InvalidRequest {
-                message: format!(
-                    "model '{}' has no candidate matching requested capabilities",
-                    requested
-                ),
-                details: None,
-            }
-        }
-        ExecutorError::Resolve(other) => crate::error::CoreError::InternalError {
-            message: format!("alias resolution: {}", other),
-            source: None,
-        },
-        ExecutorError::AllCandidatesFailed { .. }
-        | ExecutorError::TransportPendingCutover(_) => {
-            crate::error::CoreError::AllBackendsUnavailable {
-                model_name: model.to_string(),
-            }
-        }
-        ExecutorError::FlowDispatcherUnavailable
-        | ExecutorError::FlowEmptyResult { .. }
-        | ExecutorError::Internal(_)
-        | ExecutorError::SttRuntimeUnavailable
-        | ExecutorError::SttBackend(_) => crate::error::CoreError::InternalError {
-            message: format!("executor: {}", err),
-            source: None,
-        },
-    }
-}
