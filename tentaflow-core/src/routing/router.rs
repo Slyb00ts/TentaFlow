@@ -335,7 +335,6 @@ impl Router {
                 pool,
                 service_manager.clone(),
                 executor_slot.clone(),
-                stt_runtime_slot.clone(),
                 blobs.clone(),
             ))
         });

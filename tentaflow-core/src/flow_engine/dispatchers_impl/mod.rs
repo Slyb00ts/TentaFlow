@@ -51,6 +51,6 @@ pub use memory_impl::MemoryStoreImpl;
 pub use pii_rules_impl::PiiRulesStoreImpl;
 pub use prompts_impl::PromptsImpl;
 pub use quic_finder::{QuicClientFinder, ServiceManagerQuicFinder};
-pub use stt_impl::{SttDispatcherImpl, SttRuntimeSlot};
+pub use stt_impl::SttDispatcherImpl;
 pub use tts_cleaning_impl::TtsCleaningStoreImpl;
 pub use tts_impl::TtsDispatcherImpl;
