@@ -17,27 +17,13 @@ use tracing::{debug, warn};
 
 use futures::Stream;
 
-/// Single PII streaming wrapper — uzywany przez wszystkie streaming
-/// route paths (executor, flow streaming, LocalLlm, QuicLlm, MeshForward,
-/// legacy HTTP). Per-chunk `StreamingProcessor.process_token` + EOF flush
-/// dla buforowanych tail tokenow.
-///
-/// Niezmienniki:
-/// - Procesory keyed per `choice.index` (u32) — nie per pozycja w wektorze
-///   `chunk.choices`. Klient OpenAI moze wysylac chunki z tylko choice
-///   `index=1` (n>1, parallel sampling) i `enumerate()` mieszaloby
-///   procesory miedzy choices.
-/// - Chunki z `finish_reason = Some(_)` sa wstrzymywane i emitowane PO
-///   `flush_tail`. Inaczej buforowany tail token wpadalby po `[DONE]`/stop
-///   i klient ktory zatrzymuje sie na finish bylby pozbawiony konca tekstu.
-///   Jezeli oryginalny finish chunk niesie tez `delta.content` /
-///   `delta.reasoning_content`, splitujemy go na content-only (emit od razu,
-///   przepuszczone przez procesor) + finish-only (hold do konca).
 /// Bridge `StreamingExecution.stream` (rkyv `EnvelopeDelta::Llm`) na strumień
 /// `ChatCompletionChunk` zgodny z OpenAI SSE. Outcome receiver z executor'a
 /// jest spawnowany do background task'a (per plan: routing nie czeka na
 /// outcome). Disconnect klienta propaguje się przez `CancelOnDropStream`
-/// wstawiony przez SSE wrapper.
+/// wstawiony przez SSE wrapper. PII cleaning siedzi w `pii_filter`
+/// StreamingNodeAdapter wewnątrz flow_engine (Krok 6) — wire layer już
+/// nie filtruje.
 fn envelope_stream_to_chunk_stream(
     stream_exec: crate::flow_engine::executor::StreamingExecution,
     model: String,

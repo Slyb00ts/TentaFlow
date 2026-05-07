@@ -27,9 +27,8 @@ use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "tts_stream_bridge";
 
-/// Sentence terminators dla per-zdanie batching. Parytet z legacy
-/// `services/tts/processor.rs::TTSBufferingProcessor` (`.!?…;`) +
-/// `\n` z PII filter dla spójności.
+/// Sentence terminators dla per-zdanie batching: `.!?…;` + `\n`
+/// (spójne z PII filter).
 const SENTENCE_TERMINATORS: &[char] = &['.', '!', '?', '…', ';', '\n'];
 
 /// Maks bytes bufora przed forced flush. Default 1000 — kompromis: za małe

@@ -48,8 +48,7 @@ const OUTPUT_PORTS: &[&str] = &["full", "stream"];
 /// jak email może zostać przerwane mid-token; za duże = klient czeka
 /// długo na pierwszy chunk.
 const DEFAULT_MAX_BUFFER_CHARS: usize = 1000;
-/// Sentence terminators dla streaming flush — parytet z legacy PII
-/// `StreamingProcessor` w `services/runtime/middleware.rs`.
+/// Sentence terminators dla streaming flush.
 const SENTENCE_TERMINATORS: &[char] = &['.', '!', '?', '…', ';', '\n'];
 
 #[async_trait]
