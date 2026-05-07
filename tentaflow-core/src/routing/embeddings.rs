@@ -58,6 +58,67 @@ impl Router {
         debug!("Routing embeddings dla modelu: {}", request.model);
 
         let t = std::time::Instant::now();
+
+        // Stage 3d-0b-3: Embeddings path zawsze przez FlowDispatcher
+        // (Universal Flow Gateway). Synthetic flow `trigger →
+        // embeddings(model) → output` aktywuje się gdy admin nie
+        // skonfigurował user-defined flow. Direct executor jako fallback
+        // dla CompileFailed / no flow_dispatcher.
+        if let Some(ref dispatcher) = self.flow_dispatcher {
+            let (initial, meta) =
+                crate::services::runtime::executor::embeddings_request_to_initial_envelope(
+                    &request,
+                    user.clone(),
+                );
+            match dispatcher
+                .try_dispatch(&request.model, "embeddings", initial, meta)
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    let expected_count = match &request.input {
+                        crate::api::openai::types::EmbeddingInput::Single(_) => 1,
+                        crate::api::openai::types::EmbeddingInput::Multiple(texts) => texts.len(),
+                    };
+                    let response =
+                        crate::services::runtime::executor::flow_outcome_to_embedding_response(
+                            outcome,
+                            &request,
+                            expected_count,
+                        )
+                        .map_err(|e| crate::error::CoreError::InternalError {
+                            message: format!("embeddings flow result: {e}"),
+                            source: None,
+                        })?;
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string()),
+                        backend_type: "flow_engine".to_string(),
+                        strategy_used: "flow_dispatch".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                        usage: None,
+                        finish_reason: None,
+                    };
+                    return Ok(crate::routing::RouteResult { response, metadata });
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        model = %request.model,
+                        "embeddings flow_dispatch returned None — fallback to executor direct"
+                    );
+                }
+                Err(e) => {
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("embeddings flow dispatch: {e}"),
+                        source: None,
+                    }
+                    .into());
+                }
+            }
+        }
+
         let executor_snapshot = self.executor.read().clone();
         if let Some(executor) = executor_snapshot {
             use crate::services::runtime::context::ExecutionContext;
