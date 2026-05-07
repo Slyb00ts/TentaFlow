@@ -89,6 +89,79 @@ impl Router {
 
         let tts_model = cleaned_request.model.clone();
         let t = std::time::Instant::now();
+
+        // Stage 3d-0b-2: TTS path zawsze przez FlowDispatcher (Universal
+        // Flow Gateway). Synthetic flow `trigger → tts(model) → output`
+        // aktywuje się gdy admin nie skonfigurował user-defined flow.
+        // Direct executor.execute_tts zostaje jako fallback (CompileFailed
+        // / no flow_dispatcher) — będzie wycięte w finalnym 0b commit.
+        if let Some(ref dispatcher) = self.flow_dispatcher {
+            let (initial, meta) = crate::services::runtime::executor::tts_request_to_initial_envelope(
+                &cleaned_request,
+                user.clone(),
+            );
+            match dispatcher.try_dispatch(&cleaned_request.model, "tts", initial, meta).await {
+                Ok(Some(outcome)) => {
+                    let result = crate::services::runtime::executor::flow_outcome_to_tts_result(
+                        outcome,
+                        dispatcher.blobs(),
+                    )
+                    .await
+                    .map_err(|e| crate::error::CoreError::InternalError {
+                        message: format!("tts flow result: {e}"),
+                        source: None,
+                    })?;
+                    if let Some(req_fmt) = cleaned_request.response_format.as_deref() {
+                        if !req_fmt.eq_ignore_ascii_case(&result.format) {
+                            tracing::warn!(
+                                requested = %req_fmt,
+                                actual = %result.format,
+                                model = %cleaned_request.model,
+                                "TTS flow returned different format than requested"
+                            );
+                        }
+                    }
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string()),
+                        backend_type: "flow_engine".to_string(),
+                        strategy_used: "flow_dispatch".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                        usage: None,
+                        finish_reason: None,
+                    };
+                    return Ok(crate::routing::RouteResult {
+                        response: TtsBytes {
+                            bytes: result.bytes,
+                            format: result.format,
+                        },
+                        metadata,
+                    });
+                }
+                Ok(None) => {
+                    // CompileFailed user-defined flow — log warn, fallback
+                    // do executor direct (backward-compat). Synthetic NIE
+                    // aktywuje się dla CompileFailed (admin chciał konkretny
+                    // flow — niech naprawi flow_json).
+                    tracing::warn!(
+                        model = %cleaned_request.model,
+                        "tts flow_dispatch returned None — fallback to executor direct"
+                    );
+                }
+                Err(e) => {
+                    self.log_tts_dispatch_diagnostics(&tts_model);
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("tts flow dispatch: {e}"),
+                        source: None,
+                    }
+                    .into());
+                }
+            }
+        }
+
         let executor_snapshot = self.executor.read().clone();
         if let Some(executor) = executor_snapshot {
             use crate::services::runtime::context::ExecutionContext;
