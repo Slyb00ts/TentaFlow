@@ -1720,6 +1720,11 @@ fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 }
 
 /// Buduje seed envelope + per-request meta dla embeddings flow path.
+/// Dla `EmbeddingInput::Multiple` payload zostaje pierwszym tekstem
+/// (single-input fallback dla legacy adapterów), a pełna lista trafia do
+/// `envelope.meta["embeddings_inputs"]` jako JSON array. EmbeddingsNodeAdapter
+/// preferuje meta gdy istnieje (multi-input batch), w przeciwnym wypadku
+/// używa payload (single).
 pub(crate) fn embeddings_request_to_initial_envelope(
     request: &EmbeddingRequest,
     user: Option<crate::auth::acl::UserContext>,
@@ -1728,12 +1733,26 @@ pub(crate) fn embeddings_request_to_initial_envelope(
     crate::flow_engine::dispatcher::FlowRequestMeta,
 ) {
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
-    let input_text = match &request.input {
-        EmbeddingInput::Single(text) => text.clone(),
-        EmbeddingInput::Multiple(texts) => texts.join("\n"),
-    };
     let mut env = FlowEnvelope::empty();
-    env.payload = FlowValue::Text(input_text);
+    match &request.input {
+        EmbeddingInput::Single(text) => {
+            env.payload = FlowValue::Text(text.clone());
+        }
+        EmbeddingInput::Multiple(texts) => {
+            // Pierwszy tekst zostaje na payload jako fallback dla adapterów
+            // które zostały na single-input contract; pełna lista w meta.
+            env.payload = FlowValue::Text(texts.first().cloned().unwrap_or_default());
+            env.meta.insert(
+                "embeddings_inputs".into(),
+                serde_json::Value::Array(
+                    texts
+                        .iter()
+                        .map(|t| serde_json::Value::String(t.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
     env.meta.insert(
         "embeddings_model".into(),
         serde_json::Value::String(request.model.clone()),
