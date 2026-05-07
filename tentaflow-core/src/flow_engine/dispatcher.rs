@@ -28,7 +28,7 @@ use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers_impl::{
     AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
     MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
-    SttDispatcherImpl, SttRuntimeSlot, TtsCleaningStoreImpl, TtsDispatcherImpl,
+    SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
     EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
@@ -146,7 +146,6 @@ impl FlowDispatcher {
         db: DbPool,
         service_manager: Arc<ServiceManager>,
         runtime_slot: ModelRuntimeSlot,
-        stt_runtime_slot: SttRuntimeSlot,
         blobs: Arc<dyn BlobStore>,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -169,9 +168,9 @@ impl FlowDispatcher {
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
-            Arc::new(TtsDispatcherImpl::new(runtime_slot, blobs.clone()));
+            Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
-            Arc::new(SttDispatcherImpl::new(stt_runtime_slot, blobs.clone()));
+            Arc::new(SttDispatcherImpl::new(runtime_slot, blobs.clone()));
 
         let ctx_factory = Arc::new(ContextFactory {
             clock,
