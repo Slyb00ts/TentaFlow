@@ -347,22 +347,39 @@ pub fn validate(
         .filter(|e| e.from_port == "stream")
         .collect();
 
-    // R7 multi-branch guard: każdy node może mieć MAX 1 wychodzący edge
-    // z `from_port="stream"`. Linear chain (stream → stream → stream)
-    // OK; równoległe rozgałęzienie (jeden node ma 2 stream edges →
-    // różne sink'i) odrzucone — runtime executor i tak fold'uje tylko
-    // jedną ścieżkę, druga byłaby ignorowana.
+    // R7 multi-branch guard:
+    //
+    // 1. Per-node: max 1 wychodzący edge z `from_port="stream"`. Linear
+    //    chain (stream → stream → stream) OK; równoległe rozgałęzienie
+    //    z tego samego node'a → odrzucone.
+    //
+    // 2. Per-flow: tylko 1 unikalny producer stream'u (top-of-chain).
+    //    Producent = node z stream edge wychodzącym, ale BEZ
+    //    przychodzącego stream edge'a (intermediate w chain'ie ma
+    //    incoming + outgoing stream — to dalej ten sam chain).
+    //    Runtime executor fold'uje pojedynczy chain; dwóch niezależnych
+    //    producerów byłoby silently zignorowane.
     let mut stream_out_count: HashMap<&str, usize> = HashMap::new();
+    let mut stream_in_count: HashMap<&str, usize> = HashMap::new();
     for edge in &stream_edges {
         *stream_out_count.entry(edge.from.as_str()).or_insert(0) += 1;
+        *stream_in_count.entry(edge.to.as_str()).or_insert(0) += 1;
     }
-    for (node_id, count) in &stream_out_count {
+    for count in stream_out_count.values() {
         if *count > 1 {
             return Err(FlowValidationError::MultipleStreamingBranches {
                 count: *count,
             });
         }
-        let _ = node_id;
+    }
+    let producer_count = stream_out_count
+        .keys()
+        .filter(|node_id| !stream_in_count.contains_key(*node_id))
+        .count();
+    if producer_count > 1 {
+        return Err(FlowValidationError::MultipleStreamingBranches {
+            count: producer_count,
+        });
     }
 
     // Walk chain: zacznij od pierwszego stream edge'a, follow `from_port=
@@ -703,6 +720,51 @@ mod tests {
                     {"from":"t","to":"l"},
                     {"from":"l","to":"o1","from_port":"stream"},
                     {"from":"l","to":"o2","from_port":"stream"}
+                ]
+            }"#,
+        );
+        let err = validate(
+            &def,
+            &r,
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::MultipleStreamingBranches { .. }
+        ));
+    }
+
+    /// R7 per-flow guard: tylko 1 producer stream'u w całym flow.
+    /// Dwa niezależne LLM, każdy z własnym stream edge → 2 output sinks
+    /// → walidator odrzuca, runtime fold'uje tylko pierwszy chain.
+    #[test]
+    fn rejects_multiple_independent_stream_producers() {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(ConditionNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+
+        // Trigger fan-out do condition który decyduje (true/false branch
+        // — symulujemy bo trigger ma tylko 1 outgoing). Każdy LLM emit
+        // własny stream → osobny output sink. Independent producers.
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"c","type":"condition","config":{}},
+                    {"id":"l1","type":"llm","config":{}},
+                    {"id":"l2","type":"llm","config":{}},
+                    {"id":"o1","type":"output","config":{"mode":"stream"}},
+                    {"id":"o2","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"c"},
+                    {"from":"c","to":"l1","from_port":"true"},
+                    {"from":"c","to":"l2","from_port":"false"},
+                    {"from":"l1","to":"o1","from_port":"stream"},
+                    {"from":"l2","to":"o2","from_port":"stream"}
                 ]
             }"#,
         );
