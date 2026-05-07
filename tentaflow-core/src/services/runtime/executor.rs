@@ -1861,6 +1861,101 @@ pub(crate) fn flow_outcome_to_embedding_response(
     Ok(response)
 }
 
+/// Stage 3d-0b-4: buduje seed envelope + meta dla STT-as-flow path.
+/// Audio bytes lądują w BlobStore (sentinel BlobRef zostaje na payload),
+/// adapter STT pobiera bytes z `ctx.blobs.get(&blob_ref)` w execute().
+/// Pola `language` / `prompt` / `temperature` lądują w `envelope.meta` —
+/// adapter może je czytać z fallback `node.config -> envelope.meta`.
+pub(crate) async fn stt_request_to_initial_envelope(
+    request: &TranscriptionRequest,
+    user: Option<crate::auth::acl::UserContext>,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> anyhow::Result<(
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+)> {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let mime = mime_for_filename(&request.filename);
+    let bytes_vec = request.file.to_vec();
+    let blob_ref = blobs
+        .put(bytes_vec, &mime)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT blob put: {e}"))?;
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Audio {
+        blob_ref,
+        mime,
+        sample_rate: None,
+    };
+    env.meta.insert(
+        "stt_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    if let Some(lang) = &request.language {
+        env.meta
+            .insert("language".into(), serde_json::Value::String(lang.clone()));
+    }
+    if let Some(prompt) = &request.prompt {
+        env.meta
+            .insert("prompt".into(), serde_json::Value::String(prompt.clone()));
+    }
+    if let Some(temp) = request.temperature {
+        if let Some(num) = serde_json::Number::from_f64(temp as f64) {
+            env.meta
+                .insert("temperature".into(), serde_json::Value::Number(num));
+        }
+    }
+
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    Ok((env, meta))
+}
+
+fn mime_for_filename(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "wav" => "audio/wav".to_string(),
+        "mp3" => "audio/mpeg".to_string(),
+        "ogg" => "audio/ogg".to_string(),
+        "flac" => "audio/flac".to_string(),
+        "webm" => "audio/webm".to_string(),
+        "m4a" | "mp4" => "audio/mp4".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+/// Stage 3d-0b-4: konwertuje FlowExecutionOutcome na TranscriptionResponse.
+/// STT flow output to FlowValue::Text (transcript). Brak segments/duration
+/// w synthetic flow — admin który chce verbose response konfiguruje
+/// user-defined flow.
+pub(crate) fn flow_outcome_to_stt_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) -> Result<TranscriptionResponse, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    let text = match outcome.final_envelope.payload {
+        FlowValue::Text(t) => t,
+        FlowValue::Empty => String::new(),
+        other => {
+            return Err(ExecutorError::Internal(format!(
+                "stt flow returned non-Text payload kind: {}",
+                other.kind()
+            )));
+        }
+    };
+    Ok(TranscriptionResponse {
+        text,
+        task: None,
+        language: None,
+        duration: None,
+        segments: None,
+        speakers: None,
+    })
+}
+
 /// Etap 3a: extract token usage z `ModelMetrics.detailed` gdy backend dostarczył
 /// `DetailedMetrics::Completion`. Inny wariant (np. Embeddings dla embeddings
 /// stream'a) lub brak `final_metrics` zwraca `None` — chunk wtedy bez `usage`,
