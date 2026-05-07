@@ -222,9 +222,15 @@ pub struct CachedFlow {
     pub compiled: Arc<CompiledFlow>,
 }
 
+/// Domyślny limit slotu synthetic w `FlowCache`. Każdy unikalny model w
+/// produkcji generuje wpis `__synthetic__:<kind>:<model>` — bez capu pamięć
+/// rosłaby liniowo z liczbą modelu × kindów (chat/stream/tts/stt/embeddings).
+pub const DEFAULT_SYNTHETIC_CACHE_SIZE: usize = 256;
+
 pub struct FlowCache {
     entries: RwLock<HashMap<String, CacheEntry>>,
     ttl: Duration,
+    synthetic: RwLock<SyntheticSlot>,
 }
 
 struct CacheEntry {
@@ -232,11 +238,79 @@ struct CacheEntry {
     inserted_at: Instant,
 }
 
+/// LRU-bounded slot dla synthetic ad-hoc flows zbudowanych w runtime przez
+/// `FlowDispatcher` gdy resolver nie ma user-defined flow dla modelu. Klucze
+/// mają format `<kind>:<model>` (kind ∈ chat/chat_stream/tts/stt/embeddings).
+struct SyntheticSlot {
+    entries: HashMap<String, Arc<CompiledFlow>>,
+    /// Kolejność dostępu: front = najstarszy (next-to-evict), back = najnowszy.
+    /// Każdy `set`/`get` przesuwa klucz na koniec.
+    lru_order: VecDeque<String>,
+    max_size: usize,
+}
+
+impl SyntheticSlot {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_size.min(64)),
+            lru_order: VecDeque::with_capacity(max_size.min(64)),
+            max_size,
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
+            self.lru_order.remove(pos);
+        }
+        self.lru_order.push_back(key.to_string());
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<CompiledFlow>> {
+        let val = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(val)
+    }
+
+    fn set(&mut self, key: String, flow: Arc<CompiledFlow>) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), flow);
+            self.touch(&key);
+            return;
+        }
+        while self.entries.len() >= self.max_size {
+            match self.lru_order.pop_front() {
+                Some(oldest) => {
+                    self.entries.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.entries.insert(key.clone(), flow);
+        self.lru_order.push_back(key);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru_order.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 impl FlowCache {
     pub fn new(ttl_secs: u64) -> Self {
+        Self::with_synthetic_capacity(ttl_secs, DEFAULT_SYNTHETIC_CACHE_SIZE)
+    }
+
+    pub fn with_synthetic_capacity(ttl_secs: u64, synthetic_max: usize) -> Self {
+        let cap = synthetic_max.max(1);
         Self {
             entries: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(ttl_secs),
+            synthetic: RwLock::new(SyntheticSlot::new(cap)),
         }
     }
 
@@ -271,6 +345,30 @@ impl FlowCache {
         if let Ok(mut entries) = self.entries.write() {
             entries.clear();
         }
+        if let Ok(mut synth) = self.synthetic.write() {
+            synth.clear();
+        }
+    }
+
+    /// Pobiera synthetic flow dla pary `<kind>:<model>`. Hit przesuwa klucz na
+    /// koniec LRU. Brak TTL — synthetic flowy nie mają „świeżości” jak user
+    /// flows; ich invalidacja idzie wyłącznie przez `invalidate_all`.
+    pub fn synthetic_get(&self, key: &str) -> Option<Arc<CompiledFlow>> {
+        self.synthetic.write().ok()?.get(key)
+    }
+
+    /// Zapisuje synthetic flow. Gdy slot przekracza `max_size`, ewicowany jest
+    /// najstarszy entry (LRU). Powtarzalny zapis pod ten sam klucz odświeża
+    /// pozycję LRU.
+    pub fn synthetic_set(&self, key: &str, flow: Arc<CompiledFlow>) {
+        if let Ok(mut synth) = self.synthetic.write() {
+            synth.set(key.to_string(), flow);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn synthetic_len(&self) -> usize {
+        self.synthetic.read().map(|s| s.len()).unwrap_or(0)
     }
 }
 
@@ -360,5 +458,75 @@ mod tests {
         assert!(neg.is_none());
         cache.invalidate("k");
         assert!(cache.get("k").is_none());
+    }
+
+    fn synthetic_compiled() -> Arc<CompiledFlow> {
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","position":{"x":0,"y":0}},
+                {"id":"l","type":"llm","position":{"x":1,"y":0}},
+                {"id":"o","type":"output","position":{"x":2,"y":0}}
+            ],
+            "edges":[
+                {"from":"t","to":"l"},
+                {"from":"l","to":"o"}
+            ]
+        }"#;
+        Arc::new(
+            CompiledFlow::from_json(
+                42,
+                json,
+                &registry(),
+                crate::flow_engine::validation::ValidationSource::Synthetic,
+            )
+            .expect("compile"),
+        )
+    }
+
+    #[test]
+    fn synthetic_slot_roundtrip() {
+        let cache = FlowCache::new(60);
+        assert!(cache.synthetic_get("chat:foo").is_none());
+        cache.synthetic_set("chat:foo", synthetic_compiled());
+        assert!(cache.synthetic_get("chat:foo").is_some());
+        assert_eq!(cache.synthetic_len(), 1);
+    }
+
+    #[test]
+    fn synthetic_slot_evicts_lru_when_over_cap() {
+        let cache = FlowCache::with_synthetic_capacity(60, 3);
+        cache.synthetic_set("a", synthetic_compiled());
+        cache.synthetic_set("b", synthetic_compiled());
+        cache.synthetic_set("c", synthetic_compiled());
+        assert_eq!(cache.synthetic_len(), 3);
+
+        // touch "a" żeby został (najnowszy access);
+        // "b" jest teraz najstarszy.
+        let _ = cache.synthetic_get("a");
+
+        cache.synthetic_set("d", synthetic_compiled());
+        assert_eq!(cache.synthetic_len(), 3);
+        assert!(cache.synthetic_get("a").is_some(), "a powinien zostać (touch)");
+        assert!(cache.synthetic_get("b").is_none(), "b powinien być evicted (LRU)");
+        assert!(cache.synthetic_get("c").is_some());
+        assert!(cache.synthetic_get("d").is_some());
+    }
+
+    #[test]
+    fn synthetic_slot_overwrite_preserves_cap() {
+        let cache = FlowCache::with_synthetic_capacity(60, 2);
+        cache.synthetic_set("k1", synthetic_compiled());
+        cache.synthetic_set("k1", synthetic_compiled());
+        cache.synthetic_set("k1", synthetic_compiled());
+        assert_eq!(cache.synthetic_len(), 1);
+    }
+
+    #[test]
+    fn invalidate_all_clears_synthetic_too() {
+        let cache = FlowCache::new(60);
+        cache.synthetic_set("k", synthetic_compiled());
+        assert_eq!(cache.synthetic_len(), 1);
+        cache.invalidate_all();
+        assert_eq!(cache.synthetic_len(), 0);
     }
 }
