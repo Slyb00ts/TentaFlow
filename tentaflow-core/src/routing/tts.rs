@@ -5,7 +5,7 @@
 //       a HTTP endpoint /v1/audio/speech/stream w api/openai/server.rs.
 // =============================================================================
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::routing::router::Router;
 
 use tracing::debug;

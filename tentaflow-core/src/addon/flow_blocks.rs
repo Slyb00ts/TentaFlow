@@ -5,7 +5,6 @@
 // =============================================================================
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

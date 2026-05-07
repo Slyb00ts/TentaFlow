@@ -765,7 +765,7 @@ impl ModelRuntimeExecutor {
             }
             ResolvedExecutionTarget::Flow {
                 flow_id,
-                published_name,
+                published_name: _,
             } => {
                 let dispatcher = self
                     .flow_dispatcher
@@ -1235,7 +1235,7 @@ impl ModelRuntimeExecutor {
             }
             ResolvedExecutionTarget::Flow {
                 flow_id,
-                published_name,
+                published_name: _,
             } => {
                 // Catalog can advertise embedding-surface flows
                 // (`EmbeddingsNodeAdapter` is registered) so this branch must
