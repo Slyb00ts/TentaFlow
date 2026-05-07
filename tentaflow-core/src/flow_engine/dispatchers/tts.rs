@@ -20,6 +20,10 @@ pub struct TtsRequest {
     pub format: Option<String>, // "wav" | "mp3" | "ogg" — engine-specific
     /// ISO-639-1 (np. "en", "pl") — backend wybiera locale syntezy. Etap 2.
     pub language: Option<String>,
+    /// Stage 3d-0b-2-fix: speed multiplier (1.0 = normalna prędkość mowy).
+    /// Backend embedded ignoruje gdy nie wspiera (whisper-cpp skips); HTTP
+    /// backendy przepisują w request body.
+    pub speed: Option<f32>,
     pub user_id: Option<i64>,
     pub user_role: Option<String>,
     /// Etap 3c: cancel signal dla stream_synthesize (klient disconnect).
@@ -35,6 +39,7 @@ impl Default for TtsRequest {
             voice: None,
             format: None,
             language: None,
+            speed: None,
             user_id: None,
             user_role: None,
             cancel_token: CancellationToken::new(),

@@ -65,6 +65,19 @@ impl TtsNodeAdapter {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
+
+    /// Stage 3d-0b-2-fix: helper dla numerycznych pól (np. speed). Akceptuje
+    /// JSON Number (zarówno f64 jak i i64).
+    fn pick_optional_f32(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<f32> {
+        if let Some(n) = node.config.get(key).and_then(|v| v.as_f64()) {
+            return Some(n as f32);
+        }
+        envelope
+            .meta
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .map(|n| n as f32)
+    }
 }
 
 impl Default for TtsNodeAdapter {
@@ -127,6 +140,7 @@ impl NodeAdapter for TtsNodeAdapter {
             voice: Self::pick_optional_str(node, envelope, "voice"),
             format: Self::pick_optional_str(node, envelope, "format"),
             language: Self::pick_optional_str(node, envelope, "language"),
+            speed: Self::pick_optional_f32(node, envelope, "speed"),
             user_id: ctx.user_id,
             user_role: ctx.user_role.clone(),
             cancel_token: ctx.cancel_token.clone(),
