@@ -19,9 +19,10 @@ use tracing::debug;
 ///    explicit binding wygrywa niezależnie od modality.
 /// 2. Default flow for the requested `service_type` — TYLKO gdy `request_modality
 ///    = "text"`. Vision request (`request_modality = "image"`) bez bindingu
-///    falls through do bare passthrough; default flows są zakładowo text-only
-///    bo `vision_llm` node wymaga R8 input_port_type=Image.
-/// 3. None — caller falls back to direct dispatch (`ModelRuntimeExecutor`).
+///    zwraca `None`; default flows są zakładowo text-only bo `vision_llm` node
+///    wymaga R8 input_port_type=Image.
+/// 3. None — `FlowDispatcher` aktywuje synthetic ad-hoc flow (Universal Flow
+///    Gateway, stage 3d). Zero direct executor fallback po stage 3d-0b-final.
 pub fn resolve_flow(
     pool: &DbPool,
     model_name: &str,
