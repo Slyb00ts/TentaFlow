@@ -720,12 +720,26 @@ impl Router {
                         metadata,
                     });
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Stage 3d-0b-final: Ok(None) z try_dispatch_streaming
+                    // = CompileFailed albo unsupported service_type. Brak
+                    // fallback do blocking try_dispatch + executor.stream_chat
+                    // — klient dostaje 500. Po wrapper-as-stream
+                    // (commit 015f54c) blocking-only user flow zwraca
+                    // Ok(Some) z single-chunk stream'em, więc Ok(None)
+                    // tutaj oznacza tylko broken admin config.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!(
+                            "flow_dispatcher returned no streaming result for model '{}' — \
+                             user-defined flow nie kompiluje się albo synthetic builder \
+                             nie wspiera service_type='chat'",
+                            request.model
+                        ),
+                        source: None,
+                    }
+                    .into());
+                }
                 Err(e) => {
-                    // Stage 3d round 10 fail-closed: dispatcher Err = ACL
-                    // deny / runtime / timeout. Brak fallback do blocking
-                    // try_dispatch albo legacy executor — klient dostaje
-                    // 500 zamiast cichego bypass.
                     return Err(crate::error::CoreError::InternalError {
                         message: format!("flow streaming dispatch: {}", e),
                         source: None,
@@ -733,172 +747,20 @@ impl Router {
                     .into());
                 }
             }
-
-            let (initial, meta) =
-                crate::routing::build_initial_envelope_for_user(
-                    &request,
-                    user.clone(),
-                    &blobs,
-                )
-                .await?;
-            match dispatcher
-                .try_dispatch(&request.model, "chat", initial, meta)
-                .await
-            {
-                Ok(Some(outcome)) => {
-                    let response = flow_outcome_to_chat_response(outcome, &request.model);
-                    let raw_text = response
-                        .choices
-                        .first()
-                        .and_then(|c| c.message.content.as_ref())
-                        .map(|c| match c {
-                            MessageContent::Text(t) => t.clone(),
-                            MessageContent::Parts(_) => String::new(),
-                        })
-                        .unwrap_or_default();
-                    // Codex H1 round 2: PII filter na single-chunk
-                    // (blocking flow → wrapped in stream::once). Aplikujemy
-                    // pelne `clean_text` (non-streaming) bo mamy caly text
-                    // od razu — StreamingProcessor jest dla token-by-token.
-                    let text = self
-                        .response_middleware
-                        .clean_text(&raw_text)
-                        .unwrap_or(raw_text);
-
-                    let chunk = ChatCompletionChunk {
-                        id: response.id,
-                        object: "chat.completion.chunk".to_string(),
-                        created: response.created,
-                        model: response.model,
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: Delta {
-                                role: Some("assistant".to_string()),
-                                content: Some(text),
-                                tool_calls: None,
-                                reasoning_content: None,
-                            },
-                            finish_reason: Some("stop".to_string()),
-                            logprobs: None,
-                        }],
-                        system_fingerprint: None,
-                        audio: None,
-                        detected_intent: None,
-                        detected_tools: None,
-                        transcribed_text: None,
-                        speaker_id: None,
-                        speaker_name: None,
-                    usage: None,
-                    };
-
-                    let stream = futures::stream::once(async move { Ok(chunk) });
-                    let metadata = crate::routing::RouteMetadata {
-                        served_by_node: stream_node_name.clone(),
-                        backend_type: "flow_engine".to_string(),
-                        strategy_used: "direct".to_string(),
-                        fallbacks_tried: 0,
-                        hop_count: 0,
-                        latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
-                    usage: None,
-                    finish_reason: None,
-                    };
-                    return Ok(crate::routing::RouteResult {
-                        response: Box::pin(stream),
-                        metadata,
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    // Stage 3d round 10 fail-closed: dispatcher Err
-                    // (ACL deny / runtime / timeout) = 500, brak fallback.
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("flow stream dispatch: {}", e),
-                        source: None,
-                    }
-                    .into());
-                }
-            }
         }
 
-        let mut metrics = RequestMetrics::new();
-        let route = self.resolve_route(&request.model);
-        let model_name = route
-            .targets
-            .first()
-            .cloned()
-            .unwrap_or_else(|| request.model.clone());
-        metrics.model_name = Some(model_name.clone());
-
-        debug!("Routing streaming request dla modelu: {}", model_name);
-
-        // R2d (D.7): chat streaming NIE robi ukrytego STT. Po
-        // `target_accepts_audio` guard wyzej, audio_input dociera albo do
-        // audio-capable backendu w surowej formie albo request zostaje
-        // odrzucony (`audio_input_unsupported`). Speaker info i transkrypcja
-        // odbywaja sie jawnie przez /v1/audio/transcriptions albo flow z STT
-        // node — nie chowamy ich w strumieniu chat completion.
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Plan v1.5 wymaga że KAŻDY chat streaming request przechodzi przez
+        // flow_engine (synthetic streaming albo user-defined flow). Direct
+        // executor.stream_chat fallback wycięty — Universal Flow Gateway
+        // jest jedyną ścieżką dispatch.
         let _ = target_accepts_audio;
-
-        // R3a stream: spróbuj jednolity dispatch przez ModelRuntimeExecutor.
-        // MeshForward + Flow streaming sa deferred do follow-up — wracamy
-        // tam do legacy per-target loop ponizej. HTTP streaming z PII
-        // middleware pozostaje na ostatecznej sciezce ponizej (executor
-        // MVP nie aplikuje response middleware na chunkach).
-        let executor_snapshot = self.executor.read().clone();
-        if let Some(executor) = executor_snapshot {
-            use crate::services::runtime::context::ExecutionContext;
-            
-            let mut exec_ctx = ExecutionContext {
-                user: user.clone(),
-                ..ExecutionContext::default()
-            };
-            match executor.stream_chat(request.clone(), &mut exec_ctx).await {
-                Ok(stream) => {
-                    // Etap 3a: split usage off finish chunk per
-                    // `stream_options.include_usage`. Executor stempluje
-                    // `chunk.usage = Some(metrics)` na finish chunk gdy
-                    // backend zaraportował tokeny; routing layer decyduje
-                    // jak to wykorzystać (strip back-compat lub split na tail).
-                    let include_usage = request
-                        .stream_options
-                        .as_ref()
-                        .map(|so| so.include_usage)
-                        .unwrap_or(false);
-                    let usage_aware = apply_include_usage_split(stream, include_usage);
-                    // Codex H2 + H3 round 2: PII filter + EOF flush — wspolny
-                    // helper dla executor + flow streaming paths.
-                    let filtered = wrap_with_pii_streaming(
-                        usage_aware,
-                        self.response_middleware.clone(),
-                    );
-                    let metadata = crate::routing::RouteMetadata {
-                        served_by_node: exec_ctx
-                            .route_metadata
-                            .served_by_node
-                            .unwrap_or_else(|| stream_node_name.clone()),
-                        backend_type: exec_ctx
-                            .route_metadata
-                            .backend_type
-                            .unwrap_or_else(|| "executor_stream".to_string()),
-                        strategy_used: "executor".to_string(),
-                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
-                        hop_count: 0,
-                        latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
-                    usage: None,
-                    finish_reason: None,
-                    };
-                    return Ok(crate::routing::RouteResult {
-                        response: filtered,
-                        metadata,
-                    });
-                }
-                Err(e) => {
-                    return Err(crate::routing::chat::executor_err_to_core(e, &request.model).into());
-                }
-            }
-        }
+        let _ = stream_start;
+        let _ = stream_node_name;
         Err(crate::error::CoreError::InternalError {
-            message: "router executor not wired (Router::new precondition)".to_string(),
+            message: "flow_dispatcher not wired (DB-less router) — chat streaming \
+                      path requires Universal Flow Gateway"
+                .to_string(),
             source: None,
         }
         .into())

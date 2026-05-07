@@ -156,12 +156,26 @@ impl Router {
                     };
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Stage 3d-0b-final: Ok(None) z try_dispatch oznacza
+                    // CompileFailed (user-defined flow z broken flow_json)
+                    // albo unsupported service_type (synthetic builder
+                    // None). W obu przypadkach: brak fallback do executor
+                    // direct — klient dostaje 500. Admin musi naprawić
+                    // flow albo dodać synthetic builder dla nowego
+                    // service_type.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!(
+                            "flow_dispatcher returned no result for model '{}' — \
+                             user-defined flow nie kompiluje się albo synthetic \
+                             builder nie wspiera service_type='chat'",
+                            request.model
+                        ),
+                        source: None,
+                    }
+                    .into());
+                }
                 Err(e) => {
-                    // Stage 3d round 10 fail-closed: dispatcher Err = ACL
-                    // deny / runtime error / timeout. Brak fallback do
-                    // executor direct — admin's decyzja jest finalna,
-                    // klient dostaje 500 zamiast cichego bypass.
                     return Err(crate::error::CoreError::InternalError {
                         message: format!("flow dispatch: {}", e),
                         source: None,
@@ -171,98 +185,17 @@ impl Router {
             }
         }
 
-        // R2d (D.7): chat NIE robi ukrytego STT. Po `target_accepts_audio`
-        // guard wyzej, audio_input dociera albo do audio-capable backendu w
-        // surowej formie albo request zostaje odrzucony (`audio_input_unsupported`).
-        // VoiceInfo stays None — explicit STT lezy pod /v1/audio/transcriptions
-        // albo flow z dedykowanym STT node.
-        let voice_info: Option<VoiceInfo> = None;
-
-        // Single dispatch path — `ModelRuntimeExecutor.execute_chat`.
-        // Resolver + strategy + per-instance modality filter handle
-        // Embedded / HTTP / QUIC / Mesh / Flow targets. Legacy
-        // `BackendHandle` dispatch is gone after R3b.8.
-        let _ = target_accepts_audio;
-        let t2 = std::time::Instant::now();
-        let executor_snapshot = self.executor.read().clone();
-        let route_result = match executor_snapshot {
-            Some(executor) => {
-                use crate::services::runtime::context::ExecutionContext;
-                let mut exec_ctx = ExecutionContext {
-                    user: user.clone(),
-                    ..ExecutionContext::default()
-                };
-                match executor.execute_chat(request.clone(), &mut exec_ctx).await {
-                    Ok(mut response) => {
-                        // Apply PII filter on content/reasoning — the executor
-                        // is middleware-agnostic in MVP, so the caller
-                        // gates here.
-                        self.apply_response_middleware(&mut response)?;
-                        let usage = response.usage.as_ref().map(|u| {
-                            crate::routing::middleware::TokenUsageMetadata {
-                                prompt_tokens: u.prompt_tokens as u64,
-                                completion_tokens: u.completion_tokens as u64,
-                                total_tokens: u.total_tokens as u64,
-                            }
-                        });
-                        let finish_reason = response
-                            .choices
-                            .first()
-                            .and_then(|c| c.finish_reason.clone());
-                        let route_metadata = crate::routing::RouteMetadata {
-                            served_by_node: exec_ctx
-                                .route_metadata
-                                .served_by_node
-                                .unwrap_or_else(|| {
-                                    hostname::get()
-                                        .map(|h| h.to_string_lossy().to_string())
-                                        .unwrap_or_else(|_| "unknown".to_string())
-                                }),
-                            backend_type: exec_ctx
-                                .route_metadata
-                                .backend_type
-                                .unwrap_or_else(|| "executor".to_string()),
-                            strategy_used: "executor".to_string(),
-                            fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
-                            hop_count: 0,
-                            latency_ms: Some(t2.elapsed().as_secs_f64() * 1000.0),
-                            usage,
-                            finish_reason,
-                        };
-                        crate::routing::RouteResult {
-                            response,
-                            metadata: route_metadata,
-                        }
-                    }
-                    Err(e) => return Err(executor_err_to_core(e, &request.model).into()),
-                }
-            }
-            None => {
-                return Err(crate::error::CoreError::InternalError {
-                    message: "router executor not wired (Router::new precondition)".to_string(),
-                    source: None,
-                }
-                .into());
-            }
-        };
-        let mut response = route_result.response;
-        let route_metadata = route_result.metadata;
-        metrics.model_name = Some(route_metadata.backend_type.clone());
-        metrics.llm_inference_ms = Some(t2.elapsed().as_millis() as u64);
-
-        if let Some(info) = voice_info {
-            response.transcribed_text = Some(info.transcribed_text);
-            response.speaker_id = info.speaker_id;
-            response.speaker_name = info.speaker_name;
-            response.speaker_confidence = info.speaker_confidence;
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Plan v1.5 wymaga że KAŻDY chat request przechodzi przez flow_engine
+        // (synthetic albo user-defined). Direct executor.execute_chat fallback
+        // wycięty.
+        Err(crate::error::CoreError::InternalError {
+            message: "flow_dispatcher not wired (DB-less router) — chat path \
+                      requires Universal Flow Gateway"
+                .to_string(),
+            source: None,
         }
-
-        info!("\n{}", metrics.format_table());
-
-        Ok(crate::routing::RouteResult {
-            response,
-            metadata: route_metadata,
-        })
+        .into())
     }
 
     /// Codex H1 + H3 round 2: jedyny single point gdzie aplikujemy
