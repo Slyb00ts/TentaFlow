@@ -806,10 +806,7 @@ impl ModelRuntimeExecutor {
                 ctx.leave_flow();
 
                 let outcome = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
-                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
-                        model: published_name.clone(),
-                    })?;
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
                 Ok(crate::routing::chat::flow_outcome_to_chat_response(
                     outcome,
@@ -1277,10 +1274,7 @@ impl ModelRuntimeExecutor {
                     .await;
                 ctx.leave_flow();
                 let outcome = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
-                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
-                        model: published_name.clone(),
-                    })?;
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                 let expected_count = match &request.input {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
@@ -1564,10 +1558,7 @@ impl ModelRuntimeExecutor {
                     dispatcher.dispatch_by_flow_id(*flow_id, initial, meta).await;
                 ctx.leave_flow();
                 let outcome = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?
-                    .ok_or_else(|| ExecutorError::FlowEmptyResult {
-                        model: request.model.clone(),
-                    })?;
+                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                 flow_outcome_to_tts_result(outcome, dispatcher.blobs()).await
             }
         }

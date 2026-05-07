@@ -76,7 +76,7 @@ impl Router {
                 .try_dispatch(&request.model, "embeddings", initial, meta)
                 .await
             {
-                Ok(Some(outcome)) => {
+                Ok(outcome) => {
                     let expected_count = match &request.input {
                         crate::api::openai::types::EmbeddingInput::Single(_) => 1,
                         crate::api::openai::types::EmbeddingInput::Multiple(texts) => texts.len(),
@@ -105,26 +105,8 @@ impl Router {
                     };
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
-                Ok(None) => {
-                    // Stage 3d-0b-final: Ok(None) = CompileFailed albo
-                    // unsupported service_type. Brak fallback do executor.
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!(
-                            "flow_dispatcher returned no result for embeddings model '{}' — \
-                             user-defined flow nie kompiluje się albo synthetic builder \
-                             nie wspiera service_type='embeddings'",
-                            request.model
-                        ),
-                        source: None,
-                    }
-                    .into());
-                }
                 Err(e) => {
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("embeddings flow dispatch: {e}"),
-                        source: None,
-                    }
-                    .into());
+                    return Err(crate::routing::dispatch_error_to_core(e, &request.model).into());
                 }
             }
         }
