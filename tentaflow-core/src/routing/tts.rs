@@ -99,7 +99,7 @@ impl Router {
                 user.clone(),
             );
             match dispatcher.try_dispatch(&cleaned_request.model, "tts", initial, meta).await {
-                Ok(Some(outcome)) => {
+                Ok(outcome) => {
                     let result = crate::services::runtime::executor::flow_outcome_to_tts_result(
                         outcome,
                         dispatcher.blobs(),
@@ -139,29 +139,9 @@ impl Router {
                         metadata,
                     });
                 }
-                Ok(None) => {
-                    // Stage 3d-0b-final: Ok(None) = CompileFailed albo
-                    // unsupported service_type. Brak fallback do executor —
-                    // klient dostaje 500. Admin musi naprawić flow_json
-                    // albo sprawdzić synthetic builder.
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!(
-                            "flow_dispatcher returned no result for tts model '{}' — \
-                             user-defined flow nie kompiluje się albo synthetic builder \
-                             nie wspiera service_type='tts'",
-                            cleaned_request.model
-                        ),
-                        source: None,
-                    }
-                    .into());
-                }
                 Err(e) => {
                     self.log_tts_dispatch_diagnostics(&tts_model);
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("tts flow dispatch: {e}"),
-                        source: None,
-                    }
-                    .into());
+                    return Err(crate::routing::dispatch_error_to_core(e, &tts_model).into());
                 }
             }
         }

@@ -58,7 +58,7 @@ impl Router {
                         .try_dispatch(&request.model, "stt", initial, meta)
                         .await
                     {
-                        Ok(Some(outcome)) => {
+                        Ok(outcome) => {
                             let response =
                                 crate::services::runtime::executor::flow_outcome_to_stt_response(
                                     outcome,
@@ -83,27 +83,10 @@ impl Router {
                                 },
                             });
                         }
-                        Ok(None) => {
-                            // Stage 3d-0b-final: Ok(None) = CompileFailed albo
-                            // unsupported service_type. Brak fallback do
-                            // executor — klient dostaje 500.
-                            return Err(crate::error::CoreError::InternalError {
-                                message: format!(
-                                    "flow_dispatcher returned no result for stt model '{}' — \
-                                     user-defined flow nie kompiluje się albo synthetic builder \
-                                     nie wspiera service_type='stt'",
-                                    request.model
-                                ),
-                                source: None,
-                            }
-                            .into());
-                        }
                         Err(e) => {
-                            return Err(crate::error::CoreError::InternalError {
-                                message: format!("stt flow dispatch: {e}"),
-                                source: None,
-                            }
-                            .into());
+                            return Err(
+                                crate::routing::dispatch_error_to_core(e, &request.model).into(),
+                            );
                         }
                     }
                 }

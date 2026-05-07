@@ -125,10 +125,7 @@ impl Router {
                 .try_dispatch(&request.model, "chat", initial, meta)
                 .await
             {
-                Ok(Some(outcome)) => {
-                    // Etap 2: pull usage/finish_reason from outcome BEFORE
-                    // converting to ChatCompletionResponse (response only
-                    // carries them as Option<Usage> + choices.finish_reason).
+                Ok(outcome) => {
                     let usage = crate::routing::middleware::TokenUsageMetadata {
                         prompt_tokens: outcome.usage.prompt_tokens,
                         completion_tokens: outcome.usage.completion_tokens,
@@ -139,9 +136,6 @@ impl Router {
                         .as_openai_str()
                         .map(|s| s.to_string());
                     let mut response = flow_outcome_to_chat_response(outcome, &request.model);
-                    // Codex H1 round 2: flow path tez musi przejsc przez
-                    // response_middleware — wczesniej tylko direct executor
-                    // sciezka aplikowala clean_text, flow zwracal bezposrednio.
                     self.apply_response_middleware(&mut response)?;
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
@@ -157,31 +151,10 @@ impl Router {
                     };
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
-                Ok(None) => {
-                    // Stage 3d-0b-final: Ok(None) z try_dispatch oznacza
-                    // CompileFailed (user-defined flow z broken flow_json)
-                    // albo unsupported service_type (synthetic builder
-                    // None). W obu przypadkach: brak fallback do executor
-                    // direct — klient dostaje 500. Admin musi naprawić
-                    // flow albo dodać synthetic builder dla nowego
-                    // service_type.
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!(
-                            "flow_dispatcher returned no result for model '{}' — \
-                             user-defined flow nie kompiluje się albo synthetic \
-                             builder nie wspiera service_type='chat'",
-                            request.model
-                        ),
-                        source: None,
-                    }
-                    .into());
-                }
                 Err(e) => {
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("flow dispatch: {}", e),
-                        source: None,
-                    }
-                    .into());
+                    // Stage 3d-0b-final: typed DispatchError → CoreError.
+                    // Denied → 404, pozostałe → 500.
+                    return Err(crate::routing::dispatch_error_to_core(e, &request.model).into());
                 }
             }
         }

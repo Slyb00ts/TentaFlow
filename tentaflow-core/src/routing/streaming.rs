@@ -681,7 +681,7 @@ impl Router {
                 .try_dispatch_streaming(&request.model, "chat", initial_stream, meta_stream)
                 .await
             {
-                Ok(Some(stream_exec)) => {
+                Ok(stream_exec) => {
                     let model_for_stream = request.model.clone();
                     let include_usage = request
                         .stream_options
@@ -723,31 +723,8 @@ impl Router {
                         metadata,
                     });
                 }
-                Ok(None) => {
-                    // Stage 3d-0b-final: Ok(None) z try_dispatch_streaming
-                    // = CompileFailed albo unsupported service_type. Brak
-                    // fallback do blocking try_dispatch + executor.stream_chat
-                    // — klient dostaje 500. Po wrapper-as-stream
-                    // (commit 015f54c) blocking-only user flow zwraca
-                    // Ok(Some) z single-chunk stream'em, więc Ok(None)
-                    // tutaj oznacza tylko broken admin config.
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!(
-                            "flow_dispatcher returned no streaming result for model '{}' — \
-                             user-defined flow nie kompiluje się albo synthetic builder \
-                             nie wspiera service_type='chat'",
-                            request.model
-                        ),
-                        source: None,
-                    }
-                    .into());
-                }
                 Err(e) => {
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("flow streaming dispatch: {}", e),
-                        source: None,
-                    }
-                    .into());
+                    return Err(crate::routing::dispatch_error_to_core(e, &request.model).into());
                 }
             }
         }
