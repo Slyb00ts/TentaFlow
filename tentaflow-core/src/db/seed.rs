@@ -851,7 +851,11 @@ mod tests {
         for (name, json) in &flow_jsons {
             let parsed: FlowDefinition = serde_json::from_str(json)
                 .unwrap_or_else(|e| panic!("flow '{}': nie parsuje: {}", name, e));
-            validate(&parsed, &registry)
+            validate(
+                &parsed,
+                &registry,
+                crate::flow_engine::validation::ValidationSource::UserDefined,
+            )
                 .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
         }
     }

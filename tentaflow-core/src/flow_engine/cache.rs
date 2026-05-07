@@ -60,16 +60,18 @@ impl CompiledFlow {
         flow_id: i64,
         flow_json: &str,
         registry: &AdapterRegistry,
+        source: crate::flow_engine::validation::ValidationSource,
     ) -> Result<Self, CompileError> {
         let definition: FlowDefinition = serde_json::from_str(flow_json)
             .map_err(|e| CompileError::Json(e.to_string()))?;
-        Self::compile(flow_id, definition, registry)
+        Self::compile(flow_id, definition, registry, source)
     }
 
     pub fn compile(
         flow_id: i64,
         definition: FlowDefinition,
         registry: &AdapterRegistry,
+        source: crate::flow_engine::validation::ValidationSource,
     ) -> Result<Self, CompileError> {
         if definition.nodes.is_empty() {
             return Err(CompileError::Empty);
@@ -86,7 +88,7 @@ impl CompiledFlow {
                 actual: definition.edges.len(),
             });
         }
-        validate(&definition, registry)?;
+        validate(&definition, registry, source)?;
 
         let order_ids = topological_sort(&definition)?;
         let node_idx_in_def: HashMap<&str, usize> = definition
@@ -298,7 +300,7 @@ mod tests {
             ],
             "edges": [{"from":"t","to":"o"}]
         }"#;
-        let cf = CompiledFlow::from_json(1, json, &registry()).unwrap();
+        let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
         assert_eq!(cf.execution_order.len(), 2);
         assert!(!cf.is_streaming);
         assert_eq!(cf.trigger_run_idx(), Some(0));
@@ -317,7 +319,7 @@ mod tests {
                 {"from":"l","to":"o","from_port":"stream"}
             ]
         }"#;
-        let cf = CompiledFlow::from_json(1, json, &registry()).unwrap();
+        let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
         assert!(cf.is_streaming);
         assert_eq!(cf.streaming_llm_run_idx(), Some(1));
     }
@@ -338,14 +340,14 @@ mod tests {
                 {"from":"b","to":"a","from_port":"true"}
             ]
         }"#;
-        let err = CompiledFlow::from_json(1, json, &registry()).unwrap_err();
+        let err = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, CompileError::Cycle { .. }));
     }
 
     #[test]
     fn compile_rejects_empty_flow() {
         let json = r#"{"nodes":[],"edges":[]}"#;
-        let err = CompiledFlow::from_json(1, json, &registry()).unwrap_err();
+        let err = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, CompileError::Empty));
     }
 

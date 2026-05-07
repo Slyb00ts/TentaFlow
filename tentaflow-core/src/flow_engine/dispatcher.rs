@@ -245,7 +245,7 @@ impl FlowDispatcher {
         if !self.acl_allow(flow_id, &meta) {
             return Ok(None);
         }
-        let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry) {
+        let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry, crate::flow_engine::validation::ValidationSource::UserDefined) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 warn!(flow_id, "compile failed: {e}");
@@ -352,7 +352,7 @@ impl FlowDispatcher {
         .await??;
         match resolved {
             Some(flow) => {
-                let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry) {
+                let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry, crate::flow_engine::validation::ValidationSource::UserDefined) {
                     Ok(c) => Arc::new(c),
                     Err(e) => {
                         warn!(
