@@ -227,48 +227,4 @@ impl Router {
 
 }
 
-/// Map executor errors onto typed `CoreError` variants. Mirror of
-/// `executor_err_to_core` from routing/embeddings.rs but with the
-/// `CapabilityUnsupported` variant routed to `InvalidRequest` (Codex
-/// R3b.4 L1) — a model that has no audio-output candidate is a client
-/// misconfiguration, not an internal failure.
-fn map_tts_executor_err(
-    err: crate::services::runtime::executor::ExecutorError,
-    model: &str,
-) -> CoreError {
-    use crate::services::runtime::executor::ExecutorError;
-    use crate::services::runtime::resolver::ResolveError;
-    match err {
-        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
-            CoreError::ModelNotFound { model_name: m }
-        }
-        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
-            CoreError::InvalidRequest {
-                message: format!(
-                    "TTS model '{}' has no candidate that emits audio output",
-                    requested
-                ),
-                details: None,
-            }
-        }
-        ExecutorError::Resolve(other) => CoreError::InternalError {
-            message: format!("TTS alias resolution: {}", other),
-            source: None,
-        },
-        ExecutorError::AllCandidatesFailed { .. } => CoreError::AllBackendsUnavailable {
-            model_name: model.to_string(),
-        },
-        ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
-            model_name: model.to_string(),
-        },
-        ExecutorError::FlowDispatcherUnavailable
-        | ExecutorError::FlowEmptyResult { .. }
-        | ExecutorError::Internal(_)
-        | ExecutorError::SttRuntimeUnavailable
-        | ExecutorError::SttBackend(_) => CoreError::InternalError {
-            message: format!("executor.execute_tts: {}", err),
-            source: None,
-        },
-    }
-}
 
