@@ -164,12 +164,53 @@ pub trait LlmAdapter: NodeAdapter {
     ) -> super::dispatchers::LlmRequest;
 }
 
-/// Registry z typed accessorem dla LLM (plan v4.1 — bez downcastu). Dodatkowe
-/// typed pola dochodzą jeśli executor będzie potrzebował kolejnych concrete
-/// metod (dziś tylko llm).
+/// Stage 3d Krok 2: streaming-aware adapter dla nodów które konsumują
+/// upstream `EnvelopeDelta` stream i produkują downstream stream.
+/// Używane do chain budowy w `executor::execute_streaming`:
+/// `LLM → pii_filter (StreamingNodeAdapter) → tts_stream_bridge
+/// (StreamingNodeAdapter) → output(stream)`.
+///
+/// Adapter implementujący ten trait MUSI też implementować `NodeAdapter`
+/// (blocking ścieżka) — `register_streaming<T>` rejestruje go w obu slotach
+/// rejestru.
+#[async_trait]
+pub trait StreamingNodeAdapter: NodeAdapter {
+    /// Konsumuje upstream envelope stream, produkuje downstream envelope
+    /// stream. `seed_envelope` to ostatni FlowEnvelope przed stream chain'em
+    /// (zazwyczaj producer LLM blocking output) — pozwala adapterowi zasiać
+    /// stan z payload + meta przed pierwszym chunkiem.
+    async fn process_stream(
+        &self,
+        node: &FlowNode,
+        upstream: futures::stream::BoxStream<
+            'static,
+            anyhow::Result<crate::flow_engine::envelope::EnvelopeDelta>,
+        >,
+        seed_envelope: std::sync::Arc<crate::flow_engine::envelope::FlowEnvelope>,
+        ctx: &ExecutionContext,
+    ) -> anyhow::Result<
+        futures::stream::BoxStream<
+            'static,
+            anyhow::Result<crate::flow_engine::envelope::EnvelopeDelta>,
+        >,
+    >;
+
+    /// Typ delty który adapter konsumuje (np. `Llm` dla pii_filter). R8
+    /// chain compatibility: producer.stream_output_kind == consumer.stream_input_kind.
+    fn stream_input_kind(&self) -> crate::flow_engine::envelope::EnvelopeDeltaKind;
+
+    /// Typ delty który adapter emituje. `pii_filter` Llm→Llm; `tts_stream_bridge`
+    /// Llm→Audio; future STT bridges Audio→Text.
+    fn stream_output_kind(&self) -> crate::flow_engine::envelope::EnvelopeDeltaKind;
+}
+
+/// Registry z typed accessorem dla LLM (plan v4.1 — bez downcastu) + streaming
+/// slot (Krok 2). Adaptery dual-trait (NodeAdapter + StreamingNodeAdapter)
+/// rejestrują się przez `register_streaming` w obu slotach.
 pub struct AdapterRegistry {
     adapters: HashMap<String, Arc<dyn NodeAdapter>>,
     llm: Option<Arc<dyn LlmAdapter>>,
+    streaming_adapters: HashMap<String, Arc<dyn StreamingNodeAdapter>>,
 }
 
 impl AdapterRegistry {
@@ -177,6 +218,7 @@ impl AdapterRegistry {
         Self {
             adapters: HashMap::new(),
             llm: None,
+            streaming_adapters: HashMap::new(),
         }
     }
 
@@ -215,6 +257,27 @@ impl AdapterRegistry {
 
     pub fn registered_types(&self) -> Vec<&str> {
         self.adapters.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Stage 3d Krok 2: rejestracja adaptera implementującego `NodeAdapter` +
+    /// `StreamingNodeAdapter`. Generic bound + osobna koercja per slot —
+    /// trait-object upcasting nie wymagany.
+    pub fn register_streaming<T>(&mut self, adapter: Arc<T>)
+    where
+        T: NodeAdapter + StreamingNodeAdapter + 'static,
+    {
+        let key = adapter.node_type().to_string();
+        let blocking: Arc<dyn NodeAdapter> = adapter.clone();
+        let streaming: Arc<dyn StreamingNodeAdapter> = adapter;
+        self.adapters.insert(key.clone(), blocking);
+        self.streaming_adapters.insert(key, streaming);
+    }
+
+    /// Streaming-aware accessor — zwraca `Some` gdy node_type ma rejestrację
+    /// `StreamingNodeAdapter`. Executor stream chain woła to żeby zbudować
+    /// fold pipeline; brak rejestracji oznacza że node nie obsługuje stream.
+    pub fn streaming_adapter(&self, node_type: &str) -> Option<&Arc<dyn StreamingNodeAdapter>> {
+        self.streaming_adapters.get(node_type)
     }
 }
 
