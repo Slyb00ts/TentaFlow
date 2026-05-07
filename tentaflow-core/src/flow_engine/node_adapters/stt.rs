@@ -279,6 +279,61 @@ mod tests {
         assert!(out.artifacts.contains_key("source_audio"));
     }
 
+    /// Stage 3d-0b-4-fix: verbose STT round-trip — fake dispatcher zwraca
+    /// segments_json + duration, adapter rozpakowuje do envelope.meta jako
+    /// JSON value (nie string). Czytelny przez flow_outcome_to_stt_response.
+    struct FakeVerboseStt;
+
+    #[async_trait]
+    impl SttDispatcher for FakeVerboseStt {
+        async fn transcribe(&self, req: SttRequest) -> Result<SttResponse> {
+            assert_eq!(req.audio.id, "blob1");
+            assert_eq!(req.prompt.as_deref(), Some("Pan Kowalski"));
+            assert_eq!(req.temperature, Some(0.2));
+            assert_eq!(req.response_format.as_deref(), Some("verbose_json"));
+            Ok(SttResponse {
+                text: "Cześć!".into(),
+                detected_language: Some("pl".into()),
+                duration: Some(1.25),
+                segments_json: Some(
+                    r#"[{"id":0,"start":0.0,"end":1.25,"text":"Cześć!"}]"#.into(),
+                ),
+                speakers_json: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn verbose_segments_propagated_to_envelope_meta() {
+        let mut ctx = stub_ctx();
+        ctx.stt = Arc::new(FakeVerboseStt);
+        let mut env = audio_envelope();
+        env.meta.insert("prompt".into(), json!("Pan Kowalski"));
+        env.meta.insert("temperature".into(), json!(0.2));
+        env.meta.insert("response_format".into(), json!("verbose_json"));
+
+        let out = SttNodeAdapter::new()
+            .execute(
+                &node(json!({"model": "whisper"})),
+                &[input(env)],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.meta.get("duration").and_then(|v| v.as_f64()),
+            Some(1.25)
+        );
+        let segments = out
+            .meta
+            .get("segments")
+            .and_then(|v| v.as_array())
+            .expect("segments array");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].get("text").and_then(|v| v.as_str()), Some("Cześć!"));
+    }
+
     #[tokio::test]
     async fn rejects_non_audio_payload() {
         let mut env = FlowEnvelope::empty();

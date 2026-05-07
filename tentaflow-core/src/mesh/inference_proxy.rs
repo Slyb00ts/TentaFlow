@@ -187,6 +187,11 @@ pub async fn dispatch_reverse_request(
                         hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
                         ..crate::services::runtime::context::ExecutionContext::default()
                     };
+                    // EXEMPT-MESH-INBOUND (stage 3d v1.5): mesh reverse chat —
+                    // peer forwarduje request, my wykonujemy direct executor
+                    // żeby zachować ultra-low latency LAN budżet. Flow żyje
+                    // po stronie inicjatora (Node A), peer = remote backend
+                    // call. Plan v1.5 single dozwolony wyjątek.
                     let chat_response = match executor
                         .execute_chat(chat_request, &mut exec_ctx)
                         .await

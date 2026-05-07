@@ -274,6 +274,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speed_propagated_from_envelope_meta() {
+        // Stage 3d-0b-2-fix: speed seedowane z requestu do envelope.meta
+        // (przez tts_request_to_initial_envelope) → adapter czyta z meta.
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("hello".into());
+        env.meta.insert("speed".into(), json!(1.5));
+        let mut ctx = stub_ctx();
+        let fake = Arc::new(FakeTts { last: Mutex::new(None) });
+        ctx.tts = fake.clone();
+
+        TtsNodeAdapter::new()
+            .execute(&node(json!({"model": "m"})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+
+        let last = fake.last.lock().unwrap();
+        assert_eq!(last.as_ref().unwrap().speed, Some(1.5));
+    }
+
+    #[tokio::test]
     async fn rejects_non_text_payload() {
         let mut env = FlowEnvelope::empty();
         env.payload = FlowValue::Empty;

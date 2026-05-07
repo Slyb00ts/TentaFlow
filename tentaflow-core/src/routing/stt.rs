@@ -298,11 +298,15 @@ impl Router {
                     options: crate::api::openai::types::SttRequestOptions::default(),
                 };
 
-                // Codex R3b.5+6 M3: protocol-native STT goes through the
-                // same executor entry point as `/v1/audio/transcriptions`
-                // so the resolver / SttRuntime contract is uniform across
-                // mesh reverse and HTTP. `route_audio_transcription` is
-                // still hit as fallback for DB-less / executor-not-ready.
+                // EXEMPT-MESH-INBOUND (stage 3d v1.5): protocol-native STT
+                // dociera tu z `route_audio_via_protocol` — mesh peer
+                // forwarduje AudioOperation rkyv przez QUIC. Plan v1.5:
+                // mesh inbound = remote backend call (analogiczny do
+                // HTTP/QUIC service), flow żyje po stronie inicjatora,
+                // peer wykonuje direct executor żeby zachować ultra-low
+                // latency LAN budżet (1-5ms baseline). Direct executor
+                // zostaje świadomie — to jedyny dozwolony wyjątek od
+                // "wszystko przez flow_engine" w repo.
                 let executor_snapshot = self.executor.read().clone();
                 let stt_dispatch = match executor_snapshot {
                     Some(executor) => {
