@@ -191,7 +191,10 @@ pub async fn dispatch_reverse_request(
                     // peer forwarduje request, my wykonujemy direct executor
                     // żeby zachować ultra-low latency LAN budżet. Flow żyje
                     // po stronie inicjatora (Node A), peer = remote backend
-                    // call. Plan v1.5 single dozwolony wyjątek.
+                    // call. Plan v1.5: jeden z 3 dozwolonych wyjątków
+                    // (chat tutaj + STT routing/stt.rs:301 + embeddings
+                    // routing/embeddings.rs:222), wszystkie wywoływane
+                    // wyłącznie z mesh reverse path.
                     let chat_response = match executor
                         .execute_chat(chat_request, &mut exec_ctx)
                         .await
