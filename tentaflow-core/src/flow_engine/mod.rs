@@ -17,5 +17,6 @@ pub mod executor;
 pub mod node_adapter;
 pub mod node_adapters;
 pub mod resolver;
+pub mod synthetic;
 pub mod types;
 pub mod validation;
