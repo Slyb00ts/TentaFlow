@@ -725,6 +725,73 @@ mod tests {
         assert_eq!(fake.synthesized.lock().unwrap().len(), 0);
     }
 
+    /// Krok 8 item 32: bridge MUSI wywołać `ctx.tts_cleaning.clean()`
+    /// przed każdym synthesize, żeby tekst zdania był sprzątnięty
+    /// (markdown, hashtagi, emoji-jak-tekst itd.) zanim trafi do
+    /// silnika TTS. Counting stub zlicza wywołania i porównuje z
+    /// liczbą wysyntetyzowanych zdań.
+    #[tokio::test]
+    async fn bridge_uses_tts_cleaning_store_per_sentence() {
+        use crate::flow_engine::dispatchers::TtsCleaningStore;
+
+        struct CountingClean {
+            called_with: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl TtsCleaningStore for CountingClean {
+            async fn clean(&self, text: &str) -> Result<String> {
+                self.called_with.lock().unwrap().push(text.to_string());
+                Ok(format!("[clean] {}", text))
+            }
+        }
+
+        let mut ctx = stub_ctx();
+        let fake = Arc::new(FakeTts {
+            synthesized: Mutex::new(Vec::new()),
+            bytes: vec![0xAA],
+        });
+        let counting = Arc::new(CountingClean {
+            called_with: Mutex::new(Vec::new()),
+        });
+        ctx.tts = fake.clone();
+        ctx.tts_cleaning = counting.clone();
+        ctx.blobs = Arc::new(StaticBytesBlob(vec![0xAA]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "First sentence.".into(),
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: " Second!".into(),
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = TtsStreamBridgeNodeAdapter
+            .process_stream(&node(json!({"model": "voxcpm"})), upstream, seed, &ctx)
+            .await
+            .unwrap();
+        while out.next().await.is_some() {}
+
+        let cleans = counting.called_with.lock().unwrap().clone();
+        assert_eq!(
+            cleans.len(),
+            2,
+            "tts_cleaning.clean() musi być wywołane raz per zdanie, got {cleans:?}"
+        );
+        // Synthesize widzi wynik clean'a, nie raw input.
+        let synthesized = fake.synthesized.lock().unwrap().clone();
+        assert!(
+            synthesized.iter().all(|s| s.starts_with("[clean] ")),
+            "synthesize widziało tekst nie-cleaned: {synthesized:?}"
+        );
+    }
+
     /// Pomocniczy BlobStore dla testów — zawsze zwraca te same bajty.
     struct StaticBytesBlob(Vec<u8>);
     #[async_trait]
