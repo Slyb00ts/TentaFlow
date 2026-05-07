@@ -722,10 +722,15 @@ impl Router {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!(
-                        "Flow Engine streaming error, fallback na blocking/stary pipeline: {}",
-                        e
-                    );
+                    // Stage 3d round 10 fail-closed: dispatcher Err = ACL
+                    // deny / runtime / timeout. Brak fallback do blocking
+                    // try_dispatch albo legacy executor — klient dostaje
+                    // 500 zamiast cichego bypass.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("flow streaming dispatch: {}", e),
+                        source: None,
+                    }
+                    .into());
                 }
             }
 
@@ -804,10 +809,13 @@ impl Router {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!(
-                        "Flow Engine error (stream), fallback na stary pipeline: {}",
-                        e
-                    );
+                    // Stage 3d round 10 fail-closed: dispatcher Err
+                    // (ACL deny / runtime / timeout) = 500, brak fallback.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("flow stream dispatch: {}", e),
+                        source: None,
+                    }
+                    .into());
                 }
             }
         }

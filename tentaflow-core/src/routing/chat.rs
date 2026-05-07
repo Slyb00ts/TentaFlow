@@ -158,7 +158,15 @@ impl Router {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("Flow Engine error, fallback na direct dispatch: {}", e);
+                    // Stage 3d round 10 fail-closed: dispatcher Err = ACL
+                    // deny / runtime error / timeout. Brak fallback do
+                    // executor direct — admin's decyzja jest finalna,
+                    // klient dostaje 500 zamiast cichego bypass.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("flow dispatch: {}", e),
+                        source: None,
+                    }
+                    .into());
                 }
             }
         }
