@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 /// Reference to a blob stored outside FlowEnvelope. Cloning is cheap; bytes
 /// stay in BlobStore. id is uuid v4 for the row, sha256 is content hash for
 /// dedup/integrity.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobRef {
     pub id: String,
     pub size_bytes: u64,

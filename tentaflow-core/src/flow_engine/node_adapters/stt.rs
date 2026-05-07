@@ -45,12 +45,35 @@ impl SttNodeAdapter {
         ))
     }
 
-    fn pick_language(node: &FlowNode) -> Option<String> {
-        node.config
-            .get("language")
+    /// Stage 3d-0b-4-fix: language/prompt/response_format priorytet
+    /// `node.config` > `envelope.meta`. Operator pin'uje wartości w
+    /// node config, ale request seedy mają fallback na meta.
+    fn pick_optional_str(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<String> {
+        if let Some(s) = node
+            .config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+        envelope
+            .meta
+            .get(key)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
+    }
+
+    fn pick_optional_f32(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<f32> {
+        if let Some(n) = node.config.get(key).and_then(|v| v.as_f64()) {
+            return Some(n as f32);
+        }
+        envelope
+            .meta
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .map(|n| n as f32)
     }
 }
 
@@ -110,12 +133,20 @@ impl NodeAdapter for SttNodeAdapter {
         };
 
         let model = Self::pick_model(node, envelope)?;
-        let language = Self::pick_language(node);
+        let language = Self::pick_optional_str(node, envelope, "language");
+        let prompt = Self::pick_optional_str(node, envelope, "prompt");
+        let temperature = Self::pick_optional_f32(node, envelope, "temperature");
+        let response_format = Self::pick_optional_str(node, envelope, "response_format");
 
         let req = SttRequest {
             model,
             audio: blob_ref.clone(),
             language: language.clone(),
+            prompt,
+            temperature,
+            response_format,
+            user_id: ctx.user_id,
+            user_role: ctx.user_role.clone(),
         };
 
         let response = ctx
@@ -125,8 +156,9 @@ impl NodeAdapter for SttNodeAdapter {
             .map_err(|e| anyhow!("stt adapter: dispatcher failed: {e}"))?;
 
         // Output envelope: payload Text(transcript), audio blob ląduje w
-        // artifacts['source_audio'] (downstream node, np. memory/llm, ma
-        // do niego dostęp). Wykryty język w meta['detected_language'].
+        // artifacts['source_audio']. Verbose pola (duration/segments/speakers)
+        // lądują w meta — flow_outcome_to_stt_response je rozpakowuje gdy
+        // klient prosił o response_format=verbose_json.
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Text(response.text);
         out.put_artifact(
@@ -146,6 +178,22 @@ impl NodeAdapter for SttNodeAdapter {
         if let Some(lang) = response.detected_language {
             out.meta
                 .insert("detected_language".into(), serde_json::Value::String(lang));
+        }
+        if let Some(dur) = response.duration {
+            if let Some(num) = serde_json::Number::from_f64(dur as f64) {
+                out.meta
+                    .insert("duration".into(), serde_json::Value::Number(num));
+            }
+        }
+        if let Some(segs_json) = response.segments_json {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&segs_json) {
+                out.meta.insert("segments".into(), parsed);
+            }
+        }
+        if let Some(sp_json) = response.speakers_json {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&sp_json) {
+                out.meta.insert("speakers".into(), parsed);
+            }
         }
         Ok(out)
     }
@@ -202,6 +250,7 @@ mod tests {
             Ok(SttResponse {
                 text: "transkrypcja".into(),
                 detected_language: Some("pl".into()),
+                ..SttResponse::default()
             })
         }
     }

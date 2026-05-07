@@ -1930,6 +1930,12 @@ pub(crate) async fn stt_request_to_initial_envelope(
                 .insert("temperature".into(), serde_json::Value::Number(num));
         }
     }
+    if let Some(fmt) = &request.response_format {
+        env.meta.insert(
+            "response_format".into(),
+            serde_json::Value::String(fmt.clone()),
+        );
+    }
 
     let mut meta =
         crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
@@ -1954,14 +1960,15 @@ fn mime_for_filename(filename: &str) -> String {
 }
 
 /// Stage 3d-0b-4: konwertuje FlowExecutionOutcome na TranscriptionResponse.
-/// STT flow output to FlowValue::Text (transcript). Brak segments/duration
-/// w synthetic flow — admin który chce verbose response konfiguruje
-/// user-defined flow.
+/// STT flow output to FlowValue::Text (transcript) z verbose polami w
+/// envelope.meta (segments / duration / speakers / detected_language) —
+/// SttNodeAdapter zapisuje je gdy backend zwrócił verbose_json.
 pub(crate) fn flow_outcome_to_stt_response(
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
 ) -> Result<TranscriptionResponse, ExecutorError> {
     use crate::flow_engine::envelope::FlowValue;
-    let text = match outcome.final_envelope.payload {
+    let envelope = outcome.final_envelope;
+    let text = match envelope.payload {
         FlowValue::Text(t) => t,
         FlowValue::Empty => String::new(),
         other => {
@@ -1971,13 +1978,31 @@ pub(crate) fn flow_outcome_to_stt_response(
             )));
         }
     };
+    let language = envelope
+        .meta
+        .get("detected_language")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let duration = envelope
+        .meta
+        .get("duration")
+        .and_then(|v| v.as_f64())
+        .map(|n| n as f32);
+    let segments = envelope
+        .meta
+        .get("segments")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let speakers = envelope
+        .meta
+        .get("speakers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
     Ok(TranscriptionResponse {
         text,
         task: None,
-        language: None,
-        duration: None,
-        segments: None,
-        speakers: None,
+        language,
+        duration,
+        segments,
+        speakers,
     })
 }
 
