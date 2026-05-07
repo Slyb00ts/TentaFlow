@@ -286,7 +286,7 @@ fn message_to_chat_message(m: &Message) -> Option<ChatMessage> {
         "tool" => ChatRole::Tool,
         _ => return None,
     };
-    use crate::flow_engine::envelope::{ChatMessageContent, MessagePart};
+    use crate::flow_engine::envelope::ChatMessageContent;
     let content = match m.content.as_ref() {
         Some(MessageContent::Text(t)) => ChatMessageContent::Text(t.clone()),
         Some(MessageContent::Parts(_parts)) => {

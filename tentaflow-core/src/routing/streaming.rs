@@ -6,14 +6,12 @@
 // =============================================================================
 
 use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, MessageContent,
+    ChatCompletionChunk, ChatCompletionRequest,
 };
 use crate::error::Result;
-use crate::routing::chat::flow_outcome_to_chat_response;
 use crate::routing::router::Router;
 
 use std::pin::Pin;
-use tracing::{debug, warn};
 
 use futures::Stream;
 
@@ -34,8 +32,8 @@ fn envelope_stream_to_chunk_stream(
             + Send,
     >,
 > {
-    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta, Usage};
-    use crate::flow_engine::envelope::{EnvelopeDelta, FlowExecutionOutcome};
+    
+    use crate::flow_engine::envelope::EnvelopeDelta;
     use futures::StreamExt;
 
     let crate::flow_engine::executor::StreamingExecution { stream, outcome } = stream_exec;
@@ -242,6 +240,13 @@ fn build_flow_tail_chunk(
 ///
 /// Wszystkie chunki bez `usage` (regularne content delta) przepuszczane bez
 /// modyfikacji.
+///
+/// Po Universal Flow Gateway (stage 3d) production path nie używa już tego
+/// helpera — usage tail jest budowany w `envelope_stream_to_chunk_stream`
+/// bezpośrednio z `FlowExecutionOutcome.usage`. Helper żyje wyłącznie pod
+/// `cfg(test)` jako oracle dla testów include_usage semantyki — kasowanie
+/// całości razem z testami zostawiłoby bez pokrycia.
+#[cfg(test)]
 fn apply_include_usage_split<S>(
     inner: S,
     include_usage: bool,
@@ -338,6 +343,7 @@ where
     Box::pin(composite)
 }
 
+#[cfg(test)]
 enum UsageSplitState {
     Active {
         inner: std::pin::Pin<

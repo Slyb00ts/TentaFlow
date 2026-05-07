@@ -17,8 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::db::{repository, DbPool};
 use crate::flow_engine::cache::CompiledFlow;
 use crate::flow_engine::envelope::{
-    ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue,
-    LlmStreamChunk, NodeInput, TokenUsage, TraceStatus, TraceStep,
+    ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue, NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext};
 

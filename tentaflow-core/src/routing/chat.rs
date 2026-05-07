@@ -6,16 +6,14 @@
 // =============================================================================
 
 use crate::api::openai::types::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent, Usage,
+    ChatCompletionRequest, ChatCompletionResponse,
 };
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::envelope::FlowExecutionOutcome;
-use crate::routing::router::{
-    Router, VoiceInfo,
-};
+use crate::routing::router::Router;
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 impl Router {
     /// Single entry point for non-streaming chat completion.
@@ -87,7 +85,7 @@ impl Router {
                 .into());
             }
         }
-        let target_accepts_audio = if request.audio_input.is_some() {
+        let _target_accepts_audio = if request.audio_input.is_some() {
             let snap = self.catalog_snapshot();
             if !catalog_target_accepts_audio(&snap, &request.model) {
                 tracing::warn!(
