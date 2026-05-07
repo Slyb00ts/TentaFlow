@@ -1,9 +1,11 @@
 // =============================================================================
 // Plik: routing/embeddings.rs
-// Opis: Obsluga zapytan o embeddingi — wszystko deleguje przez
-//       `ModelRuntimeExecutor.execute_embeddings`. `route_embeddings_via_quic`
-//       to protocol-native API uzywane przez mesh reverse handler
-//       (`mesh/inference_proxy.rs`) z anti-loop guardem.
+// Opis: Obsluga zapytan o embeddingi przez flow_engine (stage 3d Universal
+//       Flow Gateway). Synthetic flow trigger → embeddings(model) → output
+//       aktywuje się gdy admin nie skonfigurował user-defined flow; backend
+//       dispatch idzie przez EmbeddingsDispatcherImpl → executor.execute_
+//       embeddings. `route_embeddings_via_quic` to mesh inbound EXEMPT —
+//       direct executor żeby zachować ultra-low latency LAN budżet.
 // =============================================================================
 
 use crate::api::openai::types::{
@@ -46,10 +48,11 @@ impl Router {
         self.route_embeddings_inner(request, user).await
     }
 
-    /// Obsluguje zarowno Single jak i Multiple input. Single dispatch path:
-    /// `ModelRuntimeExecutor::execute_embeddings`. `user` propagowany do
-    /// `ExecutionContext.user` zeby flow ACL gate w `dispatch_by_flow_id`
-    /// widzial user_id/role.
+    /// Obsluguje zarowno Single jak i Multiple input przez flow_engine.
+    /// Multi-input batch propagowany przez `envelope.meta["embeddings_inputs"]`
+    /// (JSON array); EmbeddingsNodeAdapter rozpakowuje do EmbeddingsRequest.
+    /// inputs. `user` propagowany do `FlowRequestMeta` żeby ACL gate flow
+    /// (jeśli admin skonfigurował user-defined flow) widział user_id/role.
     async fn route_embeddings_inner(
         &self,
         request: EmbeddingRequest,
@@ -59,11 +62,10 @@ impl Router {
 
         let t = std::time::Instant::now();
 
-        // Stage 3d-0b-3: Embeddings path zawsze przez FlowDispatcher
-        // (Universal Flow Gateway). Synthetic flow `trigger →
-        // embeddings(model) → output` aktywuje się gdy admin nie
-        // skonfigurował user-defined flow. Direct executor jako fallback
-        // dla CompileFailed / no flow_dispatcher.
+        // Stage 3d Universal Flow Gateway: embeddings path zawsze przez
+        // FlowDispatcher. Synthetic flow `trigger → embeddings(model) →
+        // output` aktywuje się gdy admin nie skonfigurował user-defined flow.
+        // Direct executor.execute_embeddings fallback wycięty w 3d-0b-final.
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let (initial, meta) =
                 crate::services::runtime::executor::embeddings_request_to_initial_envelope(

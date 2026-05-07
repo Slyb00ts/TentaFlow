@@ -12,11 +12,13 @@ use crate::routing::router::Router;
 use tracing::{debug, error};
 
 impl Router {
-    /// Routuje audio transcription request do odpowiedniego backendu.
-    ///
-    /// Probuje QUIC STT (preferowany), potem fallback na HTTP backend.
-    /// Obsluguje zarowno prosty tekst jak i verbose_json z segmentami.
-    /// Wariant z user context — ACL gate przed wywolaniem backendu.
+    /// Routuje audio transcription request przez flow_engine (stage 3d
+    /// Universal Flow Gateway). Synthetic flow `trigger → stt(model) →
+    /// output` aktywuje się gdy admin nie skonfigurował user-defined flow.
+    /// Backend dispatch (embedded whisper.cpp / MLX, HTTP, QUIC) idzie
+    /// przez SttDispatcherImpl → executor.execute_stt. verbose_json
+    /// (segments/duration/speakers) propagowany przez envelope.meta.
+    /// Wariant z user context — ACL gate przed dispatch.
     pub async fn route_audio_transcription_for_user(
         &self,
         request: TranscriptionRequest,
@@ -39,10 +41,10 @@ impl Router {
                 }
             }
         }
-        // Stage 3d-0b-4: STT path zawsze przez FlowDispatcher (Universal
-        // Flow Gateway). Synthetic flow `trigger → stt(model) → output`
+        // Stage 3d Universal Flow Gateway: STT path zawsze przez
+        // FlowDispatcher. Synthetic flow `trigger → stt(model) → output`
         // aktywuje się gdy admin nie skonfigurował user-defined flow.
-        // Direct executor jako fallback dla CompileFailed / no flow_dispatcher.
+        // Direct executor.execute_stt fallback wycięty w 3d-0b-final.
         if let Some(ref dispatcher) = self.flow_dispatcher {
             match crate::services::runtime::executor::stt_request_to_initial_envelope(
                 &request,
