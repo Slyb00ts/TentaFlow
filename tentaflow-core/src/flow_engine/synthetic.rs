@@ -178,4 +178,40 @@ mod tests {
             Some("qwen3.5-0.8b")
         );
     }
+
+    #[test]
+    fn synthetic_tts_carries_model() {
+        let def = synthetic_tts("xtts-v2");
+        let tts = def.nodes.iter().find(|n| n.node_type == "tts").unwrap();
+        assert_eq!(
+            tts.config.get("model").and_then(|v| v.as_str()),
+            Some("xtts-v2")
+        );
+        assert_eq!(def.edges.len(), 2);
+        assert!(def.edges.iter().all(|e| e.from_port == "full"));
+    }
+
+    #[test]
+    fn synthetic_stt_carries_model() {
+        let def = synthetic_stt("whisper-large-v3");
+        let stt = def.nodes.iter().find(|n| n.node_type == "stt").unwrap();
+        assert_eq!(
+            stt.config.get("model").and_then(|v| v.as_str()),
+            Some("whisper-large-v3")
+        );
+    }
+
+    #[test]
+    fn synthetic_embeddings_carries_model() {
+        let def = synthetic_embeddings("nomic-embed-text-v1.5");
+        let emb = def
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "embeddings")
+            .unwrap();
+        assert_eq!(
+            emb.config.get("model").and_then(|v| v.as_str()),
+            Some("nomic-embed-text-v1.5")
+        );
+    }
 }
