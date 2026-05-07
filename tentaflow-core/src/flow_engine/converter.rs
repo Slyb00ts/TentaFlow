@@ -135,7 +135,7 @@ fn parse_embedding_batch(v: &serde_json::Value) -> CoreResult<Vec<EmbeddingData>
         .collect()
 }
 
-fn payload_to_json(v: &FlowValue) -> serde_json::Value {
+pub(crate) fn payload_to_json(v: &FlowValue) -> serde_json::Value {
     match v {
         FlowValue::Empty => serde_json::Value::Null,
         FlowValue::Text(t) => serde_json::Value::String(t.clone()),

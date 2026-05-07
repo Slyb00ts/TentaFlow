@@ -470,7 +470,15 @@ fn aggregate_usage(trace: &[TraceStep]) -> TokenUsage {
     total
 }
 
+/// Synthetic flows (Universal Flow Gateway, flow_id=0) są ephemeral —
+/// nie istnieją w tabeli `flows`, więc insert do `flow_executions` z FK
+/// na `flows(id)` failuje przy `PRAGMA foreign_keys=ON`. Skipujemy audit
+/// row i zwracamy execution_id=0 jako sentinel; persist_execution też
+/// to honoruje.
 async fn create_execution_record(db: &DbPool, flow_id: i64) -> Result<i64> {
+    if flow_id == 0 {
+        return Ok(0);
+    }
     let pool = db.clone();
     let id = tokio::task::spawn_blocking(move || {
         repository::create_flow_execution(&pool, flow_id, None, None, "running")
@@ -480,6 +488,11 @@ async fn create_execution_record(db: &DbPool, flow_id: i64) -> Result<i64> {
 }
 
 async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecutionOutcome) {
+    // execution_id == 0 = synthetic flow (no audit row created — see
+    // create_execution_record skip). Skip persist too.
+    if execution_id == 0 {
+        return;
+    }
     let pool = db.clone();
     let status = if outcome.finish_reason == FinishReason::Cancelled {
         "cancelled"
