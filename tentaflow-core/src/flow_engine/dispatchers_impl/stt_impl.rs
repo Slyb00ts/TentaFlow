@@ -45,19 +45,15 @@ impl SttDispatcher for SttDispatcherImpl {
         let mime = req.audio.mime.clone();
         let filename = blob_filename(&req.audio.id, &mime);
 
-        // SttRequest nie ma jeszcze user_id/user_role (rozszerzenie planu w
-        // późniejszym kroku 3d). Build user context jako None — executor
-        // wewnętrznie waliduje ACL przez catalog provider, nie wymaga user
-        // context dla blocking transcribe path.
-        let user = build_user_context(None, None);
+        let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = TranscriptionRequest {
             file,
             filename,
             model: req.model,
             language: req.language,
-            prompt: None,
-            response_format: None,
-            temperature: None,
+            prompt: req.prompt,
+            response_format: req.response_format,
+            temperature: req.temperature,
             timestamp_granularities: None,
             no_speech_threshold: None,
             avg_logprob_threshold: None,
@@ -71,9 +67,24 @@ impl SttDispatcher for SttDispatcherImpl {
             .await
             .map_err(|e| anyhow!("SttDispatcher execute_stt: {e}"))?;
 
+        // Verbose pola serializujemy do JSON żeby przeszły przez SttResponse
+        // (envelope artifacts) bez rozszerzania publicznego API
+        // dispatcher'a o pełny TranscriptionSegment shape.
+        let segments_json = response
+            .segments
+            .as_ref()
+            .and_then(|segs| serde_json::to_string(segs).ok());
+        let speakers_json = response
+            .speakers
+            .as_ref()
+            .and_then(|sp| serde_json::to_string(sp).ok());
+
         Ok(SttResponse {
             text: response.text,
             detected_language: response.language,
+            duration: response.duration,
+            segments_json,
+            speakers_json,
         })
     }
 }
