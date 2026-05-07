@@ -28,4 +28,4 @@ pub mod snapshot_builder;
 pub mod supervisor;
 pub mod transport;
 
-pub use tts::{SynthesizeCallback, TTSBufferingProcessor, TTSClient, TTSConfigCompat};
+pub use tts::{TTSClient, TTSConfigCompat};

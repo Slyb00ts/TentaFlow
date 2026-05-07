@@ -340,17 +340,11 @@ pub struct QuicProtocolConfig {
 // Middleware i rate limiting
 // =============================================================================
 
-/// Konfiguracja middleware
+/// Konfiguracja middleware. Po Krok 6 zostaje tylko rate-limit + audit
+/// — request/response filtering przeszło do flow_engine (`pii_filter`
+/// node), nie ma już osobnych knobów.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MiddlewareConfig {
-    /// Czy request middleware jest wlaczony (Faza 0: false = noop)
-    #[serde(default)]
-    pub request_validation_enabled: bool,
-
-    /// Czy response middleware jest wlaczony (Faza 0: false = noop)
-    #[serde(default)]
-    pub response_filtering_enabled: bool,
-
     /// Czy rate limiting jest wlaczony
     #[serde(default = "default_true")]
     pub rate_limiting_enabled: bool,
@@ -828,8 +822,6 @@ impl NodeConfig {
 impl Default for MiddlewareConfig {
     fn default() -> Self {
         Self {
-            request_validation_enabled: false,
-            response_filtering_enabled: false,
             rate_limiting_enabled: true,
             audit_logging_enabled: true,
         }
