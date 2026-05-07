@@ -127,9 +127,9 @@ Jeśli admin chce PII na danym modelu — definiuje flow w DB z
 | 2 | `routing/streaming.rs:739–740` | DEL fallback do blocking `try_dispatch` po stream None. `try_dispatch_streaming` ma wewnętrzny wrapper sync→stream (sekcja niżej). |
 | 3 | `routing/tts.rs:102` | DEL `executor.execute_tts` direct. `synthesize_speech` woła `dispatcher.try_dispatch(model, "tts", ...)`. |
 | 4 | `routing/stt.rs:56` | DEL pierwszy `executor.execute_stt` direct (default path). |
-| 5 | `routing/stt.rs:249` | DEL drugi `executor.execute_stt` direct (protocol-native AudioOperation::STT branch). |
+| 5 | ~~`routing/stt.rs:249`~~ | **NIE wycinamy** — protocol-native AudioOperation::STT to mesh inbound (route_audio_via_protocol), oznaczone `EXEMPT-MESH-INBOUND`. |
 | 6 | `routing/embeddings.rs:71` | DEL `executor.execute_embeddings` direct (default path). |
-| 7 | `routing/embeddings.rs:161` | DEL drugi `executor.execute_embeddings` direct (protocol-native branch). |
+| 7 | ~~`routing/embeddings.rs:161`~~ | **NIE wycinamy** — `route_embeddings_via_quic` to mesh inbound, oznaczone `EXEMPT-MESH-INBOUND`. |
 | 8 | `flow_engine/dispatchers_impl/stt_impl.rs:30` | REFACTOR: `SttDispatcherImpl::transcribe` woła `executor.execute_stt` zamiast `SttRuntime::transcribe` direct. D4 invariant relaxed (rationale w sekcji niżej). |
 
 **Mesh inbound paths NIE wycinamy** (3 callsites: `mesh/inference_proxy.rs:190`,
