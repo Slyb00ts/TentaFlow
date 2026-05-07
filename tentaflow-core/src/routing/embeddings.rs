@@ -219,6 +219,11 @@ impl Router {
             ..ExecutionContext::default()
         };
 
+        // EXEMPT-MESH-INBOUND (stage 3d v1.5): protocol-native embeddings
+        // mesh reverse path — peer forwarduje rkyv ModelRequest, my
+        // wykonujemy direct executor żeby zachować ultra-low latency
+        // budget (LAN 1-5ms). Plan v1.5 dokumentuje to jako jedyny
+        // dozwolony wyjątek od "wszystko przez flow_engine".
         let response = match executor.execute_embeddings(request, &mut exec_ctx).await {
             Ok(r) => r,
             Err(e) => return Err(executor_err_to_core(e, model).into()),
