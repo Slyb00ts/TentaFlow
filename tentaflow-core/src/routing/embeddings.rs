@@ -18,11 +18,12 @@ use tentaflow_protocol::*;
 use tracing::debug;
 
 impl Router {
-    /// Routuje embeddings request do odpowiedniego backendu.
+    /// Routuje embeddings request przez flow_engine.
     ///
     /// Wariant z user context — sprawdza ACL ('model', request.model) zanim
-    /// uderzymy w backend. Maskujemy denied jako AllBackendsUnavailable
-    /// zeby nie ujawniac istnienia modelu.
+    /// uderzymy w backend. ACL deny mapuje na ModelNotFound (404) — nie
+    /// ujawniamy istnienia modelu klientom bez dostępu (parytet z 4
+    /// pozostałymi default HTTP paths).
     pub async fn route_embeddings_for_user(
         &self,
         request: EmbeddingRequest,
