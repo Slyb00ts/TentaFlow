@@ -319,11 +319,16 @@ fn openai_finish_to_envelope(s: Option<&str>) -> FinishReason {
 }
 
 fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
+    let mut choice_index: u32 = 0;
     let mut text_delta = String::new();
     let mut reasoning_delta: Option<String> = None;
     let mut finish_reason: Option<FinishReason> = None;
 
     if let Some(choice) = chunk.choices.into_iter().next() {
+        // Stage 3d Krok 1: propagate choice.index z OpenAI response.
+        // Backend zwykle zwraca n=1 (index=0), ale schemat propaguje
+        // wartość żeby multi-choice działał gdy backend wspiera.
+        choice_index = choice.index;
         if let Some(c) = choice.delta.content {
             text_delta = c;
         }
@@ -336,6 +341,7 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
     }
 
     LlmStreamChunk {
+        choice_index,
         text_delta,
         reasoning_delta,
         tool_calls: Vec::new(),

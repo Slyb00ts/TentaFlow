@@ -187,7 +187,10 @@ fn make_chunk(
         created,
         model: model.to_string(),
         choices: vec![ChunkChoice {
-            index: 0,
+            // Stage 3d Krok 1: propagate choice_index z LlmStreamChunk
+            // (zamiast hardcoded 0). Default 0 dla synthetic + większości
+            // backendów; multi-choice n>1 dostaje per-choice value.
+            index: c.choice_index,
             delta: Delta {
                 role: None,
                 content: if c.text_delta.is_empty() {
