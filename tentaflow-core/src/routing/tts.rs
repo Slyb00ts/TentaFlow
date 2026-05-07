@@ -21,12 +21,11 @@ pub struct TtsBytes {
 }
 
 impl Router {
-    /// Syntezuje mowe z tekstu uzywajac QUIC TTS lub HTTP TTS.
-    ///
-    /// Flow:
-    /// 1. Probuje znalezc QUIC TTS client (preferowany - lokalne modele Sherpa)
-    /// 2. Jesli brak QUIC -> fallback do HTTP TTS (OpenAI API)
-    /// 3. Wysyla request i zwraca raw audio bytes
+    /// Syntezuje mowe z tekstu przez flow_engine (stage 3d Universal Flow
+    /// Gateway). Synthetic flow `trigger → tts(model) → output` aktywuje
+    /// się gdy admin nie skonfigurował user-defined flow; backend dispatch
+    /// (embedded sherpa, HTTP, QUIC, mesh) idzie przez TtsDispatcherImpl
+    /// → executor.execute_tts.
     ///
     /// Parametry:
     /// - `request`: TTSRequest z OpenAI API format (model, input, voice, format, speed)
@@ -90,11 +89,10 @@ impl Router {
         let tts_model = cleaned_request.model.clone();
         let t = std::time::Instant::now();
 
-        // Stage 3d-0b-2: TTS path zawsze przez FlowDispatcher (Universal
-        // Flow Gateway). Synthetic flow `trigger → tts(model) → output`
+        // Stage 3d Universal Flow Gateway: TTS path zawsze przez
+        // FlowDispatcher. Synthetic flow `trigger → tts(model) → output`
         // aktywuje się gdy admin nie skonfigurował user-defined flow.
-        // Direct executor.execute_tts zostaje jako fallback (CompileFailed
-        // / no flow_dispatcher) — będzie wycięte w finalnym 0b commit.
+        // Direct executor.execute_tts fallback wycięty w 3d-0b-final.
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let (initial, meta) = crate::services::runtime::executor::tts_request_to_initial_envelope(
                 &cleaned_request,
