@@ -173,10 +173,28 @@ impl fmt::Display for FlowValidationError {
 
 impl std::error::Error for FlowValidationError {}
 
+/// Źródło flow definition — decyduje czy mandatoryjne reguły jak R-SAFETY
+/// (pii_filter na chain LLM) są egzekwowane.
+///
+/// `UserDefined` — flow zapisany przez admina w DB (handlers save path,
+/// seedy). Pełna walidacja, R-SAFETY enforce.
+///
+/// `Synthetic` — ad-hoc flow zbudowany w runtime (FlowDispatcher fallback
+/// gdy resolver zwraca None dla danego modelu). R-SAFETY skip — synthetic
+/// ma trivial topology trigger→capability→output, bez chain'a, R-SAFETY
+/// nieaplikowalny. Admin który nie zdefiniował flow akceptuje raw output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationSource {
+    UserDefined,
+    Synthetic,
+}
+
 pub fn validate(
     def: &FlowDefinition,
     registry: &AdapterRegistry,
+    source: ValidationSource,
 ) -> Result<(), FlowValidationError> {
+    let _ = source;
     let nodes_by_id: HashMap<&str, &crate::flow_engine::types::FlowNode> =
         def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
@@ -389,7 +407,7 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o"}]}"#,
         );
-        validate(&def, &registry()).unwrap();
+        validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
     }
 
     #[test]
@@ -397,7 +415,7 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"o","type":"output","config":{}}],"edges":[]}"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, FlowValidationError::TriggerCount { actual: 0 }));
     }
 
@@ -406,7 +424,7 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"t1","type":"trigger","config":{}},{"id":"t2","type":"trigger","config":{}}],"edges":[]}"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, FlowValidationError::TriggerCount { actual: 2 }));
     }
 
@@ -426,7 +444,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, FlowValidationError::MultipleInputs { .. }));
     }
 
@@ -435,7 +453,7 @@ mod tests {
         let def = parse(
             r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"x","type":"mystery","config":{}}],"edges":[{"from":"t","to":"x"}]}"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, FlowValidationError::UnknownAdapter { .. }));
     }
 
@@ -454,7 +472,7 @@ mod tests {
                 ]
             }"#,
         );
-        validate(&def, &registry()).unwrap();
+        validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
     }
 
     #[test]
@@ -472,7 +490,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::StreamingNotToOutput { .. }
@@ -494,7 +512,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::StreamingOutputModeMismatch { .. }
@@ -528,7 +546,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(&def, &r).unwrap_err();
+        let err = validate(&def, &r, crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::EdgePortTypesMismatch { .. }
@@ -556,7 +574,7 @@ mod tests {
                 ]
             }"#,
         );
-        validate(&def, &r).unwrap();
+        validate(&def, &r, crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
     }
 
     #[test]
@@ -580,7 +598,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(&def, &r).unwrap_err();
+        let err = validate(&def, &r, crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::EdgeTypeMismatch { side: "from", .. }
@@ -600,7 +618,7 @@ mod tests {
                 ]
             }"#,
         );
-        let err = validate(&def, &registry()).unwrap_err();
+        let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(
             err,
             FlowValidationError::ConditionEdgeFromNonCondition { .. }
