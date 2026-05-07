@@ -31,7 +31,7 @@ use crate::flow_engine::dispatchers_impl::{
     SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
-    EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
+    AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
 };
 use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
 use crate::flow_engine::node_adapter::{
@@ -349,7 +349,7 @@ impl FlowDispatcher {
                         .run_blocking(cached.compiled.clone(), initial, meta)
                         .await
                         .map_err(DispatchError::from)?;
-                    return Ok(wrap_blocking_as_stream(outcome));
+                    return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
                 }
                 cached.compiled.clone()
             }
@@ -563,27 +563,61 @@ fn derive_modality(envelope: &FlowEnvelope) -> &'static str {
 /// streaming flow. Klient SSE konsumuje jednolicie — single chunk z całością
 /// payloadu + finish_reason ze stop. Outcome `oneshot` channel jest natychmiast
 /// rozwiązany — wrapper nie czeka na EOF, blocking już skończył.
-fn wrap_blocking_as_stream(outcome: FlowExecutionOutcome) -> StreamingExecution {
+///
+/// Dla `FlowValue::Audio { blob_ref, mime, .. }` (np. blocking TTS-as-flow przez
+/// `/v1/audio/speech/flow-stream`) wrapper fetchuje bytes z `BlobStore` i emit'uje
+/// `EnvelopeDelta::Audio` zamiast Llm-z-JSON-em — żeby audio sink endpoint dostał
+/// realne ramki.
+fn wrap_blocking_as_stream(
+    outcome: FlowExecutionOutcome,
+    blobs: Arc<dyn BlobStore>,
+) -> StreamingExecution {
     use futures::stream::StreamExt;
-    // Parytet z flow_outcome_to_chat_response: Text → raw, Empty → "",
-    // pozostałe (Image/Audio/Embedding/Json) → serde_json string. Inaczej
-    // streaming-wrapped blocking-only flow gubiłby non-text payload.
-    let text_delta = match &outcome.final_envelope.payload {
-        FlowValue::Text(t) => t.clone(),
-        FlowValue::Empty => String::new(),
-        other => serde_json::to_string(&crate::flow_engine::converter::payload_to_json(other))
-            .unwrap_or_default(),
-    };
-    let chunk = LlmStreamChunk {
-        choice_index: 0,
-        text_delta,
-        reasoning_delta: None,
-        tool_calls: Vec::new(),
-        usage: Some(outcome.usage.clone()),
-        finish_reason: Some(outcome.finish_reason.clone()),
-        error: outcome.error.clone(),
-    };
-    let stream = futures::stream::once(async move { Ok(EnvelopeDelta::Llm(chunk)) }).boxed();
+    let payload_for_stream = outcome.final_envelope.payload.clone();
+    let usage = outcome.usage.clone();
+    let finish = outcome.finish_reason.clone();
+    let err = outcome.error.clone();
+    let stream = futures::stream::once(async move {
+        match payload_for_stream {
+            FlowValue::Audio {
+                blob_ref,
+                mime,
+                sample_rate,
+            } => {
+                let bytes = blobs
+                    .get(&blob_ref)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("audio blob fetch: {e}"))?;
+                Ok(EnvelopeDelta::Audio(AudioStreamChunk {
+                    choice_index: 0,
+                    bytes_delta: bytes,
+                    mime,
+                    sample_rate,
+                    finish_reason: Some(finish),
+                }))
+            }
+            other => {
+                let text_delta = match &other {
+                    FlowValue::Text(t) => t.clone(),
+                    FlowValue::Empty => String::new(),
+                    v => serde_json::to_string(
+                        &crate::flow_engine::converter::payload_to_json(v),
+                    )
+                    .unwrap_or_default(),
+                };
+                Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                    choice_index: 0,
+                    text_delta,
+                    reasoning_delta: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(usage),
+                    finish_reason: Some(finish),
+                    error: err,
+                }))
+            }
+        }
+    })
+    .boxed();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(outcome);
     StreamingExecution {
@@ -685,7 +719,9 @@ mod tests {
             total_latency_ms: 42,
             error: None,
         };
-        let exec = wrap_blocking_as_stream(outcome);
+        let blobs: Arc<dyn BlobStore> =
+            Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new());
+        let exec = wrap_blocking_as_stream(outcome, blobs);
         let collected: Vec<EnvelopeDelta> = futures::executor::block_on(async {
             use futures::StreamExt;
             exec.stream
@@ -715,7 +751,9 @@ mod tests {
             total_latency_ms: 0,
             error: None,
         };
-        let exec = wrap_blocking_as_stream(outcome);
+        let blobs: Arc<dyn BlobStore> =
+            Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new());
+        let exec = wrap_blocking_as_stream(outcome, blobs);
         let collected: Vec<EnvelopeDelta> = futures::executor::block_on(async {
             use futures::StreamExt;
             exec.stream
@@ -733,5 +771,51 @@ mod tests {
             "expected JSON serialization, got: {}",
             chunk.text_delta
         );
+    }
+
+    /// Krok 5: blocking flow który zwraca FlowValue::Audio (np. synthetic
+    /// TTS) musi wyjść jako EnvelopeDelta::Audio z prawdziwymi bajtami,
+    /// nie jako JSON-z-blob_ref. Wrapper fetchuje BlobStore przed emitem.
+    #[test]
+    fn wrap_blocking_as_stream_fetches_audio_blob() {
+        use crate::flow_engine::blob_store::InMemoryBlobStore;
+        use crate::flow_engine::envelope::{FinishReason, FlowEnvelope, FlowValue, TokenUsage};
+
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let blob_ref = futures::executor::block_on(blobs.put(bytes.clone(), "audio/wav"))
+            .expect("put");
+
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Audio {
+            blob_ref,
+            mime: "audio/wav".into(),
+            sample_rate: Some(22_050),
+        };
+        let outcome = FlowExecutionOutcome {
+            final_envelope: env,
+            trace: Vec::new(),
+            usage: TokenUsage::default(),
+            finish_reason: FinishReason::Stop,
+            total_latency_ms: 0,
+            error: None,
+        };
+        let blobs_dyn: Arc<dyn BlobStore> = blobs;
+        let exec = wrap_blocking_as_stream(outcome, blobs_dyn);
+        let collected: Vec<EnvelopeDelta> = futures::executor::block_on(async {
+            use futures::StreamExt;
+            exec.stream
+                .filter_map(|r| async move { r.ok() })
+                .collect()
+                .await
+        });
+        assert_eq!(collected.len(), 1);
+        let EnvelopeDelta::Audio(chunk) = &collected[0] else {
+            panic!("expected Audio variant, got {:?}", collected[0].kind());
+        };
+        assert_eq!(chunk.bytes_delta, bytes);
+        assert_eq!(chunk.mime, "audio/wav");
+        assert_eq!(chunk.sample_rate, Some(22_050));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
     }
 }
