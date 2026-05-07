@@ -49,7 +49,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
             input: req.text,
             voice: req.voice.unwrap_or_else(|| DEFAULT_VOICE.to_string()),
             response_format: req.format.clone(),
-            speed: None,
+            speed: req.speed,
             language: req.language.clone(),
         };
 

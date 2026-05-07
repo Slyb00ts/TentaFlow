@@ -1788,6 +1788,12 @@ pub(crate) fn tts_request_to_initial_envelope(
         env.meta
             .insert("language".into(), serde_json::Value::String(lang.clone()));
     }
+    if let Some(spd) = request.speed {
+        if let Some(num) = serde_json::Number::from_f64(spd as f64) {
+            env.meta
+                .insert("speed".into(), serde_json::Value::Number(num));
+        }
+    }
 
     let mut meta =
         crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());

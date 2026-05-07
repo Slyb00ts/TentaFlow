@@ -654,6 +654,7 @@ async fn handle_audio_tts_stream(
         voice: Some(api_request.voice.clone()),
         format: api_request.response_format.clone(),
         language: api_request.language.clone(),
+        speed: api_request.speed,
         user_id: user_ctx.as_ref().map(|u| u.user_id),
         user_role: user_ctx.as_ref().map(|u| u.role.clone()),
         cancel_token: cancel.clone(),
