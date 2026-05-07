@@ -503,9 +503,14 @@ fn derive_modality(envelope: &FlowEnvelope) -> &'static str {
 /// rozwiązany — wrapper nie czeka na EOF, blocking już skończył.
 fn wrap_blocking_as_stream(outcome: FlowExecutionOutcome) -> StreamingExecution {
     use futures::stream::StreamExt;
+    // Parytet z flow_outcome_to_chat_response: Text → raw, Empty → "",
+    // pozostałe (Image/Audio/Embedding/Json) → serde_json string. Inaczej
+    // streaming-wrapped blocking-only flow gubiłby non-text payload.
     let text_delta = match &outcome.final_envelope.payload {
         FlowValue::Text(t) => t.clone(),
-        _ => String::new(),
+        FlowValue::Empty => String::new(),
+        other => serde_json::to_string(&crate::flow_engine::converter::payload_to_json(other))
+            .unwrap_or_default(),
     };
     let chunk = LlmStreamChunk {
         text_delta,
@@ -577,5 +582,72 @@ mod tests {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
         assert!(r.llm().is_some(), "LLM typed accessor must be wired");
+    }
+
+    #[test]
+    fn wrap_blocking_as_stream_emits_text_payload() {
+        use crate::flow_engine::envelope::{FinishReason, FlowEnvelope, FlowValue, TokenUsage};
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("hello world".into());
+        let outcome = FlowExecutionOutcome {
+            final_envelope: env,
+            trace: Vec::new(),
+            usage: TokenUsage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+            },
+            finish_reason: FinishReason::Stop,
+            total_latency_ms: 42,
+            error: None,
+        };
+        let exec = wrap_blocking_as_stream(outcome);
+        let collected: Vec<EnvelopeDelta> = futures::executor::block_on(async {
+            use futures::StreamExt;
+            exec.stream
+                .filter_map(|r| async move { r.ok() })
+                .collect()
+                .await
+        });
+        assert_eq!(collected.len(), 1);
+        let EnvelopeDelta::Llm(chunk) = &collected[0] else {
+            panic!("expected Llm variant");
+        };
+        assert_eq!(chunk.text_delta, "hello world");
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(chunk.usage.as_ref().unwrap().total_tokens, 12);
+    }
+
+    #[test]
+    fn wrap_blocking_as_stream_serializes_non_text_payload_as_json() {
+        use crate::flow_engine::envelope::{FinishReason, FlowEnvelope, FlowValue, TokenUsage};
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Embedding(vec![0.5, 0.25]);
+        let outcome = FlowExecutionOutcome {
+            final_envelope: env,
+            trace: Vec::new(),
+            usage: TokenUsage::default(),
+            finish_reason: FinishReason::Stop,
+            total_latency_ms: 0,
+            error: None,
+        };
+        let exec = wrap_blocking_as_stream(outcome);
+        let collected: Vec<EnvelopeDelta> = futures::executor::block_on(async {
+            use futures::StreamExt;
+            exec.stream
+                .filter_map(|r| async move { r.ok() })
+                .collect()
+                .await
+        });
+        assert_eq!(collected.len(), 1);
+        let EnvelopeDelta::Llm(chunk) = &collected[0] else {
+            panic!("expected Llm variant");
+        };
+        // Parytet z flow_outcome_to_chat_response — Embedding leci jako JSON
+        assert!(
+            chunk.text_delta.contains("0.5"),
+            "expected JSON serialization, got: {}",
+            chunk.text_delta
+        );
     }
 }
