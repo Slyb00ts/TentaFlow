@@ -405,19 +405,28 @@ async fn finalize_streaming_flow(
             }
         }
     }
-    let _ = audio_chunks_emitted;
-    let _ = last_audio_finish;
-
     drop(outbound_tx);
 
-    // Buduj final envelope: klon input envelope LLM + payload Text(content)
-    // + dopisana assistant message (parytet z LlmNodeAdapter::execute).
+    // Stage 3d Krok 2c-2 fix: outcome shape zależny od końcowego kind'u
+    // strumienia. Audio path (chain skończony przez tts_stream_bridge)
+    // emit'uje bytes przez SSE — outcome.payload = Empty (bytes już
+    // skonsumowane przez klienta, nie ma sensu duplikować w outcome).
+    // LLM path agreguje text/reasoning do final_envelope.
+    let is_audio_path = audio_chunks_emitted > 0;
     let mut final_envelope: FlowEnvelope = (*inputs.llm_input_envelope).clone();
-    final_envelope.payload = FlowValue::Text(text_buf.clone());
-    final_envelope
-        .context
-        .messages
-        .push(ChatMessage::assistant(text_buf));
+    if is_audio_path {
+        final_envelope.payload = FlowValue::Empty;
+        // Audio path nie dopisuje assistant message — głos czytał
+        // odpowiedź LLM, ale w envelope kontekstowym text już szedł
+        // przez chain (tts_stream_bridge konsumował) lub został
+        // pochłonięty wewnątrz bridge. Brak text_buf do append'u.
+    } else {
+        final_envelope.payload = FlowValue::Text(text_buf.clone());
+        final_envelope
+            .context
+            .messages
+            .push(ChatMessage::assistant(text_buf));
+    }
 
     let llm_duration_ms = llm_attempt_started.elapsed().as_millis() as u64;
     let llm_usage = last_usage.unwrap_or_default();
@@ -442,10 +451,14 @@ async fn finalize_streaming_flow(
 
     let aggregate_usage = aggregate_usage(&inputs.trace);
     let total_latency_ms = inputs.started.elapsed().as_millis() as i64;
+    // finish_reason priority: cancel/error > audio_finish (chain
+    // terminal) > llm_finish > Stop default.
     let finish_reason = if cancelled {
         FinishReason::Cancelled
     } else if error.is_some() {
         FinishReason::Error
+    } else if is_audio_path {
+        last_audio_finish.unwrap_or(FinishReason::Stop)
     } else {
         last_finish.unwrap_or(FinishReason::Stop)
     };

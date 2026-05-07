@@ -327,54 +327,76 @@ pub fn validate(
         }
     }
 
-    // R7: streaming end-shape
+    // R7: streaming end-shape (Stage 3d Krok 2d update — chain support).
+    //
+    // Reguła: edge `from_port="stream"` może iść albo bezpośrednio do
+    // `output(mode=stream)`, albo do streaming-aware node'a (np. pii_filter,
+    // tts_stream_bridge), który dalej feeduje stream chain — chain musi się
+    // ostatecznie zakończyć na `output(mode=stream)`.
+    //
+    // - producent stream edge'a może mieć dwa wyjścia (np. `stream` + `full`
+    //   dla mixed blocking + streaming flow), ale `from_port="stream"`
+    //   może być tylko jeden.
+    // - intermediate chain nodes wykrywane przez walk po `from_port="stream"`
+    //   edges. Każdy intermediate node MUSI być w streaming_adapters slot
+    //   rejestru (lookup w executor — runtime fail, R7 sprawdza tylko
+    //   strukturę chain'a).
     let stream_edges: Vec<_> = def
         .edges
         .iter()
         .filter(|e| e.from_port == "stream")
         .collect();
-    if stream_edges.len() > 1 {
-        return Err(FlowValidationError::MultipleStreamingBranches {
-            count: stream_edges.len(),
-        });
-    }
-    if let Some(edge) = stream_edges.first() {
-        let to_node = nodes_by_id[edge.to.as_str()];
-        if to_node.node_type != "output" {
-            return Err(FlowValidationError::StreamingNotToOutput {
-                from_node: edge.from.clone(),
-                to_node: edge.to.clone(),
-            });
-        }
-        let mode = to_node
-            .config
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if mode != "stream" {
-            return Err(FlowValidationError::StreamingOutputModeMismatch {
-                node_id: to_node.id.clone(),
-                actual: mode.to_string(),
-            });
-        }
-    }
 
-    // R7 cont: po stream-producer LLM nie może być żadnego node'a oprócz
-    // tego output. Sprawdzamy że wszystkie outgoing edges z LLM idą tylko do
-    // tego jednego output node'a.
-    if let Some(edge) = stream_edges.first() {
-        let llm_node = edge.from.as_str();
-        let mut llm_outgoing: HashSet<&str> = HashSet::new();
-        for e in &def.edges {
-            if e.from == llm_node {
-                llm_outgoing.insert(e.to.as_str());
+    // Walk chain: zacznij od pierwszego stream edge'a, follow `from_port=
+    // "stream"` aż do output sink. Wykrywaj cykle przez seen set.
+    if !stream_edges.is_empty() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut current_id = stream_edges[0].from.as_str();
+        seen.insert(current_id);
+        loop {
+            let next_edge = def
+                .edges
+                .iter()
+                .find(|e| e.from == current_id && e.from_port == "stream");
+            let Some(edge) = next_edge else {
+                // Brak dalszego stream edge'a — chain musi się skończyć na
+                // output(mode=stream); jeśli current_id to nie output,
+                // chain wisi w powietrzu.
+                let last_node = nodes_by_id[current_id];
+                if last_node.node_type != "output" {
+                    return Err(FlowValidationError::StreamingNotToOutput {
+                        from_node: current_id.to_string(),
+                        to_node: "<chain end without output sink>".to_string(),
+                    });
+                }
+                break;
+            };
+            let to_node = nodes_by_id[edge.to.as_str()];
+            if to_node.node_type == "output" {
+                let mode = to_node
+                    .config
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if mode != "stream" {
+                    return Err(FlowValidationError::StreamingOutputModeMismatch {
+                        node_id: to_node.id.clone(),
+                        actual: mode.to_string(),
+                    });
+                }
+                break;
             }
-        }
-        if llm_outgoing.len() > 1 {
-            return Err(FlowValidationError::StreamingNotToOutput {
-                from_node: llm_node.to_string(),
-                to_node: format!("{} branches", llm_outgoing.len()),
-            });
+            // Intermediate chain node — sprawdź że nie jest cyklem. Walidacja
+            // czy node ma StreamingNodeAdapter zostaje na runtime executor
+            // lookup (R7 nie ma dostępu do streaming_adapters slot, tylko
+            // node_type registration).
+            if !seen.insert(edge.to.as_str()) {
+                return Err(FlowValidationError::StreamingNotToOutput {
+                    from_node: edge.from.clone(),
+                    to_node: format!("{} (cycle)", edge.to),
+                });
+            }
+            current_id = edge.to.as_str();
         }
     }
 
@@ -603,6 +625,75 @@ mod tests {
             err,
             FlowValidationError::EdgeTypeMismatch { side: "from", .. }
         ), "got {:?}", err);
+    }
+
+    /// Stage 3d Krok 2d: R7 update — chain z streaming-aware intermediate
+    /// nodes. Validator akceptuje `llm.stream → pii_filter → output(stream)`.
+    #[test]
+    fn accepts_streaming_chain_with_intermediate_node() {
+        use crate::flow_engine::node_adapters::PiiFilterNodeAdapter;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{}},
+                    {"id":"p","type":"pii_filter","config":{}},
+                    {"id":"o","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"p","from_port":"stream"},
+                    {"from":"p","to":"o","from_port":"stream"}
+                ]
+            }"#,
+        );
+        let res = validate(
+            &def,
+            &r,
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        );
+        assert!(res.is_ok(), "expected chain to pass R7, got: {:?}", res.err());
+    }
+
+    /// Chain bez output sink (pii_filter na końcu) odrzucony przez R7.
+    #[test]
+    fn rejects_streaming_chain_without_output_sink() {
+        use crate::flow_engine::node_adapters::PiiFilterNodeAdapter;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{}},
+                    {"id":"p","type":"pii_filter","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"p","from_port":"stream"}
+                ]
+            }"#,
+        );
+        let err = validate(
+            &def,
+            &r,
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::StreamingNotToOutput { .. }
+        ));
     }
 
     #[test]
