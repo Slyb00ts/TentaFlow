@@ -42,9 +42,23 @@ use crate::flow_engine::node_adapters::{
     TtsNodeAdapter, VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
+use crate::flow_engine::synthetic;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 const FLOW_TIMEOUT_SECS: u64 = 120;
+
+/// Wynik resolve_cached — rozróżnia 3 stany żeby caller wiedział czy aktywować
+/// synthetic fallback (NotFound) czy zwrócić błąd kompilacji (CompileFailed).
+enum ResolvedFlow {
+    Found(Arc<CachedFlow>),
+    /// Resolver nie znalazł user-defined flow dla danego (model, kind, modality).
+    /// Caller buduje synthetic ad-hoc flow (Universal Flow Gateway).
+    NotFound,
+    /// User-defined flow istnieje ale compile failed. Cache'owane jako None
+    /// żeby nie próbować ponownie do invalidate. Synthetic NIE aktywuje się
+    /// (admin chciał konkretny flow — niech go naprawi).
+    CompileFailed,
+}
 
 /// Per-request metadata przekazywane przez callera. FlowDispatcher buduje z
 /// tego `ExecutionContext` (klonując Arc'i dispatcherów + clock + blobs).
@@ -213,17 +227,28 @@ impl FlowDispatcher {
     ) -> Result<Option<FlowExecutionOutcome>> {
         let modality = derive_modality(&initial);
         let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
-        let cached = match self
+        match self
             .resolve_cached(&cache_key, model_name, service_type, modality)
             .await?
         {
-            Some(c) => c,
-            None => return Ok(None),
-        };
-        if !self.acl_allow(cached.flow.id, &meta) {
-            return Ok(None);
+            ResolvedFlow::Found(cached) => {
+                if !self.acl_allow(cached.flow.id, &meta) {
+                    return Ok(None);
+                }
+                self.run_blocking(cached.compiled.clone(), initial, meta).await
+            }
+            ResolvedFlow::NotFound => {
+                // Universal Flow Gateway — admin nie skonfigurował user-defined flow,
+                // runtime buduje synthetic ad-hoc (trigger → capability(model) → output)
+                // i wykonuje przez tę samą ścieżkę co user flow.
+                let compiled = match self.compile_synthetic_blocking(service_type, model_name) {
+                    Some(c) => c,
+                    None => return Ok(None), // unsupported service_type
+                };
+                self.run_blocking(compiled, initial, meta).await
+            }
+            ResolvedFlow::CompileFailed => Ok(None),
         }
-        self.run_blocking(cached.compiled.clone(), initial, meta).await
     }
 
     pub async fn dispatch_by_flow_id(
@@ -264,23 +289,36 @@ impl FlowDispatcher {
     ) -> Result<Option<StreamingExecution>> {
         let modality = derive_modality(&initial);
         let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
-        let cached = match self
+        let compiled = match self
             .resolve_cached(&cache_key, model_name, service_type, modality)
             .await?
         {
-            Some(c) => c,
-            None => return Ok(None),
+            ResolvedFlow::Found(cached) => {
+                if !self.acl_allow(cached.flow.id, &meta) {
+                    return Ok(None);
+                }
+                if !cached.compiled.is_streaming {
+                    // User-defined flow blocking-only — backward-compat: zostawiamy
+                    // wrapper sync→stream do Krok 0a-5 (po zmianie sygnatury na
+                    // Result<StreamingExecution, DispatchError>). Na razie caller
+                    // (routing/streaming.rs) fallback'uje do try_dispatch blocking.
+                    return Ok(None);
+                }
+                cached.compiled.clone()
+            }
+            ResolvedFlow::NotFound => {
+                // Synthetic streaming flow — chat path streamuje z LLM.
+                match self.compile_synthetic_streaming(service_type, model_name) {
+                    Some(c) => c,
+                    None => return Ok(None),
+                }
+            }
+            ResolvedFlow::CompileFailed => return Ok(None),
         };
-        if !cached.compiled.is_streaming {
-            return Ok(None);
-        }
-        if !self.acl_allow(cached.flow.id, &meta) {
-            return Ok(None);
-        }
         let ctx = self.ctx_factory.make_context(&meta);
         let stream_exec = execute_streaming(
             self.db.clone(),
-            cached.compiled.clone(),
+            compiled,
             initial,
             ctx,
             self.registry.clone(),
@@ -339,9 +377,13 @@ impl FlowDispatcher {
         model_name: &str,
         service_type: &str,
         request_modality: &'static str,
-    ) -> Result<Option<Arc<CachedFlow>>> {
+    ) -> Result<ResolvedFlow> {
+        // Cache hit: Some(cached) = Found, None = CompileFailed (negative cache)
         if let Some(slot) = self.cache.get(cache_key) {
-            return Ok(slot);
+            return Ok(match slot {
+                Some(cached) => ResolvedFlow::Found(cached),
+                None => ResolvedFlow::CompileFailed,
+            });
         }
         let pool = self.db.clone();
         let model_owned = model_name.to_string();
@@ -359,19 +401,85 @@ impl FlowDispatcher {
                             cache_key,
                             "compile failed for flow id={}: {e}", flow.id
                         );
+                        // Negative cache TYLKO dla compile failure. Admin musi
+                        // naprawić flow_json — synthetic fallback NIE aktywuje
+                        // tutaj (admin chciał konkretny flow).
                         self.cache.set(cache_key, None);
-                        return Ok(None);
+                        return Ok(ResolvedFlow::CompileFailed);
                     }
                 };
                 let cached = Arc::new(CachedFlow { flow, compiled });
                 self.cache.set(cache_key, Some(cached.clone()));
-                Ok(Some(cached))
+                Ok(ResolvedFlow::Found(cached))
             }
             None => {
-                self.cache.set(cache_key, None);
-                Ok(None)
+                // Brak negative cache dla resolver=None — synthetic ma odpalić
+                // za każdym razem (z cache w synthetic slot, LRU).
+                Ok(ResolvedFlow::NotFound)
             }
         }
+    }
+
+    /// Buduje (lub pobiera z synthetic slot cache'a) compiled synthetic blocking
+    /// flow dla pary (service_type, model). Zwraca None gdy service_type nie jest
+    /// wspierany (np. niestandardowa wartość jak "image" — Universal Gateway w v1
+    /// pokrywa chat/tts/stt/embeddings).
+    fn compile_synthetic_blocking(
+        &self,
+        service_type: &str,
+        model: &str,
+    ) -> Option<Arc<CompiledFlow>> {
+        self.compile_synthetic_inner(service_type, model, false)
+    }
+
+    fn compile_synthetic_streaming(
+        &self,
+        service_type: &str,
+        model: &str,
+    ) -> Option<Arc<CompiledFlow>> {
+        self.compile_synthetic_inner(service_type, model, true)
+    }
+
+    fn compile_synthetic_inner(
+        &self,
+        service_type: &str,
+        model: &str,
+        streaming: bool,
+    ) -> Option<Arc<CompiledFlow>> {
+        let kind = match (service_type, streaming) {
+            ("chat", false) => "chat",
+            ("chat", true) => "chat_stream",
+            ("tts", _) => "tts",
+            ("stt", _) => "stt",
+            ("embeddings", _) => "embeddings",
+            _ => return None,
+        };
+        let synth_key = format!("{}:{}", kind, model);
+        if let Some(hit) = self.cache.synthetic_get(&synth_key) {
+            return Some(hit);
+        }
+        let definition = match (service_type, streaming) {
+            ("chat", false) => synthetic::synthetic_chat(model),
+            ("chat", true) => synthetic::synthetic_chat_stream(model),
+            ("tts", _) => synthetic::synthetic_tts(model),
+            ("stt", _) => synthetic::synthetic_stt(model),
+            ("embeddings", _) => synthetic::synthetic_embeddings(model),
+            _ => return None,
+        };
+        let compiled = match CompiledFlow::compile(
+            0,
+            definition,
+            &self.registry,
+            crate::flow_engine::validation::ValidationSource::Synthetic,
+        ) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                warn!(kind, model, "synthetic compile failed: {e}");
+                return None;
+            }
+        };
+        self.cache.synthetic_set(&synth_key, compiled.clone());
+        Some(compiled)
     }
 }
 
