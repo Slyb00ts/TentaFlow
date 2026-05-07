@@ -318,6 +318,14 @@ fn openai_finish_to_envelope(s: Option<&str>) -> FinishReason {
     }
 }
 
+/// Stage 3d Krok 1a: zakładamy **single-choice-per-chunk** invariant —
+/// OpenAI streaming protocol emituje osobne SSE events dla każdego choice
+/// gdy `n>1` (każdy chunk ma `choices: [{index, delta, ...}]` z jedną
+/// pozycją). Bierzemy `chunk.choices.next()` i propagujemy `choice.index`.
+/// Wielochunkowe `chunk.choices[..]` (np. backend agreguje multiple
+/// choices per emit) **nie są wspierane** w v1 — multi-choice routing
+/// fan-out wymagałby zmiany sygnatury z `LlmStreamChunk` na `Vec<...>`,
+/// out-of-scope Krok 1.
 fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
     let mut choice_index: u32 = 0;
     let mut text_delta = String::new();
@@ -325,9 +333,6 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
     let mut finish_reason: Option<FinishReason> = None;
 
     if let Some(choice) = chunk.choices.into_iter().next() {
-        // Stage 3d Krok 1: propagate choice.index z OpenAI response.
-        // Backend zwykle zwraca n=1 (index=0), ale schemat propaguje
-        // wartość żeby multi-choice działał gdy backend wspiera.
         choice_index = choice.index;
         if let Some(c) = choice.delta.content {
             text_delta = c;
