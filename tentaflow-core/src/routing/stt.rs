@@ -304,9 +304,8 @@ impl Router {
                 // mesh inbound = remote backend call (analogiczny do
                 // HTTP/QUIC service), flow żyje po stronie inicjatora,
                 // peer wykonuje direct executor żeby zachować ultra-low
-                // latency LAN budżet (1-5ms baseline). Direct executor
-                // zostaje świadomie — to jedyny dozwolony wyjątek od
-                // "wszystko przez flow_engine" w repo.
+                // latency LAN budżet (1-5ms baseline). Jeden z 3 dozwolonych
+                // wyjątków (mesh chat + STT tutaj + embeddings via_quic).
                 let executor_snapshot = self.executor.read().clone();
                 let stt_dispatch = match executor_snapshot {
                     Some(executor) => {
