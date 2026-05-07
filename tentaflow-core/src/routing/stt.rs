@@ -82,10 +82,19 @@ impl Router {
                             });
                         }
                         Ok(None) => {
-                            tracing::warn!(
-                                model = %request.model,
-                                "stt flow_dispatch returned None — fallback to executor direct"
-                            );
+                            // Stage 3d-0b-final: Ok(None) = CompileFailed albo
+                            // unsupported service_type. Brak fallback do
+                            // executor — klient dostaje 500.
+                            return Err(crate::error::CoreError::InternalError {
+                                message: format!(
+                                    "flow_dispatcher returned no result for stt model '{}' — \
+                                     user-defined flow nie kompiluje się albo synthetic builder \
+                                     nie wspiera service_type='stt'",
+                                    request.model
+                                ),
+                                source: None,
+                            }
+                            .into());
                         }
                         Err(e) => {
                             return Err(crate::error::CoreError::InternalError {
@@ -97,68 +106,28 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "stt envelope build failed — fallback to executor");
+                    // Stage 3d-0b-final: envelope build error (np. blob put
+                    // failed) → 500. Brak fallback do executor direct.
+                    return Err(crate::error::CoreError::InternalError {
+                        message: format!("stt envelope build: {e}"),
+                        source: None,
+                    }
+                    .into());
                 }
             }
         }
 
-        // Delegate through the executor — single dispatch surface for all
-        // four routes (chat / embeddings / tts / stt). `execute_stt` is a
-        // thin wrapper over `SttRuntime` (D.3 single owner) so this path
-        // ends up in the same place as the legacy `Router.stt_runtime()`
-        // delegation; routing through the executor keeps the
-        // `routing/*` -> `services/runtime` -> backend layering uniform.
-        let executor_snapshot = self.executor.read().clone();
-        if let Some(executor) = executor_snapshot {
-            use crate::services::runtime::context::ExecutionContext;
-            use crate::services::runtime::executor::ExecutorError;
-            let mut exec_ctx = ExecutionContext {
-                user: user.clone(),
-                ..ExecutionContext::default()
-            };
-            match executor.execute_stt(request.clone(), &mut exec_ctx).await {
-                Ok(response) => {
-                    return Ok(crate::routing::RouteResult {
-                        response,
-                        metadata: crate::routing::RouteMetadata {
-                            served_by_node: hostname::get()
-                                .map(|h| h.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| "unknown".to_string()),
-                            backend_type: "executor".to_string(),
-                            strategy_used: "executor".to_string(),
-                            fallbacks_tried: 0,
-                            hop_count: 0,
-                            latency_ms: None,
-                        usage: None,
-                        finish_reason: None,
-                        },
-                    });
-                }
-                Err(ExecutorError::SttRuntimeUnavailable) => {
-                    // Codex R3b.5+6 H1: fall back ONLY for executor-not-ready;
-                    // real STT errors must surface so we don't re-dispatch
-                    // the same expensive transcription.
-                    tracing::debug!(
-                        "STT runtime not wired in executor, falling back to legacy route_audio_transcription"
-                    );
-                }
-                Err(ExecutorError::SttBackend(msg)) => {
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("STT backend error: {}", msg),
-                        source: None,
-                    }
-                    .into());
-                }
-                Err(other) => {
-                    return Err(crate::error::CoreError::InternalError {
-                        message: format!("executor.execute_stt: {}", other),
-                        source: None,
-                    }
-                    .into());
-                }
-            }
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Direct executor.execute_stt fallback wycięty.
+        Err(crate::error::CoreError::InternalError {
+            message: format!(
+                "flow_dispatcher not wired for stt model '{}' — DB-less router \
+                 nie wspiera Universal Flow Gateway",
+                request.model
+            ),
+            source: None,
         }
-        self.route_audio_transcription(request).await
+        .into())
     }
 
     pub async fn route_audio_transcription(
