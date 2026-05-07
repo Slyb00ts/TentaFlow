@@ -575,6 +575,7 @@ fn wrap_blocking_as_stream(outcome: FlowExecutionOutcome) -> StreamingExecution 
             .unwrap_or_default(),
     };
     let chunk = LlmStreamChunk {
+        choice_index: 0,
         text_delta,
         reasoning_delta: None,
         tool_calls: Vec::new(),

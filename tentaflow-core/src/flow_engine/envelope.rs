@@ -362,6 +362,12 @@ pub struct FlowExecutionOutcome {
 /// — pole jest puste/None dla większości chunków.
 #[derive(Debug, Clone, Default)]
 pub struct LlmStreamChunk {
+    /// Stage 3d Krok 1: identyfikator choice w response (OpenAI compat z
+    /// `n>1`). Default 0 — większość backendów obsługuje tylko n=1, ale
+    /// schemat jest gotowy na multi-choice. Dispatcher impl (LlmDispatcherImpl)
+    /// propaguje wartość z OpenAI streaming response; bridge w
+    /// `routing/streaming.rs` propaguje do ChatCompletionChunk.choice_index.
+    pub choice_index: u32,
     pub text_delta: String,
     pub reasoning_delta: Option<String>,
     pub tool_calls: Vec<ToolCallDelta>,
@@ -396,6 +402,25 @@ pub enum EnvelopeDelta {
     /// endpoint, NIE przez flow executor (TTS-as-flow streaming wraca
     /// w 3e+).
     Audio(AudioStreamChunk),
+}
+
+/// Stage 3d Krok 1: kind enum dla EnvelopeDelta — używane przez
+/// `StreamingNodeAdapter::stream_input_kind` / `stream_output_kind`
+/// (Krok 2) do walidacji R8 chain compatibility (text→audio transitions
+/// w `tts_stream_bridge` itp.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeDeltaKind {
+    Llm,
+    Audio,
+}
+
+impl EnvelopeDelta {
+    pub fn kind(&self) -> EnvelopeDeltaKind {
+        match self {
+            EnvelopeDelta::Llm(_) => EnvelopeDeltaKind::Llm,
+            EnvelopeDelta::Audio(_) => EnvelopeDeltaKind::Audio,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
