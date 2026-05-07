@@ -270,12 +270,7 @@ impl FlowDispatcher {
             }
             ResolvedFlow::NotFound => {
                 // Universal Flow Gateway — synthetic ad-hoc fallback.
-                let compiled = self
-                    .compile_synthetic_blocking(service_type, model_name)
-                    .ok_or_else(|| DispatchError::Unsupported {
-                        service_type: service_type.to_string(),
-                        model: model_name.to_string(),
-                    })?;
+                let compiled = self.compile_synthetic_blocking(service_type, model_name)?;
                 self.run_blocking(compiled, initial, meta)
                     .await
                     .map_err(DispatchError::from)
@@ -358,12 +353,9 @@ impl FlowDispatcher {
                 }
                 cached.compiled.clone()
             }
-            ResolvedFlow::NotFound => self
-                .compile_synthetic_streaming(service_type, model_name)
-                .ok_or_else(|| DispatchError::Unsupported {
-                    service_type: service_type.to_string(),
-                    model: model_name.to_string(),
-                })?,
+            ResolvedFlow::NotFound => {
+                self.compile_synthetic_streaming(service_type, model_name)?
+            }
             ResolvedFlow::CompileFailed => {
                 return Err(DispatchError::CompileFailed {
                     flow_id: 0,
@@ -489,7 +481,7 @@ impl FlowDispatcher {
         &self,
         service_type: &str,
         model: &str,
-    ) -> Option<Arc<CompiledFlow>> {
+    ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
         self.compile_synthetic_inner(service_type, model, false)
     }
 
@@ -497,27 +489,36 @@ impl FlowDispatcher {
         &self,
         service_type: &str,
         model: &str,
-    ) -> Option<Arc<CompiledFlow>> {
+    ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
         self.compile_synthetic_inner(service_type, model, true)
     }
 
+    /// Stage 3d-0b-final P2#2: rozdziela `Unsupported` (service_type bez
+    /// synthetic buildera) od `CompileFailed` (synthetic def istnieje ale
+    /// kompilacja flow nie przechodzi). Caller dostaje dokładną przyczynę
+    /// w error type.
     fn compile_synthetic_inner(
         &self,
         service_type: &str,
         model: &str,
         streaming: bool,
-    ) -> Option<Arc<CompiledFlow>> {
+    ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
         let kind = match (service_type, streaming) {
             ("chat", false) => "chat",
             ("chat", true) => "chat_stream",
             ("tts", _) => "tts",
             ("stt", _) => "stt",
             ("embeddings", _) => "embeddings",
-            _ => return None,
+            _ => {
+                return Err(DispatchError::Unsupported {
+                    service_type: service_type.to_string(),
+                    model: model.to_string(),
+                });
+            }
         };
         let synth_key = format!("{}:{}", kind, model);
         if let Some(hit) = self.cache.synthetic_get(&synth_key) {
-            return Some(hit);
+            return Ok(hit);
         }
         let definition = match (service_type, streaming) {
             ("chat", false) => synthetic::synthetic_chat(model),
@@ -525,7 +526,7 @@ impl FlowDispatcher {
             ("tts", _) => synthetic::synthetic_tts(model),
             ("stt", _) => synthetic::synthetic_stt(model),
             ("embeddings", _) => synthetic::synthetic_embeddings(model),
-            _ => return None,
+            _ => unreachable!("kind matched powyżej"),
         };
         let compiled = match CompiledFlow::compile(
             0,
@@ -536,11 +537,14 @@ impl FlowDispatcher {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 warn!(kind, model, "synthetic compile failed: {e}");
-                return None;
+                return Err(DispatchError::CompileFailed {
+                    flow_id: 0,
+                    msg: format!("synthetic '{kind}' compile: {e}"),
+                });
             }
         };
         self.cache.synthetic_set(&synth_key, compiled.clone());
-        Some(compiled)
+        Ok(compiled)
     }
 }
 

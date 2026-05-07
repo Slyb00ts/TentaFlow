@@ -605,9 +605,9 @@ impl Router {
                     tracing::warn!(
                         user_id = u.user_id,
                         model = %request.model,
-                        "ACL denied model access (stream)"
+                        "ACL denied chat-stream model"
                     );
-                    return Err(crate::error::CoreError::AllBackendsUnavailable {
+                    return Err(crate::error::CoreError::ModelNotFound {
                         model_name: request.model.clone(),
                     }
                     .into());
