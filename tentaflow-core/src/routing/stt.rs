@@ -39,6 +39,69 @@ impl Router {
                 }
             }
         }
+        // Stage 3d-0b-4: STT path zawsze przez FlowDispatcher (Universal
+        // Flow Gateway). Synthetic flow `trigger → stt(model) → output`
+        // aktywuje się gdy admin nie skonfigurował user-defined flow.
+        // Direct executor jako fallback dla CompileFailed / no flow_dispatcher.
+        if let Some(ref dispatcher) = self.flow_dispatcher {
+            match crate::services::runtime::executor::stt_request_to_initial_envelope(
+                &request,
+                user.clone(),
+                dispatcher.blobs(),
+            )
+            .await
+            {
+                Ok((initial, meta)) => {
+                    match dispatcher
+                        .try_dispatch(&request.model, "stt", initial, meta)
+                        .await
+                    {
+                        Ok(Some(outcome)) => {
+                            let response =
+                                crate::services::runtime::executor::flow_outcome_to_stt_response(
+                                    outcome,
+                                )
+                                .map_err(|e| crate::error::CoreError::InternalError {
+                                    message: format!("stt flow result: {e}"),
+                                    source: None,
+                                })?;
+                            return Ok(crate::routing::RouteResult {
+                                response,
+                                metadata: crate::routing::RouteMetadata {
+                                    served_by_node: hostname::get()
+                                        .map(|h| h.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| "unknown".to_string()),
+                                    backend_type: "flow_engine".to_string(),
+                                    strategy_used: "flow_dispatch".to_string(),
+                                    fallbacks_tried: 0,
+                                    hop_count: 0,
+                                    latency_ms: None,
+                                    usage: None,
+                                    finish_reason: None,
+                                },
+                            });
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                model = %request.model,
+                                "stt flow_dispatch returned None — fallback to executor direct"
+                            );
+                        }
+                        Err(e) => {
+                            return Err(crate::error::CoreError::InternalError {
+                                message: format!("stt flow dispatch: {e}"),
+                                source: None,
+                            }
+                            .into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "stt envelope build failed — fallback to executor");
+                }
+            }
+        }
+
         // Delegate through the executor — single dispatch surface for all
         // four routes (chat / embeddings / tts / stt). `execute_stt` is a
         // thin wrapper over `SttRuntime` (D.3 single owner) so this path
