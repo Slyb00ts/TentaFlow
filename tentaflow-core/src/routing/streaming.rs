@@ -10,7 +10,7 @@ use crate::api::openai::types::{
 };
 use crate::error::Result;
 use crate::routing::chat::flow_outcome_to_chat_response;
-use crate::routing::router::{RequestMetrics, Router};
+use crate::routing::router::Router;
 
 use std::pin::Pin;
 use tracing::{debug, warn};
@@ -571,11 +571,14 @@ fn wrap_with_pii_streaming(
 }
 
 impl Router {
-    /// Routuje chat completion request (STREAMING MODE).
-    ///
-    /// Analogiczna do route_chat_completion() ale zwraca Stream zamiast Response.
-    /// Obsluguje voice conversation (STT + speaker identification), intent analysis,
-    /// memory integration, PII filtering w strumieniu, memory store po zakonczeniu.
+    /// Routuje chat completion request (STREAMING MODE) przez flow_engine
+    /// (stage 3d Universal Flow Gateway). Synthetic streaming flow `trigger
+    /// → llm(model) → output(stream)` aktywuje się gdy admin nie
+    /// skonfigurował user-defined flow. User-defined blocking-only flow
+    /// jest opakowywany w single-chunk stream (wrapper sync→stream w
+    /// FlowDispatcher::try_dispatch_streaming). PII filtering pozostaje
+    /// w wire layer (legacy `wrap_with_pii_streaming`) — Krok 6 przeniesie
+    /// do `pii_filter` flow node w streaming chain.
     pub async fn route_chat_completion_stream(
         &self,
         request: ChatCompletionRequest,

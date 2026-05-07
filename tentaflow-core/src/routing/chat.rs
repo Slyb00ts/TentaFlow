@@ -25,11 +25,13 @@ impl Router {
     /// for internal callers (addons, reverse mesh, translate) that bypass
     /// ACL by design.
     ///
-    /// Dispatch order (stage 3d Universal Flow Gateway):
+    /// Dispatch (stage 3d Universal Flow Gateway):
     /// 1. Model-level ACL when a user is attached.
-    /// 2. Flow engine z synthetic ad-hoc fallback gdy admin nie skonfigurował
-    ///    user-defined flow. Każdy chat request przechodzi przez flow_engine —
-    ///    direct executor.execute_chat fallback wycięty w stage 3d-0b-final.
+    /// 2. FlowDispatcher::try_dispatch — user-defined flow (gdy admin
+    ///    skonfigurował) albo synthetic ad-hoc flow `trigger → llm(model)
+    ///    → output` (auto-fallback). Każdy chat request przechodzi przez
+    ///    flow_engine; backend dispatch idzie przez LlmDispatcherImpl →
+    ///    executor.execute_chat.
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
