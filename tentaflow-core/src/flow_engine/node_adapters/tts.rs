@@ -225,6 +225,7 @@ mod tests {
         ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>> {
             *self.last.lock().unwrap() = Some(req);
             let chunk = crate::flow_engine::dispatchers::TtsStreamChunk {
+                choice_index: 0,
                 bytes_delta: vec![0u8; 8],
                 mime: "audio/wav".into(),
                 sample_rate: Some(22_050),

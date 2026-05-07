@@ -293,6 +293,7 @@ impl StreamingNodeAdapter for TtsStreamBridgeNodeAdapter {
                                         &cleaning,
                                         &blobs,
                                         false, // not yet final — drainujemy
+                                        idx,
                                     )
                                     .await
                                     {
@@ -315,10 +316,13 @@ impl StreamingNodeAdapter for TtsStreamBridgeNodeAdapter {
                             }
                             // Wszystkie bufory drained — emit final empty
                             // chunk z finish_reason=Stop żeby klient widział
-                            // koniec stream'u.
+                            // koniec stream'u. emitted_final flag chroni
+                            // przed duplikatem (gdyby finish_reason mid-stream
+                            // już oznaczył audio chunk jako Stop, skipujemy).
                             if !emitted_final {
                                 emitted_final = true;
                                 let final_chunk = AudioStreamChunk {
+                                    choice_index: 0,
                                     bytes_delta: Vec::new(),
                                     mime: format.clone().unwrap_or_else(|| "audio/wav".into()),
                                     sample_rate: None,
@@ -361,10 +365,19 @@ impl StreamingNodeAdapter for TtsStreamBridgeNodeAdapter {
                                         &cleaning,
                                         &blobs,
                                         has_finish,
+                                        idx,
                                     )
                                     .await
                                     {
                                         Ok(Some(audio)) => {
+                                            // P1 fix: gdy LLM emituje finish_reason
+                                            // mid-stream, audio chunk już jest
+                                            // terminalny (is_final=true). Skip
+                                            // EOF empty Stop żeby nie wysyłać
+                                            // duplikatu.
+                                            if has_finish {
+                                                emitted_final = true;
+                                            }
                                             return Some((
                                                 Ok(EnvelopeDelta::Audio(audio)),
                                                 (upstream, buffers, max_chars, eof, emitted_final),
@@ -426,6 +439,7 @@ async fn synthesize_chunk(
     cleaning: &Arc<dyn crate::flow_engine::dispatchers::TtsCleaningStore>,
     blobs: &Arc<dyn crate::flow_engine::blob_store::BlobStore>,
     is_final: bool,
+    choice_index: u32,
 ) -> Result<Option<AudioStreamChunk>> {
     if cancel.is_cancelled() {
         return Ok(None);
@@ -461,6 +475,7 @@ async fn synthesize_chunk(
         .await
         .map_err(|e| anyhow!("tts_stream_bridge blob fetch: {e}"))?;
     Ok(Some(AudioStreamChunk {
+        choice_index,
         bytes_delta: bytes,
         mime: response.mime,
         sample_rate: response.sample_rate,
@@ -585,6 +600,97 @@ mod tests {
         // Synthesized = 3 zdania.
         let synthesized = fake.synthesized.lock().unwrap().clone();
         assert_eq!(synthesized.len(), 3);
+    }
+
+    /// Codex review Krok 2b P1#1: gdy LLM emituje finish_reason
+    /// mid-stream, audio chunk powinien być terminal (is_final=true)
+    /// I emitted_final flag musi być ustawione żeby EOF NIE wysłał
+    /// drugiego pustego Stop chunka. Klient nigdy nie widzi 2x Stop.
+    #[tokio::test]
+    async fn bridge_finish_reason_mid_stream_no_double_stop() {
+        let mut ctx = stub_ctx();
+        let fake = Arc::new(FakeTts {
+            synthesized: Mutex::new(Vec::new()),
+            bytes: vec![0xAA],
+        });
+        ctx.tts = fake.clone();
+        ctx.blobs = Arc::new(StaticBytesBlob(vec![0xAA]));
+
+        let upstream = futures::stream::iter(vec![Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+            choice_index: 0,
+            text_delta: "Hello world.".into(),
+            finish_reason: Some(FinishReason::Stop),
+            ..Default::default()
+        }))])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = TtsStreamBridgeNodeAdapter
+            .process_stream(&node(json!({"model": "voxcpm"})), upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        let mut chunks = Vec::new();
+        while let Some(item) = out.next().await {
+            chunks.push(item.unwrap());
+        }
+
+        // Tylko 1 chunk — audio z bytes + finish_reason=Stop. Brak
+        // duplikatu empty final.
+        assert_eq!(chunks.len(), 1);
+        let EnvelopeDelta::Audio(c) = &chunks[0] else {
+            panic!("expected Audio");
+        };
+        assert!(!c.bytes_delta.is_empty(), "audio chunk should carry bytes");
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// Codex review Krok 2b P1#2: AudioStreamChunk ma teraz choice_index
+    /// (parytet z LlmStreamChunk Krok 1a). Multi-choice n>1: 2 zdania
+    /// per choice → audio chunki niosą poprawny choice_index.
+    #[tokio::test]
+    async fn bridge_propagates_choice_index_multi_choice() {
+        let mut ctx = stub_ctx();
+        let fake = Arc::new(FakeTts {
+            synthesized: Mutex::new(Vec::new()),
+            bytes: vec![0xAA],
+        });
+        ctx.tts = fake.clone();
+        ctx.blobs = Arc::new(StaticBytesBlob(vec![0xAA]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "Choice zero.".into(), // sentence flush, idx=0
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 1,
+                text_delta: "Choice one.".into(), // sentence flush, idx=1
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = TtsStreamBridgeNodeAdapter
+            .process_stream(&node(json!({"model": "voxcpm"})), upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        let mut audios: Vec<AudioStreamChunk> = Vec::new();
+        while let Some(item) = out.next().await {
+            if let EnvelopeDelta::Audio(a) = item.unwrap() {
+                audios.push(a);
+            }
+        }
+
+        // 2 audio (po 1 per choice) + 1 final empty.
+        assert_eq!(audios.len(), 3);
+        assert_eq!(audios[0].choice_index, 0);
+        assert_eq!(audios[1].choice_index, 1);
+        // Final empty chunk → choice_index 0 (synthetic terminal).
+        assert!(audios[2].bytes_delta.is_empty());
     }
 
     #[tokio::test]

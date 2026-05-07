@@ -114,6 +114,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
             // Brak audio — zwracamy single Stop chunk z pustym payload
             // (klient widzi koniec stream'u natychmiast).
             let chunk = TtsStreamChunk {
+                choice_index: 0,
                 bytes_delta: Vec::new(),
                 mime,
                 sample_rate,
@@ -126,6 +127,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
             chunks.into_iter().enumerate().map(move |(idx, chunk_bytes)| {
                 let is_last = idx + 1 == total;
                 Ok(TtsStreamChunk {
+                    choice_index: 0,
                     bytes_delta: chunk_bytes,
                     mime: mime.clone(),
                     sample_rate,
@@ -215,6 +217,7 @@ mod tests {
         let cancel_for_stream = cancel.clone();
         let chunks: Vec<TtsStreamChunk> = (0..5)
             .map(|i| TtsStreamChunk {
+                choice_index: 0,
                 bytes_delta: vec![i as u8],
                 mime: "audio/wav".into(),
                 sample_rate: Some(16000),

@@ -425,6 +425,11 @@ impl EnvelopeDelta {
 
 #[derive(Debug, Clone)]
 pub struct AudioStreamChunk {
+    /// Stage 3d Krok 2b fix: identyfikator choice (parytet z
+    /// `LlmStreamChunk.choice_index`) — pozwala downstream rozróżnić
+    /// które zdanie należy do którego LLM choice w n>1 streamach.
+    /// Default 0 (większość backendów n=1).
+    pub choice_index: u32,
     pub bytes_delta: Vec<u8>,
     pub mime: String,
     pub sample_rate: Option<u32>,
