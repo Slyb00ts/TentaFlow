@@ -347,6 +347,24 @@ pub fn validate(
         .filter(|e| e.from_port == "stream")
         .collect();
 
+    // R7 multi-branch guard: każdy node może mieć MAX 1 wychodzący edge
+    // z `from_port="stream"`. Linear chain (stream → stream → stream)
+    // OK; równoległe rozgałęzienie (jeden node ma 2 stream edges →
+    // różne sink'i) odrzucone — runtime executor i tak fold'uje tylko
+    // jedną ścieżkę, druga byłaby ignorowana.
+    let mut stream_out_count: HashMap<&str, usize> = HashMap::new();
+    for edge in &stream_edges {
+        *stream_out_count.entry(edge.from.as_str()).or_insert(0) += 1;
+    }
+    for (node_id, count) in &stream_out_count {
+        if *count > 1 {
+            return Err(FlowValidationError::MultipleStreamingBranches {
+                count: *count,
+            });
+        }
+        let _ = node_id;
+    }
+
     // Walk chain: zacznij od pierwszego stream edge'a, follow `from_port=
     // "stream"` aż do output sink. Wykrywaj cykle przez seen set.
     if !stream_edges.is_empty() {
@@ -659,6 +677,45 @@ mod tests {
             crate::flow_engine::validation::ValidationSource::UserDefined,
         );
         assert!(res.is_ok(), "expected chain to pass R7, got: {:?}", res.err());
+    }
+
+    /// R7 multi-branch guard: pojedynczy node nie może mieć dwóch
+    /// wychodzących stream edges. Walidator wcześniej milczał i runtime
+    /// fold'ował tylko jedną ścieżkę, druga była ignorowana.
+    #[test]
+    fn rejects_multiple_stream_branches_from_same_node() {
+        use crate::flow_engine::node_adapters::PiiFilterNodeAdapter;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{}},
+                    {"id":"o1","type":"output","config":{"mode":"stream"}},
+                    {"id":"o2","type":"output","config":{"mode":"stream"}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l"},
+                    {"from":"l","to":"o1","from_port":"stream"},
+                    {"from":"l","to":"o2","from_port":"stream"}
+                ]
+            }"#,
+        );
+        let err = validate(
+            &def,
+            &r,
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::MultipleStreamingBranches { .. }
+        ));
     }
 
     /// Chain bez output sink (pii_filter na końcu) odrzucony przez R7.

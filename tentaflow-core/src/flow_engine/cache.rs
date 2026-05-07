@@ -466,6 +466,50 @@ mod tests {
         let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
         assert!(cf.is_streaming);
         assert_eq!(cf.streaming_llm_run_idx(), Some(1));
+        // Stage 3d Krok 2c: chain pusty dla direct LLM → output (output
+        // jest sink'iem, NIE w chain'ie).
+        assert!(cf.streaming_chain_run_idxs().is_empty());
+    }
+
+    /// Stage 3d Krok 2c: streaming_chain_run_idxs walks intermediate
+    /// streaming-aware nodes po LLM. Test używa pii_filter (rejestrowany
+    /// jako StreamingNodeAdapter w lokalnym registry).
+    #[test]
+    fn compile_streaming_chain_run_idxs_intermediate_node() {
+        use crate::flow_engine::node_adapters::PiiFilterNodeAdapter;
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(ConditionNodeAdapter::new()));
+        r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+
+        let json = r#"{
+            "nodes": [
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"l","type":"llm","config":{"model":"m"}},
+                {"id":"p","type":"pii_filter","config":{}},
+                {"id":"o","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges": [
+                {"from":"t","to":"l"},
+                {"from":"l","to":"p","from_port":"stream"},
+                {"from":"p","to":"o","from_port":"stream"}
+            ]
+        }"#;
+        let cf = CompiledFlow::from_json(
+            1,
+            json,
+            &r,
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap();
+        let chain = cf.streaming_chain_run_idxs();
+        assert_eq!(chain.len(), 1);
+        // Chain pos to run_idx pii_filter — czyli execution_order[chain[0]]
+        // wskazuje na node z node_type=='pii_filter'.
+        let def_idx = cf.execution_order[chain[0]];
+        assert_eq!(cf.definition.nodes[def_idx].node_type, "pii_filter");
     }
 
     #[test]
