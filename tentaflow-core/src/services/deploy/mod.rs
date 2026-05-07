@@ -1655,7 +1655,7 @@ mod tests {
         let conn = db.lock().unwrap();
         let (status, error_text): (String, Option<String>) = conn
             .query_row(
-                "SELECT status, error_text FROM deployments WHERE engine_id = 'emb-collide'",
+                "SELECT status, error_message FROM deployments WHERE engine_id = 'emb-collide'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1778,7 +1778,7 @@ mod tests {
         let conn = db.lock().unwrap();
         let (status, err): (String, Option<String>) = conn
             .query_row(
-                "SELECT status, error_text FROM deployments WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",
+                "SELECT status, error_message FROM deployments WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
