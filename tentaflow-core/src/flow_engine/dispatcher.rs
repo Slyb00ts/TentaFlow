@@ -30,7 +30,9 @@ use crate::flow_engine::dispatchers_impl::{
     MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
     SttDispatcherImpl, SttRuntimeSlot, TtsCleaningStoreImpl, TtsDispatcherImpl,
 };
-use crate::flow_engine::envelope::{FlowEnvelope, FlowExecutionOutcome};
+use crate::flow_engine::envelope::{
+    EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
+};
 use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
 use crate::flow_engine::node_adapter::{
     AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink,
@@ -298,11 +300,13 @@ impl FlowDispatcher {
                     return Ok(None);
                 }
                 if !cached.compiled.is_streaming {
-                    // User-defined flow blocking-only — backward-compat: zostawiamy
-                    // wrapper sync→stream do Krok 0a-5 (po zmianie sygnatury na
-                    // Result<StreamingExecution, DispatchError>). Na razie caller
-                    // (routing/streaming.rs) fallback'uje do try_dispatch blocking.
-                    return Ok(None);
+                    // User-defined blocking-only flow — wykonaj blocking
+                    // i opakuj outcome jako single-chunk stream (parity z
+                    // streaming end-shape contract dla callera).
+                    let outcome = self
+                        .run_blocking(cached.compiled.clone(), initial, meta)
+                        .await?;
+                    return Ok(outcome.map(wrap_blocking_as_stream));
                 }
                 cached.compiled.clone()
             }
@@ -487,10 +491,37 @@ impl FlowDispatcher {
 /// flows MUSZĄ być explicit bound, default flow działa tylko dla text.
 /// `Image` payload → "image", reszta (Text/Empty/Json/...) → "text".
 fn derive_modality(envelope: &FlowEnvelope) -> &'static str {
-    use crate::flow_engine::envelope::FlowValue;
     match envelope.payload {
         FlowValue::Image { .. } => "image",
         _ => "text",
+    }
+}
+
+/// Stage 3d-0a-5: opakowuje blocking `FlowExecutionOutcome` w `StreamingExecution`
+/// żeby user-defined blocking-only flow miał ten sam wire shape co native
+/// streaming flow. Klient SSE konsumuje jednolicie — single chunk z całością
+/// payloadu + finish_reason ze stop. Outcome `oneshot` channel jest natychmiast
+/// rozwiązany — wrapper nie czeka na EOF, blocking już skończył.
+fn wrap_blocking_as_stream(outcome: FlowExecutionOutcome) -> StreamingExecution {
+    use futures::stream::StreamExt;
+    let text_delta = match &outcome.final_envelope.payload {
+        FlowValue::Text(t) => t.clone(),
+        _ => String::new(),
+    };
+    let chunk = LlmStreamChunk {
+        text_delta,
+        reasoning_delta: None,
+        tool_calls: Vec::new(),
+        usage: Some(outcome.usage.clone()),
+        finish_reason: Some(outcome.finish_reason.clone()),
+        error: outcome.error.clone(),
+    };
+    let stream = futures::stream::once(async move { Ok(EnvelopeDelta::Llm(chunk)) }).boxed();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(outcome);
+    StreamingExecution {
+        stream,
+        outcome: rx,
     }
 }
 
