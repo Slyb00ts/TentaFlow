@@ -354,11 +354,7 @@ async fn handle_chat_completions(
             }
             Err(e) => {
                 error!("Blad routing (streaming): {}", e);
-                Ok(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    e.to_string(),
-                ))
+                Ok(core_error_to_response(&e))
             }
         }
     } else {
@@ -546,11 +542,7 @@ async fn handle_audio_tts(
         }
         Err(e) => {
             error!("TTS error: {}", e);
-            Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("TTS synthesis failed: {}", e),
-            ))
+            Ok(core_error_to_response(&e))
         }
     }
 }
@@ -981,11 +973,7 @@ async fn handle_audio_transcriptions(
         }
         Err(e) => {
             error!("Blad routingu audio transcription: {}", e);
-            Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "backend_error",
-                format!("Blad przetwarzania audio: {}", e),
-            ))
+            Ok(core_error_to_response(&e))
         }
     }
 }
