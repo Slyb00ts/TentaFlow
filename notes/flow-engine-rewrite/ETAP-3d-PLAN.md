@@ -28,8 +28,9 @@
   to remote backend call analogiczny do HTTP/QUIC service, flow żyje
   po stronie inicjatora. **Trzy** mesh inbound paths zostają direct
   executor — z explicit komentarzami `// EXEMPT-MESH-INBOUND`:
-  `mesh/inference_proxy.rs:190` (chat), `routing/stt.rs:301`
-  (protocol-native STT), `routing/embeddings.rs:222` (route_embeddings_via_quic).
+  `mesh/inference_proxy.rs` (chat handle_inference_request), `routing/stt.rs`
+  (route_audio_via_protocol — protocol-native STT), `routing/embeddings.rs`
+  (route_embeddings_via_quic).
   Wszystkie 3 są wywoływane **tylko** z mesh reverse path
   (`route_audio_via_protocol`, `route_embeddings_via_quic`,
   `inference_proxy::handle_inference_request`), nigdy z HTTP entrypoint.
@@ -58,11 +59,11 @@ psuje budżet latencji.
 
 Trzy mesh inbound callsites zachowane z komentarzami `EXEMPT-MESH-INBOUND`:
 
-| Plik:linia | Wywoływane z | Service |
+| Plik | Wywoływane z | Service |
 |---|---|---|
-| `mesh/inference_proxy.rs:190` | `inference_proxy::handle_inference_request` | chat |
-| `routing/stt.rs:301` | `Router::route_audio_via_protocol` | STT |
-| `routing/embeddings.rs:222` | `Router::route_embeddings_via_quic` | embeddings |
+| `mesh/inference_proxy.rs` | `inference_proxy::handle_inference_request` | chat |
+| `routing/stt.rs` | `Router::route_audio_via_protocol` | STT |
+| `routing/embeddings.rs` | `Router::route_embeddings_via_quic` | embeddings |
 
 ```rust
 // EXEMPT-MESH-INBOUND: direct executor call jest celowy.
@@ -132,11 +133,14 @@ Jeśli admin chce PII na danym modelu — definiuje flow w DB z
 
 **Mesh inbound paths zostają jako EXEMPT-MESH-INBOUND** (3 callsites,
 nie wymienione w tabeli powyżej bo są celowo zachowane):
-- `mesh/inference_proxy.rs:190` — chat reverse z mesh peer
-- `routing/stt.rs:301` (route_audio_via_protocol) — STT mesh reverse
-- `routing/embeddings.rs:222` (route_embeddings_via_quic) — embeddings mesh reverse
+- `mesh/inference_proxy.rs` (`handle_inference_request`) — chat reverse
+- `routing/stt.rs` (`route_audio_via_protocol`) — STT mesh reverse
+- `routing/embeddings.rs` (`route_embeddings_via_quic`) — embeddings mesh reverse
 
-Rationale w sekcji "Mesh exception" powyżej.
+Konkretne line numbers ulegają zmianie podczas refaktorów; szukaj
+markera `EXEMPT-MESH-INBOUND` w kodzie:
+`rg -n 'EXEMPT-MESH-INBOUND' tentaflow-core/src`. Rationale w sekcji
+"Mesh exception" powyżej.
 
 Po cięciach: `routing/*` ma **jedyne** wywołanie do `flow_engine` —
 brak direct executor calls. `ModelRuntimeExecutor::execute_*` wołane
