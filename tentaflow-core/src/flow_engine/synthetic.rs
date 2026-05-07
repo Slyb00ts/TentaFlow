@@ -13,26 +13,30 @@ use serde_json::json;
 
 use crate::flow_engine::types::{FlowDefinition, FlowEdge, FlowNode};
 
-/// Synthetic chat flow: trigger → llm(model) → output(blocking).
-/// Streaming tryb wybierany jest na poziomie executora (LLM adapter umie
-/// oba), więc synthetic ma jeden kształt który chat-blocking i chat-stream
-/// path mogą reużyć.
+/// Synthetic chat flow: trigger → llm(model) → pii_filter → output.
+/// `pii_filter` wstawiony domyślnie żeby utrzymać security parity po
+/// demolicji wire-layer middleware (Krok 6) — bez node'a synthetic flow
+/// wypuściłby raw LLM output bez czyszczenia PII.
 pub fn synthetic_chat(model: &str) -> FlowDefinition {
     FlowDefinition {
         nodes: vec![
             trigger_node(),
             capability_node("llm", "l1", model),
+            pii_filter_node(),
             output_node(),
         ],
         edges: vec![
             edge("t1", "l1", "full", "in"),
-            edge("l1", "o1", "full", "in"),
+            edge("l1", "p1", "full", "in"),
+            edge("p1", "o1", "full", "in"),
         ],
     }
 }
 
-/// Synthetic chat-stream flow: trigger → llm(model) → output(stream).
-/// LLM emituje przez port `stream`; output ma `mode=stream`.
+/// Synthetic chat-stream flow: trigger → llm(model) → pii_filter →
+/// output(stream). LLM emituje przez `stream` port, pii_filter (jako
+/// `StreamingNodeAdapter`) przepuszcza i wycina PII per zdanie, sink ma
+/// `mode=stream`.
 pub fn synthetic_chat_stream(model: &str) -> FlowDefinition {
     let mut output = output_node();
     output.config = json!({ "mode": "stream" });
@@ -40,11 +44,13 @@ pub fn synthetic_chat_stream(model: &str) -> FlowDefinition {
         nodes: vec![
             trigger_node(),
             capability_node("llm", "l1", model),
+            pii_filter_node(),
             output,
         ],
         edges: vec![
             edge("t1", "l1", "full", "in"),
-            edge("l1", "o1", "stream", "in"),
+            edge("l1", "p1", "stream", "in"),
+            edge("p1", "o1", "stream", "in"),
         ],
     }
 }
@@ -114,6 +120,16 @@ fn capability_node(node_type: &str, id: &str, model: &str) -> FlowNode {
     }
 }
 
+fn pii_filter_node() -> FlowNode {
+    FlowNode {
+        id: "p1".to_string(),
+        node_type: "pii_filter".to_string(),
+        config: serde_json::Value::Null,
+        position: None,
+        label: None,
+    }
+}
+
 fn output_node() -> FlowNode {
     FlowNode {
         id: "o1".to_string(),
@@ -142,7 +158,9 @@ mod tests {
     use super::*;
     use crate::flow_engine::cache::CompiledFlow;
     use crate::flow_engine::node_adapter::AdapterRegistry;
-    use crate::flow_engine::node_adapters::{LlmNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter};
+    use crate::flow_engine::node_adapters::{
+        LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
+    };
     use crate::flow_engine::validation::ValidationSource;
     use std::sync::Arc;
 
@@ -150,6 +168,7 @@ mod tests {
         let mut r = AdapterRegistry::new();
         r.register(Arc::new(TriggerNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
         r.register_llm(Arc::new(LlmNodeAdapter::new()));
         r
     }

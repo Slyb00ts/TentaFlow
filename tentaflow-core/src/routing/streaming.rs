@@ -377,201 +377,6 @@ enum UsageSplitState {
     Done,
 }
 
-fn wrap_with_pii_streaming(
-    upstream: std::pin::Pin<
-        Box<
-            dyn futures::Stream<
-                    Item = crate::error::Result<
-                        crate::api::openai::types::ChatCompletionChunk,
-                    >,
-                > + Send,
-        >,
-    >,
-    response_middleware: std::sync::Arc<crate::middleware::response::ResponseMiddleware>,
-) -> std::pin::Pin<
-    Box<
-        dyn futures::Stream<
-                Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
-            > + Send,
-    >,
-> {
-    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
-    use crate::middleware::response::StreamingProcessor;
-    use futures::StreamExt;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    type ProcMap = HashMap<u32, (StreamingProcessor, StreamingProcessor)>;
-    let processors: Arc<Mutex<ProcMap>> = Arc::new(Mutex::new(HashMap::new()));
-    let template: Arc<Mutex<Option<ChatCompletionChunk>>> = Arc::new(Mutex::new(None));
-    let pending_finishes: Arc<Mutex<Vec<ChatCompletionChunk>>> =
-        Arc::new(Mutex::new(Vec::new()));
-
-    let p_filter = processors.clone();
-    let t_filter = template.clone();
-    let rm_filter = response_middleware.clone();
-    let pf_filter = pending_finishes.clone();
-
-    let filtered = upstream.flat_map(move |chunk_result| {
-        let outputs: Vec<crate::error::Result<ChatCompletionChunk>> = match chunk_result {
-            Err(e) => vec![Err(e)],
-            Ok(chunk) => {
-                // Etap 3a: tail chunk z usage (choices.is_empty() && usage.is_some())
-                // przepuszczamy untouched — brak tekstu do filtrowania, OpenAI
-                // contract wymaga że tail leci PRZED [DONE] w czystej formie.
-                if chunk.choices.is_empty() && chunk.usage.is_some() {
-                    return futures::stream::iter(vec![Ok(chunk)]);
-                }
-                {
-                    let mut tpl = t_filter.lock().unwrap();
-                    if tpl.is_none() {
-                        let mut empty = chunk.clone();
-                        empty.choices.clear();
-                        *tpl = Some(empty);
-                    }
-                }
-                let mut procs = p_filter.lock().unwrap();
-                let mut content_choices: Vec<ChunkChoice> = Vec::new();
-                let mut finish_choices: Vec<ChunkChoice> = Vec::new();
-                let mut error: Option<anyhow::Error> = None;
-
-                for choice in chunk.choices.iter() {
-                    let entry = procs.entry(choice.index).or_insert_with(|| {
-                        (
-                            rm_filter.streaming_processor(),
-                            rm_filter.streaming_processor(),
-                        )
-                    });
-
-                    let mut processed = choice.clone();
-                    if let Some(text) = &choice.delta.content {
-                        if !text.is_empty() {
-                            match entry.0.process_token(text) {
-                                Ok(Some(cleaned)) => {
-                                    processed.delta.content = Some(cleaned.join(""))
-                                }
-                                Ok(None) => processed.delta.content = Some(String::new()),
-                                Err(e) => {
-                                    error = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(text) = &choice.delta.reasoning_content {
-                        if !text.is_empty() {
-                            match entry.1.process_token(text) {
-                                Ok(Some(cleaned)) => {
-                                    processed.delta.reasoning_content = Some(cleaned.join(""))
-                                }
-                                Ok(None) => {
-                                    processed.delta.reasoning_content = Some(String::new())
-                                }
-                                Err(e) => {
-                                    error = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if processed.finish_reason.is_some() {
-                        let has_content = processed
-                            .delta
-                            .content
-                            .as_deref()
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                            || processed
-                                .delta
-                                .reasoning_content
-                                .as_deref()
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false)
-                            || processed.delta.tool_calls.is_some();
-                        if has_content {
-                            let mut content_only = processed.clone();
-                            content_only.finish_reason = None;
-                            content_choices.push(content_only);
-                        }
-                        let mut finish_only = processed;
-                        finish_only.delta.content = None;
-                        finish_only.delta.reasoning_content = None;
-                        finish_only.delta.tool_calls = None;
-                        finish_choices.push(finish_only);
-                    } else {
-                        content_choices.push(processed);
-                    }
-                }
-                drop(procs);
-
-                if let Some(e) = error {
-                    vec![Err(e)]
-                } else {
-                    if !finish_choices.is_empty() {
-                        let mut hold = chunk.clone();
-                        hold.choices = finish_choices;
-                        pf_filter.lock().unwrap().push(hold);
-                    }
-                    if content_choices.is_empty() {
-                        Vec::new()
-                    } else {
-                        let mut out = chunk;
-                        out.choices = content_choices;
-                        vec![Ok(out)]
-                    }
-                }
-            }
-        };
-        futures::stream::iter(outputs)
-    });
-
-    let p_flush = processors.clone();
-    let t_flush = template.clone();
-    let pf_tail = pending_finishes.clone();
-    let tail = futures::stream::once(async move {
-        let mut out: Vec<crate::error::Result<ChatCompletionChunk>> = Vec::new();
-        let template = t_flush.lock().unwrap().clone();
-        if let Some(template) = template {
-            let mut procs = p_flush.lock().unwrap();
-            for (idx, (content_proc, reasoning_proc)) in procs.iter_mut() {
-                let content_tail = content_proc.flush().unwrap_or_default().join("");
-                let reasoning_tail = reasoning_proc.flush().unwrap_or_default().join("");
-                if content_tail.is_empty() && reasoning_tail.is_empty() {
-                    continue;
-                }
-                let mut chunk = template.clone();
-                chunk.choices = vec![ChunkChoice {
-                    index: *idx,
-                    delta: Delta {
-                        role: None,
-                        content: if content_tail.is_empty() {
-                            None
-                        } else {
-                            Some(content_tail)
-                        },
-                        reasoning_content: if reasoning_tail.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning_tail)
-                        },
-                        tool_calls: None,
-                    },
-                    finish_reason: None,
-                    logprobs: None,
-                }];
-                out.push(Ok(chunk));
-            }
-        }
-        for finish in pf_tail.lock().unwrap().drain(..) {
-            out.push(Ok(finish));
-        }
-        out
-    })
-    .flat_map(futures::stream::iter);
-
-    Box::pin(filtered.chain(tail))
-}
 
 impl Router {
     /// Routuje chat completion request (STREAMING MODE) przez flow_engine
@@ -579,9 +384,10 @@ impl Router {
     /// → llm(model) → output(stream)` aktywuje się gdy admin nie
     /// skonfigurował user-defined flow. User-defined blocking-only flow
     /// jest opakowywany w single-chunk stream (wrapper sync→stream w
-    /// FlowDispatcher::try_dispatch_streaming). PII filtering pozostaje
-    /// w wire layer (legacy `wrap_with_pii_streaming`) — Krok 6 przeniesie
-    /// do `pii_filter` flow node w streaming chain.
+    /// FlowDispatcher::try_dispatch_streaming). PII cleaning idzie przez
+    /// `pii_filter` StreamingNodeAdapter wewnątrz flow_engine — synthetic
+    /// chat-stream wstrzykuje node domyślnie; user-defined flow musi mieć
+    /// node explicite (R-SAFETY w Krok 7).
     pub async fn route_chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
@@ -696,8 +502,12 @@ impl Router {
                         model_for_stream,
                         include_usage,
                     );
-                    let filtered =
-                        wrap_with_pii_streaming(chunk_stream, self.response_middleware.clone());
+                    // PII cleaning idzie teraz przez `pii_filter`
+                    // StreamingNodeAdapter wewnątrz flow_engine — wire
+                    // layer już nie filtruje. Synthetic chat-stream
+                    // automatycznie wpina pii_filter; user-defined flowy
+                    // muszą deklarować node explicite (R-SAFETY w Krok 7).
+                    let filtered = chunk_stream;
                     let cancel_wrapped: std::pin::Pin<
                         Box<
                             dyn futures::Stream<
@@ -856,24 +666,4 @@ mod include_usage_tests {
         assert_eq!(collected.len(), 2);
     }
 
-    /// PII filter passes chunks z choices.is_empty()+usage.is_some() untouched.
-    #[tokio::test]
-    async fn pii_filter_bypasses_tail_chunk() {
-        use crate::middleware::response::ResponseMiddleware;
-        // PII middleware z disabled flag — wystarcza dla testu bypass'u tail.
-        let rm = std::sync::Arc::new(ResponseMiddleware::new(false));
-        let usage = Some(Usage {
-            prompt_tokens: 1,
-            completion_tokens: 2,
-            total_tokens: 3,
-        });
-        let mut tail = chunk_with_usage("", true, usage);
-        tail.choices = vec![]; // proper tail shape
-        let chunks = vec![Ok(tail.clone())];
-        let inner = futures::stream::iter(chunks);
-        let mut out = wrap_with_pii_streaming(Box::pin(inner), rm);
-        let c = out.next().await.unwrap().unwrap();
-        assert!(c.choices.is_empty());
-        assert!(c.usage.is_some());
-    }
 }

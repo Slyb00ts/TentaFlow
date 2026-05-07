@@ -135,8 +135,7 @@ impl Router {
                         .finish_reason
                         .as_openai_str()
                         .map(|s| s.to_string());
-                    let mut response = flow_outcome_to_chat_response(outcome, &request.model);
-                    self.apply_response_middleware(&mut response)?;
+                    let response = flow_outcome_to_chat_response(outcome, &request.model);
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
                             .map(|h| h.to_string_lossy().to_string())
@@ -171,36 +170,6 @@ impl Router {
         }
         .into())
     }
-
-    /// Codex H1 + H3 round 2: jedyny single point gdzie aplikujemy
-    /// `response_middleware.clean_text` na response. Kazda sciezka chat
-    /// (executor success, flow_engine try_dispatch result, legacy
-    /// dispatch_with_fallback) MUSI wolac to przed return zeby PII filter
-    /// nie zostal bypassowany. Lustro per-token logiki w streaming.rs
-    /// (StreamingProcessor scan + EOF flush).
-    fn apply_response_middleware(
-        &self,
-        response: &mut ChatCompletionResponse,
-    ) -> Result<()> {
-        for choice in &mut response.choices {
-            if let Some(MessageContent::Text(text)) = choice.message.content.as_mut() {
-                let cleaned = self
-                    .response_middleware
-                    .clean_text(text)
-                    .map_err(|e| anyhow::anyhow!("response_middleware.clean_text: {}", e))?;
-                *text = cleaned;
-            }
-            if let Some(reasoning) = choice.message.reasoning_content.as_mut() {
-                let cleaned = self
-                    .response_middleware
-                    .clean_text(reasoning)
-                    .map_err(|e| anyhow::anyhow!("response_middleware.clean_text: {}", e))?;
-                *reasoning = cleaned;
-            }
-        }
-        Ok(())
-    }
-
 
     pub async fn route_memory_via_quic(
         &self,
@@ -313,8 +282,11 @@ impl Router {
             Ok(route_result) => {
                 let response = route_result.response;
                 let content = crate::routing::extract_response_text(&response);
-
-                let cleaned_content = self.response_middleware.clean_text(&content)?;
+                // Vision passes przez `route_chat_completion` → flow_engine,
+                // gdzie pii_filter już sprzątnął tekst. Nie filtrujemy
+                // dwa razy — w przeciwnym razie tracilibyśmy intencje
+                // syntetycznego/usera flow który wyłączył filter celowo.
+                let cleaned_content = content;
 
                 let finish_reason = response
                     .choices

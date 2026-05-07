@@ -9,7 +9,6 @@ use crate::config::RouterConfig;
 use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
-use crate::middleware::ResponseMiddleware;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 use std::collections::HashMap;
@@ -30,9 +29,6 @@ use tracing::info;
 pub struct Router {
     /// Service Manager - zarzadza wszystkimi serwisami asynchronicznie
     pub(crate) service_manager: Arc<ServiceManager>,
-
-    /// Response middleware dla filtrowania PII
-    pub(crate) response_middleware: Arc<ResponseMiddleware>,
 
     /// Flow Engine dispatcher - opcjonalny, aktywny gdy DB jest dostepna
     pub(crate) flow_dispatcher: Option<Arc<FlowDispatcher>>,
@@ -215,12 +211,7 @@ impl Router {
         // byl ustawiony PRZED uruchomieniem petli (inaczej meeting-bot nie dostanie listenera).
         // service_manager.spawn_connection_tasks();
 
-        // === KROK 3: INICJALIZUJ RESPONSE MIDDLEWARE ===
-        let response_middleware = Arc::new(ResponseMiddleware::new(
-            config.middleware.response_filtering_enabled,
-        ));
-
-        // === KROK 4: INICJALIZUJ FLOW DISPATCHER ===
+        // === KROK 3: INICJALIZUJ FLOW DISPATCHER ===
         // R2a: Adapter LLM potrzebuje executor'a, ktory powstaje DOPIERO po
         // FlowDispatcher (cykl: executor->dispatcher->adapter->executor).
         // Tworzymy pusty slot teraz; Router::new wpisze executor po
@@ -279,7 +270,6 @@ impl Router {
 
         let router = Self {
             service_manager: service_manager.clone(),
-            response_middleware,
             flow_dispatcher: flow_dispatcher.clone(),
             db: db_clone,
             mesh_manager: Arc::new(parking_lot::RwLock::new(None)),
@@ -318,7 +308,6 @@ impl Router {
                 local_inference.clone(),
                 router.stt_runtime.clone(),
                 router.mesh_manager.clone(),
-                Vec::new(),
             ));
             *executor_slot.write() = Some(executor);
         }
