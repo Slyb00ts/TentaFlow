@@ -237,22 +237,62 @@ pub async fn execute_streaming(
         .await
         .map_err(|e| anyhow!("stream_chat failed: {e}"))?;
 
-    let cancel = ctx.cancel_token.clone();
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
-    let (outcome_tx, outcome_rx) = oneshot::channel::<FlowExecutionOutcome>();
+    // Stage 3d Krok 2c-2: mapuj LlmStreamChunk → EnvelopeDelta::Llm
+    // (envelope-level stream pomiędzy nodami chain'a).
+    use futures::stream::StreamExt;
+    let mut envelope_stream: BoxStream<'static, Result<EnvelopeDelta>> = adapter_stream
+        .map(|res| res.map(EnvelopeDelta::Llm))
+        .boxed();
 
-    // Materializujemy parametry potrzebne po move'ie do task'a.
+    // Stage 3d Krok 2c-2: fold streaming chain (intermediate streaming-aware
+    // nodes po LLM, np. pii_filter / tts_stream_bridge). Każdy node
+    // konsumuje upstream EnvelopeDelta i produkuje downstream — mogą zmienić
+    // kind (LLM → Audio przez tts_stream_bridge).
     let llm_input_envelope = llm_inputs
         .first()
         .map(|i| i.envelope.clone())
         .unwrap_or_else(|| initial_arc.clone());
+    let chain_run_idxs = compiled.streaming_chain_run_idxs();
+    for chain_run_idx in chain_run_idxs {
+        let chain_def_idx = compiled.execution_order[chain_run_idx];
+        let chain_node = &compiled.definition.nodes[chain_def_idx];
+        let streaming = adapters
+            .streaming_adapter(&chain_node.node_type)
+            .ok_or_else(|| {
+                anyhow!(
+                    "streaming chain node '{}' (type '{}') missing StreamingNodeAdapter — \
+                     compile-time R7 should have rejected this",
+                    chain_node.id,
+                    chain_node.node_type
+                )
+            })?;
+        envelope_stream = streaming
+            .process_stream(
+                chain_node,
+                envelope_stream,
+                llm_input_envelope.clone(),
+                &ctx,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "chain node '{}' process_stream failed: {e}",
+                    chain_node.id
+                )
+            })?;
+    }
+
+    let cancel = ctx.cancel_token.clone();
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
+    let (outcome_tx, outcome_rx) = oneshot::channel::<FlowExecutionOutcome>();
+
     let llm_node_id = llm_node.id.clone();
     let llm_node_type = llm_node.node_type.clone();
     let db_for_task = db.clone();
 
     tokio::spawn(finalize_streaming_flow(
         execution_id,
-        adapter_stream,
+        envelope_stream,
         outbound_tx,
         outcome_tx,
         cancel,
@@ -289,7 +329,7 @@ struct FinalizerInputs {
 
 async fn finalize_streaming_flow(
     execution_id: i64,
-    mut adapter_stream: BoxStream<'static, Result<LlmStreamChunk>>,
+    mut envelope_stream: BoxStream<'static, Result<EnvelopeDelta>>,
     outbound_tx: mpsc::Sender<Result<EnvelopeDelta>>,
     outcome_tx: oneshot::Sender<FlowExecutionOutcome>,
     cancel: CancellationToken,
@@ -301,6 +341,12 @@ async fn finalize_streaming_flow(
     let mut reasoning_buf = String::new();
     let mut last_finish: Option<FinishReason> = None;
     let mut last_usage: Option<TokenUsage> = None;
+    // Stage 3d Krok 2c-2: audio path agregator. Audio chunki z chain
+    // (np. tts_stream_bridge) — outcome.payload to Empty (klient
+    // skonsumował bytes przez SSE), ale finish_reason agregowany
+    // dla wire trailers.
+    let mut last_audio_finish: Option<FinishReason> = None;
+    let mut audio_chunks_emitted: usize = 0;
     let llm_attempt_started = Instant::now();
 
     'main: loop {
@@ -310,8 +356,8 @@ async fn finalize_streaming_flow(
                 cancelled = true;
                 break 'main;
             }
-            chunk = adapter_stream.next() => match chunk {
-                Some(Ok(c)) => {
+            delta = envelope_stream.next() => match delta {
+                Some(Ok(EnvelopeDelta::Llm(c))) => {
                     if !c.text_delta.is_empty() {
                         text_buf.push_str(&c.text_delta);
                     }
@@ -331,8 +377,22 @@ async fn finalize_streaming_flow(
                             break 'main;
                         }
                         send_res = outbound_tx.send(Ok(EnvelopeDelta::Llm(c))) => {
-                            // SendError = klient disconnect; backpressure-resilient
-                            // bo cancel idzie razem przez select.
+                            let _ = send_res;
+                        }
+                    }
+                }
+                Some(Ok(EnvelopeDelta::Audio(a))) => {
+                    audio_chunks_emitted += 1;
+                    if let Some(fr) = a.finish_reason {
+                        last_audio_finish = Some(fr);
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled = true;
+                            break 'main;
+                        }
+                        send_res = outbound_tx.send(Ok(EnvelopeDelta::Audio(a))) => {
                             let _ = send_res;
                         }
                     }
@@ -341,10 +401,12 @@ async fn finalize_streaming_flow(
                     error = Some(format!("{e}"));
                     break 'main;
                 }
-                None => break 'main, // EOF
+                None => break 'main,
             }
         }
     }
+    let _ = audio_chunks_emitted;
+    let _ = last_audio_finish;
 
     drop(outbound_tx);
 
