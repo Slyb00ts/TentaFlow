@@ -8,11 +8,17 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::stream::{BoxStream, StreamExt};
+use regex::Regex;
 use regex::RegexBuilder;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
+use crate::flow_engine::envelope::{
+    EnvelopeDelta, EnvelopeDeltaKind, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
+};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, StreamingNodeAdapter};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const REGEX_SIZE_LIMIT: usize = 1_000_000;
@@ -32,7 +38,19 @@ impl Default for PiiFilterNodeAdapter {
 }
 
 const INPUT_PORTS: &[&str] = &["in"];
-const OUTPUT_PORTS: &[&str] = &["full"];
+/// Stage 3d Krok 2: pii_filter teraz ma `stream` port — streaming chain
+/// (LLM → pii_filter → output) propaguje przez `process_stream` zamiast
+/// blocking `execute`. R8 typing: oba porty Text→Text.
+const OUTPUT_PORTS: &[&str] = &["full", "stream"];
+
+/// Maks bajtów zbierane w buforze przed flush'em jeśli sentence boundary
+/// nie pojawi się dłużej. Default 1000 — kompromis: za małe = drobne PII
+/// jak email może zostać przerwane mid-token; za duże = klient czeka
+/// długo na pierwszy chunk.
+const DEFAULT_MAX_BUFFER_CHARS: usize = 1000;
+/// Sentence terminators dla streaming flush — parytet z legacy PII
+/// `StreamingProcessor` w `services/runtime/middleware.rs`.
+const SENTENCE_TERMINATORS: &[char] = &['.', '!', '?', '…', ';', '\n'];
 
 #[async_trait]
 impl NodeAdapter for PiiFilterNodeAdapter {
@@ -141,6 +159,168 @@ impl NodeAdapter for PiiFilterNodeAdapter {
     }
 }
 
+/// Stage 3d Krok 2: streaming variant pii_filter. Konsumuje upstream
+/// `EnvelopeDelta::Llm` deltami, per-choice buffer, sentence-boundary flush,
+/// `apply_rules_to_text` (kompilacja regex raz na start, cache w lokalnym
+/// stanie), emit cleaned `EnvelopeDelta::Llm` z tym samym `choice_index`.
+///
+/// Flush warunki:
+/// 1. ostatni char delty ∈ SENTENCE_TERMINATORS (sentence boundary)
+/// 2. `len(buffer) >= max_buffer_chars` (configurable, default 1000)
+/// 3. EOF upstream (final flush)
+///
+/// `finish_reason` chunki passujemy przez (klient potrzebuje zobaczyć
+/// stop/length), ale NAJPIERW flushujemy bufor żeby nie zgubić ostatniego
+/// content delta.
+#[async_trait]
+impl StreamingNodeAdapter for PiiFilterNodeAdapter {
+    fn stream_input_kind(&self) -> EnvelopeDeltaKind {
+        EnvelopeDeltaKind::Llm
+    }
+    fn stream_output_kind(&self) -> EnvelopeDeltaKind {
+        EnvelopeDeltaKind::Llm
+    }
+
+    async fn process_stream(
+        &self,
+        node: &FlowNode,
+        upstream: BoxStream<'static, Result<EnvelopeDelta>>,
+        _seed_envelope: Arc<FlowEnvelope>,
+        ctx: &ExecutionContext,
+    ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        let max_buffer_chars = node
+            .config
+            .get("max_buffer_chars")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_BUFFER_CHARS);
+
+        // Pobieramy reguły raz na start streamu — adaptacja do per-chunk
+        // gdyby admin zmienił reguły mid-stream nie ma sensu (klient
+        // dostaje spójny snapshot reguł dla całego response).
+        let raw_rules = ctx.pii_rules.active_rules().await?;
+        let compiled: Vec<(String, Regex, String)> = raw_rules
+            .into_iter()
+            .filter_map(|r| {
+                match RegexBuilder::new(&r.pattern)
+                    .size_limit(REGEX_SIZE_LIMIT)
+                    .build()
+                {
+                    Ok(re) => Some((r.name, re, r.replacement)),
+                    Err(e) => {
+                        warn!(
+                            rule = %r.name,
+                            error = %e,
+                            "pii_filter streaming: niepoprawny regex — skip"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        let stream = futures::stream::unfold(
+            (upstream, compiled, HashMap::<u32, String>::new(), max_buffer_chars, false),
+            |(mut upstream, compiled, mut buffers, max_chars, mut eof)| async move {
+                loop {
+                    if eof {
+                        // EOF już zaobserwowany — drain pozostałych buforów
+                        // jeden chunk per iteracja (po jednym choice).
+                        if let Some((idx, text)) = buffers.iter().next().map(|(k, v)| (*k, v.clone())) {
+                            buffers.remove(&idx);
+                            if !text.is_empty() {
+                                let cleaned = apply_rules_to_text(&text, &compiled);
+                                let chunk = LlmStreamChunk {
+                                    choice_index: idx,
+                                    text_delta: cleaned,
+                                    ..Default::default()
+                                };
+                                return Some((
+                                    Ok(EnvelopeDelta::Llm(chunk)),
+                                    (upstream, compiled, buffers, max_chars, eof),
+                                ));
+                            }
+                            continue;
+                        }
+                        return None;
+                    }
+                    match upstream.next().await {
+                        Some(Ok(EnvelopeDelta::Llm(chunk))) => {
+                            // Audio chunki w LLM stream NIE powinny się
+                            // pojawić (R8 chain compatibility), ale defensywny
+                            // passthrough jest tańszy niż Err.
+                            let idx = chunk.choice_index;
+                            let buffer = buffers.entry(idx).or_default();
+                            buffer.push_str(&chunk.text_delta);
+                            let should_flush = chunk.text_delta.chars().any(|c| {
+                                SENTENCE_TERMINATORS.contains(&c)
+                            }) || buffer.len() >= max_chars;
+                            let has_finish = chunk.finish_reason.is_some();
+                            if should_flush || has_finish {
+                                let drained = std::mem::take(buffer);
+                                let cleaned = apply_rules_to_text(&drained, &compiled);
+                                let out_chunk = LlmStreamChunk {
+                                    choice_index: idx,
+                                    text_delta: cleaned,
+                                    reasoning_delta: chunk.reasoning_delta,
+                                    tool_calls: chunk.tool_calls,
+                                    usage: chunk.usage,
+                                    finish_reason: chunk.finish_reason,
+                                    error: chunk.error,
+                                };
+                                return Some((
+                                    Ok(EnvelopeDelta::Llm(out_chunk)),
+                                    (upstream, compiled, buffers, max_chars, eof),
+                                ));
+                            }
+                            // Buffer'owany tekst — emit pusty chunk?
+                            // Lepiej kontynuuj loop (skipuj emit) i wpij
+                            // kolejne delty aż do flush — to oszczędza
+                            // SSE events.
+                            continue;
+                        }
+                        Some(Ok(other)) => {
+                            // Nie-Llm delta (Audio) — passthrough bez
+                            // mutacji. R8 powinien to zablokować na
+                            // poziomie validation; defensywne.
+                            return Some((
+                                Ok(other),
+                                (upstream, compiled, buffers, max_chars, eof),
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            return Some((
+                                Err(e),
+                                (upstream, compiled, buffers, max_chars, eof),
+                            ));
+                        }
+                        None => {
+                            eof = true;
+                            // Pętla weźmie pierwszy buffer w następnej
+                            // iteracji.
+                            continue;
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(stream.boxed())
+    }
+}
+
+fn apply_rules_to_text(text: &str, compiled: &[(String, Regex, String)]) -> String {
+    let mut out = text.to_string();
+    for (name, re, replacement) in compiled {
+        let replaced = re.replace_all(&out, replacement.as_str());
+        if let std::borrow::Cow::Owned(new_text) = replaced {
+            out = new_text;
+            debug!(rule = %name, "pii_filter streaming: applied");
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +424,64 @@ mod tests {
         // w reguły — meta nie dostaje pii_rules_applied.
         assert!(matches!(out.payload, FlowValue::Embedding(_)));
         assert!(out.meta.get("pii_rules_applied").is_none());
+    }
+
+    /// Stage 3d Krok 2: streaming pii_filter — sentence boundary flush
+    /// łączy delty z 3 chunków ("Jan", " ", "Kowalski.") i aplikuje
+    /// regex na cały bufor. Single-chunk PII detection by zgubił to,
+    /// bo regex na "Jan" / " " / "Kowalski." osobno nie złapie pełnego
+    /// nazwiska.
+    #[tokio::test]
+    async fn pii_filter_streaming_buffers_until_sentence_boundary() {
+        use crate::flow_engine::envelope::FlowEnvelope;
+        use futures::stream::StreamExt;
+
+        let mut ctx = stub_ctx();
+        ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
+            id: 1,
+            name: "full_name".into(),
+            category: "pii".into(),
+            pattern: r"Jan Kowalski".into(),
+            replacement: "[IMIĘ NAZWISKO]".into(),
+        }]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "Jan".into(),
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: " ".into(),
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "Kowalski.".into(), // sentence boundary tu
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = PiiFilterNodeAdapter
+            .process_stream(&pii_node(), upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        // Pierwsze dwa delty są buforowane (skip emit). Trzecia ma
+        // sentence terminator → flush całego bufora "Jan Kowalski."
+        // przez regex → "[IMIĘ NAZWISKO]."
+        let chunk = out.next().await.unwrap().unwrap();
+        let EnvelopeDelta::Llm(c) = chunk else {
+            panic!("expected Llm");
+        };
+        assert_eq!(c.text_delta, "[IMIĘ NAZWISKO].");
+        assert_eq!(c.choice_index, 0);
+        // Następne `.next()` → None (stream zakończony, brak EOF drainu
+        // bo bufor już opróżniony).
+        assert!(out.next().await.is_none());
     }
 
     #[tokio::test]
