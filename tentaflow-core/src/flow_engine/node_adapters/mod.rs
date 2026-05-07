@@ -19,6 +19,7 @@ pub mod stt;
 pub mod trigger;
 pub mod tts;
 pub mod tts_clean;
+pub mod tts_stream_bridge;
 pub mod vision_llm;
 
 pub use condition::ConditionNodeAdapter;
@@ -34,4 +35,5 @@ pub use stt::SttNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
 pub use tts::TtsNodeAdapter;
 pub use tts_clean::TtsCleanNodeAdapter;
+pub use tts_stream_bridge::TtsStreamBridgeNodeAdapter;
 pub use vision_llm::VisionNodeAdapter;
