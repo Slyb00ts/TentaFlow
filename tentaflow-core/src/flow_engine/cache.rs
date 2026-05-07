@@ -161,6 +161,52 @@ impl CompiledFlow {
         }
         None
     }
+
+    /// Stage 3d Krok 2c-2: chain stream nodes po LLM (intermediate
+    /// streaming-aware nody między LLM a output sink). Walks `from_port=
+    /// "stream"` edges starting from LLM, kolejność topologiczna
+    /// (execution_order indices). Zatrzymuje się gdy konsument to
+    /// `output` node (sink) — output nie jest w chain'ie.
+    ///
+    /// Przykład: `llm.stream → pii_filter.stream → tts_stream_bridge.full →
+    /// output` zwraca `[run_idx(pii_filter), run_idx(tts_stream_bridge)]`.
+    pub fn streaming_chain_run_idxs(&self) -> Vec<usize> {
+        let Some(llm_idx) = self.streaming_llm_run_idx() else {
+            return Vec::new();
+        };
+        let llm_def_idx = self.execution_order[llm_idx];
+        let llm_node_id = self.definition.nodes[llm_def_idx].id.as_str();
+
+        let mut chain: Vec<usize> = Vec::new();
+        let mut current_id = llm_node_id.to_string();
+        loop {
+            // Find edge `from_port="stream"` z current_id.
+            let next_edge = self
+                .definition
+                .edges
+                .iter()
+                .find(|e| e.from == current_id && e.from_port == "stream");
+            let Some(edge) = next_edge else { break };
+            // Sprawdź czy konsument to output (sink). Output node
+            // zatrzymuje chain — nie idzie do chain Vec.
+            let consumer_def_idx = self
+                .definition
+                .nodes
+                .iter()
+                .position(|n| n.id == edge.to);
+            let Some(consumer_pos) = consumer_def_idx else { break };
+            let consumer_node = &self.definition.nodes[consumer_pos];
+            if consumer_node.node_type == "output" {
+                break;
+            }
+            // Streaming-aware intermediate node — zapisz w chain'ie.
+            if let Some(&run_idx) = self.run_idx_by_id.get(edge.to.as_str()) {
+                chain.push(run_idx);
+            }
+            current_id = edge.to.clone();
+        }
+        chain
+    }
 }
 
 /// Sortowanie topologiczne (Kahn). Zwraca błąd CompileError::Cycle gdy graph
