@@ -1720,7 +1720,7 @@ fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 }
 
 /// Buduje seed envelope + per-request meta dla embeddings flow path.
-fn embeddings_request_to_initial_envelope(
+pub(crate) fn embeddings_request_to_initial_envelope(
     request: &EmbeddingRequest,
     user: Option<crate::auth::acl::UserContext>,
 ) -> (
@@ -1762,7 +1762,7 @@ fn embeddings_request_to_initial_envelope(
 /// `language` lądują w `envelope.meta`, `TtsNodeAdapter::pick_optional_str`
 /// czyta je z fallback `node.config -> envelope.meta`. Operator może
 /// override'ować przez node config; brak override = użyj wartości z requestu.
-fn tts_request_to_initial_envelope(
+pub(crate) fn tts_request_to_initial_envelope(
     request: &TTSRequest,
     user: Option<crate::auth::acl::UserContext>,
 ) -> (
@@ -1803,7 +1803,7 @@ fn tts_request_to_initial_envelope(
 /// w przeciwnym wypadku zwracamy Internal — runtime check ostatniej deski
 /// ratunku, bo R8 walidacja sama nie wymusza Audio-on-output (`output` adapter
 /// ma `input_port_type = Any`).
-async fn flow_outcome_to_tts_result(
+pub(crate) async fn flow_outcome_to_tts_result(
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
     blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> Result<TtsExecutionResult, ExecutorError> {
@@ -1843,7 +1843,7 @@ fn tts_mime_to_format(mime: &str) -> Result<String, ExecutorError> {
 
 /// Konwertuje FlowExecutionOutcome na EmbeddingResponse z walidacją
 /// cardinality (batch flow z jednym wektorem dla wielu inputów to misconfig).
-fn flow_outcome_to_embedding_response(
+pub(crate) fn flow_outcome_to_embedding_response(
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
     request: &EmbeddingRequest,
     expected_count: usize,
