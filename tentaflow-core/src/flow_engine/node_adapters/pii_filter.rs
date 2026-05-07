@@ -220,49 +220,90 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
             .collect();
 
         let stream = futures::stream::unfold(
-            (upstream, compiled, HashMap::<u32, String>::new(), max_buffer_chars, false),
+            (
+                upstream,
+                compiled,
+                HashMap::<u32, ChoiceBuffers>::new(),
+                max_buffer_chars,
+                false,
+            ),
             |(mut upstream, compiled, mut buffers, max_chars, mut eof)| async move {
                 loop {
                     if eof {
-                        // EOF już zaobserwowany — drain pozostałych buforów
-                        // jeden chunk per iteracja (po jednym choice).
-                        if let Some((idx, text)) = buffers.iter().next().map(|(k, v)| (*k, v.clone())) {
-                            buffers.remove(&idx);
-                            if !text.is_empty() {
-                                let cleaned = apply_rules_to_text(&text, &compiled);
-                                let chunk = LlmStreamChunk {
-                                    choice_index: idx,
-                                    text_delta: cleaned,
-                                    ..Default::default()
-                                };
-                                return Some((
-                                    Ok(EnvelopeDelta::Llm(chunk)),
-                                    (upstream, compiled, buffers, max_chars, eof),
-                                ));
+                        // EOF — drain remaining per-choice buffers.
+                        if let Some(idx) = buffers.keys().next().copied() {
+                            let mut state = buffers.remove(&idx).unwrap();
+                            let content_cleaned = if !state.content.is_empty() {
+                                Some(apply_rules_to_text(
+                                    &std::mem::take(&mut state.content),
+                                    &compiled,
+                                ))
+                            } else {
+                                None
+                            };
+                            let reasoning_cleaned = if !state.reasoning.is_empty() {
+                                Some(apply_rules_to_text(
+                                    &std::mem::take(&mut state.reasoning),
+                                    &compiled,
+                                ))
+                            } else {
+                                None
+                            };
+                            if content_cleaned.is_none() && reasoning_cleaned.is_none() {
+                                continue;
                             }
-                            continue;
+                            let chunk = LlmStreamChunk {
+                                choice_index: idx,
+                                text_delta: content_cleaned.unwrap_or_default(),
+                                reasoning_delta: reasoning_cleaned,
+                                ..Default::default()
+                            };
+                            return Some((
+                                Ok(EnvelopeDelta::Llm(chunk)),
+                                (upstream, compiled, buffers, max_chars, eof),
+                            ));
                         }
                         return None;
                     }
                     match upstream.next().await {
                         Some(Ok(EnvelopeDelta::Llm(chunk))) => {
-                            // Audio chunki w LLM stream NIE powinny się
-                            // pojawić (R8 chain compatibility), ale defensywny
-                            // passthrough jest tańszy niż Err.
                             let idx = chunk.choice_index;
-                            let buffer = buffers.entry(idx).or_default();
-                            buffer.push_str(&chunk.text_delta);
-                            let should_flush = chunk.text_delta.chars().any(|c| {
-                                SENTENCE_TERMINATORS.contains(&c)
-                            }) || buffer.len() >= max_chars;
+                            let state = buffers.entry(idx).or_default();
+                            state.content.push_str(&chunk.text_delta);
+                            if let Some(r) = chunk.reasoning_delta.as_deref() {
+                                state.reasoning.push_str(r);
+                            }
+                            // Flush warunki sprawdzane na ostatniej delcie:
+                            // sentence terminator w content/reasoning, max
+                            // buffer dla któregokolwiek bufora, lub
+                            // finish_reason. Wszystkie 3 wymuszają emit.
+                            let content_terminator = chunk
+                                .text_delta
+                                .chars()
+                                .any(|c| SENTENCE_TERMINATORS.contains(&c));
+                            let reasoning_terminator = chunk
+                                .reasoning_delta
+                                .as_deref()
+                                .map(|r| r.chars().any(|c| SENTENCE_TERMINATORS.contains(&c)))
+                                .unwrap_or(false);
+                            let over_cap = state.content.len() >= max_chars
+                                || state.reasoning.len() >= max_chars;
                             let has_finish = chunk.finish_reason.is_some();
-                            if should_flush || has_finish {
-                                let drained = std::mem::take(buffer);
-                                let cleaned = apply_rules_to_text(&drained, &compiled);
+                            if content_terminator || reasoning_terminator || over_cap || has_finish
+                            {
+                                let drained_content = std::mem::take(&mut state.content);
+                                let drained_reasoning = std::mem::take(&mut state.reasoning);
+                                let content_cleaned =
+                                    apply_rules_to_text(&drained_content, &compiled);
+                                let reasoning_cleaned = if drained_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(apply_rules_to_text(&drained_reasoning, &compiled))
+                                };
                                 let out_chunk = LlmStreamChunk {
                                     choice_index: idx,
-                                    text_delta: cleaned,
-                                    reasoning_delta: chunk.reasoning_delta,
+                                    text_delta: content_cleaned,
+                                    reasoning_delta: reasoning_cleaned,
                                     tool_calls: chunk.tool_calls,
                                     usage: chunk.usage,
                                     finish_reason: chunk.finish_reason,
@@ -273,16 +314,9 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                                     (upstream, compiled, buffers, max_chars, eof),
                                 ));
                             }
-                            // Buffer'owany tekst — emit pusty chunk?
-                            // Lepiej kontynuuj loop (skipuj emit) i wpij
-                            // kolejne delty aż do flush — to oszczędza
-                            // SSE events.
                             continue;
                         }
                         Some(Ok(other)) => {
-                            // Nie-Llm delta (Audio) — passthrough bez
-                            // mutacji. R8 powinien to zablokować na
-                            // poziomie validation; defensywne.
                             return Some((
                                 Ok(other),
                                 (upstream, compiled, buffers, max_chars, eof),
@@ -296,8 +330,6 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                         }
                         None => {
                             eof = true;
-                            // Pętla weźmie pierwszy buffer w następnej
-                            // iteracji.
                             continue;
                         }
                     }
@@ -307,6 +339,16 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
 
         Ok(stream.boxed())
     }
+}
+
+/// Per-choice state — osobne bufory dla content i reasoning żeby PII
+/// regex aplikował się do całych zdań w każdym kanale niezależnie.
+/// Reasoning_content (chain-of-thought od deepseek/o1) niesie wrażliwe
+/// dane tak samo jak content — codex review Krok 2a P1.
+#[derive(Default)]
+struct ChoiceBuffers {
+    content: String,
+    reasoning: String,
 }
 
 fn apply_rules_to_text(text: &str, compiled: &[(String, Regex, String)]) -> String {
@@ -482,6 +524,89 @@ mod tests {
         // Następne `.next()` → None (stream zakończony, brak EOF drainu
         // bo bufor już opróżniony).
         assert!(out.next().await.is_none());
+    }
+
+    /// Stage 3d Krok 2a fix: max_buffer_chars wymusza flush nawet bez
+    /// sentence terminator'a. Konfiguralnie przez node.config.
+    #[tokio::test]
+    async fn pii_filter_streaming_max_buffer_flush() {
+        use crate::flow_engine::envelope::FlowEnvelope;
+        use futures::stream::StreamExt;
+        use serde_json::json;
+
+        let mut ctx = stub_ctx();
+        ctx.pii_rules = Arc::new(FakePiiRules(vec![]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                // 50 znaków bez sentence terminatora — przekracza max=20.
+                text_delta: "abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJ".into(),
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let mut node = pii_node();
+        node.config = json!({"max_buffer_chars": 20});
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = PiiFilterNodeAdapter
+            .process_stream(&node, upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        let chunk = out.next().await.unwrap().unwrap();
+        let EnvelopeDelta::Llm(c) = chunk else {
+            panic!("expected Llm");
+        };
+        assert!(c.text_delta.len() >= 20, "should flush over cap, got {}", c.text_delta.len());
+    }
+
+    /// Stage 3d Krok 2a P1 fix: reasoning_delta też filtrowany przez PII
+    /// (osobny per-choice buffer). Test: 2 chunki reasoning bez content,
+    /// terminator w drugiej chunkach → flush + cleaned reasoning.
+    #[tokio::test]
+    async fn pii_filter_streaming_filters_reasoning_delta() {
+        use crate::flow_engine::envelope::FlowEnvelope;
+        use futures::stream::StreamExt;
+
+        let mut ctx = stub_ctx();
+        ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
+            id: 1,
+            name: "secret".into(),
+            category: "pii".into(),
+            pattern: r"top_secret".into(),
+            replacement: "[REDACTED]".into(),
+        }]));
+
+        let upstream = futures::stream::iter(vec![
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "".into(),
+                reasoning_delta: Some("Myślę o ".into()),
+                ..Default::default()
+            })),
+            Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "".into(),
+                reasoning_delta: Some("top_secret.".into()),
+                ..Default::default()
+            })),
+        ])
+        .boxed();
+
+        let seed = Arc::new(FlowEnvelope::empty());
+        let mut out = PiiFilterNodeAdapter
+            .process_stream(&pii_node(), upstream, seed, &ctx)
+            .await
+            .unwrap();
+
+        let chunk = out.next().await.unwrap().unwrap();
+        let EnvelopeDelta::Llm(c) = chunk else {
+            panic!("expected Llm");
+        };
+        assert_eq!(c.reasoning_delta.as_deref(), Some("Myślę o [REDACTED]."));
     }
 
     #[tokio::test]
