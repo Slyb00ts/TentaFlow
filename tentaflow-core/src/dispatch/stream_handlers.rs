@@ -104,6 +104,13 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
         let mut stream = route_result.response;
         let mut completion_tokens: u32 = 0;
+        // State machine: backend (vLLM/parser) wydziela chain-of-thought do
+        // `delta.reasoning_content`, content do `delta.content`. Frontend
+        // (chat.js) parsuje `<think>...</think>` jako collapsed block, więc
+        // bridge musi opakować reasoning w te tagi. Otwieramy `<think>` na
+        // pierwszym reasoning chunku, zamykamy `</think>` przy przejściu
+        // na content lub na finish (gdyby reasoning był ostatni).
+        let mut in_thinking = false;
         while let Some(chunk_res) = stream.next().await {
             let chunk = match chunk_res {
                 Ok(c) => c,
@@ -119,49 +126,66 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 }
             };
             if let Some(choice) = chunk.choices.first() {
-                // Reasoning_content (chain-of-thought od DeepSeek R1 / OpenAI o1)
-                // emitujemy wcześniej niż content w obrębie chunka, parytet z
-                // OpenAI streaming SSE order. ChatStreamChunk ma jedno pole
-                // `delta: String`, więc sklejamy reasoning + content w
-                // dwóch osobnych chunkach (klient widzi je jako sekwencyjny
-                // tekst). Rozszerzenie protokołu o `reasoning_delta` jest
-                // osobnym ruchem — wymaga aktualizacji rkyv schema, wasm
-                // glue i frontendu, więc na razie sklejka.
-                if let Some(reasoning) = choice.delta.reasoning_content.as_ref() {
-                    if !reasoning.is_empty() {
-                        if push_chunk_async(
-                            &sub,
-                            MessageBody::ChatStreamChunkBody(ChatStreamChunk {
-                                delta: reasoning.clone(),
-                            }),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
-                        completion_tokens = completion_tokens.saturating_add(1);
+                let reasoning = choice
+                    .delta
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|s| !s.is_empty());
+                let content = choice
+                    .delta
+                    .content
+                    .as_deref()
+                    .filter(|s| !s.is_empty());
+
+                if let Some(r) = reasoning {
+                    let payload = if in_thinking {
+                        r.to_string()
+                    } else {
+                        in_thinking = true;
+                        format!("<think>{}", r)
+                    };
+                    if push_chunk_async(
+                        &sub,
+                        MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
+                    completion_tokens = completion_tokens.saturating_add(1);
                 }
-                if let Some(content) = choice.delta.content.as_ref() {
-                    if !content.is_empty() {
-                        // Async send — czeka na slot gdy channel pelny zeby nie
-                        // gubic tokenow przy szybko generujacym modelu (200+ tok/s).
-                        if push_chunk_async(
-                            &sub,
-                            MessageBody::ChatStreamChunkBody(ChatStreamChunk {
-                                delta: content.clone(),
-                            }),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
-                        completion_tokens = completion_tokens.saturating_add(1);
+
+                if let Some(c) = content {
+                    let payload = if in_thinking {
+                        in_thinking = false;
+                        format!("</think>{}", c)
+                    } else {
+                        c.to_string()
+                    };
+                    if push_chunk_async(
+                        &sub,
+                        MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
+                    completion_tokens = completion_tokens.saturating_add(1);
                 }
             }
+        }
+        // Cleanup: gdy reasoning był ostatni (brak content po nim), domknij
+        // tag żeby front miał poprawny `<think>...</think>` parować.
+        if in_thinking {
+            let _ = push_chunk_async(
+                &sub,
+                MessageBody::ChatStreamChunkBody(ChatStreamChunk {
+                    delta: "</think>".to_string(),
+                }),
+            )
+            .await;
         }
 
         let _ = push_end_async(
