@@ -60,13 +60,27 @@ fn is_alive_impl(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_impl(pid: u32) -> Result<()> {
+    // Wysylamy do CALEJ process group (negative PID). Kazdy native
+    // python-bundle / binary spawn ustawia setsid() w pre_exec, wiec
+    // child jest liderem grupy z pgid == pid. SIGTERM na -pid trafia
+    // we wszystkie potomne procesy (np. vLLM EngineCore workers
+    // trzymajace GPU memory). ESRCH z group-wide kill = grupa juz
+    // pusta, fallback na klasyczny pid-only kill na wypadek gdyby
+    // proces nie utworzyl wlasnej grupy (legacy spawn).
     unsafe {
+        if libc::kill(-(pid as libc::pid_t), libc::SIGTERM) == 0 {
+            return Ok(());
+        }
+        let errno = last_errno();
+        if errno == libc::ESRCH {
+            return Ok(());
+        }
         if libc::kill(pid as libc::pid_t, libc::SIGTERM) != 0 {
-            let errno = last_errno();
-            if errno == libc::ESRCH {
-                return Ok(()); // juz martwy
+            let errno2 = last_errno();
+            if errno2 == libc::ESRCH {
+                return Ok(());
             }
-            anyhow::bail!("SIGTERM pid={} errno={}", pid, errno);
+            anyhow::bail!("SIGTERM pid={} group_errno={} pid_errno={}", pid, errno, errno2);
         }
     }
     Ok(())
@@ -75,12 +89,19 @@ fn terminate_impl(pid: u32) -> Result<()> {
 #[cfg(unix)]
 fn force_kill(pid: u32) -> Result<()> {
     unsafe {
+        if libc::kill(-(pid as libc::pid_t), libc::SIGKILL) == 0 {
+            return Ok(());
+        }
+        let errno = last_errno();
+        if errno == libc::ESRCH {
+            return Ok(());
+        }
         if libc::kill(pid as libc::pid_t, libc::SIGKILL) != 0 {
-            let errno = last_errno();
-            if errno == libc::ESRCH {
+            let errno2 = last_errno();
+            if errno2 == libc::ESRCH {
                 return Ok(());
             }
-            anyhow::bail!("SIGKILL pid={} errno={}", pid, errno);
+            anyhow::bail!("SIGKILL pid={} group_errno={} pid_errno={}", pid, errno, errno2);
         }
     }
     Ok(())
