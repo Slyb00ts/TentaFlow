@@ -1809,6 +1809,25 @@ fn spawn_engine(
         .open(&log_path)
         .with_context(|| format!("open engine log {}", log_path.display()))?;
 
+    // setsid() przed exec: child staje sie liderem nowej sesji + process
+    // group. Wszystkie subprocess'y ktore vLLM uvicorn parent spawn'uje
+    // (EngineCore workers, multiproc DP) dziedziczą tę grupę. Bez tego
+    // SIGTERM na parent zostawiał zombie engine cores trzymajace GPU
+    // memory (9GB+ na 0.5B model przez fragmentacje). Stop_all_supervised
+    // zabija teraz `kill(-pid)` (negative = group), co dotyka wszystkich.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut child = if log.is_some() {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.spawn().with_context(|| format!("spawn {:?}", exe))?
