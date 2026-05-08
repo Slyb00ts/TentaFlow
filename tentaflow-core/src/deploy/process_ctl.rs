@@ -46,16 +46,39 @@ fn last_errno() -> i32 {
 
 #[cfg(unix)]
 fn is_alive_impl(pid: u32) -> bool {
-    // kill(pid, 0) zwraca 0 gdy proces istnieje i mamy do niego dostep,
-    // -1 z ESRCH gdy go nie ma. EPERM tez sygnalizuje ze zyje (ale nie jest
-    // nasz) — traktujemy jako zywy.
+    // kill(pid, 0) zwraca 0 gdy proces istnieje (TAKZE zombie!) i mamy
+    // do niego dostep, -1 z ESRCH gdy go nie ma. EPERM tez sygnalizuje
+    // ze zyje (ale nie jest nasz).
+    //
+    // KRYTYCZNE: zombie process (defunct, zakonczony ale nie reaped)
+    // tez zwraca kill(pid, 0) == 0. Bez wykrywania zombie nasz
+    // smart_health_probe loops forever czekajac na readiness URL od
+    // martwego procesu. Sprawdzamy `/proc/<pid>/status` i wyciagamy
+    // pole `State: Z` -> traktujemy jako not-alive (process logicznie
+    // umarl, supervisor flag'uje Failed). Linux-only path; macOS / BSD
+    // nie maja /proc, fall back na klasyczny kill check.
     unsafe {
         let rc = libc::kill(pid as libc::pid_t, 0);
-        if rc == 0 {
-            return true;
+        if rc != 0 {
+            return last_errno() == libc::EPERM;
         }
-        last_errno() == libc::EPERM
     }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("State:") {
+                    let trimmed = rest.trim();
+                    // Format: "State:\tZ (zombie)" → first non-space char.
+                    if trimmed.starts_with('Z') {
+                        return false;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    true
 }
 
 #[cfg(unix)]
