@@ -241,7 +241,7 @@ pub struct ServicePauseResponse {
 /// są materializowane do `services.config_json` jako manifest schema
 /// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
 /// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ServiceUpdateRequest {
     pub service_id: i64,
     /// See `ServiceDeleteRequest::node_id` — None = local node.
