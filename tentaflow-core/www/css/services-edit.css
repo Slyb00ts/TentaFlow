@@ -1,0 +1,170 @@
+/* ============================================================================
+ * services-edit.css — style modal Edit Service (services-edit.js).
+ * Reużywa tokens z global :root + adv-section z style.css. Reszta dodana tu
+ * żeby modal był samodzielny i nie wpływał na wizard CSS.
+ * ============================================================================ */
+
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(5,8,24,0.78); backdrop-filter: blur(4px);
+  display: flex; align-items: flex-start; justify-content: center; padding: 60px 20px 40px;
+  z-index: 100; overflow-y: auto;
+}
+.modal-shell {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: 0 24px 64px rgba(0,0,0,0.7), 0 8px 24px rgba(99,102,241,0.15);
+  overflow: hidden;
+  width: 100%; max-width: 820px; margin: 0 auto;
+}
+.modal-shell .modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.modal-shell .modal-head .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
+.modal-shell .modal-head .dot.warn { background: var(--warning); }
+.modal-shell .modal-head .dot.ok { background: var(--success); }
+.modal-shell .modal-head h3 { font-size: 15px; font-weight: 700; color: var(--text); flex: 1; }
+.modal-shell .modal-head .head-meta { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono', monospace; }
+.modal-shell .modal-body { padding: 20px 24px; }
+.modal-shell .modal-foot {
+  display: flex; justify-content: flex-end; align-items: center; gap: 10px;
+  padding: 14px 18px; border-top: 1px solid var(--border); background: var(--bg-2);
+}
+.modal-shell .modal-foot .spacer { flex: 1; }
+
+.modal-shell .step-heading h2 { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 4px; }
+.modal-shell .step-heading p { color: var(--text-2); font-size: 13px; line-height: 1.55; margin-bottom: 14px; }
+
+.modal-shell .step-warn {
+  background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.25);
+  border-radius: var(--radius); padding: 11px 14px;
+  display: flex; align-items: flex-start; gap: 10px; margin-bottom: 18px;
+}
+.modal-shell .step-warn svg { stroke: var(--warning); flex-shrink: 0; margin-top: 1px; }
+.modal-shell .step-warn .txt { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.modal-shell .step-warn .txt strong { color: var(--warning); }
+
+.modal-shell .body-section { margin-bottom: 18px; }
+.modal-shell .body-section .body-section-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--accent-2); margin-bottom: 10px;
+}
+
+/* ===== opt-cards ===== */
+.modal-shell .opt-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.modal-shell .opt-card {
+  position: relative; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px; cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+  display: flex; flex-direction: column; gap: 6px; min-height: 88px;
+}
+.modal-shell .opt-card:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.modal-shell .opt-card.active {
+  border-color: var(--accent-1); background: rgba(99,102,241,0.08);
+  box-shadow: 0 0 0 1px var(--accent-1), 0 4px 14px rgba(99,102,241,0.25);
+}
+.modal-shell .opt-card.active::before {
+  content: ''; position: absolute; top: 10px; right: 10px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: center; box-shadow: 0 0 0 3px rgba(99,102,241,0.2);
+}
+.modal-shell .opt-card .opt-icon {
+  width: 34px; height: 34px; border-radius: 9px;
+  background: rgba(99,102,241,0.12); color: var(--accent-2);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-shell .opt-card .opt-icon svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; }
+.modal-shell .opt-card .opt-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.modal-shell .opt-card .opt-desc { font-size: 11.5px; color: var(--text-3); line-height: 1.45; }
+
+/* ===== preset list ===== */
+.modal-shell .preset-list { display: flex; flex-direction: column; gap: 8px; }
+.modal-shell .preset-card {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; background: var(--bg-input);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  cursor: pointer; transition: all 0.15s;
+}
+.modal-shell .preset-card:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.modal-shell .preset-card.selected { border-color: var(--accent-1); background: rgba(99,102,241,0.06); box-shadow: 0 0 0 1px var(--accent-1); }
+.modal-shell .preset-radio { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border-hover); background: var(--bg-3); flex-shrink: 0; position: relative; }
+.modal-shell .preset-card.selected .preset-radio { border-color: var(--accent-1); }
+.modal-shell .preset-card.selected .preset-radio::after { content: ''; position: absolute; inset: 3px; border-radius: 50%; background: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%); }
+.modal-shell .preset-info { flex: 1; min-width: 0; }
+.modal-shell .preset-name { font-size: 13px; font-weight: 700; color: var(--text); display: flex; align-items: baseline; gap: 6px; }
+.modal-shell .preset-rec { font-size: 10px; padding: 2px 7px; background: rgba(34,197,94,0.14); color: var(--success); border-radius: 999px; letter-spacing: 0.04em; }
+.modal-shell .preset-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+.modal-shell .preset-meta .sep { opacity: 0.5; }
+
+/* ===== adv-extern (GPU bar) ===== */
+.modal-shell .adv-extern {
+  margin-top: 10px; padding: 12px 14px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.modal-shell .adv-extern-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.08em;
+  font-weight: 700; margin-bottom: 8px;
+}
+.modal-shell .adv-extern-head .extern-total { color: var(--warning); font-family: 'JetBrains Mono', monospace; text-transform: none; letter-spacing: 0; font-size: 12px; }
+.modal-shell .adv-extern-bar {
+  position: relative; height: 20px; background: var(--bg-2); border-radius: 4px; overflow: hidden;
+  display: flex; margin-bottom: 8px;
+}
+.modal-shell .adv-extern-bar .ext-seg { background: rgba(245,158,11,0.55); height: 100%; border-right: 1px solid rgba(245,158,11,0.85); }
+.modal-shell .adv-extern-bar .ext-seg:last-child { border-right: 0; }
+.modal-shell .adv-extern-bar .cap-seg { height: 100%; }
+.modal-shell .adv-extern-bar .deploy-room { height: 100%; }
+.modal-shell .adv-extern-procs { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; font-size: 11.5px; }
+.modal-shell .adv-extern-procs .name { color: var(--text-2); font-family: 'JetBrains Mono', monospace; }
+.modal-shell .adv-extern-procs .mb { color: var(--warning); font-family: 'JetBrains Mono', monospace; text-align: right; }
+.modal-shell .extern-foot {
+  margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border);
+  font-size: 11px; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px;
+}
+
+/* ===== fact-list ===== */
+.modal-shell .fact-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; padding: 12px 14px; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius); }
+.modal-shell .fact-list .row { display: flex; flex-direction: column; gap: 2px; }
+.modal-shell .fact-list .key { font-size: 10.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.modal-shell .fact-list .val { font-size: 12.5px; color: var(--text-2); font-family: 'JetBrains Mono', monospace; }
+
+/* ===== form fields ===== */
+.modal-shell .form-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+.modal-shell .form-row label { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+.modal-shell .adv-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.modal-shell .tf-input, .modal-shell .tf-select, .modal-shell .tf-textarea {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font-family: inherit; font-size: 13px;
+  padding: 8px 10px; outline: none; width: 100%;
+}
+.modal-shell .tf-input:focus, .modal-shell .tf-select:focus, .modal-shell .tf-textarea:focus { border-color: var(--accent-1); }
+.modal-shell .tf-input.mono, .modal-shell .tf-textarea.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+
+/* ===== buttons ===== */
+.modal-shell .btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px; border-radius: var(--radius); border: 1px solid transparent;
+  background: transparent; color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; min-height: 38px; white-space: nowrap;
+}
+.modal-shell .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.modal-shell .btn.ghost { color: var(--text-2); }
+.modal-shell .btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+.modal-shell .btn.primary {
+  background: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%); color: white;
+  box-shadow: 0 4px 14px rgba(99,102,241,0.35);
+}
+.modal-shell .btn.primary:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
+
+/* range slider */
+.modal-shell input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; height: 22px; }
+.modal-shell input[type="range"]::-webkit-slider-runnable-track { height: 4px; background: var(--bg-3); border-radius: 2px; }
+.modal-shell input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%); border: 2px solid var(--bg);
+  margin-top: -7px; cursor: grab; box-shadow: 0 0 0 1px var(--accent-1);
+}
