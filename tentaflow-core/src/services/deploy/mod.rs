@@ -389,6 +389,16 @@ pub async fn respawn(
             ))
         })?;
 
+    // Pre-kill: jeśli na preserved_port siedzi nasz wlasny stary proces
+    // (zombie po crash, OR run_loop respawnuje serwis ktory wciaz dziala
+    // bo health probe zwrocil Failed na chwile), strategy.prepare()
+    // probowalby zabindowac port i dostal "port zajety". Probujemy
+    // znalezc PID slychający na tym porcie i go zabic. Bez tego
+    // respawn pinned services walil sie nieskonczenie.
+    if let Some(port) = preserved_port {
+        kill_listener_on_port(port).await;
+    }
+
     let user_config: serde_json::Value = if config_json.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
@@ -507,6 +517,59 @@ pub async fn stop(
     let _ = ports;
 
     Ok(())
+}
+
+/// Znajduje PID nasłuchujacy na danym porcie (TCP, 127.0.0.1) i wysyla
+/// SIGTERM, po 1.5s SIGKILL. Uzywane przed respawn — gdy stary proces
+/// serwisu zyje na preserved_port (zombie po crash tentaflow albo
+/// run_loop respawn na zywym serwisie), strategy.prepare() dostalby
+/// "port zajety". No-op gdy nikt nie nasluchuje.
+async fn kill_listener_on_port(port: u16) {
+    let pid_opt = tokio::task::spawn_blocking(move || find_listener_pid(port))
+        .await
+        .ok()
+        .flatten();
+    let Some(pid) = pid_opt else {
+        return;
+    };
+    tracing::info!(
+        "respawn: killing leftover process pid={} on port {}",
+        pid,
+        port
+    );
+    let _ = crate::deploy::process_ctl::terminate(pid);
+    // Krotki grace na zwolnienie portu w jadrze (TCP_LISTEN -> CLOSED).
+    for _ in 0..20 {
+        if is_listener_gone(port) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn find_listener_pid(port: u16) -> Option<u32> {
+    let out = std::process::Command::new("ss")
+        .args(["-Hlntp", &format!("sport = :{}", port)])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(start) = line.find("pid=") {
+            let rest = &line[start + 4..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if let Ok(pid) = rest[..end].parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn is_listener_gone(port: u16) -> bool {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
 // ----- DB helpers -----------------------------------------------------------
