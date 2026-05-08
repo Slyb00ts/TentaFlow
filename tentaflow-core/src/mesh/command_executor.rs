@@ -579,12 +579,14 @@ impl MeshCommandExecutor {
             let engine_id = svc.engine_id.clone();
             let deploy_method = svc.deploy_method;
             let cfg_json_for_task = new_config_json.clone();
+            let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
                     &cfg_json_for_task,
                     ports,
+                    preserved_port,
                 )
                 .await
                 {
@@ -752,6 +754,7 @@ impl MeshCommandExecutor {
             svc.deploy_method,
             &svc.config_json,
             actions.port_allocator.clone(),
+            svc.runtime_port,
         )
         .await;
 

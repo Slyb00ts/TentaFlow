@@ -325,6 +325,36 @@ async fn run_server(args: Args) -> Result<()> {
         }
     };
 
+    // Pre-rezerwacja portów już zapisanych w DB (runtime_port każdego
+    // serwisu). Bez tego świeży `acquire()` w równoległym deploy mógł
+    // dostać port który należy do istniejącego serwisu (allocator nic o
+    // nim nie wie po restarcie procesu) → respawn pinned dostawał konflikt
+    // i wpadał w fallback z innym portem, czyli "magiczna" zmiana portu.
+    if let Some(port_allocator) = services_port_allocator.clone() {
+        match db.lock() {
+            Ok(conn) => {
+                match tentaflow_core::services_repo::services::list_all(&conn) {
+                    Ok(services) => {
+                        for svc in services {
+                            if let Some(port) = svc.runtime_port {
+                                if let Err(e) = port_allocator.reserve(port) {
+                                    tracing::warn!(
+                                        service_id = svc.id,
+                                        port,
+                                        "boot port reserve skipped: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("boot port reserve: list_all failed: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!("boot port reserve: db lock poisoned: {}", e),
+        }
+    }
+
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
