@@ -5573,6 +5573,7 @@ pub async fn service_start(
         svc.deploy_method,
         &svc.config_json,
         port_allocator,
+        svc.runtime_port,
     )
     .await;
 
@@ -5796,12 +5797,14 @@ pub async fn service_update(
             let engine_id = svc.engine_id.clone();
             let deploy_method = svc.deploy_method;
             let cfg_json = new_config_json.clone();
+            let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
                     &cfg_json,
                     ports,
+                    preserved_port,
                 )
                 .await
                 {

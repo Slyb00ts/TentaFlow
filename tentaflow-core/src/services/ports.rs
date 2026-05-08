@@ -90,6 +90,72 @@ impl PortAllocator {
         Ok(out)
     }
 
+    /// Bierze KONKRETNY port jeśli wolny — używane przy respawn istniejącego
+    /// serwisu, żeby zachować port który admin już widzi w GUI / DB.
+    /// Port = atrybut serwisu, raz przyznany zostaje na całe życie wpisu w
+    /// `services`. Bez tego allocator dawał kolejny port z cursora przy
+    /// każdym respawn (5000 → 5001 → 5002 …) i `LiveHandlesCache` wskazywał
+    /// na zwolnione porty.
+    ///
+    /// `preferred=None` → fallback na zwykły `acquire()` (świeży deploy bez
+    /// zaalokowanego portu w DB). `Some(p)` z `p` poza zakresem `range`
+    /// też idzie na fallback (np. legacy serwis zapisany przed zmianą
+    /// `port_range` w configu).
+    ///
+    /// Bind probe: gdy port w zakresie ale aktualnie zajęty przez OBCY
+    /// proces (sunshine, chrome, zombie z poprzedniej sesji), zwracamy
+    /// `Err` żeby caller widział konflikt — nie próbujemy "po cichu"
+    /// zmienić portu, bo to ten klasa bug.
+    pub fn acquire_or_specific(&self, preferred: Option<u16>) -> Result<u16> {
+        let Some(port) = preferred else {
+            return self.acquire();
+        };
+        let (lo, hi) = self.range;
+        if port < lo || port > hi {
+            // Port poza pulą — admin musi przebudować serwis przy zmienionym
+            // zakresie. Fallback na świeży acquire jako pragmatyczny ratunek.
+            return self.acquire();
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow!("port allocator mutex poisoned: {}", e))?;
+        if inner.excluded.contains(&port) {
+            return Err(anyhow!(
+                "port {port} jest na excluded list (zarezerwowany dla dashboard / prometheus)"
+            ));
+        }
+        if inner.leased.contains(&port) {
+            // Już leased przez allocator — nie ma konfliktu (to znaczy że
+            // CTOŚ inny w tym samym procesie tentaflow już ma ten port,
+            // pewnie inny serwis o tym samym `runtime_port` w DB → bug
+            // duplikatu).
+            return Err(anyhow!(
+                "port {port} juz leased — duplikat w DB (dwa serwisy z tym samym runtime_port)?"
+            ));
+        }
+        if !is_port_free(port) {
+            return Err(anyhow!(
+                "port {port} zajety przez inny proces — sprawdz `ss -tln` (nasz wlasny stary respawn? zombie?)"
+            ));
+        }
+        inner.leased.insert(port);
+        Ok(port)
+    }
+
+    /// Pre-rezerwuj port który już jest zapisany w DB jako `runtime_port`
+    /// któregoś serwisu. Wywoływane przy boot tentaflow PRZED `auto_start_pinned`,
+    /// żeby kolejne `acquire()` (świeże deployy w tej samej sesji) nie
+    /// zaproponowały portu już przypisanego do istniejącego serwisu.
+    pub fn reserve(&self, port: u16) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow!("port allocator mutex poisoned: {}", e))?;
+        inner.leased.insert(port);
+        Ok(())
+    }
+
     /// Releases a previously acquired port so future calls may hand it out
     /// again. Releasing an unleased port is a no-op (logged via Result Ok).
     pub fn release(&self, port: u16) -> Result<()> {

@@ -400,6 +400,7 @@ impl Supervisor {
             let engine_id = svc.engine_id.clone();
             let deploy_method = svc.deploy_method;
             let config_json = svc.config_json.clone();
+            let preserved_port = svc.runtime_port;
             let db_for_task = self.db.clone();
             let ports_for_task = self.ports.clone();
 
@@ -421,6 +422,7 @@ impl Supervisor {
                     deploy_method,
                     &config_json,
                     ports_for_task,
+                    preserved_port,
                 );
                 tokio::pin!(respawn_fut);
                 let started = std::time::Instant::now();
@@ -965,6 +967,7 @@ impl Supervisor {
                     svc.deploy_method,
                     &svc.config_json,
                     self.ports.clone(),
+                    svc.runtime_port,
                 )
                 .await
                 {
