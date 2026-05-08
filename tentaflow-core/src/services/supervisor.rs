@@ -483,6 +483,11 @@ impl Supervisor {
                             Some(&msg),
                         )
                         .await;
+                        // Wyczyść runtime_pid/runtime_port/endpoint_url po
+                        // failu — bez tego DB wlokła stary endpoint przez
+                        // restart, a `LiveHandlesCache` budował handle
+                        // wskazujacy na zwolniony port (zombie endpoint).
+                        clear_runtime_detached(&db_for_task, svc_id).await;
                         // Progress message: pokazujemy ostatni stan +
                         // ze padlo, zeby GUI mialo wskazowke (bezpiecznie
                         // duplikuje error_message ale GUI moze inaczej
@@ -983,6 +988,10 @@ impl Supervisor {
                         let msg = format!("restart {}: {}", attempt, e);
                         self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                             .await;
+                        // Defensywnie wyczysc runtime endpoint (jak w
+                        // detached pinned deploy) — DB nie ma wleko stary
+                        // URL przez restart tentaflow.
+                        clear_runtime_detached(&self.db, svc.id).await;
                         tracing::warn!(
                             "supervisor: respawn failed for service {} ({}): {}",
                             svc.id,
@@ -1057,6 +1066,24 @@ fn handle_endpoint_signature(svc: &tentaflow_protocol::ServiceInfo) -> String {
         }
         other => format!("unknown:{}:{}", other, svc.engine_id),
     }
+}
+
+/// Czyści `runtime_pid`, `runtime_port`, `sidecar_quic_port`, `endpoint_url`
+/// w `services` row. Wywoływane gdy deploy padł — bez tego DB wlokła
+/// stary endpoint z poprzedniego sukcesu przez restart tentaflow, a
+/// `LiveHandlesCache::build_handle` przy boot trafiał na ten URL i
+/// chat/embeddings/tts wysyłali request na zwolniony / zajęty przez
+/// zombie port.
+async fn clear_runtime_detached(db: &DbPool, id: i64) {
+    let db = db.clone();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        crate::services_repo::services::update_runtime(&conn, id, None, None, None, None)?;
+        Ok(())
+    })
+    .await;
 }
 
 async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
