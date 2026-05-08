@@ -3029,6 +3029,26 @@ export function encodeRegistryListRequest() {
 }
 
 /**
+ * MessageBody::ServiceBody(ServicePayload::ReqUpdate) — edycja serwisu po
+ * deploy (Edit modal). 13 pól opcjonalnych; klient sam decyduje co jest
+ * `Some(_)`. Payload przyjmujemy jako JSON string żeby nie trzymać 13
+ * argumentów wasm-bindgen.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeServiceConfigUpdateRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceConfigUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::ServiceBody(ServicePayload::ReqDelete) — stop + delete the row
  * (cascades to `model_registry`).
  * @param {number} service_id
@@ -3039,6 +3059,25 @@ export function encodeServiceDeleteRequest(service_id, node_id) {
     var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeServiceDeleteRequest(service_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqEnginePresets) — lista
+ * presetów modelu z manifestu silnika (single source of truth z
+ * `tentaflow-containers/<cat>/_services/<engine>.toml`).
+ * @param {string} engine_id
+ * @returns {Uint8Array}
+ */
+export function encodeServiceEnginePresetsRequest(engine_id) {
+    const ptr0 = passStringToWasm0(engine_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceEnginePresetsRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -3149,6 +3188,26 @@ export function encodeServiceStartRequest(service_id, node_id) {
     var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeServiceStartRequest(service_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ServiceBody(ServicePayload::ReqVramHint) — snapshot VRAM
+ * per GPU + lista zewnętrznych procesów (sunshine, chrome itp.).
+ * @param {number | null} [gpu_index]
+ * @param {string | null} [node_id]
+ * @param {number | null} [exclude_service_id]
+ * @returns {Uint8Array}
+ */
+export function encodeServiceVramHintRequest(gpu_index, node_id, exclude_service_id) {
+    var ptr0 = isLikeNone(node_id) ? 0 : passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeServiceVramHintRequest(isLikeNone(gpu_index) ? Number.MAX_SAFE_INTEGER : (gpu_index) >>> 0, ptr0, len0, !isLikeNone(exclude_service_id), isLikeNone(exclude_service_id) ? 0 : exclude_service_id);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

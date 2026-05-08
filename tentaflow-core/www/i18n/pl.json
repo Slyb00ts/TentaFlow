@@ -3422,6 +3422,8 @@
     "model_custom": "Custom HF repo",
     "model_custom_desc": "Dowolny model org/repo z HuggingFace.",
     "no_presets": "Manifest tego silnika nie deklaruje presetów.",
+    "hf_search_placeholder": "Szukaj na HuggingFace — wpisz fragment org/repo",
+    "hf_no_results": "Brak dopasowań.",
     "hf_repo_label": "HuggingFace repo",
     "recommended_pill": "REKOMENDOWANY",
     "vram_title": "Alokacja VRAM",

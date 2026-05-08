@@ -1547,6 +1547,50 @@ pub fn encode_service_pause_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceBody(ServicePayload::ReqUpdate) — edycja serwisu po
+/// deploy (Edit modal). 13 pól opcjonalnych; klient sam decyduje co jest
+/// `Some(_)`. Payload przyjmujemy jako JSON string żeby nie trzymać 13
+/// argumentów wasm-bindgen.
+#[wasm_bindgen(js_name = encodeServiceConfigUpdateRequest)]
+pub fn encode_service_config_update_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePayload, ServiceUpdateRequest};
+    let payload: ServiceUpdateRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceUpdateRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqUpdate(payload)))
+        .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceBody(ServicePayload::ReqVramHint) — snapshot VRAM
+/// per GPU + lista zewnętrznych procesów (sunshine, chrome itp.).
+#[wasm_bindgen(js_name = encodeServiceVramHintRequest)]
+pub fn encode_service_vram_hint_request(
+    gpu_index: Option<u32>,
+    node_id: Option<String>,
+    exclude_service_id: Option<f64>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePayload, ServiceVramHintRequest};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqVramHint(
+        ServiceVramHintRequest {
+            gpu_index,
+            node_id,
+            exclude_service_id: exclude_service_id.map(|v| v as i64),
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceBody(ServicePayload::ReqEnginePresets) — lista
+/// presetów modelu z manifestu silnika (single source of truth z
+/// `tentaflow-containers/<cat>/_services/<engine>.toml`).
+#[wasm_bindgen(js_name = encodeServiceEnginePresetsRequest)]
+pub fn encode_service_engine_presets_request(engine_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceEnginePresetsRequest, ServicePayload};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqEnginePresets(
+        ServiceEnginePresetsRequest { engine_id },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Prompts --------------------------------------------------------------
 
 /// MessageBody::PromptListRequest (unit).
@@ -2072,6 +2116,79 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             if let Some(e) = r.error {
                 set(obj, "error", e.into());
             }
+        }
+        SP::ReqUpdate(_) => {
+            // Klient nie odbiera tego variantu (request-only); decoder zwraca
+            // pustą obwiednię żeby debugger miał variant tag.
+            set(obj, "variant", "ServiceConfigUpdateRequest".into());
+        }
+        SP::ResUpdate(r) => {
+            set(obj, "variant", "ServiceConfigUpdateResponse".into());
+            set(obj, "success", r.success.into());
+            set(obj, "restarted", r.restarted.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqVramHint(_) => {
+            set(obj, "variant", "ServiceVramHintRequest".into());
+        }
+        SP::ResVramHint(r) => {
+            set(obj, "variant", "ServiceVramHintResponse".into());
+            if let Some(rec) = r.recommended_utilization {
+                set(obj, "recommendedUtilization", (rec as f64).into());
+                set(obj, "recommended_utilization", (rec as f64).into());
+            }
+            let arr = js_sys::Array::new();
+            for g in r.gpus {
+                let item = js_sys::Object::new();
+                set(&item, "gpuIndex", (g.gpu_index as f64).into());
+                set(&item, "gpu_index", (g.gpu_index as f64).into());
+                set(&item, "gpuName", g.gpu_name.clone().into());
+                set(&item, "gpu_name", g.gpu_name.into());
+                set(&item, "totalMib", (g.total_mib as f64).into());
+                set(&item, "total_mib", (g.total_mib as f64).into());
+                set(&item, "freeMib", (g.free_mib as f64).into());
+                set(&item, "free_mib", (g.free_mib as f64).into());
+                set(&item, "usedMib", (g.used_mib as f64).into());
+                set(&item, "used_mib", (g.used_mib as f64).into());
+                let procs = js_sys::Array::new();
+                for p in g.external_processes {
+                    let pi = js_sys::Object::new();
+                    set(&pi, "pid", (p.pid as f64).into());
+                    set(&pi, "processName", p.process_name.clone().into());
+                    set(&pi, "process_name", p.process_name.into());
+                    set(&pi, "usedMib", (p.used_mib as f64).into());
+                    set(&pi, "used_mib", (p.used_mib as f64).into());
+                    procs.push(&pi);
+                }
+                set(&item, "externalProcesses", procs.clone().into());
+                set(&item, "external_processes", procs.into());
+                arr.push(&item);
+            }
+            set(obj, "gpus", arr.into());
+        }
+        SP::ReqEnginePresets(r) => {
+            set(obj, "variant", "ServiceEnginePresetsRequest".into());
+            set(obj, "engineId", r.engine_id.clone().into());
+            set(obj, "engine_id", r.engine_id.into());
+        }
+        SP::ResEnginePresets(r) => {
+            set(obj, "variant", "ServiceEnginePresetsResponse".into());
+            let arr = js_sys::Array::new();
+            for p in r.presets {
+                let item = js_sys::Object::new();
+                set(&item, "id", p.id.clone().into());
+                set(&item, "displayName", p.display_name.clone().into());
+                set(&item, "display_name", p.display_name.into());
+                set(&item, "repo", p.repo.into());
+                if let Some(q) = p.quantization {
+                    set(&item, "quantization", q.into());
+                }
+                set(&item, "recommended", p.recommended.into());
+                arr.push(&item);
+            }
+            set(obj, "presets", arr.into());
         }
     }
 }
