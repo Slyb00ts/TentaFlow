@@ -44,10 +44,12 @@ const INPUT_PORTS: &[&str] = &["in"];
 const OUTPUT_PORTS: &[&str] = &["full", "stream"];
 
 /// Maks bajtów zbierane w buforze przed flush'em jeśli sentence boundary
-/// nie pojawi się dłużej. Default 1000 — kompromis: za małe = drobne PII
-/// jak email może zostać przerwane mid-token; za duże = klient czeka
-/// długo na pierwszy chunk.
-const DEFAULT_MAX_BUFFER_CHARS: usize = 1000;
+/// nie pojawi się dłużej. Default 64 — parytet ze starym `StreamingProcessor`
+/// (`max_buffer_size = 6` tokenów ≈ 24-48 znaków typowych) z marginesem
+/// dla multi-token PII (np. „Jan Kowalski" 12 znaków, NIP z separatorami
+/// ~15 znaków, email ~30 znaków). Klient widzi pierwszy chunk po ~10-15
+/// tokenach LLM zamiast czekać na pierwszą kropkę.
+const DEFAULT_MAX_BUFFER_CHARS: usize = 64;
 /// Sentence terminators dla streaming flush.
 const SENTENCE_TERMINATORS: &[char] = &['.', '!', '?', '…', ';', '\n'];
 
@@ -165,7 +167,7 @@ impl NodeAdapter for PiiFilterNodeAdapter {
 ///
 /// Flush warunki:
 /// 1. ostatni char delty ∈ SENTENCE_TERMINATORS (sentence boundary)
-/// 2. `len(buffer) >= max_buffer_chars` (configurable, default 1000)
+/// 2. `len(buffer) >= max_buffer_chars` (configurable, default 64)
 /// 3. EOF upstream (final flush)
 ///
 /// `finish_reason` chunki passujemy przez (klient potrzebuje zobaczyć
