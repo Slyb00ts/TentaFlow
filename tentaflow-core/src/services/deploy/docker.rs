@@ -40,6 +40,8 @@ pub struct DockerDeploy {
     log_sink: Option<LogSink>,
     #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     container_id: std::sync::Mutex<Option<String>>,
+    /// Port z DB przy respawn — patrz `PythonBundleDeploy::preserved_port`.
+    preserved_port: Option<u16>,
 }
 
 impl DockerDeploy {
@@ -49,12 +51,23 @@ impl DockerDeploy {
         ports: Arc<PortAllocator>,
         log_sink: Option<LogSink>,
     ) -> Self {
+        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+    }
+
+    pub fn new_with_port(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
+        preserved_port: Option<u16>,
+    ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
             log_sink,
             container_id: std::sync::Mutex::new(None),
+            preserved_port,
         }
     }
 
@@ -352,18 +365,26 @@ impl DeployStrategy for DockerDeploy {
         let internal_port = self.manifest.engine.default_port;
         let mut allocated = Vec::new();
 
-        // Allocate ports.
+        // Allocate ports. Respawn istniejacego serwisu zachowuje port z DB
+        // (preserved_port). Dla SidecarQuic preserved_port to host_http;
+        // sidecar_quic_port jest zawsze swiezy bo nie trzymamy go w DB
+        // jako stable identifier (rzadko exposed do klientow).
         let (host_http, sidecar_quic) = if transport == Transport::SidecarQuic {
-            let pair = self
+            let http = self
                 .ports
-                .acquire_many(2)
+                .acquire_or_specific(self.preserved_port)
                 .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
-            allocated.extend_from_slice(&pair);
-            (pair[0], Some(pair[1]))
+            let quic = self
+                .ports
+                .acquire()
+                .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
+            allocated.push(http);
+            allocated.push(quic);
+            (http, Some(quic))
         } else {
             let p = self
                 .ports
-                .acquire()
+                .acquire_or_specific(self.preserved_port)
                 .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
             allocated.push(p);
             (p, None)

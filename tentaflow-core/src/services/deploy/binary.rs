@@ -32,6 +32,8 @@ pub struct BinaryDeploy {
     /// Child handle is stored on `self` (not on `PreparedDeploy`) so it stays
     /// alive across the await boundary in `deploy()`. Rollback consumes it.
     child: std::sync::Mutex<Option<Child>>,
+    /// Port z DB przy respawn — patrz `PythonBundleDeploy::preserved_port`.
+    preserved_port: Option<u16>,
 }
 
 impl BinaryDeploy {
@@ -41,12 +43,23 @@ impl BinaryDeploy {
         ports: Arc<PortAllocator>,
         log_sink: Option<LogSink>,
     ) -> Self {
+        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+    }
+
+    pub fn new_with_port(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
+        preserved_port: Option<u16>,
+    ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
             log_sink,
             child: std::sync::Mutex::new(None),
+            preserved_port,
         }
     }
 
@@ -100,9 +113,10 @@ impl DeployStrategy for BinaryDeploy {
         }
 
         let root = self.binary_root()?;
+        // Respawn istniejacego serwisu zachowuje port z DB.
         let port = self
             .ports
-            .acquire()
+            .acquire_or_specific(self.preserved_port)
             .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
         let allocated_ports = vec![port];
 

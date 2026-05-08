@@ -377,6 +377,7 @@ pub async fn respawn(
     deploy_method: DeployMethod,
     config_json: &str,
     ports: Arc<PortAllocator>,
+    preserved_port: Option<u16>,
 ) -> DeployResult<RuntimeHandle> {
     let manifest = crate::services::manifest::registry()
         .by_id(engine_id)
@@ -399,23 +400,26 @@ pub async fn respawn(
         DeployMethod::NativeEmbedded => {
             Box::new(embedded::EmbeddedDeploy::new(manifest, user_config, None))
         }
-        DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
+        DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new_with_port(
             manifest,
             user_config,
             ports.clone(),
             None,
+            preserved_port,
         )),
-        DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
+        DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new_with_port(
             manifest,
             user_config,
             ports.clone(),
             None,
+            preserved_port,
         )),
-        DeployMethod::Docker => Box::new(docker::DockerDeploy::new(
+        DeployMethod::Docker => Box::new(docker::DockerDeploy::new_with_port(
             manifest,
             user_config,
             ports.clone(),
             None,
+            preserved_port,
         )),
         DeployMethod::External => {
             return Err(DeployError::Manifest(
@@ -1783,6 +1787,7 @@ mod tests {
             DeployMethod::NativeEmbedded,
             "{}",
             ports.clone(),
+            None,
         )
         .await
         .unwrap_err();

@@ -65,6 +65,11 @@ pub struct PythonBundleDeploy {
     ports: Arc<PortAllocator>,
     log_sink: Option<LogSink>,
     running: Mutex<Option<RunningState>>,
+    /// Port zapisany w `services.runtime_port` (gdy respawn istniejącego
+    /// serwisu). `None` = świeży deploy, `acquire()` wybierze nowy z puli.
+    /// `Some(p)` = `acquire_or_specific(p)` próbuje wziąć dokładnie ten
+    /// port, fail gdy zajęty (zamiast cicho zmieniać).
+    preserved_port: Option<u16>,
 }
 
 impl PythonBundleDeploy {
@@ -74,12 +79,23 @@ impl PythonBundleDeploy {
         ports: Arc<PortAllocator>,
         log_sink: Option<LogSink>,
     ) -> Self {
+        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+    }
+
+    pub fn new_with_port(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
+        preserved_port: Option<u16>,
+    ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
             log_sink,
             running: Mutex::new(None),
+            preserved_port,
         }
     }
 
@@ -154,9 +170,13 @@ impl DeployStrategy for PythonBundleDeploy {
         )
         .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
 
+        // Respawn istniejącego serwisu zachowuje port z DB (`preserved_port`);
+        // świeży deploy → acquire z puli. Bez tego allocator dawał kolejny
+        // port z cursora przy każdym respawn → DB miało :5002 ale cache
+        // BackendClient :5001 (poprzednia próba) → routing 404.
         let port = self
             .ports
-            .acquire()
+            .acquire_or_specific(self.preserved_port)
             .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
         let allocated_ports = vec![port];
 
