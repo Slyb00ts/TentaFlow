@@ -228,6 +228,19 @@ function bindTabEvents() {
       togglePin(b);
     };
   });
+  body.querySelectorAll('[data-svc-edit]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const svcId = b.dataset.svcEdit;
+      const engineId = b.dataset.svcEngine;
+      const nodeId = b.dataset.svcNode || undefined;
+      const svc = (services || []).find((s) => String(s.id) === String(svcId));
+      if (!svc) return;
+      import('./services-edit.js').then((mod) => {
+        mod.openEditModal(svc, { engineId, nodeId, onSaved: refreshServiceList });
+      });
+    };
+  });
   body.querySelectorAll('[data-empty-cta]').forEach((b) => {
     b.onclick = () => Router.navigate('catalog');
   });
@@ -426,6 +439,11 @@ function renderRow(s) {
           data-svc-pinned="${pinned ? 'true' : 'false'}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(pinTooltip)}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="edit"
+          data-svc-edit="${svcId}"
+          data-svc-engine="${escapeAttr(s.engine_id || '')}"
+          data-svc-node="${svcNodeId}"
+          title="${escapeAttr(I18n.t('services.btn_edit') || 'Edit')}"></tf-button>
         <tf-button variant="danger" size="sm" icon="trash"
           data-svc-delete="${svcId}"
           data-svc-name="${escapeAttr(displayName)}"
