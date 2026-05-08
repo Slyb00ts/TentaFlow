@@ -744,6 +744,17 @@ impl Supervisor {
                 }
                 matches!(svc.transport.as_str(), "sidecar_quic" | "external_http")
             })
+            // Pomin handle build dla serwisow bez aktywnego runtime. HTTP
+            // transports (http_direct / external_http) wymagaja
+            // `endpoint_url` z DB; gdy NULL (serwis Stopped/Failed albo
+            // Starting przed pierwszym deploy_writeback), `build_handle`
+            // i tak by zwrocil "endpoint_url missing" co tickiem zalewa
+            // logi WARN. Embedded i SidecarQuic budujemy zawsze — embedded
+            // nie ma URLa, sidecar bierze port z DB.
+            .filter(|svc| match svc.transport.as_str() {
+                "http_direct" | "external_http" => svc.endpoint_url.is_some(),
+                _ => true,
+            })
             .map(|svc| ((svc.node_id.clone(), svc.id), svc))
             .collect();
 
