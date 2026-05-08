@@ -534,19 +534,24 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
     //
     // RAG flows usuniete razem z RAG path; nowa implementacja RAG bedzie
     // miala wlasne default flows.
+    // Wszystkie chat/agents flowy seedowane jako STREAMING (LLM -> pii_filter
+    // -> output z mode=stream, edges od LLM dalej z from_port=stream).
+    // Bez tego try_dispatch_streaming wpada na is_streaming=false ->
+    // wrap_blocking_as_stream -> single chunk z całością odpowiedzi
+    // (klient widzi calosc po EOF zamiast token-by-token).
     let flows: &[(&str, &str, &str, &str, i64)] = &[
         (
             "Standardowy pipeline LLM",
-            "Prosty pipeline LLM z filtrem PII na odpowiedzi.",
+            "Streaming pipeline LLM z filtrem PII na odpowiedzi.",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream"}]}"#,
             1,
         ),
         (
             "Default Chat",
-            "Najprostszy chat pipeline: trigger -> LLM -> pii_filter -> output (R-SAFETY).",
+            "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream"}]}"#,
             0,
         ),
         (
@@ -558,35 +563,62 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
         ),
         (
             "Audio Chat",
-            "Voice conversation: STT (z diarization) -> LLM -> pii_filter -> output (R-SAFETY). Wlaczany dla audio_input.",
+            "Voice conversation streaming: STT (z diarization) -> LLM -> pii_filter -> output(stream). Wlaczany dla audio_input.",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":600,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":800,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"s1"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":600,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":800,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"s1"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream"}]}"#,
             0,
         ),
         (
             "teams-flow",
-            "Domyslny flow dla teams-bot: trigger -> llm -> pii_filter -> output.",
+            "Streaming flow dla teams-bot: trigger -> llm -> pii_filter -> output(stream).",
             "agents",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream"}]}"#,
             0,
         ),
     ];
 
-    let mut stmt = conn.prepare(
+    // Migracja seedów: gdy istniejący flow_json NIE zawiera `from_port":"stream"`
+    // (czyli to stary blocking seed sprzed Krok 6/7), nadpisz go aktualnym
+    // streamingowym wariantem. Custom flows (admin zmienił JSON) zostają
+    // nietknięte. Brak rekordu → INSERT.
+    let mut update_stmt = conn.prepare(
+        "UPDATE flows SET description = ?2, service_type = ?3, flow_json = ?4, \
+         is_default = ?5, status = 'active' \
+         WHERE name = ?1 AND flow_json NOT LIKE '%\"from_port\":\"stream\"%'",
+    )?;
+    let mut insert_stmt = conn.prepare(
         "INSERT INTO flows (name, description, service_type, flow_json, status, is_default) \
          SELECT ?1, ?2, ?3, ?4, 'active', ?5 \
          WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?1)",
     )?;
 
     for (name, description, service_type, flow_json, is_default) in flows {
-        let affected = stmt.execute(rusqlite::params![
+        // Streaming-aware seedy (chat + agents) — UPDATE legacy blocking
+        // wariantu, INSERT jeśli rekord nie istnieje. TTS pozostaje
+        // blocking, więc UPDATE nic nie zmieni (LIKE nie matchuje), INSERT
+        // wstawi przy fresh DB.
+        let migrated = update_stmt.execute(rusqlite::params![
             name,
             description,
             service_type,
             flow_json,
             is_default
         ])?;
-        if affected > 0 {
+        if migrated > 0 {
+            tracing::info!(
+                "seed: zmigrowano flow '{}' z blocking na streaming variant",
+                name
+            );
+            continue;
+        }
+        let inserted = insert_stmt.execute(rusqlite::params![
+            name,
+            description,
+            service_type,
+            flow_json,
+            is_default
+        ])?;
+        if inserted > 0 {
             debug!("Utworzono domyslny flow: {}", name);
         }
     }
