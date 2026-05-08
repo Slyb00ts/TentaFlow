@@ -534,6 +534,16 @@ impl Supervisor {
                 if svc.paused {
                     continue;
                 }
+                // Status=Starting znaczy ze detached deploy task wciaz pracuje
+                // (vLLM cold-start ~3 min). Endpoint_url jest NULL do momentu
+                // gdy `write_runtime` zapisze go po sukcesie deploy. Bez tego
+                // skipa health probe widzi NULL endpoint_url → Failed →
+                // run_loop wola deploy::respawn rownoczesnie z trwajacym
+                // deployem → dwie instancje walcza o ten sam port. Detached
+                // task sam ustawi status na Running albo Failed gdy skonczy.
+                if svc.status == ServiceStatus::Starting {
+                    continue;
+                }
                 let health = self
                     .check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
                     .await;
