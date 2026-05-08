@@ -452,6 +452,25 @@ pub enum MeshCommandType {
         deploy_method: String,
         config_json: String,
     },
+    /// Forwarded `ServiceUpdateRequest`. Receiver wykonuje pełną logikę
+    /// edycji serwisu (merge config_json, opcjonalny stop+respawn), tak
+    /// samo jak handler na lokalnym nodzie. Zwraca status przez
+    /// `ServiceActionResult` (success/failure z message).
+    ServiceUpdateRemote {
+        service_id: i64,
+        model_repo: Option<String>,
+        model_preset_id: Option<String>,
+        gpu_memory_utilization: Option<f32>,
+        max_model_len: Option<u32>,
+        max_num_seqs: Option<u32>,
+        max_num_batched_tokens: Option<u32>,
+        kv_cache_dtype: Option<String>,
+        chunked_prefill: Option<bool>,
+        vllm_args_override: Option<String>,
+        pinned: Option<bool>,
+        paused: Option<bool>,
+        restart_after_save: bool,
+    },
 }
 
 // =============================================================================
@@ -632,6 +651,15 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("ServiceDeployRemote")
                 .field("engine_id", engine_id)
                 .field("deploy_method", deploy_method)
+                .finish(),
+            Self::ServiceUpdateRemote {
+                service_id,
+                restart_after_save,
+                ..
+            } => f
+                .debug_struct("ServiceUpdateRemote")
+                .field("service_id", service_id)
+                .field("restart_after_save", restart_after_save)
                 .finish(),
         }
     }

@@ -447,6 +447,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResUpdate(_) => "ServiceUpdateResponse",
             tentaflow_protocol::ServicePayload::ReqVramHint(_) => "ServiceVramHintRequest",
             tentaflow_protocol::ServicePayload::ResVramHint(_) => "ServiceVramHintResponse",
+            tentaflow_protocol::ServicePayload::ReqEnginePresets(_) => "ServiceEnginePresetsRequest",
+            tentaflow_protocol::ServicePayload::ResEnginePresets(_) => "ServiceEnginePresetsResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {

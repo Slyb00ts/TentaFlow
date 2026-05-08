@@ -17,8 +17,9 @@ import { I18n } from '../lib/i18n.js';
 
 let currentModalEl = null;
 let vramPollHandle = null;
+let recommendDebounceHandle = null;
 
-export function openEditModal(svc, opts = {}) {
+export async function openEditModal(svc, opts = {}) {
   closeModal();
   const onSaved = opts.onSaved || (() => {});
   const engineId = opts.engineId || svc.engine_id;
@@ -27,9 +28,19 @@ export function openEditModal(svc, opts = {}) {
   const initialModelRepo = cfg.model_repo || '';
   const isVllm = engineId === 'vllm';
 
+  // Fetch presetow z manifestu (rkyv binary) ZAMIAST hardcoded list. Backend
+  // zwraca dokladnie te [[model_preset]] ktore sa w pliku TOML silnika.
+  let presets = [];
+  try {
+    const res = await ApiBinary.action('serviceEnginePresetsRequest', { engineId });
+    presets = (res && res.presets) || [];
+  } catch (_e) {
+    presets = [];
+  }
+
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRepo);
+  overlay.innerHTML = renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRepo, presets);
   document.body.appendChild(overlay);
   currentModalEl = overlay;
 
@@ -59,28 +70,39 @@ export function openEditModal(svc, opts = {}) {
     });
   });
 
-  // GPU memory slider
+  // GPU memory slider — debounced VRAM recommendation refresh.
   const slider = overlay.querySelector('[data-mu-slider]');
   const sliderVal = overlay.querySelector('[data-mu-value]');
   if (slider) {
     slider.addEventListener('input', () => {
       sliderVal.textContent = parseFloat(slider.value).toFixed(2);
-      updateVramFitBanner(overlay);
+      scheduleRecommendRefresh(overlay, svc, engineId);
     });
   }
+  // Inputy max_model_len / max_num_seqs / KV dtype / preset zmieniają model
+  // lub config — recompute estimate.
+  ['data-max-model-len', 'data-max-num-seqs', 'data-max-batched', 'data-kv-dtype'].forEach((sel) => {
+    const el = overlay.querySelector(`[${sel}]`);
+    if (el) el.addEventListener('change', () => scheduleRecommendRefresh(overlay, svc, engineId));
+  });
+  overlay.querySelectorAll('.preset-card').forEach((card) => {
+    card.addEventListener('click', () => scheduleRecommendRefresh(overlay, svc, engineId));
+  });
 
   // Save handler
+  const saveLabel = I18n.t('services_edit.save') || 'Zapisz i restartuj';
+  const savingLabel = I18n.t('services_edit.saving') || 'Zapisuję…';
   overlay.querySelector('[data-save]').addEventListener('click', async () => {
     const saveBtn = overlay.querySelector('[data-save]');
     saveBtn.setAttribute('disabled', '');
-    saveBtn.textContent = 'Zapisuję…';
+    saveBtn.textContent = savingLabel;
     try {
       const payload = collectPayload(overlay, svc.id, opts.nodeId);
       const res = await ApiBinary.action('serviceUpdateRequest', payload);
       if (res && res.success === false && res.error) {
         showInlineError(overlay, res.error);
         saveBtn.removeAttribute('disabled');
-        saveBtn.textContent = 'Zapisz i restartuj';
+        saveBtn.textContent = saveLabel;
         return;
       }
       closeModal();
@@ -88,12 +110,14 @@ export function openEditModal(svc, opts = {}) {
     } catch (e) {
       showInlineError(overlay, e.message || String(e));
       saveBtn.removeAttribute('disabled');
-      saveBtn.textContent = 'Zapisz i restartuj';
+      saveBtn.textContent = saveLabel;
     }
   });
 
-  // VRAM hint live poll (2s)
+  // VRAM hint live poll (2s) — pasek "co używa GPU teraz"
   startVramPoll(overlay, svc.id);
+  // Pierwszy estimate VRAM (HF config.json + estimate_vllm_vram).
+  if (isVllm) scheduleRecommendRefresh(overlay, svc, engineId);
 }
 
 function closeModal() {
@@ -101,10 +125,151 @@ function closeModal() {
     clearInterval(vramPollHandle);
     vramPollHandle = null;
   }
+  if (recommendDebounceHandle) {
+    clearTimeout(recommendDebounceHandle);
+    recommendDebounceHandle = null;
+  }
   if (currentModalEl) {
     currentModalEl.remove();
     currentModalEl = null;
   }
+}
+
+// Debounced refresh kalkulatora VRAM. Po zmianie modelu / ctx / utilization
+// czekamy 250ms zeby uniknąć spam HF API i auto-fit calls. Backend
+// `DeployVllmRecommendRequest` fetchuje config.json modelu z HF (cache po
+// stronie reqwest) i odpala `estimate_vllm_vram` — to ten SAM kalkulator
+// którego używa wizard krok Advanced. KPI grid + segmentowy pasek w VRAM
+// card są renderowane z `vram_estimate` (model_weights_gb/kv_cache_gb/
+// activations_gb/per_gpu_gb/fits_per_gpu/warnings).
+function scheduleRecommendRefresh(overlay, svc, engineId) {
+  if (engineId !== 'vllm') return;
+  if (recommendDebounceHandle) clearTimeout(recommendDebounceHandle);
+  recommendDebounceHandle = setTimeout(() => {
+    fetchRecommendation(overlay, svc).catch((e) => {
+      console.warn('VRAM recommend:', e);
+    });
+  }, 250);
+}
+
+async function fetchRecommendation(overlay, _svc) {
+  const card = overlay.querySelector('[data-vram-card]');
+  if (!card) return;
+
+  // Model: preferuj selected preset repo, fallback na custom HF input.
+  const sel = overlay.querySelector('.preset-card.selected');
+  const customInput = overlay.querySelector('[data-custom-repo-input]');
+  let modelRepo = null;
+  if (sel) modelRepo = sel.dataset.presetRepo;
+  if (!modelRepo && customInput && customInput.value.trim()) modelRepo = customInput.value.trim();
+  if (!modelRepo) {
+    card.innerHTML = `<div style="font-size:11px;color:var(--text-3);">${escapeHtml(I18n.t('services_edit.vram.no_model') || 'Wybierz model żeby policzyć VRAM.')}</div>`;
+    return;
+  }
+
+  const muSlider = overlay.querySelector('[data-mu-slider]');
+  const maxModelLen = overlay.querySelector('[data-max-model-len]');
+  const maxNumSeqs = overlay.querySelector('[data-max-num-seqs]');
+  const kvDtype = overlay.querySelector('[data-kv-dtype]');
+
+  // Pobierz aktualne GPU specs (z VRAM hint snapshot — zostaje cached).
+  let gpus = [];
+  try {
+    const res = await ApiBinary.action('serviceVramHintRequest', { gpuIndex: 0 });
+    if (res && Array.isArray(res.gpus)) {
+      gpus = res.gpus.map((g) => ({
+        index: g.gpu_index,
+        memory_gb: (g.total_mib || 0) / 1024,
+        name: g.gpu_name || '',
+      }));
+    }
+  } catch (_e) {}
+  if (gpus.length === 0) {
+    card.innerHTML = `<div style="font-size:11px;color:var(--text-3);">${escapeHtml(I18n.t('services_edit.vram.no_gpu') || 'GPU nie wykryte (nvidia-smi).')}</div>`;
+    return;
+  }
+
+  card.innerHTML = `<div style="font-size:11px;color:var(--text-3);">${escapeHtml(I18n.t('services_edit.vram.loading') || 'Liczenie VRAM z config.json modelu HF…')}</div>`;
+
+  const reqPayload = {
+    model: modelRepo,
+    gpus,
+    gpuMemoryUtilization: muSlider ? parseFloat(muSlider.value) : 0.9,
+    maxModelLen: maxModelLen?.value ? parseInt(maxModelLen.value, 10) : null,
+    maxNumSeqs: maxNumSeqs?.value ? parseInt(maxNumSeqs.value, 10) : null,
+    kvCacheDtype: kvDtype?.value || null,
+    quantizationOverride: null,
+    hfToken: null,
+    tensorParallel: null,
+    pipelineParallel: null,
+    lockMaxModelLen: false,
+    lockMaxNumSeqs: false,
+    lockTensorParallel: false,
+  };
+
+  let resp;
+  try {
+    resp = await ApiBinary.action('deployVllmRecommendRequest', reqPayload);
+  } catch (e) {
+    card.innerHTML = `<div style="font-size:11px;color:var(--danger);">HF: ${escapeHtml(e.message || String(e))}</div>`;
+    return;
+  }
+  renderRecommendation(card, resp);
+}
+
+function renderRecommendation(card, r) {
+  const v = r.vram_estimate || {};
+  const spec = r.model_spec || {};
+  const totalGb = v.per_gpu_gb && r.applied?.tensor_parallel
+    ? (v.per_gpu_gb * r.applied.tensor_parallel)
+    : v.total_gb || 0;
+  const fitsPct = totalGb > 0 ? Math.min(200, Math.round((v.total_gb / totalGb) * 100)) : 0;
+  const fits = v.fits_per_gpu !== false;
+  const tk = (k) => I18n.t(`services_edit.vram.${k}`) || k;
+
+  const pillCls = fits ? 'ok' : 'danger';
+  const pillTxt = fits
+    ? (I18n.t('services_edit.vram.pill_fits') || 'Mieści się')
+    : (I18n.t('services_edit.vram.pill_oom') || 'Nie mieści się');
+
+  const weightsGb = (v.model_weights_gb || 0).toFixed(1);
+  const kvGb = (v.kv_cache_gb || 0).toFixed(1);
+  const actGb = (v.activations_gb || 0).toFixed(1);
+  const perGpuGb = (v.per_gpu_gb || 0).toFixed(1);
+  const totalUsed = (v.total_gb || 0).toFixed(1);
+
+  const warningsHtml = (v.warnings || []).map((w) => `<li>${escapeHtml(w)}</li>`).join('');
+
+  card.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <span style="font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">
+        ${escapeHtml(tk('calc_title'))}
+      </span>
+      <span style="font-size:11px;padding:3px 9px;border-radius:999px;font-weight:700;${
+        fits
+          ? 'background:rgba(34,197,94,0.14);color:var(--success);'
+          : 'background:rgba(239,68,68,0.14);color:var(--danger);'
+      }">${escapeHtml(pillTxt)}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px;">
+      ${kpiCell(tk('kpi_weights'), `${weightsGb} GB`, escapeHtml(spec.dtype || ''))}
+      ${kpiCell(tk('kpi_kv'), `${kvGb} GB`, `ctx ${(r.applied?.max_model_len || 0).toLocaleString()}`)}
+      ${kpiCell(tk('kpi_activations'), `${actGb} GB`, '')}
+      ${kpiCell(tk('kpi_per_gpu'), `${perGpuGb} GB`, `${r.applied?.tensor_parallel || 1}× GPU`)}
+      ${kpiCell(tk('kpi_total'), `${totalUsed} GB`, `${fitsPct}%`, fits ? 'success' : 'danger')}
+    </div>
+    ${warningsHtml ? `<ul style="font-size:11px;color:var(--warning);margin-left:18px;">${warningsHtml}</ul>` : ''}
+  `;
+}
+
+function kpiCell(label, value, sub, cls) {
+  const valueColor = cls === 'success' ? 'color:var(--success);' : (cls === 'danger' ? 'color:var(--danger);' : '');
+  return `
+    <div style="background:var(--bg-3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;">
+      <div style="font-size:9.5px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.06em;font-weight:700;">${escapeHtml(label)}</div>
+      <div style="font-size:14px;font-weight:800;font-family:'JetBrains Mono',monospace;${valueColor}">${escapeHtml(value)}</div>
+      <div style="font-size:10px;color:var(--text-3);">${escapeHtml(sub || '')}</div>
+    </div>`;
 }
 
 function startVramPoll(overlay, serviceId) {
@@ -247,98 +412,97 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
-function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRepo) {
+function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRepo, presets) {
   const status = (svc.status || '').toLowerCase();
   const isStarting = status === 'starting';
   const dotCls = status === 'running' ? 'ok' : (status === 'failed' ? '' : 'warn');
   const headMeta = `#${svc.id} · ${svc.endpoint_url ? svc.endpoint_url.replace(/^https?:\/\/[^/]*/, '') : ''} · ${svc.status}`;
   const restartWarn = isStarting || status === 'running' || status === 'degraded';
+  const tk = (k) => I18n.t(`services_edit.${k}`) || k;
 
   return `
     <div class="modal-shell" style="margin-top:5vh;">
       <div class="modal-head">
         <div class="dot ${dotCls}"></div>
-        <h3>Edycja serwisu: ${escapeHtml(svc.display_name || engineId)}</h3>
+        <h3>${escapeHtml(tk('title'))}: ${escapeHtml(svc.display_name || engineId)}</h3>
         <span class="head-meta">${escapeHtml(headMeta)}</span>
-        <button class="btn ghost" data-close style="padding:4px 10px;min-height:0;font-size:18px;">×</button>
+        <button class="btn ghost" data-close style="padding:4px 10px;min-height:0;font-size:18px;" title="${escapeAttr(tk('close'))}">×</button>
       </div>
       <div class="modal-body">
         <div class="step-heading">
-          <h2>Konfiguracja silnika ${escapeHtml(engineId)}</h2>
-          <p>Zmiana modelu, alokacji VRAM lub parametrów runtime. Engine_id / deploy_method / port są niezmienne.</p>
+          <h2>${escapeHtml(tk('subtitle').replace('{engine}', engineId))}</h2>
+          <p>${escapeHtml(tk('subtitle_desc'))}</p>
         </div>
         ${restartWarn ? `
           <div class="step-warn">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v3M12 17h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/></svg>
-            <div class="txt">
-              <strong>Serwis żyje teraz.</strong> Zapisanie zatrzyma serwis, zaktualizuje konfigurację
-              i uruchomi go ponownie. Strumienie chat / TTS aktywne dostaną <em>503</em>. Reload modelu ~30–180 s.
-            </div>
+            <div class="txt">${escapeHtml(tk('restart_warn'))}</div>
           </div>
         ` : ''}
 
         <div data-error style="display:none;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);color:var(--danger);padding:10px 14px;border-radius:8px;font-size:12px;margin-bottom:14px;"></div>
 
-        ${renderModelSection(initialPresetId, initialModelRepo)}
+        ${renderModelSection(initialPresetId, initialModelRepo, presets, tk)}
 
-        ${isVllm ? renderVramSection(cfg) : ''}
+        ${isVllm ? renderVramSection(tk) : ''}
 
-        ${isVllm ? renderEngineArgsSection(cfg) : renderGenericArgsSection(cfg)}
+        ${isVllm ? renderEngineArgsSection(cfg, tk) : renderGenericArgsSection(tk)}
 
         <div class="body-section">
-          <div class="body-section-title">Niezmienne</div>
+          <div class="body-section-title">${escapeHtml(tk('immutable'))}</div>
           <div class="fact-list">
-            <div class="row"><span class="key">Engine ID</span><span class="val">${escapeHtml(svc.engine_id || '')}</span></div>
-            <div class="row"><span class="key">Deploy method</span><span class="val">${escapeHtml(svc.deploy_method || '')}</span></div>
-            <div class="row"><span class="key">Transport</span><span class="val">${escapeHtml(svc.transport || '')}</span></div>
-            <div class="row"><span class="key">Port</span><span class="val">${escapeHtml(String(svc.runtime_port || ''))}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_engine'))}</span><span class="val">${escapeHtml(svc.engine_id || '')}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_method'))}</span><span class="val">${escapeHtml(svc.deploy_method || '')}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_transport'))}</span><span class="val">${escapeHtml(svc.transport || '')}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_port'))}</span><span class="val">${escapeHtml(String(svc.runtime_port || ''))}</span></div>
           </div>
         </div>
       </div>
       <div class="modal-foot">
-        <button class="btn ghost" data-cancel>Anuluj</button>
+        <button class="btn ghost" data-cancel>${escapeHtml(tk('cancel'))}</button>
         <div class="spacer"></div>
         <label style="font-size:12px;color:var(--text-2);display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
           <input type="checkbox" data-restart-after-save checked style="accent-color:var(--accent-1);">
-          Restart po zapisie
+          ${escapeHtml(tk('restart_after_save'))}
         </label>
         <button class="btn primary" data-save>
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>
-          Zapisz i restartuj
+          ${escapeHtml(tk('save'))}
         </button>
       </div>
     </div>`;
 }
 
-function renderModelSection(initialPresetId, initialModelRepo) {
-  const useCustom = !initialPresetId && initialModelRepo;
+function renderModelSection(initialPresetId, initialModelRepo, presets, tk) {
+  const useCustom = !initialPresetId && !!initialModelRepo;
+  const presetsHtml = renderPresetCards(presets, initialPresetId, tk);
   return `
     <div class="body-section">
-      <div class="body-section-title">Model</div>
+      <div class="body-section-title">${escapeHtml(tk('model'))}</div>
       <div class="opt-cards">
         <div class="opt-card${useCustom ? '' : ' active'}" data-model-mode="preset">
           <div class="opt-icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
           </div>
-          <div class="opt-title">Preset</div>
-          <div class="opt-desc">Z manifestu silnika.</div>
+          <div class="opt-title">${escapeHtml(tk('model_preset'))} <span class="tag">${presets.length}</span></div>
+          <div class="opt-desc">${escapeHtml(tk('model_preset_desc'))}</div>
         </div>
         <div class="opt-card${useCustom ? ' active' : ''}" data-model-mode="custom">
           <div class="opt-icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
           </div>
-          <div class="opt-title">Custom HF repo</div>
-          <div class="opt-desc">Dowolny <code>org/repo</code>.</div>
+          <div class="opt-title">${escapeHtml(tk('model_custom'))}</div>
+          <div class="opt-desc">${escapeHtml(tk('model_custom_desc'))}</div>
         </div>
       </div>
       <div data-preset-list style="${useCustom ? 'display:none;' : ''}">
         <div class="preset-list">
-          ${renderPresetCards(initialPresetId)}
+          ${presetsHtml || `<div style="font-size:11px;color:var(--text-3);padding:8px 0;">${escapeHtml(tk('no_presets'))}</div>`}
         </div>
       </div>
       <div data-custom-repo style="${useCustom ? '' : 'display:none;'}">
         <div class="form-row">
-          <label>HuggingFace repo</label>
+          <label>${escapeHtml(tk('hf_repo_label'))}</label>
           <input class="tf-input mono" data-custom-repo-input placeholder="org/repo"
             value="${escapeAttr(initialModelRepo)}">
         </div>
@@ -346,29 +510,32 @@ function renderModelSection(initialPresetId, initialModelRepo) {
     </div>`;
 }
 
-function renderPresetCards(initialPresetId) {
-  // Lista presetów obecnie hardkodowana — w pełnej wersji ładujemy z
-  // /api/services/manifest/:engine_id (HTTP, JSON, OK bo to read-only
-  // queryczny katalog manifestow). MVP: same te które już masz w DB.
-  const presets = [
-    { id: 'qwen3-5-9b-nvfp4', name: 'Qwen3.5-9B-NVFP4', repo: 'AxionML/Qwen3.5-9B-NVFP4', vram: '~8.4 GiB', tags: ['recommended', '4-bit NVFP4'] },
-    { id: 'qwen3-5-0-8b-nvfp4', name: 'Qwen3.5-0.8B-NVFP4', repo: 'AxionML/Qwen3.5-0.8B-NVFP4', vram: '~1.2 GiB', tags: ['4-bit NVFP4'] },
-    { id: 'deepseek-r1-distill-qwen-7b', name: 'DeepSeek-R1-Distill-Qwen-7B', repo: 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B', vram: '~14 GiB FP16', tags: ['reasoning'] },
-  ];
+function renderPresetCards(presets, initialPresetId, tk) {
+  if (!presets || presets.length === 0) return '';
+  // Wybor sel: jesli initialPresetId pasuje do listy → ten. Inaczej recommended
+  // jako fallback. Inaczej pierwszy.
+  const matched = initialPresetId && presets.find((p) => p.id === initialPresetId);
+  const fallback = !matched && (presets.find((p) => p.recommended) || presets[0]);
+  const selectedId = matched ? matched.id : fallback?.id;
+
   return presets
     .map((p) => {
-      const sel = p.id === initialPresetId || (!initialPresetId && p.tags.includes('recommended'));
-      const recPill = p.tags.includes('recommended')
-        ? '<span class="preset-rec">RECOMMENDED</span>'
+      const sel = p.id === selectedId;
+      const recPill = p.recommended
+        ? `<span class="preset-rec">${escapeHtml(tk('recommended_pill'))}</span>`
+        : '';
+      const quantTag = p.quantization
+        ? `<span class="sep">·</span><span>${escapeHtml(p.quantization)}</span>`
         : '';
       return `
-        <div class="preset-card${sel ? ' selected' : ''}" data-preset-id="${escapeAttr(p.id)}">
+        <div class="preset-card${sel ? ' selected' : ''}"
+             data-preset-id="${escapeAttr(p.id)}"
+             data-preset-repo="${escapeAttr(p.repo)}">
           <div class="preset-radio"></div>
           <div class="preset-info">
-            <div class="preset-name">${escapeHtml(p.name)} ${recPill}</div>
+            <div class="preset-name">${escapeHtml(p.display_name)} ${recPill}</div>
             <div class="preset-meta">
-              <span>${escapeHtml(p.repo)}</span><span class="sep">·</span>
-              <span>${escapeHtml(p.vram)}</span>
+              <span>${escapeHtml(p.repo)}</span>${quantTag}
             </div>
           </div>
         </div>`;
@@ -376,21 +543,23 @@ function renderPresetCards(initialPresetId) {
     .join('');
 }
 
-function renderVramSection(cfg) {
-  const muVal = typeof cfg.gpu_memory_utilization === 'number' ? cfg.gpu_memory_utilization : 0.9;
+function renderVramSection(tk) {
   return `
     <div class="body-section">
-      <div class="body-section-title">Alokacja VRAM</div>
+      <div class="body-section-title">${escapeHtml(tk('vram_title'))}</div>
       <div class="adv-section">
-        <div class="adv-extern" data-vram-bar style="margin-top:0;">
-          <div style="font-size:11px;color:var(--text-3);">Ładowanie GPU snapshot…</div>
+        <div data-vram-card>
+          <div style="font-size:11px;color:var(--text-3);">${escapeHtml(tk('vram.loading') || 'Liczenie…')}</div>
+        </div>
+        <div class="adv-extern" data-vram-bar style="margin-top:14px;">
+          <div style="font-size:11px;color:var(--text-3);">${escapeHtml(tk('vram_external_loading'))}</div>
         </div>
         <div style="margin-top:14px;">
           <label style="display:flex;justify-content:space-between;font-size:11.5px;font-weight:600;color:var(--text-2);">
             <span>gpu_memory_utilization</span>
-            <span data-mu-value style="color:var(--accent-2);font-family:'JetBrains Mono',monospace;font-weight:700;">${muVal.toFixed(2)}</span>
+            <span data-mu-value style="color:var(--accent-2);font-family:'JetBrains Mono',monospace;font-weight:700;">0.90</span>
           </label>
-          <input type="range" data-mu-slider min="0.10" max="0.95" step="0.01" value="${muVal}" style="width:100%;margin-top:6px;">
+          <input type="range" data-mu-slider min="0.10" max="0.95" step="0.01" value="0.90" style="width:100%;margin-top:6px;">
           <div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--text-3);margin-top:4px;padding:0 8px;">
             <span>0.10</span><span>0.30</span><span>0.50</span><span>0.70</span><span>0.95</span>
           </div>
@@ -399,27 +568,27 @@ function renderVramSection(cfg) {
     </div>`;
 }
 
-function renderEngineArgsSection(cfg) {
+function renderEngineArgsSection(cfg, tk) {
   return `
     <div class="body-section">
-      <div class="body-section-title">Parametry runtime (vLLM)</div>
+      <div class="body-section-title">${escapeHtml(tk('runtime_title'))}</div>
       <div class="adv-row-2">
         <div class="form-row">
-          <label>Max model len</label>
+          <label>${escapeHtml(tk('max_model_len'))}</label>
           <input class="tf-input mono" data-max-model-len value="${escapeAttr(cfg.max_model_len ?? '')}" placeholder="32768">
         </div>
         <div class="form-row">
-          <label>Max num seqs</label>
+          <label>${escapeHtml(tk('max_num_seqs'))}</label>
           <input class="tf-input mono" data-max-num-seqs value="${escapeAttr(cfg.max_num_seqs ?? '')}" placeholder="1">
         </div>
         <div class="form-row">
-          <label>Max num batched tokens</label>
+          <label>${escapeHtml(tk('max_batched'))}</label>
           <input class="tf-input mono" data-max-batched value="${escapeAttr(cfg.max_num_batched_tokens ?? '')}" placeholder="8192">
         </div>
         <div class="form-row">
-          <label>KV cache dtype</label>
+          <label>${escapeHtml(tk('kv_dtype'))}</label>
           <select class="tf-select" data-kv-dtype>
-            <option value="">(default)</option>
+            <option value="">${escapeHtml(tk('kv_dtype_default'))}</option>
             <option value="auto"${cfg.kv_cache_dtype === 'auto' ? ' selected' : ''}>auto</option>
             <option value="fp8"${cfg.kv_cache_dtype === 'fp8' ? ' selected' : ''}>fp8</option>
             <option value="fp16"${cfg.kv_cache_dtype === 'fp16' ? ' selected' : ''}>fp16</option>
@@ -430,18 +599,18 @@ function renderEngineArgsSection(cfg) {
       <div class="form-row" style="margin-top:8px;">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12.5px;">
           <input type="checkbox" data-chunked-prefill${cfg.chunked_prefill === false ? '' : ' checked'} style="accent-color:var(--accent-1);">
-          <span>Enable chunked prefill</span>
+          <span>${escapeHtml(tk('chunked_prefill'))}</span>
         </label>
       </div>
     </div>`;
 }
 
-function renderGenericArgsSection(_cfg) {
+function renderGenericArgsSection(tk) {
   return `
     <div class="body-section">
-      <div class="body-section-title">Parametry runtime</div>
+      <div class="body-section-title">${escapeHtml(tk('runtime_title'))}</div>
       <div class="form-row">
-        <label>Edycja typed parameters dostępna tylko dla vLLM. Dla pozostałych silników skorzystaj z deploy wizard'a (delete + create).</label>
+        <label>${escapeHtml(tk('runtime_generic_note'))}</label>
       </div>
     </div>`;
 }
