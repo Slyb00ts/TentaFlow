@@ -5644,6 +5644,262 @@ pub async fn service_start(
     ))
 }
 
+#[handler(variant = "ServiceUpdateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqUpdate(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqUpdate",
+            ));
+        }
+    };
+
+    if let Some(_target) = forward_target_node(ctx, &payload.node_id) {
+        // Mesh forward gdy GUI edytuje serwis na peer node — TODO Krok 9 plan
+        // (osobna komenda MeshCommandType::ServiceUpdateRemote). Na razie
+        // odbijamy z BadRequest żeby caller wiedział że trzeba edytować
+        // bezpośrednio na nodzie.
+        return Err(ProtocolError::new(
+            tentaflow_protocol::ProtocolErrorCode::NotImplemented,
+            "service update on remote nodes not implemented yet",
+        ));
+    }
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+
+    // Zaktualizuj config_json: parsujemy istniejący JSON, mergujemy podane
+    // pola, serializujemy. Pozostałe pola (np. ścieżki bundle) zostają.
+    let mut cfg: serde_json::Value = serde_json::from_str(&svc.config_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let cfg_obj = cfg
+        .as_object_mut()
+        .ok_or_else(|| ProtocolError::bad_request("service config_json is not an object"))?;
+
+    if let Some(repo) = payload.model_repo.as_ref() {
+        cfg_obj.insert("model_repo".into(), serde_json::Value::String(repo.clone()));
+        cfg_obj.insert("model_preset_id".into(), serde_json::Value::Null);
+    }
+    if let Some(preset_id) = payload.model_preset_id.as_ref() {
+        cfg_obj.insert(
+            "model_preset_id".into(),
+            serde_json::Value::String(preset_id.clone()),
+        );
+        cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
+    }
+    if let Some(util) = payload.gpu_memory_utilization {
+        if let Some(num) = serde_json::Number::from_f64(util as f64) {
+            cfg_obj.insert("gpu_memory_utilization".into(), serde_json::Value::Number(num));
+        }
+    }
+    if let Some(v) = payload.max_model_len {
+        cfg_obj.insert("max_model_len".into(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = payload.max_num_seqs {
+        cfg_obj.insert("max_num_seqs".into(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = payload.max_num_batched_tokens {
+        cfg_obj.insert(
+            "max_num_batched_tokens".into(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    if let Some(dt) = payload.kv_cache_dtype.as_ref() {
+        cfg_obj.insert("kv_cache_dtype".into(), serde_json::Value::String(dt.clone()));
+    }
+    if let Some(b) = payload.chunked_prefill {
+        cfg_obj.insert("chunked_prefill".into(), serde_json::Value::Bool(b));
+    }
+    if let Some(args) = payload.vllm_args_override.as_ref() {
+        cfg_obj.insert("vllm_args".into(), serde_json::Value::String(args.clone()));
+    }
+
+    let new_config_json = serde_json::to_string(&cfg)
+        .map_err(|e| ProtocolError::internal(format!("serialize config: {e}")))?;
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::update_config_json(
+            &conn,
+            payload.service_id,
+            &new_config_json,
+        )
+        .map_err(db_err)?;
+        if let Some(p) = payload.pinned {
+            crate::services_repo::services::set_pinned(&conn, payload.service_id, p)
+                .map_err(db_err)?;
+        }
+        if let Some(p) = payload.paused {
+            crate::services_repo::services::set_paused(&conn, payload.service_id, p)
+                .map_err(db_err)?;
+        }
+    }
+
+    let mut restarted = false;
+    let mut respawn_error: Option<String> = None;
+    let was_running = matches!(
+        svc.status,
+        crate::services_repo::services::ServiceStatus::Running
+            | crate::services_repo::services::ServiceStatus::Degraded
+            | crate::services_repo::services::ServiceStatus::Starting
+    );
+
+    if payload.restart_after_save && was_running {
+        // Stop running runtime — terminate(pid) + release ports.
+        if let Some(ports) = ctx.state.port_allocator.clone() {
+            if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
+                tracing::warn!(
+                    service_id = payload.service_id,
+                    "service_update: stop failed before respawn: {}",
+                    e
+                );
+            }
+            // Mark Starting + spawn detached respawn (jak supervisor).
+            {
+                let conn = ctx.state.db.lock().map_err(|_| {
+                    ProtocolError::internal("db pool poisoned")
+                })?;
+                let _ = crate::services_repo::services::update_status(
+                    &conn,
+                    payload.service_id,
+                    crate::services_repo::services::ServiceStatus::Starting,
+                );
+            }
+            let db = ctx.state.db.clone();
+            let svc_id = payload.service_id;
+            let engine_id = svc.engine_id.clone();
+            let deploy_method = svc.deploy_method;
+            let cfg_json = new_config_json.clone();
+            tokio::spawn(async move {
+                match crate::services::deploy::respawn(
+                    &engine_id,
+                    deploy_method,
+                    &cfg_json,
+                    ports,
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        if let Ok(conn) = db.lock() {
+                            let _ = crate::services_repo::services::update_runtime(
+                                &conn,
+                                svc_id,
+                                handle.pid,
+                                handle.port,
+                                handle.sidecar_port,
+                                handle.endpoint_url.as_deref(),
+                            );
+                            let _ = crate::services_repo::services::update_status(
+                                &conn,
+                                svc_id,
+                                crate::services_repo::services::ServiceStatus::Running,
+                            );
+                        }
+                        tracing::info!(
+                            "service_update: respawn ok service_id={} engine={}",
+                            svc_id,
+                            engine_id
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("respawn after update: {}", e);
+                        if let Ok(conn) = db.lock() {
+                            let _ = crate::services_repo::services::update_status(
+                                &conn,
+                                svc_id,
+                                crate::services_repo::services::ServiceStatus::Failed,
+                            );
+                            let _ = crate::services_repo::services::update_health(
+                                &conn,
+                                svc_id,
+                                false,
+                                Some(&msg),
+                            );
+                        }
+                        tracing::warn!(
+                            "service_update: respawn failed service_id={}: {}",
+                            svc_id,
+                            msg
+                        );
+                    }
+                }
+            });
+            restarted = true;
+        } else {
+            respawn_error = Some("port allocator not initialized".into());
+        }
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.update",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} restart={}",
+            payload.service_id, payload.restart_after_save
+        )),
+    );
+
+    push_service_updated(ctx, payload.service_id);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResUpdate(tentaflow_protocol::ServiceUpdateResponse {
+            success: respawn_error.is_none(),
+            error: respawn_error,
+            restarted,
+        }),
+    ))
+}
+
+#[handler(variant = "ServiceVramHintRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_vram_hint(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqVramHint(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqVramHint",
+            ));
+        }
+    };
+
+    // Mesh forward NIE jest zaimplementowany dla VramHint — wymagałby
+    // proxy nvidia-smi przez QUIC. Local only na razie. `node_id` ignored.
+    let exclude_pids: Vec<u32> = Vec::new(); // exclude_service_id mapping na PID
+                                              // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
+                                              // własny serwis zwykle nie liczy się jako zaskakujący duży
+                                              // konsument GPU bo jest dopiero startowany lub stopped.
+    let snapshot =
+        crate::services::gpu_snapshot::collect_vram_snapshot(payload.gpu_index, &exclude_pids)
+            .await;
+
+    let recommended = snapshot
+        .first()
+        .map(crate::services::gpu_snapshot::recommended_utilization);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResVramHint(tentaflow_protocol::ServiceVramHintResponse {
+            gpus: snapshot,
+            recommended_utilization: recommended,
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod catalog_list_tests {
     //! Coverage for the snapshot→wire mapping that backs the
