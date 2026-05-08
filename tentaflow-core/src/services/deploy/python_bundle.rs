@@ -352,6 +352,13 @@ impl DeployStrategy for PythonBundleDeploy {
             ],
             status_report_interval: Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
+            // 5 minut na warmup. Wiekszosc python-bundle silnikow
+            // (qwen-asr, parakeet, xtts) gotowi w <30s. vLLM cold start
+            // 60-180s przy pierwszym ladowaniu modelu (HF download +
+            // weights mmap). Po 5 min uznajemy ze cos nie tak (typowo
+            // CUDA OOM w child workerze, parent uvicorn wisi czekajac
+            // na engine core message).
+            max_wait: Some(Duration::from_secs(300)),
         };
         let outcome = smart_health_probe(probe_cfg, move || async move {
             // None = still alive; Some(_) = exited (we cannot recover the

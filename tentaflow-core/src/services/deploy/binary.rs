@@ -183,6 +183,10 @@ impl DeployStrategy for BinaryDeploy {
             ],
             status_report_interval: Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
+            // 2 minuty na binary spawn — wiekszosc native binarek
+            // (sherpa-onnx, teams-bot) gotowi w <10s, ale rezerwujemy
+            // margines na cold filesystem / first-launch initialization.
+            max_wait: Some(Duration::from_secs(120)),
         };
         let outcome = smart_health_probe(probe_cfg, move || async move {
             match pid_for_probe {

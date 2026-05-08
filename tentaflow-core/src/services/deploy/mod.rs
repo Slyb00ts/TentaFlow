@@ -591,12 +591,23 @@ pub struct SmartProbeConfig {
     /// `log_sink` so the dashboard sees progress.
     pub status_report_interval: std::time::Duration,
     pub log_sink: Option<LogSink>,
+    /// Maximum wall-clock time before giving up. Po przekroczeniu probe
+    /// zwraca `ProcessExited(None)`, callerzy traktują jako fail i robią
+    /// rollback. None = no timeout (legacy zachowanie).
+    ///
+    /// Bez tego deploy::respawn wisi w nieskończoność gdy podproces
+    /// engine'a żyje (parent PID alive) ale nigdy nie wystawia HTTP
+    /// readiness — typowo przy CUDA OOM w child workerze (uvicorn parent
+    /// trzyma się i czeka na engine core message). Supervisor `Starting`
+    /// status pozostaje na zawsze, GUI nie widzi błędu.
+    pub max_wait: Option<std::time::Duration>,
 }
 
-/// Smart liveness+readiness probe with no hard timeout. Loops until one of:
+/// Smart liveness+readiness probe. Loops until one of:
 ///
 /// * a readiness URL answers 2xx → `Ready`;
-/// * `is_alive_check` reports the process gone → `ProcessExited`.
+/// * `is_alive_check` reports the process gone → `ProcessExited`;
+/// * `max_wait` upłynął (gdy ustawiony) → `ProcessExited(None)`.
 ///
 /// `is_alive_check` is an async closure returning `Some(exit_code)` when
 /// the supervised process has exited (None inside Some means "exited but
@@ -627,6 +638,18 @@ where
     };
 
     loop {
+        if let Some(deadline) = cfg.max_wait {
+            if started.elapsed() >= deadline {
+                if let Some(sink) = &cfg.log_sink {
+                    sink.info(&format!(
+                        "[health] timeout after {}s — engine alive but not ready (likely crashed worker / CUDA OOM); failing deploy",
+                        started.elapsed().as_secs()
+                    ));
+                }
+                return SmartProbeOutcome::ProcessExited(None);
+            }
+        }
+
         if let Some(exit) = is_alive_check().await {
             return SmartProbeOutcome::ProcessExited(exit);
         }
@@ -1576,6 +1599,7 @@ mod tests {
             readiness_urls: vec![format!("{}/v1/models", server.uri())],
             status_report_interval: Duration::from_secs(60),
             log_sink: None,
+            max_wait: None,
         };
         let alive = AtomicBool::new(true);
         let outcome = smart_health_probe(cfg, || async {
@@ -1598,11 +1622,33 @@ mod tests {
             readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
             status_report_interval: Duration::from_secs(60),
             log_sink: None,
+            max_wait: None,
         };
         let outcome = smart_health_probe(cfg, || async { Some(Some(137)) }).await;
         match outcome {
             SmartProbeOutcome::ProcessExited(Some(137)) => {}
             other => panic!("expected ProcessExited(137), got {:?}", other),
+        }
+    }
+
+    /// Process zywy ale readiness URL nieosiagalny → po max_wait probe
+    /// kończy z ProcessExited(None). Bez tego deploy::respawn wisial w
+    /// nieskonczonosc gdy parent uvicorn alive ale child engine core
+    /// crashowal (CUDA OOM).
+    #[tokio::test]
+    async fn smart_probe_times_out_when_alive_but_never_ready() {
+        use std::time::Duration;
+
+        let cfg = SmartProbeConfig {
+            readiness_urls: vec!["http://127.0.0.1:1/health".to_string()],
+            status_report_interval: Duration::from_secs(60),
+            log_sink: None,
+            max_wait: Some(Duration::from_millis(800)),
+        };
+        let outcome = smart_health_probe(cfg, || async { None }).await;
+        match outcome {
+            SmartProbeOutcome::ProcessExited(None) => {}
+            other => panic!("expected ProcessExited(None) on timeout, got {:?}", other),
         }
     }
 
