@@ -127,6 +127,15 @@ pub struct ServiceEntry {
     /// top-level keys, when materialising a legacy `ServiceBackend` for
     /// `BackendClient::new`. Numeric / object / array values are excluded.
     pub extra_config: HashMap<String, String>,
+    /// Krótki opis aktualnej fazy startu (np. "warming up — alive 30s,
+    /// waiting for /v1/models"). Aktualizowany przez supervisor heartbeat
+    /// w detached deploy task. GUI snapshot pokazuje obok statusu —
+    /// klient widzi PROGRES startu zamiast tylko "Starting" przez
+    /// minuty. NULL gdy serwis Running albo nie ma nic do raportowania.
+    pub progress_message: Option<String>,
+    /// Ostatni błąd zdrowia (failed health probe, pinned auto-start
+    /// failure). Przekazywany 1:1 z `services.health_last_err`.
+    pub health_last_err: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,14 +404,44 @@ impl Supervisor {
             let ports_for_task = self.ports.clone();
 
             tokio::spawn(async move {
-                match deploy::respawn(
+                // Heartbeat progress: co 5s update progress_message
+                // ("warming up — alive Xs") zeby GUI snapshot pokazywal
+                // user'owi PROGRES startu (cold start vLLM ~3 min).
+                // tokio::select! z deploy::respawn() future i interval
+                // tick — pierwszy deploy result wins, interval jest
+                // anulowany.
+                update_progress_detached(
+                    &db_for_task,
+                    svc_id,
+                    Some("starting — bootstrap+spawn"),
+                )
+                .await;
+                let respawn_fut = deploy::respawn(
                     &engine_id,
                     deploy_method,
                     &config_json,
                     ports_for_task,
-                )
-                .await
-                {
+                );
+                tokio::pin!(respawn_fut);
+                let started = std::time::Instant::now();
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.tick().await; // skip immediate first tick
+                let outcome: Result<deploy::RuntimeHandle, deploy::DeployError> = loop {
+                    tokio::select! {
+                        biased;
+                        res = &mut respawn_fut => break res,
+                        _ = tick.tick() => {
+                            let secs = started.elapsed().as_secs();
+                            update_progress_detached(
+                                &db_for_task,
+                                svc_id,
+                                Some(&format!("warming up — alive {}s, waiting for ready", secs)),
+                            )
+                            .await;
+                        }
+                    }
+                };
+                match outcome {
                     Ok(handle) => {
                         if let Err(e) =
                             update_runtime_detached(&db_for_task, svc_id, &handle).await
@@ -421,10 +460,12 @@ impl Supervisor {
                             None,
                         )
                         .await;
+                        update_progress_detached(&db_for_task, svc_id, None).await;
                         tracing::info!(
-                            "supervisor: pinned service {} ({}) up after detached deploy",
+                            "supervisor: pinned service {} ({}) up after detached deploy ({}s)",
                             svc_id,
-                            engine_id
+                            engine_id,
+                            started.elapsed().as_secs()
                         );
                     }
                     Err(e) => {
@@ -440,6 +481,16 @@ impl Supervisor {
                             svc_id,
                             ServiceStatus::Failed,
                             Some(&msg),
+                        )
+                        .await;
+                        // Progress message: pokazujemy ostatni stan +
+                        // ze padlo, zeby GUI mialo wskazowke (bezpiecznie
+                        // duplikuje error_message ale GUI moze inaczej
+                        // renderowac progress vs error).
+                        update_progress_detached(
+                            &db_for_task,
+                            svc_id,
+                            Some(&format!("failed after {}s", started.elapsed().as_secs())),
                         )
                         .await;
                     }
@@ -621,6 +672,8 @@ impl Supervisor {
                     weight: meta.weight,
                     model_name_override: meta.model_name_override,
                     extra_config: meta.extra_config,
+                    progress_message: row.progress_message,
+                    health_last_err: row.health_last_err,
                 });
             }
 
@@ -950,6 +1003,22 @@ async fn update_runtime_detached(
     .await
     .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     .map_err(|e| SupervisorError::Database(e.to_string()))
+}
+
+/// Aktualizuje progress_message przez `services_repo::update_progress_message`.
+/// `None` = wyczyść message (Running success / Failed cleanup). Erroram
+/// w spawn_blocking nie reagujemy — heartbeat to best-effort UX.
+async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
+    let db = db.clone();
+    let msg_owned = msg.map(|s| s.to_string());
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        services_repo::update_progress_message(&conn, id, msg_owned.as_deref())?;
+        Ok(())
+    })
+    .await;
 }
 
 async fn update_status_detached(
@@ -1760,6 +1829,7 @@ mod tests {
             endpoint_url: None,
             restart_count: 0,
             health_last_err: None,
+            progress_message: None,
             models: vec![tentaflow_protocol::ServiceModelEntry {
                 model_name: "qwen-tiny".into(),
                 display_name: None,

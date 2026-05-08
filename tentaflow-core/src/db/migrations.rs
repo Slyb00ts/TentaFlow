@@ -75,8 +75,25 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flow_json_rename_edge_fields",
             MigrationStep::Sql(FLOW_JSON_RENAME_EDGE_FIELDS),
         ),
+        (
+            5,
+            "services_progress_message",
+            MigrationStep::Sql(SERVICES_PROGRESS_MESSAGE),
+        ),
     ]
 }
+
+// progress_message: krotki status text aktualizowany przez supervisor /
+// detached deploy task podczas Starting (np. "warming up — alive 30s,
+// waiting for /v1/models"). GUI snapshot pokazuje obok statusu, zeby
+// user widzial PROGRES startu serwisu (vLLM cold start ~3 min, klient
+// inaczej widzi tylko "Starting" przez kilka minut bez feedbacku).
+//
+// Health_last_err zostaje DEDYKOWANE dla bledow zdrowia (failed probe).
+// Progress_message jest informacyjne, NULL gdy nic do powiedzenia.
+const SERVICES_PROGRESS_MESSAGE: &str = r#"
+ALTER TABLE services ADD COLUMN progress_message TEXT;
+"#;
 
 // Rename edge fieldow w flow_json: `from`/`to` -> `from_node`/`to_node`.
 // GUI canvas (flows-builder/canvas.js) oczekuje `from_node`/`to_node`, seed
@@ -966,6 +983,9 @@ CREATE TABLE services (
     config_json TEXT NOT NULL DEFAULT '{}',
     health_last_ok TIMESTAMP,
     health_last_err TEXT,
+    -- progress_message dodawany przez migration 5 (services_progress_message).
+    -- Nie dodajemy tu zeby ALTER TABLE w migracji nie zwalil "duplicate column"
+    -- na fresh DB.
     restart_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
