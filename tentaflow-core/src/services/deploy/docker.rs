@@ -478,10 +478,11 @@ impl DeployStrategy for DockerDeploy {
             ],
             status_report_interval: std::time::Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
-            // 5 minut na container warmup. Docker pull + start + model
-            // load (vllm GPU container 60-180s typowo). Po 5 min flaguje
-            // jako Failed (typowo CUDA OOM lub crash w child procesach).
-            max_wait: Some(std::time::Duration::from_secs(300)),
+            // Brak hard timeoutu — docker container exit (CUDA OOM,
+            // OOMKilled przez kernel cgroups itp.) flag'uje jako
+            // Failed natychmiast. Bez timeoutu zeby duze modele
+            // (70B+, multi-GB HF download) mogly sie ladowac dluzej.
+            max_wait: None,
         };
         let docker_for_probe = docker.clone();
         let name_for_probe = container_name.clone();
