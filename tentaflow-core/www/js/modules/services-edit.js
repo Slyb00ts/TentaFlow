@@ -12,8 +12,8 @@
 // te style w services.css albo deploy-wizard.css załadowane.
 // =============================================================================
 
-import { ApiBinary } from '../lib/api-binary.js';
-import { I18n } from '../lib/i18n.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { I18n } from '/js/i18n.js';
 
 let currentModalEl = null;
 let vramPollHandle = null;
