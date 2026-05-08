@@ -292,25 +292,14 @@ async fn run_server(args: Args) -> Result<()> {
     let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
         use std::collections::HashSet;
         use tentaflow_core::services::ports::PortAllocator;
-        use tentaflow_core::services_repo::services as services_v2_repo;
 
         let services_runtime_cfg = config.services_runtime.clone();
 
-        // Reserve ports already owned by alive services_v2 rows so the allocator
-        // never hands them to a parallel deploy.
-        let mut excluded: HashSet<u16> = HashSet::new();
-        if let Ok(conn) = db.lock() {
-            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
-                for row in rows {
-                    if let Some(p) = row.runtime_port {
-                        excluded.insert(p);
-                    }
-                    if let Some(p) = row.sidecar_quic_port {
-                        excluded.insert(p);
-                    }
-                }
-            }
-        }
+        // Excluded set zostaje pusty — porty istniejących serwisów (z DB)
+        // sa pre-rezerwowane PONIZEJ przez `ports.reserve(p)` co dodaje je
+        // do `leased` (zwalniane przy stop/delete) zamiast do `excluded`
+        // (permanentne, blokuje takze wlasciciela portu przy respawn).
+        let excluded: HashSet<u16> = HashSet::new();
 
         match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
             Ok(allocator) => Some(Arc::new(allocator)),
@@ -336,7 +325,10 @@ async fn run_server(args: Args) -> Result<()> {
                 match tentaflow_core::services_repo::services::list_all(&conn) {
                     Ok(services) => {
                         for svc in services {
-                            if let Some(port) = svc.runtime_port {
+                            for port in [svc.runtime_port, svc.sidecar_quic_port]
+                                .into_iter()
+                                .flatten()
+                            {
                                 if let Err(e) = port_allocator.reserve(port) {
                                     tracing::warn!(
                                         service_id = svc.id,
