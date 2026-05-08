@@ -767,10 +767,36 @@ impl Supervisor {
             }
         }
 
-        // (4) Insert handles for new pairs.
+        // (4) Insert / refresh handles. Bug N7.3: gdy serwis dostaje
+        // nowy port (np. po CUDA OOM crash + respawn na innym porcie z
+        // alokatora), DB endpoint_url zmienia sie ale live_handles
+        // trzymalo stary handle ze starym URL. Skutek: routing chat
+        // trafial na zwolniony port (zombie z poprzedniego attempta).
+        // Fix: porownaj endpoint signature; gdy rozni sie od desired,
+        // shutdown old + insert new.
         for ((node_id, service_id), svc) in desired.into_iter() {
-            if self.live_handles.get(&node_id, service_id).is_some() {
+            let existing_signature = self
+                .live_handles
+                .get(&node_id, service_id)
+                .map(|h| h.endpoint_signature());
+            let desired_signature = handle_endpoint_signature(&svc);
+            if existing_signature.as_deref() == Some(desired_signature.as_str()) {
                 continue;
+            }
+            // Endpoint mismatch (lub brak handle) → shutdown stary, build nowy.
+            if existing_signature.is_some() {
+                if let Some(old) = self.live_handles.remove(&node_id, service_id) {
+                    old.shutdown();
+                }
+                let mut tasks = self.reconnect_tasks.lock().await;
+                if let Some(task) = tasks.remove(&(node_id.clone(), service_id)) {
+                    task.abort();
+                }
+                tracing::info!(
+                    "supervisor: handle endpoint changed for service {} ({}) — rebuilding",
+                    service_id,
+                    svc.engine_id
+                );
             }
             let handle = match build_handle(&svc) {
                 Ok(h) => h,
@@ -1008,6 +1034,31 @@ async fn update_runtime_detached(
 /// Aktualizuje progress_message przez `services_repo::update_progress_message`.
 /// `None` = wyczyść message (Running success / Failed cleanup). Erroram
 /// w spawn_blocking nie reagujemy — heartbeat to best-effort UX.
+/// Sygnatura endpointu dla `tentaflow_protocol::ServiceInfo` —
+/// odpowiednik `BackendHandle::endpoint_signature()`. Pozwala wykryć że
+/// serwis dostal nowy port (CUDA OOM crash + respawn z innym portem
+/// alokatora) i `live_handles` cached musi zostać przebudowany.
+fn handle_endpoint_signature(svc: &tentaflow_protocol::ServiceInfo) -> String {
+    match svc.transport.as_str() {
+        "http_direct" | "external_http" => {
+            format!("http:{}", svc.endpoint_url.as_deref().unwrap_or(""))
+        }
+        "sidecar_quic" => format!(
+            "quic:quic://127.0.0.1:{}",
+            svc.sidecar_quic_port.unwrap_or(0)
+        ),
+        "embedded" => {
+            let model = svc
+                .models
+                .first()
+                .map(|m| m.model_name.as_str())
+                .unwrap_or("");
+            format!("embedded:{}:{}", svc.engine_id, model)
+        }
+        other => format!("unknown:{}:{}", other, svc.engine_id),
+    }
+}
+
 async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
     let db = db.clone();
     let msg_owned = msg.map(|s| s.to_string());
