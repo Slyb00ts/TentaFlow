@@ -345,6 +345,15 @@ impl Supervisor {
 
     /// Iterates pinned services and re-launches every one that is stopped /
     /// failed and not paused. Used exclusively by `run_first_tick`.
+    ///
+    /// Non-blocking: każdy pinned service deploy::respawn idzie do osobnego
+    /// detached `tokio::spawn` task'a. `run_first_tick` (i tym samym
+    /// `main.rs::Wszystkie serwery uruchomione`) nie czeka na deploy
+    /// pythonowych bundli (vLLM ~140s, qwen-asr ~6s). Status w DB jest
+    /// `Starting` od razu po spawn'ie, GUI/snapshot zobaczy `Running` po
+    /// najbliższym health-check tick'u (default 2s). Przy fail status jest
+    /// `Failed` z error message — zgodnie z zamiarem "po porażce user
+    /// musi nacisnąć Start manualnie" (komentarz w `run_first_tick`).
     async fn auto_start_pinned(&self) -> Result<(), SupervisorError> {
         let db = self.db.clone();
         let pinned =
@@ -371,43 +380,71 @@ impl Supervisor {
                 continue;
             }
             tracing::info!(
-                "supervisor: auto-starting pinned service {} ({})",
+                "supervisor: auto-starting pinned service {} ({}) [detached]",
                 svc.id,
                 svc.engine_id
             );
             self.mark_status(svc.id, ServiceStatus::Starting, None)
                 .await;
-            match deploy::respawn(
-                &svc.engine_id,
-                svc.deploy_method,
-                &svc.config_json,
-                self.ports.clone(),
-            )
-            .await
-            {
-                Ok(handle) => {
-                    if let Err(e) = self.write_runtime(svc.id, &handle).await {
-                        tracing::warn!(
-                            "supervisor: write_runtime failed for pinned {} ({}): {}",
-                            svc.id,
-                            svc.engine_id,
-                            e
+
+            let svc_id = svc.id;
+            let engine_id = svc.engine_id.clone();
+            let deploy_method = svc.deploy_method;
+            let config_json = svc.config_json.clone();
+            let db_for_task = self.db.clone();
+            let ports_for_task = self.ports.clone();
+
+            tokio::spawn(async move {
+                match deploy::respawn(
+                    &engine_id,
+                    deploy_method,
+                    &config_json,
+                    ports_for_task,
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        if let Err(e) =
+                            update_runtime_detached(&db_for_task, svc_id, &handle).await
+                        {
+                            tracing::warn!(
+                                "supervisor: write_runtime failed for pinned {} ({}): {}",
+                                svc_id,
+                                engine_id,
+                                e
+                            );
+                        }
+                        update_status_detached(
+                            &db_for_task,
+                            svc_id,
+                            ServiceStatus::Running,
+                            None,
+                        )
+                        .await;
+                        tracing::info!(
+                            "supervisor: pinned service {} ({}) up after detached deploy",
+                            svc_id,
+                            engine_id
                         );
                     }
-                    self.mark_status(svc.id, ServiceStatus::Running, None).await;
-                }
-                Err(e) => {
-                    let msg = format!("pinned auto-start: {}", e);
-                    tracing::warn!(
-                        "supervisor: pinned auto-start failed for {} ({}): {}",
-                        svc.id,
-                        svc.engine_id,
-                        e
-                    );
-                    self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
+                    Err(e) => {
+                        let msg = format!("pinned auto-start: {}", e);
+                        tracing::warn!(
+                            "supervisor: pinned auto-start failed for {} ({}): {}",
+                            svc_id,
+                            engine_id,
+                            e
+                        );
+                        update_status_detached(
+                            &db_for_task,
+                            svc_id,
+                            ServiceStatus::Failed,
+                            Some(&msg),
+                        )
                         .await;
+                    }
                 }
-            }
+            });
         }
         Ok(())
     }
@@ -883,6 +920,57 @@ impl Supervisor {
         let mut g = self.restart_state.lock().await;
         g.remove(&id);
     }
+}
+
+// ----- Detached pinned-deploy helpers ---------------------------------------
+//
+// Free fn'y dla detached `tokio::spawn` w `auto_start_pinned`. Logika
+// identyczna jak `Supervisor::write_runtime` / `mark_status` ale bez
+// `&self`, żeby spawn task mógł żyć po zwrocie z first_tick. Snapshot
+// rebuild dzieje się w run_loop tick (interval=2000ms domyślnie),
+// więc GUI zobaczy `Running`/`Failed` w max ~2s po deploy complete.
+
+async fn update_runtime_detached(
+    db: &DbPool,
+    id: i64,
+    runtime: &RuntimeHandle,
+) -> Result<(), SupervisorError> {
+    let db = db.clone();
+    let pid = runtime.pid;
+    let port = runtime.port;
+    let sidecar = runtime.sidecar_port;
+    let url = runtime.endpoint_url.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        services_repo::update_runtime(&conn, id, pid, port, sidecar, url.as_deref())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
+    .map_err(|e| SupervisorError::Database(e.to_string()))
+}
+
+async fn update_status_detached(
+    db: &DbPool,
+    id: i64,
+    status: ServiceStatus,
+    err: Option<&str>,
+) {
+    let db = db.clone();
+    let err_owned = err.map(|s| s.to_string());
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+        services_repo::update_status(&conn, id, status)?;
+        if let Some(msg) = err_owned {
+            services_repo::update_health(&conn, id, false, Some(&msg))?;
+        }
+        Ok(())
+    })
+    .await;
 }
 
 // ----- HTTP probe helper ----------------------------------------------------
@@ -1423,14 +1511,32 @@ mod tests {
 
         sup.auto_start_pinned().await.unwrap();
 
-        let final_status = {
-            let conn = db.lock().unwrap();
-            services_repo::get(&conn, id).unwrap().unwrap().status
-        };
+        // Detached deploy task pisze końcowy status async — test pollu z
+        // krótkim timeoutem żeby się dowiedzieć kiedy task dobiegnie.
+        // respawn() na bogus engine_id padnie szybko (zanim się dotknie
+        // Docker/python), więc 2s timeout z marżą wystarcza.
+        let final_status = poll_until_terminal(&db, id, Duration::from_secs(2)).await;
         // respawn() on an unknown engine flips the row to Failed; the key
         // assertion is that status moved away from Stopped — the pinned
         // path ran.
         assert_eq!(final_status, ServiceStatus::Failed);
+    }
+
+    async fn poll_until_terminal(db: &DbPool, id: i64, timeout: Duration) -> ServiceStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = {
+                let conn = db.lock().unwrap();
+                services_repo::get(&conn, id).unwrap().unwrap().status
+            };
+            if matches!(status, ServiceStatus::Running | ServiceStatus::Failed) {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
