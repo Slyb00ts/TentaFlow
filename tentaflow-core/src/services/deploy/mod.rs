@@ -499,14 +499,12 @@ pub async fn stop(
         }
     }
 
-    // Always release whichever ports the row claims; PortAllocator is idempotent
-    // on unknown ports.
-    if let Some(p) = svc.runtime_port {
-        let _ = ports.release(p);
-    }
-    if let Some(p) = svc.sidecar_quic_port {
-        let _ = ports.release(p);
-    }
+    // NIE zwalniamy portow przy stop(). Port to permanentny atrybut serwisu
+    // — przyznany przy `deploy()`, zwalniany dopiero przy delete (gdy row
+    // znika z DB). Restart / pause / crash zostawia port w `leased`,
+    // zeby kolejny respawn dostal dokladnie ten sam port przez
+    // `acquire_or_specific(svc.runtime_port)`.
+    let _ = ports;
 
     Ok(())
 }
