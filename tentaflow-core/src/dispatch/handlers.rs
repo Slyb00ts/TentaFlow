@@ -5660,14 +5660,31 @@ pub async fn service_update(
         }
     };
 
-    if let Some(_target) = forward_target_node(ctx, &payload.node_id) {
-        // Mesh forward gdy GUI edytuje serwis na peer node — TODO Krok 9 plan
-        // (osobna komenda MeshCommandType::ServiceUpdateRemote). Na razie
-        // odbijamy z BadRequest żeby caller wiedział że trzeba edytować
-        // bezpośrednio na nodzie.
-        return Err(ProtocolError::new(
-            tentaflow_protocol::ProtocolErrorCode::NotImplemented,
-            "service update on remote nodes not implemented yet",
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceUpdateRemote {
+            service_id: payload.service_id,
+            model_repo: payload.model_repo.clone(),
+            model_preset_id: payload.model_preset_id.clone(),
+            gpu_memory_utilization: payload.gpu_memory_utilization,
+            max_model_len: payload.max_model_len,
+            max_num_seqs: payload.max_num_seqs,
+            max_num_batched_tokens: payload.max_num_batched_tokens,
+            kv_cache_dtype: payload.kv_cache_dtype.clone(),
+            chunked_prefill: payload.chunked_prefill,
+            vllm_args_override: payload.vllm_args_override.clone(),
+            pinned: payload.pinned,
+            paused: payload.paused,
+            restart_after_save: payload.restart_after_save,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResUpdate(
+                tentaflow_protocol::ServiceUpdateResponse {
+                    success,
+                    error,
+                    restarted: payload.restart_after_save && success,
+                },
+            ),
         ));
     }
 
@@ -5897,6 +5914,48 @@ pub async fn service_vram_hint(
             gpus: snapshot,
             recommended_utilization: recommended,
         }),
+    ))
+}
+
+#[handler(variant = "ServiceEnginePresetsRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_engine_presets(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqEnginePresets(p)) => {
+            p.clone()
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqEnginePresets",
+            ));
+        }
+    };
+    let manifest = crate::services::manifest::registry().by_id(&payload.engine_id);
+    let Some(manifest) = manifest else {
+        return Err(ProtocolError::not_found(format!(
+            "engine '{}' not in manifest",
+            payload.engine_id
+        )));
+    };
+    let presets = manifest
+        .model_presets
+        .iter()
+        .map(|p| tentaflow_protocol::ServicePresetInfo {
+            id: p.id.clone(),
+            display_name: p.display_name.clone(),
+            repo: p.repo.clone(),
+            quantization: p.quantization.clone(),
+            recommended: p.recommended,
+        })
+        .collect();
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResEnginePresets(
+            tentaflow_protocol::ServiceEnginePresetsResponse { presets },
+        ),
     ))
 }
 

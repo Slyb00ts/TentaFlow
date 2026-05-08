@@ -348,6 +348,38 @@ impl MeshCommandExecutor {
                 self.handle_service_deploy_remote(&engine_id, &deploy_method, &config_json)
                     .await
             }
+            MeshCommandType::ServiceUpdateRemote {
+                service_id,
+                model_repo,
+                model_preset_id,
+                gpu_memory_utilization,
+                max_model_len,
+                max_num_seqs,
+                max_num_batched_tokens,
+                kv_cache_dtype,
+                chunked_prefill,
+                vllm_args_override,
+                pinned,
+                paused,
+                restart_after_save,
+            } => {
+                self.handle_service_update_remote(
+                    service_id,
+                    model_repo,
+                    model_preset_id,
+                    gpu_memory_utilization,
+                    max_model_len,
+                    max_num_seqs,
+                    max_num_batched_tokens,
+                    kv_cache_dtype,
+                    chunked_prefill,
+                    vllm_args_override,
+                    pinned,
+                    paused,
+                    restart_after_save,
+                )
+                .await
+            }
         }
     }
 
@@ -401,6 +433,198 @@ impl MeshCommandExecutor {
                 return CommandResponse::fail(e.to_string());
             }
         }
+        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
+        CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+    }
+
+    /// Cross-node service edit. Receiver merguje pola opcjonalne do
+    /// `services.config_json`, opcjonalnie restartuje serwis (tak samo jak
+    /// lokalny `service_update` handler). Zwraca `ServiceActionResult`
+    /// (success/error tekst); pełen `ServiceUpdateResponse` z restarted
+    /// flag nie idzie przez mesh — caller widzi ack i `push_service_updated`
+    /// event przekazuje stan przez normalny snapshot push.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_service_update_remote(
+        &self,
+        service_id: i64,
+        model_repo: Option<String>,
+        model_preset_id: Option<String>,
+        gpu_memory_utilization: Option<f32>,
+        max_model_len: Option<u32>,
+        max_num_seqs: Option<u32>,
+        max_num_batched_tokens: Option<u32>,
+        kv_cache_dtype: Option<String>,
+        chunked_prefill: Option<bool>,
+        vllm_args_override: Option<String>,
+        pinned: Option<bool>,
+        paused: Option<bool>,
+        restart_after_save: bool,
+    ) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+
+        let svc = {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return CommandResponse::fail(format!("service id={} not found", service_id));
+                }
+                Err(e) => return CommandResponse::fail(e.to_string()),
+            }
+        };
+
+        // Merge config_json (sama logika co handler local).
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&svc.config_json).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(cfg_obj) = cfg.as_object_mut() else {
+            return CommandResponse::fail("service config_json is not an object");
+        };
+        if let Some(repo) = model_repo {
+            cfg_obj.insert("model_repo".into(), serde_json::Value::String(repo));
+            cfg_obj.insert("model_preset_id".into(), serde_json::Value::Null);
+        }
+        if let Some(preset_id) = model_preset_id {
+            cfg_obj.insert("model_preset_id".into(), serde_json::Value::String(preset_id));
+            cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
+        }
+        if let Some(util) = gpu_memory_utilization {
+            if let Some(num) = serde_json::Number::from_f64(util as f64) {
+                cfg_obj.insert("gpu_memory_utilization".into(), serde_json::Value::Number(num));
+            }
+        }
+        if let Some(v) = max_model_len {
+            cfg_obj.insert("max_model_len".into(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = max_num_seqs {
+            cfg_obj.insert("max_num_seqs".into(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = max_num_batched_tokens {
+            cfg_obj.insert(
+                "max_num_batched_tokens".into(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        if let Some(dt) = kv_cache_dtype {
+            cfg_obj.insert("kv_cache_dtype".into(), serde_json::Value::String(dt));
+        }
+        if let Some(b) = chunked_prefill {
+            cfg_obj.insert("chunked_prefill".into(), serde_json::Value::Bool(b));
+        }
+        if let Some(args) = vllm_args_override {
+            cfg_obj.insert("vllm_args".into(), serde_json::Value::String(args));
+        }
+        let new_config_json = match serde_json::to_string(&cfg) {
+            Ok(s) => s,
+            Err(e) => return CommandResponse::fail(format!("serialize config: {}", e)),
+        };
+
+        {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            if let Err(e) = crate::services_repo::services::update_config_json(
+                &conn,
+                service_id,
+                &new_config_json,
+            ) {
+                return CommandResponse::fail(e.to_string());
+            }
+            if let Some(p) = pinned {
+                if let Err(e) = crate::services_repo::services::set_pinned(&conn, service_id, p) {
+                    return CommandResponse::fail(e.to_string());
+                }
+            }
+            if let Some(p) = paused {
+                if let Err(e) = crate::services_repo::services::set_paused(&conn, service_id, p) {
+                    return CommandResponse::fail(e.to_string());
+                }
+            }
+        }
+
+        // Optional restart — stop running runtime + spawn detached respawn
+        // (mirror lokalnego handler'a żeby UX był identyczny).
+        let was_running = matches!(
+            svc.status,
+            crate::services_repo::services::ServiceStatus::Running
+                | crate::services_repo::services::ServiceStatus::Degraded
+                | crate::services_repo::services::ServiceStatus::Starting
+        );
+        if restart_after_save && was_running {
+            let ports = actions.port_allocator.clone();
+            if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
+                tracing::warn!(
+                    service_id,
+                    "service_update_remote: stop failed: {}", e
+                );
+            }
+            {
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                let _ = crate::services_repo::services::update_status(
+                    &conn,
+                    service_id,
+                    crate::services_repo::services::ServiceStatus::Starting,
+                );
+            }
+            let db = actions.db.clone();
+            let engine_id = svc.engine_id.clone();
+            let deploy_method = svc.deploy_method;
+            let cfg_json_for_task = new_config_json.clone();
+            tokio::spawn(async move {
+                match crate::services::deploy::respawn(
+                    &engine_id,
+                    deploy_method,
+                    &cfg_json_for_task,
+                    ports,
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        if let Ok(conn) = db.lock() {
+                            let _ = crate::services_repo::services::update_runtime(
+                                &conn,
+                                service_id,
+                                handle.pid,
+                                handle.port,
+                                handle.sidecar_port,
+                                handle.endpoint_url.as_deref(),
+                            );
+                            let _ = crate::services_repo::services::update_status(
+                                &conn,
+                                service_id,
+                                crate::services_repo::services::ServiceStatus::Running,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("respawn after update_remote: {}", e);
+                        if let Ok(conn) = db.lock() {
+                            let _ = crate::services_repo::services::update_status(
+                                &conn,
+                                service_id,
+                                crate::services_repo::services::ServiceStatus::Failed,
+                            );
+                            let _ = crate::services_repo::services::update_health(
+                                &conn,
+                                service_id,
+                                false,
+                                Some(&msg),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
         push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
         CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
     }

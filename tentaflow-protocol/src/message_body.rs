@@ -319,6 +319,33 @@ pub struct GpuProcessInfo {
     pub used_mib: u64,
 }
 
+/// Lista presetów modelu z manifestu silnika. Edit modal wywołuje to po
+/// zmianie dropdown'a "Preset z manifestu" — backend zwraca dokładnie te
+/// `[[model_preset]]` które są zadeklarowane w `<engine>.toml` (single
+/// source of truth, build.rs generuje z TOML do `services_generated.rs`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEnginePresetsRequest {
+    pub engine_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEnginePresetsResponse {
+    pub presets: Vec<ServicePresetInfo>,
+}
+
+/// Pojedynczy preset z manifestu — frontend renderuje jako preset-card
+/// w Edit modal lub deploy wizard. `repo` to HF repository, `quantization`
+/// pochodzi z manifestu (auto/awq/gptq/nvfp4/...). Pełen VRAM estimate
+/// liczony jest osobno przez `DeployVllmRecommendRequest` po wyborze.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServicePresetInfo {
+    pub id: String,
+    pub display_name: String,
+    pub repo: String,
+    pub quantization: Option<String>,
+    pub recommended: bool,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -337,6 +364,8 @@ pub enum ServicePayload {
     ResUpdate(ServiceUpdateResponse),
     ReqVramHint(ServiceVramHintRequest),
     ResVramHint(ServiceVramHintResponse),
+    ReqEnginePresets(ServiceEnginePresetsRequest),
+    ResEnginePresets(ServiceEnginePresetsResponse),
 }
 
 // =============================================================================
