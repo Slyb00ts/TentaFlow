@@ -72,6 +72,21 @@ impl BackendHandle {
             handle.shutdown();
         }
     }
+
+    /// Stabilny opis "gdzie ten handle wskazuje" dla wykrywania zmian
+    /// adresu po stronie supervisor reconcile_handles. Gdy serwis padl
+    /// i respawn dostal nowy port z alokatora, signature nowego desired
+    /// stanu rozni sie od cached → reconcile rebuild. Bez tego routing
+    /// trafial na zwolniony port (zombie z poprzedniego attempta).
+    pub fn endpoint_signature(&self) -> String {
+        match self {
+            BackendHandle::Http(client) => format!("http:{}", client.url()),
+            BackendHandle::Quic(h) => format!("quic:{}", h.config.url),
+            BackendHandle::Embedded { engine_id, model_name, .. } => {
+                format!("embedded:{engine_id}:{model_name}")
+            }
+        }
+    }
 }
 
 /// Lock-free cache live handlow keyed by `(node_id, service_id)`. Lokalne i
