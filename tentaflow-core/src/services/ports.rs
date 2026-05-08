@@ -125,15 +125,11 @@ impl PortAllocator {
                 "port {port} jest na excluded list (zarezerwowany dla dashboard / prometheus)"
             ));
         }
-        if inner.leased.contains(&port) {
-            // Już leased przez allocator — nie ma konfliktu (to znaczy że
-            // CTOŚ inny w tym samym procesie tentaflow już ma ten port,
-            // pewnie inny serwis o tym samym `runtime_port` w DB → bug
-            // duplikatu).
-            return Err(anyhow!(
-                "port {port} juz leased — duplikat w DB (dwa serwisy z tym samym runtime_port)?"
-            ));
-        }
+        // `leased` to znacznik "ten port nalezy do JAKIEGOS serwisu" —
+        // boot pre-rezerwuje runtime_port kazdego wpisu, deploy() znaczy
+        // przy alokacji. Respawn istniejacego serwisu prosi o swoj wlasny
+        // port (preserved_port) ktory JUZ jest w leased. Idempotent OK,
+        // realny konflikt z innym procesem wykryje is_port_free.
         if !is_port_free(port) {
             return Err(anyhow!(
                 "port {port} zajety przez inny proces — sprawdz `ss -tln` (nasz wlasny stary respawn? zombie?)"
