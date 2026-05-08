@@ -330,6 +330,16 @@ function renderRow(s) {
   const statusInfo = mapStatusToChip(s.status, paused);
   const statusLabel = I18n.t(`services.status.${statusInfo.key}`)
     || s.status || '—';
+  // progress_message niesie krotki opis fazy startu od supervisor
+  // heartbeat (np. "warming up — alive 30s, waiting for /v1/models").
+  // Renderujemy pod chipem statusu, zeby user widzial PROGRES startu
+  // serwisu a nie tylko "Starting" przez minuty.
+  const progressMsg = typeof s.progress_message === 'string' && s.progress_message.length > 0
+    ? s.progress_message
+    : '';
+  const progressBadge = progressMsg
+    ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(progressMsg)}</div>`
+    : '';
   const endpoint = s.endpoint_url
     ? `<code style="font-size:11px;" title="${escapeAttr(s.endpoint_url)}">${escapeHtml(truncateMiddle(s.endpoint_url, 36))}</code>`
     : '<span style="color:var(--text-3);">—</span>';
@@ -396,6 +406,7 @@ function renderRow(s) {
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
         <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+        ${progressBadge}
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_endpoint'))}">${endpoint}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_models'))}">

@@ -375,6 +375,7 @@ mod tests {
             endpoint_url: Some("http://127.0.0.1:8000".into()),
             restart_count: 0,
             health_last_err: None,
+            progress_message: None,
             models: Vec::new(),
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),

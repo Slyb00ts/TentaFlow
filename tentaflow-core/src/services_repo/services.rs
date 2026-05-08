@@ -133,6 +133,7 @@ pub struct ServiceRow {
     pub config_json: String,
     pub health_last_ok: Option<String>,
     pub health_last_err: Option<String>,
+    pub progress_message: Option<String>,
     pub restart_count: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -172,6 +173,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
         config_json: row.get("config_json")?,
         health_last_ok: row.get("health_last_ok")?,
         health_last_err: row.get("health_last_err")?,
+        progress_message: row.get("progress_message").ok().flatten(),
         restart_count: row.get("restart_count")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -180,7 +182,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
 
 const SELECT_COLUMNS: &str = "id, engine_id, category, display_name, deploy_method, transport, \
     status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
-    config_json, health_last_ok, health_last_err, restart_count, created_at, updated_at";
+    config_json, health_last_ok, health_last_err, progress_message, restart_count, created_at, updated_at";
 
 const INSERT_SQL: &str = "INSERT INTO services (engine_id, category, display_name, deploy_method, \
     transport, status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
@@ -325,6 +327,25 @@ pub fn update_health(conn: &Connection, id: i64, ok: bool, err: Option<&str>) ->
     };
     if n == 0 {
         return Err(anyhow!("update_health: service id={} not found", id));
+    }
+    Ok(())
+}
+
+/// Aktualizuje informacyjny `progress_message` (czysto opisowy, bez efektu
+/// w logice — supervisor uzywa do raportowania UX-friendly statusu startu
+/// jak "warming up — alive 30s, waiting for /v1/models"). `None` =
+/// wyczyść message (przy Running success / Failed error).
+pub fn update_progress_message(
+    conn: &Connection,
+    id: i64,
+    msg: Option<&str>,
+) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET progress_message = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, msg],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("update_progress_message: service id={} not found", id));
     }
     Ok(())
 }

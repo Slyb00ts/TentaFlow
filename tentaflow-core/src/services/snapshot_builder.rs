@@ -103,6 +103,7 @@ pub fn project_service_row(
         endpoint_url: svc.endpoint_url,
         restart_count: u32::try_from(svc.restart_count).unwrap_or(u32::MAX),
         health_last_err: svc.health_last_err,
+        progress_message: svc.progress_message,
         models,
         created_at: svc.created_at,
         updated_at: svc.updated_at,

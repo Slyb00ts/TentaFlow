@@ -281,6 +281,8 @@ mod tests {
             weight,
             model_name_override: None,
             extra_config: HashMap::new(),
+            progress_message: None,
+            health_last_err: None,
         }
     }
 
