@@ -331,6 +331,20 @@ pub fn update_health(conn: &Connection, id: i64, ok: bool, err: Option<&str>) ->
     Ok(())
 }
 
+/// Nadpisuje `config_json`. Używane przez `service_update` handler gdy
+/// admin edytuje serwis przez Edit modal — backend regeneruje konfigurację
+/// z manifest schema parameters i deserializuje całość do JSON.
+pub fn update_config_json(conn: &Connection, id: i64, config_json: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET config_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, config_json],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("update_config_json: service id={} not found", id));
+    }
+    Ok(())
+}
+
 /// Aktualizuje informacyjny `progress_message` (czysto opisowy, bez efektu
 /// w logice — supervisor uzywa do raportowania UX-friendly statusu startu
 /// jak "warming up — alive 30s, waiting for /v1/models"). `None` =

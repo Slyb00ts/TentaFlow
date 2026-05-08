@@ -233,9 +233,95 @@ pub struct ServicePauseResponse {
     pub error: Option<String>,
 }
 
+/// Edycja istniejącego serwisu (po deploy). Pola opcjonalne — backend
+/// aktualizuje tylko te które są `Some(_)`. `restart_after_save=true`
+/// wymusza stop+respawn z nowym configiem (vLLM model reload ~30–180s).
+///
+/// Typed parameters (max_model_len, max_num_seqs, kv_cache_dtype itd.)
+/// są materializowane do `services.config_json` jako manifest schema
+/// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
+/// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ServiceUpdateRequest {
+    pub service_id: i64,
+    /// See `ServiceDeleteRequest::node_id` — None = local node.
+    pub node_id: Option<String>,
+    /// HF repo — switch model bez delete+create. `model_preset_id` ma
+    /// wyższy priorytet gdy oba podane.
+    pub model_repo: Option<String>,
+    pub model_preset_id: Option<String>,
+    /// vLLM-specific parametry runtime. Backend mapuje na `config_json`
+    /// keys i dorzuca do regenerated `vllm_args` jeśli engine to vLLM.
+    pub gpu_memory_utilization: Option<f32>,
+    pub max_model_len: Option<u32>,
+    pub max_num_seqs: Option<u32>,
+    pub max_num_batched_tokens: Option<u32>,
+    pub kv_cache_dtype: Option<String>,
+    pub chunked_prefill: Option<bool>,
+    /// Power user: surowe `vllm_args`. Gdy ustawione, nadpisuje typed
+    /// pola powyżej (backend honoruje 1:1, brak walidacji).
+    pub vllm_args_override: Option<String>,
+    /// Pinned/paused flagi — pomija jeśli `None`.
+    pub pinned: Option<bool>,
+    pub paused: Option<bool>,
+    /// `true` = stop running service + respawn z nowym configiem.
+    /// `false` = tylko zapisz do DB (zmiany aktywne po następnym restarcie).
+    pub restart_after_save: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceUpdateResponse {
+    pub success: bool,
+    pub error: Option<String>,
+    /// `true` jeśli serwis został restartowany w ramach tej operacji.
+    pub restarted: bool,
+}
+
+/// Snapshot aktualnego zajęcia VRAM per GPU + lista zewnętrznych procesów.
+/// Klient wywołuje co 2s podczas modal Edit / wizard Advanced step żeby
+/// pokazać user'owi "co już używa GPU" + zalecony `gpu_memory_utilization`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceVramHintRequest {
+    /// `None` = wszystkie GPU. Zawęź do indeksu jeśli wizard już wybrał GPU.
+    pub gpu_index: Option<u32>,
+    /// `None` = local node. Mesh forward gdy wybrano peer.
+    pub node_id: Option<String>,
+    /// Service ID dla którego liczymy hint (excluded z external — własne
+    /// procesy serwisu nie liczą się jako "external"). `None` = nowy
+    /// deploy, brak wykluczeń.
+    pub exclude_service_id: Option<i64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ServiceVramHintResponse {
+    pub gpus: Vec<GpuVramSnapshot>,
+    /// Sugerowane `gpu_memory_utilization` z uwzględnieniem external
+    /// processes. Wzór: `(free_mib - desktop_reserve_mib) / total_mib`,
+    /// clamp [0.10..0.95]. Desktop reserve = 1024 MiB (bezpieczne dla
+    /// X11/Wayland compositor + headroom).
+    pub recommended_utilization: Option<f32>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GpuVramSnapshot {
+    pub gpu_index: u32,
+    pub gpu_name: String,
+    pub total_mib: u64,
+    pub free_mib: u64,
+    pub used_mib: u64,
+    pub external_processes: Vec<GpuProcessInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GpuProcessInfo {
+    pub pid: u32,
+    pub process_name: String,
+    pub used_mib: u64,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum ServicePayload {
     ReqList(ServiceListRequest),
     ResList(ServiceListResponse),
@@ -247,6 +333,10 @@ pub enum ServicePayload {
     ResPause(ServicePauseResponse),
     ReqStart(ServiceStartRequest),
     ResStart(ServiceStartResponse),
+    ReqUpdate(ServiceUpdateRequest),
+    ResUpdate(ServiceUpdateResponse),
+    ReqVramHint(ServiceVramHintRequest),
+    ResVramHint(ServiceVramHintResponse),
 }
 
 // =============================================================================

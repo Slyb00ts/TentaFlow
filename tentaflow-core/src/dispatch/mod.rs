@@ -443,6 +443,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResPause(_) => "ServicePauseResponse",
             tentaflow_protocol::ServicePayload::ReqStart(_) => "ServiceStartRequest",
             tentaflow_protocol::ServicePayload::ResStart(_) => "ServiceStartResponse",
+            tentaflow_protocol::ServicePayload::ReqUpdate(_) => "ServiceUpdateRequest",
+            tentaflow_protocol::ServicePayload::ResUpdate(_) => "ServiceUpdateResponse",
+            tentaflow_protocol::ServicePayload::ReqVramHint(_) => "ServiceVramHintRequest",
+            tentaflow_protocol::ServicePayload::ResVramHint(_) => "ServiceVramHintResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
