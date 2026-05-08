@@ -5644,7 +5644,7 @@ pub async fn service_start(
     ))
 }
 
-#[handler(variant = "ServiceUpdateRequest", since = (1, 0))]
+#[handler(variant = "ServiceConfigUpdateRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
 pub async fn service_update(

@@ -2534,6 +2534,8 @@
     "model_custom": "Repo HF personnalisé",
     "model_custom_desc": "N'importe quel org/repo HuggingFace.",
     "no_presets": "Ce manifeste de moteur ne déclare aucun preset.",
+    "hf_search_placeholder": "Rechercher sur HuggingFace — tape une partie de org/repo",
+    "hf_no_results": "Aucune correspondance.",
     "hf_repo_label": "Repo HuggingFace",
     "recommended_pill": "RECOMMANDÉ",
     "vram_title": "Allocation VRAM",

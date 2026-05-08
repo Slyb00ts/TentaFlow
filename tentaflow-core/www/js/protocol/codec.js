@@ -979,6 +979,41 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::ServiceBody(ServicePayload::ReqUpdate) — edycja serwisu
+   * po deploy. Payload to JSON-encoded ServiceUpdateRequest (13 pól
+   * opcjonalnych — łatwiej tak niż 13 args wasm-bindgen).
+   */
+  serviceConfigUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceConfigUpdateRequest(JSON.stringify(camelToSnakePayload(payload)));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqVramHint) */
+  serviceVramHintRequest(correlationId, { gpuIndex, nodeId, excludeServiceId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceVramHintRequest(
+      gpuIndex == null ? undefined : Number(gpuIndex),
+      nodeId ?? undefined,
+      excludeServiceId == null ? undefined : Number(excludeServiceId),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
+  /** MessageBody::ServiceBody(ServicePayload::ReqEnginePresets) */
+  serviceEnginePresetsRequest(correlationId, { engineId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceEnginePresetsRequest(String(engineId || ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+    );
+  },
+
   /** MessageBody::ServiceQuicStatusRequest (unit) */
   serviceQuicStatusRequest(correlationId, sequence = 1) {
     assertReady();
@@ -2487,6 +2522,23 @@ export function validateFrame(bytes) {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/**
+ * Konwersja kluczy camelCase → snake_case dla JSON-encoded payload'ów
+ * które backend parsuje przez serde (struktury z snake_case fields).
+ * Zachowuje wartości bez zmian, mapuje tylko klucze pierwszego poziomu
+ * obiektu (rekursja niepotrzebna dla naszych payloadów które są płaskie).
+ */
+function camelToSnakePayload(obj) {
+  if (obj == null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(camelToSnakePayload);
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const sk = k.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase());
+    out[sk] = camelToSnakePayload(v);
+  }
+  return out;
+}
 
 function assertReady() {
   if (!_wasm) {

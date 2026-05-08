@@ -89,6 +89,23 @@ export async function openEditModal(svc, opts = {}) {
     card.addEventListener('click', () => scheduleRecommendRefresh(overlay, svc, engineId));
   });
 
+  // HuggingFace search w Custom mode (publiczne API HF, nie nasz rkyv —
+  // to bezpośredni katalog modeli HF, nie wewnętrzny stan tentaflow).
+  const customInput = overlay.querySelector('[data-custom-repo-input]');
+  if (customInput) {
+    let hfTimer = null;
+    customInput.addEventListener('input', () => {
+      const q = customInput.value.trim();
+      if (hfTimer) clearTimeout(hfTimer);
+      if (q.length < 2) {
+        const box = overlay.querySelector('[data-hf-results]');
+        if (box) box.innerHTML = '';
+        return;
+      }
+      hfTimer = setTimeout(() => doHfSearch(overlay, q, svc, engineId), 300);
+    });
+  }
+
   // Save handler
   const saveLabel = I18n.t('services_edit.save') || 'Zapisz i restartuj';
   const savingLabel = I18n.t('services_edit.saving') || 'Zapisuję…';
@@ -98,7 +115,7 @@ export async function openEditModal(svc, opts = {}) {
     saveBtn.textContent = savingLabel;
     try {
       const payload = collectPayload(overlay, svc.id, opts.nodeId);
-      const res = await ApiBinary.action('serviceUpdateRequest', payload);
+      const res = await ApiBinary.action('serviceConfigUpdateRequest', payload);
       if (res && res.success === false && res.error) {
         showInlineError(overlay, res.error);
         saveBtn.removeAttribute('disabled');
@@ -260,6 +277,52 @@ function renderRecommendation(card, r) {
     </div>
     ${warningsHtml ? `<ul style="font-size:11px;color:var(--warning);margin-left:18px;">${warningsHtml}</ul>` : ''}
   `;
+}
+
+async function doHfSearch(overlay, query, svc, engineId) {
+  const box = overlay.querySelector('[data-hf-results]');
+  if (!box) return;
+  box.innerHTML = `<div style="font-size:11px;color:var(--text-3);">${escapeHtml(I18n.t('common.loading') || '…')}</div>`;
+  try {
+    const url = `https://huggingface.co/api/models?search=${encodeURIComponent(query)}&limit=15&sort=downloads&direction=-1`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HF API ${resp.status}`);
+    const data = await resp.json();
+    if (!Array.isArray(data) || data.length === 0) {
+      box.innerHTML = `<div style="font-size:11px;color:var(--text-3);">${escapeHtml(I18n.t('services_edit.hf_no_results') || 'No matches.')}</div>`;
+      return;
+    }
+    box.innerHTML = data.map((m) => {
+      const id = m.id || m.modelId || '';
+      const downloads = m.downloads ? formatHfCount(m.downloads) : '';
+      const likes = m.likes || '';
+      const lastMod = m.lastModified ? m.lastModified.substring(0, 10) : '';
+      const info = [downloads && `↓ ${downloads}`, likes && `♥ ${likes}`, lastMod].filter(Boolean).join(' · ');
+      return `
+        <div class="hf-item" data-hf-pick="${escapeAttr(id)}"
+          style="padding:8px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;cursor:pointer;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--text);">${escapeHtml(id)}</div>
+          ${info ? `<div style="font-size:10.5px;color:var(--text-3);margin-top:2px;">${escapeHtml(info)}</div>` : ''}
+        </div>`;
+    }).join('');
+    // Click handler — set input value + trigger VRAM recompute.
+    box.querySelectorAll('[data-hf-pick]').forEach((it) => {
+      it.addEventListener('click', () => {
+        const repo = it.dataset.hfPick;
+        const input = overlay.querySelector('[data-custom-repo-input]');
+        if (input) input.value = repo;
+        box.innerHTML = '';
+        scheduleRecommendRefresh(overlay, svc, engineId);
+      });
+    });
+  } catch (e) {
+    box.innerHTML = `<div style="font-size:11px;color:var(--danger);">HF: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+function formatHfCount(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
 }
 
 function kpiCell(label, value, sub, cls) {
@@ -474,8 +537,21 @@ function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRe
 }
 
 function renderModelSection(initialPresetId, initialModelRepo, presets, tk) {
-  const useCustom = !initialPresetId && !!initialModelRepo;
-  const presetsHtml = renderPresetCards(presets, initialPresetId, tk);
+  // Wybor mode: jesli config ma `model_preset_id` ktore istnieje w manifescie
+  // → preset. Jesli ma `model_repo` ktorym pasuje preset → preset (selected
+  // ten ktory ma ten repo). Jesli `model_repo` ale ZADEN preset nie pasuje
+  // → custom HF (bo user wybral cos spoza manifestu).
+  let useCustom = false;
+  let resolvedPresetId = initialPresetId;
+  if (!resolvedPresetId && initialModelRepo) {
+    const match = presets.find((p) => p.repo === initialModelRepo);
+    if (match) {
+      resolvedPresetId = match.id;
+    } else {
+      useCustom = true;
+    }
+  }
+  const presetsHtml = renderPresetCards(presets, resolvedPresetId, tk);
   return `
     <div class="body-section">
       <div class="body-section-title">${escapeHtml(tk('model'))}</div>
@@ -503,8 +579,10 @@ function renderModelSection(initialPresetId, initialModelRepo, presets, tk) {
       <div data-custom-repo style="${useCustom ? '' : 'display:none;'}">
         <div class="form-row">
           <label>${escapeHtml(tk('hf_repo_label'))}</label>
-          <input class="tf-input mono" data-custom-repo-input placeholder="org/repo"
-            value="${escapeAttr(initialModelRepo)}">
+          <input class="tf-input mono" data-custom-repo-input
+            placeholder="${escapeAttr(tk('hf_search_placeholder'))}"
+            value="${escapeAttr(initialModelRepo)}" autocomplete="off">
+          <div class="hf-results" data-hf-results style="margin-top:8px;display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;"></div>
         </div>
       </div>
     </div>`;

@@ -2534,6 +2534,8 @@
     "model_custom": "Eigenes HF-Repo",
     "model_custom_desc": "Beliebiges HuggingFace org/repo.",
     "no_presets": "Dieses Engine-Manifest deklariert keine Voreinstellungen.",
+    "hf_search_placeholder": "Suche auf HuggingFace — Teil von org/repo eingeben",
+    "hf_no_results": "Keine Treffer.",
     "hf_repo_label": "HuggingFace-Repo",
     "recommended_pill": "EMPFOHLEN",
     "vram_title": "VRAM-Zuweisung",

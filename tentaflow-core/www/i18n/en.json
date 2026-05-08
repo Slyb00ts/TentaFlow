@@ -3430,6 +3430,8 @@
     "model_custom": "Custom HF repo",
     "model_custom_desc": "Any HuggingFace org/repo.",
     "no_presets": "This engine manifest declares no presets.",
+    "hf_search_placeholder": "Search HuggingFace — type part of org/repo",
+    "hf_no_results": "No matches.",
     "hf_repo_label": "HuggingFace repo",
     "recommended_pill": "RECOMMENDED",
     "vram_title": "VRAM allocation",
