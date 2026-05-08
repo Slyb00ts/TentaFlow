@@ -107,6 +107,13 @@ pub struct ServiceInfo {
     pub endpoint_url: Option<String>,
     pub restart_count: u32,
     pub health_last_err: Option<String>,
+    /// Krótki user-friendly opis aktualnej fazy startu (np.
+    /// "warming up — alive 30s, waiting for /v1/models"). Aktualizowany
+    /// przez supervisor heartbeat co 5s podczas Starting. Frontend
+    /// pokazuje obok status chipa, zeby user widzial PROGRES (vLLM
+    /// cold start ~3 min). NULL gdy serwis Running albo nic do
+    /// raportowania.
+    pub progress_message: Option<String>,
     pub models: Vec<ServiceModelEntry>,
     pub created_at: String,
     pub updated_at: String,
