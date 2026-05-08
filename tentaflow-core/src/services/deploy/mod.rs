@@ -591,15 +591,16 @@ pub struct SmartProbeConfig {
     /// `log_sink` so the dashboard sees progress.
     pub status_report_interval: std::time::Duration,
     pub log_sink: Option<LogSink>,
-    /// Maximum wall-clock time before giving up. Po przekroczeniu probe
-    /// zwraca `ProcessExited(None)`, callerzy traktują jako fail i robią
-    /// rollback. None = no timeout (legacy zachowanie).
+    /// Opcjonalny hard ceiling czasu warmupu. `None` = no timeout (default
+    /// zachowanie — duze modele 70B+ moga ladowac 10-30 min). Operator
+    /// moze ustawic explicit deadline (np. dla CI/CD) — po przekroczeniu
+    /// probe zwraca `ProcessExited(None)`, caller robi rollback.
     ///
-    /// Bez tego deploy::respawn wisi w nieskończoność gdy podproces
-    /// engine'a żyje (parent PID alive) ale nigdy nie wystawia HTTP
-    /// readiness — typowo przy CUDA OOM w child workerze (uvicorn parent
-    /// trzyma się i czeka na engine core message). Supervisor `Starting`
-    /// status pozostaje na zawsze, GUI nie widzi błędu.
+    /// W produkcji preferujemy `None` zeby nie zabijac legitnych dlugich
+    /// loadow. User widzi PROGRES przez `progress_message` heartbeat w
+    /// supervisor i moze recznie anulowac deploy w GUI gdy uzna ze cos
+    /// wisi (np. CUDA OOM gdzie parent uvicorn pozostaje alive ale nie
+    /// odpowiada na readiness).
     pub max_wait: Option<std::time::Duration>,
 }
 
