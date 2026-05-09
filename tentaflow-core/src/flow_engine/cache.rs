@@ -442,7 +442,7 @@ mod tests {
                 {"id":"t","type":"trigger","config":{}},
                 {"id":"o","type":"output","config":{}}
             ],
-            "edges": [{"from":"t","to":"o","from_port":"text"}]
+            "edges": [{"from":"t","to":"o","from_port":"text","to_port":"text"}]
         }"#;
         let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
         assert_eq!(cf.execution_order.len(), 2);
@@ -460,7 +460,7 @@ mod tests {
             ],
             "edges": [
                 {"from":"t","to":"l","from_port":"text"},
-                {"from":"l","to":"o","from_port":"stream"}
+                {"from":"l","to":"o","from_port":"stream","to_port":"text"}
             ]
         }"#;
         // Synthetic source — testujemy R7 streaming end-shape, nie R-SAFETY.
@@ -495,7 +495,7 @@ mod tests {
             "edges": [
                 {"from":"t","to":"l","from_port":"text"},
                 {"from":"l","to":"p","from_port":"stream"},
-                {"from":"p","to":"o","from_port":"stream"}
+                {"from":"p","to":"o","from_port":"stream","to_port":"text"}
             ]
         }"#;
         let cf = CompiledFlow::from_json(
@@ -560,7 +560,7 @@ mod tests {
             ],
             "edges":[
                 {"from":"t","to":"l","from_port":"text"},
-                {"from":"l","to":"o"}
+                {"from":"l","to":"o","to_port":"text"}
             ]
         }"#;
         Arc::new(

@@ -721,7 +721,7 @@ mod chain_integration_tests {
             "edges":[
                 {"from":"t1","to":"l1","from_port":"text"},
                 {"from":"l1","to":"p1","from_port":"stream"},
-                {"from":"p1","to":"o1","from_port":"stream"}
+                {"from":"p1","to":"o1","from_port":"stream","to_port":"text"}
             ]
         }"#;
         let compiled = Arc::new(
@@ -804,7 +804,7 @@ mod chain_integration_tests {
                 {"from":"t1","to":"l1","from_port":"text"},
                 {"from":"l1","to":"p1","from_port":"stream"},
                 {"from":"p1","to":"b1","from_port":"stream"},
-                {"from":"b1","to":"o1","from_port":"stream"}
+                {"from":"b1","to":"o1","from_port":"stream","to_port":"audio"}
             ]
         }"#;
         let compiled = Arc::new(
