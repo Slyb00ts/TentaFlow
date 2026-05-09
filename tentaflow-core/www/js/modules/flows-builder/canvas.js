@@ -1118,8 +1118,14 @@ export class FlowCanvas {
 
   _onClick(ev) {
     if (this._suppressNextClick) { this._suppressNextClick = false; return; }
+    // Pobieramy realny element pod kursorem: ev.target moze byc rootem
+    // canvasa gdy SVG path z pointer-events: stroke nie zostaje primary
+    // target'em w niektorych przegladarkach (np. po zmianach DOM w
+    // _renderEdges). elementFromPoint jest authoritative dla kliku.
+    const hitTarget = document.elementFromPoint(ev.clientX, ev.clientY) || ev.target;
+
     // Klik w X-przycisk na srodku selected edge'a → usun krawedz.
-    const deleteBtn = ev.target.closest('.fb-edge-delete');
+    const deleteBtn = hitTarget.closest('.fb-edge-delete');
     if (deleteBtn) {
       const edgeId = deleteBtn.dataset.edgeId;
       this.edges = this.edges.filter((e) => e.id !== edgeId);
@@ -1129,7 +1135,7 @@ export class FlowCanvas {
       this.onChange();
       return;
     }
-    const hit = ev.target.closest('.fb-edge-hit');
+    const hit = hitTarget.closest('.fb-edge-hit');
     if (hit) {
       this.selectedIds.clear();
       this.selectedEdgeId = hit.dataset.edgeId;
@@ -1138,7 +1144,7 @@ export class FlowCanvas {
       this.onSelect(null);
       return;
     }
-    const nodeEl = ev.target.closest('.fb-node');
+    const nodeEl = hitTarget.closest('.fb-node');
     if (nodeEl) {
       this.selectNode(nodeEl.dataset.nodeId, { additive: ev.shiftKey });
       return;
