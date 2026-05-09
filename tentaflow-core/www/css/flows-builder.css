@@ -552,6 +552,36 @@
   /* Pelne kolko — jawna klasa dla przewidywalnosci stylu nad heurystyka. */
   border-style: solid;
 }
+
+/* Typed port colors — kazdy `FlowDataType` dostaje wlasny kolor obwodki +
+   accent dla hover/drop-target. Wartosci czerpiemy z wire string'a
+   (`data-port-type`) ktory backend przesyla w `output_port_types`/
+   `input_port_types` (Rust `FlowDataType::as_wire_str`). `any` zostaje przy
+   defaultowym kolorze nody zeby legacy porty (np. `condition` true/false)
+   nie zmienialy wygladu. */
+.fb-port-type-text     { --port-color: #38bdf8; border-color: var(--port-color); }
+.fb-port-type-audio    { --port-color: #f472b6; border-color: var(--port-color); }
+.fb-port-type-image    { --port-color: #34d399; border-color: var(--port-color); }
+.fb-port-type-video    { --port-color: #f59e0b; border-color: var(--port-color); }
+.fb-port-type-embedding{ --port-color: #a78bfa; border-color: var(--port-color); }
+.fb-port-type-other    { --port-color: #94a3b8; border-color: var(--port-color); }
+.fb-port-type-json     { --port-color: #facc15; border-color: var(--port-color); }
+
+/* Hover/drop dla typed portów uzywa `--port-color` zamiast `--node-color` —
+   port niesie typ niezaleznie od koloru noda. */
+.fb-port[class*="fb-port-type-"]:hover,
+.fb-port[class*="fb-port-type-"].drop-target {
+  background: var(--port-color);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--port-color) 70%, transparent);
+}
+
+/* Etykieta portu (widoczna gdy node ma >=2 porty) dziedziczy kolor typu
+   zeby od razu pokazac uzytkownikowi czego sie spodziewa. */
+.fb-port[class*="fb-port-type-"] + .fb-port-label,
+.fb-port[class*="fb-port-type-"] .fb-port-label {
+  color: var(--port-color);
+}
+
 .fb-port-label {
   position: absolute;
   top: 50%;
@@ -704,6 +734,24 @@
 .fb-port-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--tf-text-2, #c1c5e0); }
 .fb-port-list code { font-family: ui-monospace, monospace; font-size: 11px; color: var(--tf-text, #f5f6ff); background: var(--tf-bg-input, #0b0e22); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--tf-border, #1f2548); }
 .fb-port-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--tf-accent-2, #818cf8); flex-shrink: 0; }
+.fb-port-dot.fb-port-type-text     { background: #38bdf8; }
+.fb-port-dot.fb-port-type-audio    { background: #f472b6; }
+.fb-port-dot.fb-port-type-image    { background: #34d399; }
+.fb-port-dot.fb-port-type-video    { background: #f59e0b; }
+.fb-port-dot.fb-port-type-embedding{ background: #a78bfa; }
+.fb-port-dot.fb-port-type-other    { background: #94a3b8; }
+.fb-port-dot.fb-port-type-json     { background: #facc15; }
+.fb-port-type-tag {
+  margin-left: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--tf-text-3, #6a7196);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--tf-bg-input, #0b0e22);
+}
 .fb-field-row {
   display: flex;
   align-items: center;

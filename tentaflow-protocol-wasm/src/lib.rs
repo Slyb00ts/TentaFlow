@@ -5408,6 +5408,18 @@ fn flow_node_template_to_js(
     }
     set(&obj, "outputPorts", output_ports.clone().into());
     set(&obj, "output_ports", output_ports.into());
+    let input_port_types = js_sys::Array::new();
+    for ty in &t.input_port_types {
+        input_port_types.push(&JsValue::from_str(ty));
+    }
+    set(&obj, "inputPortTypes", input_port_types.clone().into());
+    set(&obj, "input_port_types", input_port_types.into());
+    let output_port_types = js_sys::Array::new();
+    for ty in &t.output_port_types {
+        output_port_types.push(&JsValue::from_str(ty));
+    }
+    set(&obj, "outputPortTypes", output_port_types.clone().into());
+    set(&obj, "output_port_types", output_port_types.into());
     obj
 }
 

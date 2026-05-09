@@ -318,7 +318,10 @@ export class FlowConfig {
         const key = side === 'in' ? 'flows_config.no_inputs' : 'flows_config.no_outputs';
         return `<div class="fb-field-hint">${escapeHtml(I18n.t(key))}</div>`;
       }
-      return `<ul class="fb-port-list">${list.map((p) => `<li><span class="fb-port-dot" aria-hidden="true"></span><code>${escapeHtml(p.name)}</code></li>`).join('')}</ul>`;
+      return `<ul class="fb-port-list">${list.map((p) => {
+        const t = (p.type || 'any').toLowerCase();
+        return `<li><span class="fb-port-dot fb-port-type-${escapeAttr(t)}" aria-hidden="true" title="${escapeAttr(t)}"></span><code>${escapeHtml(p.name)}</code><span class="fb-port-type-tag">${escapeHtml(t)}</span></li>`;
+      }).join('')}</ul>`;
     };
 
     const dynamicHtml = (n.type === 'switch' || n.type === 'router')
@@ -341,26 +344,34 @@ export class FlowConfig {
   _computePorts(n) {
     const isTrigger = n.type === 'trigger' || n.type === 'start';
     const isOutput = n.type === 'output' || n.type === 'end';
-    // Adapter metadata z backendu ma priorytet (input_ports/output_ports);
-    // inaczej zostajemy przy heurystyce per node-type.
+    // Adapter metadata z backendu ma priorytet (input_ports/output_ports +
+    // input_port_types/output_port_types z `FlowDataType::as_wire_str`).
     const tpl = this.template;
     const tplIn = (tpl && Array.isArray(tpl.input_ports) && tpl.input_ports.length > 0) ? tpl.input_ports : null;
     const tplOut = (tpl && Array.isArray(tpl.output_ports) && tpl.output_ports.length > 0) ? tpl.output_ports : null;
-    const inputs = tplIn ? tplIn.map((name) => ({ name })) : (isTrigger ? [] : [{ name: 'in' }]);
+    const tplInTypes = (tpl && Array.isArray(tpl.input_port_types)) ? tpl.input_port_types : null;
+    const tplOutTypes = (tpl && Array.isArray(tpl.output_port_types)) ? tpl.output_port_types : null;
+    const withType = (names, types) => names.map((name, i) => ({
+      name,
+      type: (types && typeof types[i] === 'string') ? types[i] : 'any',
+    }));
+    const inputs = tplIn
+      ? withType(tplIn, tplInTypes)
+      : (isTrigger ? [] : [{ name: 'in', type: 'any' }]);
     let outputs;
     if (tplOut) {
-      outputs = tplOut.map((name) => ({ name }));
-    } else if (n.type === 'condition') outputs = [{ name: 'true' }, { name: 'false' }];
+      outputs = withType(tplOut, tplOutTypes);
+    } else if (n.type === 'condition') outputs = [{ name: 'true', type: 'any' }, { name: 'false', type: 'any' }];
     else if (n.type === 'switch' || n.type === 'router') {
       const cases = Array.isArray(n.config?.cases) ? n.config.cases : [];
       if (cases.length > 0) {
-        outputs = cases.map((c, i) => ({ name: typeof c === 'string' ? c : (c.name || `case_${i + 1}`) }));
-        outputs.push({ name: 'default' });
+        outputs = cases.map((c, i) => ({ name: typeof c === 'string' ? c : (c.name || `case_${i + 1}`), type: 'any' }));
+        outputs.push({ name: 'default', type: 'any' });
       } else {
-        outputs = [{ name: 'case_1' }, { name: 'case_2' }, { name: 'default' }];
+        outputs = [{ name: 'case_1', type: 'any' }, { name: 'case_2', type: 'any' }, { name: 'default', type: 'any' }];
       }
     } else if (isOutput) outputs = [];
-    else outputs = [{ name: 'full' }];
+    else outputs = [{ name: 'full', type: 'any' }];
     return { inputs, outputs };
   }
 

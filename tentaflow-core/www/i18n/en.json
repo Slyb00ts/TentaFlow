@@ -1007,6 +1007,7 @@
     "port_full": "Complete response",
     "port_in": "Input",
     "invalid_port": "Port \"{port}\" is not supported by {node_type}",
+    "invalid_port_type": "Incompatible port types: {from_type} → {to_type}",
     "edge_dangling": "Edge points to a non-existent node",
     "cycle_detected": "Cycle detected in flow graph"
   },
