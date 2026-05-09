@@ -1097,6 +1097,7 @@
       "speaker_context": "Speaker",
       "memory_analyzer": "Analyzer",
       "condition": "Condition",
+      "combine": "Combine",
       "switch": "Switch",
       "router": "Router",
       "output": "Output"
@@ -1116,6 +1117,7 @@
       "speaker_context": "Voice recognition - personalization",
       "memory_analyzer": "Memory query analysis (bielik-1.5b)",
       "condition": "Conditional branch (if/else)",
+      "combine": "Collects responses from multiple branches and joins them into one text",
       "switch": "Multiple choice branch",
       "router": "Pass-through node",
       "output": "Flow output - returns result"

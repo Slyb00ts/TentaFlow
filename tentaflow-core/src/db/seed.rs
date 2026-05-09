@@ -254,6 +254,14 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "git-branch",
         ),
         (
+            "combine",
+            "logic",
+            "Połącz",
+            "Zbiera odpowiedzi z wielu branchy i łączy w jeden tekst",
+            r#"{"separator":"\n\n"}"#,
+            "merge",
+        ),
+        (
             "output",
             "output",
             "Wyjście",

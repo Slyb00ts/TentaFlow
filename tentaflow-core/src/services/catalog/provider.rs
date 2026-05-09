@@ -414,6 +414,7 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "trigger",
     "output",
     "condition",
+    "combine",
     "pii_filter",
     "tts_clean",
     "session_context",

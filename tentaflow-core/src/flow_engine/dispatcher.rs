@@ -38,10 +38,10 @@ use crate::flow_engine::node_adapter::{
     AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink,
 };
 use crate::flow_engine::node_adapters::{
-    ConditionNodeAdapter, ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter,
-    MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, SessionContextNodeAdapter,
-    SpeakerContextNodeAdapter, SttNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
-    TtsNodeAdapter, VisionNodeAdapter,
+    CombineNodeAdapter, ConditionNodeAdapter, ConversationHistoryNodeAdapter,
+    EmbeddingsNodeAdapter, LlmNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter,
+    PiiFilterNodeAdapter, SessionContextNodeAdapter, SpeakerContextNodeAdapter, SttNodeAdapter,
+    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::synthetic;
@@ -641,6 +641,7 @@ fn build_registry() -> AdapterRegistry {
         Arc::new(TriggerNodeAdapter::new()),
         Arc::new(OutputNodeAdapter::new()),
         Arc::new(ConditionNodeAdapter::new()),
+        Arc::new(CombineNodeAdapter::new()),
         Arc::new(TtsCleanNodeAdapter::new()),
         Arc::new(SttNodeAdapter::new()),
         Arc::new(TtsNodeAdapter::new()),

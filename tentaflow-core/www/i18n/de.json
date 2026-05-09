@@ -986,6 +986,7 @@
       "speaker_context": "Sprecher",
       "memory_analyzer": "Analyzer",
       "condition": "Bedingung",
+      "combine": "Zusammenführen",
       "switch": "Switch",
       "router": "Router",
       "output": "Ausgang"
@@ -1005,6 +1006,7 @@
       "speaker_context": "Stimmerkennung — Personalisierung",
       "memory_analyzer": "Analyse der Speicherabfrage (bielik-1.5b)",
       "condition": "Bedingte Verzweigung (if/else)",
+      "combine": "Sammelt Antworten aus mehreren Branches und führt sie zu einem Text zusammen",
       "switch": "Mehrfachverzweigung",
       "router": "Pass-through Node",
       "output": "Flow-Ausgang — gibt Ergebnis zurück"
