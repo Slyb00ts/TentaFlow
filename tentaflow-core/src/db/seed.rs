@@ -585,14 +585,28 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
         ),
     ];
 
-    // Migracja seedów: gdy istniejący flow_json NIE zawiera `from_port":"stream"`
-    // (czyli to stary blocking seed sprzed Krok 6/7), nadpisz go aktualnym
-    // streamingowym wariantem. Custom flows (admin zmienił JSON) zostają
-    // nietknięte. Brak rekordu → INSERT.
+    // Migracja seedów. Dwie generacje legacy do nadpisania:
+    // 1) Stary blocking seed sprzed Krok 6/7 — flow_json bez `from_port":"stream"`.
+    // 2) Streaming seed sprzed wprowadzenia 6 typed input portow w output —
+    //    flow_json z `from_port":"stream"` ale bez `to_port":"text"` lub
+    //    `to_port":"audio"` (czyli edge'y konczace w output uzywaja default
+    //    `to_port="in"` ktory juz nie istnieje w output adapter).
+    // Custom flows (admin zmienil JSON i ma `to_port":"text"`/`audio`) zostaja
+    // nietkniete. Brak rekordu → INSERT.
     let mut update_stmt = conn.prepare(
         "UPDATE flows SET description = ?2, service_type = ?3, flow_json = ?4, \
          is_default = ?5, status = 'active' \
-         WHERE name = ?1 AND flow_json NOT LIKE '%\"from_port\":\"stream\"%'",
+         WHERE name = ?1 AND ( \
+             flow_json NOT LIKE '%\"from_port\":\"stream\"%' \
+             OR ( \
+                 flow_json NOT LIKE '%\"to_port\":\"text\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"audio\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"image\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"video\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"embedding\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"other\"%' \
+             ) \
+         )",
     )?;
     let mut insert_stmt = conn.prepare(
         "INSERT INTO flows (name, description, service_type, flow_json, status, is_default) \
