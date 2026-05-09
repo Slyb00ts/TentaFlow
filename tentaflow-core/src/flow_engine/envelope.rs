@@ -36,6 +36,15 @@ pub enum FlowValue {
         duration_ms: Option<u64>,
     },
     Embedding(Vec<f32>),
+    /// Generyczny plik / dokument (PDF, DOCX, XLSX, ZIP itp.). `mime` opisuje
+    /// faktyczny typ; `filename` opcjonalna oryginalna nazwa pliku gdy klient
+    /// ja przeslal (uzytecznosc dla logow / display, NIE source-of-truth dla
+    /// typu — type bierzemy z mime).
+    Other {
+        blob_ref: BlobRef,
+        mime: String,
+        filename: Option<String>,
+    },
 }
 
 impl FlowValue {
@@ -62,6 +71,7 @@ impl FlowValue {
             FlowValue::Image { .. } => "Image",
             FlowValue::Video { .. } => "Video",
             FlowValue::Embedding(_) => "Embedding",
+            FlowValue::Other { .. } => "Other",
         }
     }
 }

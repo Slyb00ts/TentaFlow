@@ -1012,21 +1012,30 @@ pub fn flow_node_templates_list(
     let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
         .map(|t| {
-            let (input_ports, output_ports) =
+            let (input_ports, output_ports, input_port_types, output_port_types) =
                 match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
-                    Some(adapter) => (
-                        adapter
+                    Some(adapter) => {
+                        let in_ports: Vec<String> = adapter
                             .supported_input_ports()
                             .iter()
                             .map(|s| s.to_string())
-                            .collect(),
-                        adapter
+                            .collect();
+                        let out_ports: Vec<String> = adapter
                             .supported_output_ports()
                             .iter()
                             .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                    None => (Vec::new(), Vec::new()),
+                            .collect();
+                        let in_types: Vec<String> = in_ports
+                            .iter()
+                            .map(|p| adapter.input_port_type(p).as_wire_str().to_string())
+                            .collect();
+                        let out_types: Vec<String> = out_ports
+                            .iter()
+                            .map(|p| adapter.output_port_type(p).as_wire_str().to_string())
+                            .collect();
+                        (in_ports, out_ports, in_types, out_types)
+                    }
+                    None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
                 };
             tentaflow_protocol::FlowNodeTemplate {
                 id: t.id,
@@ -1038,6 +1047,8 @@ pub fn flow_node_templates_list(
                 icon: t.icon,
                 input_ports,
                 output_ports,
+                input_port_types,
+                output_port_types,
             }
         })
         .collect();

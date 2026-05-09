@@ -157,6 +157,13 @@ fn flow_value_to_json(v: &FlowValue) -> Value {
             "mime": mime,
             "duration_ms": duration_ms,
         }),
+        FlowValue::Other { blob_ref, mime, filename } => serde_json::json!({
+            "blob_id": blob_ref.id,
+            "size_bytes": blob_ref.size_bytes,
+            "sha256": blob_ref.sha256,
+            "mime": mime,
+            "filename": filename,
+        }),
     }
 }
 
