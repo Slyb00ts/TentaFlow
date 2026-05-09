@@ -880,7 +880,9 @@ export class FlowCanvas {
       return;
     }
 
-    // 1) Port out → start łączenia
+    // 1) Port out → start łączenia. setPointerCapture jest tu potrzebne
+    // bo pointermove musi miec gwarancje delivery do roota nawet gdy
+    // kursor wyjdzie poza canvas (drag-line do drugiego node'a).
     const portOut = ev.target.closest('.fb-port-out');
     if (portOut) {
       const nodeId = portOut.dataset.nodeId;
@@ -905,7 +907,18 @@ export class FlowCanvas {
     // 2) Port in → nic, obsłużony przy release łączenia
     if (ev.target.closest('.fb-port-in')) return;
 
-    // 3) Node → drag (ignoruj interaktywne elementy wewnątrz)
+    // 3) Klik w krawedz (SVG fb-edge-hit) — NIE rob panning, NIE rob
+    // setPointerCapture, NIE preventDefault. Zostawiamy przegladarce
+    // native dispatch zeby click event mial poprawny target = edge-hit
+    // (setPointerCapture przekierowywaloby click na roota).
+    if (ev.target.closest('.fb-edge-hit') || ev.target.closest('.fb-edge-delete')) {
+      return;
+    }
+
+    // 4) Node → drag (ignoruj interaktywne elementy wewnątrz). Brak
+    // setPointerCapture: pointermove/pointerup sa juz podpiete na window
+    // (linia 236-238), wiec drag dziala bez capture'a, a click na koniec
+    // ma poprawny ev.target.
     const nodeEl = ev.target.closest('.fb-node');
     if (nodeEl) {
       if (ev.target.closest('input, select, textarea, button, tf-button, [data-no-drag]')) return;
@@ -926,12 +939,13 @@ export class FlowCanvas {
         moved: false,
         pointerId: ev.pointerId,
       };
-      try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
+      // preventDefault tylko zeby zatrzymac native text selection na node
+      // labelach przy dlugim drag — NIE blokuje click bo standard W3C.
       ev.preventDefault();
       return;
     }
 
-    // 4) Pusty canvas → pan
+    // 5) Pusty canvas → pan. Bez setPointerCapture (jak w node-drag).
     this._panning = {
       startClientX: ev.clientX,
       startClientY: ev.clientY,
@@ -939,7 +953,6 @@ export class FlowCanvas {
       pointerId: ev.pointerId,
       moved: false,
     };
-    try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
     this.root.classList.add('panning');
     ev.preventDefault();
   }
