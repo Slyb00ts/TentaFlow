@@ -156,6 +156,12 @@ pub(crate) fn payload_to_json(v: &FlowValue) -> serde_json::Value {
             "mime": mime,
         }),
         FlowValue::Embedding(e) => serde_json::json!({"type":"embedding","values":e}),
+        FlowValue::Other { blob_ref, mime, filename } => serde_json::json!({
+            "type": "other",
+            "blob_id": blob_ref.id,
+            "mime": mime,
+            "filename": filename,
+        }),
     }
 }
 

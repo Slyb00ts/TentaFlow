@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct TriggerNodeAdapter;
 
@@ -27,7 +27,34 @@ impl Default for TriggerNodeAdapter {
 }
 
 const INPUT_PORTS: &[&str] = &[];
-const OUTPUT_PORTS: &[&str] = &["full"];
+// Sześć typed output portów (`text` / `audio` / `image` / `video` /
+// `embedding` / `other`) plus jeden legacy `full` (typ `Any`).
+//
+// Typed porty: GUI rysuje kazdy w innym kolorze (typed via
+// `output_port_type`), R8 walidacja edge'y wymusza ze krawedz z portu
+// `audio` laczy sie tylko z node'm ktory deklaruje `input_port_type = Audio`
+// (lub `Any`). Runtime: trigger emituje pojedynczy envelope (passthrough z
+// `ctx.initial_envelope`); informacja o porcie sluzy walidacji compile-time
+// + GUI rendering. Multi-modal payload w envelope niesie wszystkie typy z
+// requestu, downstream node konsumuje swoja czesc.
+//
+// `other` to kanał dla plików ktore nie sa native media (PDF, DOCX, XLSX,
+// ZIP itp.) — adapter konsumujacy musi czytac `FlowValue::Other.mime` zeby
+// zdecydowac co z tym zrobic.
+//
+// `full` zostaje TYLKO jako compat-passthrough dla legacy seed flowów
+// ktore wpisuja `from_port = "full"` (default `FlowEdge::from_port`). Po
+// migracji wszystkich seedów + testów na typed porty `full` znika razem ze
+// starymi flowami (Standardowy LLM/TTS, Audio Chat).
+const OUTPUT_PORTS: &[&str] = &[
+    "text",
+    "audio",
+    "image",
+    "video",
+    "embedding",
+    "other",
+    "full",
+];
 
 #[async_trait]
 impl NodeAdapter for TriggerNodeAdapter {
@@ -41,6 +68,22 @@ impl NodeAdapter for TriggerNodeAdapter {
 
     fn supported_output_ports(&self) -> &[&'static str] {
         OUTPUT_PORTS
+    }
+
+    fn output_port_type(&self, port: &str) -> FlowDataType {
+        match port {
+            "text" => FlowDataType::Text,
+            "audio" => FlowDataType::Audio,
+            "image" => FlowDataType::Image,
+            "video" => FlowDataType::Video,
+            "embedding" => FlowDataType::Embedding,
+            "other" => FlowDataType::Other,
+            // `full` to compat-passthrough — Any pasuje do kazdego konsumenta
+            // niezaleznie od jego `input_port_type`, dzieki czemu legacy seedy
+            // dzialaja bez zmian. Trafi do usuniecia razem ze starymi flowami.
+            "full" => FlowDataType::Any,
+            _ => FlowDataType::Any,
+        }
     }
 
     async fn execute(
@@ -111,10 +154,21 @@ mod tests {
     }
 
     #[test]
-    fn trigger_advertises_zero_input_ports() {
+    fn trigger_advertises_six_typed_output_ports_plus_legacy_full() {
         let a = TriggerNodeAdapter::new();
         assert!(a.supported_input_ports().is_empty());
-        assert_eq!(a.supported_output_ports(), &["full"]);
+        assert_eq!(
+            a.supported_output_ports(),
+            &["text", "audio", "image", "video", "embedding", "other", "full"]
+        );
         assert_eq!(a.node_type(), "trigger");
+        assert_eq!(a.output_port_type("text"), FlowDataType::Text);
+        assert_eq!(a.output_port_type("audio"), FlowDataType::Audio);
+        assert_eq!(a.output_port_type("image"), FlowDataType::Image);
+        assert_eq!(a.output_port_type("video"), FlowDataType::Video);
+        assert_eq!(a.output_port_type("embedding"), FlowDataType::Embedding);
+        assert_eq!(a.output_port_type("other"), FlowDataType::Other);
+        assert_eq!(a.output_port_type("full"), FlowDataType::Any);
+        assert_eq!(a.output_port_type("unknown"), FlowDataType::Any);
     }
 }
