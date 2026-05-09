@@ -771,17 +771,12 @@ export class FlowCanvas {
       const isSelected = this.selectedEdgeId === e.id;
       if (isSelected) p.classList.add('selected');
       this.svg.appendChild(p);
-      // Animowana kropka przepływu — pointer-events:none w CSS, zeby nie
-      // przesłaniała hit-area i nie blokowała kliku w edge.
-      const dot = document.createElementNS(svgNs, 'circle');
-      dot.setAttribute('class', 'fb-edge-flow');
-      dot.setAttribute('r', '3');
-      const anim = document.createElementNS(svgNs, 'animateMotion');
-      anim.setAttribute('dur', '2.4s');
-      anim.setAttribute('repeatCount', 'indefinite');
-      anim.setAttribute('path', d);
-      dot.appendChild(anim);
-      this.svg.appendChild(dot);
+      // Animowane kropki na krawedziach byly niedeterministyczne — animacja
+      // SVG `animateMotion` zostawiala duchy podczas pan/zoom (svg.innerHTML
+      // = '' nie zawsze konczyl trwajace animacje natychmiast, browser
+      // trzymal ostatnia pozycje ducha jako wolny <circle>). Wizualnie
+      // edge'e maja juz cyan glow + selected red — kropki przeplywu byly
+      // ozdoba bez wartosci diagnostycznej, wycinamy.
       // Przycisk delete (X) na srodku krawedzi gdy selected — kazda
       // krawedz ma takze hover-interaktywny target przez .fb-edge-hit:hover
       // w CSS, ale realny przycisk jest renderowany dopiero po selekcji

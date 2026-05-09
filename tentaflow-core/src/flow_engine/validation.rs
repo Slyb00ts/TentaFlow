@@ -377,46 +377,64 @@ pub fn validate(
         .filter(|e| e.from_port == "stream")
         .collect();
 
-    // R7 multi-branch guard:
+    // R7 multi-branch guard (luzny dla typed-output node'a):
     //
-    // 1. Per-node: max 1 wychodzący edge z `from_port="stream"`. Linear
-    //    chain (stream → stream → stream) OK; równoległe rozgałęzienie
-    //    z tego samego node'a → odrzucone.
+    // 1. Per-node: max 1 wychodzący edge z `from_port="stream"` POZA
+    //    `output` node — output ma 6 typed input portow i moze przyjac
+    //    rownolegle stream tekstu (LLM→PII→output.text) plus stream
+    //    audio (TTS_bridge→output.audio). Stara reguła zakazywała tej
+    //    konfiguracji bo runtime executor fold'owal jeden chain;
+    //    chain-merge wraca w nastepnym kroku ale topologia juz jest
+    //    legalna w GUI.
     //
-    // 2. Per-flow: tylko 1 unikalny producer stream'u (top-of-chain).
-    //    Producent = node z stream edge wychodzącym, ale BEZ
-    //    przychodzącego stream edge'a (intermediate w chain'ie ma
-    //    incoming + outgoing stream — to dalej ten sam chain).
-    //    Runtime executor fold'uje pojedynczy chain; dwóch niezależnych
-    //    producerów byłoby silently zignorowane.
+    // 2. Per-flow: dowolna liczba niezaleznych producerów stream'u DOZWOLONA
+    //    pod warunkiem ze WSZYSTKIE konczacych sie chainów wpadaja do
+    //    `output` node. Sprawdzamy w walk-chain ponizej.
     let mut stream_out_count: HashMap<&str, usize> = HashMap::new();
     let mut stream_in_count: HashMap<&str, usize> = HashMap::new();
     for edge in &stream_edges {
         *stream_out_count.entry(edge.from.as_str()).or_insert(0) += 1;
         *stream_in_count.entry(edge.to.as_str()).or_insert(0) += 1;
     }
-    for count in stream_out_count.values() {
+    // Mapa node_id -> typ; potrzebna zeby wykluczyc output z per-node limitu
+    // (wszystkie inne typy wciaz max 1 stream out).
+    let node_type_by_id: HashMap<&str, &str> = def
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.node_type.as_str()))
+        .collect();
+    for (node_id, count) in &stream_out_count {
         if *count > 1 {
-            return Err(FlowValidationError::MultipleStreamingBranches {
-                count: *count,
-            });
+            let nt = node_type_by_id.get(node_id).copied().unwrap_or("");
+            // Tylko output moze miec wiele wychodzacych stream edges (i nawet
+            // to nie ma sensu — output to terminal sink — ale defensywnie
+            // zostawiamy dziure bo R7 sprawdza tez ze terminal.from_port=
+            // stream prowadzi do output, co dla output samego siebie nie
+            // ma jak skomponowac).
+            if nt != "output" {
+                return Err(FlowValidationError::MultipleStreamingBranches {
+                    count: *count,
+                });
+            }
         }
     }
-    let producer_count = stream_out_count
-        .keys()
-        .filter(|node_id| !stream_in_count.contains_key(*node_id))
-        .count();
-    if producer_count > 1 {
-        return Err(FlowValidationError::MultipleStreamingBranches {
-            count: producer_count,
-        });
-    }
 
-    // Walk chain: zacznij od pierwszego stream edge'a, follow `from_port=
-    // "stream"` aż do output sink. Wykrywaj cykle przez seen set.
-    if !stream_edges.is_empty() {
+    // Walk chain dla KAŻDEGO niezaleznego producenta stream'u. Producent =
+    // node z >=1 wychodzacym stream edge ale BEZ wchodzacego stream edge
+    // (intermediate w chain'ie ma incoming + outgoing stream → caly chain
+    // policzymy raz od jego producenta). Multi-producer pozwala na
+    // rownolegly stream tekstu i audio do output (output ma 6 typed input
+    // portow). Runtime executor jeszcze nie skleja N strumieni w jeden
+    // wynik klienta — to wraca w follow-up; walidacja juz akceptuje
+    // topologie.
+    let producers: Vec<&str> = stream_out_count
+        .keys()
+        .copied()
+        .filter(|node_id| !stream_in_count.contains_key(*node_id))
+        .collect();
+    for producer in producers {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut current_id = stream_edges[0].from.as_str();
+        let mut current_id = producer;
         seen.insert(current_id);
         loop {
             let next_edge = def
@@ -424,9 +442,6 @@ pub fn validate(
                 .iter()
                 .find(|e| e.from == current_id && e.from_port == "stream");
             let Some(edge) = next_edge else {
-                // Brak dalszego stream edge'a — chain musi się skończyć na
-                // output(mode=stream); jeśli current_id to nie output,
-                // chain wisi w powietrzu.
                 let last_node = nodes_by_id[current_id];
                 if last_node.node_type != "output" {
                     return Err(FlowValidationError::StreamingNotToOutput {
@@ -451,10 +466,6 @@ pub fn validate(
                 }
                 break;
             }
-            // Intermediate chain node — sprawdź że nie jest cyklem. Walidacja
-            // czy node ma StreamingNodeAdapter zostaje na runtime executor
-            // lookup (R7 nie ma dostępu do streaming_adapters slot, tylko
-            // node_type registration).
             if !seen.insert(edge.to.as_str()) {
                 return Err(FlowValidationError::StreamingNotToOutput {
                     from_node: edge.from.clone(),
@@ -818,20 +829,21 @@ mod tests {
         ));
     }
 
-    /// R7 per-flow guard: tylko 1 producer stream'u w całym flow.
-    /// Dwa niezależne LLM, każdy z własnym stream edge → 2 output sinks
-    /// → walidator odrzuca, runtime fold'uje tylko pierwszy chain.
+    /// R7 multi-producer: dwa niezalezne LLM kazdy ze swoim stream chain'em
+    /// jest TERAZ DOZWOLONY (output ma 6 typed input portow, moze
+    /// jednoczesnie przyjac stream tekstu i stream audio). Walidacja
+    /// akceptuje, runtime executor jeszcze nie skleja N strumieni — to
+    /// follow-up. Test pilnuje ze topologia jest legalna od strony
+    /// kompilacji.
     #[test]
-    fn rejects_multiple_independent_stream_producers() {
+    fn accepts_multiple_independent_stream_producers_into_typed_output() {
         let mut r = AdapterRegistry::new();
         r.register(Arc::new(TriggerNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register(Arc::new(ConditionNodeAdapter::new()));
+        r.register(Arc::new(crate::flow_engine::node_adapters::PiiFilterNodeAdapter::new()));
         r.register_llm(Arc::new(LlmNodeAdapter::new()));
 
-        // Trigger fan-out do condition który decyduje (true/false branch
-        // — symulujemy bo trigger ma tylko 1 outgoing). Każdy LLM emit
-        // własny stream → osobny output sink. Independent producers.
         let def = parse(
             r#"{
                 "nodes":[
@@ -839,6 +851,8 @@ mod tests {
                     {"id":"c","type":"condition","config":{}},
                     {"id":"l1","type":"llm","config":{}},
                     {"id":"l2","type":"llm","config":{}},
+                    {"id":"p1","type":"pii_filter","config":{}},
+                    {"id":"p2","type":"pii_filter","config":{}},
                     {"id":"o1","type":"output","config":{"mode":"stream"}},
                     {"id":"o2","type":"output","config":{"mode":"stream"}}
                 ],
@@ -846,21 +860,19 @@ mod tests {
                     {"from":"t","to":"c","from_port":"text"},
                     {"from":"c","to":"l1","from_port":"true"},
                     {"from":"c","to":"l2","from_port":"false"},
-                    {"from":"l1","to":"o1","from_port":"stream","to_port":"text"},
-                    {"from":"l2","to":"o2","from_port":"stream","to_port":"text"}
+                    {"from":"l1","to":"p1","from_port":"stream"},
+                    {"from":"p1","to":"o1","from_port":"stream","to_port":"text"},
+                    {"from":"l2","to":"p2","from_port":"stream"},
+                    {"from":"p2","to":"o2","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
-        let err = validate(
+        validate(
             &def,
             &r,
             crate::flow_engine::validation::ValidationSource::UserDefined,
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            FlowValidationError::MultipleStreamingBranches { .. }
-        ));
+        .expect("multi-producer streaming should validate");
     }
 
     /// Chain bez output sink (pii_filter na końcu) odrzucony przez R7.
