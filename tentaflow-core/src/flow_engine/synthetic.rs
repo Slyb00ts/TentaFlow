@@ -29,7 +29,9 @@ pub fn synthetic_chat(model: &str) -> FlowDefinition {
             // Trigger emituje typed payload. Chat = Text, więc trigger.text → llm.in.
             edge("t1", "l1", "text", "in"),
             edge("l1", "p1", "full", "in"),
-            edge("p1", "o1", "full", "in"),
+            // Output ma 6 typed input portow (text/audio/image/video/embedding
+            // /other) — pii_filter zwraca Text wiec idziemy do `text`.
+            edge("p1", "o1", "full", "text"),
         ],
     }
 }
@@ -51,7 +53,7 @@ pub fn synthetic_chat_stream(model: &str) -> FlowDefinition {
         edges: vec![
             edge("t1", "l1", "text", "in"),
             edge("l1", "p1", "stream", "in"),
-            edge("p1", "o1", "stream", "in"),
+            edge("p1", "o1", "stream", "text"),
         ],
     }
 }
@@ -66,7 +68,8 @@ pub fn synthetic_tts(model: &str) -> FlowDefinition {
         ],
         edges: vec![
             edge("t1", "t2", "text", "in"),
-            edge("t2", "o1", "full", "in"),
+            // TTS produkuje Audio → output.audio.
+            edge("t2", "o1", "full", "audio"),
         ],
     }
 }
@@ -82,7 +85,8 @@ pub fn synthetic_stt(model: &str) -> FlowDefinition {
         edges: vec![
             // STT konsumuje audio, wiec trigger.audio → stt.in.
             edge("t1", "s1", "audio", "in"),
-            edge("s1", "o1", "full", "in"),
+            // STT zwraca tekst transkrypcji → output.text.
+            edge("s1", "o1", "full", "text"),
         ],
     }
 }
@@ -97,7 +101,8 @@ pub fn synthetic_embeddings(model: &str) -> FlowDefinition {
         ],
         edges: vec![
             edge("t1", "e1", "text", "in"),
-            edge("e1", "o1", "full", "in"),
+            // Embeddings produkuje Embedding → output.embedding.
+            edge("e1", "o1", "full", "embedding"),
         ],
     }
 }
