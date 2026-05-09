@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn ok_minimal_flow() {
         let def = parse(
-            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o"}]}"#,
+            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text"}]}"#,
         );
         validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
     }
@@ -564,7 +564,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"c"},
+                    {"from":"t","to":"c","from_port":"text"},
                     {"from":"c","to":"o","from_port":"true"},
                     {"from":"c","to":"o","from_port":"false"}
                 ]
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn rejects_unknown_adapter() {
         let def = parse(
-            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"x","type":"mystery","config":{}}],"edges":[{"from":"t","to":"x"}]}"#,
+            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"x","type":"mystery","config":{}}],"edges":[{"from":"t","to":"x","from_port":"text"}]}"#,
         );
         let err = validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
         assert!(matches!(err, FlowValidationError::UnknownAdapter { .. }));
@@ -596,7 +596,7 @@ mod tests {
                     {"id":"o","type":"output","config":{"mode":"stream"}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"o","from_port":"stream"}
                 ]
             }"#,
@@ -614,7 +614,7 @@ mod tests {
                     {"id":"c","type":"condition","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"c","from_port":"stream"}
                 ]
             }"#,
@@ -636,7 +636,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"o","from_port":"stream"}
                 ]
             }"#,
@@ -669,7 +669,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"s"},
                     {"from":"s","to":"o"}
                 ]
@@ -698,7 +698,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"p","data_type":"text"},
+                    {"from":"t","to":"p","from_port":"text","data_type":"text"},
                     {"from":"p","to":"o","data_type":"text"}
                 ]
             }"#,
@@ -722,7 +722,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"p"},
+                    {"from":"t","to":"p","from_port":"text"},
                     {"from":"p","to":"o","data_type":"audio"}
                 ]
             }"#,
@@ -754,7 +754,7 @@ mod tests {
                     {"id":"o","type":"output","config":{"mode":"stream"}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p","from_port":"stream"},
                     {"from":"p","to":"o","from_port":"stream"}
                 ]
@@ -789,7 +789,7 @@ mod tests {
                     {"id":"o2","type":"output","config":{"mode":"stream"}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"o1","from_port":"stream"},
                     {"from":"l","to":"o2","from_port":"stream"}
                 ]
@@ -832,7 +832,7 @@ mod tests {
                     {"id":"o2","type":"output","config":{"mode":"stream"}}
                 ],
                 "edges":[
-                    {"from":"t","to":"c"},
+                    {"from":"t","to":"c","from_port":"text"},
                     {"from":"c","to":"l1","from_port":"true"},
                     {"from":"c","to":"l2","from_port":"false"},
                     {"from":"l1","to":"o1","from_port":"stream"},
@@ -870,7 +870,7 @@ mod tests {
                     {"id":"p","type":"pii_filter","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p","from_port":"stream"}
                 ]
             }"#,
@@ -905,7 +905,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"o"}
                 ]
             }"#,
@@ -950,7 +950,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p"},
                     {"from":"p","to":"o"}
                 ]
@@ -986,7 +986,7 @@ mod tests {
                     {"id":"o","type":"output","config":{"mode":"stream"}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p","from_port":"stream"},
                     {"from":"p","to":"o","from_port":"stream"}
                 ]
@@ -1022,7 +1022,7 @@ mod tests {
                     {"id":"o2","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"l"},
+                    {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"c"},
                     {"from":"c","to":"p","from_port":"true"},
                     {"from":"p","to":"o1"},

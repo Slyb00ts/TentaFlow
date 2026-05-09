@@ -617,6 +617,14 @@ export class FlowCanvas {
 
     const { inputs, outputs } = portsForNode(n, tmpl);
 
+    // Wysokosc nody musi pomiescic obie strony portow (in/out). Naszym
+    // pivotem jest strona z wieksza liczba portow. Header to PORT_HEADER_OFFSET
+    // (44px) + 14px stopka per port. Bez tego node ma sztywne CSS height i
+    // przy 6+ portach (trigger) ostatnie wystaja na zewnatrz dolnej krawedzi.
+    const portCount = Math.max(inputs.length, outputs.length, 1);
+    const minHeight = PORT_HEADER_OFFSET + portCount * PORT_STEP + 14;
+    div.style.minHeight = `${minHeight}px`;
+
     const inPortsHtml = inputs.map((p, i) => this._renderPortEl(n.id, p, i, 'in', inputs.length)).join('');
     const outPortsHtml = outputs.map((p, i) => this._renderPortEl(n.id, p, i, 'out', outputs.length)).join('');
 
@@ -721,9 +729,11 @@ export class FlowCanvas {
       p.setAttribute('class', 'fb-edge-path');
       p.setAttribute('d', d);
       p.dataset.edgeId = e.id;
-      if (this.selectedEdgeId === e.id) p.classList.add('selected');
+      const isSelected = this.selectedEdgeId === e.id;
+      if (isSelected) p.classList.add('selected');
       this.svg.appendChild(p);
-      // Animowana kropka przepływu
+      // Animowana kropka przepływu — pointer-events:none w CSS, zeby nie
+      // przesłaniała hit-area i nie blokowała kliku w edge.
       const dot = document.createElementNS(svgNs, 'circle');
       dot.setAttribute('class', 'fb-edge-flow');
       dot.setAttribute('r', '3');
@@ -733,6 +743,32 @@ export class FlowCanvas {
       anim.setAttribute('path', d);
       dot.appendChild(anim);
       this.svg.appendChild(dot);
+      // Przycisk delete (X) na srodku krawedzi gdy selected — kazda
+      // krawedz ma takze hover-interaktywny target przez .fb-edge-hit:hover
+      // w CSS, ale realny przycisk jest renderowany dopiero po selekcji
+      // (po pierwszym kliku w edge). Klik w X usuwa krawedz.
+      if (isSelected) {
+        const mid = this._bezierMidpoint(fp.x, fp.y, tp.x, tp.y);
+        const g = document.createElementNS(svgNs, 'g');
+        g.setAttribute('class', 'fb-edge-delete');
+        g.dataset.edgeId = e.id;
+        g.setAttribute('transform', `translate(${mid.x}, ${mid.y})`);
+        const bg = document.createElementNS(svgNs, 'circle');
+        bg.setAttribute('r', '11');
+        bg.setAttribute('class', 'fb-edge-delete-bg');
+        const x1 = document.createElementNS(svgNs, 'line');
+        x1.setAttribute('x1', '-4'); x1.setAttribute('y1', '-4');
+        x1.setAttribute('x2', '4'); x1.setAttribute('y2', '4');
+        x1.setAttribute('class', 'fb-edge-delete-stroke');
+        const x2 = document.createElementNS(svgNs, 'line');
+        x2.setAttribute('x1', '-4'); x2.setAttribute('y1', '4');
+        x2.setAttribute('x2', '4'); x2.setAttribute('y2', '-4');
+        x2.setAttribute('class', 'fb-edge-delete-stroke');
+        g.appendChild(bg);
+        g.appendChild(x1);
+        g.appendChild(x2);
+        this.svg.appendChild(g);
+      }
     }
     // Tymczasowa linia podczas łączenia
     if (this._connecting) {
@@ -749,6 +785,19 @@ export class FlowCanvas {
   _bezierPath(x1, y1, x2, y2) {
     const dx = Math.max(40, Math.abs(x2 - x1) * 0.5);
     return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+  }
+
+  /// Punkt na krzywej Beziera w t=0.5 — dla cubic z punktami kontrolnymi
+  /// `(P0, P1, P2, P3)` gdzie P1=(x1+dx,y1) i P2=(x2-dx,y2). Wzor cubic
+  /// Bezier dla t=0.5: B = (P0+3P1+3P2+P3)/8.
+  _bezierMidpoint(x1, y1, x2, y2) {
+    const dx = Math.max(40, Math.abs(x2 - x1) * 0.5);
+    const c1x = x1 + dx, c1y = y1;
+    const c2x = x2 - dx, c2y = y2;
+    return {
+      x: (x1 + 3 * c1x + 3 * c2x + x2) / 8,
+      y: (y1 + 3 * c1y + 3 * c2y + y2) / 8,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1056,11 +1105,23 @@ export class FlowCanvas {
 
   _onClick(ev) {
     if (this._suppressNextClick) { this._suppressNextClick = false; return; }
+    // Klik w X-przycisk na srodku selected edge'a → usun krawedz.
+    const deleteBtn = ev.target.closest('.fb-edge-delete');
+    if (deleteBtn) {
+      const edgeId = deleteBtn.dataset.edgeId;
+      this.edges = this.edges.filter((e) => e.id !== edgeId);
+      this.selectedEdgeId = null;
+      this._pushHistory();
+      this._renderEdges();
+      this.onChange();
+      return;
+    }
     const hit = ev.target.closest('.fb-edge-hit');
     if (hit) {
       this.selectedIds.clear();
       this.selectedEdgeId = hit.dataset.edgeId;
       this._applySelectionClasses();
+      this._renderEdges();
       this.onSelect(null);
       return;
     }
