@@ -896,6 +896,7 @@
     "port_full": "Vollständige Antwort",
     "port_in": "Eingang",
     "invalid_port": "Port „{port}“ wird von {node_type} nicht unterstützt",
+    "invalid_port_type": "Inkompatible Porttypen: {from_type} → {to_type}",
     "edge_dangling": "Kante verweist auf einen nicht existierenden Knoten",
     "cycle_detected": "Zyklus im Flow-Graph erkannt"
   },

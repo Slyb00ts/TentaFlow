@@ -999,6 +999,7 @@
     "port_full": "Kompletna odpowiedź",
     "port_in": "Wejście",
     "invalid_port": "Port „{port}” nie jest wspierany przez {node_type}",
+    "invalid_port_type": "Niekompatybilne typy portów: {from_type} → {to_type}",
     "edge_dangling": "Krawędź prowadzi do nieistniejącego węzła",
     "cycle_detected": "Wykryto cykl w grafie przepływu"
   },
