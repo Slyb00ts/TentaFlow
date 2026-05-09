@@ -986,6 +986,7 @@
       "speaker_context": "Hablante",
       "memory_analyzer": "Analizador",
       "condition": "Condición",
+      "combine": "Combinar",
       "switch": "Switch",
       "router": "Router",
       "output": "Salida"
@@ -1005,6 +1006,7 @@
       "speaker_context": "Reconocimiento de voz - personalización",
       "memory_analyzer": "Análisis de consulta a memoria (bielik-1.5b)",
       "condition": "Bifurcación condicional (if/else)",
+      "combine": "Recoge las respuestas de varias ramas y las une en un solo texto",
       "switch": "Bifurcación múltiple",
       "router": "Nodo pasarela",
       "output": "Salida del flow - devuelve el resultado"

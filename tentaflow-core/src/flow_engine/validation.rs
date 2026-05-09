@@ -325,6 +325,9 @@ pub fn validate(
     }
 
     // R4: trigger ma 0 incoming (jest źródłem flow), każdy non-trigger ≤1.
+    // Wyjątek: `combine` to fan-in node ktory z definicji konsumuje N
+    // incoming edges (kazdy z osobnego brancha) i czeka na wszystkie zanim
+    // wyemituje swoj single text output. Walidacja R4 nie liczy go.
     for node in &def.nodes {
         let count = incoming_count.get(node.id.as_str()).copied().unwrap_or(0);
         if node.node_type == "trigger" {
@@ -334,6 +337,9 @@ pub fn validate(
                     actual: count,
                 });
             }
+            continue;
+        }
+        if node.node_type == "combine" {
             continue;
         }
         if count > 1 {
