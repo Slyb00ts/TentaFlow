@@ -7,7 +7,69 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
+
+// Cache dla dynamic_enum dropdown opcji. Klucz `<source>:<category>`. Wartosc
+// to Promise<Array<{value,label}>> — pojedynczy fetch na cala sesje GUI.
+// Inwalidacja po przeladowaniu strony (Ctrl+Shift+R) — zmiana modeli/aliasow
+// w sesji wymaga reload zeby builder zobaczyl nowe wpisy w dropdownie.
+const _dynamicEnumCache = new Map();
+
+async function loadDynamicEnumOptions(source, category) {
+  const key = `${source}:${category || '_all'}`;
+  if (_dynamicEnumCache.has(key)) return _dynamicEnumCache.get(key);
+  const promise = (async () => {
+    if (source === 'models') {
+      const [modelsRaw, aliasesRaw] = await Promise.all([
+        ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+        ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
+      ]);
+      const models = Array.isArray(modelsRaw) ? modelsRaw : [];
+      const aliases = Array.isArray(aliasesRaw) ? aliasesRaw : [];
+      const modelByName = new Map();
+      for (const m of models) {
+        const name = m.model_name || m.modelName;
+        if (name) modelByName.set(name, m);
+      }
+      const cat = (category || '').toLowerCase();
+      const filtered = cat
+        ? models.filter((m) => (m.category || '').toLowerCase() === cat)
+        : models;
+      const opts = filtered.map((m) => {
+        const value = m.model_name || m.modelName || '';
+        const display = m.display_name || m.displayName || value;
+        const engine = m.engine_id || m.engineId;
+        const label = engine ? `${display} (${engine})` : display;
+        return { value, label };
+      });
+      // Aliasy ktore kieruja do modelu z tej kategorii — uzytkownik widzi je
+      // pod prawdziwymi modelami z prefixem `↪`.
+      for (const a of aliases) {
+        if (a.is_active === false || a.isActive === false) continue;
+        const target = a.target_model || a.targetModel;
+        const targetModel = target ? modelByName.get(target) : null;
+        if (!targetModel) continue;
+        if (cat && (targetModel.category || '').toLowerCase() !== cat) continue;
+        opts.push({
+          value: a.alias,
+          label: `↪ ${a.alias} → ${target}`,
+        });
+      }
+      return opts;
+    }
+    if (source === 'prompts') {
+      const list = await ApiBinary.list('promptListRequest', { arrayKey: 'prompts' }).catch(() => []);
+      return (Array.isArray(list) ? list : []).map((p) => ({
+        value: p.id || p.promptId || '',
+        label: p.name || p.id || '',
+      }));
+    }
+    return [];
+  })();
+  _dynamicEnumCache.set(key, promise);
+  return promise;
+}
 
 const TYPE_ICON = {
   trigger: 'bolt', start: 'bolt',
@@ -242,6 +304,25 @@ export class FlowConfig {
         </div>`;
     }
 
+    if (def.dynamic_enum && typeof def.dynamic_enum === 'object') {
+      // Renderujemy placeholder select; opcje zaciagamy async po renderze
+      // (loadDynamicEnumOptions z cache). Aktualna wartosc trzymana jako
+      // jedyna opcja zeby preview JSON pokazywal poprawnie.
+      const source = String(def.dynamic_enum.source || '');
+      const category = String(def.dynamic_enum.category || '');
+      const placeholder = curVal ? escapeHtml(String(curVal)) : '— wybierz —';
+      return `
+        <div class="fb-field">
+          <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
+          <select class="fb-select" data-bind="${escapeAttr(key)}" data-type="string"
+                  data-dynamic-source="${escapeAttr(source)}"
+                  data-dynamic-category="${escapeAttr(category)}">
+            <option value="${escapeAttr(curVal || '')}" selected>${placeholder}</option>
+          </select>
+          ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+        </div>`;
+    }
+
     if (type === 'number' || type === 'integer') {
       const hasRange = def.minimum != null && def.maximum != null;
       if (hasRange) {
@@ -306,6 +387,43 @@ export class FlowConfig {
         if (rv) rv.textContent = String(v);
         this.opts.onConfigChange?.(this.node.id, { [key]: v });
       });
+    });
+
+    // Async populate dynamic_enum dropdownow. Bierzemy aktualna wartosc z
+    // node.config zeby zachowac selekcje po refresh listy. Jak fetch
+    // failuje, zostawiamy single-option placeholder + log do konsoli.
+    body.querySelectorAll('select[data-dynamic-source]').forEach(async (sel) => {
+      const source = sel.dataset.dynamicSource;
+      const category = sel.dataset.dynamicCategory || '';
+      const key = sel.dataset.bind;
+      const currentValue = (this.node.config && this.node.config[key]) || '';
+      try {
+        const opts = await loadDynamicEnumOptions(source, category);
+        if (!opts.length) {
+          sel.innerHTML = `<option value="" disabled selected>— brak dostepnych ${source} ${category} —</option>`;
+          return;
+        }
+        const html = [
+          `<option value="" ${currentValue ? '' : 'selected'}>— wybierz —</option>`,
+          ...opts.map((o) => {
+            const sel2 = String(currentValue) === String(o.value) ? 'selected' : '';
+            return `<option value="${escapeAttr(o.value)}" ${sel2}>${escapeHtml(o.label)}</option>`;
+          }),
+        ].join('');
+        sel.innerHTML = html;
+        // Jesli aktualna wartosc nie jest na liscie (np. usuniety alias), zostawiamy
+        // placeholder selected — user widzi ze cos przepadlo i moze wybrac inny.
+        if (currentValue && !opts.some((o) => String(o.value) === String(currentValue))) {
+          const stale = document.createElement('option');
+          stale.value = currentValue;
+          stale.textContent = `${currentValue} (niedostepne)`;
+          stale.selected = true;
+          sel.appendChild(stale);
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[fb-config] dynamic_enum load failed for ${source}:${category}:`, err);
+      }
     });
   }
 
