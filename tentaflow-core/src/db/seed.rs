@@ -179,8 +179,8 @@ fn seed_pii_rules(conn: &Connection) -> Result<()> {
 
 /// Seeduje domyslne szablony wezlow flow (paleta komponentow).
 fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
-    // (node_type, category, label, description, default_config, icon)
-    let templates: &[(&str, &str, &str, &str, &str, &str)] = &[
+    // (node_type, category, label, description, default_config, icon, params_schema)
+    let templates: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
         (
             "trigger",
             "trigger",
@@ -188,6 +188,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Punkt wejścia flow (HTTP, QUIC, webhook)",
             "{}",
             "zap",
+            "",
         ),
         (
             "llm",
@@ -196,6 +197,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Wywołanie modelu językowego",
             r#"{"model":"","prompt_id":"","system_prompt":"","temperature":0.7,"max_tokens":4096,"stream":true}"#,
             "brain",
+            r#"{"properties":{"model":{"type":"string","title":"Model / alias","description":"LLM lub alias z tym samym katalogu","dynamic_enum":{"source":"models","category":"llm"}},"system_prompt":{"type":"string","title":"System prompt","format":"textarea","placeholder":"Jesteś pomocnym asystentem…"},"temperature":{"type":"number","title":"Temperature","minimum":0,"maximum":2,"step":0.1,"default":0.7},"max_tokens":{"type":"integer","title":"Max tokens","minimum":1,"maximum":131072,"default":4096},"top_p":{"type":"number","title":"Top P","minimum":0,"maximum":1,"step":0.05}},"required":["model"],"order":["model","system_prompt","temperature","max_tokens","top_p"]}"#,
         ),
         (
             "stt",
@@ -204,6 +206,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zamiana mowy na tekst (STT)",
             r#"{"language":"pl","model":""}"#,
             "mic",
+            r#"{"properties":{"model":{"type":"string","title":"Model STT / alias","description":"Wybierz silnik STT lub alias","dynamic_enum":{"source":"models","category":"stt"}},"language":{"type":"string","title":"Język","enum":[{"value":"pl","label":"Polski"},{"value":"en","label":"English"},{"value":"de","label":"Deutsch"},{"value":"es","label":"Español"},{"value":"fr","label":"Français"},{"value":"auto","label":"Auto-detect"}],"default":"pl"},"diarization":{"type":"boolean","title":"Diaryzacja mówców","description":"Rozpoznaj kto mówi w nagraniu","default":false}},"required":["model"],"order":["model","language","diarization"]}"#,
         ),
         (
             "tts",
@@ -212,6 +215,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zamiana tekstu na mowę (TTS)",
             r#"{"language":"pl","voice":"","speed":1.0}"#,
             "volume-2",
+            r#"{"properties":{"model":{"type":"string","title":"Model TTS / alias","dynamic_enum":{"source":"models","category":"tts"}},"voice":{"type":"string","title":"Głos","placeholder":"jarvis"},"format":{"type":"string","title":"Format","enum":[{"value":"mp3","label":"MP3"},{"value":"opus","label":"Opus (low-latency)"},{"value":"wav","label":"WAV"}],"default":"opus"},"speed":{"type":"number","title":"Tempo","minimum":0.25,"maximum":4,"step":0.05,"default":1}},"required":["model"],"order":["model","voice","format","speed"]}"#,
         ),
         (
             "embeddings",
@@ -220,6 +224,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Generowanie embeddingów tekstu",
             r#"{"model":""}"#,
             "hash",
+            r#"{"properties":{"model":{"type":"string","title":"Model embeddings","dynamic_enum":{"source":"models","category":"embeddings"}},"dimensions":{"type":"integer","title":"Wymiary","minimum":1,"maximum":8192,"description":"Opcjonalnie wymuś rozmiar wektora"}},"required":["model"],"order":["model","dimensions"]}"#,
         ),
         (
             "memory",
@@ -228,6 +233,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Odczyt/zapis pamięci konwersacji",
             r#"{"mode":"query","memory_type":"conversation","max_entries":10,"inject_to_messages":false,"context_prompt_id":""}"#,
             "database",
+            r#"{"properties":{"mode":{"type":"string","title":"Tryb","enum":[{"value":"query","label":"Query (read)"},{"value":"store","label":"Store (write)"}],"default":"query"},"memory_type":{"type":"string","title":"Typ pamięci","enum":[{"value":"conversation","label":"Conversation"},{"value":"semantic","label":"Semantic"},{"value":"episodic","label":"Episodic"}],"default":"conversation"},"max_entries":{"type":"integer","title":"Maks. wpisów","minimum":1,"maximum":200,"default":10},"inject_to_messages":{"type":"boolean","title":"Wstrzyknij do messages","default":false}},"order":["mode","memory_type","max_entries","inject_to_messages"]}"#,
         ),
         (
             "pii_filter",
@@ -236,6 +242,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Usuwanie danych osobowych z tekstu",
             "{}",
             "shield",
+            "",
         ),
         (
             "tts_clean",
@@ -244,6 +251,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Czyszczenie i normalizacja tekstu dla TTS",
             "{}",
             "eraser",
+            "",
         ),
         (
             "condition",
@@ -252,6 +260,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Rozgałęzienie warunkowe (if/else)",
             r#"{"field":"","operator":"equals","value":""}"#,
             "git-branch",
+            r#"{"properties":{"field":{"type":"string","title":"Pole","placeholder":"payload.text"},"operator":{"type":"string","title":"Operator","enum":[{"value":"equals","label":"="},{"value":"contains","label":"contains"},{"value":"starts_with","label":"starts with"},{"value":"matches","label":"regex match"}],"default":"equals"},"value":{"type":"string","title":"Wartość"}},"required":["field","operator"],"order":["field","operator","value"]}"#,
         ),
         (
             "combine",
@@ -260,6 +269,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zbiera odpowiedzi z wielu branchy i łączy w jeden tekst",
             r#"{"separator":"\n\n"}"#,
             "merge",
+            r#"{"properties":{"separator":{"type":"string","title":"Separator","description":"Tekst wstawiany między branche","default":"\n\n"}},"order":["separator"]}"#,
         ),
         (
             "output",
@@ -268,6 +278,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Punkt wyjścia flow",
             r#"{"format":"text"}"#,
             "send",
+            r#"{"properties":{"mode":{"type":"string","title":"Tryb","enum":[{"value":"blocking","label":"Blocking"},{"value":"stream","label":"Streaming"}],"default":"blocking"}},"order":["mode"]}"#,
         ),
         (
             "conversation_history",
@@ -276,6 +287,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zarządzanie historią konwersacji - wstrzykuje poprzednie wiadomości do kontekstu",
             r#"{"max_messages":20}"#,
             "message-circle",
+            r#"{"properties":{"max_messages":{"type":"integer","title":"Maks. wiadomości","minimum":1,"maximum":200,"default":20},"session_id":{"type":"string","title":"Session ID (opcjonalnie)","description":"Pomiń aby użyć ctx.session_id"}},"order":["max_messages","session_id"]}"#,
         ),
         (
             "session_context",
@@ -284,6 +296,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Świadomość sesji - informuje LLM czy to początek/kontynuacja/niezrozumiała wiadomość",
             r#"{"first_prompt_id":"","continue_prompt_id":"","unclear_prompt_id":""}"#,
             "clock",
+            r#"{"properties":{"first_prompt_id":{"type":"string","title":"Prompt: pierwsza wiadomość","dynamic_enum":{"source":"prompts"}},"continue_prompt_id":{"type":"string","title":"Prompt: kontynuacja","dynamic_enum":{"source":"prompts"}},"unclear_prompt_id":{"type":"string","title":"Prompt: niezrozumiała wiadomość","dynamic_enum":{"source":"prompts"}}},"order":["first_prompt_id","continue_prompt_id","unclear_prompt_id"]}"#,
         ),
         (
             "speaker_context",
@@ -292,24 +305,43 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Identyfikacja głosu, personalizacja, obsługa nieznanego użytkownika",
             r#"{"high_threshold":0.85,"medium_threshold":0.60,"personalization_first_prompt":"","personalization_continue_prompt":"","unknown_user_prompt":"","medium_confidence_known_prompt":"","medium_confidence_unknown_prompt":"","new_voice_prompt":"","new_speaker_prompt":""}"#,
             "user",
+            r#"{"properties":{"high_threshold":{"type":"number","title":"Próg wysokiej pewności","minimum":0,"maximum":1,"step":0.05,"default":0.85},"medium_threshold":{"type":"number","title":"Próg średniej pewności","minimum":0,"maximum":1,"step":0.05,"default":0.6}},"order":["high_threshold","medium_threshold"]}"#,
         ),
     ];
 
+    // INSERT OR REPLACE — przy unique node_type aktualizujemy istniejace
+    // wpisy zeby seed'owe schemy doszly do uzytkownikow ktorzy mieli juz
+    // bazę z migracji 5. Custom adminowych template'ow nie ma (palette jest
+    // backend-owned), wiec nadpisanie jest bezpieczne.
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO flow_node_templates (node_type, category, label, description, default_config, icon) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO flow_node_templates (node_type, category, label, description, default_config, icon, params_schema) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(node_type) DO UPDATE SET \
+            category = excluded.category, \
+            label = excluded.label, \
+            description = excluded.description, \
+            default_config = excluded.default_config, \
+            icon = excluded.icon, \
+            params_schema = excluded.params_schema",
     )?;
-    for (node_type, category, label, description, default_config, icon) in templates {
+    for (node_type, category, label, description, default_config, icon, params_schema) in templates {
+        let params_schema_opt: Option<&str> = if params_schema.is_empty() {
+            None
+        } else {
+            Some(params_schema)
+        };
         stmt.execute(rusqlite::params![
             node_type,
             category,
             label,
             description,
             default_config,
-            icon
+            icon,
+            params_schema_opt,
         ])?;
     }
 
-    info!("Zaladowano szablony wezlow flow (INSERT OR IGNORE)");
+    info!("Zaladowano szablony wezlow flow (upsert z params_schema)");
     Ok(())
 }
 
