@@ -896,6 +896,7 @@
     "port_full": "Réponse complète",
     "port_in": "Entrée",
     "invalid_port": "Le port « {port} » n'est pas pris en charge par {node_type}",
+    "invalid_port_type": "Types de ports incompatibles : {from_type} → {to_type}",
     "edge_dangling": "L'arête pointe vers un nœud inexistant",
     "cycle_detected": "Cycle détecté dans le graphe de flux"
   },
