@@ -719,7 +719,7 @@ mod chain_integration_tests {
                 {"id":"o1","type":"output","config":{"mode":"stream"}}
             ],
             "edges":[
-                {"from":"t1","to":"l1"},
+                {"from":"t1","to":"l1","from_port":"text"},
                 {"from":"l1","to":"p1","from_port":"stream"},
                 {"from":"p1","to":"o1","from_port":"stream"}
             ]
@@ -801,7 +801,7 @@ mod chain_integration_tests {
                 {"id":"o1","type":"output","config":{"mode":"stream"}}
             ],
             "edges":[
-                {"from":"t1","to":"l1"},
+                {"from":"t1","to":"l1","from_port":"text"},
                 {"from":"l1","to":"p1","from_port":"stream"},
                 {"from":"p1","to":"b1","from_port":"stream"},
                 {"from":"b1","to":"o1","from_port":"stream"}

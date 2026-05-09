@@ -26,7 +26,8 @@ pub fn synthetic_chat(model: &str) -> FlowDefinition {
             output_node(),
         ],
         edges: vec![
-            edge("t1", "l1", "full", "in"),
+            // Trigger emituje typed payload. Chat = Text, więc trigger.text → llm.in.
+            edge("t1", "l1", "text", "in"),
             edge("l1", "p1", "full", "in"),
             edge("p1", "o1", "full", "in"),
         ],
@@ -48,7 +49,7 @@ pub fn synthetic_chat_stream(model: &str) -> FlowDefinition {
             output,
         ],
         edges: vec![
-            edge("t1", "l1", "full", "in"),
+            edge("t1", "l1", "text", "in"),
             edge("l1", "p1", "stream", "in"),
             edge("p1", "o1", "stream", "in"),
         ],
@@ -64,7 +65,7 @@ pub fn synthetic_tts(model: &str) -> FlowDefinition {
             output_node(),
         ],
         edges: vec![
-            edge("t1", "t2", "full", "in"),
+            edge("t1", "t2", "text", "in"),
             edge("t2", "o1", "full", "in"),
         ],
     }
@@ -79,7 +80,8 @@ pub fn synthetic_stt(model: &str) -> FlowDefinition {
             output_node(),
         ],
         edges: vec![
-            edge("t1", "s1", "full", "in"),
+            // STT konsumuje audio, wiec trigger.audio → stt.in.
+            edge("t1", "s1", "audio", "in"),
             edge("s1", "o1", "full", "in"),
         ],
     }
@@ -94,7 +96,7 @@ pub fn synthetic_embeddings(model: &str) -> FlowDefinition {
             output_node(),
         ],
         edges: vec![
-            edge("t1", "e1", "full", "in"),
+            edge("t1", "e1", "text", "in"),
             edge("e1", "o1", "full", "in"),
         ],
     }
@@ -207,7 +209,9 @@ mod tests {
             Some("xtts-v2")
         );
         assert_eq!(def.edges.len(), 2);
-        assert!(def.edges.iter().all(|e| e.from_port == "full"));
+        // Pierwsza krawedz: trigger.text → tts.in. Druga: tts.full → output.in.
+        assert_eq!(def.edges[0].from_port, "text");
+        assert_eq!(def.edges[1].from_port, "full");
     }
 
     #[test]

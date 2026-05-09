@@ -442,7 +442,7 @@ mod tests {
                 {"id":"t","type":"trigger","config":{}},
                 {"id":"o","type":"output","config":{}}
             ],
-            "edges": [{"from":"t","to":"o"}]
+            "edges": [{"from":"t","to":"o","from_port":"text"}]
         }"#;
         let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
         assert_eq!(cf.execution_order.len(), 2);
@@ -459,7 +459,7 @@ mod tests {
                 {"id":"o","type":"output","config":{"mode":"stream"}}
             ],
             "edges": [
-                {"from":"t","to":"l"},
+                {"from":"t","to":"l","from_port":"text"},
                 {"from":"l","to":"o","from_port":"stream"}
             ]
         }"#;
@@ -493,7 +493,7 @@ mod tests {
                 {"id":"o","type":"output","config":{"mode":"stream"}}
             ],
             "edges": [
-                {"from":"t","to":"l"},
+                {"from":"t","to":"l","from_port":"text"},
                 {"from":"l","to":"p","from_port":"stream"},
                 {"from":"p","to":"o","from_port":"stream"}
             ]
@@ -559,7 +559,7 @@ mod tests {
                 {"id":"o","type":"output","position":{"x":2,"y":0}}
             ],
             "edges":[
-                {"from":"t","to":"l"},
+                {"from":"t","to":"l","from_port":"text"},
                 {"from":"l","to":"o"}
             ]
         }"#;
