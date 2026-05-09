@@ -24,9 +24,30 @@ pub enum FlowDataType {
     Video,
     Embedding,
     Json,
+    /// Generyczny plik / dokument (PDF, DOCX, XLSX, ZIP itp.) — wszystko co
+    /// nie jest natywnym media type (audio/image/video) ani structured data
+    /// (text/json/embedding). Adaptery konsumujace `Other` musza patrzec na
+    /// `FlowValue::Other.mime` zeby zdecydowac co z tym zrobic.
+    Other,
 }
 
 impl FlowDataType {
+    /// Stable lowercase tag uzywany w wire (rkyv) i GUI rendering. Spojny z
+    /// `serde(rename_all = "snake_case")` zeby JSON i string surface daly ten
+    /// sam tag.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            FlowDataType::Any => "any",
+            FlowDataType::Text => "text",
+            FlowDataType::Audio => "audio",
+            FlowDataType::Image => "image",
+            FlowDataType::Video => "video",
+            FlowDataType::Embedding => "embedding",
+            FlowDataType::Json => "json",
+            FlowDataType::Other => "other",
+        }
+    }
+
     /// `Any` na której kolwiek stronie = wildcard (compatible z każdym
     /// konkretnym typem). Inaczej wymaga dokładnego match'a.
     pub fn compatible_with(self, other: FlowDataType) -> bool {
@@ -48,6 +69,7 @@ impl FlowDataType {
             FlowValue::Image { .. } => Some(FlowDataType::Image),
             FlowValue::Video { .. } => Some(FlowDataType::Video),
             FlowValue::Embedding(_) => Some(FlowDataType::Embedding),
+            FlowValue::Other { .. } => Some(FlowDataType::Other),
         }
     }
 }

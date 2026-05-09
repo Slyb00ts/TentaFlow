@@ -1538,6 +1538,13 @@ pub struct FlowNodeTemplate {
     /// Dostepne porty wyjsciowe adaptera. LLM: ["stream","full"], wiekszosc
     /// innych: ["full"]. Pusta lista = nieznany adapter.
     pub output_ports: Vec<String>,
+    /// Typ danych per port wejsciowy w tej samej kolejnosci co `input_ports`.
+    /// Wartosci jako lowercase string FlowDataType: "any" / "text" / "audio"
+    /// / "image" / "video" / "embedding" / "json". GUI uzywa do kolorowania
+    /// portu i blokowania niekompatybilnych polaczen (lustrzana walidacja R8).
+    pub input_port_types: Vec<String>,
+    /// Analogicznie do `input_port_types`, dla portow wyjsciowych.
+    pub output_port_types: Vec<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
