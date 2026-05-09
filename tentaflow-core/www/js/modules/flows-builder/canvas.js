@@ -266,7 +266,16 @@ export class FlowCanvas {
       const y = typeof n.y === 'number' ? n.y : (typeof pos.y === 'number' ? pos.y : 0);
       return { ...n, x, y, config: n.config || {} };
     });
-    this.edges = (edges || []).map((e) => ({ ...e }));
+    // Krawedzie z backendu (flow_json w DB) nie maja `id` — to pole jest
+    // wewnetrznym uchwytem GUI dla selekcji + delete. Generujemy stable
+    // `e_<idx>_<from>_<to>_<from_port>_<to_port>` zeby ten sam graf po
+    // round-tripie (load → save → load) konsystentnie zaznaczal te same
+    // krawedzie. Dla nowych krawedzi `_onPointerUp` nadal generuje
+    // unikalne `e_<timestamp>` przy tworzeniu.
+    this.edges = (edges || []).map((e, idx) => {
+      const id = e.id || `e${idx}_${e.from_node || ''}-${e.to_node || ''}_${e.from_port || ''}-${e.to_port || ''}`;
+      return { ...e, id };
+    });
     this._normalizeNodeLabels();
     this._normalizeEdgePorts();
     this.selectedIds.clear();
@@ -300,6 +309,13 @@ export class FlowCanvas {
       }),
       edges: this.edges.map((e) => {
         const out = { ...e };
+        // `id` jest wewnetrznym uchwytem GUI generowanym przy load'zie z
+        // tupli (idx, from, to, ports). Backend FlowEdge ma `id: Option<String>`
+        // ale nasze syntetyczne klucze nie maja sensu w DB — czyscimy zeby
+        // round-trip do flow_json byl byte-identyczny ze zrodlem.
+        if (typeof out.id === 'string' && out.id.startsWith('e')) {
+          delete out.id;
+        }
         if (out.from_port === 'full') delete out.from_port;
         if (out.to_port === 'in') delete out.to_port;
         return out;
