@@ -1545,6 +1545,14 @@ pub struct FlowNodeTemplate {
     pub input_port_types: Vec<String>,
     /// Analogicznie do `input_port_types`, dla portow wyjsciowych.
     pub output_port_types: Vec<String>,
+    /// JSON-Schema-like opis pol konfiguracyjnych. Pusty string = brak
+    /// schemy (config tab w builderze pokazuje "Brak parametrow"). Format:
+    /// `{"properties":{<key>:{type, title, description, default, enum?,
+    /// minimum?, maximum?, format?, dynamic_enum?}}, "required":[...],
+    /// "order":[...]}`. `dynamic_enum` (rozszerzenie tentaflow): mowi GUI
+    /// zeby wczytac liste z runtime registry zamiast statycznego enum
+    /// — `{"source":"models","category":"stt"|"tts"|"llm"|"embeddings"}`.
+    pub params_schema: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]

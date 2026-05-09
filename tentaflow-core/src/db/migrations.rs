@@ -80,8 +80,24 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "services_progress_message",
             MigrationStep::Sql(SERVICES_PROGRESS_MESSAGE),
         ),
+        (
+            6,
+            "flow_node_templates_params_schema",
+            MigrationStep::Sql(FLOW_NODE_TEMPLATES_PARAMS_SCHEMA),
+        ),
     ]
 }
+
+// params_schema: JSON-Schema-like opis pol konfiguracyjnych per node type.
+// GUI flow builder rendere dynamic form z tej deklaracji (typ string z enum
+// → select, number z range → slider, boolean → toggle, format=textarea →
+// textarea, type=model_picker z `category` → dynamic dropdown z
+// model_registry filtrowane po category). Bez tej kolumny config tab w
+// builderze byl pusty bo wczytywal `template.params_schema` ktore byl
+// undefined.
+const FLOW_NODE_TEMPLATES_PARAMS_SCHEMA: &str = r#"
+ALTER TABLE flow_node_templates ADD COLUMN params_schema TEXT;
+"#;
 
 // progress_message: krotki status text aktualizowany przez supervisor /
 // detached deploy task podczas Starting (np. "warming up — alive 30s,

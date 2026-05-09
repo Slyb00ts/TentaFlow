@@ -1534,7 +1534,7 @@ pub fn delete_flow_model_binding(pool: &DbPool, id: i64) -> Result<()> {
 // --- Flow Node Templates ---
 
 const NODE_TEMPLATE_COLS: &str =
-    "id, node_type, category, label, description, default_config, icon";
+    "id, node_type, category, label, description, default_config, icon, params_schema";
 
 fn row_to_node_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowNodeTemplate> {
     Ok(DbFlowNodeTemplate {
@@ -1545,6 +1545,7 @@ fn row_to_node_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowNodeT
         description: row.get(4)?,
         default_config: row.get(5)?,
         icon: row.get(6)?,
+        params_schema: row.get(7)?,
     })
 }
 

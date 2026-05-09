@@ -5420,6 +5420,8 @@ fn flow_node_template_to_js(
     }
     set(&obj, "outputPortTypes", output_port_types.clone().into());
     set(&obj, "output_port_types", output_port_types.into());
+    set(&obj, "paramsSchema", JsValue::from_str(&t.params_schema));
+    set(&obj, "params_schema", JsValue::from_str(&t.params_schema));
     obj
 }
 

@@ -161,6 +161,14 @@ pub struct DbFlowNodeTemplate {
     pub description: Option<String>,
     pub default_config: String,
     pub icon: Option<String>,
+    /// JSON-Schema-like opis pol konfiguracyjnych. NULL → GUI nie renderuje
+    /// formy (pusty config tab). Niech-NULL JSON object z polami:
+    /// `properties: { <key>: { type, title, description, default, enum?,
+    /// minimum?, maximum?, format?, dynamic_enum? } }`, `required: []`,
+    /// `order: [...]`. `dynamic_enum: { source: "models", category: "stt"
+    /// | "tts" | "llm" | "embeddings" }` mowi GUI zeby wczytac liste
+    /// modeli z runtime registry zamiast statycznego enum.
+    pub params_schema: Option<String>,
 }
 
 /// Regula filtrowania danych osobowych (PII)

@@ -1049,6 +1049,7 @@ pub fn flow_node_templates_list(
                 output_ports,
                 input_port_types,
                 output_port_types,
+                params_schema: t.params_schema.unwrap_or_default(),
             }
         })
         .collect();
