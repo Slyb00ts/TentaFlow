@@ -404,8 +404,31 @@ export class FlowCanvas {
         const inputNames = inputs.map((p) => p.name);
         const currentTo = edge.to_port || 'in';
         if (!inputNames.includes(currentTo)) {
-          if (inputNames.length === 1) edge.to_port = inputNames[0];
-          else if (inputNames.includes('in')) edge.to_port = 'in';
+          if (inputNames.length === 1) {
+            edge.to_port = inputNames[0];
+          } else if (inputNames.includes('in')) {
+            edge.to_port = 'in';
+          } else if (from) {
+            // Multi-port consumer (np. typed output node) bez `in` — auto-map
+            // po typie producenta. Bierzemy from_port type i znajdujemy
+            // input port konsumenta z tym samym typem. Bez tego legacy edge
+            // z `to_port="in"` (default) walil walidacje przy save.
+            const fromTpl = this.templates.get(from.type);
+            const { outputs: fromOutputs } = portsForNode(from, fromTpl);
+            const fromPortObj = fromOutputs.find((p) => p.name === edge.from_port);
+            const fromType = (fromPortObj?.type || 'any').toLowerCase();
+            const matched = inputs.find((p) => (p.type || 'any').toLowerCase() === fromType);
+            if (matched) {
+              edge.to_port = matched.name;
+            } else {
+              // Fallback: pierwszy input port. Walidacja serwera moze
+              // jeszcze odrzucic na typed mismatch, ale przynajmniej damy
+              // prawidlowa nazwe portu zeby user wiedzial gdzie kierowac.
+              edge.to_port = inputNames[0];
+            }
+          } else {
+            edge.to_port = inputNames[0];
+          }
         } else {
           edge.to_port = currentTo;
         }
