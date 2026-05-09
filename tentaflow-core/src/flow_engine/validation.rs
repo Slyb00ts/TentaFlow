@@ -342,6 +342,13 @@ pub fn validate(
         if node.node_type == "combine" {
             continue;
         }
+        // `output` ma 6 typed input portow (text/audio/image/video/embedding
+        // /other) — kazdy branch flow moze emitowac inny typ jednoczesnie
+        // (np. text z LLM + audio z TTS w streamingu). Wymaga zwolnienia z
+        // 1-input-edge.
+        if node.node_type == "output" {
+            continue;
+        }
         if count > 1 {
             return Err(FlowValidationError::MultipleInputs {
                 node_id: node.id.clone(),
@@ -531,7 +538,7 @@ mod tests {
     #[test]
     fn ok_minimal_flow() {
         let def = parse(
-            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text"}]}"#,
+            r#"{"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"o","from_port":"text","to_port":"text"}]}"#,
         );
         validate(&def, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
     }
@@ -556,17 +563,21 @@ mod tests {
 
     #[test]
     fn rejects_multi_input_edge() {
+        // Output node jest zwolniony z R4 (multi-modal sink), wiec pivotem
+        // testu staje sie LLM ktory MUSI miec dokladnie 1 incoming.
         let def = parse(
             r#"{
                 "nodes":[
                     {"id":"t","type":"trigger","config":{}},
                     {"id":"c","type":"condition","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
                     {"from":"t","to":"c","from_port":"text"},
-                    {"from":"c","to":"o","from_port":"true"},
-                    {"from":"c","to":"o","from_port":"false"}
+                    {"from":"c","to":"l","from_port":"true"},
+                    {"from":"c","to":"l","from_port":"false"},
+                    {"from":"l","to":"o","to_port":"text"}
                 ]
             }"#,
         );
@@ -597,7 +608,7 @@ mod tests {
                 ],
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"o","from_port":"stream"}
+                    {"from":"l","to":"o","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
@@ -637,7 +648,7 @@ mod tests {
                 ],
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"o","from_port":"stream"}
+                    {"from":"l","to":"o","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
@@ -671,7 +682,7 @@ mod tests {
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"s"},
-                    {"from":"s","to":"o"}
+                    {"from":"s","to":"o","to_port":"text"}
                 ]
             }"#,
         );
@@ -699,7 +710,7 @@ mod tests {
                 ],
                 "edges":[
                     {"from":"t","to":"p","from_port":"text","data_type":"text"},
-                    {"from":"p","to":"o","data_type":"text"}
+                    {"from":"p","to":"o","data_type":"text","to_port":"text"}
                 ]
             }"#,
         );
@@ -723,7 +734,7 @@ mod tests {
                 ],
                 "edges":[
                     {"from":"t","to":"p","from_port":"text"},
-                    {"from":"p","to":"o","data_type":"audio"}
+                    {"from":"p","to":"o","data_type":"audio","to_port":"text"}
                 ]
             }"#,
         );
@@ -756,7 +767,7 @@ mod tests {
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p","from_port":"stream"},
-                    {"from":"p","to":"o","from_port":"stream"}
+                    {"from":"p","to":"o","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
@@ -790,8 +801,8 @@ mod tests {
                 ],
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"o1","from_port":"stream"},
-                    {"from":"l","to":"o2","from_port":"stream"}
+                    {"from":"l","to":"o1","from_port":"stream","to_port":"text"},
+                    {"from":"l","to":"o2","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
@@ -835,8 +846,8 @@ mod tests {
                     {"from":"t","to":"c","from_port":"text"},
                     {"from":"c","to":"l1","from_port":"true"},
                     {"from":"c","to":"l2","from_port":"false"},
-                    {"from":"l1","to":"o1","from_port":"stream"},
-                    {"from":"l2","to":"o2","from_port":"stream"}
+                    {"from":"l1","to":"o1","from_port":"stream","to_port":"text"},
+                    {"from":"l2","to":"o2","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
@@ -906,7 +917,7 @@ mod tests {
                 ],
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
-                    {"from":"l","to":"o"}
+                    {"from":"l","to":"o","to_port":"text"}
                 ]
             }"#,
         );
@@ -952,7 +963,7 @@ mod tests {
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p"},
-                    {"from":"p","to":"o"}
+                    {"from":"p","to":"o","to_port":"text"}
                 ]
             }"#,
         );
@@ -988,7 +999,7 @@ mod tests {
                 "edges":[
                     {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"p","from_port":"stream"},
-                    {"from":"p","to":"o","from_port":"stream"}
+                    {"from":"p","to":"o","from_port":"stream","to_port":"text"}
                 ]
             }"#,
         );
@@ -1025,8 +1036,8 @@ mod tests {
                     {"from":"t","to":"l","from_port":"text"},
                     {"from":"l","to":"c"},
                     {"from":"c","to":"p","from_port":"true"},
-                    {"from":"p","to":"o1"},
-                    {"from":"c","to":"o2","from_port":"false"}
+                    {"from":"p","to":"o1","to_port":"text"},
+                    {"from":"c","to":"o2","from_port":"false","to_port":"text"}
                 ]
             }"#,
         );
@@ -1048,7 +1059,7 @@ mod tests {
                     {"id":"o","type":"output","config":{}}
                 ],
                 "edges":[
-                    {"from":"t","to":"o","from_port":"true"}
+                    {"from":"t","to":"o","from_port":"true","to_port":"text"}
                 ]
             }"#,
         );
