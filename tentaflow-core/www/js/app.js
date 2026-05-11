@@ -349,6 +349,60 @@ async function renderApp() {
     byId('lang-select')?.addEventListener('change', async (e) => {
       await I18n.setLanguage(e.target.value);
     });
+
+    // Async: dorzuc addon application tiles do sidebar pod sekcja Apps.
+    // Bez tego addon z [application] manifestu pojawial sie tylko w
+    // `apps-home` grid, ale nie w lewym menu.
+    injectAddonAppsIntoSidebar();
+  }
+
+  async function injectAddonAppsIntoSidebar() {
+    let apps;
+    try {
+      apps = await ApiBinary.list('addonApplicationsListRequest', {
+        arrayKey: 'applications',
+      });
+    } catch (e) {
+      console.warn('[app] addonApplicationsListRequest fail:', e?.message ?? e);
+      return;
+    }
+    if (!Array.isArray(apps) || apps.length === 0) return;
+
+    // Znajdz sekcje Apps po headingu (i18n key nav.section_apps).
+    const appsHeading = I18n.t('nav.section_apps');
+    const sections = document.querySelectorAll('.sidebar .nav-section');
+    let appsSection = null;
+    sections.forEach((s) => {
+      const h = s.querySelector('.heading');
+      if (h && h.textContent.trim().endsWith(appsHeading)) {
+        appsSection = s;
+      }
+    });
+    if (!appsSection) return;
+
+    for (const app of apps) {
+      const addonId = String(app.addonId ?? app.addon_id ?? '');
+      const panelId = String(app.entryPanel ?? app.entry_panel ?? '');
+      const title = String(app.title ?? addonId);
+      const iconRaw = String(app.icon ?? '');
+      const iconId = (iconRaw.startsWith('i-') ? iconRaw.slice(2) : iconRaw) || 'chip';
+      if (!addonId || !panelId) continue;
+
+      const item = document.createElement('div');
+      item.className = 'nav-item';
+      item.dataset.addonId = addonId;
+      item.dataset.panelId = panelId;
+      item.innerHTML =
+        `<svg class="icon"><use href="#i-${iconId}"/></svg>` +
+        `<span>${escapeHtml(title)}</span>`;
+      item.addEventListener('click', () => {
+        document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
+        item.classList.add('active');
+        Router.navigate('addon-app', { addonId, panelId });
+        closeDrawer();
+      });
+      appsSection.appendChild(item);
+    }
   }
 
   function openDrawer() {
