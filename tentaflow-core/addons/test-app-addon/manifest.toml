@@ -1,0 +1,72 @@
+[addon]
+id = "test-app-addon"
+name = "Test App Addon"
+version = "1.0.0"
+description = "End-to-end walidacja addon stack v2: [application] launcher tile, [service] tick loop, UiComponent renderer (wszystkie 14 wariantow), 3 actions, custom flow block."
+category = "test"
+keywords = ["test", "ui", "service"]
+author = "TentaFlow Tests"
+license = "Apache-2.0"
+icon = "shield"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+# --- Permissions ---
+[[permission]]
+id = "ui"
+display_name = "Render UI panels"
+description = "Renderuje deklaratywne drzewo UiComponent przez ui_render."
+risk = "low"
+
+[[permission]]
+id = "notifications"
+display_name = "Show notifications"
+description = "Emituje toast notifications przez ui_notify."
+risk = "low"
+
+[[permission]]
+id = "events"
+display_name = "Publish/subscribe events"
+description = "Pub/sub na shared event bus."
+risk = "low"
+
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Czyta zapisany counter."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Zapisuje counter co tick."
+risk = "low"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Execute flow blocks"
+description = "Wykonuje custom flow block 'uppercase'."
+risk = "low"
+
+# --- Application (Apps menu launcher) ---
+[application]
+entry_panel = "main"
+title = "Test App"
+icon = "shield"
+sort_order = 999
+
+# --- Service (background tick driver) ---
+[service]
+enabled = true
+tick_interval_ms = 2000
+tick_fuel_budget = 5000000
+tick_timeout_ms = 1000
+
+[visibility]
+admin_only = false
+show_in_catalog = true
+
+[resources]
+memory_mb = 64
+fuel_limit = 10000000
