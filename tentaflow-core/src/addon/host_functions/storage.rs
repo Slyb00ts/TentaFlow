@@ -218,8 +218,17 @@ pub fn storage_set(
                     )
                     .unwrap_or(100);
 
-                let limit_bytes = limit_mb * 1024 * 1024;
-                current_size + value_size <= limit_bytes
+                // Konwencja: `storage_limit_mb = 0` w DB oznacza brak
+                // limitu (addony bez explicit `[resources].storage_total_mb`
+                // w manifescie maja default 0 z lifecycle.rs:151).
+                // Bez tego store_set ZAWSZE failowal z ABI_ERR_OPERATION
+                // bo `current + value <= 0` jest false.
+                if limit_mb == 0 {
+                    true
+                } else {
+                    let limit_bytes = limit_mb * 1024 * 1024;
+                    current_size + value_size <= limit_bytes
+                }
             }
             Err(_) => return ABI_ERR_OPERATION,
         }
