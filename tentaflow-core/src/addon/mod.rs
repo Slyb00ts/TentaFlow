@@ -333,7 +333,7 @@ pub struct AddonState {
     /// drzewo komponentow, MessageBody handler `AddonUiPanelGetRequest`
     /// odczytuje. `None` w testach event_bus w izolacji.
     pub ui_panels:
-        Option<Arc<PlRwLock<HashMap<(String, String), serde_json::Value>>>>,
+        Option<Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -410,7 +410,7 @@ pub struct AddonManager {
     /// `tree` w tym cache; frontend GUI pyta przez MessageBody
     /// `AddonUiPanelGetRequest`. Push do frontu przez bus subscribe wraca
     /// w przyszlej iteracji.
-    ui_panels: Arc<PlRwLock<HashMap<(String, String), serde_json::Value>>>,
+    ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>,
 }
 
 impl AddonManager {
@@ -450,8 +450,19 @@ impl AddonManager {
 
     /// Zwraca handle do cache UI panel state — host function `ui_render`
     /// uzywa do zapisu, handler `AddonUiPanelGetRequest` do odczytu.
-    pub fn ui_panels(&self) -> Arc<PlRwLock<HashMap<(String, String), serde_json::Value>>> {
+    pub fn ui_panels(&self) -> Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>> {
         self.ui_panels.clone()
+    }
+
+    /// Czy addon ma przynajmniej jedna running instancje. Uzywane przez
+    /// handler `AddonUiPayload::ReqPanelGet` zeby zdecydowac czy lazy-start
+    /// jest potrzebny.
+    pub fn has_running_instance(&self, addon_id: &str) -> bool {
+        self.instances
+            .lock()
+            .get(addon_id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
     }
 
     /// Wywoluje `on_request` na running instance addonu z action_id i params
@@ -1039,22 +1050,45 @@ impl AddonManager {
             token.cancel();
         }
 
-        let mut instances = self.instances.lock();
-
-        // Znajdz addon_id i indeks instancji
-        let mut found = None;
-        for (addon_id, addon_instances) in instances.iter_mut() {
-            if let Some(pos) = addon_instances
-                .iter()
-                .position(|i| i.instance_id == instance_id)
-            {
-                found = Some((addon_id.clone(), pos));
-                break;
+        // P2 race fix (codex review): tick loop moze byc IN-FLIGHT, ze
+        // wyciagnal juz instancje z mapy w call_tick_static. Cancel tokenu
+        // zatrzyma kolejne iteracje, ale aktualnie running tick wciaz
+        // konczy WASM call i odda instancje. Czekamy do 5s na powrot
+        // instancji do mapy. Po timeout: surface error — user moze
+        // wyowulac stop ponownie.
+        let (mut instances, addon_id, pos) = {
+            let mut attempt = 0u32;
+            loop {
+                {
+                    let mut instances = self.instances.lock();
+                    let mut found = None;
+                    for (aid, addon_instances) in instances.iter_mut() {
+                        if let Some(p) = addon_instances
+                            .iter()
+                            .position(|i| i.instance_id == instance_id)
+                        {
+                            found = Some((aid.clone(), p));
+                            break;
+                        }
+                    }
+                    if let Some((aid, p)) = found {
+                        break (instances, aid, p);
+                    }
+                }
+                attempt += 1;
+                if attempt > 50 {
+                    bail!(
+                        "Instancja '{}' nie znaleziona po cancel tokenu \
+                         (czekano 5s na powrot z tick loop)",
+                        instance_id
+                    );
+                }
+                // 100ms × 50 = 5s window — wystarcza dla typowego tick
+                // (fuel limit 5M instrukcji + tick_timeout_ms default 30s
+                // jest watchdog ceiling). W praktyce tick wraca w ms.
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-        }
-
-        let (addon_id, pos) =
-            found.ok_or_else(|| anyhow::anyhow!("Instancja '{}' nie znaleziona", instance_id))?;
+        };
 
         // Pobierz instancje
         let mut addon_instance = instances.get_mut(&addon_id).unwrap().remove(pos);

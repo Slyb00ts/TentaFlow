@@ -4826,6 +4826,33 @@ fn addon_ui_err(e: anyhow::Error) -> ProtocolError {
     ProtocolError::internal(format!("AddonUi: {}", e))
 }
 
+/// Lazy-start addonu z `[application]` przed serwowaniem panelu lub
+/// dispatch'em UI action. Pure `[application]` (bez `[service]`) nie jest
+/// auto-started przez `auto_start_services`, wiec bez tego helpera klikanie
+/// tile'a w launcherze zwracalo by pusty panel. Idempotent — jesli addon
+/// ma juz uruchomione instancje, no-op. Bledy ignorujemy (panel po prostu
+/// bedzie pusty / ResAction zwroci blad, oba diagnostyczne dla usera).
+fn ensure_application_addon_running(
+    manager: &std::sync::Arc<crate::addon::AddonManager>,
+    addon_id: &str,
+) {
+    if manager.has_running_instance(addon_id) {
+        return;
+    }
+    match manager.start_addon(addon_id, None) {
+        Ok(iid) => tracing::info!(
+            "ensure_application_addon_running: '{}' lazy started, instance={}",
+            addon_id,
+            iid
+        ),
+        Err(e) => tracing::warn!(
+            "ensure_application_addon_running: '{}' fail: {}",
+            addon_id,
+            e
+        ),
+    }
+}
+
 #[handler(variant = "AddonUiBody", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -4839,18 +4866,39 @@ pub fn addon_ui_dispatch(
         _ => return Err(ProtocolError::bad_request("expected AddonUiBody")),
     };
 
+    // Visibility check — addon moze byc admin_only lub ograniczony do grup.
+    // Wszystkie 3 sciezki AddonUi musza honorowac to samo co AddonsList
+    // (codex review: P1, hidden addons nie moga byc enumerowane przez
+    // launcher ani uruchamiane przez UI action).
+    let user_id_bytes = require_user_id(ctx)?;
+    let user_id = user_id_to_i64(&user_id_bytes)
+        .ok_or_else(|| ProtocolError::internal("nie udalo sie zdekodowac user_id z sesji"))?;
+    let is_admin = matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    );
+    let visible_to_user = |addon_id: &str| -> Result<bool, ProtocolError> {
+        if is_admin {
+            return Ok(true);
+        }
+        repository::is_addon_visible_to_user(&ctx.state.db, addon_id, user_id).map_err(db_err)
+    };
+
     let res = match payload {
         // ---- Apps menu ----
         P::ReqApplicationsList => {
             // Zrodlo prawdy: zainstalowane addony, ktore deklaruja
             // [application] w manifescie. Czytamy manifest_json z DB,
-            // deserializujemy, filtrujemy.
+            // deserializujemy, filtrujemy po widocznosci dla usera.
             let rows =
                 crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
             let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> =
                 Vec::new();
             for a in rows {
                 if !a.is_enabled {
+                    continue;
+                }
+                if !visible_to_user(&a.addon_id)? {
                     continue;
                 }
                 let manifest: crate::addon::AddonManifest =
@@ -4888,22 +4936,34 @@ pub fn addon_ui_dispatch(
             addon_id,
             panel_id,
         } => {
-            // Cache po stronie hosta — `ui_render` z guesta zapisuje tutaj
-            // drzewo komponentow. Brak panelu = pusty tree_json (frontend
-            // renderuje "panel nie zaladowany").
-            let cache = ctx
-                .state
-                .addon_manager
-                .as_ref()
-                .map(|m| m.ui_panels());
-            let tree_json = match cache {
-                Some(c) => {
-                    let map = c.read();
-                    map.get(&(addon_id.clone(), panel_id.clone()))
-                        .map(|v| serde_json::to_string(v).unwrap_or_default())
-                        .unwrap_or_default()
-                }
-                None => String::new(),
+            // Visibility check — addon admin_only lub group-restricted nie
+            // moze byc otwierany przez non-admin (codex P1).
+            if !visible_to_user(addon_id)? {
+                return Err(ProtocolError::not_found("addon"));
+            }
+            let manager = ctx.state.addon_manager.as_ref().ok_or_else(|| {
+                ProtocolError::internal("addon manager not configured")
+            })?;
+            // Lazy-start dla [application] addonow bez [service] — przed
+            // serwowaniem pierwszego panelu uruchamiamy addon, zeby on_start
+            // miał szansę zawołać `ui_render` (codex P1: tile widoczny w
+            // launcherze, ale klikanie zwracalo empty panel bo addon nigdy
+            // nie wystartował).
+            ensure_application_addon_running(manager, addon_id);
+            // Cache scoped po (user_id, addon_id, panel_id) — codex P1:
+            // wczesniejszy klucz (addon_id, panel_id) leakowal panel jednego
+            // usera do drugiego gdy addon obslugiwal user-specific dane.
+            // Fallback do (0, addon, panel) — default panel zarejestrowany
+            // przez `on_start` system call, ten sam dla wszystkich uzytkownikow.
+            let tree_json = {
+                let cache = manager.ui_panels();
+                let map = cache.read();
+                let value = map
+                    .get(&(user_id, addon_id.clone(), panel_id.clone()))
+                    .or_else(|| map.get(&(0, addon_id.clone(), panel_id.clone())));
+                value
+                    .map(|v| serde_json::to_string(v).unwrap_or_default())
+                    .unwrap_or_default()
             };
             P::ResPanelGet {
                 addon_id: addon_id.clone(),
@@ -4919,21 +4979,19 @@ pub fn addon_ui_dispatch(
             action_id,
             params_json,
         } => {
+            if !visible_to_user(addon_id)? {
+                return Err(ProtocolError::not_found("addon"));
+            }
             let manager = ctx.state.addon_manager.as_ref().ok_or_else(|| {
                 ProtocolError::internal("addon manager not configured")
             })?;
+            ensure_application_addon_running(manager, addon_id);
             let params: serde_json::Value =
                 serde_json::from_str(params_json).map_err(|e| {
                     ProtocolError::bad_request(format!("params_json invalid: {}", e))
                 })?;
-            let user_id = match &ctx.session {
-                SessionAuth::UserSession { user_id, .. } => {
-                    user_id_to_i64(user_id)
-                }
-                _ => None,
-            };
             let result_value = manager
-                .invoke_ui_action(addon_id, panel_id, action_id, params, user_id)
+                .invoke_ui_action(addon_id, panel_id, action_id, params, Some(user_id))
                 .map_err(addon_ui_err)?;
             let result_json = serde_json::to_string(&result_value).unwrap_or_default();
             P::ResAction { result_json }
