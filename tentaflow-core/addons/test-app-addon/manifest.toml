@@ -70,3 +70,8 @@ show_in_catalog = true
 [resources]
 memory_mb = 64
 fuel_limit = 10000000
+# UWAGA: storage limit MUSI byc explicit > 0. lifecycle.rs:151 zapisuje
+# `storage_total_mb.unwrap_or(0)` do DB, a `host_functions/storage.rs:222`
+# rejects gdy `current + value > limit_bytes` (no unlimited semantics).
+# Bez tego pola wszystkie store_set zwracaja ABI_ERR_OPERATION.
+storage_total_mb = 10
