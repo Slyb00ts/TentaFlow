@@ -253,6 +253,21 @@ export function encodeAddonAdminOnlySetRequest(addon_id, admin_only) {
 }
 
 /**
+ * MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
+ * w glownym menu launcher. Frontend buduje liste ikon w app menu.
+ * @returns {Uint8Array}
+ */
+export function encodeAddonApplicationsListRequest() {
+    const ret = wasm.encodeAddonApplicationsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * @param {string} addon_id
  * @returns {Uint8Array}
  */
@@ -770,6 +785,55 @@ export function encodeAddonToolsRequest(addon_id) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * MessageBody::AddonUiBody(ReqAction) — button click / form submit z UI
+ * panelu. Host woła addon on_request z tool_name = "ui.{panel_id}.{action_id}".
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {string} action_id
+ * @param {string} params_json
+ * @returns {Uint8Array}
+ */
+export function encodeAddonUiActionRequest(addon_id, panel_id, action_id, params_json) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(action_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonUiActionRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * MessageBody::AddonUiBody(ReqPanelGet) — pobierz ostatnio wyrenderowane
+ * drzewo UI panelu addonu. Tree_json = JSON `UiComponent`; frontend renderuje
+ * przez tf-* komponenty.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @returns {Uint8Array}
+ */
+export function encodeAddonUiPanelGetRequest(addon_id, panel_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonUiPanelGetRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
 }
 
 /**

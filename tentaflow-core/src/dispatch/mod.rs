@@ -649,6 +649,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         // ServiceManifestDeploy przeniesione do DeploymentPayload::ReqStart/ResStart.
         MessageBody::AddonsListRequest => "AddonsListRequest",
         MessageBody::AddonsListResponseBody(_) => "AddonsListResponse",
+        MessageBody::AddonUiBody(p) => match p {
+            tentaflow_protocol::AddonUiPayload::ReqApplicationsList => {
+                "AddonApplicationsListRequest"
+            }
+            tentaflow_protocol::AddonUiPayload::ResApplicationsList { .. } => {
+                "AddonApplicationsListResponse"
+            }
+            tentaflow_protocol::AddonUiPayload::ReqPanelGet { .. } => "AddonUiPanelGetRequest",
+            tentaflow_protocol::AddonUiPayload::ResPanelGet { .. } => "AddonUiPanelGetResponse",
+            tentaflow_protocol::AddonUiPayload::ReqAction { .. } => "AddonUiActionRequest",
+            tentaflow_protocol::AddonUiPayload::ResAction { .. } => "AddonUiActionResponse",
+        },
         MessageBody::IamBody(p) => match p {
             tentaflow_protocol::IamPayload::ReqListUsers => "IamListUsersRequest",
             tentaflow_protocol::IamPayload::ResListUsers { .. } => "IamListUsersResponse",

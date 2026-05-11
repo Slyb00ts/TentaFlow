@@ -4818,6 +4818,172 @@ register_iam_variant!(
 );
 
 // =============================================================================
+// Apps menu + UI v2 endpointy — multiplex 6 operacji w `AddonUiBody`
+// (zeby zmiescic sie w 256-variant rkyv limicie). Schema v14.
+// =============================================================================
+
+fn addon_ui_err(e: anyhow::Error) -> ProtocolError {
+    ProtocolError::internal(format!("AddonUi: {}", e))
+}
+
+#[handler(variant = "AddonUiBody", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn addon_ui_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::AddonUiPayload as P;
+    let payload = match req {
+        MessageBody::AddonUiBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonUiBody")),
+    };
+
+    let res = match payload {
+        // ---- Apps menu ----
+        P::ReqApplicationsList => {
+            // Zrodlo prawdy: zainstalowane addony, ktore deklaruja
+            // [application] w manifescie. Czytamy manifest_json z DB,
+            // deserializujemy, filtrujemy.
+            let rows =
+                crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
+            let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> =
+                Vec::new();
+            for a in rows {
+                if !a.is_enabled {
+                    continue;
+                }
+                let manifest: crate::addon::AddonManifest =
+                    match serde_json::from_str(&a.manifest_json) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                if let Some(app) = manifest.application {
+                    let icon = app.icon.or_else(|| {
+                        if a.icon.is_empty() {
+                            None
+                        } else {
+                            Some(a.icon.clone())
+                        }
+                    });
+                    applications.push(tentaflow_protocol::AddonApplicationInfo {
+                        addon_id: a.addon_id.clone(),
+                        title: app.title,
+                        entry_panel: app.entry_panel,
+                        icon,
+                        sort_order: app.sort_order.unwrap_or(100),
+                    });
+                }
+            }
+            applications.sort_by(|a, b| {
+                a.sort_order
+                    .cmp(&b.sort_order)
+                    .then_with(|| a.title.cmp(&b.title))
+            });
+            P::ResApplicationsList { applications }
+        }
+
+        // ---- UI panel get ----
+        P::ReqPanelGet {
+            addon_id,
+            panel_id,
+        } => {
+            // Cache po stronie hosta — `ui_render` z guesta zapisuje tutaj
+            // drzewo komponentow. Brak panelu = pusty tree_json (frontend
+            // renderuje "panel nie zaladowany").
+            let cache = ctx
+                .state
+                .addon_manager
+                .as_ref()
+                .map(|m| m.ui_panels());
+            let tree_json = match cache {
+                Some(c) => {
+                    let map = c.read();
+                    map.get(&(addon_id.clone(), panel_id.clone()))
+                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                        .unwrap_or_default()
+                }
+                None => String::new(),
+            };
+            P::ResPanelGet {
+                addon_id: addon_id.clone(),
+                panel_id: panel_id.clone(),
+                tree_json,
+            }
+        }
+
+        // ---- UI action ----
+        P::ReqAction {
+            addon_id,
+            panel_id,
+            action_id,
+            params_json,
+        } => {
+            let manager = ctx.state.addon_manager.as_ref().ok_or_else(|| {
+                ProtocolError::internal("addon manager not configured")
+            })?;
+            let params: serde_json::Value =
+                serde_json::from_str(params_json).map_err(|e| {
+                    ProtocolError::bad_request(format!("params_json invalid: {}", e))
+                })?;
+            let user_id = match &ctx.session {
+                SessionAuth::UserSession { user_id, .. } => {
+                    user_id_to_i64(user_id)
+                }
+                _ => None,
+            };
+            let result_value = manager
+                .invoke_ui_action(addon_id, panel_id, action_id, params, user_id)
+                .map_err(addon_ui_err)?;
+            let result_json = serde_json::to_string(&result_value).unwrap_or_default();
+            P::ResAction { result_json }
+        }
+
+        // Response variants nie powinny przychodzic jako request.
+        P::ResApplicationsList { .. }
+        | P::ResPanelGet { .. }
+        | P::ResAction { .. } => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::AddonUiBody(res))
+}
+
+// variant_name_of() zwraca nazwy inner payloadu, wiec rejestrujemy
+// pod kazda z 3 request nazw (analogicznie do IamBody).
+macro_rules! register_addon_ui_variant {
+    ($variant:literal, $metric:literal, $auth:expr) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: $auth,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_addon_ui_dispatch,
+            }
+        }
+    };
+}
+
+register_addon_ui_variant!(
+    "AddonApplicationsListRequest",
+    "tentaflow_ws_handler_addon_apps_list",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+register_addon_ui_variant!(
+    "AddonUiPanelGetRequest",
+    "tentaflow_ws_handler_addon_ui_panel_get",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+register_addon_ui_variant!(
+    "AddonUiActionRequest",
+    "tentaflow_ws_handler_addon_ui_action",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+
+// =============================================================================
 // Mesh & Network settings (enumeracja IPv4 NIC + bind/advertise rules)
 // =============================================================================
 

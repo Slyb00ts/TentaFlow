@@ -54,10 +54,13 @@ pub fn start_unified_server(
     quic_mesh: Option<Arc<IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Result<()> {
+    let permission_checker =
+        addon_manager.as_ref().map(|m| m.permission_checker().clone());
     start_unified_server_with_permissions(
         config,
         db,
@@ -67,7 +70,8 @@ pub fn start_unified_server(
         quic_mesh,
         local_node_id,
         mesh_security,
-        None,
+        permission_checker,
+        addon_manager,
         mesh_relay_health,
         port_allocator,
         mesh_services_registry,
@@ -85,6 +89,7 @@ pub fn start_unified_server_with_permissions(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
@@ -138,6 +143,7 @@ pub fn start_unified_server_with_permissions(
     let local_node_id = local_node_id.clone();
     let mesh_security = mesh_security.clone();
     let permission_checker = permission_checker.clone();
+    let addon_manager = addon_manager.clone();
     let mesh_relay_health = mesh_relay_health.clone();
     let port_allocator = port_allocator.clone();
     let mesh_services_registry = mesh_services_registry.clone();
@@ -273,6 +279,7 @@ pub fn start_unified_server_with_permissions(
                 let lni = local_node_id.clone();
                 let msec = mesh_security.clone();
                 let pc = permission_checker.clone();
+                let am = addon_manager.clone();
                 let mrh = mesh_relay_health.clone();
                 let pa = port_allocator.clone();
                 let msr = mesh_services_registry.clone();
@@ -305,6 +312,7 @@ pub fn start_unified_server_with_permissions(
                         let lni = lni.clone();
                         let msec = msec.clone();
                         let pc = pc.clone();
+                        let am = am.clone();
                         let mrh = mrh.clone();
                         let pa = pa.clone();
                         let msr = msr.clone();
@@ -398,7 +406,7 @@ pub fn start_unified_server_with_permissions(
                             } else {
                                 let resp = crate::api::dashboard::server::handle_request(
                                     req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec,
-                                    pc, lic, mrh, pa, ra, msr,
+                                    pc, am, lic, mrh, pa, ra, msr,
                                 )
                                 .await?;
                                 let resp = resp.map(|body| {

@@ -2035,6 +2035,63 @@ pub struct AddonsListResponse {
     pub addons: Vec<AddonInfo>,
 }
 
+// =============================================================================
+// SCHEMA v14: Apps menu + UI v2 endpointy
+// =============================================================================
+
+/// Aplikacja addonu widoczna w głównym menu launcher. Źródło:
+/// manifest `[application]` sekcja po install.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonApplicationInfo {
+    pub addon_id: String,
+    pub title: String,
+    /// ID panelu UI startowego (frontend ładuje przez
+    /// `AddonUiPayload::ReqPanelGet`).
+    pub entry_panel: String,
+    /// Identyfikator ikony sprite. None = fallback na `addon.icon`.
+    pub icon: Option<String>,
+    /// Kolejność w menu (mniejsze = wyżej). Default 100 jeżeli manifest pominie.
+    pub sort_order: i32,
+}
+
+/// Multiplex 6 endpointów Apps menu + UI v2 w jednym slocie `MessageBody`,
+/// zeby zmiescic sie w 256-variant limicie rkyv. Tag jest na poziomie tego
+/// enum'a, nie zewnetrznego `MessageBody`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum AddonUiPayload {
+    // ---- Apps menu ----
+    ReqApplicationsList,
+    ResApplicationsList {
+        applications: Vec<AddonApplicationInfo>,
+    },
+
+    // ---- UI panel get (read last rendered tree from cache) ----
+    ReqPanelGet {
+        addon_id: String,
+        panel_id: String,
+    },
+    /// `tree_json` empty = brak panelu w cache (addon nie wywolał ui_render).
+    ResPanelGet {
+        addon_id: String,
+        panel_id: String,
+        tree_json: String,
+    },
+
+    // ---- UI action (button click / form submit) ----
+    /// Host woła addon on_request z tool_name = "ui.{panel_id}.{action_id}".
+    /// `params_json` to JSON payload (form values, event metadata).
+    ReqAction {
+        addon_id: String,
+        panel_id: String,
+        action_id: String,
+        params_json: String,
+    },
+    /// `result_json` empty = brak wyniku.
+    ResAction {
+        result_json: String,
+    },
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AddonDetailRequest {
     pub addon_id: String,
@@ -3763,6 +3820,9 @@ pub enum MessageBody {
     // ---- Addons: list / detail / toggle / lifecycle ----
     AddonsListRequest,
     AddonsListResponseBody(AddonsListResponse),
+    // v14: Apps menu + UI v2 — multiplex w 1 slocie zeby zmiescic sie w 256
+    // wariantach rkyv (vide IamBody/ServicePayload).
+    AddonUiBody(AddonUiPayload),
     AddonDetailRequestBody(AddonDetailRequest),
     AddonDetailResponseBody(AddonDetailResponse),
     AddonToggleRequestBody(AddonToggleRequest),

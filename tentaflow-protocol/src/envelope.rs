@@ -73,7 +73,13 @@ use rkyv::{Archive, Deserialize, Serialize};
 // `extra_params: Option<String>` (typed JSON dla sidecar multipart
 // `data` field). Wire layout zmieniony — old/new node mix odrzucany
 // przy handshake.
-pub const SCHEMA_VERSION: u16 = 13;
+// v14 changes: dodano AddonUiPanelGet, AddonUiAction,
+// AddonApplicationsList endpointy dla GUI Apps menu + UI v2
+// (deklaratywne drzewo UiComponent renderowane przez frontend tf-*
+// komponenty, bez HTML renderingu po stronie hosta). Trzy nowe
+// MessageBody warianty (6 paired structs) — dodanie wariantu do enum
+// zmienia tag value w rkyv, wymagany handshake bump.
+pub const SCHEMA_VERSION: u16 = 14;
 
 // =============================================================================
 // Message kind discriminants
