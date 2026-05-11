@@ -77,13 +77,19 @@ pub fn ui_render(
     let addon_id = caller.data().addon_id.clone();
     info!("ui_render: addon='{}', panel_id='{}'", addon_id, panel_id);
 
-    // Zapisz drzewo UI do globalnego cache panelu — frontend GUI pyta
-    // przez `AddonUiPanelGetRequest` i renderuje przez tf-* komponenty.
-    // Host nie renderuje HTML; addon SDK przekazuje "czyste" drzewo.
+    // Zapisz drzewo UI do cache panelu scoped po (user_id, addon, panel).
+    // Per-user keying chroni przed leak'iem — `on_start` (system call,
+    // user_id=None) zapisuje default panel pod sentinel 0; user-initiated
+    // ui_render z `on_request` zapisuje pod realnym user_id.
+    // `AddonUiPanelGetRequest` najpierw szuka per-user, fallback do 0.
     if let Some(cache) = caller.data().ui_panels.clone() {
+        let key_user = caller.data().user_id.unwrap_or(0);
         cache
             .write()
-            .insert((addon_id.clone(), panel_id.clone()), ui_value.clone());
+            .insert(
+                (key_user, addon_id.clone(), panel_id.clone()),
+                ui_value.clone(),
+            );
     }
 
     // Event "ui.panel_rendered" zostaje — inne addony moga reagowac (np.
