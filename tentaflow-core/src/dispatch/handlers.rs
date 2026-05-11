@@ -1009,7 +1009,7 @@ pub fn flow_node_templates_list(
     // Nodes bez zarejestrowanego adaptera dostaja puste listy, co GUI traktuje
     // jako "adapter niewspierany" i blokuje wiazania do walidacji backendu.
     let dispatcher = ctx.state.router.flow_dispatcher();
-    let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
+    let mut templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
         .map(|t| {
             let (input_ports, output_ports, input_port_types, output_port_types) =
@@ -1049,6 +1049,47 @@ pub fn flow_node_templates_list(
             }
         })
         .collect();
+
+    // Dorzuc custom flow blocks z zainstalowanych addonow. GUI Flow Builder
+    // dostaje je w tej samej palecie co core templates, kluczem jest
+    // `node_type` ("addon.{addon_id}.{block}"); `id=0` bo addon blocks nie
+    // żyją w tabeli flow_node_templates.
+    if let Some(blocks) = dispatcher.and_then(|d| d.addon_flow_blocks()) {
+        for b in blocks.list_all_blocks() {
+            let input_ports: Vec<String> =
+                b.inputs.iter().map(|p| p.name.clone()).collect();
+            let output_ports: Vec<String> =
+                b.outputs.iter().map(|p| p.name.clone()).collect();
+            let input_port_types: Vec<String> =
+                b.inputs.iter().map(|p| p.port_type.clone()).collect();
+            let output_port_types: Vec<String> =
+                b.outputs.iter().map(|p| p.port_type.clone()).collect();
+            let params_schema = if b.config_schema.is_null() {
+                String::new()
+            } else {
+                serde_json::to_string(&b.config_schema).unwrap_or_default()
+            };
+            templates.push(tentaflow_protocol::FlowNodeTemplate {
+                id: 0,
+                node_type: b.block_type.clone(),
+                category: b.category.clone(),
+                label: b.label.clone(),
+                description: if b.description.is_empty() {
+                    None
+                } else {
+                    Some(b.description.clone())
+                },
+                default_config: "{}".to_string(),
+                icon: b.icon.clone(),
+                input_ports,
+                output_ports,
+                input_port_types,
+                output_port_types,
+                params_schema,
+            });
+        }
+    }
+
     Ok(MessageBody::FlowNodeTemplatesListResponseBody(
         tentaflow_protocol::FlowNodeTemplatesListResponse { templates },
     ))
