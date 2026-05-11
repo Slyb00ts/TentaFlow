@@ -47,16 +47,27 @@ pub extern "C" fn on_stop() -> i32 {
 pub extern "C" fn on_tick(_timestamp_ms: i64) -> i32 {
     // Bump counter w storage (validates storage host functions + persistent
     // state across tick instance lifetime).
-    let current: u32 = store_get("tick_counter")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let get_result = store_get("tick_counter");
+    let current: u32 = match &get_result {
+        Ok(Some(v)) => v.parse().unwrap_or(0),
+        Ok(None) => 0,
+        Err(e) => {
+            log::error(&format!("on_tick: store_get fail: {}", e));
+            0
+        }
+    };
     let next = current + 1;
-    let _ = store_set("tick_counter", &next.to_string());
+    if let Err(e) = store_set("tick_counter", &next.to_string()) {
+        log::error(&format!("on_tick: store_set fail: {}", e));
+    }
+    log::info(&format!(
+        "on_tick: counter {} -> {} (get_was={:?})",
+        current, next, get_result
+    ));
 
-    // Re-render — frontend pobiera fresh state przy nastepnym ReqPanelGet.
-    let _ = render_main_panel();
+    if let Err(e) = render_main_panel() {
+        log::error(&format!("on_tick: render_main_panel fail: {}", e));
+    }
     0
 }
 
