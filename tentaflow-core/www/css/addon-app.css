@@ -53,13 +53,23 @@
   margin-bottom: 12px;
 }
 
-/* ---- Text ---- */
+/* ---- Text ----
+   Addon-controlled style values are dropped — only whitelisted variants
+   below are accepted, mapped from c.style ∈ {muted, bold, italic, error,
+   success, warning}. Bare strings ignored to prevent CSS exfiltration. */
 .addon-text {
   color: var(--text-1);
   line-height: 1.5;
   margin: 0;
   white-space: pre-wrap;
 }
+
+.addon-text-muted   { color: var(--text-2); }
+.addon-text-bold    { font-weight: 700; }
+.addon-text-italic  { font-style: italic; }
+.addon-text-error   { color: var(--danger, #dc3545); }
+.addon-text-success { color: var(--success, #28a745); }
+.addon-text-warning { color: var(--warning, #ffc107); }
 
 /* ---- Card ---- */
 .addon-card {

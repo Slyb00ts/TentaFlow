@@ -89,20 +89,24 @@ pub fn compile_module(engine: &WasmEngine, wasm_bytes: &[u8]) -> Result<WasmModu
 // Tworzenie Store z limiterami
 // =============================================================================
 
-/// Tworzy nowy Store z limitem paliwa i limiterem pamieci
+/// Tworzy nowy Store z limitem paliwa i limiterem pamieci.
+/// Epoch deadline domyslnie `u64::MAX` — store nigdy nie wytrapuje przez
+/// global increment_epoch. Per-call (invoke_block, call_tick_static) ustawia
+/// unikalny N przed wywolaniem WASM i watchdog inkrementuje counter do tego
+/// konkretnego N. Po call deadline jest przywracany na u64::MAX, dzieki czemu
+/// dlugo zyjace instancje (start_addon → on_event handler) nie sa trapowane
+/// gdy inny addon ma odpalony watchdog.
 pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<AddonState>> {
     let mut store = WasmStore::new(engine, state);
 
-    // Ustaw poczatkowe paliwo — addon zuzywa paliwo z kazdej instrukcji WASM
     store
         .set_fuel(DEFAULT_FUEL_LIMIT)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie ustawic paliwa: {e}"))?;
 
-    // Ustaw epoch deadline — pozwala na przerywanie z innego watku
-    store.epoch_deadline_async_yield_and_update(1);
+    store.set_epoch_deadline(u64::MAX);
 
     info!(
-        "Store Wasmtime utworzony (fuel={}, memory_limit={}MB)",
+        "Store Wasmtime utworzony (fuel={}, memory_limit={}MB, epoch=MAX)",
         DEFAULT_FUEL_LIMIT,
         DEFAULT_MEMORY_LIMIT_BYTES / (1024 * 1024)
     );
