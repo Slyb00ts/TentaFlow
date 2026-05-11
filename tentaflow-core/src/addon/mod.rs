@@ -99,6 +99,32 @@ pub struct AddonManifest {
     pub license: Option<String>,
     /// Flaga widocznosci w katalogu "Available apps" (default true w lifecycle).
     pub show_in_catalog: Option<bool>,
+    /// Sekcja [service] — gdy obecna, addon dziala w trybie ciaglym: po
+    /// `start_addon` AddonManager spawnuje dedykowany tokio task ktory wola
+    /// `on_tick(timestamp_ms)` co `tick_interval_ms`. Stop_addon anuluje task.
+    /// `None` = klasyczny tryb request/response + event-driven (bez tickow).
+    #[serde(default)]
+    pub service: Option<AddonServiceSection>,
+}
+
+/// Sekcja [service] manifestu — deklaracja trybu ciaglego addonu.
+/// Wymagane dla addonow ktore musza pracowac 24/7 (analiza wideo z kamer,
+/// monitoring sieci, background sync) zamiast czekac na request/event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddonServiceSection {
+    /// Czy service ma byc uruchamiany. Default `true` gdy sekcja istnieje
+    /// (admin moze szybko wylaczyc bez usuwania sekcji).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Interwal miedzy wywolaniami `on_tick`, w ms. `0` lub `None` = brak
+    /// tickow (service tylko reaguje na eventy przez `on_event`, persistent
+    /// instance daje wlasciwosc trzymania stanu miedzy eventami).
+    #[serde(default)]
+    pub tick_interval_ms: Option<u64>,
+    /// Budzet paliwa na pojedynczy tick. Default 5M instrukcji — wystarczy
+    /// na typowy poll/aggregation, blokuje runaway loop w guest.
+    #[serde(default)]
+    pub tick_fuel_budget: Option<u64>,
 }
 
 /// Sekcja [visibility] manifestu — kontrola widocznosci addona w GUI.
@@ -329,6 +355,10 @@ pub struct AddonManager {
     /// Rejestr custom flow blocks z addonow. Resolver `AdapterRegistry` woła
     /// `find_block` po prefiksowanym node_type ("addon.{id}.{name}").
     flow_blocks_registry: Arc<flow_blocks::AddonFlowRegistry>,
+    /// Tokens anulujace petle service tasków per instance_id. Stop_addon
+    /// wola `cancel()` na tokenie — tick loop wychodzi po nastepnym
+    /// `select!`, zwalnia uchwyt do instancji.
+    service_tasks: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 impl AddonManager {
@@ -359,6 +389,7 @@ impl AddonManager {
             registered_tools: Arc::new(PlRwLock::new(Vec::new())),
             router: Arc::new(PlRwLock::new(None)),
             flow_blocks_registry: Arc::new(flow_blocks::AddonFlowRegistry::new()),
+            service_tasks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -576,6 +607,30 @@ impl AddonManager {
             timestamp: chrono::Utc::now(),
         });
 
+        // Tryb ciagly (service mode) — manifest deklaruje sekcje [service] z
+        // tick_interval_ms. AddonManager spawnuje dedykowany tokio task
+        // ktory periodycznie wola `on_tick(timestamp_ms)` na trzymanej
+        // instancji. Persistent state w guest memory zostaje miedzy tickami.
+        // Cancel token w `service_tasks` pozwala stop_addon zatrzymac petle.
+        let manifest_for_service = self.load_addon_manifest(addon_id).ok();
+        if let Some(manifest) = manifest_for_service.as_ref() {
+            if let Some(service) = manifest.service.as_ref() {
+                if service.enabled {
+                    if let Some(interval_ms) = service.tick_interval_ms {
+                        if interval_ms > 0 {
+                            let fuel = service.tick_fuel_budget.unwrap_or(5_000_000);
+                            self.spawn_service_tick_loop(
+                                addon_id.to_string(),
+                                instance_id.clone(),
+                                interval_ms,
+                                fuel,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Reaktywuj aliasy modeli dla teams-bot
         if addon_id == "teams-bot" {
             self.activate_teams_aliases();
@@ -588,9 +643,159 @@ impl AddonManager {
         Ok(instance_id)
     }
 
+    /// Spawnuje petle tickow dla addonu w trybie service. Loop dziala dopóki
+    /// `stop_addon` nie anuluje tokenu w `service_tasks`. Kazdy tick:
+    /// - sprawdza cancel token (select),
+    /// - czeka `interval_ms`,
+    /// - woluje `call_tick(addon_id, instance_id, fuel)` — bierze instancje
+    ///   z mapy, refueluje store, wola WASM `on_tick(timestamp_ms)`.
+    /// Bledy tick'a nie zabijaja petli — addon w trybie service ma szanse
+    /// odzyskac sprawnosc przy nastepnym ticku. Crash z fuel exhaustion =
+    /// trap, instancja zostaje porzucona, w przyszlosci moglibyśmy ja
+    /// odtworzyc; MVP zostawia kierownikowi (admin) decyzje przez logi.
+    fn spawn_service_tick_loop(
+        &self,
+        addon_id: String,
+        instance_id: String,
+        interval_ms: u64,
+        fuel_per_tick: u64,
+    ) {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.service_tasks
+            .lock()
+            .insert(instance_id.clone(), token.clone());
+
+        let manager_instances = self.instances.clone();
+        let engine = self.engine.clone();
+        let event_bus = self.event_bus.clone();
+        let addon_id_for_log = addon_id.clone();
+        let instance_id_for_log = instance_id.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Pierwsze tick() wraca natychmiast — odpuscic, zeby addon mial
+            // chwile na ustawienie sie po on_start.
+            interval.tick().await;
+
+            info!(
+                "Service tick loop wystartowany dla '{}' (instance={}, interval={}ms, fuel={})",
+                addon_id_for_log, instance_id_for_log, interval_ms, fuel_per_tick
+            );
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!(
+                            "Service tick loop dla '{}' (instance={}) zatrzymany",
+                            addon_id_for_log, instance_id_for_log
+                        );
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let res = tokio::task::block_in_place(|| {
+                            Self::call_tick_static(
+                                &manager_instances,
+                                &engine,
+                                &addon_id_for_log,
+                                &instance_id_for_log,
+                                fuel_per_tick,
+                            )
+                        });
+                        if let Err(e) = res {
+                            warn!(
+                                "on_tick failed for '{}' (instance={}): {}",
+                                addon_id_for_log, instance_id_for_log, e
+                            );
+                            event_bus.publish(Event {
+                                event_type: "addon.tick_error".to_string(),
+                                source_addon: Some(addon_id_for_log.clone()),
+                                source_user: None,
+                                payload: serde_json::json!({
+                                    "addon_id": &addon_id_for_log,
+                                    "instance_id": &instance_id_for_log,
+                                    "error": e.to_string(),
+                                }),
+                                timestamp: chrono::Utc::now(),
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Wykonanie pojedynczego ticka — wzorowane na `handle_event`: bierze
+    /// instancje z mapy pod krotkim lockiem, refueluje store, wola
+    /// `on_tick(timestamp_ms) -> i32` na guest, wklada instancje z powrotem.
+    /// Static zeby uniknac trzymania referencji do `&self` w spawnowanym
+    /// tasku — przekazujemy Arc'i pól bezposrednio.
+    fn call_tick_static(
+        instances_map: &Arc<Mutex<HashMap<String, Vec<AddonInstance>>>>,
+        _engine: &runtime::WasmEngine,
+        addon_id: &str,
+        instance_id: &str,
+        fuel_per_tick: u64,
+    ) -> Result<()> {
+        // Wyciagnij instancje (lock briefly)
+        let mut addon_instance = {
+            let mut instances = instances_map.lock();
+            let addon_instances = instances
+                .get_mut(addon_id)
+                .ok_or_else(|| anyhow::anyhow!("addon '{}' nie ma uruchomionych instancji", addon_id))?;
+            let pos = addon_instances
+                .iter()
+                .position(|i| i.instance_id == instance_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("instance '{}' nie znaleziona w mapie", instance_id)
+                })?;
+            addon_instances.remove(pos)
+        };
+
+        // Refuel — kazdy tick dostaje swiezy budzet.
+        let _ = runtime::refuel_store(&mut addon_instance.store, fuel_per_tick);
+
+        // Wywolaj on_tick(timestamp_ms) -> i32 — addon nie musi go eksportowac;
+        // brak exportu = no-op (instance zostaje aktywna na inne hooks
+        // jak on_event).
+        let res: Result<()> = (|| {
+            if let Ok(on_tick) = addon_instance
+                .instance
+                .get_typed_func::<i64, i32>(&mut addon_instance.store, "on_tick")
+            {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                let code = on_tick
+                    .call(&mut addon_instance.store, ts_ms)
+                    .map_err(|e| anyhow::anyhow!("on_tick call: {e}"))?;
+                if code != 0 {
+                    bail!("on_tick zwrocil kod {}", code);
+                }
+            }
+            Ok(())
+        })();
+
+        // Wloz z powrotem nawet przy bledzie — pojedyncza nieudana tura nie
+        // zabija service (np. transient error w dispatch'u host_function).
+        instances_map
+            .lock()
+            .entry(addon_id.to_string())
+            .or_default()
+            .push(addon_instance);
+
+        res
+    }
+
     /// Zatrzymuje instancje addonu
     pub fn stop_addon(&self, instance_id: &str) -> Result<()> {
         info!("Zatrzymywanie instancji: {}", instance_id);
+
+        // Anuluj service tick loop (jesli ten instance ma service mode).
+        // Token wyzwala `select` w petli, ktora wychodzi cleanly bez
+        // szarpania trzymanej instancji — po cancel mozemy bezpiecznie
+        // wyciagnac instancje z mapy ponizej.
+        if let Some(token) = self.service_tasks.lock().remove(instance_id) {
+            token.cancel();
+        }
 
         let mut instances = self.instances.lock();
 
