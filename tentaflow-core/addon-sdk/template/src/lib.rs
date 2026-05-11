@@ -94,6 +94,24 @@ pub extern "C" fn on_stop() -> i32 {
 // Obsluga eventow
 // =============================================================================
 
+/// Wywolywane periodycznie przez AddonManager gdy manifest deklaruje sekcje
+/// `[service]` z `tick_interval_ms`. Persistent state addonu (statyki Rust,
+/// guest memory) przezywa miedzy tickami — tu jest miejsce na pull/polling
+/// long-running pracy (np. odczyt kolejnej klatki z kamery i jej analiza).
+///
+/// `timestamp_ms` to UTC unix ms z momentu wywolania.
+/// Zwroc 0 dla success, niezero = blad (host loguje + emit'uje event
+/// "addon.tick_error", petla kontynuuje).
+///
+/// Brak eksportu tej funkcji jest OK — host wykryje przez `get_typed_func`
+/// i pominie tick (addon dziala wtedy tylko event-driven, ale ma persistent
+/// state).
+#[no_mangle]
+pub extern "C" fn on_tick(_timestamp_ms: i64) -> i32 {
+    // Template nie ma service mode — placeholder. Removeable.
+    0
+}
+
 /// Wywolywane gdy addon otrzyma event z event bus.
 /// Parametry: wskaznik i dlugosc JSON eventu w pamieci WASM.
 #[no_mangle]
