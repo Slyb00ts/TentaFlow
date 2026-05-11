@@ -117,6 +117,10 @@ pub struct FlowDispatcher {
     cache: FlowCache,
     registry: Arc<AdapterRegistry>,
     ctx_factory: Arc<ContextFactory>,
+    /// `AddonFlowRegistry` udostępniany handlerom GUI (Flow Builder lista
+    /// templates dorzuca tu addon blocks). Ustawiany przez `set_addon_resolver`
+    /// razem z resolverem dla AdapterRegistry — single touchpoint w main.rs.
+    addon_flow_blocks: parking_lot::RwLock<Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>>>,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -219,6 +223,7 @@ impl FlowDispatcher {
             cache: FlowCache::new(60),
             registry: Arc::new(registry),
             ctx_factory,
+            addon_flow_blocks: parking_lot::RwLock::new(None),
         }
     }
 
@@ -235,6 +240,9 @@ impl FlowDispatcher {
     pub fn set_addon_resolver(&self, manager: Arc<crate::addon::AddonManager>) {
         use crate::flow_engine::node_adapters::AddonNodeAdapter;
         let blocks_registry = manager.flow_blocks_registry().clone();
+        // Zachowaj referencję do registry zeby handlery GUI mogly listowac
+        // addon blocks (Flow Builder palette).
+        *self.addon_flow_blocks.write() = Some(blocks_registry.clone());
         let resolver: crate::flow_engine::node_adapter::DynamicAdapterResolver =
             Arc::new(move |node_type: &str| -> Option<Arc<dyn NodeAdapter>> {
                 // Tylko prefiks "addon." idzie do registry — szybki bail
@@ -248,6 +256,15 @@ impl FlowDispatcher {
                 Some(Arc::new(adapter) as Arc<dyn NodeAdapter>)
             });
         self.registry.set_dynamic_resolver(resolver);
+    }
+
+    /// Zwraca `AddonFlowRegistry` jesli `set_addon_resolver` zostalo wolane.
+    /// Handler `FlowNodeTemplatesListRequest` uzywa do dorzucenia addon
+    /// blocks do palety Flow Buildera.
+    pub fn addon_flow_blocks(
+        &self,
+    ) -> Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>> {
+        self.addon_flow_blocks.read().clone()
     }
 
     /// Etap 2: BlobStore handle — używane przez TTS-as-flow path w
