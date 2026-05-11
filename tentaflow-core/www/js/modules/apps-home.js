@@ -37,6 +37,23 @@ function renderTile(t) {
     </div>`;
 }
 
+// Dynamic tile dla zainstalowanego addonu z `[application]` w manifescie.
+// Click -> Router.navigate('addon-app', { addonId, panelId }).
+function renderAddonTile(app) {
+  const title = escapeHtml(app.title ?? app.addonId ?? '');
+  const desc = escapeHtml(app.addonId ?? '');
+  const iconRaw = (app.icon ?? '').toString();
+  const iconId = (iconRaw.startsWith('i-') ? iconRaw.slice(2) : iconRaw) || 'chip';
+  return `
+    <div class="app-tile addon-app-tile"
+         data-addon-id="${escapeHtml(app.addonId ?? '')}"
+         data-panel-id="${escapeHtml(app.entryPanel ?? '')}">
+      <div class="app-icon">${sprite(iconId)}</div>
+      <div class="app-name">${title}</div>
+      <div class="app-desc">${desc}</div>
+    </div>`;
+}
+
 const AppsHomeScreen = {
   render() {
     return `
@@ -60,8 +77,32 @@ const AppsHomeScreen = {
     }
 
     const grid = byId('apps-grid');
+
+    // Dolacz dynamiczne kafelki addon applications. Bledem nie zabijamy
+    // calego widoku — kafelki built-in zostaja widoczne.
+    try {
+      const apps = await ApiBinary.list('addonApplicationsListRequest', {
+        arrayKey: 'applications',
+      });
+      if (Array.isArray(apps) && apps.length > 0) {
+        const html = apps.map(renderAddonTile).join('');
+        grid.insertAdjacentHTML('beforeend', html);
+      }
+    } catch (e) {
+      console.warn('[apps-home] addon applications fetch failed:', e?.message ?? e);
+    }
+
     grid.querySelectorAll('.app-tile').forEach((el) => {
       el.addEventListener('click', () => {
+        // Addon app tile — drill-down do renderera UI v2.
+        if (el.classList.contains('addon-app-tile')) {
+          const addonId = el.dataset.addonId;
+          const panelId = el.dataset.panelId;
+          if (addonId && panelId) {
+            Router.navigate('addon-app', { addonId, panelId });
+          }
+          return;
+        }
         // Soon tiles still navigate — the target screen explains the status
         // honestly instead of faking a feature.
         const route = el.dataset.route;

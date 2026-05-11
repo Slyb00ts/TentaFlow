@@ -1,0 +1,192 @@
+/* =============================================================================
+   File: addon-app.css
+   Opis: Style dla addon UI v2 — drzewo UiComponent renderowane przez
+   modules/addon-app.js. tf-* komponenty maja wlasne style (shared-styles.js);
+   tu definiujemy layout + semantyczne elementy (text/card/list/divider/code/
+   progress/image) ktore nie sa primitive w sensie rule 8.
+   ============================================================================= */
+
+.addon-app-shell {
+  padding: 24px 28px 48px;
+  max-width: 960px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.addon-app-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin: 0 0 4px;
+}
+
+.addon-app-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.addon-app-loading,
+.addon-app-empty,
+.addon-app-error {
+  padding: 32px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  text-align: center;
+}
+
+.addon-app-empty h3,
+.addon-app-error h3 {
+  margin: 0 0 8px;
+  color: var(--text-1);
+}
+
+.addon-action-error {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(220, 53, 69, 0.12);
+  color: var(--danger, #dc3545);
+  border: 1px solid rgba(220, 53, 69, 0.3);
+  margin-bottom: 12px;
+}
+
+/* ---- Text ---- */
+.addon-text {
+  color: var(--text-1);
+  line-height: 1.5;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+/* ---- Card ---- */
+.addon-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border-1);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.addon-card-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin: 0;
+}
+
+.addon-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ---- List ---- */
+.addon-list {
+  list-style: disc;
+  padding-left: 24px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-1);
+}
+
+.addon-list > li {
+  line-height: 1.4;
+}
+
+/* ---- Form ---- */
+.addon-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  background: var(--surface-2);
+  border-radius: 10px;
+}
+
+/* ---- Divider ---- */
+.addon-divider {
+  border: none;
+  border-top: 1px solid var(--border-1);
+  margin: 8px 0;
+}
+
+/* ---- Progress ---- */
+.addon-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.addon-progress-bar {
+  flex: 1 1 auto;
+  height: 8px;
+  appearance: none;
+  border: none;
+  border-radius: 4px;
+  background: var(--surface-3, #e0e0e0);
+  overflow: hidden;
+}
+
+.addon-progress-bar::-webkit-progress-bar {
+  background: var(--surface-3, #e0e0e0);
+  border-radius: 4px;
+}
+
+.addon-progress-bar::-webkit-progress-value {
+  background: var(--accent, #4a90e2);
+  border-radius: 4px;
+}
+
+.addon-progress-bar::-moz-progress-bar {
+  background: var(--accent, #4a90e2);
+  border-radius: 4px;
+}
+
+.addon-progress-label {
+  font-size: 12px;
+  color: var(--text-2);
+  min-width: 40px;
+  text-align: right;
+}
+
+/* ---- Code ---- */
+.addon-code {
+  background: var(--code-bg, #1e1e2e);
+  color: var(--code-fg, #d4d4d4);
+  padding: 12px 14px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.addon-code code {
+  background: none;
+  padding: 0;
+}
+
+/* ---- Image ---- */
+.addon-image {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+/* ---- Unknown component (fallback) ---- */
+.addon-unknown {
+  padding: 6px 10px;
+  background: var(--surface-3, #f5f5f5);
+  color: var(--text-3);
+  font-family: monospace;
+  font-size: 12px;
+  border-radius: 4px;
+}
