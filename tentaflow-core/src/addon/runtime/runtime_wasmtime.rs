@@ -103,10 +103,15 @@ pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<
         .set_fuel(DEFAULT_FUEL_LIMIT)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie ustawic paliwa: {e}"))?;
 
-    store.set_epoch_deadline(u64::MAX);
+    // UWAGA: set_epoch_deadline przyjmuje DELTA od current_epoch (wasmtime
+    // wewnetrznie robi `current_epoch + delta`). Wartosc u64::MAX powoduje
+    // overflow (panic). Uzywamy u64::MAX / 4 — bezpieczna delta ktora nigdy
+    // nie zostanie osiagnieta przez normalne incrementy, ale tez nie
+    // przepelnia gdy wasmtime dodaje do current_epoch.
+    store.set_epoch_deadline(u64::MAX / 4);
 
     info!(
-        "Store Wasmtime utworzony (fuel={}, memory_limit={}MB, epoch=MAX)",
+        "Store Wasmtime utworzony (fuel={}, memory_limit={}MB, epoch_delta=u64::MAX/4)",
         DEFAULT_FUEL_LIMIT,
         DEFAULT_MEMORY_LIMIT_BYTES / (1024 * 1024)
     );
