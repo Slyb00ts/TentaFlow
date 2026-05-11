@@ -1,0 +1,11 @@
+[package]
+name = "tentaflow-addon-test-app"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
+serde_json = "1.0"
