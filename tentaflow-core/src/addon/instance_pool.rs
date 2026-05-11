@@ -278,6 +278,7 @@ impl InstancePool {
             memory_limit: super::DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.clone(),
             oauth_refresh_guard: self.oauth_refresh_guard.clone(),
+            ui_panels: None,
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
