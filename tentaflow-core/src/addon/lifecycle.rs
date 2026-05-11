@@ -933,6 +933,21 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         })
         .unwrap_or_default();
 
+    let service = top
+        .get("service")
+        .and_then(|v| v.as_table())
+        .map(|svc| crate::addon::AddonServiceSection {
+            enabled: svc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            tick_interval_ms: svc
+                .get("tick_interval_ms")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64),
+            tick_fuel_budget: svc
+                .get("tick_fuel_budget")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64),
+        });
+
     let resources = top.get("resources").map(|res| ResourceRequirements {
         storage_total_mb: res
             .get("storage_total_mb")
@@ -988,6 +1003,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         oauth_provider,
         license,
         show_in_catalog,
+        service,
     })
 }
 
@@ -1152,6 +1168,59 @@ mod tests {
     fn minimal_wasm_bytes() -> Vec<u8> {
         // Minimal valid WASM module header: magic "\0asm" + version 1.
         vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    #[test]
+    fn parses_service_section_with_tick_interval_and_fuel() {
+        let toml = r#"
+[addon]
+id = "cam-watcher"
+name = "Camera Watcher"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[service]
+enabled = true
+tick_interval_ms = 500
+tick_fuel_budget = 20000000
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let svc = m.service.expect("[service] sekcja wczytana");
+        assert!(svc.enabled);
+        assert_eq!(svc.tick_interval_ms, Some(500));
+        assert_eq!(svc.tick_fuel_budget, Some(20_000_000));
+    }
+
+    #[test]
+    fn missing_service_section_yields_none() {
+        let toml = r#"
+[addon]
+id = "no-service"
+name = "No Service"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        assert!(m.service.is_none());
+    }
+
+    #[test]
+    fn service_section_defaults_enabled_true_when_omitted() {
+        let toml = r#"
+[addon]
+id = "default-enabled"
+name = "Default Enabled"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[service]
+tick_interval_ms = 1000
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let svc = m.service.expect("[service] sekcja wczytana");
+        assert!(svc.enabled, "enabled default to true when section present");
+        assert_eq!(svc.tick_interval_ms, Some(1000));
+        assert!(svc.tick_fuel_budget.is_none());
     }
 
     #[test]
