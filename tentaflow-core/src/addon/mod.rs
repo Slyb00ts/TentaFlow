@@ -808,7 +808,10 @@ impl AddonManager {
             if !a.is_enabled {
                 continue;
             }
-            let manifest: AddonManifest = match serde_json::from_str(&a.manifest_json) {
+            // UWAGA: `manifest_json` w DB to RAW manifest.toml string
+            // (nazwa kolumny myli, patrz lifecycle.rs:125). Parsujemy
+            // przez `parse_manifest_toml`, NIE serde_json.
+            let manifest: AddonManifest = match lifecycle::parse_manifest_toml(&a.manifest_json) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(

@@ -4901,8 +4901,11 @@ pub fn addon_ui_dispatch(
                 if !visible_to_user(&a.addon_id)? {
                     continue;
                 }
+                // UWAGA: `manifest_json` w DB to RAW manifest.toml string
+                // (nazwa kolumny myli, patrz addon/lifecycle.rs:125).
+                // Parsujemy przez parse_manifest_toml, NIE serde_json.
                 let manifest: crate::addon::AddonManifest =
-                    match serde_json::from_str(&a.manifest_json) {
+                    match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
