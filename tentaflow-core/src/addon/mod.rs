@@ -938,10 +938,34 @@ impl AddonManager {
             }
         }
 
-        // Opublikuj dalej na bus (dla innych subskrybentow)
-        self.event_bus.publish(event);
+        self.event_bus.record_delivery(subscribers.len() as u64);
 
         Ok(())
+    }
+
+    /// Startuje dispatcher eventow — tworzy kanal mpsc, podpina sender do
+    /// `EventBus` (kazdy `publish` trafia na ten kanal) i odpala dedykowany
+    /// blocking-thread, ktory drenuje kanal i woluje `self.handle_event`
+    /// dla kazdego eventu. Wywolaj raz po `AddonManager::new`.
+    pub fn start_event_dispatcher(self: Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::addon::event_bus::Event>();
+        self.event_bus.set_dispatch_sender(tx);
+
+        let manager = self;
+        tokio::task::spawn_blocking(move || {
+            while let Some(event) = rx.blocking_recv() {
+                let event_type = event.event_type.clone();
+                if let Err(e) = manager.handle_event(event) {
+                    warn!(
+                        "Dispatcher: handle_event('{}') zwrocil blad: {}",
+                        event_type, e
+                    );
+                }
+            }
+            info!("Dispatcher eventow zakonczony — kanal zamkniety");
+        });
+
+        info!("AddonManager: dispatcher eventow wystartowany");
     }
 
     /// Zwraca liste narzedzi ze wszystkich addonow (dla LLM)
