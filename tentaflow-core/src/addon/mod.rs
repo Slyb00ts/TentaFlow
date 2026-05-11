@@ -1822,16 +1822,20 @@ impl AddonManager {
             return Ok(module.clone());
         }
 
-        // Pobierz WASM z DB
-        let wasm_bytes: Vec<u8> = {
-            let conn = self.db.lock().unwrap();
-            conn.query_row(
-                "SELECT wasm_bytes FROM addon_wasm WHERE addon_id = ?1",
-                rusqlite::params![addon_id],
-                |row| row.get(0),
+        // Tabela `addon_wasm` jest martwa od pierwszego commita — lifecycle
+        // nigdy do niej nie zapisuje. WASM zyje na dysku w
+        // bundled_addons_dir()/{addon_id}/{manifest.wasm_file}. Czytamy
+        // sciezke z manifestu (pole `wasm_file` z [addon]).
+        let manifest = self.load_addon_manifest(addon_id)?;
+        let wasm_path = bundled::bundled_addons_dir()
+            .join(addon_id)
+            .join(&manifest.wasm_file);
+        let wasm_bytes = std::fs::read(&wasm_path).with_context(|| {
+            format!(
+                "Nie znaleziono WASM dla addonu '{}' (oczekiwana sciezka: {:?})",
+                addon_id, wasm_path
             )
-            .context(format!("Nie znaleziono WASM dla addonu '{}'", addon_id))?
-        };
+        })?;
 
         // Kompiluj modul
         let module = runtime::compile_module(&self.engine, &wasm_bytes)?;
