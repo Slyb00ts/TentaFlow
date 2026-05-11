@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -242,8 +243,6 @@ pub trait StreamingNodeAdapter: NodeAdapter {
 /// instalacji addonu (np. block z `addon.{id}.{name}`). Zwraca `None` gdy nie
 /// znajduje match'a; registry zwraca wynik z `dynamic_resolver` jeśli builtin
 /// map nie zawiera node_type.
-///
-/// `Send + Sync` bo registry jest dzielone między task'i executora przez `Arc`.
 pub type DynamicAdapterResolver =
     Arc<dyn Fn(&str) -> Option<Arc<dyn NodeAdapter>> + Send + Sync>;
 
@@ -261,8 +260,10 @@ pub struct AdapterRegistry {
     streaming_adapters: HashMap<String, Arc<dyn StreamingNodeAdapter>>,
     /// Resolver dla node_type'ów nie znalezionych w `adapters`. Cache wynikow
     /// (jeden lookup = jedno wywolanie) wewnatrz resolver-impl, registry nie
-    /// memoize'uje — co compile flow to nowe pytanie.
-    dynamic_resolver: Option<DynamicAdapterResolver>,
+    /// memoize'uje — co compile flow to nowe pytanie. RwLock bo `set` jest
+    /// jednorazowe (po inicjalizacji `AddonManager`), reads tylko klonują
+    /// Arc — kontencja zerowa w praktyce.
+    dynamic_resolver: RwLock<Option<DynamicAdapterResolver>>,
 }
 
 impl AdapterRegistry {
@@ -271,7 +272,7 @@ impl AdapterRegistry {
             adapters: HashMap::new(),
             llm: None,
             streaming_adapters: HashMap::new(),
-            dynamic_resolver: None,
+            dynamic_resolver: RwLock::new(None),
         }
     }
 
@@ -297,11 +298,10 @@ impl AdapterRegistry {
     }
 
     /// Ustawia dynamic resolver dla node_type'ów nie zarejestrowanych jako
-    /// builtin. Pierwszy resolver wygrywa; kolejne `set_dynamic_resolver`
-    /// nadpisuje poprzedni (typowo: bootstrap setuje raz po
-    /// register_llm + register'ach).
-    pub fn set_dynamic_resolver(&mut self, resolver: DynamicAdapterResolver) {
-        self.dynamic_resolver = Some(resolver);
+    /// builtin. Może być wołane z innego wątku po inicjalizacji rejestru.
+    /// Nadpisuje poprzedni resolver.
+    pub fn set_dynamic_resolver(&self, resolver: DynamicAdapterResolver) {
+        *self.dynamic_resolver.write() = Some(resolver);
     }
 
     /// Zwraca adapter dla podanego node_type. Najpierw szuka w builtin map,
@@ -312,17 +312,16 @@ impl AdapterRegistry {
         if let Some(a) = self.adapters.get(node_type) {
             return Some(a.clone());
         }
-        self.dynamic_resolver
-            .as_ref()
-            .and_then(|r| r(node_type))
+        let resolver = self.dynamic_resolver.read().clone();
+        resolver.and_then(|r| r(node_type))
     }
 
     pub fn has(&self, node_type: &str) -> bool {
         if self.adapters.contains_key(node_type) {
             return true;
         }
-        self.dynamic_resolver
-            .as_ref()
+        let resolver = self.dynamic_resolver.read().clone();
+        resolver
             .map(|r| r(node_type).is_some())
             .unwrap_or(false)
     }
