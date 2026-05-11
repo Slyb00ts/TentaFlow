@@ -946,6 +946,31 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                 .get("tick_fuel_budget")
                 .and_then(|v| v.as_integer())
                 .map(|v| v as u64),
+            tick_timeout_ms: svc
+                .get("tick_timeout_ms")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64),
+        });
+
+    let application = top
+        .get("application")
+        .and_then(|v| v.as_table())
+        .and_then(|app| {
+            let entry_panel = app.get("entry_panel").and_then(|v| v.as_str())?.to_string();
+            let title = app
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&entry_panel)
+                .to_string();
+            Some(crate::addon::AddonApplicationSection {
+                entry_panel,
+                title,
+                icon: app.get("icon").and_then(|v| v.as_str()).map(String::from),
+                sort_order: app
+                    .get("sort_order")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as i32),
+            })
         });
 
     let resources = top.get("resources").map(|res| ResourceRequirements {
@@ -1004,6 +1029,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         license,
         show_in_catalog,
         service,
+        application,
     })
 }
 

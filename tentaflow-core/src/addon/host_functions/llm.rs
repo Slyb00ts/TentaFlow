@@ -427,6 +427,7 @@ mod tests {
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
             ),
             router: None,
+            ui_panels: None,
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
         }
