@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -70,10 +70,12 @@ pub struct EventBus {
     /// Licznik dostarczonych eventow
     delivered_count: AtomicU64,
     /// Sender kanalu dispatchera — kazdy `publish()` wpada na ten kanal,
-    /// `AddonManager` drenuje go w dedykowanym watku i woluje `handle_event`.
-    /// `OnceLock` bo bus jest tworzony przed managerem, dispatcher dopisywany
-    /// po inicjalizacji (`AddonManager::start_event_dispatcher`).
-    dispatch_tx: OnceLock<UnboundedSender<Event>>,
+    /// `AddonManager` drenuje go w dedykowanym blocking watku i woluje
+    /// `handle_event`. RwLock<Option> (nie OnceLock!) bo shutdown musi
+    /// mochic dropowac sender — inaczej blocking_recv wisi wiecznie i
+    /// proces nie konczy sie po SIGINT (cykl referencyjny przez
+    /// Arc<AddonManager> trzymany w spawn_blocking task).
+    dispatch_tx: RwLock<Option<UnboundedSender<Event>>>,
 }
 
 impl EventBus {
@@ -85,16 +87,27 @@ impl EventBus {
             subscription_counter: AtomicU64::new(1),
             published_count: AtomicU64::new(0),
             delivered_count: AtomicU64::new(0),
-            dispatch_tx: OnceLock::new(),
+            dispatch_tx: RwLock::new(None),
         }
     }
 
     /// Podpina sender kanalu dispatchera — moze byc wywolany tylko raz przez
     /// `AddonManager` przy inicjalizacji. Kolejne wywolania sa ignorowane.
     pub fn set_dispatch_sender(&self, tx: UnboundedSender<Event>) {
-        if self.dispatch_tx.set(tx).is_err() {
+        let mut slot = self.dispatch_tx.write();
+        if slot.is_some() {
             warn!("EventBus: dispatcher sender juz ustawiony, ignoruje");
+            return;
         }
+        *slot = Some(tx);
+    }
+
+    /// Zamyka kanal dispatchera — dropuje sender, dispatcher loop dostaje
+    /// `None` z `blocking_recv` i wychodzi. Wolane z `AddonManager::shutdown`
+    /// zeby graceful shutdown faktycznie sie zakonczyl (bez tego blocking
+    /// thread wisi wiecznie przez cykl referencyjny Arc<AddonManager>).
+    pub fn close_dispatcher(&self) {
+        *self.dispatch_tx.write() = None;
     }
 
     /// Bumpuje licznik dostarczonych eventow (wolane przez dispatcher po handle_event).
@@ -136,7 +149,9 @@ impl EventBus {
 
         // Wyslij na kanal dispatchera (jesli skonfigurowany).
         // Klon eventu zostaje pozniej dolozony do ring buffera dla historii.
-        if let Some(tx) = self.dispatch_tx.get() {
+        // Drop guard `tx` szybko — nie trzymamy locka podczas send.
+        let tx = self.dispatch_tx.read().clone();
+        if let Some(tx) = tx {
             if let Err(e) = tx.send(event.clone()) {
                 warn!(
                     "EventBus: dispatcher kanal zamkniety, event '{}' upuszczony: {}",
