@@ -35,13 +35,37 @@ extern "C" {
     fn http_request(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
 
     /// Publikacja eventu na event bus
-    fn event_publish(event_ptr: i32, event_len: i32) -> i32;
+    /// ABI: (event_type_ptr, event_type_len, payload_json_ptr, payload_json_len) -> i32
+    /// Zgodne z host function w host_functions/events.rs::event_publish
+    fn event_publish(
+        event_type_ptr: i32, event_type_len: i32,
+        payload_json_ptr: i32, payload_json_len: i32,
+    ) -> i32;
+
+    /// Subskrypcja eventu — Core wywola guest export `on_event(ptr, len)` przy dostarczeniu.
+    /// ABI: (event_type_ptr, event_type_len, filter_json_ptr, filter_json_len) -> i32
+    /// Zwraca: subscription_id (>0) lub kod bledu (<0). Filtr opcjonalny — przekaz (0,0).
+    fn event_subscribe(
+        event_type_ptr: i32, event_type_len: i32,
+        filter_json_ptr: i32, filter_json_len: i32,
+    ) -> i32;
 
     /// Renderowanie panelu UI (deklaratywny JSON)
-    fn ui_render(panel_ptr: i32, panel_len: i32) -> i32;
+    /// ABI: (panel_id_ptr, panel_id_len, ui_json_ptr, ui_json_len) -> i32
+    /// Zgodne z host function w host_functions/ui.rs::ui_render
+    fn ui_render(
+        panel_id_ptr: i32, panel_id_len: i32,
+        ui_json_ptr: i32, ui_json_len: i32,
+    ) -> i32;
 
     /// Wyswietlenie powiadomienia
-    fn ui_notify(msg_ptr: i32, msg_len: i32) -> i32;
+    /// ABI: (title_ptr, title_len, body_ptr, body_len, level_ptr, level_len) -> i32
+    /// Zgodne z host function w host_functions/ui.rs::ui_notify
+    fn ui_notify(
+        title_ptr: i32, title_len: i32,
+        body_ptr: i32, body_len: i32,
+        level_ptr: i32, level_len: i32,
+    ) -> i32;
 
     /// Odczyt sekretu (szyfrowany w Core)
     /// ABI: (key_ptr, key_len, out_ptr, out_cap, out_len_ptr) -> i32
@@ -394,22 +418,54 @@ pub struct Event {
 }
 
 /// Publikuje event na event bus Core.
-/// Wymaga uprawnienia "events" w manifescie addonu.
+/// Wymaga uprawnienia "events" z resource = event_type w manifescie addonu.
 pub fn publish_event(event_type: &str, payload: serde_json::Value) -> Result<(), String> {
-    let event = Event {
-        event_type: event_type.to_string(),
-        payload,
-    };
-    let event_json = serde_json::to_string(&event)
-        .map_err(|e| format!("Blad serializacji eventu: {}", e))?;
-    let bytes = event_json.as_bytes();
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|e| format!("Blad serializacji payload eventu: {}", e))?;
+    let et = event_type.as_bytes();
+    let pl = payload_json.as_bytes();
     let result = unsafe {
-        event_publish(bytes.as_ptr() as i32, bytes.len() as i32)
+        event_publish(
+            et.as_ptr() as i32, et.len() as i32,
+            pl.as_ptr() as i32, pl.len() as i32,
+        )
     };
-    if result != 0 {
+    if result < 0 {
         return Err(format!("Blad publikacji eventu: {}", result));
     }
     Ok(())
+}
+
+/// Subskrybuje event — Core wywola guest export `on_event(ptr, len)` przy dostarczeniu.
+/// Wymaga uprawnienia "events" z resource = event_type w manifescie addonu.
+/// `filter` to opcjonalny filtr JSON (np. dopasowanie polu w payloadzie); `None` = brak filtra.
+/// Zwraca `subscription_id` przyznane przez Core.
+pub fn subscribe_event(
+    event_type: &str,
+    filter: Option<serde_json::Value>,
+) -> Result<i64, String> {
+    let filter_json = match &filter {
+        Some(v) => serde_json::to_string(v)
+            .map_err(|e| format!("Blad serializacji filtra eventu: {}", e))?,
+        None => String::new(),
+    };
+    let et = event_type.as_bytes();
+    let (filter_ptr, filter_len) = if filter.is_some() {
+        let fb = filter_json.as_bytes();
+        (fb.as_ptr() as i32, fb.len() as i32)
+    } else {
+        (0i32, 0i32)
+    };
+    let result = unsafe {
+        event_subscribe(
+            et.as_ptr() as i32, et.len() as i32,
+            filter_ptr, filter_len,
+        )
+    };
+    if result < 0 {
+        return Err(format!("Blad subskrypcji eventu: {}", result));
+    }
+    Ok(result as i64)
 }
 
 // =============================================================================
@@ -417,50 +473,43 @@ pub fn publish_event(event_type: &str, payload: serde_json::Value) -> Result<(),
 // =============================================================================
 
 /// Renderuje panel UI addonu (deklaratywny JSON).
+/// `content` to drzewo komponentow UI (zgodne z `UiComponent` w Core); panel jest
+/// przekazywany do GUI przez event "ui.panel_rendered".
 /// Wymaga uprawnienia "ui" w manifescie addonu.
 pub fn render_panel(panel_id: &str, content: serde_json::Value) -> Result<(), String> {
-    let panel_json = serde_json::json!({
-        "panel_id": panel_id,
-        "content": content,
-    });
-    let bytes = serde_json::to_string(&panel_json)
+    let ui_json = serde_json::to_string(&content)
         .map_err(|e| format!("Blad serializacji panelu UI: {}", e))?;
-    let b = bytes.as_bytes();
+    let pid = panel_id.as_bytes();
+    let uj = ui_json.as_bytes();
     let result = unsafe {
-        ui_render(b.as_ptr() as i32, b.len() as i32)
+        ui_render(
+            pid.as_ptr() as i32, pid.len() as i32,
+            uj.as_ptr() as i32, uj.len() as i32,
+        )
     };
-    if result != 0 {
+    if result < 0 {
         return Err(format!("Blad renderowania panelu UI: {}", result));
     }
     Ok(())
 }
 
-/// Wyswietla powiadomienie uzytkownikowi.
+/// Wyswietla powiadomienie z poziomem "info".
 /// Wymaga uprawnienia "notifications" w manifescie addonu.
-pub fn notify(message: &str) {
-    let msg_json = serde_json::json!({
-        "message": message,
-        "level": "info",
-    });
-    if let Ok(bytes) = serde_json::to_string(&msg_json) {
-        let b = bytes.as_bytes();
-        unsafe {
-            ui_notify(b.as_ptr() as i32, b.len() as i32);
-        }
-    }
+pub fn notify(title: &str, body: &str) {
+    notify_with_level(title, body, "info");
 }
 
 /// Wyswietla powiadomienie z okreslonym poziomem (info, warn, error, success).
-pub fn notify_with_level(message: &str, level: &str) {
-    let msg_json = serde_json::json!({
-        "message": message,
-        "level": level,
-    });
-    if let Ok(bytes) = serde_json::to_string(&msg_json) {
-        let b = bytes.as_bytes();
-        unsafe {
-            ui_notify(b.as_ptr() as i32, b.len() as i32);
-        }
+pub fn notify_with_level(title: &str, body: &str, level: &str) {
+    let t = title.as_bytes();
+    let b = body.as_bytes();
+    let l = level.as_bytes();
+    unsafe {
+        ui_notify(
+            t.as_ptr() as i32, t.len() as i32,
+            b.as_ptr() as i32, b.len() as i32,
+            l.as_ptr() as i32, l.len() as i32,
+        );
     }
 }
 
@@ -666,7 +715,7 @@ pub mod prelude {
         generate,
         store_get, store_set,
         http_get, http_post, http_send, HttpRequest, HttpResponse,
-        publish_event, Event,
+        publish_event, subscribe_event, Event,
         render_panel, notify, notify_with_level,
         secret_get_value, secret_set_value,
         get_current_user, CurrentUser,
