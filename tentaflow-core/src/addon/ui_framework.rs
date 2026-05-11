@@ -132,42 +132,19 @@ pub struct UiPanel {
 }
 
 impl UiPanel {
-    /// Renderuje panel na HTML (dla obecnego backendu webowego)
-    pub fn to_html(&self) -> String {
-        let mut html = String::with_capacity(4096);
-
-        html.push_str(&format!(
-            "<div class=\"addon-panel\" data-addon=\"{}\" data-panel=\"{}\">\n",
-            escape_html(&self.addon_id),
-            escape_html(&self.panel_id)
-        ));
-        html.push_str(&format!(
-            "  <h2 class=\"addon-panel-title\">{}</h2>\n",
-            escape_html(&self.title)
-        ));
-        html.push_str("  <div class=\"addon-panel-content\">\n");
-
-        for component in &self.components {
-            render_component_html(&mut html, component, 4);
-        }
-
-        html.push_str("  </div>\n");
-        html.push_str("</div>\n");
-
-        html
-    }
-
-    /// Serializuje panel do JSON (dla przyszlego renderera WGPU)
+    /// Serializuje panel do JSON — to format wysylany frontendowi przez
+    /// `AddonUiPanelGetRequest`. Frontend GUI renderuje drzewo przez tf-*
+    /// komponenty; host nie produkuje HTML.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
 }
 
-// =============================================================================
-// Renderowanie komponentow na HTML
-// =============================================================================
-
-/// Renderuje pojedynczy komponent na HTML
+// HTML rendering po stronie hosta zostal usuniety w UI v2 — frontend GUI
+// renderuje drzewo komponentow przez tf-* komponenty (pseudokod ponizej
+// zachowany w bloku #[cfg(any())] nigdy nie kompilowanym, tylko jako
+// dokumentacja semantyki kazdego UiComponent).
+#[cfg(any())]
 fn render_component_html(html: &mut String, component: &UiComponent, indent: usize) {
     let pad = " ".repeat(indent);
 
@@ -465,33 +442,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_panel_to_html() {
-        let panel = UiPanel {
-            addon_id: "test.addon".to_string(),
-            panel_id: "main".to_string(),
-            title: "Test Panel".to_string(),
-            components: vec![
-                UiComponent::Text {
-                    content: "Hello World".to_string(),
-                    style: None,
-                },
-                UiComponent::Button {
-                    id: "btn1".to_string(),
-                    label: "Kliknij".to_string(),
-                    action: "test_action".to_string(),
-                    style: Some("primary".to_string()),
-                },
-            ],
-        };
-
-        let html = panel.to_html();
-        assert!(html.contains("addon-panel"));
-        assert!(html.contains("Hello World"));
-        assert!(html.contains("addon-btn-primary"));
-        assert!(html.contains("test_action"));
-    }
-
-    #[test]
     fn test_panel_to_json() {
         let panel = UiPanel {
             addon_id: "test".to_string(),
@@ -530,13 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_html() {
-        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
-        assert_eq!(escape_html("a&b"), "a&amp;b");
-    }
-
-    #[test]
-    fn test_table_html() {
+    fn test_table_round_trips_through_json() {
         let panel = UiPanel {
             addon_id: "t".to_string(),
             panel_id: "p".to_string(),
@@ -547,8 +491,9 @@ mod tests {
             }],
         };
 
-        let html = panel.to_html();
-        assert!(html.contains("<th>Nazwa</th>"));
-        assert!(html.contains("<td>klucz</td>"));
+        let json = panel.to_json();
+        assert_eq!(json["components"][0]["type"], "table");
+        assert_eq!(json["components"][0]["headers"][0], "Nazwa");
+        assert_eq!(json["components"][0]["rows"][0][0], "klucz");
     }
 }

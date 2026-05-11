@@ -105,6 +105,30 @@ pub struct AddonManifest {
     /// `None` = klasyczny tryb request/response + event-driven (bez tickow).
     #[serde(default)]
     pub service: Option<AddonServiceSection>,
+    /// Sekcja [application] — gdy obecna, addon rejestruje sie jako aplikacja
+    /// widoczna w glownym menu GUI (osobno od katalogu addonow). User klika
+    /// ikone w menu → GUI ladowuje route'a i renderuje UI panel addonu.
+    /// `None` = addon tylko jako tool/flow block, bez wlasnego UI launchera.
+    #[serde(default)]
+    pub application: Option<AddonApplicationSection>,
+}
+
+/// Sekcja [application] manifestu — rejestracja addonu jako aplikacji
+/// widocznej w glownym menu GUI (Apps launcher). Wymaga zeby addon
+/// eksportowal `on_request` i renderowal UI panel przez `ui_render`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddonApplicationSection {
+    /// ID panelu UI startowego — frontend po kliknieciu w menu woła
+    /// `AddonUiPanelGetRequest { addon_id, panel_id }`.
+    pub entry_panel: String,
+    /// Tytul widoczny pod ikona w launchu.
+    pub title: String,
+    /// Identyfikator ikony sprite (np. "i-camera"). Domyslnie `addon.icon`.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Opcjonalna kolejnosc w menu (mniejsza wartosc = wyzej). Default 100.
+    #[serde(default)]
+    pub sort_order: Option<i32>,
 }
 
 /// Sekcja [service] manifestu — deklaracja trybu ciaglego addonu.
@@ -125,6 +149,12 @@ pub struct AddonServiceSection {
     /// na typowy poll/aggregation, blokuje runaway loop w guest.
     #[serde(default)]
     pub tick_fuel_budget: Option<u64>,
+    /// Hard deadline na pojedynczy tick w ms. Watchdog thread po wygasnieciu
+    /// wola `engine.increment_epoch()` — guest dostaje trap nawet jesli paliwo
+    /// jeszcze jest (np. addon zablokowany w host_function long-poll).
+    /// `None` = brak deadline, wystarczy fuel limit.
+    #[serde(default)]
+    pub tick_timeout_ms: Option<u64>,
 }
 
 /// Sekcja [visibility] manifestu — kontrola widocznosci addona w GUI.
@@ -299,6 +329,11 @@ pub struct AddonState {
     pub router: Option<Arc<crate::routing::router::Router>>,
     /// Per-account mutex map used to serialize OAuth refresh_token calls.
     pub oauth_refresh_guard: Arc<oauth_refresh_guard::OAuthRefreshGuard>,
+    /// Shared cache UI panel state — host function `ui_render` zapisuje tu
+    /// drzewo komponentow, MessageBody handler `AddonUiPanelGetRequest`
+    /// odczytuje. `None` w testach event_bus w izolacji.
+    pub ui_panels:
+        Option<Arc<PlRwLock<HashMap<(String, String), serde_json::Value>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -359,6 +394,12 @@ pub struct AddonManager {
     /// wola `cancel()` na tokenie — tick loop wychodzi po nastepnym
     /// `select!`, zwalnia uchwyt do instancji.
     service_tasks: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Cache ostatnio wyrenderowanego UI tree per (addon_id, panel_id).
+    /// Addon woła `ui_render(panel_id, tree)` z guest WASM, host zapisuje
+    /// `tree` w tym cache; frontend GUI pyta przez MessageBody
+    /// `AddonUiPanelGetRequest`. Push do frontu przez bus subscribe wraca
+    /// w przyszlej iteracji.
+    ui_panels: Arc<PlRwLock<HashMap<(String, String), serde_json::Value>>>,
 }
 
 impl AddonManager {
@@ -390,7 +431,30 @@ impl AddonManager {
             router: Arc::new(PlRwLock::new(None)),
             flow_blocks_registry: Arc::new(flow_blocks::AddonFlowRegistry::new()),
             service_tasks: Arc::new(Mutex::new(HashMap::new())),
+            ui_panels: Arc::new(PlRwLock::new(HashMap::new())),
         })
+    }
+
+    /// Zwraca handle do cache UI panel state — host function `ui_render`
+    /// uzywa do zapisu, handler `AddonUiPanelGetRequest` do odczytu.
+    pub fn ui_panels(&self) -> Arc<PlRwLock<HashMap<(String, String), serde_json::Value>>> {
+        self.ui_panels.clone()
+    }
+
+    /// Wywoluje `on_request` na running instance addonu z action_id i params
+    /// — uzywane dla button click / form submit z UI panel.
+    /// Konwencja tool name: `ui.{panel_id}.{action_id}`. Reuse istniejacego
+    /// on_request ABI (parse params z JSON, wykonaj akcje, zwroc JSON).
+    pub fn invoke_ui_action(
+        &self,
+        addon_id: &str,
+        panel_id: &str,
+        action_id: &str,
+        params: serde_json::Value,
+        user_id: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let tool_name = format!("ui.{}.{}", panel_id, action_id);
+        self.call_tool(addon_id, &tool_name, params, user_id.unwrap_or(0))
     }
 
     /// Zwraca rejestr flow blocks — dispatcher buduje z tego dynamic resolver
@@ -535,6 +599,7 @@ impl AddonManager {
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.read().clone(),
             oauth_refresh_guard: self.oauth_refresh_guard.clone(),
+            ui_panels: Some(self.ui_panels.clone()),
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -619,11 +684,13 @@ impl AddonManager {
                     if let Some(interval_ms) = service.tick_interval_ms {
                         if interval_ms > 0 {
                             let fuel = service.tick_fuel_budget.unwrap_or(5_000_000);
+                            let timeout_ms = service.tick_timeout_ms;
                             self.spawn_service_tick_loop(
                                 addon_id.to_string(),
                                 instance_id.clone(),
                                 interval_ms,
                                 fuel,
+                                timeout_ms,
                             );
                         }
                     }
@@ -643,6 +710,102 @@ impl AddonManager {
         Ok(instance_id)
     }
 
+    /// Auto-start wszystkich zainstalowanych addonow w trybie service ktore
+    /// maja `is_enabled = true` w DB. Wolane raz przy starcie binarki po
+    /// `start_event_dispatcher` — bez tego addony service mode dzialaja tylko
+    /// w sesji w ktorej zostaly explicit `start_addon`'em, a po reboocie
+    /// tentaflow trzeba je rece startowac.
+    pub fn auto_start_services(&self) {
+        let addons = match crate::db::repository::list_addons(&self.db) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("auto_start_services: list_addons: {}", e);
+                return;
+            }
+        };
+        for a in addons {
+            if !a.is_enabled {
+                continue;
+            }
+            let manifest: AddonManifest = match serde_json::from_str(&a.manifest_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "auto_start_services: '{}' manifest_json niepoprawny: {}",
+                        a.addon_id, e
+                    );
+                    continue;
+                }
+            };
+            let has_service = manifest
+                .service
+                .as_ref()
+                .map(|s| s.enabled && s.tick_interval_ms.map(|i| i > 0).unwrap_or(false))
+                .unwrap_or(false);
+            if !has_service {
+                continue;
+            }
+            match self.start_addon(&a.addon_id, None) {
+                Ok(iid) => info!(
+                    "auto_start_services: '{}' uruchomiony, instance_id={}",
+                    a.addon_id, iid
+                ),
+                Err(e) => warn!("auto_start_services: '{}' fail: {}", a.addon_id, e),
+            }
+        }
+    }
+
+    /// Toggle `is_enabled` flagi w DB + runtime side-effects:
+    /// - `enabled = false`: zatrzymuje wszystkie running instances tego addonu
+    ///   (anulujac service tick loops). Konfiguracja zostaje w DB, mozna
+    ///   wlaczyc z powrotem bez deinstalacji.
+    /// - `enabled = true`: aktualizuje flage; jezeli addon ma service mode,
+    ///   startuje swiezo instancje.
+    pub fn set_addon_enabled(&self, addon_id: &str, enabled: bool) -> Result<()> {
+        info!(
+            "Toggle is_enabled dla addonu '{}' -> {}",
+            addon_id, enabled
+        );
+
+        {
+            let conn = self.db.lock().unwrap();
+            conn.execute(
+                "UPDATE addons SET is_enabled = ?1, updated_at = datetime('now') WHERE addon_id = ?2",
+                rusqlite::params![enabled as i64, addon_id],
+            )
+            .map_err(|e| anyhow::anyhow!("UPDATE is_enabled: {e}"))?;
+        }
+
+        if !enabled {
+            // Zatrzymaj wszystkie instancje
+            let instance_ids: Vec<String> = {
+                let instances = self.instances.lock();
+                instances
+                    .get(addon_id)
+                    .map(|v| v.iter().map(|i| i.instance_id.clone()).collect())
+                    .unwrap_or_default()
+            };
+            for iid in instance_ids {
+                if let Err(e) = self.stop_addon(&iid) {
+                    warn!("set_addon_enabled stop '{}': {}", iid, e);
+                }
+            }
+        } else {
+            // Sprawdz czy ma service mode — jesli tak, wystartuj
+            let manifest = self.load_addon_manifest(addon_id)?;
+            let has_service = manifest
+                .service
+                .as_ref()
+                .map(|s| s.enabled && s.tick_interval_ms.map(|i| i > 0).unwrap_or(false))
+                .unwrap_or(false);
+            if has_service {
+                self.start_addon(addon_id, None)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Spawnuje petle tickow dla addonu w trybie service. Loop dziala dopóki
     /// `stop_addon` nie anuluje tokenu w `service_tasks`. Kazdy tick:
     /// - sprawdza cancel token (select),
@@ -659,6 +822,7 @@ impl AddonManager {
         instance_id: String,
         interval_ms: u64,
         fuel_per_tick: u64,
+        timeout_ms: Option<u64>,
     ) {
         let token = tokio_util::sync::CancellationToken::new();
         self.service_tasks
@@ -700,6 +864,7 @@ impl AddonManager {
                                 &addon_id_for_log,
                                 &instance_id_for_log,
                                 fuel_per_tick,
+                                timeout_ms,
                             )
                         });
                         if let Err(e) = res {
@@ -732,10 +897,11 @@ impl AddonManager {
     /// tasku — przekazujemy Arc'i pól bezposrednio.
     fn call_tick_static(
         instances_map: &Arc<Mutex<HashMap<String, Vec<AddonInstance>>>>,
-        _engine: &runtime::WasmEngine,
+        engine: &runtime::WasmEngine,
         addon_id: &str,
         instance_id: &str,
         fuel_per_tick: u64,
+        timeout_ms: Option<u64>,
     ) -> Result<()> {
         // Wyciagnij instancje (lock briefly)
         let mut addon_instance = {
@@ -755,6 +921,20 @@ impl AddonManager {
         // Refuel — kazdy tick dostaje swiezy budzet.
         let _ = runtime::refuel_store(&mut addon_instance.store, fuel_per_tick);
 
+        // Watchdog deadline — gdy timeout_ms set, spawnujemy thread ktory po
+        // wygasnieciu inkrementuje engine epoch. Store ma juz
+        // epoch_deadline_async_yield_and_update(1) z create_store, wiec
+        // pierwszy increment trapuje guesta nawet jesli paliwo zostalo.
+        // Watchdog jest detached — sleep+increment_epoch wraca naturalnie.
+        let watchdog = timeout_ms.map(|t| {
+            let engine = engine.clone();
+            let dur = std::time::Duration::from_millis(t);
+            std::thread::spawn(move || {
+                std::thread::sleep(dur);
+                engine.increment_epoch();
+            })
+        });
+
         // Wywolaj on_tick(timestamp_ms) -> i32 — addon nie musi go eksportowac;
         // brak exportu = no-op (instance zostaje aktywna na inne hooks
         // jak on_event).
@@ -773,6 +953,10 @@ impl AddonManager {
             }
             Ok(())
         })();
+
+        // Watchdog cleanup — niezaleznie od wyniku ticka, watek detached
+        // i tak sie skonczy po sleep. Drop nie blokuje na join.
+        drop(watchdog);
 
         // Wloz z powrotem nawet przy bledzie — pojedyncza nieudana tura nie
         // zabija service (np. transient error w dispatch'u host_function).
@@ -1159,6 +1343,7 @@ impl AddonManager {
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.read().clone(),
             oauth_refresh_guard: self.oauth_refresh_guard.clone(),
+            ui_panels: Some(self.ui_panels.clone()),
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
             #[cfg(any(target_os = "ios", target_os = "android"))]

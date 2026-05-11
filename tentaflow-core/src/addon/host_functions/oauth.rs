@@ -456,6 +456,7 @@ mod tests {
             manifest: Arc::new(AddonManifest::default()),
             memory_limit: 64 * 1024 * 1024,
             router: None,
+            ui_panels: None,
             oauth_refresh_guard: Arc::new(
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
             ),

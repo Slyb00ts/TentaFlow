@@ -77,22 +77,17 @@ pub fn ui_render(
     let addon_id = caller.data().addon_id.clone();
     info!("ui_render: addon='{}', panel_id='{}'", addon_id, panel_id);
 
-    // Parsuj komponenty UI i renderuj na HTML
-    let panel = crate::addon::ui_framework::UiPanel {
-        addon_id: addon_id.clone(),
-        panel_id: panel_id.clone(),
-        title: ui_value
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Addon Panel")
-            .to_string(),
-        components: crate::addon::ui_framework::parse_components_from_json(&ui_value),
-    };
+    // Zapisz drzewo UI do globalnego cache panelu — frontend GUI pyta
+    // przez `AddonUiPanelGetRequest` i renderuje przez tf-* komponenty.
+    // Host nie renderuje HTML; addon SDK przekazuje "czyste" drzewo.
+    if let Some(cache) = caller.data().ui_panels.clone() {
+        cache
+            .write()
+            .insert((addon_id.clone(), panel_id.clone()), ui_value.clone());
+    }
 
-    // Renderuj HTML i opublikuj event z wynikiem
-    let html = panel.to_html();
-
-    // Wyslij event z wyrenderowanym UI
+    // Event "ui.panel_rendered" zostaje — inne addony moga reagowac (np.
+    // notification overlay) + przyszly push do frontu przez bus subscribe.
     caller
         .data()
         .event_bus
@@ -101,9 +96,9 @@ pub fn ui_render(
             source_addon: Some(addon_id.clone()),
             source_user: caller.data().user_id,
             payload: serde_json::json!({
+                "addon_id": &addon_id,
                 "panel_id": &panel_id,
-                "html": &html,
-                "json": &ui_value,
+                "tree": &ui_value,
             }),
             timestamp: chrono::Utc::now(),
         });

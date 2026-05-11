@@ -444,6 +444,11 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::info!("FlowDispatcher: addon block resolver wpiety");
     }
 
+    // Auto-start wszystkich service-mode addonow ktore byly enabled przed
+    // reboot'em — bez tego service mode dzialalby tylko w sesji w ktorej
+    // admin explicit kliknal Start.
+    addon_manager.auto_start_services();
+
     // Mesh networking — iroh (LAN mDNS + DHT + relay), wspoldzielony pipeline z Core
     let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> =
         None;
