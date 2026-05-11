@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct TriggerNodeAdapter;
@@ -26,26 +26,17 @@ impl Default for TriggerNodeAdapter {
     }
 }
 
-const INPUT_PORTS: &[&str] = &[];
 // Sześć typed output portów per modality: `text` / `audio` / `image` /
-// `video` / `embedding` / `other`. Każde wyjście emituje typed `FlowDataType`
-// (`output_port_type` ponizej), R8 walidacja krawedzi wymusza ze krawedz z
-// portu `audio` laczy sie tylko z node'm o `input_port_type = Audio` (lub
-// `Any`). Runtime: trigger emituje pojedynczy envelope (passthrough z
-// `ctx.initial_envelope`); informacja o porcie sluzy walidacji
-// compile-time + GUI rendering. Multi-modal payload w envelope niesie
-// wszystkie typy z requestu, downstream node konsumuje swoja czesc.
+// `video` / `embedding` / `other`. Każde wyjście emituje typed `FlowDataType`,
+// R8 walidacja krawedzi wymusza ze krawedz z portu `audio` laczy sie tylko
+// z node'm o input_port_type = Audio (lub Any). Runtime: trigger emituje
+// pojedynczy envelope (passthrough z `ctx.initial_envelope`); informacja o
+// porcie sluzy walidacji compile-time + GUI rendering. Multi-modal payload
+// w envelope niesie wszystkie typy z requestu, downstream node konsumuje
+// swoja czesc.
 //
 // `other` to kanał dla plików ktore nie sa native media (PDF, DOCX, XLSX,
 // ZIP itp.) — adapter konsumujacy musi czytac `FlowValue::Other.mime`.
-const OUTPUT_PORTS: &[&str] = &[
-    "text",
-    "audio",
-    "image",
-    "video",
-    "embedding",
-    "other",
-];
 
 #[async_trait]
 impl NodeAdapter for TriggerNodeAdapter {
@@ -53,24 +44,19 @@ impl NodeAdapter for TriggerNodeAdapter {
         "trigger"
     }
 
-    fn supported_input_ports(&self) -> &[&'static str] {
-        INPUT_PORTS
+    fn input_ports(&self) -> Vec<PortSpec> {
+        Vec::new()
     }
 
-    fn supported_output_ports(&self) -> &[&'static str] {
-        OUTPUT_PORTS
-    }
-
-    fn output_port_type(&self, port: &str) -> FlowDataType {
-        match port {
-            "text" => FlowDataType::Text,
-            "audio" => FlowDataType::Audio,
-            "image" => FlowDataType::Image,
-            "video" => FlowDataType::Video,
-            "embedding" => FlowDataType::Embedding,
-            "other" => FlowDataType::Other,
-            _ => FlowDataType::Any,
-        }
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![
+            PortSpec::new("text", FlowDataType::Text),
+            PortSpec::new("audio", FlowDataType::Audio),
+            PortSpec::new("image", FlowDataType::Image),
+            PortSpec::new("video", FlowDataType::Video),
+            PortSpec::new("embedding", FlowDataType::Embedding),
+            PortSpec::new("other", FlowDataType::Other),
+        ]
     }
 
     async fn execute(
@@ -143,11 +129,9 @@ mod tests {
     #[test]
     fn trigger_advertises_six_typed_output_ports() {
         let a = TriggerNodeAdapter::new();
-        assert!(a.supported_input_ports().is_empty());
-        assert_eq!(
-            a.supported_output_ports(),
-            &["text", "audio", "image", "video", "embedding", "other"]
-        );
+        assert!(a.input_ports().is_empty());
+        let names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["text", "audio", "image", "video", "embedding", "other"]);
         assert_eq!(a.node_type(), "trigger");
         assert_eq!(a.output_port_type("text"), FlowDataType::Text);
         assert_eq!(a.output_port_type("audio"), FlowDataType::Audio);

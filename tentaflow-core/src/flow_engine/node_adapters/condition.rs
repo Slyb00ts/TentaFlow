@@ -12,8 +12,8 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct ConditionNodeAdapter;
 
@@ -29,21 +29,21 @@ impl Default for ConditionNodeAdapter {
     }
 }
 
-const INPUT_PORTS: &[&str] = &["in"];
-const OUTPUT_PORTS: &[&str] = &["true", "false"];
-
 #[async_trait]
 impl NodeAdapter for ConditionNodeAdapter {
     fn node_type(&self) -> &str {
         "condition"
     }
 
-    fn supported_input_ports(&self) -> &[&'static str] {
-        INPUT_PORTS
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Any)]
     }
 
-    fn supported_output_ports(&self) -> &[&'static str] {
-        OUTPUT_PORTS
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![
+            PortSpec::new("true", FlowDataType::Any),
+            PortSpec::new("false", FlowDataType::Any),
+        ]
     }
 
     async fn execute(
@@ -331,8 +331,10 @@ mod tests {
     #[test]
     fn condition_advertises_true_false_ports() {
         let a = ConditionNodeAdapter;
-        assert_eq!(a.supported_input_ports(), &["in"]);
-        assert_eq!(a.supported_output_ports(), &["true", "false"]);
+        let in_names: Vec<String> = a.input_ports().iter().map(|p| p.name.clone()).collect();
+        let out_names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(in_names, vec!["in"]);
+        assert_eq!(out_names, vec!["true", "false"]);
     }
 
     #[test]

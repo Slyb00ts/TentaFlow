@@ -13,7 +13,7 @@ use crate::flow_engine::dispatchers::LlmRequest;
 use crate::flow_engine::envelope::{
     ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput,
 };
-use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "llm";
@@ -159,26 +159,21 @@ impl NodeAdapter for LlmNodeAdapter {
     fn node_type(&self) -> &str {
         NODE_TYPE
     }
-    fn supported_input_ports(&self) -> &[&'static str] {
-        &["in"]
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Text)]
     }
-    fn supported_output_ports(&self) -> &[&'static str] {
+    fn output_ports(&self) -> Vec<PortSpec> {
         // Adapter umie wyprodukować obie formy outputu — streaming
         // (przez prepare_llm_request + ctx.llm.stream_chat) i blocking
         // (execute → ctx.llm.execute_chat). Wybór ścieżki zależy od
         // executora (compiled.is_streaming); end-shape validation
         // przyjdzie razem z executor rewrite w stage 1d.
-        &["stream", "full"]
-    }
-
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
-    }
-
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
         // Zarówno `stream` jak i `full` produkują Text. Multimodal LLM
         // (Vision/Omni) jest osobnym node type w Etap 3.
-        FlowDataType::Text
+        vec![
+            PortSpec::new("stream", FlowDataType::Text),
+            PortSpec::new("full", FlowDataType::Text),
+        ]
     }
 
     async fn execute(

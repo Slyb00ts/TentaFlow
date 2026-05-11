@@ -107,11 +107,36 @@ pub struct ExecutionContext {
     pub usage_sink: Arc<UsageSink>,
 }
 
+/// Pojedynczy port — nazwa + typ danych. Adapter zwraca `Vec<PortSpec>` z
+/// `input_ports()`/`output_ports()`. Owned String pozwala na dynamiczne porty
+/// (addon block adapter buduje listę z manifest blocks.json) bez `'static`
+/// constraintu na rdzeniowych adapterach.
+#[derive(Debug, Clone)]
+pub struct PortSpec {
+    pub name: String,
+    pub data_type: FlowDataType,
+}
+
+impl PortSpec {
+    pub fn new(name: impl Into<String>, data_type: FlowDataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+        }
+    }
+}
+
 #[async_trait]
 pub trait NodeAdapter: Send + Sync {
     fn node_type(&self) -> &str;
-    fn supported_input_ports(&self) -> &[&'static str];
-    fn supported_output_ports(&self) -> &[&'static str];
+
+    /// Lista wspieranych input portów. Każdy z deklaracją typu (FlowDataType)
+    /// dla walidacji R8 (edge type compatibility). Walidacja R3 sprawdza
+    /// `edge.to_port` ∈ {p.name}.
+    fn input_ports(&self) -> Vec<PortSpec>;
+
+    /// Lista wspieranych output portów (analogicznie do `input_ports`).
+    fn output_ports(&self) -> Vec<PortSpec>;
 
     /// Pojedyncza metoda execute — zgodnie z hard rule 8 z planu v4.1.
     /// Streaming jest cechą flow (executor decyduje), nie adaptera. LLM
@@ -123,17 +148,26 @@ pub trait NodeAdapter: Send + Sync {
         ctx: &ExecutionContext,
     ) -> Result<FlowEnvelope>;
 
-    /// Etap 2: typ danych przyjmowanych na danym input port. Default `Any`
-    /// (passthrough adaptery: trigger, output, condition, conversation_history,
-    /// session_context, speaker_context). Walidacja R8 sprawdza zgodność z
-    /// `edge.data_type` i z `output_port_type` producenta.
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Any
+    /// Etap 2: typ danych przyjmowanych na danym input port. Default —
+    /// derive z `input_ports()` (lookup po nazwie); jeśli port nie jest
+    /// zadeklarowany zwraca `Any` (passthrough). Adapter z prostym mappingiem
+    /// 1:1 może nie nadpisywać tej metody.
+    fn input_port_type(&self, port: &str) -> FlowDataType {
+        self.input_ports()
+            .into_iter()
+            .find(|p| p.name == port)
+            .map(|p| p.data_type)
+            .unwrap_or(FlowDataType::Any)
     }
 
-    /// Etap 2: typ danych emitowanych na danym output port. Default `Any`.
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Any
+    /// Etap 2: typ danych emitowanych na danym output port. Default —
+    /// derive z `output_ports()` (analogicznie do `input_port_type`).
+    fn output_port_type(&self, port: &str) -> FlowDataType {
+        self.output_ports()
+            .into_iter()
+            .find(|p| p.name == port)
+            .map(|p| p.data_type)
+            .unwrap_or(FlowDataType::Any)
     }
 
     /// Etap 2: ArtifactKey deklaracje — klucze które adapter MOŻE wyprodukować
@@ -204,13 +238,31 @@ pub trait StreamingNodeAdapter: NodeAdapter {
     fn stream_output_kind(&self) -> crate::flow_engine::envelope::EnvelopeDeltaKind;
 }
 
+/// Resolver dla dynamicznych typów node — adaptery rejestrowane runtime po
+/// instalacji addonu (np. block z `addon.{id}.{name}`). Zwraca `None` gdy nie
+/// znajduje match'a; registry zwraca wynik z `dynamic_resolver` jeśli builtin
+/// map nie zawiera node_type.
+///
+/// `Send + Sync` bo registry jest dzielone między task'i executora przez `Arc`.
+pub type DynamicAdapterResolver =
+    Arc<dyn Fn(&str) -> Option<Arc<dyn NodeAdapter>> + Send + Sync>;
+
 /// Registry z typed accessorem dla LLM (plan v4.1 — bez downcastu) + streaming
-/// slot (Krok 2). Adaptery dual-trait (NodeAdapter + StreamingNodeAdapter)
-/// rejestrują się przez `register_streaming` w obu slotach.
+/// slot (Krok 2) + dynamic_resolver dla addon block adapterów. Adaptery
+/// dual-trait (NodeAdapter + StreamingNodeAdapter) rejestrują się przez
+/// `register_streaming` w obu slotach.
+///
+/// Lookup priority: builtin `adapters` > `dynamic_resolver` (jeśli ustawiony).
+/// To pozwala core adapterowi wygrać z addonem deklarującym ten sam node_type
+/// (np. addon malicious rejestrujący `llm` nie nadpisze prawdziwego).
 pub struct AdapterRegistry {
     adapters: HashMap<String, Arc<dyn NodeAdapter>>,
     llm: Option<Arc<dyn LlmAdapter>>,
     streaming_adapters: HashMap<String, Arc<dyn StreamingNodeAdapter>>,
+    /// Resolver dla node_type'ów nie znalezionych w `adapters`. Cache wynikow
+    /// (jeden lookup = jedno wywolanie) wewnatrz resolver-impl, registry nie
+    /// memoize'uje — co compile flow to nowe pytanie.
+    dynamic_resolver: Option<DynamicAdapterResolver>,
 }
 
 impl AdapterRegistry {
@@ -219,6 +271,7 @@ impl AdapterRegistry {
             adapters: HashMap::new(),
             llm: None,
             streaming_adapters: HashMap::new(),
+            dynamic_resolver: None,
         }
     }
 
@@ -243,18 +296,45 @@ impl AdapterRegistry {
         self.llm = Some(typed);
     }
 
-    pub fn get(&self, node_type: &str) -> Option<&Arc<dyn NodeAdapter>> {
-        self.adapters.get(node_type)
+    /// Ustawia dynamic resolver dla node_type'ów nie zarejestrowanych jako
+    /// builtin. Pierwszy resolver wygrywa; kolejne `set_dynamic_resolver`
+    /// nadpisuje poprzedni (typowo: bootstrap setuje raz po
+    /// register_llm + register'ach).
+    pub fn set_dynamic_resolver(&mut self, resolver: DynamicAdapterResolver) {
+        self.dynamic_resolver = Some(resolver);
+    }
+
+    /// Zwraca adapter dla podanego node_type. Najpierw szuka w builtin map,
+    /// fallback przez `dynamic_resolver` (jeśli skonfigurowany). Wynik
+    /// resolvera jest klonem `Arc` — nie cache'ujemy w registry, bo addon
+    /// może w międzyczasie zostać odinstalowany.
+    pub fn get(&self, node_type: &str) -> Option<Arc<dyn NodeAdapter>> {
+        if let Some(a) = self.adapters.get(node_type) {
+            return Some(a.clone());
+        }
+        self.dynamic_resolver
+            .as_ref()
+            .and_then(|r| r(node_type))
     }
 
     pub fn has(&self, node_type: &str) -> bool {
-        self.adapters.contains_key(node_type)
+        if self.adapters.contains_key(node_type) {
+            return true;
+        }
+        self.dynamic_resolver
+            .as_ref()
+            .map(|r| r(node_type).is_some())
+            .unwrap_or(false)
     }
 
     pub fn llm(&self) -> Option<&Arc<dyn LlmAdapter>> {
         self.llm.as_ref()
     }
 
+    /// Zwraca tylko statycznie zarejestrowane node_type'y. Dynamiczne addon
+    /// block typy nie są tu wymienione, bo resolver nie wie a priori jakie
+    /// typy potrafi obsłużyć — to znana niedokładność (acceptable: GUI list
+    /// addon blocks z `AddonFlowRegistry`, builtin types z tego API).
     pub fn registered_types(&self) -> Vec<&str> {
         self.adapters.keys().map(|s| s.as_str()).collect()
     }

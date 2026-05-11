@@ -22,7 +22,7 @@ use crate::flow_engine::envelope::{
     ArtifactProvenance, AudioStreamChunk, EnvelopeDelta, EnvelopeDeltaKind, FinishReason,
     FlowEnvelope, FlowValue, NodeInput,
 };
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, StreamingNodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "tts_stream_bridge";
@@ -105,19 +105,14 @@ impl NodeAdapter for TtsStreamBridgeNodeAdapter {
     fn node_type(&self) -> &str {
         NODE_TYPE
     }
-    fn supported_input_ports(&self) -> &[&'static str] {
-        &["in"]
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Text)]
     }
-    fn supported_output_ports(&self) -> &[&'static str] {
-        &["full", "stream"]
-    }
-
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
-    }
-
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Audio
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![
+            PortSpec::new("full", FlowDataType::Audio),
+            PortSpec::new("stream", FlowDataType::Audio),
+        ]
     }
 
     fn produced_artifacts(&self) -> &[(&'static str, FlowDataType)] {

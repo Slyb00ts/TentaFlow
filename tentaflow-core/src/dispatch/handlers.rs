@@ -1015,23 +1015,19 @@ pub fn flow_node_templates_list(
             let (input_ports, output_ports, input_port_types, output_port_types) =
                 match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
                     Some(adapter) => {
-                        let in_ports: Vec<String> = adapter
-                            .supported_input_ports()
+                        let in_specs = adapter.input_ports();
+                        let out_specs = adapter.output_ports();
+                        let in_ports: Vec<String> =
+                            in_specs.iter().map(|p| p.name.clone()).collect();
+                        let out_ports: Vec<String> =
+                            out_specs.iter().map(|p| p.name.clone()).collect();
+                        let in_types: Vec<String> = in_specs
                             .iter()
-                            .map(|s| s.to_string())
+                            .map(|p| p.data_type.as_wire_str().to_string())
                             .collect();
-                        let out_ports: Vec<String> = adapter
-                            .supported_output_ports()
+                        let out_types: Vec<String> = out_specs
                             .iter()
-                            .map(|s| s.to_string())
-                            .collect();
-                        let in_types: Vec<String> = in_ports
-                            .iter()
-                            .map(|p| adapter.input_port_type(p).as_wire_str().to_string())
-                            .collect();
-                        let out_types: Vec<String> = out_ports
-                            .iter()
-                            .map(|p| adapter.output_port_type(p).as_wire_str().to_string())
+                            .map(|p| p.data_type.as_wire_str().to_string())
                             .collect();
                         (in_ports, out_ports, in_types, out_types)
                     }
