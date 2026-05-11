@@ -326,6 +326,9 @@ pub struct AddonManager {
     registered_tools: Arc<PlRwLock<Vec<ToolDefinition>>>,
     /// Router do routowania requestow LLM z addonow
     router: Arc<PlRwLock<Option<Arc<crate::routing::router::Router>>>>,
+    /// Rejestr custom flow blocks z addonow. Resolver `AdapterRegistry` woła
+    /// `find_block` po prefiksowanym node_type ("addon.{id}.{name}").
+    flow_blocks_registry: Arc<flow_blocks::AddonFlowRegistry>,
 }
 
 impl AddonManager {
@@ -355,7 +358,15 @@ impl AddonManager {
             oauth_refresh_guard: Arc::new(oauth_refresh_guard::OAuthRefreshGuard::new()),
             registered_tools: Arc::new(PlRwLock::new(Vec::new())),
             router: Arc::new(PlRwLock::new(None)),
+            flow_blocks_registry: Arc::new(flow_blocks::AddonFlowRegistry::new()),
         })
+    }
+
+    /// Zwraca rejestr flow blocks — dispatcher buduje z tego dynamic resolver
+    /// dla `AdapterRegistry`, GUI handler dla listy bloków serializuje
+    /// `list_all_blocks()`.
+    pub fn flow_blocks_registry(&self) -> &Arc<flow_blocks::AddonFlowRegistry> {
+        &self.flow_blocks_registry
     }
 
     /// Ustawia router do routowania requestow LLM z addonow
@@ -374,6 +385,26 @@ impl AddonManager {
 
         // Zarejestruj narzedzia z manifestu
         self.register_tools_from_manifest(&manifest)?;
+
+        // Zarejestruj custom flow blocks (jesli addon dostarcza blocks.json
+        // obok manifest.toml). Brak blocks.json = addon nie deklaruje
+        // bloków — graceful skip.
+        match flow_blocks::load_blocks_from_addon(&manifest.addon_id, addon_path) {
+            Ok(blocks) if !blocks.is_empty() => {
+                let count = blocks.len();
+                self.flow_blocks_registry
+                    .register_addon_blocks(&manifest.addon_id, blocks);
+                info!(
+                    "Addon '{}': zarejestrowano {} flow block(s)",
+                    manifest.addon_id, count
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Addon '{}': blad ladowania blocks.json: {}",
+                manifest.addon_id, e
+            ),
+        }
 
         // Automatyczne aliasy modeli dla teams-bot
         if manifest.addon_id == "teams-bot" {
@@ -413,6 +444,12 @@ impl AddonManager {
         self.registered_tools
             .write()
             .retain(|t| t.addon_id != addon_id);
+
+        // Usun custom flow blocks — adapter resolver natychmiast przestanie
+        // ich znajdowac, kompilacje flow w trakcie zostawiamy w spokoju (mają
+        // własną kopię flow definition, executor po prostu zwroci "no
+        // adapter for node" przy nastepnym uzyciu).
+        self.flow_blocks_registry.unregister_addon_blocks(addon_id);
 
         // Usun z DB
         lifecycle::uninstall(addon_id, &self.db)?;
@@ -848,6 +885,230 @@ impl AddonManager {
 
         // Loguj do audit
         self.log_audit(addon_id, user_id, "tool.call", Some(tool_name), None);
+
+        result
+    }
+
+    /// Wywoluje pojedynczy blok flow z addonu — fresh instancja per call,
+    /// per-call fuel budget, opcjonalny deadline (epoch interruption z
+    /// background task'a). Decyzje #6 i #7 z planu addonow:
+    /// - fresh instance per call (zero state leakage miedzy invocations)
+    /// - per-call fuel/memory/timeout (DoS protection przed addon z `while {}`).
+    ///
+    /// ABI guest: ten sam co `call_tool` (`on_request(in_ptr, in_len, out_ptr,
+    /// out_cap, out_len_ptr) -> i32`), z konwencja tool name = "block.{block_type}".
+    /// `envelope_json` to serialized FlowEnvelope; response to envelope JSON
+    /// po wykonaniu logiki bloku.
+    pub fn invoke_block(
+        &self,
+        addon_id: &str,
+        block_type: &str,
+        envelope_json: &[u8],
+        user_id: Option<i64>,
+        fuel_budget: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<u8>> {
+        info!(
+            "Wywolanie flow blocku '{}.{}' (user_id={:?}, fuel={}, deadline={:?})",
+            addon_id, block_type, user_id, fuel_budget, deadline
+        );
+
+        // Permission: addon musi miec "flow_blocks" (opcjonalnie z resource =
+        // block_type, ale dla MVP wystarczy ogolne). Brak uprawnien = bail.
+        if let Some(uid) = user_id {
+            let perm = self
+                .permission_checker
+                .check(addon_id, uid, "flow_blocks", Some(block_type));
+            if !perm.is_granted() {
+                bail!(
+                    "Brak uprawnien 'flow_blocks' dla addonu '{}' (user_id={})",
+                    addon_id,
+                    uid
+                );
+            }
+        }
+
+        let module = self.get_or_compile_module(addon_id)?;
+        let permissions = self.load_addon_permissions(addon_id)?;
+        let manifest = self.load_addon_manifest(addon_id)?;
+
+        let instance_id = format!("block-{}", uuid::Uuid::new_v4());
+
+        // Fresh AddonState — odizolowane od running instances w `self.instances`.
+        let state = AddonState {
+            addon_id: addon_id.to_string(),
+            instance_id: instance_id.clone(),
+            user_id,
+            db: self.db.clone(),
+            permissions,
+            event_bus: self.event_bus.clone(),
+            permission_checker: self.permission_checker.clone(),
+            fuel_consumed: 0,
+            is_system_call: user_id.is_none(),
+            rate_limiter: None,
+            net_manager: Arc::new(Mutex::new(
+                host_functions::network::NetworkConnectionManager::new(),
+            )),
+            settings_cipher: self.settings_cipher.clone(),
+            manifest: Arc::new(manifest),
+            memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
+            router: self.router.read().clone(),
+            oauth_refresh_guard: self.oauth_refresh_guard.clone(),
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            store_limits: wasmi::StoreLimitsBuilder::new()
+                .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
+                .trap_on_grow_failure(true)
+                .instances(10)
+                .memories(1)
+                .tables(10)
+                .build(),
+        };
+
+        let mut store = runtime::create_store(&self.engine, state)?;
+        store
+            .set_fuel(fuel_budget)
+            .map_err(|e| anyhow::anyhow!("set_fuel({}): {e}", fuel_budget))?;
+
+        // Epoch watchdog — jesli deadline jest set, spawnujemy task ktory
+        // po wygasnieciu inkrementuje engine epoch. Store ma juz
+        // epoch_deadline_async_yield_and_update(1) z create_store, wiec
+        // pierwszy increment przerwie wykonanie WASM.
+        let watchdog = deadline.map(|d| {
+            let engine = self.engine.clone();
+            std::thread::spawn(move || {
+                let now = std::time::Instant::now();
+                if d > now {
+                    std::thread::sleep(d - now);
+                }
+                engine.increment_epoch();
+            })
+        });
+
+        let mut linker = runtime::create_linker(&self.engine);
+        host_functions::register_host_functions(&mut linker)?;
+        let instance = runtime::instantiate(&linker, &mut store, &module)?;
+
+        // Request: konwencja tool = "block.{block_type}", params = envelope JSON.
+        // Addon parsuje `params` jako FlowEnvelope-shaped Value.
+        let envelope_value: serde_json::Value = serde_json::from_slice(envelope_json)
+            .map_err(|e| anyhow::anyhow!("invoke_block: envelope_json nie jest valid JSON: {e}"))?;
+        let request_json = serde_json::json!({
+            "tool": format!("block.{}", block_type),
+            "params": envelope_value,
+            "user_id": user_id,
+        });
+        let request_bytes = serde_json::to_vec(&request_json)?;
+
+        let result = (|| -> Result<Vec<u8>> {
+            let alloc_fn = instance
+                .get_typed_func::<i32, i32>(&mut store, "alloc")
+                .map_err(|e| anyhow::anyhow!("brak alloc(): {e}"))?;
+
+            let input_ptr = alloc_fn
+                .call(&mut store, request_bytes.len() as i32)
+                .map_err(|e| anyhow::anyhow!("alloc(input): {e}"))?;
+            if input_ptr < 0 {
+                bail!("alloc(input) zwrocil {} ", input_ptr);
+            }
+
+            let memory = instance
+                .get_memory(&mut store, "memory")
+                .ok_or_else(|| anyhow::anyhow!("brak export 'memory'"))?;
+
+            let input_end = (input_ptr as usize)
+                .checked_add(request_bytes.len())
+                .ok_or_else(|| anyhow::anyhow!("input range overflow"))?;
+            if input_end > memory.data(&store).len() {
+                bail!("input buffer poza guest memory");
+            }
+            memory.data_mut(&mut store)[input_ptr as usize..input_end]
+                .copy_from_slice(&request_bytes);
+
+            // 256KB output buffer — flow blocks moga zwracac caly envelope z
+            // historia, wiec wiekszy niz tool calls (64KB).
+            let out_cap: i32 = 256 * 1024;
+            let out_ptr = alloc_fn
+                .call(&mut store, out_cap)
+                .map_err(|e| anyhow::anyhow!("alloc(output): {e}"))?;
+            if out_ptr < 0 {
+                bail!("alloc(output) zwrocil {}", out_ptr);
+            }
+            let out_len_ptr = alloc_fn
+                .call(&mut store, 4)
+                .map_err(|e| anyhow::anyhow!("alloc(out_len): {e}"))?;
+            if out_len_ptr < 0 {
+                bail!("alloc(out_len) zwrocil {}", out_len_ptr);
+            }
+
+            let on_request = instance
+                .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "on_request")
+                .map_err(|e| anyhow::anyhow!("brak on_request: {e}"))?;
+
+            let result_code = on_request
+                .call(
+                    &mut store,
+                    (
+                        input_ptr,
+                        request_bytes.len() as i32,
+                        out_ptr,
+                        out_cap,
+                        out_len_ptr,
+                    ),
+                )
+                .map_err(|e| anyhow::anyhow!("on_request fail: {e}"))?;
+
+            if result_code != 0 {
+                bail!("on_request zwrocil kod bledu: {}", result_code);
+            }
+
+            let mem_data = memory.data(&store);
+            let out_len_end = (out_len_ptr as usize)
+                .checked_add(4)
+                .ok_or_else(|| anyhow::anyhow!("out_len range overflow"))?;
+            if out_len_end > mem_data.len() {
+                bail!("out_len_ptr poza guest memory");
+            }
+            let out_len = i32::from_le_bytes([
+                mem_data[out_len_ptr as usize],
+                mem_data[out_len_ptr as usize + 1],
+                mem_data[out_len_ptr as usize + 2],
+                mem_data[out_len_ptr as usize + 3],
+            ]);
+            if out_len < 0 {
+                bail!("out_len ujemny: {}", out_len);
+            }
+            if out_len > out_cap {
+                bail!("out_len > out_cap ({} > {})", out_len, out_cap);
+            }
+
+            let result_end = (out_ptr as usize)
+                .checked_add(out_len as usize)
+                .ok_or_else(|| anyhow::anyhow!("output range overflow"))?;
+            if result_end > mem_data.len() {
+                bail!("output buffer poza guest memory");
+            }
+
+            Ok(mem_data[out_ptr as usize..result_end].to_vec())
+        })();
+
+        // Watchdog cleanup — niezaleznie od wyniku.
+        if let Some(handle) = watchdog {
+            // Nie joinujemy — watek i tak sie skonczy po sleep+increment_epoch.
+            // Drop join handle = detach.
+            drop(handle);
+        }
+
+        // Loguj do audit. user_id=0 = system call (None mapuje na 0,
+        // konwencja z call_tool gdzie sygnatura jest i64).
+        self.log_audit(
+            addon_id,
+            user_id.unwrap_or(0),
+            "flow_block.invoke",
+            Some(block_type),
+            None,
+        );
 
         result
     }

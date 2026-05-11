@@ -6,6 +6,7 @@
 //       adapters` do czasu executor rewrite w stage 1c.
 // =============================================================================
 
+pub mod addon;
 pub mod combine;
 pub mod condition;
 pub mod conversation_history;
@@ -23,6 +24,7 @@ pub mod tts_clean;
 pub mod tts_stream_bridge;
 pub mod vision_llm;
 
+pub use addon::AddonNodeAdapter;
 pub use combine::CombineNodeAdapter;
 pub use condition::ConditionNodeAdapter;
 pub use conversation_history::ConversationHistoryNodeAdapter;
