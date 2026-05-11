@@ -1738,6 +1738,57 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji addonow
+   *  do glownego menu launcher. Frontend buduje liste ikon. */
+  addonApplicationsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonApplicationsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonUiBody(ReqPanelGet) — pobierz drzewo UI panelu.
+   *  Payload: { addonId, panelId }. */
+  addonUiPanelGetRequest(payload, correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonUiPanelGetRequest(
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.panelId ?? payload.panel_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonUiBody(ReqAction) — button click / form submit.
+   *  Payload: { addonId, panelId, actionId, params } gdzie params to
+   *  zwykly obiekt JS — codec stringify'uje do JSON. */
+  addonUiActionRequest(payload, correlationId, sequence = 1) {
+    assertReady();
+    const params = payload.params ?? {};
+    const paramsJson =
+      typeof params === 'string' ? params : JSON.stringify(params);
+    const body = _wasm.encodeAddonUiActionRequest(
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.panelId ?? payload.panel_id ?? ''),
+      String(payload.actionId ?? payload.action_id ?? ''),
+      paramsJson,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {
     assertReady();

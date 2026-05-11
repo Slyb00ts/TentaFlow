@@ -41,6 +41,7 @@ pub struct DashboardServer {
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
@@ -71,6 +72,7 @@ impl DashboardServer {
             local_node_id: Arc::from(""),
             mesh_security: None,
             permission_checker: None,
+            addon_manager: None,
             license: Arc::new(StaticLicenseChecker::free()),
             mesh_relay_health: None,
             port_allocator: None,
@@ -133,6 +135,16 @@ impl DashboardServer {
         self
     }
 
+    /// Ustawia AddonManager — udostepnia ui_panels cache i invoke_ui_action
+    /// dla handlerów Apps menu / UI v2.
+    pub fn with_addon_manager(
+        mut self,
+        addon_manager: Option<Arc<crate::addon::AddonManager>>,
+    ) -> Self {
+        self.addon_manager = addon_manager;
+        self
+    }
+
     /// Uruchamia serwer HTTP - blokuje do zakonczenia
     pub async fn run(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.bind).await?;
@@ -149,6 +161,7 @@ impl DashboardServer {
         let local_node_id = self.local_node_id.clone();
         let mesh_security = self.mesh_security.clone();
         let permission_checker = self.permission_checker.clone();
+        let addon_manager = self.addon_manager.clone();
         let license = self.license.clone();
         let mesh_relay_health = self.mesh_relay_health.clone();
         let port_allocator = self.port_allocator.clone();
@@ -196,6 +209,7 @@ impl DashboardServer {
             let lni_clone = local_node_id.clone();
             let msec_clone = mesh_security.clone();
             let pc_clone = permission_checker.clone();
+            let am_clone = addon_manager.clone();
             let lic_clone = license.clone();
             let mrh_clone = mesh_relay_health.clone();
             let pa_clone = port_allocator.clone();
@@ -218,6 +232,7 @@ impl DashboardServer {
                     let lni = lni_clone.clone();
                     let msec = msec_clone.clone();
                     let pc = pc_clone.clone();
+                    let am = am_clone.clone();
                     let lic = lic_clone.clone();
                     let mrh = mrh_clone.clone();
                     let pa = pa_clone.clone();
@@ -225,8 +240,8 @@ impl DashboardServer {
                     let ra = remote_addr_str.clone();
                     async move {
                         handle_request(
-                            req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic,
-                            mrh, pa, ra, msr,
+                            req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, am,
+                            lic, mrh, pa, ra, msr,
                         )
                         .await
                     }
@@ -333,6 +348,7 @@ pub async fn handle_request(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
@@ -494,6 +510,7 @@ pub async fn handle_request(
             local_node_id: local_node_id.clone(),
             mesh_security: mesh_security.clone(),
             permission_checker: permission_checker.clone(),
+            addon_manager: addon_manager.clone(),
             license: license.clone(),
             meeting_manager,
             vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),

@@ -647,6 +647,7 @@ async fn run_server(args: Args) -> Result<()> {
         quic_mesh_for_server,
         local_node_id_for_server,
         mesh_security_for_server,
+        Some(addon_manager.clone()),
         mesh_relay_health_for_server,
         services_port_allocator.clone(),
         mesh_services_registry.clone(),
