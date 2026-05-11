@@ -304,7 +304,23 @@ function renderBadge(c) {
 function renderText(c) {
   const el = document.createElement('div');
   el.className = 'addon-text';
-  if (c.style) el.setAttribute('style', String(c.style));
+  // c.style nie jest applikowane jako raw CSS — addon to user-installed
+  // kod, mógłby wstrzyknąć CSS exfiltration (background-image z external
+  // URL = network leak z dashboardu). Style stringów dropujemy; gdy
+  // addon chce semantyczne wariacje, mapujemy whitelistowe wartosci
+  // do klas CSS (np. "muted"/"bold"/"error"). Brak match = czysty div.
+  const styleKey = String(c.style ?? '').trim().toLowerCase();
+  const TEXT_STYLE_CLASSES = {
+    muted: 'addon-text-muted',
+    bold: 'addon-text-bold',
+    italic: 'addon-text-italic',
+    error: 'addon-text-error',
+    success: 'addon-text-success',
+    warning: 'addon-text-warning',
+  };
+  if (TEXT_STYLE_CLASSES[styleKey]) {
+    el.classList.add(TEXT_STYLE_CLASSES[styleKey]);
+  }
   el.textContent = c.content ?? '';
   return el;
 }
@@ -332,11 +348,37 @@ function renderCard(c, ctx) {
 function renderImage(c) {
   const el = document.createElement('img');
   el.className = 'addon-image';
-  el.setAttribute('src', c.src ?? '');
-  el.setAttribute('alt', c.alt ?? '');
+  // c.src ograniczony do safe schemes — addon malicious mogl by wstrzyknac
+  // zewnetrzny URL jako tracking pixel (leak session w referrer / log
+  // serwera attacker'a). Walidacja: same-origin path, https:, lub data:image/*.
+  const rawSrc = String(c.src ?? '');
+  if (isSafeImageSrc(rawSrc)) {
+    el.setAttribute('src', rawSrc);
+  } else if (rawSrc) {
+    console.warn('[addon-app] renderImage: dropped unsafe src:', rawSrc);
+  }
+  el.setAttribute('alt', String(c.alt ?? ''));
   if (c.width) el.setAttribute('width', String(c.width));
   if (c.height) el.setAttribute('height', String(c.height));
   return el;
+}
+
+function isSafeImageSrc(src) {
+  if (!src) return false;
+  // Relative / same-origin path
+  if (src.startsWith('/') && !src.startsWith('//')) return true;
+  // data: tylko obrazy
+  if (src.startsWith('data:image/')) return true;
+  // https: do tej samej origin (np. self-hosted dashboard)
+  try {
+    const url = new URL(src, window.location.href);
+    if (url.protocol === 'https:' && url.origin === window.location.origin) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 function renderList(c, ctx) {
