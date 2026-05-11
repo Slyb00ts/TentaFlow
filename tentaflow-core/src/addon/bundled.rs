@@ -240,7 +240,7 @@ fn hash_chunk(hasher: &mut Sha256, name: &[u8], bytes: &[u8]) {
 // =============================================================================
 
 /// Zwraca sciezke do katalogu gdzie rozpakowane sa wbudowane addony
-fn bundled_addons_dir() -> PathBuf {
+pub fn bundled_addons_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tentaflow-ai")
