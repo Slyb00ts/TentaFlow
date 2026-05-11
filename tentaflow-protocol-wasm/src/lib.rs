@@ -2956,6 +2956,63 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
         }
 
+        // ---- Apps menu + UI v2 (schema v14) ----
+        MessageBody::AddonUiBody(p) => {
+            use tentaflow_protocol::AddonUiPayload as AP;
+            match p {
+                AP::ReqApplicationsList => {
+                    set(&obj, "variant", "AddonApplicationsListRequest".into());
+                }
+                AP::ResApplicationsList { applications } => {
+                    set(&obj, "variant", "AddonApplicationsListResponse".into());
+                    let arr = js_sys::Array::new();
+                    for a in applications {
+                        let item = js_sys::Object::new();
+                        set(&item, "addonId", a.addon_id.clone().into());
+                        set(&item, "addon_id", a.addon_id.into());
+                        set(&item, "title", a.title.into());
+                        set(&item, "entryPanel", a.entry_panel.clone().into());
+                        set(&item, "entry_panel", a.entry_panel.into());
+                        if let Some(icon) = a.icon {
+                            set(&item, "icon", icon.into());
+                        }
+                        set(&item, "sortOrder", (a.sort_order as f64).into());
+                        set(&item, "sort_order", (a.sort_order as f64).into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "applications", arr.into());
+                }
+                AP::ReqPanelGet { addon_id, panel_id } => {
+                    set(&obj, "variant", "AddonUiPanelGetRequest".into());
+                    set(&obj, "addonId", addon_id.clone().into());
+                    set(&obj, "addon_id", addon_id.into());
+                    set(&obj, "panelId", panel_id.clone().into());
+                    set(&obj, "panel_id", panel_id.into());
+                }
+                AP::ResPanelGet {
+                    addon_id,
+                    panel_id,
+                    tree_json,
+                } => {
+                    set(&obj, "variant", "AddonUiPanelGetResponse".into());
+                    set(&obj, "addonId", addon_id.clone().into());
+                    set(&obj, "addon_id", addon_id.into());
+                    set(&obj, "panelId", panel_id.clone().into());
+                    set(&obj, "panel_id", panel_id.into());
+                    set(&obj, "treeJson", tree_json.clone().into());
+                    set(&obj, "tree_json", tree_json.into());
+                }
+                AP::ReqAction { .. } => {
+                    set(&obj, "variant", "AddonUiActionRequest".into());
+                }
+                AP::ResAction { result_json } => {
+                    set(&obj, "variant", "AddonUiActionResponse".into());
+                    set(&obj, "resultJson", result_json.clone().into());
+                    set(&obj, "result_json", result_json.into());
+                }
+            }
+        }
+
         // ---- Audit log screen ----
         MessageBody::AuditLogListRequestBody(_) => {
             set(&obj, "variant", "AuditLogListRequest".into());
@@ -6495,6 +6552,54 @@ pub fn encode_iam_list_perms_subject(
     encode_iam(IamPayload::ReqListPermsForSubject {
         subject_type,
         subject_id: subject_id as i64,
+    })
+}
+
+// =============================================================================
+// AddonUi encoders (Apps menu + UI v2). Schema v14.
+// =============================================================================
+
+use tentaflow_protocol::AddonUiPayload;
+
+fn encode_addon_ui(payload: AddonUiPayload) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonUiBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
+/// w glownym menu launcher. Frontend buduje liste ikon w app menu.
+#[wasm_bindgen(js_name = encodeAddonApplicationsListRequest)]
+pub fn encode_addon_applications_list_request() -> Result<Vec<u8>, JsError> {
+    encode_addon_ui(AddonUiPayload::ReqApplicationsList)
+}
+
+/// MessageBody::AddonUiBody(ReqPanelGet) — pobierz ostatnio wyrenderowane
+/// drzewo UI panelu addonu. Tree_json = JSON `UiComponent`; frontend renderuje
+/// przez tf-* komponenty.
+#[wasm_bindgen(js_name = encodeAddonUiPanelGetRequest)]
+pub fn encode_addon_ui_panel_get_request(
+    addon_id: String,
+    panel_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_addon_ui(AddonUiPayload::ReqPanelGet {
+        addon_id,
+        panel_id,
+    })
+}
+
+/// MessageBody::AddonUiBody(ReqAction) — button click / form submit z UI
+/// panelu. Host woła addon on_request z tool_name = "ui.{panel_id}.{action_id}".
+#[wasm_bindgen(js_name = encodeAddonUiActionRequest)]
+pub fn encode_addon_ui_action_request(
+    addon_id: String,
+    panel_id: String,
+    action_id: String,
+    params_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_addon_ui(AddonUiPayload::ReqAction {
+        addon_id,
+        panel_id,
+        action_id,
+        params_json,
     })
 }
 

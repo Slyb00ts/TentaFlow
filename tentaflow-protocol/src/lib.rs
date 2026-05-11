@@ -36,6 +36,7 @@ pub use message_body::{
     // Addons + Notes + Translate + Users (theme 7 recovery).
     AddonAdminOnlySetRequest,
     AddonAdminOnlySetResponse,
+    AddonApplicationInfo,
     AddonConfigField,
     AddonConfigGetRequest,
     AddonConfigGetResponse,
@@ -190,6 +191,7 @@ pub use message_body::{
     HubDownloadProgress,
     HubEngineSummary,
     HubModelSearchResult,
+    AddonUiPayload,
     IamPayload,
     MeetingActionItemItem,
     MeetingActionItemStatusUpdateRequest,
