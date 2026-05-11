@@ -434,6 +434,8 @@ async fn run_server(args: Args) -> Result<()> {
         .service_manager()
         .set_event_bus(addon_manager.event_bus().clone());
 
+    addon_manager.clone().start_event_dispatcher();
+
     // Mesh networking — iroh (LAN mDNS + DHT + relay), wspoldzielony pipeline z Core
     let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> =
         None;
