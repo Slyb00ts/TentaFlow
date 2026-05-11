@@ -661,6 +661,11 @@ async fn run_server(args: Args) -> Result<()> {
     wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
+    // Zamknij addon manager: anuluj service tick loops, drop dispatcher
+    // sender (rozwalenie cyklu referencyjnego Arc<AddonManager> w
+    // spawn_blocking task), drop running instances. Bez tego proces nie
+    // konczyl sie po SIGINT.
+    addon_manager.shutdown();
     // Zatrzymaj wszystkie supervised services (native python-bundle / native
     // binary / docker) zanim router shutdown zwolni RwLocki. Bez tego vLLM /
     // sglang subprocessy zostawaly zombie po Ctrl+C — trzymaly VRAM (~15 GiB

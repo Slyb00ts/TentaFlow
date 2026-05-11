@@ -454,6 +454,52 @@ impl AddonManager {
         self.ui_panels.clone()
     }
 
+    /// Graceful shutdown — wolane z main.rs przed wyjsciem. Bez tego:
+    /// 1) dispatcher event_bus task wisi na `blocking_recv` (cykl
+    ///    referencyjny Arc<AddonManager> trzymany przez spawn_blocking),
+    /// 2) service tick tasks pętlowicze przez select (token nigdy nie
+    ///    cancelled na shutdown), 3) running instances blokują WAL exit.
+    ///
+    /// Po `shutdown()` proces moze normalnie wyjsc. Idempotent — wielokrotne
+    /// wolanie OK (np. signal handler + tests cleanup).
+    pub fn shutdown(&self) {
+        info!("AddonManager: shutdown initiated");
+
+        // 1. Anuluj wszystkie service tick loops — token.cancel() wybudza
+        //    `select!` w petli, ktora wychodzi cleanly.
+        let task_count = {
+            let mut tasks = self.service_tasks.lock();
+            let count = tasks.len();
+            for (_iid, token) in tasks.drain() {
+                token.cancel();
+            }
+            count
+        };
+        if task_count > 0 {
+            info!("AddonManager: anulowano {} service tick loops", task_count);
+        }
+
+        // 2. Zamknij dispatcher event_bus — drop sender, blocking_recv
+        //    zwroci None, spawn_blocking task wychodzi. To uwalnia ostatni
+        //    Arc<AddonManager> trzymany w tasku.
+        self.event_bus.close_dispatcher();
+
+        // 3. Drop wszystkich instances — wasmtime cleanup, net connections
+        //    closed, host functions zaktualizuja audit DB.
+        let instance_count = {
+            let mut instances = self.instances.lock();
+            let count: usize = instances.values().map(|v| v.len()).sum();
+            instances.clear();
+            count
+        };
+        if instance_count > 0 {
+            info!(
+                "AddonManager: rozwalonio {} addon instances",
+                instance_count
+            );
+        }
+    }
+
     /// Czy addon ma przynajmniej jedna running instancje. Uzywane przez
     /// handler `AddonUiPayload::ReqPanelGet` zeby zdecydowac czy lazy-start
     /// jest potrzebny.
