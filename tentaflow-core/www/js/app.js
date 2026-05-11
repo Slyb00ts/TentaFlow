@@ -39,6 +39,7 @@ import UsersScreen from '/js/modules/users.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
 import AddonsScreen from '/js/modules/addons.js';
+import AddonAppScreen from '/js/modules/addon-app.js';
 import MyAccountsScreen from '/js/modules/my-accounts.js';
 import AppsHomeScreen from '/js/modules/apps-home.js';
 import ProfileScreen from '/js/modules/profile.js';
@@ -417,6 +418,8 @@ async function renderApp() {
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
   Router.register('addons', AddonsScreen);
+  // Drill-down: Router.navigate('addon-app', { addonId, panelId }) z apps-home.
+  Router.register('addon-app', AddonAppScreen);
   Router.register('my-accounts', MyAccountsScreen);
   Router.register('apps-home', AppsHomeScreen);
   Router.register('profile', ProfileScreen);

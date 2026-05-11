@@ -1752,8 +1752,10 @@ export const encode = {
   },
 
   /** MessageBody::AddonUiBody(ReqPanelGet) — pobierz drzewo UI panelu.
-   *  Payload: { addonId, panelId }. */
-  addonUiPanelGetRequest(payload, correlationId, sequence = 1) {
+   *  Payload: { addonId, panelId }.
+   *  Sygnatura `(correlationId, payload, sequence)` jak addonDetailRequest —
+   *  binary-ws-client woła `encode[kind](corrId, ...args, seq)`. */
+  addonUiPanelGetRequest(correlationId, payload, sequence = 1) {
     assertReady();
     const body = _wasm.encodeAddonUiPanelGetRequest(
       String(payload.addonId ?? payload.addon_id ?? ''),
@@ -1770,7 +1772,7 @@ export const encode = {
   /** MessageBody::AddonUiBody(ReqAction) — button click / form submit.
    *  Payload: { addonId, panelId, actionId, params } gdzie params to
    *  zwykly obiekt JS — codec stringify'uje do JSON. */
-  addonUiActionRequest(payload, correlationId, sequence = 1) {
+  addonUiActionRequest(correlationId, payload, sequence = 1) {
     assertReady();
     const params = payload.params ?? {};
     const paramsJson =
