@@ -226,6 +226,30 @@ impl FlowDispatcher {
         &self.registry
     }
 
+    /// Wpina addon manager jako resolver custom flow blocks. Wołane raz
+    /// z main.rs po `AddonManager::new` — od tego momentu compile flow
+    /// pasuje node_type'y w formacie "addon.{id}.{block}" do
+    /// `AddonNodeAdapter` zbudowanego z `AddonFlowRegistry::find_block`.
+    /// Builtin adaptery (`llm`, `tts`, ...) wygrywają nad addon resolverem,
+    /// więc addon nie może nadpisać core node_type.
+    pub fn set_addon_resolver(&self, manager: Arc<crate::addon::AddonManager>) {
+        use crate::flow_engine::node_adapters::AddonNodeAdapter;
+        let blocks_registry = manager.flow_blocks_registry().clone();
+        let resolver: crate::flow_engine::node_adapter::DynamicAdapterResolver =
+            Arc::new(move |node_type: &str| -> Option<Arc<dyn NodeAdapter>> {
+                // Tylko prefiks "addon." idzie do registry — szybki bail
+                // dla wszystkich innych node_type'ów (oszczędność jednego
+                // RwLock read na każde compile flow).
+                if !node_type.starts_with("addon.") {
+                    return None;
+                }
+                let block = blocks_registry.find_block(node_type)?;
+                let adapter = AddonNodeAdapter::from_block(&block, manager.clone());
+                Some(Arc::new(adapter) as Arc<dyn NodeAdapter>)
+            });
+        self.registry.set_dynamic_resolver(resolver);
+    }
+
     /// Etap 2: BlobStore handle — używane przez TTS-as-flow path w
     /// services/runtime/executor.rs do pobrania bytes audio po BlobRef
     /// po zakończeniu flow.

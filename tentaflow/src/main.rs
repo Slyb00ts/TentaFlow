@@ -436,6 +436,14 @@ async fn run_server(args: Args) -> Result<()> {
 
     addon_manager.clone().start_event_dispatcher();
 
+    // Wpiecie addon block resolverem do flow_engine — od tego momentu flow
+    // z node_type "addon.{id}.{block}" dostaje AddonNodeAdapter z resolvera
+    // zamiast bledu "no adapter for node".
+    if let Some(dispatcher) = router.flow_dispatcher() {
+        dispatcher.set_addon_resolver(addon_manager.clone());
+        tracing::info!("FlowDispatcher: addon block resolver wpiety");
+    }
+
     // Mesh networking — iroh (LAN mDNS + DHT + relay), wspoldzielony pipeline z Core
     let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> =
         None;
