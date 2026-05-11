@@ -570,6 +570,17 @@ impl AddonManager {
         // adapter for node" przy nastepnym uzyciu).
         self.flow_blocks_registry.unregister_addon_blocks(addon_id);
 
+        // Wymus invalidate FlowCache — flow z cached `CompiledFlow` moze
+        // miec dangling reference do bloku tego addonu, ktory wlasnie znika
+        // z resolvera. Executor i tak by zwrocil "no adapter for node"
+        // przy nastepnym uzyciu, ale clean cache produkuje czytelniejszy
+        // blad przy compile (R2 "no adapter").
+        if let Some(router) = self.router.read().clone() {
+            if let Some(dispatcher) = router.flow_dispatcher() {
+                dispatcher.invalidate_cache();
+            }
+        }
+
         // Usun z DB
         lifecycle::uninstall(addon_id, &self.db)?;
 
