@@ -15,7 +15,7 @@ use crate::flow_engine::dispatchers::LlmRequest;
 use crate::flow_engine::envelope::{
     ChatMessage, ChatMessageContent, ChatRole, FlowEnvelope, FlowValue, MessagePart, NodeInput,
 };
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "vision_llm";
@@ -144,17 +144,11 @@ impl NodeAdapter for VisionNodeAdapter {
     fn node_type(&self) -> &str {
         NODE_TYPE
     }
-    fn supported_input_ports(&self) -> &[&'static str] {
-        &["in"]
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Image)]
     }
-    fn supported_output_ports(&self) -> &[&'static str] {
-        &["full"]
-    }
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Image
-    }
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("full", FlowDataType::Text)]
     }
 
     async fn execute(

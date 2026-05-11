@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct OutputNodeAdapter;
@@ -34,8 +34,6 @@ impl Default for OutputNodeAdapter {
 // (output moze zwrocic dowolna kombinacje typow w envelope.payload +
 // envelope.artifacts; konsument output'u to caller flow_engine, nie inny
 // node, wiec out_port_type nie jest egzekwowany przez R8).
-const INPUT_PORTS: &[&str] = &["text", "audio", "image", "video", "embedding", "other"];
-const OUTPUT_PORTS: &[&str] = &["full"];
 
 /// Priorytet portow przy wyborze primary envelope gdy do output trafia kilka
 /// branchy. Modyfikacje listy zmieniaja kolejnosc fallback'a.
@@ -47,28 +45,19 @@ impl NodeAdapter for OutputNodeAdapter {
         "output"
     }
 
-    fn supported_input_ports(&self) -> &[&'static str] {
-        INPUT_PORTS
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![
+            PortSpec::new("text", FlowDataType::Text),
+            PortSpec::new("audio", FlowDataType::Audio),
+            PortSpec::new("image", FlowDataType::Image),
+            PortSpec::new("video", FlowDataType::Video),
+            PortSpec::new("embedding", FlowDataType::Embedding),
+            PortSpec::new("other", FlowDataType::Other),
+        ]
     }
 
-    fn supported_output_ports(&self) -> &[&'static str] {
-        OUTPUT_PORTS
-    }
-
-    fn input_port_type(&self, port: &str) -> FlowDataType {
-        match port {
-            "text" => FlowDataType::Text,
-            "audio" => FlowDataType::Audio,
-            "image" => FlowDataType::Image,
-            "video" => FlowDataType::Video,
-            "embedding" => FlowDataType::Embedding,
-            "other" => FlowDataType::Other,
-            _ => FlowDataType::Any,
-        }
-    }
-
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Any
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("full", FlowDataType::Any)]
     }
 
     async fn execute(
@@ -178,11 +167,10 @@ mod tests {
     #[test]
     fn output_advertises_six_typed_input_ports_and_full_output() {
         let a = OutputNodeAdapter::new();
-        assert_eq!(
-            a.supported_input_ports(),
-            &["text", "audio", "image", "video", "embedding", "other"]
-        );
-        assert_eq!(a.supported_output_ports(), &["full"]);
+        let in_names: Vec<String> = a.input_ports().iter().map(|p| p.name.clone()).collect();
+        let out_names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(in_names, vec!["text", "audio", "image", "video", "embedding", "other"]);
+        assert_eq!(out_names, vec!["full"]);
         assert_eq!(a.node_type(), "output");
         assert_eq!(a.input_port_type("text"), FlowDataType::Text);
         assert_eq!(a.input_port_type("audio"), FlowDataType::Audio);
