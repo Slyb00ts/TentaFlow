@@ -6,8 +6,8 @@
 //       Reguły:
 //         R1. każdy edge.from / edge.to wskazuje na istniejący node
 //         R2. każdy node ma adapter w registry
-//         R3. edge.from_port ∈ supported_output_ports producenta;
-//             edge.to_port ∈ supported_input_ports konsumenta
+//         R3. edge.from_port ∈ output_ports producenta;
+//             edge.to_port ∈ input_ports konsumenta
 //         R4. strict 1-input-edge dla każdego non-trigger node'a
 //         R5. dokładnie jeden trigger node
 //         R6. condition edges (from_port "true"/"false") tylko z node'a
@@ -265,22 +265,22 @@ pub fn validate(
             });
         }
 
-        let out_ports = from_adapter.supported_output_ports();
-        if !out_ports.contains(&edge.from_port.as_str()) {
+        let out_ports = from_adapter.output_ports();
+        if !out_ports.iter().any(|p| p.name == edge.from_port) {
             return Err(FlowValidationError::InvalidOutputPort {
                 node_id: from_node.id.clone(),
                 node_type: from_node.node_type.clone(),
                 port: edge.from_port.clone(),
-                available: out_ports.iter().map(|s| s.to_string()).collect(),
+                available: out_ports.iter().map(|p| p.name.clone()).collect(),
             });
         }
-        let in_ports = to_adapter.supported_input_ports();
-        if !in_ports.contains(&edge.to_port.as_str()) {
+        let in_ports = to_adapter.input_ports();
+        if !in_ports.iter().any(|p| p.name == edge.to_port) {
             return Err(FlowValidationError::InvalidInputPort {
                 node_id: to_node.id.clone(),
                 node_type: to_node.node_type.clone(),
                 port: edge.to_port.clone(),
-                available: in_ports.iter().map(|s| s.to_string()).collect(),
+                available: in_ports.iter().map(|p| p.name.clone()).collect(),
             });
         }
 

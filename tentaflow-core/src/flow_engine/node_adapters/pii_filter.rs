@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use crate::flow_engine::envelope::{
     EnvelopeDelta, EnvelopeDeltaKind, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
 };
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, StreamingNodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const REGEX_SIZE_LIMIT: usize = 1_000_000;
@@ -37,12 +37,6 @@ impl Default for PiiFilterNodeAdapter {
     }
 }
 
-const INPUT_PORTS: &[&str] = &["in"];
-/// Stage 3d Krok 2: pii_filter teraz ma `stream` port — streaming chain
-/// (LLM → pii_filter → output) propaguje przez `process_stream` zamiast
-/// blocking `execute`. R8 typing: oba porty Text→Text.
-const OUTPUT_PORTS: &[&str] = &["full", "stream"];
-
 /// Maks bajtów zbierane w buforze przed flush'em jeśli sentence boundary
 /// nie pojawi się dłużej. Default 64 — parytet ze starym `StreamingProcessor`
 /// (`max_buffer_size = 6` tokenów ≈ 24-48 znaków typowych) z marginesem
@@ -59,20 +53,18 @@ impl NodeAdapter for PiiFilterNodeAdapter {
         "pii_filter"
     }
 
-    fn supported_input_ports(&self) -> &[&'static str] {
-        INPUT_PORTS
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Text)]
     }
 
-    fn supported_output_ports(&self) -> &[&'static str] {
-        OUTPUT_PORTS
-    }
-
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
-    }
-
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
+    fn output_ports(&self) -> Vec<PortSpec> {
+        // Stage 3d Krok 2: pii_filter ma `stream` port — streaming chain
+        // (LLM → pii_filter → output) propaguje przez `process_stream` zamiast
+        // blocking `execute`. R8 typing: oba porty Text→Text.
+        vec![
+            PortSpec::new("full", FlowDataType::Text),
+            PortSpec::new("stream", FlowDataType::Text),
+        ]
     }
 
     async fn execute(

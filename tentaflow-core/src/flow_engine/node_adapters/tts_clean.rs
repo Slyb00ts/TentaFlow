@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct TtsCleanNodeAdapter;
@@ -26,29 +26,18 @@ impl Default for TtsCleanNodeAdapter {
     }
 }
 
-const INPUT_PORTS: &[&str] = &["in"];
-const OUTPUT_PORTS: &[&str] = &["full"];
-
 #[async_trait]
 impl NodeAdapter for TtsCleanNodeAdapter {
     fn node_type(&self) -> &str {
         "tts_clean"
     }
 
-    fn supported_input_ports(&self) -> &[&'static str] {
-        INPUT_PORTS
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Text)]
     }
 
-    fn supported_output_ports(&self) -> &[&'static str] {
-        OUTPUT_PORTS
-    }
-
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
-    }
-
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("full", FlowDataType::Text)]
     }
 
     async fn execute(
@@ -137,7 +126,9 @@ mod tests {
     #[test]
     fn tts_clean_advertises_full_ports() {
         let a = TtsCleanNodeAdapter;
-        assert_eq!(a.supported_input_ports(), &["in"]);
-        assert_eq!(a.supported_output_ports(), &["full"]);
+        let in_names: Vec<String> = a.input_ports().iter().map(|p| p.name.clone()).collect();
+        let out_names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(in_names, vec!["in"]);
+        assert_eq!(out_names, vec!["full"]);
     }
 }

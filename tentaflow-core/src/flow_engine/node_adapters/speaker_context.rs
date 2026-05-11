@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "speaker_context";
 const DEFAULT_HIGH: f32 = 0.85;
@@ -118,11 +118,11 @@ impl NodeAdapter for SpeakerContextNodeAdapter {
     fn node_type(&self) -> &str {
         NODE_TYPE
     }
-    fn supported_input_ports(&self) -> &[&'static str] {
-        &["in"]
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Any)]
     }
-    fn supported_output_ports(&self) -> &[&'static str] {
-        &["full"]
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("full", FlowDataType::Any)]
     }
 
     async fn execute(

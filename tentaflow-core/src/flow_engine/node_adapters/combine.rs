@@ -16,7 +16,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub struct CombineNodeAdapter;
@@ -33,9 +33,6 @@ impl Default for CombineNodeAdapter {
     }
 }
 
-const INPUT_PORTS: &[&str] = &["in"];
-const OUTPUT_PORTS: &[&str] = &["full"];
-
 /// Domyslny separator miedzy textami z poszczegolnych branchy. Operator
 /// moze nadpisac w `node.config["separator"]`.
 const DEFAULT_SEPARATOR: &str = "\n\n";
@@ -46,23 +43,15 @@ impl NodeAdapter for CombineNodeAdapter {
         "combine"
     }
 
-    fn supported_input_ports(&self) -> &[&'static str] {
-        INPUT_PORTS
-    }
-
-    fn supported_output_ports(&self) -> &[&'static str] {
-        OUTPUT_PORTS
-    }
-
-    fn input_port_type(&self, _port: &str) -> FlowDataType {
+    fn input_ports(&self) -> Vec<PortSpec> {
         // Combine akceptuje wszystko (text, json, audio z pre-text bridge,
         // image z OCR itd.) — kazdy input mapowany na text representation
         // przez `flow_value_to_text`.
-        FlowDataType::Any
+        vec![PortSpec::new("in", FlowDataType::Any)]
     }
 
-    fn output_port_type(&self, _port: &str) -> FlowDataType {
-        FlowDataType::Text
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("full", FlowDataType::Text)]
     }
 
     async fn execute(
@@ -269,8 +258,10 @@ mod tests {
     fn combine_advertises_correct_ports_and_types() {
         let a = CombineNodeAdapter::new();
         assert_eq!(a.node_type(), "combine");
-        assert_eq!(a.supported_input_ports(), &["in"]);
-        assert_eq!(a.supported_output_ports(), &["full"]);
+        let in_names: Vec<String> = a.input_ports().iter().map(|p| p.name.clone()).collect();
+        let out_names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(in_names, vec!["in"]);
+        assert_eq!(out_names, vec!["full"]);
         assert_eq!(a.input_port_type("in"), FlowDataType::Any);
         assert_eq!(a.output_port_type("full"), FlowDataType::Text);
     }
