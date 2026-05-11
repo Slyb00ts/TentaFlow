@@ -394,17 +394,6 @@ pub struct AddonManager {
     /// wola `cancel()` na tokenie — tick loop wychodzi po nastepnym
     /// `select!`, zwalnia uchwyt do instancji.
     service_tasks: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
-    /// Globalny licznik unikalnych epoch deadlines dla per-call timeoutow.
-    /// Kazdy invoke_block / call_tick_static `fetch_add(1)+1` rezerwuje
-    /// wlasny slot N. Store dla tego call dostaje `set_epoch_deadline(N)`,
-    /// watchdog inkrementuje counter wasmtime az do N. Inne stores (z
-    /// deadline u64::MAX domyslnie) nie sa trapowane.
-    next_epoch_deadline: Arc<std::sync::atomic::AtomicU64>,
-    /// Mirror globalnego epoch counter wasmtime (`Engine::current_epoch()`
-    /// jest `pub(crate)` — nie mamy bezposredniego dostepu). Inkrementowany
-    /// wraz z `engine.increment_epoch()` w watchdogach. Pozwala watchdogowi
-    /// sprawdzic czy juz osiagnal swoj target N (i pominac increment).
-    epoch_mirror: Arc<std::sync::atomic::AtomicU64>,
     /// Cache ostatnio wyrenderowanego UI tree per (addon_id, panel_id).
     /// Addon woła `ui_render(panel_id, tree)` z guest WASM, host zapisuje
     /// `tree` w tym cache; frontend GUI pyta przez MessageBody
@@ -443,8 +432,6 @@ impl AddonManager {
             flow_blocks_registry: Arc::new(flow_blocks::AddonFlowRegistry::new()),
             service_tasks: Arc::new(Mutex::new(HashMap::new())),
             ui_panels: Arc::new(PlRwLock::new(HashMap::new())),
-            next_epoch_deadline: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            epoch_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -916,8 +903,6 @@ impl AddonManager {
         let manager_instances = self.instances.clone();
         let engine = self.engine.clone();
         let event_bus = self.event_bus.clone();
-        let next_epoch_deadline = self.next_epoch_deadline.clone();
-        let epoch_mirror = self.epoch_mirror.clone();
         let addon_id_for_log = addon_id.clone();
         let instance_id_for_log = instance_id.clone();
 
@@ -951,8 +936,6 @@ impl AddonManager {
                                 &instance_id_for_log,
                                 fuel_per_tick,
                                 timeout_ms,
-                                &next_epoch_deadline,
-                                &epoch_mirror,
                             )
                         });
                         if let Err(e) = res {
@@ -990,8 +973,6 @@ impl AddonManager {
         instance_id: &str,
         fuel_per_tick: u64,
         timeout_ms: Option<u64>,
-        next_epoch_deadline: &Arc<std::sync::atomic::AtomicU64>,
-        epoch_mirror: &Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
         // Wyciagnij instancje (lock briefly)
         let mut addon_instance = {
@@ -1025,37 +1006,19 @@ impl AddonManager {
             return Err(anyhow::anyhow!("refuel_store: {e}"));
         }
 
-        // Per-store epoch deadline + watchdog — rezerwujemy unikalny N,
-        // ustawiamy go na TYM store, watchdog inkrementuje counter (+ mirror)
-        // az do N. Inne stores z deadline u64::MAX nie sa trapowane.
-        let deadline_n = next_epoch_deadline
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        addon_instance.store.set_epoch_deadline(deadline_n);
+        // Per-call epoch deadline: store trapuje po 1 increment counter.
+        // Watchdog (jesli timeout_ms set) zwiększa counter raz po `t` ms.
+        // UWAGA: wasmtime epoch jest engine-global — trap dotyczy wszystkich
+        // stores z deadline ≤ current. Per-store isolated cancellation
+        // wymaga epoch_deadline_callback (follow-up).
+        addon_instance.store.set_epoch_deadline(1);
 
         let watchdog = timeout_ms.map(|t| {
             let engine = engine.clone();
-            let mirror = epoch_mirror.clone();
             let dur = std::time::Duration::from_millis(t);
             std::thread::spawn(move || {
                 std::thread::sleep(dur);
-                loop {
-                    let cur = mirror.load(std::sync::atomic::Ordering::Acquire);
-                    if cur >= deadline_n {
-                        break;
-                    }
-                    if mirror
-                        .compare_exchange(
-                            cur,
-                            cur + 1,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        engine.increment_epoch();
-                    }
-                }
+                engine.increment_epoch();
             })
         });
 
@@ -1082,10 +1045,11 @@ impl AddonManager {
         // i tak sie skonczy po sleep. Drop nie blokuje na join.
         drop(watchdog);
 
-        // Reset epoch deadline na u64::MAX — store wraca do mapy i moze
-        // byc uzyty przez handle_event lub call_tool. Bez resetu trapowal
-        // by sie przy nastepnym call gdy engine counter > deadline_n.
-        addon_instance.store.set_epoch_deadline(u64::MAX);
+        // Reset epoch deadline — store wraca do mapy i moze byc uzyty
+        // przez handle_event lub call_tool. Set_epoch_deadline jest DELTA,
+        // wiec u64::MAX/4 zachowuje sie jak "nigdy nie wytrap" (current+
+        // delta nie osiagniete normalnymi incrementami).
+        addon_instance.store.set_epoch_deadline(u64::MAX / 4);
 
         // Wloz z powrotem nawet przy bledzie — pojedyncza nieudana tura nie
         // zabija service (np. transient error w dispatch'u host_function).
@@ -1513,43 +1477,21 @@ impl AddonManager {
             .set_fuel(fuel_budget)
             .map_err(|e| anyhow::anyhow!("set_fuel({}): {e}", fuel_budget))?;
 
-        // Per-store epoch deadline — rezerwujemy unikalny N z global counter,
-        // ustawiamy `set_epoch_deadline(N)` na TYM konkretnym store. Watchdog
-        // inkrementuje engine counter (i mirror) az do N. Inne stores (z
-        // deadline u64::MAX domyslnie) nie sa trapowane.
-        let deadline_n = self
-            .next_epoch_deadline
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        store.set_epoch_deadline(deadline_n);
+        // Per-call epoch deadline: store trapuje po 1 increment counter.
+        // UWAGA: wasmtime epoch jest engine-global — increment_epoch
+        // trapuje WSZYSTKIE stores z deadline ≤ current. Per-store
+        // isolated cancellation wymaga epoch_deadline_callback z
+        // per-store atomic flag; odlozone jako follow-up.
+        store.set_epoch_deadline(1);
 
         let watchdog = deadline.map(|d| {
             let engine = self.engine.clone();
-            let mirror = self.epoch_mirror.clone();
             std::thread::spawn(move || {
                 let now = std::time::Instant::now();
                 if d > now {
                     std::thread::sleep(d - now);
                 }
-                // Inkrementuj counter tylko do swojego N. CAS pozwala
-                // wielu watchdogom konkurencyjnie incrementowac bez race.
-                loop {
-                    let cur = mirror.load(std::sync::atomic::Ordering::Acquire);
-                    if cur >= deadline_n {
-                        break;
-                    }
-                    if mirror
-                        .compare_exchange(
-                            cur,
-                            cur + 1,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        engine.increment_epoch();
-                    }
-                }
+                engine.increment_epoch();
             })
         });
 
