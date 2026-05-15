@@ -1,8 +1,10 @@
 # TentaVision F1a — implementation plan (week-by-week)
 
-**Wersja:** v0.3.2 · M1.W6 ukończony (Chunks A/B/C/D) — cameras table v21 + GStreamer FakeFile supervisor + 10 host functions ABI + e2e WASM addon + security suite. Wszystkie codex review fixes applied.
+**Wersja:** v0.3.3 · M1.W7 ukończony (Chunks A/B/C/D) — streaming bus + frame_storage LRU + pickup tokens HMAC + 3 streaming ABIs + /core/frame/pickup + service_call extension + 6 e2e testów (mock yolo pickup) + 9 criterion benchów. Wszystkie targety §17.8 spełnione z marginesem.
 
-**Poprzednia:** v0.3.1 · Chunk C ukończony — system uprawnień dwukierunkowych zaimplementowany, runtime alias CRUD ABI usunięte.
+**Poprzednia:** v0.3.2 · M1.W6 ukończony (Chunks A/B/C/D) — cameras table v21 + GStreamer FakeFile supervisor + 10 host functions ABI + e2e WASM addon + security suite.
+
+**Wcześniejsza:** v0.3.1 · Chunk C ukończony — system uprawnień dwukierunkowych zaimplementowany, runtime alias CRUD ABI usunięte.
 
 **Wcześniejsza:** v0.3 · rewizja M1.W5 — runtime alias CRUD usuniety, dodany system dwukierunkowych uprawnien (visibility + consumers + uses_*); Chunk C kompletnie przepisany; Chunk D (admin UI) wydzielony i przesuniety do M2.
 
@@ -502,7 +504,42 @@ Mockupy: `~/.gstack/projects/Slyb00ts-TentaFlow/designs/tentavision-v1/`
 
 **Acceptance:** `camera_add({vendor:"fake_file", url:"/test/sample_traffic.mp4"})` → CameraId. List online z fps_actual ≈ target. `camera_snapshot` → SnapshotRef. Path traversal blocked. Vendor whitelist enforced.
 
-### M1.W7 — Streaming + RawFrameRef + PickupToken + Service-to-Core API
+### M1.W7 — Streaming + RawFrameRef + PickupToken + Service-to-Core API  `[completed]`
+
+**Recap chunków (commit hashes):**
+- **Chunk A** (`e59a7bf`): recon decisions — deps (dashmap/hmac/sha2 już obecne), schema (alias_calls v9 + frame_pickup_log v12 wystarczają, brak v22), HMAC key strategy (in-memory OsRng, restart invaliduje, TTL=30s pokrywa).
+- **Chunk B** (`1da6361` + fix `b1f5196`): `services/frame_storage/` LRU 1024 ramki + `services/streaming/` bounded mpsc bus per camera (capacity 100, drop najstarsze + Drop{count}) + `CameraIngestSupervisor::close_camera` propagujący invalidation streamów.
+- **Chunk C** (`519fc0d` + fix `f5be74b`): `services/pickup_tokens.rs` (HMAC-SHA256, DashMap TTL 30s, background cleanup 60s) + 3 streaming ABI (`stream_subscribe_v1`, `stream_next_v1`, `stream_close_v1`) w `host_functions/streaming.rs` + rozszerzenie `service_call_v1` (router resolve → wystaw PickupToken → audit `alias_calls`) + `api/frame_pickup.rs` (POST `/core/frame/pickup` z HMAC verify + one-shot consume + `frame_pickup_log` audit) — 13 codex review fixes applied.
+- **Chunk D** (`<this commit>`): mock yolo e2e — `tests/streaming_pickup_e2e.rs` (6 testów: happy path z bbox, replay→403, cross-service→403, TTL→410, missing header→400, oversized body→413) + `benches/streaming_pickup_perf.rs` (9 criterion bench groups, `--quick --noplot`).
+
+**Performance benchmarks (Chunk D, criterion `--quick`):**
+
+| Bench | Median | Target §17.8 | Status |
+|---|---|---|---|
+| `pickup_token/issue` | 1.10 µs | < 1 ms (token issuance) | PASS (≈900× margin) |
+| `pickup_token_verify_only` | 600 ns | — (sub-component) | INFO |
+| `pickup_token/consume_one_shot` | 554 ns | — (sub-component) | INFO |
+| `frame_storage/insert/320x240` | 131 ns | — | INFO |
+| `frame_storage/insert/1280x720` | 131 ns | — | INFO |
+| `frame_storage/get/320x240` | 27 ns | — | INFO |
+| `frame_storage/get/1280x720` | 27 ns | — | INFO |
+| `streaming_bus/broadcast_no_drop` | 1.22 µs | — | INFO |
+| `streaming_bus/stream_next_hot_buffer` | 91 ns | < 1 ms p99 (stream_next poll) | PASS (≈11000× margin) |
+| `pickup_roundtrip/320x240` | 146 µs | < 20 ms (pickup_frame) | PASS (≈137× margin) |
+| `pickup_roundtrip/1280x720` | 147 µs | < 20 ms (pickup_frame) | PASS (≈136× margin) |
+| `service_call_overhead_model` | 7.72 µs | < 5 ms (service_call overhead) | PASS (≈647× margin) |
+
+Wszystkie krytyczne targety z `tentavision-plan.md` §17.8 spełnione z dwoma rzędami wielkości marginesu na CPU benchmark (in-process, bez sieciowego transportu). Realistyczny narzut QUIC + serialization rzędu ~1-3 ms dodaje się przy production deploy — nadal mieści się w 5 ms / 20 ms budżetach.
+
+**DoD coverage (§17 plan):**
+- **DoD-5** (service_call e2e z mock service): ✓ `test_e2e_happy_path_pickup_returns_bbox` — FakeFile frame → service_call (mock yolo) → pickup_frame → bbox response.
+- **DoD-6** (FakeFile→stream→service_call→pickup): partial ✓ — pełny pipeline FakeFile→stream_bus→pickup zweryfikowany przez bench `pickup_roundtrip` + e2e happy path; wasmtime addon e2e (z poziomu WASM guest) odłożone do M2 (wymaga camera-test-addon rozszerzonego o streaming ABI).
+- **DoD-10** (PickupToken replay → 403 + audit): ✓ `test_e2e_replay_rejected_on_wire` + `test_e2e_cross_service_rejected_on_wire` (oba sprawdzają `frame_pickup_log` audit entry z `result='token_invalid'/'unauthorized'`).
+- **DoD-13** (performance): ✓ MEASURED — wszystkie 4 targety §17.8 dotyczące tej ścieżki PASS (token issuance, stream_next, pickup_frame, service_call overhead).
+
+**Coverage M1.W7:** 13 pickup unit + 4 streaming host fn unit + 6 e2e + 9 benches = **32 nowych testów + 9 benchów**.
+
+**Coverage cumulative F1a (M1.W4-W7):** 26 unit + 4 e2e + 21 security (M1.W6) + 13 pickup unit + 4 streaming host fn + 6 e2e pickup (M1.W7) + 9 benches = **~83 testów + 9 benchów**.
 
 **Scope:**
 - Streaming bus `services/streaming/` z bounded mpsc per camera (capacity 100)

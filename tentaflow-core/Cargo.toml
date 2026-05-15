@@ -275,5 +275,9 @@ harness = false
 name = "audio_pipeline_clones"
 harness = false
 
+[[bench]]
+name = "streaming_pickup_perf"
+harness = false
+
 [patch.crates-io]
 ed25519-dalek = { path = "../vendor/ed25519-dalek" }
