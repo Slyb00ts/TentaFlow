@@ -24,7 +24,7 @@ use super::{audit_log_with_risk, check_permission, get_memory, read_guest_bytes,
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::get_camera_for_addon;
-use crate::services::streaming::{StreamFilter, StreamMessage, StreamSubscriber};
+use crate::services::streaming::{NextOutcome, StreamFilter, StreamMessage, StreamSubscriber};
 use crate::services::{streaming_bus};
 
 // =============================================================================
@@ -127,6 +127,11 @@ struct NextTimeoutOutput {
     r#type: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct NextStreamClosedOutput {
+    r#type: &'static str,
+}
+
 #[derive(Debug, Deserialize)]
 struct CloseInput {
     stream_id: String,
@@ -142,6 +147,15 @@ struct CloseOutput {
 // =============================================================================
 
 const MAX_TIMEOUT_MS: u64 = 5_000;
+
+/// Per-addon ceiling on simultaneous stream subscriptions. F1a value picked
+/// so a 32-camera quota plus a couple of analyses per camera fits, while
+/// still blocking pathological loops that mint thousands of subs.
+const MAX_STREAMS_PER_ADDON: usize = 16;
+
+/// Global ceiling across every addon. Defence against a single compromised
+/// addon plus accumulated leakage from other addons.
+const MAX_STREAMS_GLOBAL: usize = 256;
 
 fn audit(state: &AddonState, action: &str, resource_id: Option<&str>, result: &str, reason: Option<&str>) {
     audit_log_with_risk(
@@ -273,13 +287,26 @@ pub fn stream_subscribe_v1(
         }
     }
 
+    // Quota enforcement BEFORE we allocate a new subscriber on the bus —
+    // otherwise the channel + drop counter outlive the reject path.
+    let registry = subscribers();
+    if registry.len() >= MAX_STREAMS_GLOBAL {
+        audit(caller.data(), "stream.subscribe", Some(&camera_id), "denied", Some("streams_quota_global"));
+        return AbiError::QuotaExceeded.as_i32();
+    }
+    let per_addon = registry.iter().filter(|e| e.key().0 == addon_id).count();
+    if per_addon >= MAX_STREAMS_PER_ADDON {
+        audit(caller.data(), "stream.subscribe", Some(&camera_id), "denied", Some("streams_quota_per_addon"));
+        return AbiError::QuotaExceeded.as_i32();
+    }
+
     let filter = match input.filter {
         Some(f) => StreamFilter { max_fps: f.max_fps, skip_frames: f.skip_frames },
         None => StreamFilter::default(),
     };
     let sub = streaming_bus().subscribe(&camera_id, filter);
     let stream_id = sub.stream_id.to_string();
-    subscribers().insert(
+    registry.insert(
         (addon_id.clone(), stream_id.clone()),
         SubscriberSlot {
             camera_id: camera_id.clone(),
@@ -348,7 +375,7 @@ pub fn stream_next_v1(
     });
 
     match msg {
-        Some(StreamMessage::Frame { frame_ref, metadata }) => {
+        NextOutcome::Message(StreamMessage::Frame { frame_ref, metadata }) => {
             let pf = match metadata.pixel_format {
                 crate::services::frame_storage::FramePixelFormat::Rgb24 => "rgb24",
             };
@@ -364,25 +391,29 @@ pub fn stream_next_v1(
             audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("frame"));
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-        Some(StreamMessage::Drop { count }) => {
+        NextOutcome::Message(StreamMessage::Drop { count }) => {
             let out = NextDropOutput { r#type: "drop", count };
             audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some(&format!("drop={}", count)));
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-        Some(StreamMessage::CameraOffline { reason }) => {
-            // Camera left the bus — also evict the subscriber slot so future
-            // calls fail fast with StreamNotFound rather than parking forever.
+        NextOutcome::Message(StreamMessage::CameraOffline { reason }) => {
+            // Camera left the bus — evict the subscriber slot so future
+            // calls fail fast with StreamNotFound.
             subscribers().remove(&(addon_id, input.stream_id.clone()));
             let out = NextCameraOfflineOutput { r#type: "camera_offline", reason: &reason };
             audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("camera_offline"));
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
-        None => {
-            // Could be timeout (channel still open) or channel closed. We
-            // cannot cheaply distinguish here — report as `timeout` so the
-            // addon can decide to retry; the next call after a real close
-            // will return `StreamNotFound` via the SUBSCRIBERS lookup if the
-            // entry has been removed elsewhere.
+        NextOutcome::Closed => {
+            // Channel closed without an explicit CameraOffline (subscriber
+            // dropped, supervisor exit). Evict registry entry and surface a
+            // distinct `stream_closed` type so the addon stops polling.
+            subscribers().remove(&(addon_id, input.stream_id.clone()));
+            let out = NextStreamClosedOutput { r#type: "stream_closed" };
+            audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("stream_closed"));
+            write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+        }
+        NextOutcome::Timeout => {
             let out = NextTimeoutOutput { r#type: "timeout" };
             audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("timeout"));
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
@@ -469,6 +500,16 @@ pub mod test_api {
     }
 
     #[doc(hidden)]
+    pub fn max_streams_per_addon() -> usize {
+        super::MAX_STREAMS_PER_ADDON
+    }
+
+    #[doc(hidden)]
+    pub fn max_streams_global() -> usize {
+        super::MAX_STREAMS_GLOBAL
+    }
+
+    #[doc(hidden)]
     pub fn stream_id_valid_for_test(s: &str) -> bool {
         super::stream_id_valid(s)
     }
@@ -500,6 +541,22 @@ mod tests {
         assert_eq!(parse_target("camera:cam_1").unwrap(), "cam_1");
         assert!(parse_target("service:foo").is_err());
         assert!(parse_target("nope").is_err());
+    }
+
+    #[test]
+    fn per_addon_quota_threshold_holds() {
+        // Pre-fill the global registry with slots owned by a unique addon up
+        // to the per-addon cap, then verify that count() reflects the limit
+        // and would block a subsequent subscribe attempt.
+        let addon = format!("addon-quota-{}", uuid::Uuid::new_v4());
+        let cam = format!("cam-quota-{}", uuid::Uuid::new_v4());
+        for _ in 0..MAX_STREAMS_PER_ADDON {
+            test_api::subscribe_for_test(&addon, &cam);
+        }
+        let per_addon = subscribers().iter().filter(|e| e.key().0 == addon).count();
+        assert_eq!(per_addon, MAX_STREAMS_PER_ADDON);
+        // Any further subscribe for the same addon would exceed the cap.
+        assert!(per_addon >= MAX_STREAMS_PER_ADDON);
     }
 
     #[test]

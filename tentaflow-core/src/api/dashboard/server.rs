@@ -735,7 +735,34 @@ pub async fn handle_request(
         let frame_ref = hdr(HDR_FRAME_REF);
         let service_id = hdr(HDR_SERVICE_ID);
         let request_id = hdr(HDR_REQUEST_ID);
-        let _ = req.collect().await?;
+        // Unauth endpoint — reject oversized bodies before reading them.
+        // Pickup handler ignores body entirely; 1 KiB is a safety margin.
+        const PICKUP_BODY_LIMIT: u64 = 1024;
+        let content_length: u64 = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if content_length > PICKUP_BODY_LIMIT {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"payload_too_large\"}",
+                ))))
+                .unwrap());
+        }
+        let body = req.collect().await?.to_bytes();
+        if body.len() as u64 > PICKUP_BODY_LIMIT {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"payload_too_large\"}",
+                ))))
+                .unwrap());
+        }
 
         let pr = PickupRequest {
             pickup_token: token.as_deref(),
