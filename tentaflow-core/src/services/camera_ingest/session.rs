@@ -196,14 +196,16 @@ async fn run_session(
     let pipeline = match build_pipeline(&path, cam_id.clone(), mailbox.clone(), counters.clone()) {
         Ok(p) => p,
         Err(e) => {
+            let reason = e.to_string();
             publish(
                 &health_tx,
                 &cam_id,
                 CameraStatus::Error,
-                Some(e.to_string()),
+                Some(reason.clone()),
                 &counters,
                 None,
             );
+            crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
             // Drain commands until Stop so the supervisor's join completes
             // cleanly even on early failure.
             drain_until_stop(&mut cmd_rx, &health_tx).await;
@@ -212,15 +214,17 @@ async fn run_session(
     };
 
     if let Err(e) = pipeline.pipeline.set_state(gst::State::Playing) {
+        let reason = format!("set_state(Playing) failed: {e}");
         publish(
             &health_tx,
             &cam_id,
             CameraStatus::Error,
-            Some(format!("set_state(Playing) failed: {e}")),
+            Some(reason.clone()),
             &counters,
             None,
         );
         let _ = pipeline.pipeline.set_state(gst::State::Null);
+        crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
         drain_until_stop(&mut cmd_rx, &health_tx).await;
         return;
     }
@@ -248,6 +252,7 @@ async fn run_session(
                         publish(&health_tx, &cam_id, CameraStatus::Stopping, None, &counters, fps_window.back().copied());
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
                         publish(&health_tx, &cam_id, CameraStatus::Offline, None, &counters, None);
+                        crate::services::streaming_bus().close_camera(&cam_id, "stopped").await;
                         return;
                     }
                     Some(SessionCommand::UpdateConfig(_new)) => {
@@ -301,16 +306,19 @@ async fn run_session(
                         MessageView::Eos(_) => {
                             // Seek back to start to implement replay loop.
                             if let Err(e) = seek_to_start(&pipeline.pipeline) {
-                                publish(&health_tx, &cam_id, CameraStatus::Error, Some(e.to_string()), &counters, fps_window.back().copied());
+                                let reason = e.to_string();
+                                publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.clone()), &counters, fps_window.back().copied());
                                 let _ = pipeline.pipeline.set_state(gst::State::Null);
+                                crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
                                 drain_until_stop(&mut cmd_rx, &health_tx).await;
                                 return;
                             }
                         }
                         MessageView::Error(err) => {
                             let text = format!("{} ({})", err.error(), err.debug().unwrap_or_default());
-                            publish(&health_tx, &cam_id, CameraStatus::Error, Some(text), &counters, fps_window.back().copied());
+                            publish(&health_tx, &cam_id, CameraStatus::Error, Some(text.clone()), &counters, fps_window.back().copied());
                             let _ = pipeline.pipeline.set_state(gst::State::Null);
+                            crate::services::streaming_bus().close_camera(&cam_id, &text).await;
                             drain_until_stop(&mut cmd_rx, &health_tx).await;
                             return;
                         }
@@ -338,8 +346,10 @@ async fn run_session(
                     if total > 0 {
                         online = true;
                     } else if tokio::time::Instant::now() >= warmup_deadline {
-                        publish(&health_tx, &cam_id, CameraStatus::Error, Some("no frames within warmup window".into()), &counters, None);
+                        let reason = "no frames within warmup window";
+                        publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, None);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
+                        crate::services::streaming_bus().close_camera(&cam_id, reason).await;
                         drain_until_stop(&mut cmd_rx, &health_tx).await;
                         return;
                     }
