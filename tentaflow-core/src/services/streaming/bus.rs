@@ -77,15 +77,28 @@ pub struct StreamSubscriber {
     drop_counter: Arc<AtomicU64>,
 }
 
+/// Three-way result from `StreamSubscriber::next`. Splitting `Closed` from
+/// `Timeout` lets the host evict the subscriber slot on real channel close
+/// rather than parking the addon forever in `timeout` polls.
+#[derive(Debug)]
+pub enum NextOutcome {
+    /// Real message — frame, drop signal, or camera_offline.
+    Message(StreamMessage),
+    /// Channel was closed by the bus (camera removed, supervisor exit).
+    Closed,
+    /// Bounded wait elapsed with no message; channel still open.
+    Timeout,
+}
+
 impl StreamSubscriber {
-    /// Bounded poll. Returns `None` only when the bus has closed the channel
-    /// (camera removed / closed); a timeout yields `Some(Drop { count: 0 })`-
-    /// shaped absence by returning `None` from `try_recv`-style fall-through.
-    pub async fn next(&mut self, timeout: Duration) -> Option<StreamMessage> {
+    /// Bounded poll. Distinguishes channel-closed from timeout — the host
+    /// must treat the two cases differently (evict registry slot vs. let
+    /// the addon retry).
+    pub async fn next(&mut self, timeout: Duration) -> NextOutcome {
         match tokio::time::timeout(timeout, self.rx.recv()).await {
-            Ok(Some(m)) => Some(m),
-            Ok(None) => None,
-            Err(_) => None,
+            Ok(Some(m)) => NextOutcome::Message(m),
+            Ok(None) => NextOutcome::Closed,
+            Err(_) => NextOutcome::Timeout,
         }
     }
 
@@ -259,7 +272,10 @@ mod tests {
             bus.broadcast("cam1", RawFrameRef::new(), mk_meta("cam1"));
         }
         for _ in 0..3 {
-            let m = sub.next(Duration::from_millis(100)).await.expect("recv");
+            let m = match sub.next(Duration::from_millis(100)).await {
+                NextOutcome::Message(m) => m,
+                other => panic!("expected message, got {other:?}"),
+            };
             assert!(matches!(m, StreamMessage::Frame { .. }));
         }
     }
@@ -275,14 +291,23 @@ mod tests {
         assert_eq!(sub.dropped_pending(), 6);
         // Drain the 4 buffered frames so the channel becomes writable again.
         for _ in 0..4 {
-            let m = sub.next(Duration::from_millis(100)).await.expect("recv");
+            let m = match sub.next(Duration::from_millis(100)).await {
+                NextOutcome::Message(m) => m,
+                other => panic!("expected message, got {other:?}"),
+            };
             assert!(matches!(m, StreamMessage::Frame { .. }));
         }
         // Next broadcast should deliver the Drop signal first, then the frame.
         bus.broadcast("cam1", RawFrameRef::new(), mk_meta("cam1"));
-        let m = sub.next(Duration::from_millis(100)).await.expect("recv");
+        let m = match sub.next(Duration::from_millis(100)).await {
+            NextOutcome::Message(m) => m,
+            other => panic!("expected message, got {other:?}"),
+        };
         assert!(matches!(m, StreamMessage::Drop { count: 6 }));
-        let m = sub.next(Duration::from_millis(100)).await.expect("recv");
+        let m = match sub.next(Duration::from_millis(100)).await {
+            NextOutcome::Message(m) => m,
+            other => panic!("expected message, got {other:?}"),
+        };
         assert!(matches!(m, StreamMessage::Frame { .. }));
     }
 
@@ -306,7 +331,10 @@ mod tests {
         }
         // Fast subscriber: all 20 land (capacity 100 ≥ 20).
         for _ in 0..20 {
-            let m = fast.next(Duration::from_millis(100)).await.expect("recv");
+            let m = match fast.next(Duration::from_millis(100)).await {
+                NextOutcome::Message(m) => m,
+                other => panic!("expected message, got {other:?}"),
+            };
             assert!(matches!(m, StreamMessage::Frame { .. }));
         }
         // Slow subscriber: capacity 2, so 18 frames dropped.
@@ -318,7 +346,10 @@ mod tests {
         let bus = StreamingBus::new();
         let mut sub = bus.subscribe("cam1", StreamFilter::default());
         bus.close_camera("cam1", "removed").await;
-        let m = sub.next(Duration::from_millis(100)).await.expect("recv");
+        let m = match sub.next(Duration::from_millis(100)).await {
+            NextOutcome::Message(m) => m,
+            other => panic!("expected message, got {other:?}"),
+        };
         assert!(matches!(m, StreamMessage::CameraOffline { .. }));
         // After close, the camera key is gone.
         assert!(bus.list_subscribers("cam1").is_empty());
@@ -334,12 +365,15 @@ mod tests {
             let mut got_none = false;
             for _ in 0..10 {
                 match sub.next(Duration::from_millis(500)).await {
-                    Some(StreamMessage::CameraOffline { .. }) => got_offline = true,
-                    Some(_) => continue,
-                    None => {
+                    NextOutcome::Message(StreamMessage::CameraOffline { .. }) => {
+                        got_offline = true;
+                    }
+                    NextOutcome::Message(_) => continue,
+                    NextOutcome::Closed => {
                         got_none = true;
                         break;
                     }
+                    NextOutcome::Timeout => continue,
                 }
             }
             (got_offline, got_none)
@@ -373,11 +407,12 @@ mod tests {
         let mut saw_none = false;
         for _ in 0..200 {
             match sub.next(Duration::from_millis(100)).await {
-                Some(_) => continue,
-                None => {
+                NextOutcome::Message(_) => continue,
+                NextOutcome::Closed => {
                     saw_none = true;
                     break;
                 }
+                NextOutcome::Timeout => continue,
             }
         }
         assert!(saw_none, "subscriber must observe channel close after timeout");

@@ -131,34 +131,9 @@ pub fn service_request(
         request_json.len()
     );
 
-    // M1.W7 — when the addon hands us a `frame_ref` in the payload, mint a
-    // PickupToken so the receiving service can fetch the frame bytes over
-    // the Service-to-Core API. We rewrite the payload to include the wire
-    // token + a fresh request_id alongside the existing fields. Addons that
-    // do not pass a `frame_ref` (pure text calls) bypass this branch
-    // entirely — backward-compatible.
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let (effective_payload, frame_ref_for_audit) =
-        match maybe_inject_pickup_token(&request_json, &service_name, &request_id) {
-            Ok((payload, fref)) => (payload, fref),
-            Err(reason) => {
-                warn!(
-                    "service_request: pickup token injection failed for '{}': {}",
-                    service_name, reason
-                );
-                audit_log(
-                    caller.data(),
-                    "service.request",
-                    Some("service"),
-                    Some(&service_name),
-                    "error",
-                    Some(reason),
-                );
-                return ABI_ERR_OPERATION;
-            }
-        };
-
-    // Sprawdz rate limit
+    // Rate limit + router availability are checked BEFORE minting the pickup
+    // token so a denied call does not leave an orphan entry in the inflight
+    // map. Token mint comes only when we are committed to dispatching.
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
         if rate_limiter
             .check(&addon_id, ResourceType::HttpRequests)
@@ -177,7 +152,6 @@ pub fn service_request(
         rate_limiter.record_usage(&addon_id, ResourceType::HttpRequests, 1);
     }
 
-    // Pobierz router z AddonState
     let router = match caller.data().router.as_ref() {
         Some(r) => r.clone(),
         None => {
@@ -197,16 +171,83 @@ pub fn service_request(
         }
     };
 
+    // M1.W7 — mint PickupToken only after rate-limit + router are green. If
+    // the dispatch fails downstream we revoke the token explicitly so the
+    // inflight map cannot grow without bound under partial failures.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (effective_payload, frame_ref_for_audit, minted_token_wire) =
+        match maybe_inject_pickup_token(&request_json, &service_name, &request_id) {
+            Ok((payload, fref, wire)) => (payload, fref, wire),
+            Err(reason) => {
+                warn!(
+                    "service_request: pickup token injection failed for '{}': {}",
+                    service_name, reason
+                );
+                audit_log(
+                    caller.data(),
+                    "service.request",
+                    Some("service"),
+                    Some(&service_name),
+                    "error",
+                    Some(reason),
+                );
+                return ABI_ERR_OPERATION;
+            }
+        };
+
     // Znajdz QUIC client dla serwisu — szukamy po kolei w roznych typach
     let service_manager = router.service_manager();
 
+    // Bounded dispatch timeout — any service that legitimately needs >30 s is
+    // a bug, and an unbounded wait would leave the alias_calls table without
+    // any record of the call until the hang resolves (audit chain gap).
+    const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let dispatch_started = std::time::Instant::now();
-    let result = tokio::task::block_in_place(|| {
+    let dispatch_outcome = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            dispatch_to_service(service_manager, &service_name, &effective_payload, &addon_id).await
+            tokio::time::timeout(
+                DISPATCH_TIMEOUT,
+                dispatch_to_service(service_manager, &service_name, &effective_payload, &addon_id),
+            )
+            .await
         })
     });
     let duration_ms = dispatch_started.elapsed().as_millis() as i64;
+    let result = match dispatch_outcome {
+        Ok(inner) => inner,
+        Err(_) => {
+            warn!(
+                "service_request: dispatch timeout (>{}s) for service='{}'",
+                DISPATCH_TIMEOUT.as_secs(),
+                service_name
+            );
+            // Revoke minted pickup token so it cannot be replayed against a
+            // service that never received its envelope.
+            if let Some(ref wire) = minted_token_wire {
+                crate::services::pickup_token_issuer().revoke(wire);
+            }
+            log_alias_call(
+                caller.data(),
+                &service_name,
+                &request_id,
+                duration_ms,
+                effective_payload.len() as i64,
+                0,
+                frame_ref_for_audit.as_deref(),
+                "timeout",
+                Some("dispatch_timeout"),
+            );
+            audit_log(
+                caller.data(),
+                "service.request",
+                Some("service"),
+                Some(&service_name),
+                "error",
+                Some("dispatch_timeout"),
+            );
+            return ABI_ERR_OPERATION;
+        }
+    };
 
     match result {
         Ok(response_json) => {
@@ -243,6 +284,11 @@ pub fn service_request(
             )
         }
         Err(err_code) => {
+            // Dispatch failed before the receiving service could consume the
+            // pickup token — revoke it so it cannot leak past this call.
+            if let Some(ref wire) = minted_token_wire {
+                crate::services::pickup_token_issuer().revoke(wire);
+            }
             let err_msg = match err_code {
                 ABI_ERR_NOT_FOUND => format!("serwis '{}' nie znaleziony", service_name),
                 _ => format!("blad wysylania do serwisu '{}'", service_name),
@@ -281,32 +327,34 @@ pub fn service_request(
 /// `PickupToken` for `(frame_ref, service_id, request_id)` and rewrites the
 /// payload to embed `pickup_token` next to it. Non-object payloads (raw
 /// strings, arrays) and objects without `frame_ref` are returned verbatim.
-/// Returns `(rewritten_payload_json, frame_ref_for_audit)`.
+/// Returns `(rewritten_payload_json, frame_ref_for_audit, minted_wire_token)`
+/// where the wire token is `Some` only when a token was actually minted —
+/// callers use it to revoke the inflight entry on dispatch failure.
 fn maybe_inject_pickup_token(
     payload_json: &str,
     service_id: &str,
     request_id: &str,
-) -> Result<(String, Option<String>), &'static str> {
+) -> Result<(String, Option<String>, Option<String>), &'static str> {
     let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
         Ok(v) => v,
-        // Treat unparseable bodies as opaque text — pass through verbatim.
-        Err(_) => return Ok((payload_json.to_string(), None)),
+        Err(_) => return Ok((payload_json.to_string(), None, None)),
     };
     let obj = match parsed.as_object() {
         Some(o) => o,
-        None => return Ok((payload_json.to_string(), None)),
+        None => return Ok((payload_json.to_string(), None, None)),
     };
     let frame_ref = match obj.get("frame_ref").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return Ok((payload_json.to_string(), None)),
+        _ => return Ok((payload_json.to_string(), None, None)),
     };
 
     let issuer = crate::services::pickup_token_issuer();
     let (token, _) = issuer.issue(frame_ref.clone(), service_id.to_string(), request_id.to_string());
+    let wire = token.wire();
     let mut new_obj = obj.clone();
     new_obj.insert(
         "pickup_token".to_string(),
-        serde_json::Value::String(token.wire()),
+        serde_json::Value::String(wire.clone()),
     );
     new_obj.insert(
         "request_id".to_string(),
@@ -317,7 +365,7 @@ fn maybe_inject_pickup_token(
         serde_json::Value::String(service_id.to_string()),
     );
     serde_json::to_string(&serde_json::Value::Object(new_obj))
-        .map(|s| (s, Some(frame_ref)))
+        .map(|s| (s, Some(frame_ref), Some(wire)))
         .map_err(|_| "rewrite_serialize_failed")
 }
 

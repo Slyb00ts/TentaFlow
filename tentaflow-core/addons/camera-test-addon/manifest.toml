@@ -30,6 +30,12 @@ display_name = "Capture snapshots"
 description = "Capture RGB24 snapshots from owned cameras."
 risk = "medium"
 
+[[permission]]
+id = "streams.subscribe"
+display_name = "Subscribe to camera streams"
+description = "Receive live frames via stream_subscribe/next/close."
+risk = "low"
+
 [visibility]
 admin_only = true
 default_groups = []

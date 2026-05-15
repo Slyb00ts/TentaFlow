@@ -109,15 +109,31 @@ impl PickupTokenIssuer {
         (token, payload)
     }
 
-    /// Full verification path used by `/core/frame/pickup`:
-    ///   1. HMAC over `payload_b64`
-    ///   2. Inflight lookup (rejects forged / restart-invalidated tokens)
-    ///   3. Expiry check
-    ///   4. Atomic one-shot consume
-    pub fn verify_and_consume(&self, wire: &str) -> Result<TokenPayload, PickupVerifyError> {
+    /// HMAC + inflight + expiry check WITHOUT consuming the one-shot bit.
+    /// Used by the pickup handler so that a header cross-check failure does
+    /// not burn a still-good token (which would let an attacker DoS the real
+    /// recipient by forging the headers with a stolen wire string).
+    pub fn verify_only(&self, wire: &str) -> Result<TokenPayload, PickupVerifyError> {
         let (payload, key) = parse_and_verify(&self.signing_key, wire)?;
-        // Step 1 already done by parse_and_verify; do the rest under the
-        // DashMap entry guard so we cannot race with the sweeper.
+        let entry = self
+            .inflight
+            .get(&key)
+            .ok_or(PickupVerifyError::InvalidToken)?;
+        if now_unix_ms() > entry.payload.expiry_unix_ms {
+            return Err(PickupVerifyError::Expired);
+        }
+        if entry.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PickupVerifyError::AlreadyConsumed);
+        }
+        debug_assert_eq!(payload, entry.payload);
+        Ok(entry.payload.clone())
+    }
+
+    /// Atomic one-shot consume. Caller must have already run `verify_only`
+    /// and cross-checked the headers against the returned payload. Returns
+    /// `AlreadyConsumed` if a concurrent caller won the race.
+    pub fn consume_one_shot(&self, wire: &str) -> Result<TokenPayload, PickupVerifyError> {
+        let (_payload, key) = parse_and_verify(&self.signing_key, wire)?;
         let entry = self
             .inflight
             .get(&key)
@@ -128,11 +144,14 @@ impl PickupTokenIssuer {
         if !entry.try_consume() {
             return Err(PickupVerifyError::AlreadyConsumed);
         }
-        // Defense-in-depth: the parse_and_verify-decoded payload must equal
-        // the one in the store. They will be byte-identical because the wire
-        // is the index, but checking serves as a cheap invariant.
-        debug_assert_eq!(payload, entry.payload);
         Ok(entry.payload.clone())
+    }
+
+    /// Revoke an issued but not-yet-consumed token. Used by callers that
+    /// mint a token and then hit a downstream failure (router missing, rate
+    /// limit, dispatch error) before the receiving service could use it.
+    pub fn revoke(&self, wire: &str) {
+        self.inflight.remove(wire);
     }
 
     /// Test/diagnostic peek — not used in production.
@@ -177,10 +196,10 @@ mod tests {
         let i = issuer();
         let (t, _) = i.issue("frame_a".into(), "svc".into(), "req-1".into());
         let wire = t.wire();
-        let p = i.verify_and_consume(&wire).expect("ok");
+        let p = i.consume_one_shot(&wire).expect("ok");
         assert_eq!(p.raw_ref, "frame_a");
         assert_eq!(
-            i.verify_and_consume(&wire).unwrap_err(),
+            i.consume_one_shot(&wire).unwrap_err(),
             PickupVerifyError::AlreadyConsumed,
             "replay must fail"
         );
@@ -192,7 +211,7 @@ mod tests {
         let (t, _) = i.issue("frame_b".into(), "svc".into(), "req-2".into());
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
-            i.verify_and_consume(&t.wire()).unwrap_err(),
+            i.consume_one_shot(&t.wire()).unwrap_err(),
             PickupVerifyError::Expired
         );
     }
@@ -206,7 +225,7 @@ mod tests {
         let last = wire.pop().unwrap();
         wire.push(if last == 'A' { 'B' } else { 'A' });
         assert_eq!(
-            i.verify_and_consume(&wire).unwrap_err(),
+            i.consume_one_shot(&wire).unwrap_err(),
             PickupVerifyError::InvalidSignature
         );
     }
@@ -226,7 +245,7 @@ mod tests {
         };
         let t = sign_payload(&i.signing_key, &payload);
         assert_eq!(
-            i.verify_and_consume(&t.wire()).unwrap_err(),
+            i.consume_one_shot(&t.wire()).unwrap_err(),
             PickupVerifyError::InvalidToken
         );
     }

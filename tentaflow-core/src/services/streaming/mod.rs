@@ -10,5 +10,6 @@
 mod bus;
 
 pub use bus::{
-    StreamFilter, StreamId, StreamMessage, StreamSubscriber, StreamingBus, SUBSCRIBER_CAPACITY,
+    NextOutcome, StreamFilter, StreamId, StreamMessage, StreamSubscriber, StreamingBus,
+    SUBSCRIBER_CAPACITY,
 };

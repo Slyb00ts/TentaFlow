@@ -1005,6 +1005,12 @@ const MAX_OUT_CAP: usize = 4 * 1024 * 1024;
 /// payloads without raising the cap for every other call.
 const MAX_OUT_CAP_SNAPSHOT: usize = 8 * 1024 * 1024;
 
+/// Stream subscribe/next/close responses carry only small metadata payloads
+/// (stream_id, frame_ref + a few numeric fields, never frame bytes). 4 KiB is
+/// well above the realistic ceiling and keeps the guest from following a
+/// misbehaving host into a multi-megabyte allocation.
+const MAX_OUT_CAP_STREAM: usize = 4 * 1024;
+
 /// Maksymalna liczba prob retry (bez bedu) na pojedynczym callu.
 /// W praktyce 1 attempt = sukces, 2 attempt = sukces po znalezieniu rozmiaru.
 /// Trzecia proba sugeruje host bug — zwracamy OutputBufferTooSmall.
@@ -1653,6 +1659,7 @@ pub enum StreamNextMessage {
     Frame(StreamFrameMeta),
     Drop { count: u64 },
     CameraOffline { reason: String },
+    StreamClosed,
     Timeout,
 }
 
@@ -1673,6 +1680,7 @@ enum StreamNextRaw {
     CameraOffline {
         reason: String,
     },
+    StreamClosed,
     Timeout,
 }
 
@@ -1695,7 +1703,7 @@ pub fn stream_subscribe(target: &str, max_fps: Option<u32>) -> Result<String, Ab
     if let Some(fps) = max_fps {
         s.push_str(&format!("[filter]\nmax_fps = {}\nskip_frames = 0\n", fps));
     }
-    let bytes = call_sql_with_one_input(stream_subscribe_v1, s.as_bytes())?;
+    let bytes = call_sql_with_one_input_capped(stream_subscribe_v1, s.as_bytes(), MAX_OUT_CAP_STREAM)?;
     let out: StreamSubscribeOut = parse_toml(&bytes)?;
     Ok(out.stream_id)
 }
@@ -1708,7 +1716,7 @@ pub fn stream_next(stream_id: &str, timeout_ms: u64) -> Result<StreamNextMessage
         toml::Value::String(stream_id.to_string()),
         timeout_ms,
     );
-    let bytes = call_sql_with_one_input(stream_next_v1, payload.as_bytes())?;
+    let bytes = call_sql_with_one_input_capped(stream_next_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
     let raw: StreamNextRaw = parse_toml(&bytes)?;
     Ok(match raw {
         StreamNextRaw::Frame {
@@ -1728,6 +1736,7 @@ pub fn stream_next(stream_id: &str, timeout_ms: u64) -> Result<StreamNextMessage
         }),
         StreamNextRaw::Drop { count } => StreamNextMessage::Drop { count },
         StreamNextRaw::CameraOffline { reason } => StreamNextMessage::CameraOffline { reason },
+        StreamNextRaw::StreamClosed => StreamNextMessage::StreamClosed,
         StreamNextRaw::Timeout => StreamNextMessage::Timeout,
     })
 }
@@ -1736,7 +1745,7 @@ pub fn stream_next(stream_id: &str, timeout_ms: u64) -> Result<StreamNextMessage
 /// return `StreamNotFound`.
 pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
     let payload = format!("stream_id = {}\n", toml::Value::String(stream_id.to_string()));
-    let bytes = call_sql_with_one_input(stream_close_v1, payload.as_bytes())?;
+    let bytes = call_sql_with_one_input_capped(stream_close_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
     let _: StreamCloseOut = parse_toml(&bytes)?;
     Ok(())
 }

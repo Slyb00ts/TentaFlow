@@ -233,11 +233,25 @@ fn test_pickup_token_cross_service_rejected() {
         other => panic!("expected HeaderMismatch, got {:?}", other),
     }
     assert_eq!(frame_pickup_log_count(&db, "unauthorized"), 1);
-    // Note: the token IS consumed even though headers mismatched — that is
-    // intentional. A peer trying to abuse the token with bogus headers burns
-    // it immediately, so the real recipient cannot use it either, which is
-    // the safer failure mode (avoid double-spend at the cost of one denied
-    // legitimate retry).
+    // Defense-in-depth: a header-mismatched request MUST NOT consume the
+    // token. The legitimate recipient (real service_id) must still be able
+    // to redeem it. Re-issue the same wire with the correct headers and
+    // expect success.
+    let retry = handle_pickup(
+        PickupRequest {
+            pickup_token: Some(&wire),
+            frame_ref: Some(raw_ref.as_str()),
+            service_id: Some("yolo-svc"),
+            request_id: Some("req-1"),
+        },
+        &iss,
+        &storage,
+        &db,
+    );
+    match retry {
+        PickupOutcome::Ok { .. } => {}
+        other => panic!("expected Ok after header-mismatch retry, got {:?}", other),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -362,4 +376,144 @@ fn test_pickup_outcome_status_codes() {
         &db,
     );
     assert_eq!(ok.http_status(), 200);
+}
+
+// -----------------------------------------------------------------------------
+// Additional regression tests (Codex review M1.W7 Chunk C)
+// -----------------------------------------------------------------------------
+
+/// Two concurrent pickups racing the same token: exactly one wins, the other
+/// observes `AlreadyConsumed`. Validates the `compare_exchange` one-shot bit.
+#[test]
+fn test_concurrent_double_consume_race() {
+    use std::sync::Arc as StdArc;
+    use std::thread;
+
+    let storage = StdArc::new(FrameStorage::new(8));
+    let raw_ref = storage.insert(mk_frame("cam", &[1, 2, 3]));
+    let iss = StdArc::new(issuer(Duration::from_secs(30)));
+    let (tok, _) = iss.issue(raw_ref.as_str().to_string(), "svc".into(), "req".into());
+    let wire = StdArc::new(tok.wire());
+    let db = StdArc::new(make_db());
+
+    let mk_handle = |i: usize| {
+        let wire = wire.clone();
+        let iss = iss.clone();
+        let storage = storage.clone();
+        let db = db.clone();
+        let raw_ref = raw_ref.clone();
+        thread::spawn(move || {
+            let _ = i;
+            handle_pickup(
+                PickupRequest {
+                    pickup_token: Some(wire.as_str()),
+                    frame_ref: Some(raw_ref.as_str()),
+                    service_id: Some("svc"),
+                    request_id: Some("req"),
+                },
+                &iss,
+                &storage,
+                &db,
+            )
+        })
+    };
+
+    let outcomes: Vec<_> = (0..2).map(mk_handle).map(|h| h.join().unwrap()).collect();
+    let oks = outcomes.iter().filter(|o| matches!(o, PickupOutcome::Ok { .. })).count();
+    let consumed = outcomes
+        .iter()
+        .filter(|o| matches!(o, PickupOutcome::Unauthorized(PickupVerifyError::AlreadyConsumed)))
+        .count();
+    assert_eq!(oks, 1, "exactly one consumer must win the race");
+    assert_eq!(consumed, 1, "the loser must observe AlreadyConsumed");
+}
+
+/// For each of the four required headers, missing it produces `BadHeaders`
+/// (HTTP 400) AND does not consume the token: a subsequent fully-formed call
+/// still succeeds.
+#[test]
+fn test_each_missing_header_returns_400() {
+    let cases: [(&str, fn(&mut PickupRequest)); 4] = [
+        ("token", |r| r.pickup_token = None),
+        ("frame_ref", |r| r.frame_ref = None),
+        ("service_id", |r| r.service_id = None),
+        ("request_id", |r| r.request_id = None),
+    ];
+    for (label, clear) in cases {
+        let storage = FrameStorage::new(8);
+        let raw_ref = storage.insert(mk_frame("cam", &[7, 7]));
+        let iss = issuer(Duration::from_secs(30));
+        let (tok, _) = iss.issue(raw_ref.as_str().to_string(), "svc".into(), "req".into());
+        let wire = tok.wire();
+        let db = make_db();
+        let mut bad = PickupRequest {
+            pickup_token: Some(&wire),
+            frame_ref: Some(raw_ref.as_str()),
+            service_id: Some("svc"),
+            request_id: Some("req"),
+        };
+        clear(&mut bad);
+        let out = handle_pickup(bad, &iss, &storage, &db);
+        assert!(
+            matches!(out, PickupOutcome::BadHeaders(_)),
+            "missing {label} must yield BadHeaders, got {:?}",
+            out
+        );
+        assert_eq!(out.http_status(), 400);
+        // Token must NOT be consumed by a 400 path — full retry succeeds.
+        let retry = handle_pickup(
+            PickupRequest {
+                pickup_token: Some(&wire),
+                frame_ref: Some(raw_ref.as_str()),
+                service_id: Some("svc"),
+                request_id: Some("req"),
+            },
+            &iss,
+            &storage,
+            &db,
+        );
+        assert!(
+            matches!(retry, PickupOutcome::Ok { .. }),
+            "missing {label}: retry must succeed (token preserved), got {:?}",
+            retry
+        );
+    }
+}
+
+/// Token-bound `request_id` must equal the X-Request-Id header. Stress this
+/// directly by issuing one request_id and presenting another — the token
+/// must survive (still consumable later with the right id).
+#[test]
+fn test_request_id_mismatch_preserves_token() {
+    let storage = FrameStorage::new(8);
+    let raw_ref = storage.insert(mk_frame("cam", &[0xab]));
+    let iss = issuer(Duration::from_secs(30));
+    let (tok, _) = iss.issue(raw_ref.as_str().to_string(), "svc".into(), "req-good".into());
+    let wire = tok.wire();
+    let db = make_db();
+
+    let bad = handle_pickup(
+        PickupRequest {
+            pickup_token: Some(&wire),
+            frame_ref: Some(raw_ref.as_str()),
+            service_id: Some("svc"),
+            request_id: Some("req-bad"),
+        },
+        &iss,
+        &storage,
+        &db,
+    );
+    assert!(matches!(bad, PickupOutcome::HeaderMismatch(why) if why == "request_id_mismatch"));
+    let ok = handle_pickup(
+        PickupRequest {
+            pickup_token: Some(&wire),
+            frame_ref: Some(raw_ref.as_str()),
+            service_id: Some("svc"),
+            request_id: Some("req-good"),
+        },
+        &iss,
+        &storage,
+        &db,
+    );
+    assert!(matches!(ok, PickupOutcome::Ok { .. }));
 }

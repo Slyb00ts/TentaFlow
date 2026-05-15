@@ -585,7 +585,7 @@ async fn supervisor_fps_actual_approaches_target_after_warmup() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_remove_closes_streaming_bus() {
-    use tentaflow_core::services::streaming::{StreamFilter, StreamMessage};
+    use tentaflow_core::services::streaming::{NextOutcome, StreamFilter, StreamMessage};
 
     let Some(path) = sample_path() else {
         eprintln!("skipping — sample mp4 missing");
@@ -617,15 +617,16 @@ async fn supervisor_remove_closes_streaming_bus() {
     let mut saw_terminal = false;
     for _ in 0..50 {
         match sub.next(std::time::Duration::from_millis(200)).await {
-            Some(StreamMessage::CameraOffline { .. }) => {
+            NextOutcome::Message(StreamMessage::CameraOffline { .. }) => {
                 saw_terminal = true;
                 break;
             }
-            Some(_) => continue,
-            None => {
+            NextOutcome::Message(_) => continue,
+            NextOutcome::Closed => {
                 saw_terminal = true;
                 break;
             }
+            NextOutcome::Timeout => continue,
         }
     }
     assert!(saw_terminal, "subscriber must observe terminal event after remove");
