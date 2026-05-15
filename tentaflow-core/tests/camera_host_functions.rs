@@ -582,3 +582,52 @@ async fn supervisor_fps_actual_approaches_target_after_warmup() {
     assert!(h.frames_total > 30, "frames_total={}", h.frames_total);
     sup.remove_camera(&id).await.ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_remove_closes_streaming_bus() {
+    use tentaflow_core::services::streaming::{StreamFilter, StreamMessage};
+
+    let Some(path) = sample_path() else {
+        eprintln!("skipping — sample mp4 missing");
+        return;
+    };
+    let _g = drain_mutex().lock().unwrap();
+    let sup =
+        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+            .await
+            .expect("supervisor init");
+    let id = uniq("cam_close_bus");
+    sup.add_camera(CameraConfig {
+        camera_id: id.clone(),
+        vendor: "fake_file".into(),
+        url: path.to_string_lossy().into_owned(),
+        target_fps: 30,
+        resolution: None,
+        owner_addon_id: None,
+    })
+    .await
+    .expect("add");
+
+    let bus = tentaflow_core::services::streaming_bus();
+    let mut sub = bus.subscribe(&id, StreamFilter::default());
+
+    sup.remove_camera(&id).await.expect("remove");
+
+    // Either an explicit CameraOffline or channel-close (None) is acceptable.
+    let mut saw_terminal = false;
+    for _ in 0..50 {
+        match sub.next(std::time::Duration::from_millis(200)).await {
+            Some(StreamMessage::CameraOffline { .. }) => {
+                saw_terminal = true;
+                break;
+            }
+            Some(_) => continue,
+            None => {
+                saw_terminal = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_terminal, "subscriber must observe terminal event after remove");
+    assert!(bus.list_subscribers(&id).is_empty());
+}

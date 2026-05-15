@@ -208,18 +208,21 @@ impl StreamingBus {
         }
     }
 
-    /// Send `CameraOffline` to every subscriber and clear the entry. Best-
-    /// effort: a subscriber whose channel is already full or closed will not
-    /// receive the message — that is acceptable because the channel close
-    /// itself signals end-of-stream.
-    pub fn close_camera(&self, camera_id: &str, reason: &str) {
-        if let Some((_k, entries)) = self.inner.remove(camera_id) {
-            for entry in entries.into_iter() {
-                let _ = entry.tx.try_send(StreamMessage::CameraOffline {
-                    reason: reason.to_string(),
-                });
-                // Dropping `tx` here closes the channel from the sender side.
-            }
+    /// Send `CameraOffline` to every subscriber and clear the entry. Per
+    /// subscriber: try a graceful `send().await` bounded by 100 ms so a hung
+    /// reader cannot block teardown. On timeout we just drop the sender —
+    /// the receiver's next poll then returns `None` and signals end-of-stream.
+    pub async fn close_camera(&self, camera_id: &str, reason: &str) {
+        let entries = match self.inner.remove(camera_id) {
+            Some((_k, v)) => v,
+            None => return,
+        };
+        for entry in entries.into_iter() {
+            let msg = StreamMessage::CameraOffline {
+                reason: reason.to_string(),
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(100), entry.tx.send(msg)).await;
+            // `entry.tx` drops here either way, closing the channel.
         }
     }
 
@@ -314,11 +317,70 @@ mod tests {
     async fn test_bus_close_camera() {
         let bus = StreamingBus::new();
         let mut sub = bus.subscribe("cam1", StreamFilter::default());
-        bus.close_camera("cam1", "removed");
+        bus.close_camera("cam1", "removed").await;
         let m = sub.next(Duration::from_millis(100)).await.expect("recv");
         assert!(matches!(m, StreamMessage::CameraOffline { .. }));
         // After close, the camera key is gone.
         assert!(bus.list_subscribers("cam1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_close_camera_async_delivers_offline_to_active_reader() {
+        let bus = Arc::new(StreamingBus::new());
+        let mut sub = bus.subscribe("cam1", StreamFilter::default());
+        // Spawn a reader that drains until the channel closes.
+        let reader = tokio::spawn(async move {
+            let mut got_offline = false;
+            let mut got_none = false;
+            for _ in 0..10 {
+                match sub.next(Duration::from_millis(500)).await {
+                    Some(StreamMessage::CameraOffline { .. }) => got_offline = true,
+                    Some(_) => continue,
+                    None => {
+                        got_none = true;
+                        break;
+                    }
+                }
+            }
+            (got_offline, got_none)
+        });
+        // Give the reader a moment to enter recv().
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        bus.close_camera("cam1", "removed").await;
+        let (got_offline, got_none) = reader.await.expect("reader joined");
+        assert!(got_offline, "subscriber must receive CameraOffline");
+        assert!(got_none, "subscriber must observe channel close");
+    }
+
+    #[tokio::test]
+    async fn test_close_camera_async_timeout_drops_tx_for_full_subscriber() {
+        let bus = StreamingBus::new();
+        // Tiny capacity so we can fill it without reading.
+        let mut sub = bus.subscribe_with_capacity("cam1", StreamFilter::default(), 2);
+        // Fill the channel — broadcast many frames without reading.
+        for _ in 0..100 {
+            bus.broadcast("cam1", RawFrameRef::new(), mk_meta("cam1"));
+        }
+        let started = std::time::Instant::now();
+        bus.close_camera("cam1", "removed").await;
+        let elapsed = started.elapsed();
+        // Close must return within ~200 ms even though the channel is full.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "close_camera blocked for {elapsed:?}"
+        );
+        // Drain buffered frames; eventually next() returns None (tx dropped).
+        let mut saw_none = false;
+        for _ in 0..200 {
+            match sub.next(Duration::from_millis(100)).await {
+                Some(_) => continue,
+                None => {
+                    saw_none = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_none, "subscriber must observe channel close after timeout");
     }
 
     #[tokio::test]
