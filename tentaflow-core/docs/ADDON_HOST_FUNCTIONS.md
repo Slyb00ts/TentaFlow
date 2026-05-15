@@ -1434,7 +1434,8 @@ autoryzuje sie wylacznie przez token.
 |--------|------|---------------------------|
 | 200 OK | Bajty RGB24 w body + metadata w headerach | `ok` |
 | 400 Bad Request | Brak/empty header | `token_invalid` |
-| 403 Forbidden | HMAC mismatch / replay / cross-service mismatch | `token_invalid` \| `unauthorized` |
+| 403 Forbidden | HMAC mismatch / malformed / unknown token | `token_invalid` |
+| 403 Forbidden | Replay (already consumed) / cross-service header mismatch | `unauthorized` |
 | 404 Not Found | Frame evicted z LRU przed pickup | `frame_purged` |
 | 410 Gone | Token wygasl | `token_expired` |
 
