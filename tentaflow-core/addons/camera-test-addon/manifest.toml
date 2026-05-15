@@ -1,0 +1,79 @@
+[addon]
+id = "camera-test-addon"
+name = "Camera Test Addon"
+version = "0.1.0"
+description = "M1.W6 Chunk D — exercises camera_* host functions end-to-end through a real WASM guest."
+category = "test"
+keywords = ["test", "camera", "f1a"]
+author = "TentaFlow Tests"
+license = "Apache-2.0"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "cameras.read"
+display_name = "Read cameras"
+description = "List, get, health probes against owned cameras."
+risk = "low"
+
+[[permission]]
+id = "cameras.write"
+display_name = "Manage cameras"
+description = "Add, update, remove cameras owned by this addon."
+risk = "medium"
+
+[[permission]]
+id = "cameras.snapshot"
+display_name = "Capture snapshots"
+description = "Capture RGB24 snapshots from owned cameras."
+risk = "medium"
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = false
+
+[resources]
+memory_mb = 64
+storage_mb = 1
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "run_lifecycle"
+display_name = "Camera lifecycle"
+description = "camera_add -> camera_health -> camera_snapshot -> camera_remove."
+keywords = ["camera", "lifecycle"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file."
+required = true
+
+[[tool]]
+id = "run_path_traversal"
+display_name = "Path traversal probe"
+description = "camera_add with a hostile URL; expected to fail with an ABI error."
+keywords = ["camera", "security"]
+
+[[tool.parameter]]
+name = "bad_url"
+param_type = "string"
+description = "Hostile URL to feed camera_add."
+required = true
+
+[[tool]]
+id = "run_no_write_probe"
+display_name = "Permission denied probe"
+description = "Attempts camera_add; succeeds when cameras.write is granted, returns Permission when not."
+keywords = ["camera", "permission"]
+
+[[tool.parameter]]
+name = "sample_path"
+param_type = "string"
+description = "Absolute path to the test mp4 file (used only on the happy path)."
+required = true
