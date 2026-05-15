@@ -34,6 +34,11 @@ inference-mlx-kokoro = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
 rdma-probe = []
+# Camera ingest (M1.W6) — GStreamer 1.x based pipeline for RTSP/file/V4L2/MIPI
+# inputs. Optional because GStreamer pulls a large dynamic-library surface
+# (gst-plugins-base, -good, -bad). Default builds stay slim; enable
+# `--features camera` for Router/Desktop where camera ingest is needed.
+camera = ["dep:gstreamer", "dep:gstreamer-app"]
 # Jedna flaga GPU per backend — wlacza akceleracje dla LLM (llama.cpp) i STT
 # (whisper). Duplicate ggml_* symbols rozwiazane przez
 # `-Wl,--allow-multiple-definition` w `.cargo/config.toml`.
@@ -158,6 +163,14 @@ multer = "3.1"
 
 # Docker (optional)
 bollard = { version = "0.21.0", optional = true }
+
+# Camera ingest — GStreamer 1.x Rust bindings (optional, feature `camera`).
+# Version 0.23 chosen over plan's 0.21: 0.21 is from 2024 and lacks fixes
+# for GStreamer 1.24+; 0.23 targets GStreamer 1.22/1.24/1.26 which matches
+# our system (1.28). 0.25 also exists but landed too recently for stable
+# ecosystem alignment.
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }
 
 # Inference — llama.cpp (optional)
 llama-cpp-2 = { version = "0.1.146", features = ["sampler"], optional = true }
