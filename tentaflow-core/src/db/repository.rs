@@ -895,8 +895,15 @@ pub fn add_alias_consumer_within_tx(
             (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
          VALUES (?1, ?2, ?3, strftime('%s','now'), NULL) \
          ON CONFLICT(alias_id, consumer_addon_id) DO UPDATE SET \
-             revoked_at = NULL, \
-             granted_by_user_id = excluded.granted_by_user_id",
+             granted_by_user_id = COALESCE(model_alias_consumers.granted_by_user_id, excluded.granted_by_user_id), \
+             granted_at = CASE \
+                 WHEN model_alias_consumers.granted_by_user_id IS NOT NULL THEN model_alias_consumers.granted_at \
+                 ELSE excluded.granted_at \
+             END, \
+             revoked_at = CASE \
+                 WHEN model_alias_consumers.granted_by_user_id IS NOT NULL THEN model_alias_consumers.revoked_at \
+                 ELSE NULL \
+             END",
         rusqlite::params![alias_id, consumer_addon_id, granted_by_user_id],
     )?;
     Ok(())
@@ -11209,5 +11216,169 @@ mod chunk_c_visibility_consumer_tests {
         assert_eq!(consumers, 1);
         assert_eq!(uses_alias, 1);
         assert_eq!(uses_model, 1);
+    }
+
+    /// Helper: returns (granted_by_user_id, granted_at, revoked_at) for a
+    /// consumer row, asserting the row exists.
+    fn consumer_row(
+        pool: &DbPool,
+        alias_id: i64,
+        consumer: &str,
+    ) -> (Option<i64>, i64, Option<i64>) {
+        let conn = pool.lock().expect("lock");
+        conn.query_row(
+            "SELECT granted_by_user_id, granted_at, revoked_at \
+             FROM model_alias_consumers \
+             WHERE alias_id = ?1 AND consumer_addon_id = ?2",
+            rusqlite::params![alias_id, consumer],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("consumer row exists")
+    }
+
+    #[test]
+    fn admin_grant_preserved_through_manifest_reinstall() {
+        // Admin manually grants consumer B; a subsequent manifest reinstall
+        // that re-asserts B in allowed_consumers must NOT demote the admin
+        // grant to a manifest grant (granted_by_user_id must stay 42).
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            // Simulate admin grant via the same helper, with explicit user id.
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", Some(42))
+                .expect("admin grant");
+            tx.commit().expect("commit");
+        }
+        let (initial_user, initial_at, _) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(initial_user, Some(42));
+
+        // Manifest reinstall path: granted_by_user_id = None for the same
+        // (alias_id, consumer) pair.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest reassert");
+            tx.commit().expect("commit");
+        }
+        let (user_after, at_after, revoked_after) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(
+            user_after,
+            Some(42),
+            "admin grant must NOT be demoted to NULL by manifest reinstall"
+        );
+        assert_eq!(
+            at_after, initial_at,
+            "granted_at must preserve admin timestamp"
+        );
+        assert!(revoked_after.is_none(), "row stays active");
+
+        // Reinstall with B dropped from allowed_consumers must keep the
+        // admin row (revoke_obsolete only deletes granted_by_user_id IS NULL).
+        let revoked = {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let revoked =
+                revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, &[]).expect("revoke");
+            tx.commit().expect("commit");
+            revoked
+        };
+        assert!(
+            revoked.is_empty(),
+            "admin-granted row must not be returned for revocation"
+        );
+        let (user_final, _, revoked_final) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(user_final, Some(42));
+        assert!(revoked_final.is_none());
+    }
+
+    #[test]
+    fn manifest_reinstall_does_not_revive_admin_revoked() {
+        // Admin grants then revokes consumer B (granted_by_user_id=42,
+        // revoked_at NOT NULL). A manifest reinstall that re-asserts B in
+        // allowed_consumers must NOT clear revoked_at — admin revoke is final.
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
+        let original_revoked_at: i64 = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO model_alias_consumers \
+                    (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+                 VALUES (?1, 'addon-b', 42, strftime('%s','now') - 100, strftime('%s','now'))",
+                rusqlite::params![alias_id],
+            )
+            .expect("seed admin-revoked");
+            conn.query_row(
+                "SELECT revoked_at FROM model_alias_consumers \
+                 WHERE alias_id = ?1 AND consumer_addon_id = 'addon-b'",
+                rusqlite::params![alias_id],
+                |r| r.get(0),
+            )
+            .expect("read revoked_at")
+        };
+
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest reassert");
+            tx.commit().expect("commit");
+        }
+
+        let (user_after, _, revoked_after) = consumer_row(&db, alias_id, "addon-b");
+        assert_eq!(user_after, Some(42), "admin user id preserved");
+        assert_eq!(
+            revoked_after,
+            Some(original_revoked_at),
+            "admin revoke must not be cleared by manifest reinstall"
+        );
+    }
+
+    #[test]
+    fn manifest_granted_row_reactivates_after_revoke() {
+        // Pure manifest grant (granted_by_user_id IS NULL) that has been
+        // revoked must be reactivated by a subsequent manifest reinstall
+        // (revoked_at cleared).
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
+        // Initial manifest grant.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest grant");
+            tx.commit().expect("commit");
+        }
+        // Mark it revoked (simulates an out-of-band revoke path; the manifest
+        // grant has no admin user_id so reactivation should be allowed).
+        {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "UPDATE model_alias_consumers SET revoked_at = strftime('%s','now') \
+                 WHERE alias_id = ?1 AND consumer_addon_id = 'addon-b'",
+                rusqlite::params![alias_id],
+            )
+            .expect("mark revoked");
+        }
+        let (user_before, _, revoked_before) = consumer_row(&db, alias_id, "addon-b");
+        assert!(user_before.is_none());
+        assert!(revoked_before.is_some());
+
+        // Manifest reinstall must clear revoked_at.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
+                .expect("manifest reassert");
+            tx.commit().expect("commit");
+        }
+        let (user_after, _, revoked_after) = consumer_row(&db, alias_id, "addon-b");
+        assert!(user_after.is_none(), "still a manifest grant");
+        assert!(
+            revoked_after.is_none(),
+            "manifest reinstall reactivates a manifest-revoked row"
+        );
     }
 }
