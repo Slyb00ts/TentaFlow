@@ -115,17 +115,15 @@ pub fn handle_pickup(
         _ => return log_and_return(db, &req, PickupOutcome::BadHeaders("missing_request_id")),
     };
 
-    // Verify + one-shot consume. Done BEFORE the header cross-check so that a
-    // tampered header cannot exhaust a still-good token; an unauthorized
-    // verdict from the issuer means the token is already useless.
-    let payload = match issuer.verify_and_consume(token) {
+    // 1) Verify-only: HMAC + inflight + expiry, but DO NOT consume.
+    // 2) Cross-check headers against the payload.
+    // 3) Only when everything matches do we run the atomic one-shot consume.
+    // Order matters: if an attacker holds a valid wire and lies in a header,
+    // we must not burn the token — the legitimate recipient still needs it.
+    let payload = match issuer.verify_only(token) {
         Ok(p) => p,
         Err(e) => return log_and_return(db, &req, PickupOutcome::Unauthorized(e)),
     };
-
-    // Defense-in-depth: token-bound fields MUST match the headers verbatim.
-    // Without this a stolen token tied to service A could be replayed against
-    // service B by lying in the `X-Service-Id` header.
     if payload.raw_ref != frame_ref {
         return log_and_return(db, &req, PickupOutcome::HeaderMismatch("frame_ref_mismatch"));
     }
@@ -134,6 +132,9 @@ pub fn handle_pickup(
     }
     if payload.request_id != request_id {
         return log_and_return(db, &req, PickupOutcome::HeaderMismatch("request_id_mismatch"));
+    }
+    if let Err(e) = issuer.consume_one_shot(token) {
+        return log_and_return(db, &req, PickupOutcome::Unauthorized(e));
     }
 
     let raw_ref = RawFrameRef::from_string(frame_ref.to_string());
