@@ -98,6 +98,22 @@ risk = "low"                                         # low|medium|high|critical
 gate = "d4-historical"                               # opcjonalne, ref do [[gate]]
 ```
 
+`id` ma postac `<domena>.<akcja>` i odpowiada nazwie host-function/grupy
+host-functions. Znane identyfikatory uzywane przez rdzen i addony:
+
+| `permission.id` | Przeznaczenie |
+|-----------------|---------------|
+| `storage.read` / `storage.write` | KV/SQL storage addona. |
+| `network.fetch` | HTTP fetch przez allowlist `[[network_rule]]`. |
+| `alias.read` | Wywolanie aliasu AI (tylko zadeklarowane w `[[uses_alias]]`). |
+| `cameras.read` | Lista, get, health-snapshot dla kamer nalezacych do addona. |
+| `cameras.write` | Add/update/remove kamer, test_connection, credentials_rotate, discover. |
+| `cameras.snapshot` | Pobranie pojedynczej klatki z aktywnej kamery. |
+
+Lista nie jest wymuszana whitelista — rdzen akceptuje dowolny string speniajacy
+walidacje (`[a-z0-9._-]+`), ale host-functions same odrzucaja `permission_denied`
+jesli addon zazada operacji bez odpowiedniej deklaracji.
+
 ---
 
 ## `[[oauth_provider]]` — providery OAuth
