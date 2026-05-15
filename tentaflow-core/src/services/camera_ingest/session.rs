@@ -193,7 +193,7 @@ async fn run_session(
     let cam_id = config.camera_id.clone();
     publish(&health_tx, &cam_id, CameraStatus::Starting, None, &counters, None);
 
-    let pipeline = match build_pipeline(&path, mailbox.clone(), counters.clone()) {
+    let pipeline = match build_pipeline(&path, cam_id.clone(), mailbox.clone(), counters.clone()) {
         Ok(p) => p,
         Err(e) => {
             publish(
@@ -275,7 +275,7 @@ async fn run_session(
                                     height: f.height,
                                     pixel_format: PixelFormat::Rgb24,
                                     timestamp_unix_ms: f.timestamp_unix_ms,
-                                    data: (*f.data).clone(),
+                                    data: f.data.to_vec(),
                                 });
                             }
                             let h = health_tx.borrow().clone();

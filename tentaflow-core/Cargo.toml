@@ -143,6 +143,7 @@ tempfile = "3.27.0"
 # Synchronizacja
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
+lru = "0.12"
 arc-swap = "1.7.1"
 smallvec = "1.13"
 rustc-hash = "2.1.2"

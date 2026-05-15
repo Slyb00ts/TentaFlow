@@ -20,6 +20,8 @@ use gstreamer_app as gst_app;
 use parking_lot::Mutex;
 
 use super::error::{CameraIngestError, Result};
+use crate::services::frame_storage::{FrameMetadata, FramePixelFormat, StoredFrame};
+use crate::services::{frame_storage, streaming_bus};
 
 /// Single-slot latest-frame mailbox. New frames overwrite older ones — we are
 /// deliberately discarding frames a slow consumer would otherwise buffer.
@@ -28,7 +30,7 @@ pub struct LatestFrame {
     pub width: u32,
     pub height: u32,
     pub timestamp_unix_ms: u64,
-    pub data: Arc<Vec<u8>>,
+    pub data: Arc<[u8]>,
 }
 
 #[derive(Default)]
@@ -150,6 +152,7 @@ pub struct FakeFilePipeline {
 /// `counters`.
 pub fn build_pipeline(
     file_path: &Path,
+    camera_id: String,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) -> Result<FakeFilePipeline> {
@@ -177,6 +180,7 @@ pub fn build_pipeline(
 
     let mailbox_cb = mailbox.clone();
     let counters_cb = counters.clone();
+    let camera_id_cb = camera_id;
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -186,19 +190,43 @@ pub fn build_pipeline(
                 let s = caps.structure(0).ok_or(gst::FlowError::Error)?;
                 let width: i32 = s.get("width").map_err(|_| gst::FlowError::Error)?;
                 let height: i32 = s.get("height").map_err(|_| gst::FlowError::Error)?;
+                let pts_ns = buffer.pts().map(|t| t.nseconds());
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let bytes = map.as_slice().to_vec();
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                // Single Arc<[u8]> shared between mailbox + storage + future
+                // consumers; the per-frame allocation here is still the
+                // GStreamer buffer copy (improving that needs a zero-copy
+                // pull which is out of scope for F1a).
+                let shared: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+                let frame_size = shared.len();
                 mailbox_cb.put(LatestFrame {
                     width: width as u32,
                     height: height as u32,
                     timestamp_unix_ms: ts_ms,
-                    data: Arc::new(bytes),
+                    data: shared.clone(),
                 });
                 counters_cb.increment(ts_ms / 1000);
+
+                let metadata = FrameMetadata {
+                    camera_id: camera_id_cb.clone(),
+                    width: width as u32,
+                    height: height as u32,
+                    pixel_format: FramePixelFormat::Rgb24,
+                    timestamp_unix_ms: ts_ms,
+                    pts: pts_ns,
+                    frame_size_bytes: frame_size,
+                };
+                let stored = StoredFrame {
+                    metadata: metadata.clone(),
+                    data: shared,
+                    created_at: std::time::Instant::now(),
+                };
+                let frame_ref = frame_storage().insert(stored);
+                streaming_bus().broadcast(&camera_id_cb, frame_ref, metadata);
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
