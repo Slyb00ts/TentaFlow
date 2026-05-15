@@ -524,6 +524,11 @@ Mockupy: `~/.gstack/projects/Slyb00ts-TentaFlow/designs/tentavision-v1/`
 
 **Acceptance:** Pełne e2e: FakeFile → stream_subscribe → stream_next → service_call → mock yolo pickup_frame → bbox response. Security: replay → 403, TTL 31s → 410, cross-service → 403, forge → 403. Backpressure detected. stream_next < 1ms p99, pickup < 20ms p99.
 
+**Decyzje implementacyjne (Chunk A recon):**
+- **Cargo deps:** `dashmap 6.1.0`, `hmac 0.12.1`, `sha2 0.10.9`, `subtle 2`, `base64 0.22.1` są już unconditional w `tentaflow-core/Cargo.toml`. Brak nowych zależności w M1.W7. Pod feature `camera` nic nie trzeba przenosić — streaming/pickup nie wymaga GStreamer w sygnaturach modułów (tylko transportuje bajty), więc moduły services/streaming i services/pickup_tokens mogą być unconditional; gating przez feature `camera` aplikowany tylko na host_functions wywołujących GStreamer.
+- **DB schema:** istniejąca `alias_calls` (v9) ma wszystkie wymagane kolumny (`target_used`, `fallback_used`, `duration_ms`, `error_code`, plus extras). Istniejąca `frame_pickup_log` (v12) ma wymagane kolumny; warianty `result` ('ok'/'token_invalid'/'token_expired'/'frame_purged'/'unauthorized') mapują się 1:1 do spec security failures: replay/forge → `token_invalid`, TTL → `token_expired`, cross-service → `unauthorized`. Brak migracji v22 — używamy istniejących schem.
+- **HMAC signing key:** key generowany przy starcie procesu (32 random bytes via `rand::rngs::OsRng`), trzymany w in-memory shared state (`Arc<SigningKey>` w globalnym registry obok DashMap tokenów). F1a config.toml nie przechowuje key; restart procesu invaliduje wszystkie in-flight PickupTokens (akceptowalne, TTL=30s tak czy tak). F1b/M3 doda persistence dla multi-node mesh sync.
+
 ### M1.W8 — Recording basic + frame_url + audit chain hookup
 
 **Scope:**
