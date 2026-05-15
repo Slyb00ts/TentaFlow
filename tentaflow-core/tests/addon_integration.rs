@@ -99,6 +99,8 @@ fn create_addon_state_with_id(
         memory_limit: 256 * 1024 * 1024,
         router: None,
         oauth_refresh_guard: Arc::new(OAuthRefreshGuard::new()),
+        // ui_panels: brak shared cache UI panel state w testach izolowanych
+        ui_panels: None,
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
     }
@@ -589,6 +591,8 @@ fn addon_lifecycle_full() {
         memory_limit: 256 * 1024 * 1024,
         router: None,
         oauth_refresh_guard: Arc::new(OAuthRefreshGuard::new()),
+        // ui_panels: brak shared cache UI panel state w testach izolowanych
+        ui_panels: None,
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
     };
