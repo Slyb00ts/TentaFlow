@@ -510,7 +510,7 @@ Mockupy: `~/.gstack/projects/Slyb00ts-TentaFlow/designs/tentavision-v1/`
 - **Chunk A** (`e59a7bf`): recon decisions — deps (dashmap/hmac/sha2 już obecne), schema (alias_calls v9 + frame_pickup_log v12 wystarczają, brak v22), HMAC key strategy (in-memory OsRng, restart invaliduje, TTL=30s pokrywa).
 - **Chunk B** (`1da6361` + fix `b1f5196`): `services/frame_storage/` LRU 1024 ramki + `services/streaming/` bounded mpsc bus per camera (capacity 100, drop najstarsze + Drop{count}) + `CameraIngestSupervisor::close_camera` propagujący invalidation streamów.
 - **Chunk C** (`519fc0d` + fix `f5be74b`): `services/pickup_tokens.rs` (HMAC-SHA256, DashMap TTL 30s, background cleanup 60s) + 3 streaming ABI (`stream_subscribe_v1`, `stream_next_v1`, `stream_close_v1`) w `host_functions/streaming.rs` + rozszerzenie `service_call_v1` (router resolve → wystaw PickupToken → audit `alias_calls`) + `api/frame_pickup.rs` (POST `/core/frame/pickup` z HMAC verify + one-shot consume + `frame_pickup_log` audit) — 13 codex review fixes applied.
-- **Chunk D** (`<this commit>`): mock yolo e2e — `tests/streaming_pickup_e2e.rs` (6 testów: happy path z bbox, replay→403, cross-service→403, TTL→410, missing header→400, oversized body→413) + `benches/streaming_pickup_perf.rs` (9 criterion bench groups, `--quick --noplot`).
+- **Chunk D** (`<this commit>`): mock yolo e2e — `tests/streaming_pickup_e2e.rs` (6 testów: happy path z bbox, replay→403, cross-service→403, TTL→410, missing header→400, oversized body→413) + `benches/streaming_pickup_perf.rs` (criterion bench groups: pickup_token, pickup_token_verify_only, pickup_token/consume_one_shot, frame_storage, streaming_bus, pickup_handler_direct, pickup_http_roundtrip, pickup_core_model, `--quick --noplot`).
 
 **Performance benchmarks (Chunk D, criterion `--quick`):**
 
@@ -525,16 +525,18 @@ Mockupy: `~/.gstack/projects/Slyb00ts-TentaFlow/designs/tentavision-v1/`
 | `frame_storage/get/1280x720` | 27 ns | — | INFO |
 | `streaming_bus/broadcast_no_drop` | 1.22 µs | — | INFO |
 | `streaming_bus/stream_next_hot_buffer` | 91 ns | < 1 ms p99 (stream_next poll) | PASS (≈11000× margin) |
-| `pickup_roundtrip/320x240` | 146 µs | < 20 ms (pickup_frame) | PASS (≈137× margin) |
-| `pickup_roundtrip/1280x720` | 147 µs | < 20 ms (pickup_frame) | PASS (≈136× margin) |
-| `service_call_overhead_model` | 7.72 µs | < 5 ms (service_call overhead) | PASS (≈647× margin) |
+| `pickup_handler_direct/320x240` (in-process baseline) | 146 µs | < 20 ms (pickup_frame) | PASS (≈137× margin) |
+| `pickup_handler_direct/1280x720` (in-process baseline) | 147 µs | < 20 ms (pickup_frame) | PASS (≈136× margin) |
+| `pickup_http_roundtrip/320x240` (full hyper + reqwest loopback) | 70 µs | < 20 ms (pickup_frame) | PASS (≈285× margin) |
+| `pickup_http_roundtrip/1280x720` (full hyper + reqwest loopback) | 447 µs | < 20 ms (pickup_frame) | PASS (≈44× margin — resolution-dependent due to body memcpy) |
+| `pickup_core_model` (pickup segment only — mint+verify+consume+LRU+audit) | 7.72 µs | < 5 ms (service_call overhead — lower bound) | PASS (≈647× margin, router/QUIC/alias_calls NOT included) |
 
 Wszystkie krytyczne targety z `tentavision-plan.md` §17.8 spełnione z dwoma rzędami wielkości marginesu na CPU benchmark (in-process, bez sieciowego transportu). Realistyczny narzut QUIC + serialization rzędu ~1-3 ms dodaje się przy production deploy — nadal mieści się w 5 ms / 20 ms budżetach.
 
 **DoD coverage (§17 plan):**
-- **DoD-5** (service_call e2e z mock service): ✓ `test_e2e_happy_path_pickup_returns_bbox` — FakeFile frame → service_call (mock yolo) → pickup_frame → bbox response.
-- **DoD-6** (FakeFile→stream→service_call→pickup): partial ✓ — pełny pipeline FakeFile→stream_bus→pickup zweryfikowany przez bench `pickup_roundtrip` + e2e happy path; wasmtime addon e2e (z poziomu WASM guest) odłożone do M2 (wymaga camera-test-addon rozszerzonego o streaming ABI).
-- **DoD-10** (PickupToken replay → 403 + audit): ✓ `test_e2e_replay_rejected_on_wire` + `test_e2e_cross_service_rejected_on_wire` (oba sprawdzają `frame_pickup_log` audit entry z `result='token_invalid'/'unauthorized'`).
+- **DoD-5** (service_call e2e z mock service): ✓ partial — wire-level e2e via mock yolo (`test_e2e_happy_path_pickup_returns_bbox`) weryfikuje token-issued → frame fetched → bbox returned over loopback HTTP. Pełna ścieżka `service_call_v1` (rate-limit + router lookup + token mint + dispatch + audit) pokryta przez (a) Chunk C unit testy dla `maybe_inject_pickup_token` / `log_alias_call` w `host_functions/service.rs`, (b) `pickup_core_model` bench mierzący mint+verify+consume+remove+audit segment. Pełen WASM-guest → service_call_v1 → mock yolo odłożone do M2.W11 integration suite.
+- **DoD-6** (FakeFile→stream→service_call→pickup): ⚠ partial — pickup-flow integration zweryfikowany end-to-end na wire level (HTTP token-issued → frame fetched → bbox); produkcja klatek FakeFile testowana osobno w `camera_host_functions.rs` testach; `stream_subscribe` przez wasmtime guest + pełen pipeline FakeFile→stream_bus→service_call_v1→pickup odłożony do M2.W11 (wymaga camera-test-addon rozszerzonego o streaming ABI).
+- **DoD-10** (PickupToken replay → 403 + audit): ✓ `test_e2e_replay_rejected_on_wire` + `test_e2e_cross_service_rejected_on_wire`. Replay (`AlreadyConsumed`) → HTTP 403 + `frame_pickup_log.result='unauthorized'`. Cross-service header mismatch → HTTP 403 + `result='unauthorized'`. Forge / HMAC mismatch → HTTP 403 + `result='token_invalid'`. Missing header → HTTP 400 + `result='token_invalid'`.
 - **DoD-13** (performance): ✓ MEASURED — wszystkie 4 targety §17.8 dotyczące tej ścieżki PASS (token issuance, stream_next, pickup_frame, service_call overhead).
 
 **Coverage M1.W7:** 13 pickup unit + 4 streaming host fn unit + 6 e2e + 9 benches = **32 nowych testów + 9 benchów**.
