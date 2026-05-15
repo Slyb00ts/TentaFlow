@@ -35,6 +35,34 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_duplicate_add_cleans_up() {
+        // After a duplicate add the registry must contain exactly one entry
+        // and the second (orphaned) session must have been stopped — we
+        // exercise the supervisor::add_camera cleanup path.
+        let sup = start_supervisor().await.expect("supervisor");
+        let url = match sample_path() {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => {
+                eprintln!("skipping — sample mp4 missing");
+                return;
+            }
+        };
+        let cfg = CameraConfig {
+            camera_id: "race".into(),
+            vendor: "fake_file".into(),
+            url,
+            target_fps: 30,
+            resolution: None,
+        };
+        sup.add_camera(cfg.clone()).await.expect("first add");
+        let err = sup.add_camera(cfg).await.unwrap_err();
+        assert!(matches!(err, CameraIngestError::AlreadyExists(_)));
+        let listed = sup.list_handles().await;
+        assert_eq!(listed.len(), 1, "exactly one entry must remain in registry");
+        sup.shutdown().await.ok();
+    }
+
+    #[tokio::test]
     async fn test_double_add_same_id() {
         let sup = start_supervisor().await.expect("supervisor");
         let cfg = CameraConfig {

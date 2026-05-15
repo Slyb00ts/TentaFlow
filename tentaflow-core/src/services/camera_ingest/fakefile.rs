@@ -96,6 +96,7 @@ pub fn resolve_file_url(url: &str) -> Result<std::path::PathBuf> {
         return Err(CameraIngestError::InvalidUrl(url.to_string()));
     }
     let p = Path::new(raw);
+    check_no_symlinks_in_path(p)?;
     let meta = std::fs::symlink_metadata(p)
         .map_err(|_| CameraIngestError::FileNotFound(raw.to_string()))?;
     if meta.file_type().is_symlink() {
@@ -106,6 +107,35 @@ pub fn resolve_file_url(url: &str) -> Result<std::path::PathBuf> {
     }
     p.canonicalize()
         .map_err(|_| CameraIngestError::FileNotFound(raw.to_string()))
+}
+
+/// Walk every component of `path` and reject if any intermediate component is
+/// a symlink. `symlink_metadata` on the final path only checks the leaf; an
+/// attacker could swap a parent directory for a symlink to escape the
+/// intended subtree. We do this before `canonicalize` so the rejection
+/// surfaces the offending component, not the resolved target.
+fn check_no_symlinks_in_path(path: &Path) -> Result<()> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        // Root (`/`) and prefix components are never symlinks; skip cheaply
+        // by only probing components that actually exist on disk.
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CameraIngestError::SymlinkNotAllowed(
+                        current.display().to_string(),
+                    ));
+                }
+            }
+            Err(_) => {
+                // Non-existent intermediate component — leaf-existence check
+                // in the caller will report FileNotFound consistently.
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Built pipeline + the appsink handle we wired callbacks onto. Kept together
