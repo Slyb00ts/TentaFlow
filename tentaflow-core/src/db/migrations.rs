@@ -139,8 +139,40 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_uses_model",
             MigrationStep::Sql(ADDON_USES_MODEL),
         ),
+        (21, "cameras_table", MigrationStep::Sql(CAMERAS_TABLE)),
     ]
 }
+
+// F1a M1.W6 — TentaVision camera ingest registry. One row per camera owned
+// by an addon. F1a only supports `fake_file` vendor (mp4 loop via GStreamer
+// filesrc). `credentials_encrypted` carries opaque AES-GCM blob for vendors
+// that need auth (unused for fake_file). `fps_actual` + `last_frame_at`
+// expose health snapshot without a separate timeseries table.
+const CAMERAS_TABLE: &str = r#"
+CREATE TABLE cameras (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL UNIQUE,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL
+);
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+"#;
 
 // F1a §6.6 v0.6.0 — readonly aliases per Chunk C decision. Permission was
 // renamed from `alias.manage` (rollback removed CRUD ABI) to `alias.read`.
