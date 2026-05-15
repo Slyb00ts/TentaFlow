@@ -1,8 +1,10 @@
 # TentaVision F1a — implementation plan (week-by-week)
 
-**Wersja:** v0.3.1 · Chunk C ukończony — system uprawnień dwukierunkowych zaimplementowany, runtime alias CRUD ABI usunięte.
+**Wersja:** v0.3.2 · M1.W6 ukończony (Chunks A/B/C/D) — cameras table v21 + GStreamer FakeFile supervisor + 10 host functions ABI + e2e WASM addon + security suite. Wszystkie codex review fixes applied.
 
-**Poprzednia:** v0.3 · rewizja M1.W5 — runtime alias CRUD usuniety, dodany system dwukierunkowych uprawnien (visibility + consumers + uses_*); Chunk C kompletnie przepisany; Chunk D (admin UI) wydzielony i przesuniety do M2.
+**Poprzednia:** v0.3.1 · Chunk C ukończony — system uprawnień dwukierunkowych zaimplementowany, runtime alias CRUD ABI usunięte.
+
+**Wcześniejsza:** v0.3 · rewizja M1.W5 — runtime alias CRUD usuniety, dodany system dwukierunkowych uprawnien (visibility + consumers + uses_*); Chunk C kompletnie przepisany; Chunk D (admin UI) wydzielony i przesuniety do M2.
 
 **Wcześniejsza:** v0.2 · po pytaniu usera "dlaczego stub?" — usunięte stuby host functions, każdy tydzień M1 dostarcza PEŁNĄ implementację jednej kategorii API (SQL/Alias/Camera/Streaming/Recording). Boilerplate (AbiError, sdk_version, payload limits) skondensowany w M0.W2. Brak fazy "scaffolding stubs → później pełna implementacja" — zgodnie z project rules CLAUDE.md "no stubs/placeholders/TODO".
 **Cel:** wykonalny tygodniowy plan implementacji fazy F1a (10–16 tygodni jednego seniora / 6–8 tygodni 2-osobowego zespołu)
@@ -467,7 +469,15 @@ Mockupy: `~/.gstack/projects/Slyb00ts-TentaFlow/designs/tentavision-v1/`
 
 **Acceptance (M2):** Admin moze w M16b/M8b przyznac grant `pending` → `granted` na restricted alias/model; addon ktory deklaruje `[[uses_alias]] required=true` z `pending` widzi install blokowany w M15b z czytelnym CTA do M16b.
 
-### M1.W6 — Camera API PEŁNA + FakeFile connector + GStreamer pipeline
+### M1.W6 — Camera API PEŁNA + FakeFile connector + GStreamer pipeline  `[completed]`
+
+**Recap chunków:**
+- **Chunk A** (5f8ebd0+a7595ac): cargo deps (gstreamer 0.21 + gstreamer-app), migracja v21 `cameras`, docs/ADDON_HOST_FUNCTIONS.md §13, recipe `assets/test/sample_traffic.mp4`.
+- **Chunk B** (27ef060+c9d10d5): `src/services/camera_ingest/` (fakefile + session + supervisor) — singleton tokio per kamera, GStreamer `filesrc ! decodebin ! videoconvert ! video/x-raw,format=RGB ! appsink`, replay loop, symlink guard po każdym komponencie path (Issue #6).
+- **Chunk C** (c1f6eb7+976f19b): 10 host functions ABI (`camera_add_v1` ... `camera_credentials_rotate_v1`), SDK bindings (`tentaflow_addon_sdk::camera_*`), DB persistence przez `repository::*_camera`, audit log z RiskClass na każdej ścieżce, 24 unit testów w `tests/camera_host_functions.rs`.
+- **Chunk D** (M1.W6 wrap): real WASM addon `addons/camera-test-addon/` + integration test `tests/camera_integration_e2e.rs` (4 testy, `#[ignore]` gated on WASM artifact + sample mp4), security suite `tests/camera_security.rs` (17 testów: SQL injection, length caps, symlink leaf/parent, traversal, special files, cross-addon isolation, supervisor vendor/fps guards).
+
+**Coverage M1.W6:** 24 unit + 4 e2e + 17 security = **45 testów** camera API w F1a.
 
 **Scope:**
 - `tentaflow-core/src/services/camera_ingest/` (supervisor sesji tokio per kamera + registry)
