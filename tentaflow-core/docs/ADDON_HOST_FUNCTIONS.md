@@ -1086,3 +1086,232 @@ fn on_tick(_ts: i64) -> i32 {
 }
 ```
 
+## 13. Camera API (F1a M1.W6 — TentaVision)
+
+Camera ingest layer dla addonow video (TentaVision). Wszystkie host functions
+sa gated za cargo feature `camera`, ktore wciaga zalezosci GStreamer. Payload
+input/output to TOML (nie JSON).
+
+**Scope F1a:** wylacznie vendor `fake_file` (mp4 loop via GStreamer
+`filesrc`). RTSP, ONVIF discovery i rotacja credentialow przyjda w F1b/F1c —
+host functions sa zaimplementowane juz teraz jako noop zeby stabilizowac
+ABI dla SDK.
+
+**Uprawnienia (manifest `[[permission]].id`):**
+
+| Permission         | Risk | Funkcje                                                                     |
+|--------------------|------|-----------------------------------------------------------------------------|
+| `cameras.read`     | B    | `camera_list_v1`, `camera_get_v1`, `camera_health_v1`                       |
+| `cameras.write`    | A    | `camera_add_v1`, `camera_update_v1`, `camera_remove_v1`, `camera_discover_v1`, `camera_test_connection_v1`, `camera_credentials_rotate_v1` |
+| `cameras.snapshot` | A    | `camera_snapshot_v1`                                                        |
+
+**Ownership guard:** wszystkie operacje (read i write) sa zakreslone do
+kamer nalezacych do wywolujacego addona (`owner_addon_id = caller.addon_id`).
+Cudzy `camera_id` zwraca `NotFound` — nie `Permission` — zeby nie wyciekac
+przez side-channel istnienia kamer innych addonow.
+
+### Sygnatury ABI
+
+```text
+camera_add_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_list_v1(out_ptr, out_cap, out_len_ptr) -> i32
+camera_get_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_update_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_remove_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_snapshot_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_health_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_discover_v1(out_ptr, out_cap, out_len_ptr) -> i32
+camera_test_connection_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+camera_credentials_rotate_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+```
+
+### Schematy TOML — `camera_add`
+
+Input:
+```toml
+display_name = "Front gate"
+vendor = "fake_file"            # F1a: tylko 'fake_file'
+url = "file:///abs/path/sample.mp4"
+target_fps = 30                 # 1..=60, default 30
+resolution_width = 1280         # opcjonalne
+resolution_height = 720         # opcjonalne
+retention_class = "C"           # A/B/C/Unclassified, default C
+profile = "default"             # default 'default'
+```
+
+Output:
+```toml
+camera_id = "cam_<uuid>"
+status = "starting"
+```
+
+Bledy: `CameraVendorUnsupported` (vendor poza whitelist), `Operation`
+(target_fps poza zakresem, pusty display_name, niewlasciwy retention_class,
+zly TOML), `Permission`, `Conflict` (kolizja na partial unique index —
+zazwyczaj wewnetrzny rollback rozwiazuje), `CameraUnreachable`
+(file_not_found / symlink na ścieżce).
+
+### Schematy TOML — `camera_list` / `camera_get`
+
+`camera_list` (bez wejscia) zwraca:
+```toml
+[[camera]]
+camera_id = "cam_xyz"
+display_name = "Front gate"
+vendor = "fake_file"
+url = "file:///abs/path"
+target_fps = 30
+resolution_width = 1280
+resolution_height = 720
+status = "online"
+status_message = ""
+fps_actual = 29.8
+last_frame_at = 1715789000
+retention_class = "C"
+profile = "default"
+```
+
+`camera_get { camera_id = "cam_xyz" }` zwraca pojedynczy `[camera]` ze
+struktury powyzej (bez wrappera tablicy).
+
+Runtime metryki (`status`, `fps_actual`, `last_frame_at`, `status_message`)
+pochodza z supervisora; gdy session nie zyje (np. po restarcie hosta),
+fallback na wartosci z DB.
+
+### Schematy TOML — `camera_update`
+
+```toml
+camera_id = "cam_xyz"
+# Wszystkie ponizsze pola opcjonalne — pomin pole zeby zostawic bez zmian.
+display_name = "Front gate v2"
+target_fps = 25
+resolution_width = 1920
+resolution_height = 1080
+retention_class = "B"
+profile = "high_quality"
+```
+
+`vendor` i `url` NIE mogą byc updateowane — zmiana wymaga `camera_remove` +
+`camera_add`. F1a: runtime config supervisora nie jest rebuiltowany —
+nowy target_fps wchodzi po remove+add. Bledy jak w `camera_add`.
+
+### Schematy TOML — `camera_remove`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+```
+Output:
+```toml
+removed = true
+```
+Soft-delete (stamps `removed_at`). Re-add tego samego `camera_id` jest
+dozwolony (partial unique index na `camera_id WHERE removed_at IS NULL`).
+
+### Schematy TOML — `camera_snapshot`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+```
+Output:
+```toml
+camera_id = "cam_xyz"
+width = 1280
+height = 720
+pixel_format = "rgb24"
+timestamp_unix_ms = 1715789000123
+data_b64 = "<base64 RGB24 bytes>"
+```
+
+F1a: inline base64. Limit `PayloadKind::ServiceCall` = 8 MB. 1280x720 RGB24
+(2.76 MB raw, ~3.7 MB base64) miesci sie; 1920x1080 (~8.3 MB base64)
+przekroczy limit → `PayloadTooLarge`. F1c wprowadzi `SnapshotRef` z M1.W7
+LRU frame storage.
+
+### Schematy TOML — `camera_health`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+```
+Output:
+```toml
+camera_id = "cam_xyz"
+status = "online"        # offline/starting/online/error/stopping
+status_message = ""
+fps_actual = 29.8
+last_frame_at = 1715789000
+frames_total = 12345
+frames_dropped = 0
+```
+
+### Schematy TOML — `camera_discover`
+
+Brak inputu. F1a output:
+```toml
+discovered = []
+```
+F1b doda RTSP + ONVIF probe.
+
+### Schematy TOML — `camera_test_connection`
+
+Input:
+```toml
+vendor = "fake_file"
+url = "file:///path/file.mp4"
+```
+Output:
+```toml
+ok = true
+message = "fake_file path readable"
+```
+Albo `ok = false` z `message` opisujacym przyczyne (symlink, brak pliku,
+nieprawidlowy URL).
+
+### Schematy TOML — `camera_credentials_rotate`
+
+Input:
+```toml
+camera_id = "cam_xyz"
+new_credentials_b64 = "..."      # opcjonalne
+```
+F1a output (noop dla `fake_file`):
+```toml
+rotated = false
+reason = "f1a_noop_fake_file_has_no_credentials"
+```
+
+### Przyklad — addon dodaje kamere i co tick odswieża metryki
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+fn on_start() -> Result<(), AbiError> {
+    let spec = CameraAddSpec {
+        display_name: "Front gate".into(),
+        vendor: "fake_file".into(),
+        url: "file:///opt/tentaflow/samples/gate.mp4".into(),
+        target_fps: 25,
+        retention_class: "C".into(),
+        ..Default::default()
+    };
+    let added = camera_add(&spec)?;
+    store_set("front_gate_id", &added.camera_id).ok();
+    Ok(())
+}
+
+fn on_tick(_ts: i64) -> i32 {
+    let id = match store_get("front_gate_id").ok().flatten() {
+        Some(v) => v,
+        None => return AbiError::Ok.as_i32(),
+    };
+    if let Ok(h) = camera_health(&id) {
+        if h.frames_dropped > 0 {
+            log_warn(&format!("front_gate dropped {} frames", h.frames_dropped));
+        }
+    }
+    AbiError::Ok.as_i32()
+}
+```
+

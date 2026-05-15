@@ -5,6 +5,7 @@
 //       eventy, UI, sekrety, logi, rejestracja narzedzi).
 // =============================================================================
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -246,6 +247,44 @@ extern "C" {
     ) -> i32;
 
     fn alias_list_owned_v1(
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    /// Camera API (F1a M1.W6) — camera ingest layer (fake_file vendor only
+    /// in F1a). Payload format is TOML for all inputs/outputs. Requires
+    /// `cameras.read` / `cameras.write` / `cameras.snapshot` permissions.
+    fn camera_add_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_update_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_remove_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_snapshot_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_health_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_test_connection_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_credentials_rotate_v1(
+        input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 }
@@ -1138,6 +1177,11 @@ pub mod prelude {
         SqlValue, SqlRow, SqlExecResult,
         alias_get, alias_list_owned,
         AliasInfo,
+        camera_add, camera_list, camera_get, camera_update, camera_remove,
+        camera_snapshot, camera_health, camera_discover, camera_test_connection,
+        camera_credentials_rotate,
+        CameraAddSpec, CameraAddResult, CameraInfo, CameraUpdateSpec,
+        CameraHealthInfo, SnapshotInfo, CameraTestResult,
         AbiError,
         log,
     };
@@ -1223,6 +1267,320 @@ pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError> {
         }
         return Err(AbiError::from_i32(rc));
     }
+}
+
+// =============================================================================
+// Camera API (F1a M1.W6) — TentaVision camera ingest
+// =============================================================================
+//
+// Wrapper-y woke host functions camera_*_v1. Payload to TOML; bledy mapowane na
+// `AbiError`. Pelna specyfikacja: `docs/ADDON_HOST_FUNCTIONS.md` sekcja 13.
+
+/// Specyfikacja nowej kamery do `camera_add`. F1a obsluguje wylacznie
+/// `vendor = "fake_file"`; pozostale vendor-y dadza `CameraVendorUnsupported`.
+#[derive(Debug, Clone)]
+pub struct CameraAddSpec {
+    pub display_name: String,
+    pub vendor: String,
+    pub url: String,
+    pub target_fps: u32,
+    pub resolution: Option<(u32, u32)>,
+    pub retention_class: String,
+    pub profile: String,
+}
+
+impl Default for CameraAddSpec {
+    fn default() -> Self {
+        Self {
+            display_name: String::new(),
+            vendor: "fake_file".to_string(),
+            url: String::new(),
+            target_fps: 30,
+            resolution: None,
+            retention_class: "C".to_string(),
+            profile: "default".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CameraAddResult {
+    pub camera_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CameraInfo {
+    pub camera_id: String,
+    pub display_name: String,
+    pub vendor: String,
+    pub url: String,
+    pub target_fps: i64,
+    pub resolution_width: Option<i64>,
+    pub resolution_height: Option<i64>,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub fps_actual: Option<f64>,
+    pub last_frame_at: Option<i64>,
+    pub retention_class: String,
+    pub profile: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CameraListResponse {
+    #[serde(default)]
+    camera: Vec<CameraInfo>,
+}
+
+/// Partial update for `camera_update`. URL i vendor sa nie do zmiany w F1a —
+/// rebind wymaga remove + add.
+#[derive(Debug, Default, Clone)]
+pub struct CameraUpdateSpec {
+    pub camera_id: String,
+    pub display_name: Option<String>,
+    pub target_fps: Option<u32>,
+    pub resolution_width: Option<u32>,
+    pub resolution_height: Option<u32>,
+    pub retention_class: Option<String>,
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CameraHealthInfo {
+    pub camera_id: String,
+    pub status: String,
+    pub status_message: String,
+    pub fps_actual: f64,
+    pub last_frame_at: i64,
+    pub frames_total: u64,
+    pub frames_dropped: u64,
+}
+
+/// Wynik `camera_snapshot` — RGB24 frame zdekodowany z base64.
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub camera_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: String,
+    pub timestamp_unix_ms: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotRaw {
+    camera_id: String,
+    width: u32,
+    height: u32,
+    pixel_format: String,
+    timestamp_unix_ms: u64,
+    data_b64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CameraTestResult {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CameraRemoveOutRaw {
+    #[allow(dead_code)]
+    removed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CameraDiscoverRaw {
+    #[serde(default)]
+    discovered: Vec<CameraInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CameraCredentialsRotateRaw {
+    rotated: bool,
+    reason: String,
+}
+
+fn parse_toml<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AbiError> {
+    let s = std::str::from_utf8(bytes).map_err(|_| AbiError::Operation)?;
+    toml::from_str::<T>(s).map_err(|_| AbiError::Operation)
+}
+
+fn call_host_no_input(
+    host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
+) -> Result<Vec<u8>, AbiError> {
+    let mut cap = INITIAL_CAP;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            host_fn(
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            return Ok(buffer);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            if attempts > MAX_RETRY_ATTEMPTS {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            let required = out_len as usize;
+            if required <= cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
+}
+
+fn camera_add_payload(spec: &CameraAddSpec) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("display_name = {}\n", toml::Value::String(spec.display_name.clone())));
+    s.push_str(&format!("vendor = {}\n", toml::Value::String(spec.vendor.clone())));
+    s.push_str(&format!("url = {}\n", toml::Value::String(spec.url.clone())));
+    s.push_str(&format!("target_fps = {}\n", spec.target_fps));
+    if let Some((w, h)) = spec.resolution {
+        s.push_str(&format!("resolution_width = {}\n", w));
+        s.push_str(&format!("resolution_height = {}\n", h));
+    }
+    s.push_str(&format!("retention_class = {}\n", toml::Value::String(spec.retention_class.clone())));
+    s.push_str(&format!("profile = {}\n", toml::Value::String(spec.profile.clone())));
+    s
+}
+
+/// Rejestruje nowa kamere w supervisor + DB. F1a vendor whitelist: `fake_file`.
+pub fn camera_add(spec: &CameraAddSpec) -> Result<CameraAddResult, AbiError> {
+    let payload = camera_add_payload(spec);
+    let bytes = call_sql_with_one_input(camera_add_v1, payload.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Zwraca wszystkie kamery nalezace do wywolujacego addona. Kazdy wpis zawiera
+/// runtime metryki (`fps_actual`, `status`) z supervisora gdy session jest
+/// aktywna; w przeciwnym razie wartosci z DB (po restarcie hosta).
+pub fn camera_list() -> Result<Vec<CameraInfo>, AbiError> {
+    let bytes = call_host_no_input(camera_list_v1)?;
+    let resp: CameraListResponse = parse_toml(&bytes)?;
+    Ok(resp.camera)
+}
+
+/// Pobiera pojedynczy `CameraInfo`. Zwraca `NotFound` gdy kamera nie istnieje
+/// lub nalezy do innego addona (kanalu bocznego nie ma — nie da sie wnioskowac
+/// o istnieniu cudzych camera_id).
+pub fn camera_get(camera_id: &str) -> Result<CameraInfo, AbiError> {
+    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
+    let bytes = call_sql_with_one_input(camera_get_v1, payload.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Patch on-the-fly. Vendor + URL sa niezmienne — change them by remove + add.
+pub fn camera_update(spec: &CameraUpdateSpec) -> Result<CameraInfo, AbiError> {
+    let mut s = String::new();
+    s.push_str(&format!("camera_id = {}\n", toml::Value::String(spec.camera_id.clone())));
+    if let Some(v) = &spec.display_name {
+        s.push_str(&format!("display_name = {}\n", toml::Value::String(v.clone())));
+    }
+    if let Some(v) = spec.target_fps {
+        s.push_str(&format!("target_fps = {}\n", v));
+    }
+    if let Some(v) = spec.resolution_width {
+        s.push_str(&format!("resolution_width = {}\n", v));
+    }
+    if let Some(v) = spec.resolution_height {
+        s.push_str(&format!("resolution_height = {}\n", v));
+    }
+    if let Some(v) = &spec.retention_class {
+        s.push_str(&format!("retention_class = {}\n", toml::Value::String(v.clone())));
+    }
+    if let Some(v) = &spec.profile {
+        s.push_str(&format!("profile = {}\n", toml::Value::String(v.clone())));
+    }
+    let bytes = call_sql_with_one_input(camera_update_v1, s.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Soft-delete (stamps `removed_at`). Idempotent w sensie ABI: druga proba na
+/// tym samym camera_id zwraca `NotFound`.
+pub fn camera_remove(camera_id: &str) -> Result<(), AbiError> {
+    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
+    let bytes = call_sql_with_one_input(camera_remove_v1, payload.as_bytes())?;
+    let _: CameraRemoveOutRaw = parse_toml(&bytes)?;
+    Ok(())
+}
+
+/// Snapshot ostatniej ramki — RGB24 zdekodowany z base64. Maks ~5.5MB raw
+/// (1280x720 mieci sie w PayloadKind::ServiceCall; 1920x1080 przekroczy limit
+/// i zwroci `PayloadTooLarge`).
+pub fn camera_snapshot(camera_id: &str) -> Result<SnapshotInfo, AbiError> {
+    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
+    let bytes = call_sql_with_one_input(camera_snapshot_v1, payload.as_bytes())?;
+    let raw: SnapshotRaw = parse_toml(&bytes)?;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(raw.data_b64.as_bytes())
+        .map_err(|_| AbiError::Operation)?;
+    Ok(SnapshotInfo {
+        camera_id: raw.camera_id,
+        width: raw.width,
+        height: raw.height,
+        pixel_format: raw.pixel_format,
+        timestamp_unix_ms: raw.timestamp_unix_ms,
+        data,
+    })
+}
+
+/// Health + runtime metryki z supervisora. Gdy session zniknal (np. restart
+/// hosta przed Issue #8 fix), zwraca `status_message = "session missing"` +
+/// metryki = 0.
+pub fn camera_health(camera_id: &str) -> Result<CameraHealthInfo, AbiError> {
+    let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
+    let bytes = call_sql_with_one_input(camera_health_v1, payload.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// F1a stub — zawsze zwraca pusty vector. F1b doda RTSP/ONVIF scan.
+pub fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
+    let bytes = call_host_no_input(camera_discover_v1)?;
+    let resp: CameraDiscoverRaw = parse_toml(&bytes)?;
+    Ok(resp.discovered)
+}
+
+/// Lightweight probe — sprawdza czy URL kamery jest osiagalny dla danego
+/// vendora. Dla `fake_file` sprawdza ze plik istnieje, jest plikiem regularnym
+/// i nie zawiera symlinkow w sciezce.
+pub fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestResult, AbiError> {
+    let payload = format!(
+        "vendor = {}\nurl = {}\n",
+        toml::Value::String(vendor.to_string()),
+        toml::Value::String(url.to_string())
+    );
+    let bytes = call_sql_with_one_input(camera_test_connection_v1, payload.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// F1a stub dla credentialow vendorow wymagajacych auth (RTSP/ONVIF w F1b).
+/// `fake_file` nie ma credentiali — zwraca `(false, "f1a_noop_...")`.
+pub fn camera_credentials_rotate(
+    camera_id: &str,
+    new_credentials_b64: Option<&str>,
+) -> Result<(bool, String), AbiError> {
+    let mut s = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
+    if let Some(c) = new_credentials_b64 {
+        s.push_str(&format!("new_credentials_b64 = {}\n", toml::Value::String(c.to_string())));
+    }
+    let bytes = call_sql_with_one_input(camera_credentials_rotate_v1, s.as_bytes())?;
+    let raw: CameraCredentialsRotateRaw = parse_toml(&bytes)?;
+    Ok((raw.rotated, raw.reason))
 }
 
 // =============================================================================
