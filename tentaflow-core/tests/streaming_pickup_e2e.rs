@@ -99,12 +99,15 @@ fn frame_pickup_log_count(db: &DbPool, result_kind: &str) -> i64 {
 /// server (which depends on Router/ServiceManager/JWT) — the goal is to prove
 /// the wire-level contract, not the auth surround.
 async fn spawn_core_pickup_server() -> CoreEnv {
+    spawn_core_pickup_server_with(Duration::from_secs(30), [7u8; 32]).await
+}
+
+/// Variant of `spawn_core_pickup_server` that lets a test pick the issuer TTL
+/// and signing key so the TTL-expiry / fresh-issuer cases can run through the
+/// real hyper wire path rather than the in-process pure function.
+async fn spawn_core_pickup_server_with(ttl: Duration, key: [u8; 32]) -> CoreEnv {
     let storage = Arc::new(FrameStorage::new(64));
-    // Long TTL so the happy-path / replay tests do not race the wall clock.
-    let issuer = Arc::new(PickupTokenIssuer::new_for_tests(
-        [7u8; 32],
-        Duration::from_secs(30),
-    ));
+    let issuer = Arc::new(PickupTokenIssuer::new_for_tests(key, ttl));
     let db = make_db();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind core");
@@ -352,13 +355,18 @@ async fn yolo_handler(
         }
     };
 
-    // Simulated detection: fake bbox derived from frame dimensions so the
-    // assertion has something concrete to check.
+    // Echo the first 16 bytes of the body back to the driver so the test can
+    // assert end-to-end that the bytes leaving the LRU on the core side are
+    // exactly the bytes the receiving service observes — no truncation, no
+    // corruption, no header/body swap.
+    let echo_prefix_len = bytes.len().min(16);
+    let echo_prefix: Vec<u8> = bytes[..echo_prefix_len].to_vec();
     let response = json!({
         "frame_size_bytes": bytes.len(),
         "width": width,
         "height": height,
         "pixel_format": pixel_format,
+        "echo_prefix": echo_prefix,
         "bboxes": [
             { "x": 10, "y": 20, "w": width / 4, "h": height / 4, "class": "person", "conf": 0.91 }
         ]
@@ -420,14 +428,28 @@ async fn drive_dispatch(
 // Tests
 // -----------------------------------------------------------------------------
 
+// NOTE: this test verifies the **pickup wire path** (token + headers travel
+// over loopback HTTP through a mock yolo back into core's /core/frame/pickup,
+// bytes survive the roundtrip, frame_pickup_log is written). It does NOT
+// exercise the addon-side `service_call_v1` (router lookup, rate limit,
+// alias_calls audit, QUIC) — those are covered by unit tests around
+// `maybe_inject_pickup_token` / `log_alias_call` in
+// `host_functions/service.rs` and by the `pickup_core_model` bench. Full
+// WASM-guest → service_call_v1 → mock-yolo e2e is queued for M2.W11.
 #[tokio::test]
-async fn test_e2e_happy_path_pickup_returns_bbox() {
+async fn test_e2e_pickup_wire_returns_bbox() {
     let core = spawn_core_pickup_server().await;
     let yolo = spawn_mock_yolo(format!("http://{}", core.addr)).await;
 
-    // 720x480 RGB24 frame; the payload bytes here are dummy data — what
-    // matters is that the same bytes survive the HTTP roundtrip.
-    let payload = vec![0xABu8; 720 * 480 * 3];
+    // 720x480 RGB24 frame. The first 16 bytes are a fixed sentinel pattern so
+    // the mock-yolo echo prefix assertion below proves the bytes the receiving
+    // service observes are bit-identical to what core inserted into the LRU.
+    let sentinel: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+        0xEF,
+    ];
+    let mut payload = vec![0xABu8; 720 * 480 * 3];
+    payload[..16].copy_from_slice(&sentinel);
     let raw_ref = core.storage.insert(mk_frame("cam-e2e", 720, 480, payload.clone()));
 
     let resp = drive_dispatch(
@@ -449,6 +471,16 @@ async fn test_e2e_happy_path_pickup_returns_bbox() {
     assert_eq!(body["height"].as_u64().unwrap(), 480);
     assert_eq!(body["pixel_format"].as_str().unwrap(), "rgb24");
     assert_eq!(body["bboxes"][0]["class"].as_str().unwrap(), "person");
+    // Byte-content verification: mock yolo echoes back the first 16 bytes of
+    // the body it received from /core/frame/pickup — must match the sentinel
+    // pattern we wrote into the LRU before the dispatch.
+    let echo: Vec<u8> = body["echo_prefix"]
+        .as_array()
+        .expect("echo_prefix array")
+        .iter()
+        .map(|v| v.as_u64().expect("byte") as u8)
+        .collect();
+    assert_eq!(echo, sentinel);
 
     // Frame consumed from LRU, pickup audited.
     assert_eq!(core.storage.len(), 0);
@@ -506,19 +538,12 @@ async fn test_e2e_replay_rejected_on_wire() {
 
 #[tokio::test]
 async fn test_e2e_ttl_expired_returns_410() {
-    let core = spawn_core_pickup_server().await;
-    // Override issuer with a 1 ms TTL so we can observe expiry without long
-    // sleeps. We mint outside the long-lived issuer of `core` because the
-    // happy-path server has TTL=30s — for this test we run the verify against
-    // a separate short-TTL issuer with a different key. To keep the wire path
-    // honest we re-bind a fresh core server.
-    let short_issuer = Arc::new(PickupTokenIssuer::new_for_tests(
-        [11u8; 32],
-        Duration::from_millis(1),
-    ));
-    let storage = Arc::new(FrameStorage::new(8));
-    let raw_ref = storage.insert(mk_frame("cam-ttl", 4, 2, vec![9; 24]));
-    let (token, _) = short_issuer.issue(
+    // Short-TTL core server so we can observe expiry without long sleeps,
+    // while still going over the loopback HTTP wire (no direct handler call).
+    let core = spawn_core_pickup_server_with(Duration::from_millis(1), [11u8; 32]).await;
+
+    let raw_ref = core.storage.insert(mk_frame("cam-ttl", 4, 2, vec![9; 24]));
+    let (token, _) = core.issuer.issue(
         raw_ref.as_str().to_string(),
         "yolo-svc".into(),
         "req-ttl".into(),
@@ -526,25 +551,19 @@ async fn test_e2e_ttl_expired_returns_410() {
     let wire = token.wire();
     tokio::time::sleep(Duration::from_millis(25)).await;
 
-    // Hit the real core server's handler directly with the now-expired token
-    // by calling the pure function (the on-the-wire status mapping is what we
-    // assert). Using the wire-path here would require a second hyper server
-    // bound to `short_issuer`/`storage` — same code path, no extra coverage.
-    let outcome = handle_pickup(
-        PickupRequest {
-            pickup_token: Some(&wire),
-            frame_ref: Some(raw_ref.as_str()),
-            service_id: Some("yolo-svc"),
-            request_id: Some("req-ttl"),
-        },
-        &short_issuer,
-        &storage,
-        &core.db,
-    );
-    assert_eq!(outcome.http_status(), 410);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/core/frame/pickup", core.addr))
+        .header(HDR_PICKUP_TOKEN, &wire)
+        .header(HDR_FRAME_REF, raw_ref.as_str())
+        .header(HDR_SERVICE_ID, "yolo-svc")
+        .header(HDR_REQUEST_ID, "req-ttl")
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status().as_u16(), 410);
     assert_eq!(frame_pickup_log_count(&core.db, "token_expired"), 1);
     // Frame remains in storage — expiry does not consume the LRU entry.
-    assert_eq!(storage.len(), 1);
+    assert_eq!(core.storage.len(), 1);
 }
 
 #[tokio::test]
