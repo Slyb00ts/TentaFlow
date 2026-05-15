@@ -16,7 +16,9 @@ pub use session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, CameraStatus, PixelFormat,
     SessionCommand, SnapshotData,
 };
-pub use supervisor::{start_supervisor, CameraIngestSupervisor};
+pub use supervisor::{
+    start_supervisor, CameraIngestSupervisor, MAX_CAMERAS_GLOBAL, MAX_CAMERAS_PER_ADDON,
+};
 
 #[cfg(test)]
 mod integration_tests {
@@ -53,6 +55,7 @@ mod integration_tests {
             url,
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -83,6 +86,7 @@ mod integration_tests {
             },
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -103,6 +107,7 @@ mod integration_tests {
             url: path.to_string_lossy().into_owned(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .expect("add");
@@ -135,6 +140,7 @@ mod integration_tests {
             url: path.to_string_lossy().into_owned(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .expect("add");

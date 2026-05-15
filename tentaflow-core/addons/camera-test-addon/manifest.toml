@@ -10,6 +10,7 @@ license = "Apache-2.0"
 runtime = "wasmtime"
 platforms = ["linux", "macos", "windows"]
 wasm_file = "addon.wasm"
+sdk_version = ">=0.2.0, <1.0"
 
 [[permission]]
 id = "cameras.read"

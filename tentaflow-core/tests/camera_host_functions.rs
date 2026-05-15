@@ -252,6 +252,7 @@ async fn supervisor_add_and_health_via_test_api() {
         url: path.to_string_lossy().into_owned(),
         target_fps: 30,
         resolution: None,
+        owner_addon_id: None,
     };
     sup.add_camera(cfg).await.expect("add");
 
@@ -275,6 +276,7 @@ async fn supervisor_rejects_unsupported_vendor() {
             url: "rtsp://example/foo".into(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .unwrap_err();
@@ -295,6 +297,7 @@ async fn supervisor_rejects_fps_out_of_range() {
             url: "/tmp/whatever.mp4".into(),
             target_fps: 0,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .unwrap_err();
@@ -307,6 +310,7 @@ async fn supervisor_rejects_fps_out_of_range() {
             url: "/tmp/whatever.mp4".into(),
             target_fps: 61,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .unwrap_err();
@@ -330,6 +334,7 @@ async fn supervisor_snapshot_returns_rgb24_frame() {
         url: path.to_string_lossy().into_owned(),
         target_fps: 30,
         resolution: None,
+        owner_addon_id: None,
     })
     .await
     .expect("add");
@@ -441,6 +446,7 @@ async fn supervisor_reset_drains_sessions_without_dropping_singleton() {
             url: path.to_string_lossy().into_owned(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .expect("add");
@@ -491,6 +497,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         url: path.to_string_lossy().into_owned(),
         target_fps: 30,
         resolution: None,
+        owner_addon_id: None,
     })
     .await
     .expect("first add");
@@ -507,6 +514,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         url: path.to_string_lossy().into_owned(),
         target_fps: 30,
         resolution: None,
+        owner_addon_id: None,
     })
     .await
     .expect("re-add");
@@ -532,6 +540,7 @@ async fn supervisor_rejects_missing_file_path_fakefile() {
             url: "/var/empty/this/path/does/not/exist.mp4".into(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .await
         .unwrap_err();
@@ -562,6 +571,7 @@ async fn supervisor_fps_actual_approaches_target_after_warmup() {
         url: path.to_string_lossy().into_owned(),
         target_fps: 30,
         resolution: None,
+        owner_addon_id: None,
     })
     .await
     .expect("add");
