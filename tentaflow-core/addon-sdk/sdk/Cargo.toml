@@ -9,3 +9,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Base64 dla BLOB (SqlValue::Bytes) w SQL API. Wersja zgodna z core.
 base64 = "0.22"
+# TOML dla Camera API (F1a M1.W6) — payloady host functions camera_*_v1.
+toml = "0.8"

@@ -10790,6 +10790,238 @@ mod settings_to_peer_hints_migration_tests {
     }
 }
 
+// =============================================================================
+// Camera ingest registry — F1a M1.W6 (TentaVision)
+// =============================================================================
+//
+// Per-addon view over the `cameras` table (migration v21). Ownership guard
+// (`owner_addon_id = ?`) is enforced in every query so a misbehaving addon
+// can never read or mutate another addon's cameras through the host ABI.
+
+/// Row materialized from `cameras` for the camera host functions. Mirrors
+/// the columns persisted by the supervisor sync, minus `credentials_encrypted`
+/// (only `vendor='fake_file'` is supported in F1a and it carries no auth).
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct CameraRow {
+    pub id: i64,
+    pub camera_id: String,
+    pub owner_addon_id: String,
+    pub display_name: String,
+    pub vendor: String,
+    pub url: String,
+    pub profile: String,
+    pub target_fps: i64,
+    pub resolution_width: Option<i64>,
+    pub resolution_height: Option<i64>,
+    pub retention_class: String,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub fps_actual: Option<f64>,
+    pub last_frame_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Patch payload for `update_camera`. `None` means "do not touch this column".
+/// `vendor` and `url` are deliberately absent — F1a forbids in-place rebinding
+/// of the source (caller must remove + re-add to switch URL or vendor).
+#[cfg(feature = "camera")]
+#[derive(Debug, Default, Clone)]
+pub struct CameraPatch {
+    pub display_name: Option<String>,
+    pub target_fps: Option<i64>,
+    pub resolution_width: Option<Option<i64>>,
+    pub resolution_height: Option<Option<i64>>,
+    pub retention_class: Option<String>,
+    pub profile: Option<String>,
+}
+
+#[cfg(feature = "camera")]
+fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
+    Ok(CameraRow {
+        id: row.get(0)?,
+        camera_id: row.get(1)?,
+        owner_addon_id: row.get(2)?,
+        display_name: row.get(3)?,
+        vendor: row.get(4)?,
+        url: row.get(5)?,
+        profile: row.get(6)?,
+        target_fps: row.get(7)?,
+        resolution_width: row.get(8)?,
+        resolution_height: row.get(9)?,
+        retention_class: row.get(10)?,
+        status: row.get(11)?,
+        status_message: row.get(12)?,
+        fps_actual: row.get(13)?,
+        last_frame_at: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+#[cfg(feature = "camera")]
+const CAMERA_SELECT_COLS: &str =
+    "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
+     resolution_width, resolution_height, retention_class, status, status_message, \
+     fps_actual, last_frame_at, created_at, updated_at";
+
+/// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
+/// is started separately; on supervisor failure the caller must
+/// `soft_delete_camera` (or use `delete_camera_hard` for symmetric rollback
+/// before the row is ever exposed). Initial `status` is `'starting'` because
+/// the supervisor `add_camera` path drives the session into Starting before
+/// returning success.
+#[cfg(feature = "camera")]
+#[allow(clippy::too_many_arguments)]
+pub fn insert_camera(
+    pool: &DbPool,
+    camera_id: &str,
+    owner_addon_id: &str,
+    display_name: &str,
+    vendor: &str,
+    url: &str,
+    target_fps: i64,
+    resolution_width: Option<i64>,
+    resolution_height: Option<i64>,
+    retention_class: &str,
+    profile: &str,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO cameras \
+         (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
+          resolution_width, resolution_height, retention_class, status, status_message, \
+          fps_actual, last_frame_at, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?11)",
+        rusqlite::params![
+            camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
+            resolution_width, resolution_height, retention_class, now,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Hard-delete a row by `camera_id` regardless of `removed_at`. Reserved for
+/// rollback of a failed `insert_camera` before any caller observed the row;
+/// normal removal flows through `soft_delete_camera` (preserves history and
+/// keeps the partial unique index honest).
+#[cfg(feature = "camera")]
+pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM cameras WHERE camera_id = ?1 AND owner_addon_id = ?2",
+        rusqlite::params![camera_id, owner_addon_id],
+    )?;
+    Ok(())
+}
+
+/// Returns every active camera (`removed_at IS NULL`) owned by `addon_id`,
+/// ordered by `camera_id` for stable output.
+#[cfg(feature = "camera")]
+pub fn list_cameras_for_addon(pool: &DbPool, addon_id: &str) -> Result<Vec<CameraRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE owner_addon_id = ?1 AND removed_at IS NULL \
+         ORDER BY camera_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id], row_to_camera)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Returns the active row identified by `camera_id` if owned by `addon_id`.
+/// Cross-addon lookups return `Ok(None)` so the caller surfaces `NotFound`
+/// rather than `PermissionDenied` (avoiding side-channel leak of camera ids).
+#[cfg(feature = "camera")]
+pub fn get_camera_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+) -> Result<Option<CameraRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE owner_addon_id = ?1 AND camera_id = ?2 AND removed_at IS NULL"
+    );
+    let row = conn
+        .query_row(&sql, rusqlite::params![addon_id, camera_id], row_to_camera)
+        .optional()?;
+    Ok(row)
+}
+
+/// Applies a partial update. Returns `Ok(false)` if no row matched
+/// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
+/// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent
+/// re-writes (updated_at always bumped).
+#[cfg(feature = "camera")]
+pub fn update_camera(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    patch: &CameraPatch,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    // Build SET clause dynamically. Avoid string concat of values — every
+    // user-supplied piece flows through bind parameters.
+    let mut sets: Vec<&'static str> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = patch.display_name.as_ref() {
+        sets.push("display_name = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.target_fps {
+        sets.push("target_fps = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.resolution_width {
+        sets.push("resolution_width = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.resolution_height {
+        sets.push("resolution_height = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.retention_class.as_ref() {
+        sets.push("retention_class = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.profile.as_ref() {
+        sets.push("profile = ?");
+        params.push(Box::new(v.clone()));
+    }
+    sets.push("updated_at = ?");
+    params.push(Box::new(now));
+    params.push(Box::new(addon_id.to_string()));
+    params.push(Box::new(camera_id.to_string()));
+    let sql = format!(
+        "UPDATE cameras SET {} WHERE owner_addon_id = ? AND camera_id = ? AND removed_at IS NULL",
+        sets.join(", ")
+    );
+    let bound: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let n = conn.execute(&sql, rusqlite::params_from_iter(bound.into_iter()))?;
+    Ok(n > 0)
+}
+
+/// Soft-deletes the active row by stamping `removed_at`. Returns `Ok(true)`
+/// when a row was matched, `Ok(false)` for "not found / not owned".
+#[cfg(feature = "camera")]
+pub fn soft_delete_camera(pool: &DbPool, addon_id: &str, camera_id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE cameras SET removed_at = ?1, updated_at = ?1 \
+         WHERE owner_addon_id = ?2 AND camera_id = ?3 AND removed_at IS NULL",
+        rusqlite::params![now, addon_id, camera_id],
+    )?;
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod chunk_c_visibility_consumer_tests {
     use super::*;

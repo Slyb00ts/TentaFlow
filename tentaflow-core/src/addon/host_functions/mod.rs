@@ -7,6 +7,8 @@
 
 pub mod abi_helpers;
 pub mod aliases;
+#[cfg(feature = "camera")]
+pub mod camera;
 pub mod events;
 pub mod http;
 pub mod llm;
@@ -204,6 +206,49 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             aliases::alias_list_owned_v1,
         )
         .map_err(|e| anyhow::anyhow!("Rejestracja alias_list_owned_v1: {e}"))?;
+
+    // --- Camera API (F1a M1.W6 — TentaVision camera ingest) ---
+    #[cfg(feature = "camera")]
+    {
+        linker
+            .func_wrap("tentaflow", "camera_add_v1", camera::camera_add_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_add_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_list_v1", camera::camera_list_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_list_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_get_v1", camera::camera_get_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_get_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_update_v1", camera::camera_update_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_update_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_remove_v1", camera::camera_remove_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_remove_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_snapshot_v1", camera::camera_snapshot_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_snapshot_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_health_v1", camera::camera_health_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_health_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "camera_discover_v1", camera::camera_discover_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_discover_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_test_connection_v1",
+                camera::camera_test_connection_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_test_connection_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_credentials_rotate_v1",
+                camera::camera_credentials_rotate_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_credentials_rotate_v1: {e}"))?;
+    }
 
     Ok(())
 }
