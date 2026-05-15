@@ -131,6 +131,33 @@ pub fn service_request(
         request_json.len()
     );
 
+    // M1.W7 — when the addon hands us a `frame_ref` in the payload, mint a
+    // PickupToken so the receiving service can fetch the frame bytes over
+    // the Service-to-Core API. We rewrite the payload to include the wire
+    // token + a fresh request_id alongside the existing fields. Addons that
+    // do not pass a `frame_ref` (pure text calls) bypass this branch
+    // entirely — backward-compatible.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (effective_payload, frame_ref_for_audit) =
+        match maybe_inject_pickup_token(&request_json, &service_name, &request_id) {
+            Ok((payload, fref)) => (payload, fref),
+            Err(reason) => {
+                warn!(
+                    "service_request: pickup token injection failed for '{}': {}",
+                    service_name, reason
+                );
+                audit_log(
+                    caller.data(),
+                    "service.request",
+                    Some("service"),
+                    Some(&service_name),
+                    "error",
+                    Some(reason),
+                );
+                return ABI_ERR_OPERATION;
+            }
+        };
+
     // Sprawdz rate limit
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
         if rate_limiter
@@ -173,15 +200,29 @@ pub fn service_request(
     // Znajdz QUIC client dla serwisu — szukamy po kolei w roznych typach
     let service_manager = router.service_manager();
 
+    let dispatch_started = std::time::Instant::now();
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            dispatch_to_service(service_manager, &service_name, &request_json, &addon_id).await
+            dispatch_to_service(service_manager, &service_name, &effective_payload, &addon_id).await
         })
     });
+    let duration_ms = dispatch_started.elapsed().as_millis() as i64;
 
     match result {
         Ok(response_json) => {
             let response_bytes = response_json.as_bytes();
+
+            log_alias_call(
+                caller.data(),
+                &service_name,
+                &request_id,
+                duration_ms,
+                effective_payload.len() as i64,
+                response_bytes.len() as i64,
+                frame_ref_for_audit.as_deref(),
+                "ok",
+                None,
+            );
 
             audit_log(
                 caller.data(),
@@ -207,6 +248,22 @@ pub fn service_request(
                 _ => format!("blad wysylania do serwisu '{}'", service_name),
             };
             error!("service_request: addon='{}': {}", addon_id, err_msg);
+            let result_label = if err_code == ABI_ERR_NOT_FOUND {
+                "no_target"
+            } else {
+                "error"
+            };
+            log_alias_call(
+                caller.data(),
+                &service_name,
+                &request_id,
+                duration_ms,
+                effective_payload.len() as i64,
+                0,
+                frame_ref_for_audit.as_deref(),
+                result_label,
+                Some(&err_code.to_string()),
+            );
             audit_log(
                 caller.data(),
                 "service.request",
@@ -218,6 +275,113 @@ pub fn service_request(
             err_code
         }
     }
+}
+
+/// If `payload` is a JSON object containing a `frame_ref` field, mints a
+/// `PickupToken` for `(frame_ref, service_id, request_id)` and rewrites the
+/// payload to embed `pickup_token` next to it. Non-object payloads (raw
+/// strings, arrays) and objects without `frame_ref` are returned verbatim.
+/// Returns `(rewritten_payload_json, frame_ref_for_audit)`.
+fn maybe_inject_pickup_token(
+    payload_json: &str,
+    service_id: &str,
+    request_id: &str,
+) -> Result<(String, Option<String>), &'static str> {
+    let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
+        Ok(v) => v,
+        // Treat unparseable bodies as opaque text — pass through verbatim.
+        Err(_) => return Ok((payload_json.to_string(), None)),
+    };
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return Ok((payload_json.to_string(), None)),
+    };
+    let frame_ref = match obj.get("frame_ref").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Ok((payload_json.to_string(), None)),
+    };
+
+    let issuer = crate::services::pickup_token_issuer();
+    let (token, _) = issuer.issue(frame_ref.clone(), service_id.to_string(), request_id.to_string());
+    let mut new_obj = obj.clone();
+    new_obj.insert(
+        "pickup_token".to_string(),
+        serde_json::Value::String(token.wire()),
+    );
+    new_obj.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(request_id.to_string()),
+    );
+    new_obj.insert(
+        "service_id".to_string(),
+        serde_json::Value::String(service_id.to_string()),
+    );
+    serde_json::to_string(&serde_json::Value::Object(new_obj))
+        .map(|s| (s, Some(frame_ref)))
+        .map_err(|_| "rewrite_serialize_failed")
+}
+
+/// Best-effort `alias_calls` row. The resolver in `repository.rs` already
+/// writes the `permission_denied` path; here we cover the dispatch outcomes
+/// (`ok`, `error`, `no_target`). Service names that are not registered
+/// aliases simply skip the insert (FK to `model_aliases.id` would fail).
+#[allow(clippy::too_many_arguments)]
+fn log_alias_call(
+    state: &AddonState,
+    service_name: &str,
+    request_id: &str,
+    duration_ms: i64,
+    payload_bytes: i64,
+    response_bytes: i64,
+    frame_ref: Option<&str>,
+    result: &str,
+    error_code: Option<&str>,
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // Look up alias_id — if `service_name` is not a known alias we silently
+    // skip (FK constraint would fail). Pure service calls without an alias
+    // remain logged through `audit_log` above.
+    let alias_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![service_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+    let Some(alias_id) = alias_id else {
+        return;
+    };
+    let _ = frame_ref; // reserved for richer logging when schema gets a column
+    let _ = conn.execute(
+        "INSERT INTO alias_calls \
+             (alias_id, alias_name, method, target_used, target_node_id, service_id, \
+              caller_addon_id, caller_user_id, request_id, duration_ms, payload_bytes, \
+              response_bytes, fallback_used, fallback_chain_position, result, error_code, ts) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, NULL, ?12, ?13, ?14)",
+        rusqlite::params![
+            alias_id,
+            service_name,
+            "service.request",
+            service_name,
+            service_name,
+            state.addon_id,
+            state.user_id,
+            request_id,
+            duration_ms,
+            payload_bytes,
+            response_bytes,
+            result,
+            error_code,
+            ts,
+        ],
+    );
 }
 
 /// Wysyla request do serwisu przez QUIC — probuje znalezc klienta

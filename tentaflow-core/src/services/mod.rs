@@ -25,6 +25,7 @@ pub mod frame_storage;
 pub mod handles_cache;
 pub mod lifecycle;
 pub mod mesh_registry;
+pub mod pickup_tokens;
 pub mod ports;
 pub mod registry;
 pub mod runtime;
@@ -47,6 +48,7 @@ use std::sync::{Arc, OnceLock};
 
 static FRAME_STORAGE: OnceLock<Arc<frame_storage::FrameStorage>> = OnceLock::new();
 static STREAMING_BUS: OnceLock<Arc<streaming::StreamingBus>> = OnceLock::new();
+static PICKUP_TOKEN_ISSUER: OnceLock<Arc<pickup_tokens::PickupTokenIssuer>> = OnceLock::new();
 
 pub fn frame_storage() -> &'static Arc<frame_storage::FrameStorage> {
     FRAME_STORAGE.get_or_init(|| Arc::new(frame_storage::FrameStorage::new(1024)))
@@ -54,4 +56,8 @@ pub fn frame_storage() -> &'static Arc<frame_storage::FrameStorage> {
 
 pub fn streaming_bus() -> &'static Arc<streaming::StreamingBus> {
     STREAMING_BUS.get_or_init(|| Arc::new(streaming::StreamingBus::new()))
+}
+
+pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
+    PICKUP_TOKEN_ISSUER.get_or_init(|| Arc::new(pickup_tokens::PickupTokenIssuer::new()))
 }
