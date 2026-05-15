@@ -1,0 +1,13 @@
+[addon]
+id = "broken-invalid-signature"
+name = "Broken Invalid Signature"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[[ui_component]]
+id = "tv-video-grid"
+display_name = "Video Grid"
+slot = "main"
+src = "ui/video-grid.js"
+signature = "sha1:abcdef123456notreallybase64"
+risk = "low"

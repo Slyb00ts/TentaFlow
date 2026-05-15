@@ -101,6 +101,39 @@ pub fn llm_generate(
     }
 
     let addon_id = caller.data().addon_id.clone();
+
+    // F1a §6.6 alias gate. If the requested name resolves to an active
+    // alias, enforce visibility + addon_uses_alias for the calling addon.
+    // Non-alias names return Ok(None) → pass-through. Denial is audited
+    // inside the resolver (alias_calls + audit_log risk_class=A).
+    if let Some(ref model) = model_name {
+        let db = caller.data().db.clone();
+        match crate::db::repository::resolve_model_alias_for_addon(
+            &db,
+            model,
+            Some(&addon_id),
+            Some("llm.generate"),
+            None,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>().is_some() {
+                    audit_log(
+                        caller.data(),
+                        "llm.generate",
+                        Some("alias"),
+                        Some(model),
+                        "denied",
+                        Some("alias_permission_denied"),
+                    );
+                    return ABI_ERR_PERMISSION;
+                }
+                warn!("llm_generate: alias gate error for '{}': {}", model, e);
+                return ABI_ERR_OPERATION;
+            }
+        }
+    }
+
     info!(
         "llm_generate: addon='{}', model={:?}, prompt_len={}",
         addon_id,
@@ -324,6 +357,36 @@ pub fn llm_generate_stream_start(
     }
 
     let addon_id = caller.data().addon_id.clone();
+
+    // F1a §6.6 alias gate — see llm_generate for rationale.
+    if let Some(ref model) = model_name {
+        let db = caller.data().db.clone();
+        match crate::db::repository::resolve_model_alias_for_addon(
+            &db,
+            model,
+            Some(&addon_id),
+            Some("llm.generate_stream"),
+            None,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>().is_some() {
+                    audit_log(
+                        caller.data(),
+                        "llm.generate_stream",
+                        Some("alias"),
+                        Some(model),
+                        "denied",
+                        Some("alias_permission_denied"),
+                    );
+                    return ABI_ERR_PERMISSION;
+                }
+                warn!("llm_generate_stream_start: alias gate error for '{}': {}", model, e);
+                return ABI_ERR_OPERATION;
+            }
+        }
+    }
+
     info!(
         "llm_generate_stream_start: addon='{}', model={:?}",
         addon_id, model_name

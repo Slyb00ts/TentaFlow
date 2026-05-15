@@ -90,6 +90,40 @@ pub fn service_request(
     }
 
     let addon_id = caller.data().addon_id.clone();
+
+    // F1a §6.6 alias gate. `service_name` may be an alias resolving to a
+    // backend service — apply the same visibility / addon_uses_alias check
+    // before dispatch. Non-alias service names return Ok(None) → pass.
+    {
+        let db = caller.data().db.clone();
+        match crate::db::repository::resolve_model_alias_for_addon(
+            &db,
+            &service_name,
+            Some(&addon_id),
+            Some("service.request"),
+            None,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>().is_some() {
+                    audit_log(
+                        caller.data(),
+                        "service.request",
+                        Some("alias"),
+                        Some(&service_name),
+                        "denied",
+                        Some("alias_permission_denied"),
+                    );
+                    return ABI_ERR_PERMISSION;
+                }
+                warn!(
+                    "service_request: alias gate error for '{}': {}",
+                    service_name, e
+                );
+                return ABI_ERR_OPERATION;
+            }
+        }
+    }
     info!(
         "service_request: addon='{}', service='{}', payload_len={}",
         addon_id,

@@ -200,7 +200,7 @@ pub async fn meeting_session_start(
         respond_enabled: {
             let has_explicit = !r.llm_alias.is_empty();
             let has_default_alias =
-                crate::db::repository::resolve_model_alias(&ctx.state.db, "teams-llm")
+                crate::db::repository::resolve_model_alias(&ctx.state.db, "teams-llm", None)
                     .ok()
                     .flatten()
                     .map(|a| !a.target_model.trim().is_empty())

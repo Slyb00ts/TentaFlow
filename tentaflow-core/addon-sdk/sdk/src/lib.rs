@@ -8,6 +8,107 @@
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// AbiError — kanoniczne kody bledow ABI dla F1a host functions
+// =============================================================================
+//
+// MUST stay in sync with `tentaflow-core/src/addon/errors.rs`. The SDK is
+// compiled for `wasm32-wasip1` and cannot depend on `tentaflow-core` (the
+// core crate pulls in rusqlite, wasmtime, axum, tokio — none of which
+// build for that target). Duplicating the enum is the only viable path.
+//
+// Numeric values are part of the ABI: if you change one, both the host
+// and every shipped addon WASM must be rebuilt. The test
+// `abi_error_codes_match_plan_spec` in core/errors.rs anchors the
+// canonical values (0, 1, 6, 21, 24); the rest are sequential.
+
+/// Kanoniczne kody bledow ABI zwracane przez host functions F1a (SQL,
+/// Alias, Camera, Streaming, Recording). Wartosci 0..=24, gdzie 0 = sukces.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbiError {
+    Ok = 0,
+    Permission = 1,
+    NotFound = 2,
+    NoAvailableTarget = 3,
+    Timeout = 4,
+    Operation = 5,
+    OutputBufferTooSmall = 6,
+    Conflict = 7,
+    SqlSyntax = 8,
+    SqlConstraint = 9,
+    SqlNoResult = 10,
+    QuotaExceeded = 11,
+    CameraUnreachable = 12,
+    CameraAuthFailed = 13,
+    CameraVendorUnsupported = 14,
+    StreamNotFound = 15,
+    StreamClosed = 16,
+    Backpressure = 17,
+    RecordingNotFound = 18,
+    RecordingPurged = 19,
+    RecordingTimeOutOfRing = 20,
+    PayloadTooLarge = 21,
+    GateNotSatisfied = 22,
+    FrameTokenInvalid = 23,
+    FramePurged = 24,
+}
+
+impl AbiError {
+    /// Wartosc i32 do return z host functions.
+    #[inline]
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    /// Decodes a raw i32 returned by a host function. Unknown codes fall
+    /// back to `Operation` so callers never see a phantom variant after
+    /// a host/SDK version skew.
+    pub fn from_i32(rc: i32) -> Self {
+        match rc {
+            0 => Self::Ok,
+            1 => Self::Permission,
+            2 => Self::NotFound,
+            3 => Self::NoAvailableTarget,
+            4 => Self::Timeout,
+            5 => Self::Operation,
+            6 => Self::OutputBufferTooSmall,
+            7 => Self::Conflict,
+            8 => Self::SqlSyntax,
+            9 => Self::SqlConstraint,
+            10 => Self::SqlNoResult,
+            11 => Self::QuotaExceeded,
+            12 => Self::CameraUnreachable,
+            13 => Self::CameraAuthFailed,
+            14 => Self::CameraVendorUnsupported,
+            15 => Self::StreamNotFound,
+            16 => Self::StreamClosed,
+            17 => Self::Backpressure,
+            18 => Self::RecordingNotFound,
+            19 => Self::RecordingPurged,
+            20 => Self::RecordingTimeOutOfRing,
+            21 => Self::PayloadTooLarge,
+            22 => Self::GateNotSatisfied,
+            23 => Self::FrameTokenInvalid,
+            24 => Self::FramePurged,
+            _ => Self::Operation,
+        }
+    }
+}
+
+impl From<AbiError> for i32 {
+    #[inline]
+    fn from(e: AbiError) -> Self {
+        e as i32
+    }
+}
+
+impl core::fmt::Display for AbiError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "AbiError({})", *self as i32)
+    }
+}
+
+// =============================================================================
 // Bindingi do host functions (importowane z Core przez WASM)
 // =============================================================================
 
@@ -108,6 +209,43 @@ extern "C" {
     fn service_request(
         service_ptr: i32, service_len: i32,
         request_ptr: i32, request_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    /// SQL API (F1a M1.W4) — per-addon SQLite z bindowanymi parametrami.
+    /// Zob. `docs/ADDON_HOST_FUNCTIONS.md` sekcja 11 dla pelnej specyfikacji.
+    fn sql_exec_v1(
+        query_ptr: i32, query_len: i32,
+        params_json_ptr: i32, params_json_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn sql_query_v1(
+        query_ptr: i32, query_len: i32,
+        params_json_ptr: i32, params_json_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn sql_query_one_v1(
+        query_ptr: i32, query_len: i32,
+        params_json_ptr: i32, params_json_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn sql_transaction_v1(
+        statements_json_ptr: i32, statements_json_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    /// Alias API (F1a M1.W5) — readonly inspection of aliases.
+    /// Requires `alias.read` permission. Lifecycle (create/deactivate) is
+    /// driven implicitly by addon install/uninstall from the manifest.
+    fn alias_get_v1(
+        alias_id_ptr: i32, alias_id_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn alias_list_owned_v1(
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 }
@@ -705,6 +843,280 @@ pub fn service_request_call(service_name: &str, request_json: &str) -> Result<St
 }
 
 // =============================================================================
+// Wysokopoziomowe wrappery — SQL API (F1a M1.W4)
+// =============================================================================
+
+/// Reprezentacja wartosci SQL przekazywanej jako parametr lub odebranej
+/// z wiersza. Mapowanie 1:1 z ABI (zob. docs sekcja 11):
+/// String -> TEXT, I64 -> INTEGER, F64 -> REAL, Bool -> INTEGER 0/1,
+/// Null -> NULL, Bytes -> BLOB (przekazywane jako base64 JSON `{"$bytes":"..."}`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+impl SqlValue {
+    /// Reprezentacja JSON kompatybilna z host ABI.
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(*b),
+            Self::I64(i) => serde_json::Value::from(*i),
+            Self::F64(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Self::String(s) => serde_json::Value::String(s.clone()),
+            Self::Bytes(b) => {
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(b);
+                serde_json::json!({ "$bytes": encoded })
+            }
+        }
+    }
+
+    fn from_json(v: &serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .map(Self::I64)
+                .or_else(|| n.as_f64().map(Self::F64))
+                .unwrap_or(Self::Null),
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Object(obj) => {
+                if let Some(serde_json::Value::String(b64)) = obj.get("$bytes") {
+                    use base64::Engine;
+                    if let Ok(raw) =
+                        base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())
+                    {
+                        return Self::Bytes(raw);
+                    }
+                }
+                Self::Null
+            }
+            serde_json::Value::Array(_) => Self::Null,
+        }
+    }
+
+    /// Wygodny dostep do wartosci int.
+    pub fn as_i64(&self) -> Option<i64> {
+        if let Self::I64(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
+    }
+
+    /// Wygodny dostep do wartosci string.
+    pub fn as_str(&self) -> Option<&str> {
+        if let Self::String(s) = self {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+/// Wiersz wynikowy SQL — wartosci w kolejnosci kolumn.
+pub type SqlRow = Vec<SqlValue>;
+
+/// Wynik DML (sql_exec).
+#[derive(Debug, Clone)]
+pub struct SqlExecResult {
+    pub rows_affected: u64,
+    pub last_insert_id: i64,
+}
+
+/// Initial buffer for SQL/Alias response (1 KiB — kept small because most
+/// responses fit and a retry pulls the actual required size from out_len).
+const INITIAL_CAP: usize = 1024;
+
+/// Hard cap on the output buffer for SQL/Alias responses. Matches
+/// `PayloadKind::SqlCombined` on the host side. If the response would not
+/// fit in this size, the host has misbehaved and we surface PayloadTooLarge
+/// rather than allocating unboundedly inside the guest.
+const MAX_OUT_CAP: usize = 4 * 1024 * 1024;
+
+/// Maksymalna liczba prob retry (bez bedu) na pojedynczym callu.
+/// W praktyce 1 attempt = sukces, 2 attempt = sukces po znalezieniu rozmiaru.
+/// Trzecia proba sugeruje host bug — zwracamy OutputBufferTooSmall.
+const MAX_RETRY_ATTEMPTS: u32 = 2;
+
+/// Wykonuje host function SQL/Alias z retry semantics (out_cap → re-alloc).
+/// Retry jest ograniczony przez `MAX_RETRY_ATTEMPTS` i hard-cap `MAX_OUT_CAP`,
+/// chroniac guest przed nieograniczonymi alokacjami w przypadku bledu host.
+fn call_sql_with_two_inputs(
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32,
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, AbiError> {
+    let mut cap = INITIAL_CAP;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            host_fn(
+                a.as_ptr() as i32,
+                a.len() as i32,
+                b.as_ptr() as i32,
+                b.len() as i32,
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            return Ok(buffer);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            // Stop retrying after the second attempt: a correct host gives
+            // us the required size on the first try, so any further loop
+            // is a host bug — fail rather than spin.
+            if attempts > MAX_RETRY_ATTEMPTS {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            let required = out_len as usize;
+            if required <= cap {
+                // Host claims too-small but we already meet the size —
+                // protocol violation.
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                // Response would exceed the per-API payload limit. Surface
+                // PayloadTooLarge so callers can distinguish from a real
+                // out_cap negotiation failure.
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
+}
+
+fn call_sql_with_one_input(
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+    a: &[u8],
+) -> Result<Vec<u8>, AbiError> {
+    let mut cap = INITIAL_CAP;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            host_fn(
+                a.as_ptr() as i32,
+                a.len() as i32,
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            return Ok(buffer);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            if attempts > MAX_RETRY_ATTEMPTS {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            let required = out_len as usize;
+            if required <= cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
+}
+
+fn params_to_json(params: &[SqlValue]) -> String {
+    let arr: Vec<serde_json::Value> = params.iter().map(|v| v.to_json()).collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Wykonuje DML (INSERT/UPDATE/DELETE) z bindowanymi parametrami.
+///
+/// Wymaga uprawnienia `sql.write` w manifescie oraz `[storage] sql=true`.
+/// Bledy zwracane jako `AbiError` (Permission, SqlSyntax, SqlConstraint,
+/// Timeout, PayloadTooLarge, ...).
+pub fn sql_exec(query: &str, params: &[SqlValue]) -> Result<SqlExecResult, AbiError> {
+    let params_json = params_to_json(params);
+    let bytes = call_sql_with_two_inputs(sql_exec_v1, query.as_bytes(), params_json.as_bytes())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)?;
+    Ok(SqlExecResult {
+        rows_affected: v.get("rows_affected").and_then(|x| x.as_u64()).unwrap_or(0),
+        last_insert_id: v.get("last_insert_id").and_then(|x| x.as_i64()).unwrap_or(0),
+    })
+}
+
+/// Wykonuje SELECT (lub WITH/EXPLAIN) i zwraca wszystkie wiersze.
+///
+/// Wymaga uprawnienia `sql.read` w manifescie oraz `[storage] sql=true`.
+pub fn sql_query(query: &str, params: &[SqlValue]) -> Result<Vec<SqlRow>, AbiError> {
+    let params_json = params_to_json(params);
+    let bytes = call_sql_with_two_inputs(sql_query_v1, query.as_bytes(), params_json.as_bytes())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)?;
+    let rows = v.get("rows").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let out: Vec<SqlRow> = rows
+        .into_iter()
+        .map(|row| {
+            row.as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(SqlValue::from_json)
+                .collect()
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Wykonuje SELECT i zwraca pierwszy wiersz lub None.
+pub fn sql_query_one(query: &str, params: &[SqlValue]) -> Result<Option<SqlRow>, AbiError> {
+    let params_json = params_to_json(params);
+    let bytes =
+        call_sql_with_two_inputs(sql_query_one_v1, query.as_bytes(), params_json.as_bytes())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)?;
+    match v.get("row") {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(serde_json::Value::Array(arr)) => Ok(Some(arr.iter().map(SqlValue::from_json).collect())),
+        _ => Err(AbiError::Operation),
+    }
+}
+
+/// Wykonuje liste statementow atomowo. Wszystkie commited lub wszystkie rolled back.
+/// Zwraca laczna liczbe `rows_affected` wszystkich statementow.
+pub fn sql_transaction(statements: &[(&str, &[SqlValue])]) -> Result<u64, AbiError> {
+    let payload = serde_json::json!({
+        "statements": statements.iter().map(|(q, p)| {
+            serde_json::json!({
+                "query": q,
+                "params": p.iter().map(|v| v.to_json()).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let payload_str = serde_json::to_string(&payload).map_err(|_| AbiError::Operation)?;
+    let bytes = call_sql_with_one_input(sql_transaction_v1, payload_str.as_bytes())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)?;
+    Ok(v.get("rows_affected_total").and_then(|x| x.as_u64()).unwrap_or(0))
+}
+
+// =============================================================================
 // Prelude — wygodny re-eksport dla autorow addonow
 // =============================================================================
 
@@ -722,10 +1134,95 @@ pub mod prelude {
         register_tool,
         network_connect, network_send, network_recv, network_close,
         service_request_call,
+        sql_exec, sql_query, sql_query_one, sql_transaction,
+        SqlValue, SqlRow, SqlExecResult,
+        alias_get, alias_list_owned,
+        AliasInfo,
+        AbiError,
         log,
     };
     pub use serde::{Deserialize, Serialize};
     pub use serde_json::{self, json, Value};
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — Aliases API (F1a M1.W5, readonly)
+// =============================================================================
+
+/// Pelne info o aliasie zwracane przez `alias_get_v1` i `alias_list_owned_v1`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AliasInfo {
+    pub id: String,
+    /// "addon:<id>" lub "manual" lub None gdy brak owner row.
+    pub owner: Option<String>,
+    pub current_target: String,
+    pub fallback_targets: Vec<String>,
+    pub strategy: String,
+    pub is_active: bool,
+    pub last_used_target: Option<String>,
+    pub last_used_at: Option<i64>,
+    pub calls_24h: u64,
+    pub fallback_calls_24h: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AliasListResponse {
+    aliases: Vec<AliasInfo>,
+}
+
+/// Pobiera pelne info o aliasie razem ze statystykami (last_used_*,
+/// calls_24h, fallback_calls_24h).
+///
+/// Read access: dowolny addon z `alias.read` (bez ograniczenia
+/// ownership). Stats sa widoczne wylacznie dla wlasciciela aliasu i dla
+/// manual-owned aliasow — cross-addon caller dostanie metadata + counters
+/// = 0 / last_used_* = null.
+pub fn alias_get(alias_id: &str) -> Result<AliasInfo, AbiError> {
+    let bytes = call_sql_with_one_input(alias_get_v1, alias_id.as_bytes())?;
+    serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)
+}
+
+/// Zwraca liste aliasow nalezacych do biezacego addona (owner_id =
+/// caller). Inne aliasy (manual, owned by innym addonem) sa pomijane.
+pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError> {
+    // Host function bez argumentow wejsciowych: invoke direct z retry pattern
+    // chronionym przez te same gwarancje (MAX_OUT_CAP, MAX_RETRY_ATTEMPTS) co
+    // call_sql_with_*.
+    let mut cap = INITIAL_CAP;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            alias_list_owned_v1(
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            let resp: AliasListResponse =
+                serde_json::from_slice(&buffer).map_err(|_| AbiError::Operation)?;
+            return Ok(resp.aliases);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            if attempts > MAX_RETRY_ATTEMPTS {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            let required = out_len as usize;
+            if required <= cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
 }
 
 // =============================================================================

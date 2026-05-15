@@ -85,8 +85,325 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flow_node_templates_params_schema",
             MigrationStep::Sql(FLOW_NODE_TEMPLATES_PARAMS_SCHEMA),
         ),
+        (
+            7,
+            "audit_log_risk_class",
+            MigrationStep::Sql(AUDIT_LOG_RISK_CLASS),
+        ),
+        (
+            8,
+            "model_alias_owners",
+            MigrationStep::Sql(MODEL_ALIAS_OWNERS),
+        ),
+        (9, "alias_calls", MigrationStep::Sql(ALIAS_CALLS)),
+        (
+            10,
+            "model_alias_changes",
+            MigrationStep::Sql(MODEL_ALIAS_CHANGES),
+        ),
+        (
+            11,
+            "addon_migrations_applied",
+            MigrationStep::Sql(ADDON_MIGRATIONS_APPLIED),
+        ),
+        (12, "frame_pickup_log", MigrationStep::Sql(FRAME_PICKUP_LOG)),
+        (
+            13,
+            "teams_bot_aliases_ownership_backfill",
+            MigrationStep::Sql(TEAMS_BOT_ALIASES_OWNERSHIP_BACKFILL),
+        ),
+        (
+            14,
+            "rename_alias_manage_to_read",
+            MigrationStep::Sql(RENAME_ALIAS_MANAGE_TO_READ),
+        ),
+        (
+            15,
+            "model_alias_visibility",
+            MigrationStep::Sql(MODEL_ALIAS_VISIBILITY),
+        ),
+        (
+            16,
+            "model_alias_consumers",
+            MigrationStep::Sql(MODEL_ALIAS_CONSUMERS),
+        ),
+        (17, "model_visibility", MigrationStep::Sql(MODEL_VISIBILITY)),
+        (18, "model_consumers", MigrationStep::Sql(MODEL_CONSUMERS)),
+        (
+            19,
+            "addon_uses_alias",
+            MigrationStep::Sql(ADDON_USES_ALIAS),
+        ),
+        (
+            20,
+            "addon_uses_model",
+            MigrationStep::Sql(ADDON_USES_MODEL),
+        ),
     ]
 }
+
+// F1a §6.6 v0.6.0 — readonly aliases per Chunk C decision. Permission was
+// renamed from `alias.manage` (rollback removed CRUD ABI) to `alias.read`.
+// Idempotent UPDATEs touch only rows whose string column literally stores
+// `alias.manage`; `addon_declared_permissions.permission_type` uses the
+// same string semantics as the other catalogs (manifest [[permission]].id).
+const RENAME_ALIAS_MANAGE_TO_READ: &str = r#"
+UPDATE addon_permissions
+   SET permission_id = 'alias.read'
+ WHERE permission_id = 'alias.manage';
+UPDATE addon_permission_defaults
+   SET permission_id = 'alias.read'
+ WHERE permission_id = 'alias.manage';
+UPDATE addon_permission_catalog
+   SET permission_id = 'alias.read'
+ WHERE permission_id = 'alias.manage';
+UPDATE addon_declared_permissions
+   SET permission_type = 'alias.read'
+ WHERE permission_type = 'alias.manage';
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — per-alias visibility scope.
+// Three levels: `private` (only owner addon may resolve), `restricted`
+// (whitelist in `model_alias_consumers`), `public` (any addon may resolve).
+// PK = alias_id (1:1 with model_aliases). Default `private` from manifest
+// is set explicitly at install time; this CHECK has no DEFAULT so writes
+// must declare visibility.
+const MODEL_ALIAS_VISIBILITY: &str = r#"
+CREATE TABLE model_alias_visibility (
+    alias_id INTEGER PRIMARY KEY REFERENCES model_aliases(id) ON DELETE CASCADE,
+    visibility TEXT NOT NULL CHECK(visibility IN ('private','restricted','public')),
+    updated_at INTEGER NOT NULL,
+    updated_by_user_id INTEGER NULL
+);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — explicit consumer whitelist for `restricted`
+// aliases. Owner declares `allowed_consumers = [...]` in manifest; install
+// writes one row per consumer with `granted_by_user_id = NULL` (auto from
+// manifest). Admin can later add/remove rows via M16b. PK guarantees one
+// row per (alias, consumer) pair.
+const MODEL_ALIAS_CONSUMERS: &str = r#"
+CREATE TABLE model_alias_consumers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL REFERENCES model_aliases(id) ON DELETE CASCADE,
+    consumer_addon_id TEXT NOT NULL,
+    granted_by_user_id INTEGER NULL,
+    granted_at INTEGER NOT NULL,
+    revoked_at INTEGER NULL,
+    UNIQUE(alias_id, consumer_addon_id)
+);
+CREATE INDEX idx_alias_consumers_lookup ON model_alias_consumers(consumer_addon_id, alias_id);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — per-model visibility. Two levels only
+// (`restricted` default, `public`). `model_id` is a free-form TEXT key —
+// no FK because there is no `models` table in v0.6.0; the registry of
+// "known model ids" lives in services + manual config. `restricted` is
+// the default at the SQL layer so unknown models cannot be reached by
+// addons without explicit grant.
+const MODEL_VISIBILITY: &str = r#"
+CREATE TABLE model_visibility (
+    model_id TEXT PRIMARY KEY,
+    visibility TEXT NOT NULL CHECK(visibility IN ('restricted','public')) DEFAULT 'restricted',
+    updated_at INTEGER NOT NULL,
+    updated_by_user_id INTEGER NULL
+);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — model consumer whitelist (symmetric to
+// `model_alias_consumers`). `model_id` TEXT free-form (no FK).
+const MODEL_CONSUMERS: &str = r#"
+CREATE TABLE model_consumers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    consumer_addon_id TEXT NOT NULL,
+    granted_by_user_id INTEGER NULL,
+    granted_at INTEGER NOT NULL,
+    revoked_at INTEGER NULL,
+    UNIQUE(model_id, consumer_addon_id)
+);
+CREATE INDEX idx_model_consumers_lookup ON model_consumers(consumer_addon_id, model_id);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — consumer-side declaration `[[uses_alias]]`.
+// `alias_target_name` stores the alias name (not id) because a consumer
+// can declare its intent to use an alias BEFORE that alias' owner addon
+// is installed; the row then stays `pending` until reconciliation runs
+// at owner install time. Index `(alias_target_name, grant_status)` is
+// hit by reconcile lookups; `(addon_id, grant_status)` by the resolver
+// permission gate.
+const ADDON_USES_ALIAS: &str = r#"
+CREATE TABLE addon_uses_alias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    addon_id TEXT NOT NULL,
+    alias_target_name TEXT NOT NULL,
+    required INTEGER NOT NULL CHECK(required IN (0,1)),
+    reason TEXT NOT NULL,
+    grant_status TEXT NOT NULL CHECK(grant_status IN ('pending','granted','denied','auto_granted')),
+    grant_decided_at INTEGER NULL,
+    grant_decided_by_user_id INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(addon_id, alias_target_name)
+);
+CREATE INDEX idx_addon_uses_alias_target ON addon_uses_alias(alias_target_name, grant_status);
+CREATE INDEX idx_addon_uses_alias_addon ON addon_uses_alias(addon_id, grant_status);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — consumer-side declaration `[[uses_model]]`.
+// Same pending/reconcile pattern as `addon_uses_alias` but keyed on the
+// free-form `model_id` string. `model_visibility` defaults to
+// `restricted`, so unknown-model declarations stay `pending` until an
+// admin explicitly grants (no auto-grant by absence of policy).
+const ADDON_USES_MODEL: &str = r#"
+CREATE TABLE addon_uses_model (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    addon_id TEXT NOT NULL,
+    model_target_name TEXT NOT NULL,
+    required INTEGER NOT NULL CHECK(required IN (0,1)),
+    reason TEXT NOT NULL,
+    grant_status TEXT NOT NULL CHECK(grant_status IN ('pending','granted','denied','auto_granted')),
+    grant_decided_at INTEGER NULL,
+    grant_decided_by_user_id INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(addon_id, model_target_name)
+);
+CREATE INDEX idx_addon_uses_model_target ON addon_uses_model(model_target_name, grant_status);
+CREATE INDEX idx_addon_uses_model_addon ON addon_uses_model(addon_id, grant_status);
+"#;
+
+// After M1.W5: teams-bot declares aliases via [[alias]] manifest section.
+// Hard-coded TEAMS_BOT_ALIASES const and activate/deactivate helpers were
+// removed from addon/mod.rs. This migration backfills owner records for
+// existing teams-bot aliases on already-deployed databases so the new
+// owner-aware code path treats them correctly (start/stop activate/
+// deactivate, uninstall preserves owner row for audit trail).
+const TEAMS_BOT_ALIASES_OWNERSHIP_BACKFILL: &str = r#"
+INSERT OR IGNORE INTO model_alias_owners (alias_id, owner_type, owner_id, created_at)
+SELECT id, 'addon', 'teams-bot', datetime('now')
+FROM model_aliases
+WHERE alias IN ('teams-stt', 'teams-tts', 'teams-summary', 'teams-vision-face', 'teams-vision-emotion');
+"#;
+
+// F1a §6.5 — tabela powiazania aliasu z wlascicielem (addon lub manual).
+// Pozwala odroznic aliasy stworzone automatycznie przez install addonu od
+// tych wpisanych recznie przez admina (M1.W5 zacznie ja zasilac).
+const MODEL_ALIAS_OWNERS: &str = r#"
+CREATE TABLE model_alias_owners (
+    alias_id INTEGER PRIMARY KEY REFERENCES model_aliases(id) ON DELETE CASCADE,
+    owner_type TEXT NOT NULL CHECK(owner_type IN ('addon', 'manual')),
+    owner_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_alias_owners_addon ON model_alias_owners(owner_type, owner_id);
+"#;
+
+// F1a §6.5 — log wywolan aliasow AI. Kazdy alias_call (M1.W6) zapisuje
+// rekord z target_used, request_id, fallback_chain_position; pozwala na
+// debug fallback chain w UI M16 i metryki Prometheus per alias.
+const ALIAS_CALLS: &str = r#"
+CREATE TABLE alias_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL REFERENCES model_aliases(id) ON DELETE CASCADE,
+    alias_name TEXT NOT NULL,
+    method TEXT,
+    target_used TEXT NOT NULL,
+    target_node_id TEXT,
+    service_id TEXT,
+    caller_addon_id TEXT,
+    caller_user_id INTEGER,
+    request_id TEXT,
+    duration_ms INTEGER,
+    payload_bytes INTEGER,
+    response_bytes INTEGER,
+    fallback_used INTEGER DEFAULT 0,
+    fallback_chain_position INTEGER,
+    result TEXT NOT NULL CHECK(result IN ('ok','error','no_target','timeout','permission_denied','gate_denied')),
+    error_code TEXT,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX idx_alias_calls_alias_ts ON alias_calls(alias_id, ts);
+CREATE INDEX idx_alias_calls_addon_ts ON alias_calls(caller_addon_id, ts);
+CREATE INDEX idx_alias_calls_request_id ON alias_calls(request_id);
+CREATE INDEX idx_alias_calls_fallback ON alias_calls(alias_id, fallback_used) WHERE fallback_used=1;
+"#;
+
+// F1a §6.5 — historia zmian aliasu (before/after snapshot, change_type,
+// reason). UI M16 (alias detail panel) pokazuje audit trail; admin moze
+// rollback przez wstawienie nowego rekordu z before_snapshot.
+// Brak FK na model_aliases — alias mogl byc juz usuniety, ale historia
+// musi pozostac (compliance F1a §6.2.Y).
+const MODEL_ALIAS_CHANGES: &str = r#"
+CREATE TABLE model_alias_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL,
+    alias_name TEXT NOT NULL,
+    changed_by_user_id INTEGER,
+    changed_by_addon_id TEXT,
+    before_snapshot TEXT,
+    after_snapshot TEXT,
+    change_type TEXT NOT NULL CHECK(change_type IN
+        ('create','target_change','fallback_change','strategy_change',
+         'activate','deactivate','delete','suggested_default_change')),
+    reason TEXT,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX idx_alias_changes_alias ON model_alias_changes(alias_id);
+CREATE INDEX idx_alias_changes_user_ts ON model_alias_changes(changed_by_user_id, ts);
+"#;
+
+// F1a §6.5 — wykonanie migracji per-addon SQL storage. PRIMARY KEY
+// (addon_id, migration_name) zapewnia idempotencje. Hash chroni przed
+// "podmiana" tresci migracji po jej aplikacji.
+const ADDON_MIGRATIONS_APPLIED: &str = r#"
+CREATE TABLE addon_migrations_applied (
+    addon_id TEXT NOT NULL,
+    migration_name TEXT NOT NULL,
+    migration_hash TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+    applied_in_addon_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('success', 'failed', 'partial')),
+    error_message TEXT,
+    duration_ms INTEGER,
+    PRIMARY KEY (addon_id, migration_name)
+);
+CREATE INDEX idx_addon_migrations_status ON addon_migrations_applied(addon_id, status);
+"#;
+
+// F1a §6.5 — log pickupow surowych ramek (frame_ref) przez serwisy AI.
+// Token zawarty w frame_ref ma TTL; rdzen weryfikuje go przy pickupie
+// i loguje wynik (ok / token_invalid / token_expired / frame_purged /
+// unauthorized). UI compliance M22 pokazuje time-to-pickup.
+const FRAME_PICKUP_LOG: &str = r#"
+CREATE TABLE frame_pickup_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_frame_ref TEXT NOT NULL,
+    service_id TEXT NOT NULL,
+    caller_addon_id TEXT,
+    request_id TEXT NOT NULL,
+    picked_up_at INTEGER NOT NULL,
+    result TEXT NOT NULL CHECK(result IN ('ok','token_invalid','token_expired','frame_purged','unauthorized'))
+);
+CREATE INDEX idx_frame_pickup_ref ON frame_pickup_log(raw_frame_ref);
+CREATE INDEX idx_frame_pickup_request ON frame_pickup_log(request_id);
+CREATE INDEX idx_frame_pickup_service_ts ON frame_pickup_log(service_id, picked_up_at);
+"#;
+
+// Rozszerzenie audit_log o pola wymagane przez F1a §6.2.Y:
+// - risk_class — klasyfikacja RODO (A/B/C/unclassified); wpisy klasy B/C maja
+//   indeks partial dla szybkich kwerend zgodnosciowych.
+// - related_claim_id — powiazanie wpisu z claim (gate evaluation, F2).
+// - request_id — korelacja wielu wpisow w obrebie jednego wywolania service_call
+//   lub spans flow execution.
+// SQLite nie wspiera CHECK przy ALTER TABLE — walidacja po stronie Rust w
+// audit/mod.rs (RiskClass enum).
+const AUDIT_LOG_RISK_CLASS: &str = r#"
+ALTER TABLE audit_log ADD COLUMN risk_class TEXT NOT NULL DEFAULT 'unclassified';
+ALTER TABLE audit_log ADD COLUMN related_claim_id TEXT;
+ALTER TABLE audit_log ADD COLUMN request_id TEXT;
+CREATE INDEX idx_audit_risk_class ON audit_log(risk_class) WHERE risk_class IN ('B','C');
+CREATE INDEX idx_audit_claim ON audit_log(related_claim_id) WHERE related_claim_id IS NOT NULL;
+CREATE INDEX idx_audit_request_id ON audit_log(request_id);
+"#;
 
 // params_schema: JSON-Schema-like opis pol konfiguracyjnych per node type.
 // GUI flow builder rendere dynamic form z tej deklaracji (typ string z enum

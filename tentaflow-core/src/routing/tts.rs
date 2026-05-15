@@ -171,7 +171,7 @@ impl Router {
     /// emit the same hint instead of only the mesh fallback doing so.
     fn log_tts_dispatch_diagnostics(&self, tts_model: &str) {
         let Some(ref db) = self.db else { return };
-        match crate::db::repository::resolve_model_alias(db, tts_model) {
+        match crate::db::repository::resolve_model_alias(db, tts_model, None) {
             Ok(Some(alias)) => {
                 if alias.target_model.trim().is_empty() {
                     tracing::warn!(

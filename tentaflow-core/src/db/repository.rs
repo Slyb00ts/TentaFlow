@@ -609,16 +609,625 @@ pub fn get_model_alias(pool: &DbPool, id: i64) -> Result<Option<DbModelAlias>> {
     Ok(result)
 }
 
-pub fn resolve_model_alias(pool: &DbPool, alias: &str) -> Result<Option<DbModelAlias>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM model_aliases WHERE alias = ?1 AND is_active = 1",
-        MODEL_ALIAS_COLS
-    ))?;
-    let result = stmt
-        .query_row(rusqlite::params![alias], row_to_model_alias)
+/// Resolves an alias to its row. When `caller_addon_id = None` the call is
+/// a system bypass (legacy core paths like routing middleware, TTS router,
+/// teams-bot bootstrap) and the visibility/consumer gate is skipped. When
+/// `Some(addon_id)` is passed, the function enforces the F1a §6.6 v0.6.0
+/// permission gate:
+///   - owner addon resolving its own alias → always allow,
+///   - `visibility='public'` → allow,
+///   - `visibility='restricted'` with a non-revoked row in
+///     `model_alias_consumers(alias_id, consumer_addon_id)` → allow,
+///   - everything else (private, restricted without grant) → returns
+///     `AliasPermissionDenied` so the caller can surface a permission
+///     error and audit `alias_calls.result='permission_denied'`.
+///
+/// Missing alias still returns `Ok(None)` (the gate only triggers when the
+/// alias exists and is active).
+pub fn resolve_model_alias(
+    pool: &DbPool,
+    alias: &str,
+    caller_addon_id: Option<&str>,
+) -> Result<Option<DbModelAlias>> {
+    resolve_model_alias_for_addon(pool, alias, caller_addon_id, None, None)
+}
+
+/// Same as `resolve_model_alias` but carries `method` and `request_id` so
+/// the denial path can attach them to `alias_calls` / `audit_log`. Addon
+/// entrypoints (`llm_generate`, `service_request`) call this directly so
+/// `permission_denied` rows are linkable to the originating request.
+pub fn resolve_model_alias_for_addon(
+    pool: &DbPool,
+    alias: &str,
+    caller_addon_id: Option<&str>,
+    method: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<Option<DbModelAlias>> {
+    let mut conn = acquire(pool)?;
+
+    // All reads + the (optional) denial write run in one transaction so
+    // visibility / consumer / uses_alias state cannot mutate between the
+    // permission check and the audit row. The transaction is read-only on
+    // the success path (no writes performed) — SQLite still allows it.
+    let tx = conn.transaction()?;
+
+    let alias_row: Option<DbModelAlias> = {
+        let mut stmt = tx.prepare_cached(&format!(
+            "SELECT {} FROM model_aliases WHERE alias = ?1 AND is_active = 1",
+            MODEL_ALIAS_COLS
+        ))?;
+        stmt.query_row(rusqlite::params![alias], row_to_model_alias)
+            .optional()?
+    };
+    let Some(alias_row) = alias_row else {
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    // System bypass — legacy core routing paths.
+    let Some(caller_id) = caller_addon_id else {
+        tx.commit()?;
+        return Ok(Some(alias_row));
+    };
+
+    // Owner addon always passes the gate.
+    let owner: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+            rusqlite::params![alias_row.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .optional()?;
-    Ok(result)
+    if let Some((ref ot, ref oid)) = owner {
+        if ot == "addon" && oid.as_deref() == Some(caller_id) {
+            tx.commit()?;
+            return Ok(Some(alias_row));
+        }
+    }
+
+    // Visibility lookup. Absence of a row defaults to `private` (closed
+    // by default, F1a §6.6 v0.6.0).
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_alias_visibility WHERE alias_id = ?1",
+            rusqlite::params![alias_row.id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "private".to_string());
+
+    // Non-owner caller always needs an `addon_uses_alias` row with status
+    // granted/auto_granted — this is the per-addon declaration gate. The
+    // visibility tier on top adds an extra constraint for `restricted`
+    // (must also be on the consumer whitelist) and short-circuits to deny
+    // for `private`.
+    let uses_alias_ok: bool = tx
+        .query_row(
+            "SELECT 1 FROM addon_uses_alias \
+             WHERE addon_id = ?1 AND alias_target_name = ?2 \
+               AND grant_status IN ('granted','auto_granted')",
+            rusqlite::params![caller_id, alias],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    let consumer_ok: bool = if visibility == "restricted" {
+        tx.query_row(
+            "SELECT 1 FROM model_alias_consumers \
+             WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![alias_row.id, caller_id],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false)
+    } else {
+        true
+    };
+
+    let reason: Option<&'static str> = match visibility.as_str() {
+        "private" => Some("private_not_owner"),
+        "restricted" => {
+            if !consumer_ok {
+                Some("restricted_no_consumer")
+            } else if !uses_alias_ok {
+                Some("restricted_no_uses")
+            } else {
+                None
+            }
+        }
+        "public" => {
+            if !uses_alias_ok {
+                Some("public_no_uses")
+            } else {
+                None
+            }
+        }
+        // Unknown visibility values shouldn't reach here (CHECK constraint
+        // on `model_alias_visibility.visibility`), but treat as deny.
+        _ => Some("private_not_owner"),
+    };
+
+    if let Some(reason) = reason {
+        record_alias_resolve_denied_within_tx(
+            &tx,
+            alias,
+            Some(alias_row.id),
+            caller_id,
+            method,
+            request_id,
+            reason,
+        )?;
+        tx.commit()?;
+        return Err(AliasPermissionDenied::new(alias, caller_id, reason).into());
+    }
+
+    tx.commit()?;
+    Ok(Some(alias_row))
+}
+
+/// Inserts an `alias_calls` row with `result='permission_denied'` and a
+/// matching `audit_log` row (risk_class='A', action='alias_resolve_denied').
+/// Pulled out so both helpers (the resolver and any future ABI shortcut
+/// that needs to record a denial) share the same audit shape.
+fn record_alias_resolve_denied_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_name: &str,
+    alias_id: Option<i64>,
+    caller_addon_id: &str,
+    method: Option<&str>,
+    request_id: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    // `alias_calls.alias_id` is `NOT NULL REFERENCES model_aliases(id)` so
+    // we can only emit a row when the alias exists. For the rare case
+    // where the alias is missing (e.g. consumer racing against an
+    // uninstall) we skip the alias_calls insert and rely on audit_log
+    // alone — both are written in the same tx so they stay consistent.
+    if let Some(alias_id) = alias_id {
+        tx.execute(
+            "INSERT INTO alias_calls \
+                (alias_id, alias_name, method, target_used, target_node_id, service_id, \
+                 caller_addon_id, caller_user_id, request_id, duration_ms, payload_bytes, \
+                 response_bytes, fallback_used, fallback_chain_position, result, error_code, ts) \
+             VALUES (?1, ?2, ?3, '', NULL, NULL, ?4, NULL, ?5, NULL, NULL, NULL, \
+                     0, NULL, 'permission_denied', ?6, strftime('%s','now'))",
+            rusqlite::params![
+                alias_id,
+                alias_name,
+                method,
+                caller_addon_id,
+                request_id,
+                reason
+            ],
+        )?;
+    }
+
+    let details = serde_json::json!({
+        "alias": alias_name,
+        "reason": reason,
+        "method": method,
+        "request_id": request_id,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details) \
+         VALUES (datetime('now'), NULL, ?1, 'alias_resolve_denied', \
+                 'model_alias', ?2, 'denied', NULL, 'warn', 'A', ?3)",
+        rusqlite::params![caller_addon_id, alias_name, details],
+    )?;
+    Ok(())
+}
+
+/// Error returned by `resolve_model_alias` when the addon-bound caller is
+/// not allowed to resolve a particular alias. Carries enough context for
+/// `service_call_v1` to log `alias_calls.result='permission_denied'` and
+/// return `ABI_ERR_PERMISSION` without rebuilding the lookup chain.
+#[derive(Debug, Clone)]
+pub struct AliasPermissionDenied {
+    pub alias: String,
+    pub caller_addon_id: String,
+    pub reason: &'static str,
+}
+
+impl AliasPermissionDenied {
+    fn new(alias: &str, caller: &str, reason: &'static str) -> Self {
+        Self {
+            alias: alias.to_string(),
+            caller_addon_id: caller.to_string(),
+            reason,
+        }
+    }
+}
+
+impl std::fmt::Display for AliasPermissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "addon '{}' is not allowed to resolve alias '{}': {}",
+            self.caller_addon_id, self.alias, self.reason
+        )
+    }
+}
+
+impl std::error::Error for AliasPermissionDenied {}
+
+// =============================================================================
+// F1a §6.6 v0.6.0 Chunk C — visibility / consumers / uses_alias / uses_model
+// =============================================================================
+
+/// Sets per-alias visibility row (upsert). `visibility` must be one of
+/// `private`/`restricted`/`public` — caller (manifest parser) already
+/// validates the value, so an invalid input here is treated as a bug and
+/// surfaces as a SQLite CHECK error.
+pub fn set_alias_visibility_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    visibility: &str,
+    updated_by_user_id: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_alias_visibility (alias_id, visibility, updated_at, updated_by_user_id) \
+         VALUES (?1, ?2, strftime('%s','now'), ?3) \
+         ON CONFLICT(alias_id) DO UPDATE SET \
+             visibility = excluded.visibility, \
+             updated_at = excluded.updated_at, \
+             updated_by_user_id = excluded.updated_by_user_id",
+        rusqlite::params![alias_id, visibility, updated_by_user_id],
+    )?;
+    Ok(())
+}
+
+/// Adds (or restores) a consumer grant for `restricted` aliases. UNIQUE
+/// `(alias_id, consumer_addon_id)` keeps the row stable across reinstalls;
+/// `revoked_at` is cleared so an admin-revoked grant can be re-granted by
+/// a reinstall only via this helper (the helper is the only writer).
+pub fn add_alias_consumer_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    consumer_addon_id: &str,
+    granted_by_user_id: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_alias_consumers \
+            (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+         VALUES (?1, ?2, ?3, strftime('%s','now'), NULL) \
+         ON CONFLICT(alias_id, consumer_addon_id) DO UPDATE SET \
+             revoked_at = NULL, \
+             granted_by_user_id = excluded.granted_by_user_id",
+        rusqlite::params![alias_id, consumer_addon_id, granted_by_user_id],
+    )?;
+    Ok(())
+}
+
+/// Revokes manifest-granted consumer rows for `alias_id` whose
+/// `consumer_addon_id` is not in `keep` and which were not manually granted
+/// by an admin (`granted_by_user_id IS NULL`). Returns the list of revoked
+/// consumer ids so callers can emit audit entries. Admin-granted rows
+/// (`granted_by_user_id IS NOT NULL`) are preserved across manifest changes
+/// — only the operator can revoke them via M16. The DELETE is hard (not
+/// `revoked_at = now()`) because the row was synthesized from the manifest
+/// in the first place and is regenerated on every install pass; keeping it
+/// as a revoked tombstone would silently re-grant on the next install once
+/// the consumer is re-added to `allowed_consumers`.
+pub fn revoke_obsolete_manifest_consumers_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    keep: &[String],
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT consumer_addon_id FROM model_alias_consumers \
+         WHERE alias_id = ?1 AND granted_by_user_id IS NULL AND revoked_at IS NULL",
+    )?;
+    let existing: Vec<String> = stmt
+        .query_map(rusqlite::params![alias_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let keep_set: std::collections::HashSet<&str> = keep.iter().map(|s| s.as_str()).collect();
+    let mut revoked: Vec<String> = Vec::new();
+    for consumer in existing {
+        if !keep_set.contains(consumer.as_str()) {
+            tx.execute(
+                "DELETE FROM model_alias_consumers \
+                 WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND granted_by_user_id IS NULL",
+                rusqlite::params![alias_id, consumer],
+            )?;
+            revoked.push(consumer);
+        }
+    }
+    Ok(revoked)
+}
+
+/// Looks up the alias name → (alias_id, visibility) tuple inside an active
+/// transaction. Returns `Ok(None)` when the alias is absent (consumer
+/// declared `[[uses_alias]]` for an alias whose owner addon is not yet
+/// installed — row stays `pending` until reconciliation runs).
+pub fn lookup_alias_visibility_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+) -> Result<Option<(i64, String)>> {
+    let id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![alias],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_alias_visibility WHERE alias_id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "private".to_string());
+    Ok(Some((id, visibility)))
+}
+
+/// Returns whether `consumer_addon_id` has a non-revoked grant for
+/// `alias_id` in `model_alias_consumers`.
+pub fn has_alias_consumer_grant_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    consumer_addon_id: &str,
+) -> Result<bool> {
+    let row: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM model_alias_consumers \
+             WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![alias_id, consumer_addon_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
+}
+
+/// Computes the grant_status for an `addon_uses_alias` row based on the
+/// current visibility / consumer-grant state. Owner addon is treated as
+/// always granted (`auto_granted`).
+pub fn compute_uses_alias_status_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    consumer_addon_id: &str,
+) -> Result<&'static str> {
+    let Some((alias_id, visibility)) = lookup_alias_visibility_within_tx(tx, alias)? else {
+        return Ok("pending");
+    };
+    let owner_match: bool = tx
+        .query_row(
+            "SELECT 1 FROM model_alias_owners \
+             WHERE alias_id = ?1 AND owner_type = 'addon' AND owner_id = ?2",
+            rusqlite::params![alias_id, consumer_addon_id],
+            |r| r.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if owner_match {
+        return Ok("auto_granted");
+    }
+    Ok(match visibility.as_str() {
+        "public" => "auto_granted",
+        "restricted" => {
+            if has_alias_consumer_grant_within_tx(tx, alias_id, consumer_addon_id)? {
+                "granted"
+            } else {
+                "pending"
+            }
+        }
+        _ => "denied",
+    })
+}
+
+/// Inserts (or updates) a consumer-side `[[uses_alias]]` declaration into
+/// `addon_uses_alias`. The row's `grant_status` is computed by
+/// `compute_uses_alias_status_within_tx`. Subsequent reconciliation runs
+/// may flip the status when the owner addon installs the alias later.
+pub fn upsert_uses_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    addon_id: &str,
+    alias_name: &str,
+    required: bool,
+    reason: &str,
+) -> Result<&'static str> {
+    let status = compute_uses_alias_status_within_tx(tx, alias_name, addon_id)?;
+    let decided_at: Option<i64> = if status == "pending" {
+        None
+    } else {
+        Some(now_unix())
+    };
+    tx.execute(
+        "INSERT INTO addon_uses_alias \
+            (addon_id, alias_target_name, required, reason, grant_status, \
+             grant_decided_at, grant_decided_by_user_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, strftime('%s','now')) \
+         ON CONFLICT(addon_id, alias_target_name) DO UPDATE SET \
+             required = excluded.required, \
+             reason = excluded.reason, \
+             grant_status = excluded.grant_status, \
+             grant_decided_at = excluded.grant_decided_at",
+        rusqlite::params![
+            addon_id,
+            alias_name,
+            required as i64,
+            reason,
+            status,
+            decided_at
+        ],
+    )?;
+    Ok(status)
+}
+
+/// Symmetric to `upsert_uses_alias_within_tx` for direct model access.
+/// Model visibility default is `restricted`, so unknown models keep the
+/// row `pending` (an admin must explicitly grant via `model_consumers`).
+pub fn upsert_uses_model_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    addon_id: &str,
+    model_id: &str,
+    required: bool,
+    reason: &str,
+) -> Result<&'static str> {
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_visibility WHERE model_id = ?1",
+            rusqlite::params![model_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "restricted".to_string());
+    let granted: bool = tx
+        .query_row(
+            "SELECT 1 FROM model_consumers \
+             WHERE model_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![model_id, addon_id],
+            |r| r.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let status = if visibility == "public" {
+        "auto_granted"
+    } else if granted {
+        "granted"
+    } else {
+        "pending"
+    };
+    let decided_at: Option<i64> = if status == "pending" {
+        None
+    } else {
+        Some(now_unix())
+    };
+    tx.execute(
+        "INSERT INTO addon_uses_model \
+            (addon_id, model_target_name, required, reason, grant_status, \
+             grant_decided_at, grant_decided_by_user_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, strftime('%s','now')) \
+         ON CONFLICT(addon_id, model_target_name) DO UPDATE SET \
+             required = excluded.required, \
+             reason = excluded.reason, \
+             grant_status = excluded.grant_status, \
+             grant_decided_at = excluded.grant_decided_at",
+        rusqlite::params![
+            addon_id,
+            model_id,
+            required as i64,
+            reason,
+            status,
+            decided_at
+        ],
+    )?;
+    Ok(status)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Re-evaluates every `addon_uses_alias` row whose `alias_target_name =
+/// alias_name` and writes the new status. Called by the install path
+/// after a new alias / its visibility / its consumer list lands so that
+/// previously-`pending` consumers flip to `granted`/`auto_granted`/`denied`.
+///
+/// Returns the list of `(addon_id, before, after)` tuples for status
+/// transitions only (no-op when the status did not change). Caller writes
+/// one audit_log row per transition, risk_class=A, result='reconciled'.
+#[allow(clippy::type_complexity)]
+pub fn reconcile_uses_alias_for_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_name: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = tx.prepare(
+        "SELECT addon_id, grant_status FROM addon_uses_alias WHERE alias_target_name = ?1",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![alias_name], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut transitions = Vec::new();
+    for (consumer, before) in rows {
+        let after = compute_uses_alias_status_within_tx(tx, alias_name, &consumer)?;
+        if after != before.as_str() {
+            let decided_at: Option<i64> =
+                if after == "pending" { None } else { Some(now_unix()) };
+            tx.execute(
+                "UPDATE addon_uses_alias \
+                    SET grant_status = ?1, grant_decided_at = ?2 \
+                  WHERE addon_id = ?3 AND alias_target_name = ?4",
+                rusqlite::params![after, decided_at, consumer, alias_name],
+            )?;
+            transitions.push((consumer, before, after.to_string()));
+        }
+    }
+    Ok(transitions)
+}
+
+/// Writes one risk-class-A audit row for a reconciliation transition. The
+/// row carries the addon_id (consumer), the affected alias, and a JSON
+/// details blob with `before`/`after` statuses. This is the audit trail
+/// for §6.2.Y compliance — any pending→granted/denied transition driven
+/// by an owner install must be traceable to the install event.
+pub fn audit_reconcile_uses_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    consumer_addon_id: &str,
+    alias_name: &str,
+    before: &str,
+    after: &str,
+) -> Result<()> {
+    let details = serde_json::json!({
+        "alias": alias_name,
+        "before": before,
+        "after": after,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details) \
+         VALUES (datetime('now'), NULL, ?1, 'uses_alias.reconcile', \
+                 'model_alias', ?2, 'reconciled', NULL, 'info', 'A', ?3)",
+        rusqlite::params![consumer_addon_id, alias_name, details],
+    )?;
+    Ok(())
+}
+
+/// Writes one risk-class-A audit row for a manifest-driven consumer revoke
+/// during install/reinstall. Triggered when a previously listed consumer is
+/// dropped from `allowed_consumers` and `revoke_obsolete_manifest_consumers_within_tx`
+/// removes the row. Pairs with `audit_reconcile_uses_alias_within_tx` so the
+/// pending→denied transition (computed afterwards by reconcile) has the
+/// upstream cause recorded in the same transaction.
+pub fn audit_consumer_revoked_by_manifest_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    owner_addon_id: &str,
+    alias_name: &str,
+    consumer_addon_id: &str,
+) -> Result<()> {
+    let details = serde_json::json!({
+        "alias": alias_name,
+        "consumer": consumer_addon_id,
+        "reason": "manifest_no_longer_lists_consumer",
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details) \
+         VALUES (datetime('now'), NULL, ?1, 'consumer_revoked_by_manifest_change', \
+                 'model_alias', ?2, 'revoked', NULL, 'info', 'A', ?3)",
+        rusqlite::params![owner_addon_id, alias_name, details],
+    )?;
+    Ok(())
 }
 
 /// Raw insert into `model_aliases` — bypasses chain check, JSON validation,
@@ -854,21 +1463,133 @@ pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Tworzy alias jesli nie istnieje, lub reaktywuje istniejacy (bez zmiany target_model).
-/// Uzywane przez cykl zycia addonow do automatycznego zarzadzania aliasami.
+/// Validates alias identifier: `^[a-z][a-z0-9-]{0,63}$`.
+/// Untrusted input (manifest may declare arbitrary alias id); reject early
+/// so the registry cannot grow names that break URL routing or SQL LIKE
+/// patterns elsewhere.
+pub fn validate_alias_id(alias: &str) -> Result<()> {
+    let bytes = alias.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        anyhow::bail!(
+            "invalid alias id '{}': must be 1..=64 chars, got {}",
+            alias.escape_debug(),
+            bytes.len()
+        );
+    }
+    if !(bytes[0].is_ascii_lowercase()) {
+        anyhow::bail!(
+            "invalid alias id '{}': must start with lowercase letter",
+            alias.escape_debug()
+        );
+    }
+    for &b in &bytes[1..] {
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            anyhow::bail!(
+                "invalid alias id '{}': only [a-z0-9-] allowed after first char",
+                alias.escape_debug()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Creates the alias if it does not exist, or reactivates an existing one
+/// without overwriting its `target_model`. Used by addon install/start to
+/// register aliases declared in the addon manifest, and by admin UI for
+/// manually managed aliases.
 ///
-/// Reaktywacja musi sprawdzic chain — istniejacy nieaktywny rekord moze
-/// wskazywac target ktory w miedzyczasie stal sie aliasem; wlaczenie
-/// `is_active = 1` bez kontroli stworzyloby chain. Caly check + write
-/// idzie pod jedna transakcja.
+/// Ownership is recorded in `model_alias_owners` inside the same
+/// transaction. `owner_type` must be `"addon"` or `"manual"`:
+/// - `addon` requires `owner_id` = addon id; reusing the same alias from
+///   another addon returns an error (cross-addon ownership conflict).
+/// - `manual` ignores `owner_id` (NULL is stored).
+///
+/// Reactivation re-runs the chain check — a parked row may target a name
+/// that became an alias in the meantime; flipping `is_active = 1` without
+/// the check would create a forbidden alias-of-alias chain.
+///
+/// Returns the alias row id.
 pub fn create_or_reactivate_model_alias(
     pool: &DbPool,
     alias: &str,
     default_target_model: &str,
     strategy: &str,
-) -> Result<()> {
+    owner_type: &str,
+    owner_id: Option<&str>,
+) -> Result<i64> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
+    let alias_id = create_or_reactivate_model_alias_within_tx(
+        &tx,
+        alias,
+        default_target_model,
+        strategy,
+        owner_type,
+        owner_id,
+    )?;
+    tx.commit()?;
+    Ok(alias_id)
+}
+
+/// Same as `create_or_reactivate_model_alias` but commits the alias in the
+/// requested `is_active` state inside a single transaction. Used by the
+/// addon install path for gated aliases: the router must never observe an
+/// in-between window where a `gate=...` alias is active. Both the create
+/// and the deactivate audit rows are written in one tx — on failure the
+/// alias does not appear at all.
+pub fn create_or_reactivate_model_alias_with_active(
+    pool: &DbPool,
+    alias: &str,
+    default_target_model: &str,
+    strategy: &str,
+    owner_type: &str,
+    owner_id: Option<&str>,
+    is_active: bool,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let alias_id = create_or_reactivate_model_alias_within_tx(
+        &tx,
+        alias,
+        default_target_model,
+        strategy,
+        owner_type,
+        owner_id,
+    )?;
+    if !is_active {
+        // Caller wants the alias parked (gated). Reuse the audited setter so
+        // the deactivate event is recorded with proper attribution.
+        let changed_by = if owner_type == "addon" { owner_id } else { None };
+        set_model_alias_active_audited_within_tx(&tx, alias, false, changed_by)?;
+    }
+    tx.commit()?;
+    Ok(alias_id)
+}
+
+/// Same logic as `create_or_reactivate_model_alias`, but the caller owns
+/// the transaction. Used by batch installers (addon manifest registration)
+/// that need every alias write — including the audit row — to roll back
+/// together on partial failure. `model_alias_changes` has no foreign key
+/// to `model_aliases` (audit trail is preserved across deletes), so the
+/// only reliable rollback is "tx never commits".
+pub fn create_or_reactivate_model_alias_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    default_target_model: &str,
+    strategy: &str,
+    owner_type: &str,
+    owner_id: Option<&str>,
+) -> Result<i64> {
+    validate_alias_id(alias)?;
+    if owner_type != "addon" && owner_type != "manual" {
+        anyhow::bail!(
+            "invalid owner_type '{}': must be 'addon' or 'manual'",
+            owner_type
+        );
+    }
+    if owner_type == "addon" && owner_id.is_none() {
+        anyhow::bail!("owner_type='addon' requires owner_id (addon id)");
+    }
     let existing: Option<(i64, String, Option<String>)> = tx
         .query_row(
             "SELECT id, target_model, fallback_targets FROM model_aliases WHERE alias = ?1",
@@ -886,14 +1607,14 @@ pub fn create_or_reactivate_model_alias(
         if name.is_empty() {
             continue;
         }
-        if alias_is_active_within_tx(&tx, &name, action_id)? {
+        if alias_is_active_within_tx(tx, &name, action_id)? {
             anyhow::bail!(
                 "'{}' is itself an active alias; aliases of aliases are not supported",
                 name
             );
         }
     }
-    if alias_is_inbound_target_within_tx(&tx, alias, action_id)? {
+    if alias_is_inbound_target_within_tx(tx, alias, action_id)? {
         anyhow::bail!(
             "alias '{}' is already used as a target/fallback by another active alias; \
              registering or reactivating it would create a chain",
@@ -901,51 +1622,166 @@ pub fn create_or_reactivate_model_alias(
         );
     }
 
+    // Ownership guard — block silent take-over across owner_type boundaries.
+    // Cross-addon (addon→addon with different addon id) and manual↔addon
+    // transitions all require explicit admin action (M16 reassign), never
+    // a side effect of an install/reinstall.
+    if let Some(id) = action_id {
+        let existing_owner: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((ex_type, ex_owner_id)) = existing_owner {
+            if ex_type == "addon"
+                && owner_type == "addon"
+                && ex_owner_id.as_deref() != owner_id
+            {
+                anyhow::bail!(
+                    "alias '{}' is already owned by addon '{}'; cannot reassign to '{}'",
+                    alias.escape_debug(),
+                    ex_owner_id.unwrap_or_default(),
+                    owner_id.unwrap_or_default()
+                );
+            }
+            if ex_type == "manual" && owner_type == "addon" {
+                anyhow::bail!(
+                    "alias '{}' is manually owned; addon '{}' cannot adopt it silently (use admin M16 to reassign)",
+                    alias.escape_debug(),
+                    owner_id.unwrap_or("?")
+                );
+            }
+            if ex_type == "addon" && owner_type == "manual" {
+                anyhow::bail!(
+                    "alias '{}' is owned by addon '{}'; manual ownership change requires admin M16",
+                    alias.escape_debug(),
+                    ex_owner_id.as_deref().unwrap_or("?")
+                );
+            }
+        }
+    }
+
+    let alias_id: i64;
+    let change_type: &str;
     if let Some(id) = action_id {
         tx.execute(
             "UPDATE model_aliases SET is_active = 1 WHERE id = ?1",
             rusqlite::params![id],
         )?;
+        alias_id = id;
+        change_type = "activate";
     } else {
         tx.execute(
             "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, 1, ?3)",
             rusqlite::params![alias, default_target_model, strategy],
         )?;
+        alias_id = tx.last_insert_rowid();
+        change_type = "create";
     }
+
+    // Owner row: INSERT new (created_at = now) or UPDATE existing in place,
+    // preserving the original `created_at` across reactivation. Cross-owner
+    // transitions are blocked above, so the update only changes within the
+    // same owner identity (idempotent reinstall).
+    let stored_owner_id: Option<&str> = if owner_type == "addon" {
+        owner_id
+    } else {
+        None
+    };
+    tx.execute(
+        "INSERT INTO model_alias_owners (alias_id, owner_type, owner_id, created_at) \
+         VALUES (?1, ?2, ?3, datetime('now')) \
+         ON CONFLICT(alias_id) DO UPDATE SET \
+             owner_type = excluded.owner_type, \
+             owner_id = excluded.owner_id",
+        rusqlite::params![alias_id, owner_type, stored_owner_id],
+    )?;
+
+    // Audit trail: one row per create/activate event.
+    let after_snapshot = serde_json::json!({
+        "alias": alias,
+        "target_model": default_target_model,
+        "is_active": true,
+        "owner_type": owner_type,
+        "owner_id": stored_owner_id,
+    })
+    .to_string();
+    let changed_by_addon = if owner_type == "addon" {
+        owner_id
+    } else {
+        None
+    };
+    tx.execute(
+        "INSERT INTO model_alias_changes \
+         (alias_id, alias_name, changed_by_addon_id, before_snapshot, after_snapshot, change_type, ts) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, strftime('%s','now'))",
+        rusqlite::params![alias_id, alias, changed_by_addon, after_snapshot, change_type],
+    )?;
+
+    Ok(alias_id)
+}
+
+/// Sets the `is_active` flag on an alias selected by name.
+///
+/// Reactivation (`is_active = true`) re-runs the same chain check as
+/// create/update — the row's target may have become an alias itself while
+/// the flag was off, so a naive flag flip could resurrect a chain.
+/// Deactivation is always safe; an inactive row does not route.
+pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Result<()> {
+    set_model_alias_active_audited(pool, alias, is_active, None)
+}
+
+/// Same as `set_model_alias_active` but records `changed_by_addon_id` on
+/// the audit row. Used by the generic addon install/start/stop path so
+/// the audit trail attributes activate/deactivate events to the addon.
+pub fn set_model_alias_active_audited(
+    pool: &DbPool,
+    alias: &str,
+    is_active: bool,
+    changed_by_addon_id: Option<&str>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    set_model_alias_active_audited_within_tx(&tx, alias, is_active, changed_by_addon_id)?;
     tx.commit()?;
     Ok(())
 }
 
-/// Ustawia flage is_active aliasu po nazwie.
-///
-/// Reactivation (`is_active = true`) wymaga kontroli chainu po tych samych
-/// regulach co create/update — nie wystarczy przewinac flage skoro target
-/// rekordu mogl stac sie aliasem od czasu deaktywacji. Deactivation jest
-/// bezpieczna bezwarunkowo — nieaktywny rzad nie routuje.
-pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Result<()> {
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
+/// Same as `set_model_alias_active_audited`, but the caller owns the
+/// transaction. Used by the addon install path to keep the gated-alias
+/// deactivate inside the same tx as the create/reactivate above.
+pub fn set_model_alias_active_audited_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    is_active: bool,
+    changed_by_addon_id: Option<&str>,
+) -> Result<()> {
+    let existing: Option<(i64, String, Option<String>, bool)> = tx
+        .query_row(
+            "SELECT id, target_model, fallback_targets, is_active FROM model_aliases WHERE alias = ?1",
+            rusqlite::params![alias],
+            |row| {
+                let active: i64 = row.get(3)?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, active != 0))
+            },
+        )
+        .optional()?;
     if is_active {
-        let existing: Option<(i64, String, Option<String>)> = tx
-            .query_row(
-                "SELECT id, target_model, fallback_targets FROM model_aliases WHERE alias = ?1",
-                rusqlite::params![alias],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((id, target, fallbacks)) = existing {
-            for name in collect_chain_candidates(&target, fallbacks.as_deref())? {
+        if let Some((id, target, fallbacks, _)) = &existing {
+            for name in collect_chain_candidates(target, fallbacks.as_deref())? {
                 if name.is_empty() {
                     continue;
                 }
-                if alias_is_active_within_tx(&tx, &name, Some(id))? {
+                if alias_is_active_within_tx(tx, &name, Some(*id))? {
                     anyhow::bail!(
                         "'{}' is itself an active alias; aliases of aliases are not supported",
                         name
                     );
                 }
             }
-            if alias_is_inbound_target_within_tx(&tx, alias, Some(id))? {
+            if alias_is_inbound_target_within_tx(tx, alias, Some(*id))? {
                 anyhow::bail!(
                     "alias '{}' is already used as a target/fallback by another active alias; \
                      activating this row would create a chain",
@@ -958,7 +1794,34 @@ pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Re
         "UPDATE model_aliases SET is_active = ?1 WHERE alias = ?2",
         rusqlite::params![is_active, alias],
     )?;
-    tx.commit()?;
+
+    // Audit only when the row actually exists and the flag transitions —
+    // double-deactivate stays idempotent without churn in the changes log.
+    if let Some((id, target, _, prev_active)) = existing {
+        if prev_active != is_active {
+            let before = serde_json::json!({ "is_active": prev_active }).to_string();
+            let after = serde_json::json!({
+                "alias": alias,
+                "target_model": target,
+                "is_active": is_active,
+            })
+            .to_string();
+            let change_type = if is_active { "activate" } else { "deactivate" };
+            tx.execute(
+                "INSERT INTO model_alias_changes \
+                 (alias_id, alias_name, changed_by_addon_id, before_snapshot, after_snapshot, change_type, ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'))",
+                rusqlite::params![
+                    id,
+                    alias,
+                    changed_by_addon_id,
+                    before,
+                    after,
+                    change_type
+                ],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -6727,7 +7590,7 @@ mod alias_resolve_tests {
         .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "gpt-4").expect("Blad zapytania");
+        let result = resolve_model_alias(&db, "gpt-4", None).expect("Blad zapytania");
 
         // Assert
         let alias = result.expect("Alias powinien istniec");
@@ -6748,7 +7611,7 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Act
-        let result = resolve_model_alias(&db, "nieistniejacy-alias").expect("Blad zapytania");
+        let result = resolve_model_alias(&db, "nieistniejacy-alias", None).expect("Blad zapytania");
 
         // Assert
         assert!(result.is_none());
@@ -6765,7 +7628,7 @@ mod alias_resolve_tests {
             .expect("Nie udalo sie zaktualizowac aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "stary-alias").expect("Blad zapytania");
+        let result = resolve_model_alias(&db, "stary-alias", None).expect("Blad zapytania");
 
         // Assert — nieaktywny alias nie powinien byc zwracany
         assert!(result.is_none());
@@ -6779,7 +7642,7 @@ mod alias_resolve_tests {
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "test-alias")
+        let result = resolve_model_alias(&db, "test-alias", None)
             .expect("Blad zapytania")
             .expect("Alias powinien istniec");
 
@@ -6795,7 +7658,7 @@ mod alias_resolve_tests {
             .expect("Nie udalo sie utworzyc aliasu");
 
         // Act
-        let result = resolve_model_alias(&db, "simple")
+        let result = resolve_model_alias(&db, "simple", None)
             .expect("Blad zapytania")
             .expect("Alias powinien istniec");
 
@@ -6812,27 +7675,27 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Act 1 — tworzenie aliasow (symulacja instalacji teams-bot)
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
             .expect("Utworzenie aliasu teams-stt powinno sie udac");
-        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available", "addon", Some("teams-bot"))
             .expect("Utworzenie aliasu teams-tts powinno sie udac");
-        create_or_reactivate_model_alias(&db, "teams-summary", "", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-summary", "", "first_available", "addon", Some("teams-bot"))
             .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
 
         // Assert 1 — aliasy istnieja i sa aktywne
-        let stt = resolve_model_alias(&db, "teams-stt").unwrap();
+        let stt = resolve_model_alias(&db, "teams-stt", None).unwrap();
         assert!(stt.is_some(), "Alias teams-stt powinien istniec");
         let stt = stt.unwrap();
         assert_eq!(stt.target_model, "whisper-1");
         assert!(stt.is_active);
 
-        let tts = resolve_model_alias(&db, "teams-tts").unwrap();
+        let tts = resolve_model_alias(&db, "teams-tts", None).unwrap();
         assert!(tts.is_some(), "Alias teams-tts powinien istniec");
         let tts = tts.unwrap();
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
 
-        let summary = resolve_model_alias(&db, "teams-summary").unwrap();
+        let summary = resolve_model_alias(&db, "teams-summary", None).unwrap();
         assert!(summary.is_some(), "Alias teams-summary powinien istniec");
         let summary = summary.unwrap();
         assert_eq!(
@@ -6849,28 +7712,28 @@ mod alias_resolve_tests {
 
         // Assert 2 — resolve nie znajduje nieaktywnych aliasow
         assert!(
-            resolve_model_alias(&db, "teams-stt").unwrap().is_none(),
+            resolve_model_alias(&db, "teams-stt", None).unwrap().is_none(),
             "Nieaktywny alias teams-stt nie powinien byc rozwiazywany"
         );
         assert!(
-            resolve_model_alias(&db, "teams-tts").unwrap().is_none(),
+            resolve_model_alias(&db, "teams-tts", None).unwrap().is_none(),
             "Nieaktywny alias teams-tts nie powinien byc rozwiazywany"
         );
 
         // Act 3 — reaktywacja (symulacja ponownego uruchomienia)
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
             .expect("Reaktywacja teams-stt powinna sie udac");
-        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available", "addon", Some("teams-bot"))
             .expect("Reaktywacja teams-tts powinna sie udac");
 
         // Assert 3 — aliasy ponownie aktywne
-        let stt = resolve_model_alias(&db, "teams-stt")
+        let stt = resolve_model_alias(&db, "teams-stt", None)
             .unwrap()
             .expect("Alias teams-stt powinien byc reaktywowany");
         assert!(stt.is_active);
         assert_eq!(stt.target_model, "whisper-1");
 
-        let tts = resolve_model_alias(&db, "teams-tts")
+        let tts = resolve_model_alias(&db, "teams-tts", None)
             .unwrap()
             .expect("Alias teams-tts powinien byc reaktywowany");
         assert!(tts.is_active);
@@ -6884,11 +7747,11 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Tworzenie z domyslnym target_model
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
             .expect("Utworzenie aliasu powinno sie udac");
 
         // Uzytkownik zmienia target_model na inny
-        let alias = resolve_model_alias(&db, "teams-stt").unwrap().unwrap();
+        let alias = resolve_model_alias(&db, "teams-stt", None).unwrap().unwrap();
         update_model_alias_unchecked(
             &db,
             alias.id,
@@ -6904,11 +7767,11 @@ mod alias_resolve_tests {
         set_model_alias_active(&db, "teams-stt", false).unwrap();
 
         // Act — reaktywacja z domyslnym target_model
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
             .expect("Reaktywacja powinna sie udac");
 
         // Assert — target_model ustawiony przez uzytkownika jest zachowany
-        let alias = resolve_model_alias(&db, "teams-stt")
+        let alias = resolve_model_alias(&db, "teams-stt", None)
             .unwrap()
             .expect("Alias powinien byc aktywny");
         assert_eq!(
@@ -6924,7 +7787,7 @@ mod alias_resolve_tests {
 
         // Arrange
         let db = create_test_db();
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available").unwrap();
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot")).unwrap();
         set_model_alias_active(&db, "teams-stt", false).unwrap();
 
         // Act — ponowna dezaktywacja
@@ -6932,6 +7795,519 @@ mod alias_resolve_tests {
 
         // Assert — brak bledu
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_alias_with_addon_owner_writes_to_owners_table() {
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "vendor-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("vendor-bot"),
+        )
+        .expect("create alias");
+
+        let conn = db.lock().unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("owner row exists");
+        assert_eq!(row.0, "addon");
+        assert_eq!(row.1.as_deref(), Some("vendor-bot"));
+    }
+
+    #[test]
+    fn test_create_alias_with_manual_owner_writes_to_owners_table() {
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "ops-alias",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect("create alias");
+
+        let conn = db.lock().unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("owner row exists");
+        assert_eq!(row.0, "manual");
+        assert_eq!(row.1, None);
+    }
+
+    #[test]
+    fn test_create_alias_conflict_when_owner_mismatch() {
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "shared-alias",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("addon-a"),
+        )
+        .expect("addon-a registers alias");
+
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "shared-alias",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("addon-b"),
+        )
+        .expect_err("cross-addon take-over must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("addon-a"),
+            "error must name original owner, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_validation_rejects_bad_input() {
+        let db = create_test_db();
+        for bad in &["", "1starts-with-digit", "UPPER", "has space", "has_underscore"] {
+            let err = create_or_reactivate_model_alias(
+                &db,
+                bad,
+                "",
+                "first_available",
+                "manual",
+                None,
+            )
+            .expect_err("validation must reject");
+            assert!(format!("{err}").contains("invalid alias id"));
+        }
+    }
+
+    #[test]
+    fn test_create_alias_writes_audit_row() {
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "auditable",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("addon-x"),
+        )
+        .expect("create alias");
+
+        let conn = db.lock().unwrap();
+        let (change_type, addon): (String, Option<String>) = conn
+            .query_row(
+                "SELECT change_type, changed_by_addon_id FROM model_alias_changes \
+                 WHERE alias_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("change row");
+        assert_eq!(change_type, "create");
+        assert_eq!(addon.as_deref(), Some("addon-x"));
+    }
+
+    #[test]
+    fn test_generic_alias_install_works_for_arbitrary_addon() {
+        // Simulates AddonManager.install_manifest_aliases loop for a
+        // hypothetical addon "vendor-x" declaring two aliases.
+        let db = create_test_db();
+        let id1 = create_or_reactivate_model_alias(
+            &db,
+            "vendor-x-alpha",
+            "model-alpha",
+            "first_available",
+            "addon",
+            Some("vendor-x"),
+        )
+        .unwrap();
+        let id2 = create_or_reactivate_model_alias(
+            &db,
+            "vendor-x-beta",
+            "",
+            "first_available",
+            "addon",
+            Some("vendor-x"),
+        )
+        .unwrap();
+        assert_ne!(id1, id2);
+
+        let conn = db.lock().unwrap();
+        let owned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_alias_owners WHERE owner_id = 'vendor-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owned, 2);
+    }
+
+    #[test]
+    fn test_uninstall_aliases_deactivate_keeps_owner_row() {
+        // Install (create) then deactivate (simulates uninstall path):
+        // the owner row must survive so future reinstall reactivates
+        // instead of taking ownership conflict.
+        let db = create_test_db();
+        let alias_id = create_or_reactivate_model_alias(
+            &db,
+            "persist-alias",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("persist-addon"),
+        )
+        .unwrap();
+        set_model_alias_active_audited(&db, "persist-alias", false, Some("persist-addon"))
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let (active, owner): (i64, String) = conn
+            .query_row(
+                "SELECT m.is_active, o.owner_id FROM model_aliases m \
+                 JOIN model_alias_owners o ON o.alias_id = m.id WHERE m.id = ?1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active, 0, "alias deactivated");
+        assert_eq!(owner, "persist-addon", "owner row preserved");
+    }
+
+    #[test]
+    fn test_deactivate_writes_audit_row() {
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "deact-alias",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .unwrap();
+
+        set_model_alias_active_audited(&db, "deact-alias", false, Some("admin-tool"))
+            .expect("deactivate");
+
+        let conn = db.lock().unwrap();
+        let (ct, addon): (String, Option<String>) = conn
+            .query_row(
+                "SELECT change_type, changed_by_addon_id FROM model_alias_changes \
+                 WHERE alias_name = 'deact-alias' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("change row");
+        assert_eq!(ct, "deactivate");
+        assert_eq!(addon.as_deref(), Some("admin-tool"));
+    }
+
+    #[test]
+    fn test_reactivate_preserves_owner_created_at() {
+        // Reinstall (deactivate → create_or_reactivate) must keep the
+        // original `model_alias_owners.created_at`. Audit/tenure clocks
+        // downstream rely on this value as the first-seen timestamp.
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "persist-ts",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("persist-addon"),
+        )
+        .unwrap();
+
+        let original_created_at: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT created_at FROM model_alias_owners \
+                 WHERE alias_id = (SELECT id FROM model_aliases WHERE alias = 'persist-ts')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("owner row")
+        };
+
+        // Force a different `datetime('now')` by sleeping past the second
+        // boundary. SQLite resolution is 1s.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        set_model_alias_active_audited(&db, "persist-ts", false, Some("persist-addon")).unwrap();
+        create_or_reactivate_model_alias(
+            &db,
+            "persist-ts",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("persist-addon"),
+        )
+        .unwrap();
+
+        let after_created_at: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT created_at FROM model_alias_owners \
+                 WHERE alias_id = (SELECT id FROM model_aliases WHERE alias = 'persist-ts')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("owner row")
+        };
+        assert_eq!(
+            original_created_at, after_created_at,
+            "created_at must survive deactivate→reactivate"
+        );
+    }
+
+    #[test]
+    fn test_manual_alias_cannot_be_adopted_by_addon() {
+        // A manually-owned alias must not be silently re-owned by an addon
+        // through install. Adoption requires an explicit M16 admin action.
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "manual-first",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect("manual alias created");
+
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "manual-first",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("evil-addon"),
+        )
+        .expect_err("addon adoption of manual alias must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("manually owned"),
+            "error must explain manual ownership, got: {msg}"
+        );
+        assert!(
+            msg.contains("evil-addon"),
+            "error must name the attempted owner, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_addon_alias_cannot_be_taken_manual() {
+        // Symmetric: addon→manual transition must also fail without M16.
+        let db = create_test_db();
+        create_or_reactivate_model_alias(
+            &db,
+            "addon-first",
+            "model-a",
+            "first_available",
+            "addon",
+            Some("orig-addon"),
+        )
+        .expect("addon alias created");
+
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "addon-first",
+            "model-a",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("manual take-over of addon alias must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("manual ownership change requires admin M16"),
+            "error must name the M16 admin path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_with_control_byte_in_error_message_escaped() {
+        // Raw control bytes in error messages can corrupt terminals and
+        // log aggregators. `escape_debug` renders them as `\0`, `\n`, etc.
+        let db = create_test_db();
+        let bad = "bad\0name";
+        let err = create_or_reactivate_model_alias(
+            &db,
+            bad,
+            "",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("validation must reject control byte");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\\u{0}") || msg.contains("\\0"),
+            "control byte must be escaped in error, got: {msg}"
+        );
+        assert!(
+            !msg.contains('\0'),
+            "raw NUL must not appear in error message"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_length_64_chars_ok() {
+        let db = create_test_db();
+        let name = format!("a{}", "b".repeat(63)); // 64 chars total, all valid
+        assert_eq!(name.len(), 64);
+        create_or_reactivate_model_alias(
+            &db,
+            &name,
+            "model-x",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect("64-char alias must be accepted");
+    }
+
+    #[test]
+    fn test_alias_id_length_65_chars_err() {
+        let db = create_test_db();
+        let name = format!("a{}", "b".repeat(64)); // 65 chars total
+        assert_eq!(name.len(), 65);
+        let err = create_or_reactivate_model_alias(
+            &db,
+            &name,
+            "model-x",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("65-char alias must be rejected");
+        assert!(format!("{err}").contains("invalid alias id"));
+    }
+
+    #[test]
+    fn test_alias_install_rollback_atomic() {
+        // Simulates `install_manifest_aliases`: batch register two aliases
+        // for a fresh addon, where the second registration fails. Dropping
+        // the tx must roll back BOTH the `model_aliases` insert from the
+        // first call AND every `model_alias_changes` audit row written by
+        // either call. Without the external-tx fix the audit rows for
+        // call #1 would survive (no FK on the audit table) and the next
+        // install would see a duplicate "create" event.
+        let db = create_test_db();
+
+        // Pre-seed an alias owned by `addon-a` so that addon-b's second
+        // alias registration triggers the cross-addon ownership conflict.
+        create_or_reactivate_model_alias(
+            &db,
+            "shared-name",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("addon-a"),
+        )
+        .expect("addon-a seed");
+        let audit_before: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_alias_changes WHERE changed_by_addon_id = 'addon-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(audit_before, 0);
+
+        // Batch install for addon-b: alias-1 succeeds, alias-2 ('shared-name')
+        // conflicts → we drop the tx without commit.
+        {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction().expect("tx");
+            create_or_reactivate_model_alias_within_tx(
+                &tx,
+                "addon-b-first",
+                "model-y",
+                "first_available",
+                "addon",
+                Some("addon-b"),
+            )
+            .expect("first alias must register cleanly");
+
+            let err = create_or_reactivate_model_alias_within_tx(
+                &tx,
+                "shared-name",
+                "model-x",
+                "first_available",
+                "addon",
+                Some("addon-b"),
+            )
+            .expect_err("cross-addon conflict must surface inside tx");
+            assert!(format!("{err}").contains("addon-a"));
+            // tx dropped here without commit → rollback
+        }
+
+        // First alias must not exist (rollback).
+        let leftover_alias: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_aliases WHERE alias = 'addon-b-first'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            leftover_alias, 0,
+            "alias row from the partial batch must roll back"
+        );
+
+        // Audit must not have any addon-b rows — the create event for
+        // alias-1 was rolled back too. This is the critical invariant
+        // the external-tx fix protects.
+        let audit_after: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_alias_changes WHERE changed_by_addon_id = 'addon-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            audit_after, 0,
+            "audit rows from the partial batch must roll back (no FK on model_alias_changes)"
+        );
+    }
+
+    #[test]
+    fn test_alias_id_starts_with_dash_err() {
+        let db = create_test_db();
+        let err = create_or_reactivate_model_alias(
+            &db,
+            "-leading-dash",
+            "model-x",
+            "first_available",
+            "manual",
+            None,
+        )
+        .expect_err("leading dash must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must start with lowercase letter"),
+            "error must point to first-char rule, got: {msg}"
+        );
     }
 }
 
@@ -9404,5 +10780,434 @@ mod settings_to_peer_hints_migration_tests {
             .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
             .unwrap();
         assert_eq!(hints_after, 3, "second run must not create duplicate hints");
+    }
+}
+
+#[cfg(test)]
+mod chunk_c_visibility_consumer_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn make_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test db")
+    }
+
+    fn seed_owned_alias(
+        pool: &DbPool,
+        alias_name: &str,
+        owner_addon: &str,
+        visibility: &str,
+        consumers: &[&str],
+    ) -> i64 {
+        let mut conn = pool.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let alias_id = create_or_reactivate_model_alias_within_tx(
+            &tx,
+            alias_name,
+            "service-target",
+            "first_available",
+            "addon",
+            Some(owner_addon),
+        )
+        .expect("create alias");
+        set_alias_visibility_within_tx(&tx, alias_id, visibility, None).expect("vis");
+        for c in consumers {
+            add_alias_consumer_within_tx(&tx, alias_id, c, None).expect("consumer");
+        }
+        tx.commit().expect("commit");
+        alias_id
+    }
+
+    #[test]
+    fn resolver_system_bypass_returns_alias_regardless_of_visibility() {
+        // None = system caller → no gate.
+        let db = make_db();
+        seed_owned_alias(&db, "private-alias", "addon-x", "private", &[]);
+        let row = resolve_model_alias(&db, "private-alias", None).expect("ok");
+        assert!(row.is_some(), "system bypass must always resolve");
+    }
+
+    #[test]
+    fn resolver_owner_addon_always_resolves_private_alias() {
+        let db = make_db();
+        seed_owned_alias(&db, "owner-only", "addon-owner", "private", &[]);
+        let row = resolve_model_alias(&db, "owner-only", Some("addon-owner"))
+            .expect("owner must pass private gate")
+            .expect("alias row");
+        assert_eq!(row.alias, "owner-only");
+    }
+
+    /// Seeds an `addon_uses_alias` row with the given grant_status. Tests
+    /// use this to model a consumer addon that has gone through the
+    /// install/reconcile flow against an already-existing alias.
+    fn seed_uses_alias(pool: &DbPool, addon_id: &str, alias_name: &str, grant_status: &str) {
+        let conn = pool.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO addon_uses_alias \
+                (addon_id, alias_target_name, required, reason, grant_status, \
+                 grant_decided_at, grant_decided_by_user_id, created_at) \
+             VALUES (?1, ?2, 0, 'test', ?3, strftime('%s','now'), NULL, strftime('%s','now'))",
+            rusqlite::params![addon_id, alias_name, grant_status],
+        )
+        .expect("seed addon_uses_alias");
+    }
+
+    #[test]
+    fn resolver_blocks_other_addon_from_private_alias() {
+        let db = make_db();
+        seed_owned_alias(&db, "secret", "addon-owner", "private", &[]);
+        let err = resolve_model_alias(&db, "secret", Some("addon-other"))
+            .expect_err("private must reject foreign addon");
+        let denied = err
+            .downcast::<AliasPermissionDenied>()
+            .expect("AliasPermissionDenied");
+        assert_eq!(denied.reason, "private_not_owner");
+        assert_eq!(denied.alias, "secret");
+        assert_eq!(denied.caller_addon_id, "addon-other");
+    }
+
+    #[test]
+    fn resolver_public_alias_without_uses_alias_is_denied() {
+        // Issue #1: public visibility alone is not enough — non-owner needs
+        // an explicit addon_uses_alias declaration with granted/auto_granted.
+        let db = make_db();
+        seed_owned_alias(&db, "public-feed", "addon-owner", "public", &[]);
+        let err = resolve_model_alias(&db, "public-feed", Some("third-party"))
+            .expect_err("public without uses_alias must reject");
+        let denied = err.downcast::<AliasPermissionDenied>().expect("denied");
+        assert_eq!(denied.reason, "public_no_uses");
+    }
+
+    #[test]
+    fn resolver_public_alias_with_auto_granted_uses_alias_passes() {
+        let db = make_db();
+        seed_owned_alias(&db, "public-feed", "addon-owner", "public", &[]);
+        seed_uses_alias(&db, "third-party", "public-feed", "auto_granted");
+        let row = resolve_model_alias(&db, "public-feed", Some("third-party"))
+            .expect("public + auto_granted uses_alias must allow")
+            .expect("alias row");
+        assert_eq!(row.alias, "public-feed");
+    }
+
+    #[test]
+    fn resolver_restricted_alias_with_consumers_but_no_uses_alias_is_denied() {
+        // Issue #1: consumer whitelist alone is not enough — restricted
+        // still needs addon_uses_alias granted.
+        let db = make_db();
+        seed_owned_alias(
+            &db,
+            "shared-only",
+            "addon-owner",
+            "restricted",
+            &["addon-friend"],
+        );
+        let err = resolve_model_alias(&db, "shared-only", Some("addon-friend"))
+            .expect_err("whitelist alone is not enough");
+        let denied = err.downcast::<AliasPermissionDenied>().expect("denied");
+        assert_eq!(denied.reason, "restricted_no_uses");
+    }
+
+    #[test]
+    fn resolver_restricted_alias_with_uses_alias_but_no_consumer_is_denied() {
+        // Issue #1: addon_uses_alias granted alone is not enough — restricted
+        // still needs the consumer whitelist.
+        let db = make_db();
+        seed_owned_alias(&db, "shared-only", "addon-owner", "restricted", &["other-addon"]);
+        seed_uses_alias(&db, "addon-stranger", "shared-only", "granted");
+        let err = resolve_model_alias(&db, "shared-only", Some("addon-stranger"))
+            .expect_err("uses_alias alone is not enough");
+        let denied = err.downcast::<AliasPermissionDenied>().expect("denied");
+        assert_eq!(denied.reason, "restricted_no_consumer");
+    }
+
+    #[test]
+    fn resolver_restricted_alias_with_consumer_and_uses_alias_passes() {
+        let db = make_db();
+        seed_owned_alias(
+            &db,
+            "shared-only",
+            "addon-owner",
+            "restricted",
+            &["addon-friend"],
+        );
+        seed_uses_alias(&db, "addon-friend", "shared-only", "granted");
+        let row = resolve_model_alias(&db, "shared-only", Some("addon-friend"))
+            .expect("consumer + uses_alias must pass")
+            .expect("alias row");
+        assert_eq!(row.alias, "shared-only");
+    }
+
+    #[test]
+    fn resolver_denial_writes_alias_calls_and_audit_log() {
+        // Issue #3: every denial must leave a record. We use
+        // `resolve_model_alias_for_addon` so method/request_id are attached.
+        let db = make_db();
+        let alias_id = seed_owned_alias(&db, "denied-feed", "addon-owner", "private", &[]);
+        let err = resolve_model_alias_for_addon(
+            &db,
+            "denied-feed",
+            Some("addon-bad"),
+            Some("chat.completion"),
+            Some("req-xyz"),
+        )
+        .expect_err("denial");
+        let _ = err.downcast::<AliasPermissionDenied>().expect("denied");
+
+        let conn = db.lock().expect("lock");
+        let (caller, method, request_id, result, error_code): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT caller_addon_id, method, request_id, result, error_code \
+                 FROM alias_calls WHERE alias_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![alias_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("alias_calls row");
+        assert_eq!(caller, "addon-bad");
+        assert_eq!(method.as_deref(), Some("chat.completion"));
+        assert_eq!(request_id.as_deref(), Some("req-xyz"));
+        assert_eq!(result, "permission_denied");
+        assert_eq!(error_code.as_deref(), Some("private_not_owner"));
+
+        let (risk, action, audit_result): (String, String, String) = conn
+            .query_row(
+                "SELECT risk_class, action, result FROM audit_log \
+                 WHERE action = 'alias_resolve_denied' AND resource_id = 'denied-feed' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("audit_log row");
+        assert_eq!(risk, "A");
+        assert_eq!(action, "alias_resolve_denied");
+        assert_eq!(audit_result, "denied");
+    }
+
+    #[test]
+    fn reinstall_drops_obsolete_manifest_consumers() {
+        // Issue #4: revoke_obsolete_manifest_consumers_within_tx must
+        // remove manifest-granted rows that vanished from `keep`, while
+        // preserving admin-granted (granted_by_user_id IS NOT NULL) rows.
+        let db = make_db();
+        let alias_id =
+            seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["b", "c"]);
+        {
+            // Admin grant for "d" — must survive.
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO model_alias_consumers \
+                    (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+                 VALUES (?1, 'd', 99, strftime('%s','now'), NULL)",
+                rusqlite::params![alias_id],
+            )
+            .unwrap();
+        }
+        let revoked = {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let revoked = revoke_obsolete_manifest_consumers_within_tx(
+                &tx,
+                alias_id,
+                &["b".to_string()],
+            )
+            .expect("revoke");
+            tx.commit().expect("commit");
+            revoked
+        };
+        assert_eq!(revoked, vec!["c".to_string()]);
+
+        let conn = db.lock().expect("lock");
+        let remaining: Vec<String> = conn
+            .prepare("SELECT consumer_addon_id FROM model_alias_consumers WHERE alias_id = ?1 ORDER BY consumer_addon_id")
+            .unwrap()
+            .query_map(rusqlite::params![alias_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["b".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn uses_alias_pending_when_owner_not_installed_yet() {
+        let db = make_db();
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let status = upsert_uses_alias_within_tx(
+            &tx,
+            "consumer-x",
+            "future-alias",
+            true,
+            "needed for analytics",
+        )
+        .expect("upsert");
+        assert_eq!(status, "pending");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn reconcile_flips_pending_to_auto_granted_on_public_install() {
+        // Consumer registers uses_alias before owner; then owner installs
+        // alias as `public`; reconciliation flips the row to auto_granted.
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let status =
+                upsert_uses_alias_within_tx(&tx, "consumer-y", "later-alias", false, "telemetry")
+                    .expect("upsert pending");
+            assert_eq!(status, "pending");
+            tx.commit().expect("commit");
+        }
+
+        // Owner addon installs the alias with visibility=public.
+        seed_owned_alias(&db, "later-alias", "addon-owner", "public", &[]);
+
+        // Reconcile.
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            let transitions =
+                reconcile_uses_alias_for_alias_within_tx(&tx, "later-alias").expect("reconcile");
+            assert_eq!(transitions.len(), 1);
+            let (consumer, before, after) = &transitions[0];
+            assert_eq!(consumer, "consumer-y");
+            assert_eq!(before, "pending");
+            assert_eq!(after, "auto_granted");
+            audit_reconcile_uses_alias_within_tx(&tx, consumer, "later-alias", before, after)
+                .expect("audit");
+            tx.commit().expect("commit");
+        }
+
+        // Audit row exists with risk_class=A and result=reconciled.
+        let conn = db.lock().expect("lock");
+        let (risk, result): (String, String) = conn
+            .query_row(
+                "SELECT risk_class, result FROM audit_log \
+                  WHERE action = 'uses_alias.reconcile' \
+                    AND resource_id = 'later-alias' \
+                    AND addon_id = 'consumer-y'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("audit row present");
+        assert_eq!(risk, "A");
+        assert_eq!(result, "reconciled");
+    }
+
+    #[test]
+    fn reconcile_flips_pending_to_denied_on_private_install() {
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            upsert_uses_alias_within_tx(&tx, "consumer-z", "guarded", false, "ad-hoc")
+                .expect("upsert");
+            tx.commit().expect("commit");
+        }
+        seed_owned_alias(&db, "guarded", "addon-owner", "private", &[]);
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let transitions =
+            reconcile_uses_alias_for_alias_within_tx(&tx, "guarded").expect("reconcile");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].2, "denied");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn reconcile_restricted_grants_only_whitelisted_consumer() {
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            let tx = conn.transaction().expect("tx");
+            upsert_uses_alias_within_tx(&tx, "addon-friend", "shared", false, "ok").expect("a");
+            upsert_uses_alias_within_tx(&tx, "addon-stranger", "shared", false, "ok").expect("b");
+            tx.commit().expect("commit");
+        }
+        seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["addon-friend"]);
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let transitions =
+            reconcile_uses_alias_for_alias_within_tx(&tx, "shared").expect("reconcile");
+        // Only the whitelisted consumer transitions (pending → granted);
+        // the stranger stays pending so the reconciler returns no row for it.
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].0, "addon-friend");
+        assert_eq!(transitions[0].2, "granted");
+        // And the stranger row is still pending in the DB.
+        let stranger_status: String = tx
+            .query_row(
+                "SELECT grant_status FROM addon_uses_alias \
+                  WHERE addon_id = 'addon-stranger' AND alias_target_name = 'shared'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stranger row");
+        assert_eq!(stranger_status, "pending");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn uses_model_pending_for_unknown_model_default_restricted() {
+        let db = make_db();
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let status =
+            upsert_uses_model_within_tx(&tx, "addon-x", "yolo-v8", false, "vision pipeline")
+                .expect("upsert");
+        // No row in model_visibility → defaults to restricted, no consumer grant
+        // present → pending.
+        assert_eq!(status, "pending");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn uses_model_public_visibility_auto_grants() {
+        let db = make_db();
+        {
+            let mut conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO model_visibility (model_id, visibility, updated_at) \
+                 VALUES (?1, 'public', strftime('%s','now'))",
+                rusqlite::params!["llama-3"],
+            )
+            .expect("seed");
+        }
+        let mut conn = db.lock().expect("lock");
+        let tx = conn.transaction().expect("tx");
+        let status =
+            upsert_uses_model_within_tx(&tx, "addon-x", "llama-3", false, "chat").expect("upsert");
+        assert_eq!(status, "auto_granted");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn migrations_chunk_c_are_idempotent() {
+        // Schema migrate runs at init(); a second call to `migrations::run`
+        // on the same connection must be a no-op (every Chunk C migration
+        // is keyed in `_migrations`).
+        let db = make_db();
+        let conn = db.lock().expect("lock");
+        crate::db::migrations::run(&conn).expect("second run must not error");
+        let (visibility, consumers, uses_alias, uses_model): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'model_alias_visibility'), \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'model_alias_consumers'), \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'addon_uses_alias'), \
+                    (SELECT COUNT(*) FROM _migrations WHERE name = 'addon_uses_model')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("counts");
+        assert_eq!(visibility, 1, "visibility migration applied exactly once");
+        assert_eq!(consumers, 1);
+        assert_eq!(uses_alias, 1);
+        assert_eq!(uses_model, 1);
     }
 }

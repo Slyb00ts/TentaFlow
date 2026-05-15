@@ -5,11 +5,17 @@
 // =============================================================================
 
 pub mod bundled;
+pub mod errors;
 pub mod event_bus;
 pub mod flow_blocks;
+pub mod fs_sandbox;
 pub mod host_functions;
 pub mod instance_pool;
 pub mod lifecycle;
+pub mod manifest;
+pub mod migrations;
+pub mod sdk_version;
+pub mod storage_sql;
 pub mod oauth;
 pub mod oauth_cleanup;
 pub mod oauth_crypto;
@@ -111,6 +117,44 @@ pub struct AddonManifest {
     /// `None` = addon tylko jako tool/flow block, bez wlasnego UI launchera.
     #[serde(default)]
     pub application: Option<AddonApplicationSection>,
+    /// Sekcja [storage] — deklaracja KV i SQL storage. Domyslnie `None` =
+    /// KV wlaczony, SQL wylaczony (zachowanie istniejacych addonow przed F1a).
+    #[serde(default)]
+    pub storage: Option<manifest::StorageConfig>,
+    /// Lista deklaracji aliasow AI z `[[alias]]` — przy install tworzone w
+    /// globalnej tabeli `model_aliases`.
+    #[serde(default)]
+    pub aliases: Vec<manifest::AliasSpec>,
+    /// Lista bramek prawno-biznesowych z `[[gate]]`. Wymagania `required_claims`
+    /// sa interpretowane przez policy engine (F2).
+    #[serde(default)]
+    pub gates: Vec<manifest::GateSpec>,
+    /// Deklaracje vector namespace z `[[vector_namespace]]`.
+    /// F1a tylko parsuje i przechowuje; vector API stub do F1c/F2.
+    #[serde(default)]
+    pub vector_namespaces: Vec<manifest::VectorNamespaceSpec>,
+    /// Szablony Flow z `[[flow_template]]` — opt-in install do flow-engine.
+    #[serde(default)]
+    pub flow_templates: Vec<manifest::FlowTemplateSpec>,
+    /// Custom komponenty UI z `[[ui_component]]`. Sygnatura Ed25519
+    /// weryfikowana w F1c packaging tools.
+    #[serde(default)]
+    pub ui_components: Vec<manifest::UiComponentSpec>,
+    /// Sekcja [gpu] — informacyjne wskazowki o wymaganiach GPU.
+    #[serde(default)]
+    pub gpu: Option<manifest::GpuInfo>,
+    /// Wymagana wersja SDK (`addon.sdk_version`) jako semver range,
+    /// np. `">=0.2.0"`. Walidowane przez `manifest::validate_manifest_extensions`.
+    #[serde(default)]
+    pub sdk_version: Option<String>,
+    /// Deklaracje `[[uses_alias]]` — consumer-side dostep do aliasow innych
+    /// addonow (F1a §6.6 v0.6.0 Chunk C).
+    #[serde(default)]
+    pub uses_aliases: Vec<manifest::UsesAliasSpec>,
+    /// Deklaracje `[[uses_model]]` — consumer-side dostep do konkretnych
+    /// modeli (free-form `model_id`, bez FK).
+    #[serde(default)]
+    pub uses_models: Vec<manifest::UsesModelSpec>,
 }
 
 /// Sekcja [application] manifestu — rejestracja addonu jako aplikacji
@@ -402,6 +446,27 @@ pub struct AddonManager {
     ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>,
 }
 
+/// Returns the subset of `owned` alias names that should be activated on
+/// addon start: every name owned by the addon **except** the ones the
+/// manifest marks with `[gate]`. Pure function — separated out so the
+/// gated-skip invariant is unit-testable without standing up an
+/// AddonManager (and its WASM engine).
+fn pick_aliases_to_activate<'a>(
+    owned: &'a [String],
+    manifest_aliases: &[manifest::AliasSpec],
+) -> Vec<&'a str> {
+    let gated: std::collections::HashSet<&str> = manifest_aliases
+        .iter()
+        .filter(|a| a.gate.is_some())
+        .map(|a| a.id.as_str())
+        .collect();
+    owned
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|name| !gated.contains(name))
+        .collect()
+}
+
 impl AddonManager {
     /// Tworzy nowy AddonManager z podana baza danych
     pub fn new(db: DbPool, settings_cipher: Arc<crate::crypto::SettingsCipher>) -> Result<Self> {
@@ -558,15 +623,217 @@ impl AddonManager {
             ),
         }
 
-        // Automatyczne aliasy modeli dla teams-bot
-        if manifest.addon_id == "teams-bot" {
-            self.activate_teams_aliases();
+        // Generic alias registration from [[alias]] manifest sections plus
+        // consumer-side `[[uses_alias]]` / `[[uses_model]]` declarations and
+        // reconciliation of pending grants. All run in a single SQLite tx
+        // so a partial install rolls back cleanly. Trigger when any of the
+        // three sections is present — uses_* alone is enough for a pure
+        // consumer addon.
+        if !manifest.aliases.is_empty()
+            || !manifest.uses_aliases.is_empty()
+            || !manifest.uses_models.is_empty()
+        {
+            self.install_manifest_aliases(&manifest)?;
         }
 
         info!(
             "Addon '{}' v{} zainstalowany pomyslnie",
             manifest.addon_id, manifest.version
         );
+        Ok(())
+    }
+
+    /// Iterates `manifest.aliases` and registers each in `model_aliases`
+    /// with `owner_type='addon'`. Gated aliases are deactivated until the
+    /// policy engine (M2) or admin (M16) activates them.
+    ///
+    /// All alias writes for the manifest run inside a single SQLite
+    /// transaction. On any per-alias failure the transaction is dropped
+    /// uncommitted, which rolls back not just the `model_aliases` rows but
+    /// also the `model_alias_owners` and `model_alias_changes` audit rows
+    /// inserted in this call (the audit table has no FK on the alias, so
+    /// a row-by-row `DELETE` style rollback would leave orphan audit
+    /// entries that look like duplicate "create" events on the next try).
+    fn install_manifest_aliases(&self, manifest: &AddonManifest) -> Result<()> {
+        use crate::db::repository::{
+            add_alias_consumer_within_tx, audit_consumer_revoked_by_manifest_within_tx,
+            audit_reconcile_uses_alias_within_tx, create_or_reactivate_model_alias_within_tx,
+            lookup_alias_visibility_within_tx, reconcile_uses_alias_for_alias_within_tx,
+            revoke_obsolete_manifest_consumers_within_tx, set_alias_visibility_within_tx,
+            set_model_alias_active_audited_within_tx, upsert_uses_alias_within_tx,
+            upsert_uses_model_within_tx,
+        };
+
+        let mut conn = self.db.lock().map_err(|e| {
+            anyhow::anyhow!("db lock for alias install: {}", e)
+        })?;
+        let tx = conn.transaction()?;
+
+        // 1. Register owned [[alias]] entries: model_aliases + ownership +
+        //    visibility + consumer whitelist for `restricted`.
+        for alias_spec in &manifest.aliases {
+            let alias_id = create_or_reactivate_model_alias_within_tx(
+                &tx,
+                &alias_spec.id,
+                &alias_spec.suggested_default,
+                "first_available",
+                "addon",
+                Some(&manifest.addon_id),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' alias '{}' registration failed: {}",
+                    manifest.addon_id,
+                    alias_spec.id,
+                    e
+                )
+            })?;
+
+            set_alias_visibility_within_tx(
+                &tx,
+                alias_id,
+                alias_spec.visibility.as_db_str(),
+                None,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' alias '{}' visibility write failed: {}",
+                    manifest.addon_id,
+                    alias_spec.id,
+                    e
+                )
+            })?;
+
+            // Revoke manifest-granted consumers that were dropped from the
+            // current manifest (reinstall path). Admin-granted rows
+            // (`granted_by_user_id IS NOT NULL`) are preserved — only the
+            // operator can revoke those. Each revoke is audited so the
+            // downstream `addon_uses_alias` reconcile transition has a
+            // recorded upstream cause.
+            let desired_consumers: &[String] = match alias_spec.visibility {
+                crate::addon::manifest::AliasVisibility::Restricted => {
+                    &alias_spec.allowed_consumers
+                }
+                _ => &[],
+            };
+            let revoked = revoke_obsolete_manifest_consumers_within_tx(
+                &tx,
+                alias_id,
+                desired_consumers,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' alias '{}' consumer revoke failed: {}",
+                    manifest.addon_id,
+                    alias_spec.id,
+                    e
+                )
+            })?;
+            for consumer in &revoked {
+                audit_consumer_revoked_by_manifest_within_tx(
+                    &tx,
+                    &manifest.addon_id,
+                    &alias_spec.id,
+                    consumer,
+                )?;
+            }
+
+            for consumer in &alias_spec.allowed_consumers {
+                add_alias_consumer_within_tx(&tx, alias_id, consumer, None).map_err(|e| {
+                    anyhow::anyhow!(
+                        "addon '{}' alias '{}' consumer '{}' write failed: {}",
+                        manifest.addon_id,
+                        alias_spec.id,
+                        consumer,
+                        e
+                    )
+                })?;
+            }
+
+            if alias_spec.gate.is_some() {
+                set_model_alias_active_audited_within_tx(
+                    &tx,
+                    &alias_spec.id,
+                    false,
+                    Some(&manifest.addon_id),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "addon '{}' gated alias '{}' deactivate failed: {}",
+                        manifest.addon_id,
+                        alias_spec.id,
+                        e
+                    )
+                })?;
+            }
+        }
+
+        // 2. Process consumer-side [[uses_alias]] declarations. Status is
+        //    computed against the current view of model_alias_visibility /
+        //    model_alias_consumers (which already includes this addon's
+        //    own [[alias]] writes above).
+        for uses in &manifest.uses_aliases {
+            let status = upsert_uses_alias_within_tx(
+                &tx,
+                &manifest.addon_id,
+                &uses.id,
+                uses.required,
+                &uses.reason,
+            )?;
+            if uses.required && status != "granted" && status != "auto_granted" {
+                anyhow::bail!(
+                    "addon '{}' requires alias '{}' but grant_status='{}'; install rejected",
+                    manifest.addon_id,
+                    uses.id,
+                    status
+                );
+            }
+        }
+
+        // 3. Same for [[uses_model]].
+        for uses in &manifest.uses_models {
+            let status = upsert_uses_model_within_tx(
+                &tx,
+                &manifest.addon_id,
+                &uses.id,
+                uses.required,
+                &uses.reason,
+            )?;
+            if uses.required && status != "granted" && status != "auto_granted" {
+                anyhow::bail!(
+                    "addon '{}' requires model '{}' but grant_status='{}'; install rejected",
+                    manifest.addon_id,
+                    uses.id,
+                    status
+                );
+            }
+        }
+
+        // 4. Reconciliation. For each alias we just (re)installed, scan
+        //    addon_uses_alias rows pointing at this alias and recompute
+        //    statuses. Audit every transition as risk_class=A.
+        for alias_spec in &manifest.aliases {
+            // Only reconcile when the alias actually exists in this tx —
+            // gated aliases are still inserted, but stay is_active=0.
+            if lookup_alias_visibility_within_tx(&tx, &alias_spec.id)?.is_none() {
+                continue;
+            }
+            let transitions =
+                reconcile_uses_alias_for_alias_within_tx(&tx, &alias_spec.id)?;
+            for (consumer, before, after) in transitions {
+                audit_reconcile_uses_alias_within_tx(
+                    &tx,
+                    &consumer,
+                    &alias_spec.id,
+                    &before,
+                    &after,
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        drop(conn);
+        self.reload_router_alias_cache();
         Ok(())
     }
 
@@ -614,16 +881,16 @@ impl AddonManager {
             }
         }
 
+        // Deactivate aliases owned by this addon before uninstall — read
+        // owner table directly (manifest may already be unreachable). Owner
+        // rows stay so the audit trail and future reinstall match.
+        self.deactivate_aliases_owned_by_addon(addon_id);
+
         // Usun z DB
         lifecycle::uninstall(addon_id, &self.db)?;
 
         // Odsubskrybuj z event bus
         self.event_bus.unsubscribe_all(addon_id);
-
-        // Dezaktywuj aliasy modeli dla teams-bot
-        if addon_id == "teams-bot" {
-            self.deactivate_teams_aliases();
-        }
 
         info!("Addon '{}' odinstalowany pomyslnie", addon_id);
         Ok(())
@@ -766,10 +1033,9 @@ impl AddonManager {
             }
         }
 
-        // Reaktywuj aliasy modeli dla teams-bot
-        if addon_id == "teams-bot" {
-            self.activate_teams_aliases();
-        }
+        // Reactivate non-gated aliases owned by this addon. Gated aliases
+        // stay parked until policy engine / admin flips them on.
+        self.activate_aliases_owned_by_addon(addon_id);
 
         info!(
             "Addon '{}' uruchomiony, instance_id={}",
@@ -1169,9 +1435,9 @@ impl AddonManager {
             instances.remove(&addon_id);
         }
 
-        // Dezaktywuj aliasy gdy ostatnia instancja teams-bot zostala zatrzymana
-        if addon_id == "teams-bot" && no_instances_left {
-            self.deactivate_teams_aliases();
+        // Deactivate aliases when the last instance of any addon is gone.
+        if no_instances_left {
+            self.deactivate_aliases_owned_by_addon(&addon_id);
         }
 
         info!("Instancja '{}' zatrzymana", instance_id);
@@ -1810,18 +2076,23 @@ impl AddonManager {
         ))
     }
 
-    /// Zwraca kategorie uprawnien (prefix przed kropka) deklarowane przez addon.
-    /// Host functions przy `check_permission` podaja kategorie (np. "storage",
-    /// "http", "llm"), a permission id w manifescie ma forme "kategoria.akcja"
-    /// (np. "storage.read"). Tutaj wyciagamy deduplikowany zbior kategorii z
-    /// manifestu — jedyne zrodlo prawdy.
+    /// Zwraca uprawnienia deklarowane przez addon — zarowno kategorie (prefix
+    /// przed kropka, np. "storage", "http", "llm") jak i pelne identyfikatory
+    /// permission id w formie "kategoria.akcja" (np. "alias.read",
+    /// "storage.read"). Host functions wolaja `check_permission` z roznymi
+    /// granulacjami: starsze API z kategoria ("llm"), nowsze z pelnym id
+    /// ("alias.read"). Zwracamy oba warianty, deduplikowane, zeby pojedyncze
+    /// `state.permissions` pasowalo do obu konwencji.
     fn load_addon_permissions(&self, addon_id: &str) -> Result<Vec<String>> {
         let manifest = self.load_addon_manifest(addon_id)?;
         let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::with_capacity(manifest.declared_permissions.len());
+        let mut out = Vec::with_capacity(manifest.declared_permissions.len() * 2);
         for perm in &manifest.declared_permissions {
+            if seen.insert(perm.id.clone()) {
+                out.push(perm.id.clone());
+            }
             let category = perm.id.split('.').next().unwrap_or(perm.id.as_str());
-            if seen.insert(category.to_string()) {
+            if !category.is_empty() && seen.insert(category.to_string()) {
                 out.push(category.to_string());
             }
         }
@@ -1871,50 +2142,115 @@ impl AddonManager {
         }
     }
 
-    /// Aliasy STT/TTS/Summary powiazane z addonem teams-bot.
-    /// `teams-summary` ma pusty default target — admin musi recznie wskazac model
-    /// (qwen/gpt-oss/etc) w Models. Jesli pusty, meeting summary handler zwraca
-    /// "not configured" error zamiast generowac udawana odpowiedz.
-    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 5] = [
-        ("teams-stt", "whisper-1"),
-        ("teams-tts", "tts-1"),
-        ("teams-summary", ""),
-        // Vision aliasy są puste przy starcie — wypełnia je auto_bind po
-        // pierwszym deployu odpowiedniego silnika (SCRFD → face,
-        // HSEmotion → emotion). Brak deployu = pipeline w
-        // `mesh/inference_proxy.rs::VideoFrame` skipuje inferencję bez błędu.
-        ("teams-vision-face", ""),
-        ("teams-vision-emotion", ""),
-    ];
+    /// Returns the list of alias names registered to this addon in
+    /// `model_alias_owners`. Used by start/stop lifecycle paths so the
+    /// activate/deactivate logic is generic across addons.
+    fn aliases_owned_by_addon(&self, addon_id: &str) -> Vec<String> {
+        let conn = match self.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("aliases_owned_by_addon: db lock: {}", e);
+                return Vec::new();
+            }
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT m.alias FROM model_aliases m \
+             JOIN model_alias_owners o ON o.alias_id = m.id \
+             WHERE o.owner_type = 'addon' AND o.owner_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("aliases_owned_by_addon: prepare: {}", e);
+                return Vec::new();
+            }
+        };
+        let rows = stmt
+            .query_map(rusqlite::params![addon_id], |row| row.get::<_, String>(0))
+            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>());
+        rows.unwrap_or_default()
+    }
 
-    /// Tworzy lub reaktywuje aliasy teams-stt / teams-tts i odswieza cache routera
-    fn activate_teams_aliases(&self) {
-        for (alias, default_target) in &Self::TEAMS_BOT_ALIASES {
-            if let Err(e) = crate::db::repository::create_or_reactivate_model_alias(
+    /// Reactivates aliases whose owner is this addon, skipping those with
+    /// a manifest-declared `[gate]`. Called from `start_addon`. Gated
+    /// aliases stay `is_active=0` until the policy engine (M2) or admin
+    /// (M16) explicitly flips them on; activating them unconditionally on
+    /// restart would bypass the gate. Failures are logged but do not
+    /// abort startup — chain conflicts are operator-visible via the
+    /// registry UI.
+    fn activate_aliases_owned_by_addon(&self, addon_id: &str) {
+        let owned = self.aliases_owned_by_addon(addon_id);
+        if owned.is_empty() {
+            return;
+        }
+        // Build the set of gated alias ids from the manifest. If the
+        // manifest cannot be loaded (corrupt row, missing addon) we have
+        // no way to tell gated from ungated, so skip activation entirely
+        // rather than risk a bypass — admin can still toggle in M16.
+        let manifest = match self.load_addon_manifest(addon_id) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "Addon '{}': activate skipped — manifest load failed: {}",
+                    addon_id, e
+                );
+                return;
+            }
+        };
+        let to_activate = pick_aliases_to_activate(&owned, &manifest.aliases);
+        let gated_count = owned.len() - to_activate.len();
+
+        let mut activated = 0usize;
+        for alias in &to_activate {
+            if let Err(e) = crate::db::repository::set_model_alias_active_audited(
                 &self.db,
                 alias,
-                default_target,
-                "first_available",
+                true,
+                Some(addon_id),
             ) {
                 warn!(
-                    "Nie udalo sie utworzyc/reaktywowac aliasu '{}': {}",
-                    alias, e
+                    "Addon '{}': failed to activate alias '{}': {}",
+                    addon_id, alias, e
+                );
+            } else {
+                activated += 1;
+            }
+        }
+        self.reload_router_alias_cache();
+        info!(
+            "Addon '{}': activated {} of {} alias(es) ({} gated)",
+            addon_id,
+            activated,
+            owned.len(),
+            gated_count
+        );
+    }
+
+    /// Deactivates every alias whose owner is this addon. Owner rows are
+    /// preserved for audit and future reinstall.
+    fn deactivate_aliases_owned_by_addon(&self, addon_id: &str) {
+        let aliases = self.aliases_owned_by_addon(addon_id);
+        if aliases.is_empty() {
+            return;
+        }
+        for alias in &aliases {
+            if let Err(e) = crate::db::repository::set_model_alias_active_audited(
+                &self.db,
+                alias,
+                false,
+                Some(addon_id),
+            ) {
+                warn!(
+                    "Addon '{}': failed to deactivate alias '{}': {}",
+                    addon_id, alias, e
                 );
             }
         }
         self.reload_router_alias_cache();
-        info!("Aliasy teams-stt/teams-tts aktywowane");
-    }
-
-    /// Dezaktywuje aliasy teams-stt / teams-tts i odswieza cache routera
-    fn deactivate_teams_aliases(&self) {
-        for (alias, _) in &Self::TEAMS_BOT_ALIASES {
-            if let Err(e) = crate::db::repository::set_model_alias_active(&self.db, alias, false) {
-                warn!("Nie udalo sie dezaktywowac aliasu '{}': {}", alias, e);
-            }
-        }
-        self.reload_router_alias_cache();
-        info!("Aliasy teams-stt/teams-tts dezaktywowane");
+        info!(
+            "Addon '{}': deactivated {} alias(es)",
+            addon_id,
+            aliases.len()
+        );
     }
 
     /// Odswieza alias cache w routerze (jesli router jest ustawiony)
@@ -1933,6 +2269,66 @@ fn fnv1a_hash(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_activate_skips_gated_aliases() {
+        // Two aliases owned by the addon; only one is gated. The pure
+        // helper that drives `activate_aliases_owned_by_addon` must drop
+        // the gated id from the activate list so restart cannot bypass
+        // the policy gate by flipping every owned alias back to active.
+        let owned = vec!["normal-alias".to_string(), "gated-alias".to_string()];
+        let manifest_aliases = vec![
+            manifest::AliasSpec {
+                id: "normal-alias".to_string(),
+                display_name: "Normal".to_string(),
+                methods: vec![],
+                suggested_default: "model-a".to_string(),
+                gate: None,
+                visibility: manifest::AliasVisibility::Private,
+                allowed_consumers: vec![],
+            },
+            manifest::AliasSpec {
+                id: "gated-alias".to_string(),
+                display_name: "Gated".to_string(),
+                methods: vec![],
+                suggested_default: "model-b".to_string(),
+                gate: Some("require-dpia".to_string()),
+                visibility: manifest::AliasVisibility::Private,
+                allowed_consumers: vec![],
+            },
+        ];
+
+        let to_activate = pick_aliases_to_activate(&owned, &manifest_aliases);
+        assert_eq!(to_activate, vec!["normal-alias"]);
+        assert!(!to_activate.contains(&"gated-alias"));
+    }
+
+    #[test]
+    fn test_activate_returns_all_when_no_gates() {
+        let owned = vec!["a".to_string(), "b".to_string()];
+        let manifest_aliases = vec![
+            manifest::AliasSpec {
+                id: "a".to_string(),
+                display_name: "A".to_string(),
+                methods: vec![],
+                suggested_default: String::new(),
+                gate: None,
+                visibility: manifest::AliasVisibility::Private,
+                allowed_consumers: vec![],
+            },
+            manifest::AliasSpec {
+                id: "b".to_string(),
+                display_name: "B".to_string(),
+                methods: vec![],
+                suggested_default: String::new(),
+                gate: None,
+                visibility: manifest::AliasVisibility::Private,
+                allowed_consumers: vec![],
+            },
+        ];
+        let to_activate = pick_aliases_to_activate(&owned, &manifest_aliases);
+        assert_eq!(to_activate.len(), 2);
+    }
 
     #[test]
     fn resource_requirements_full_toml() {

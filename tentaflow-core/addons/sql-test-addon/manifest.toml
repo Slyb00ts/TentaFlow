@@ -1,0 +1,36 @@
+[addon]
+id = "sql-test-addon"
+name = "SQL Test Addon"
+version = "1.0.0"
+description = "End-to-end walidacja F1a M1.W4 SQL host functions — uzywa sql_exec, sql_query, sql_query_one, sql_transaction wraz z per-addon SQLite + migracjami."
+category = "test"
+keywords = ["test", "sql", "f1a"]
+author = "TentaFlow Tests"
+license = "Apache-2.0"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt SQL"
+description = "SELECT/WITH/EXPLAIN na per-addon SQLite."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis SQL"
+description = "INSERT/UPDATE/DELETE na per-addon SQLite."
+risk = "medium"
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 32
+fuel_limit = 10000000
+storage_total_mb = 10

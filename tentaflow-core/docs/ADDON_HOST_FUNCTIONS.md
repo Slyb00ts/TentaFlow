@@ -9,21 +9,157 @@ Kazda funkcja operuje na pamieci liniowej guest (WASM) przez wskazniki i dlugosc
 ## Konwencje ABI
 
 - Parametry tekstowe: `(ptr: i32, len: i32)` — wskaznik i dlugosc UTF-8 w pamieci guest
-- Bufor wyjsciowy: `(out_ptr: i32, out_capacity: i32)` — wskaznik i pojemnosc bufora
-- Zwracana wartosc `i32`: kod statusu (0 = sukces, <0 = blad)
+- Bufor wyjsciowy: `(out_ptr: i32, out_capacity: i32, out_len_ptr: i32)` — wskaznik, pojemnosc, oraz wskaznik na u32 LE z faktycznym rozmiarem
+- Zwracana wartosc `i32`: kod statusu (0 = sukces, !=0 = blad)
 - Zwracana wartosc `i64` (packed): `(status << 32) | data_length` — status w gornych 32 bitach, dlugosc danych w dolnych
+
+### Limity payloadu (`PayloadKind`)
+
+Kazda host function ktora przyjmuje payload od addona MUSI sprawdzic rozmiar przez `enforce_payload_size`. Przekroczenie → `ABI_ERR_PAYLOAD_TOO_LARGE` (21).
+
+| Kategoria | Max | Uzycie |
+|-----------|-----|--------|
+| `ServiceCall` | 8 MB | `service_call(alias, method, payload)` |
+| `SqlCombined` | 4 MB | `sql_exec/query` — query + params zlozone |
+| `VectorItem` | 1 MB | `vector_upsert` per item |
+| `UiRender` | 2 MB | `ui_render` — drzewo komponentow |
+| `Secret` | 64 KB | `secret_set/get` — wartosc |
+
+### out_cap retry pattern
+
+Kazda host function zwracajaca dane w buforze wyjsciowym uzywa ujednoliconej semantyki retry:
+
+1. Caller alokuje bufor o rozmiarze `out_cap`, przekazuje pointer + capacity + out_len_ptr.
+2. Host function probuje pisac:
+   - Jesli `actual_size <= out_cap` → zapisuje, `*out_len_ptr = actual_size`, returns `ABI_OK` (0).
+   - Jesli `actual_size > out_cap` → NIE pisze, `*out_len_ptr = actual_size` (wymagany rozmiar), returns `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (6).
+3. Caller realokuje bufor do `actual_size` (z marginesem +10%) i powtarza wywolanie.
+4. Max retry: 1 (drugi `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` → addon bug, audit anomaly).
+
+Przyklad uzycia w SDK (Rust):
+
+```rust
+const INITIAL_CAP: usize = 4096;
+let mut buf = vec![0u8; INITIAL_CAP];
+let mut out_len: u32 = 0;
+let status = unsafe {
+    host_fn(..., buf.as_mut_ptr() as i32, buf.len() as i32, &mut out_len as *mut u32 as i32)
+};
+if status == ABI_ERR_OUTPUT_BUFFER_TOO_SMALL {
+    let need = (out_len as usize) + (out_len as usize / 10); // +10% margin
+    buf = vec![0u8; need];
+    let status2 = unsafe {
+        host_fn(..., buf.as_mut_ptr() as i32, buf.len() as i32, &mut out_len as *mut u32 as i32)
+    };
+    // Drugi blad = bug addona; audit_anomaly zostal juz zapisany przez host.
+    assert_eq!(status2, ABI_OK);
+}
+buf.truncate(out_len as usize);
+```
+
+### Domyslne timeouty per kategoria
+
+| Kategoria | Timeout |
+|-----------|---------|
+| `service_call` | 30 s |
+| `sql_*` (exec/query) | 30 s |
+| `vector_*` (upsert/search) | 5 s |
+| `camera_*` (probe/connect) | 15 s |
+| `recording_*` (save/get_url) | 60 s |
+
+Przekroczenie → `ABI_ERR_TIMEOUT` (4).
 
 ---
 
 ## Globalne kody bledow ABI
 
+Wartosci dodatnie (1..24) wprowadzone w F1a (M0.W2) sa kanoniczne dla nowych host functions (SQL, Alias, Camera, Streaming, Recording). Pre-F1a host functions (`storage_*`, `http_*`, `llm_*`, `ui_*`, `events_*`, `secret_*`) uzywaja starych stalych ujemnych (`ABI_ERR_PERMISSION = -1`, ...) — zachowanych dla wstecznej kompatybilnosci. Mapowanie jest jednoznaczne po znaku wartosci.
+
+| Kod | Stala (F1a) | Opis |
+|-----|-------------|------|
+| 0  | `ABI_OK` | Operacja zakonczona pomyslnie |
+| 1  | `ABI_ERR_PERMISSION` | Brak wymaganych uprawnien |
+| 2  | `ABI_ERR_NOT_FOUND` | Zasob nie znaleziony |
+| 3  | `ABI_ERR_NO_AVAILABLE_TARGET` | Brak dostepnego targetu dla aliasu |
+| 4  | `ABI_ERR_TIMEOUT` | Przekroczono limit czasu |
+| 5  | `ABI_ERR_OPERATION` | Ogolny blad operacji |
+| 6  | `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` | Bufor wyjsciowy za maly (out_len_ptr ma wymagany rozmiar) |
+| 7  | `ABI_ERR_CONFLICT` | Konflikt stanu (duplikat) |
+| 8  | `ABI_ERR_SQL_SYNTAX` | Bledna skladnia SQL |
+| 9  | `ABI_ERR_SQL_CONSTRAINT` | Naruszenie constraint SQL (UNIQUE/NOT NULL/FK/CHECK) |
+| 10 | `ABI_ERR_SQL_NO_RESULT` | Zapytanie SQL nie zwrocilo wyniku |
+| 11 | `ABI_ERR_QUOTA_EXCEEDED` | Przekroczono kwote zasobow |
+| 12 | `ABI_ERR_CAMERA_UNREACHABLE` | Kamera niedostepna |
+| 13 | `ABI_ERR_CAMERA_AUTH_FAILED` | Bledne dane uwierzytelniajace kamery |
+| 14 | `ABI_ERR_CAMERA_VENDOR_UNSUPPORTED` | Vendor kamery nieobslugiwany |
+| 15 | `ABI_ERR_STREAM_NOT_FOUND` | Strumien nie znaleziony |
+| 16 | `ABI_ERR_STREAM_CLOSED` | Strumien zamkniety |
+| 17 | `ABI_ERR_BACKPRESSURE` | Addon nie nadaza za strumieniem |
+| 18 | `ABI_ERR_RECORDING_NOT_FOUND` | Nagranie nie znalezione |
+| 19 | `ABI_ERR_RECORDING_PURGED` | Nagranie wyczyszczone (retention) |
+| 20 | `ABI_ERR_RECORDING_TIME_OUT_OF_RING` | Timestamp poza zakresem ring-buffera |
+| 21 | `ABI_ERR_PAYLOAD_TOO_LARGE` | Payload przekroczyl limit wielkosci |
+| 22 | `ABI_ERR_GATE_NOT_SATISFIED` | Gate niespelniony — operacja zablokowana |
+| 23 | `ABI_ERR_FRAME_TOKEN_INVALID` | PickupToken/FrameToken nieprawidlowy lub wygasly |
+| 24 | `ABI_ERR_FRAME_PURGED` | Frame zostal wyczyszczony |
+
+Stare kody pre-F1a (zachowane dla `storage_*`, `http_*`, `llm_*`, `ui_*`, `events_*`, `secret_*`):
+
 | Kod | Stala | Opis |
 |-----|-------|------|
-| 0 | `ABI_OK` | Operacja zakonczona sukcesem |
-| -1 | `ABI_ERR_PERMISSION` | Brak wymaganych uprawnien |
-| -2 | `ABI_ERR_OPERATION` | Blad operacji (ogolny) |
-| -3 | `ABI_ERR_NOT_FOUND` | Zasob nie znaleziony |
-| -4 | `ABI_ERR_TIMEOUT` | Przekroczono limit czasu |
+| -1 | `ABI_ERR_PERMISSION` (legacy) | Brak uprawnien |
+| -2 | `ABI_ERR_OPERATION` (legacy) | Blad operacji |
+| -3 | `ABI_ERR_TIMEOUT` (legacy) | Timeout |
+| -4 | `ABI_ERR_RATE_LIMIT` (legacy) | Rate limit |
+| -5 | `ABI_ERR_NOT_FOUND` (legacy) | Nie znaleziono |
+| -6 | `ABI_ERR_BUFFER_TOO_SMALL` (legacy) | Bufor za maly |
+
+---
+
+## Versioning ABI
+
+### Konwencja nazw
+
+Nowe host functions F1a uzywaja sufiksu `_v1` (np. `sql_exec_v1`, `alias_get_v1`, `camera_add_v1`). Sufiks otwiera droge do `_v2` przy lamiacych zmianach bez breaking caller'ow `_v1`.
+
+### Manifest
+
+Addon moze zadeklarowac wymagana wersje SDK rdzenia:
+
+```toml
+[addon]
+sdk_version = ">=0.2.0, <1.0"  # semver VersionReq
+```
+
+Pole jest opcjonalne — brak deklaracji = zakladamy kompatybilnosc.
+
+### Mechanizm rejekcji
+
+Rdzen eksportuje `CORE_SDK_VERSION = "0.2.0"` (stala kompilacji w `addon::sdk_version`). Przy instalacji `lifecycle::install` parsuje `manifest.sdk_version` jako `semver::VersionReq` i sprawdza dopasowanie do `CORE_SDK_VERSION`. Mismatch → install rolled back z `AbiError::Operation` (kod 5) i czytelnym komunikatem (`Addon 'X' wymaga SDK 'Y', rdzen ma 'Z'`).
+
+Bumpujemy `CORE_SDK_VERSION` przy:
+- usunieciu host function,
+- zmianie ABI signatury istniejacego `_v1`,
+- zmianie semantyki zwracanych kodow bledow.
+
+Dodanie nowej host function lub nowego pola manifestu nie wymaga bumpu (addony nie deklaruja czego nie potrzebuja).
+
+---
+
+## Audit log — risk_class
+
+Wpisy `audit_log` od F1a maja kolumne `risk_class` klasyfikujaca operacje wg RODO. Indeks partial `idx_audit_risk_class` (WHERE risk_class IN ('B','C')) umozliwia szybkie kwerendy zgodnosciowe.
+
+| Klasa | Kiedy uzyc |
+|-------|------------|
+| `A` | Operacje administracyjne / techniczne bez danych osobowych (start/stop, config) |
+| `B` | Operacje na danych osobowych zwyklych (RODO art. 6 — kontakty, identyfikatory) |
+| `C` | Dane wrazliwe / biometryczne / decyzje automatyczne (RODO art. 9, art. 22 — rozpoznanie twarzy, ADR) |
+| `unclassified` | Backward compat — wpisy sprzed F1a; domyslna wartosc kolumny |
+
+Preferowane API host-side: `audit_log_with_risk(state, action, resource_type, resource_id, risk_class, related_claim_id, request_id, result, error_message)`. Stara funkcja `audit_log(...)` deleguje z `RiskClass::Unclassified` — istniejacy kod nie wymaga zmian.
+
+`related_claim_id` (powiazany claim, F2) i `request_id` (korelacja wielu wpisow w obrebie jednego service_call) sa opcjonalne — przekazuj `None` gdy nie dotycza.
 
 ---
 
@@ -574,3 +710,379 @@ stop_timeout_ms = 3000
 has_settings_panel = true
 has_dashboard_widget = true
 ```
+
+---
+
+## 10. Nowe API w F1a (planowane do implementacji)
+
+Sekcja informacyjna — pelna dokumentacja per API zostanie dodana wraz z
+implementacja w odpowiednich tygodniach planu F1a. Zarys w
+`notes/tentavision-plan.md` §6 (ABI kontrakty).
+
+| API | Funkcje | Tydzien |
+|-----|---------|---------|
+| **SQL** | `sql_exec_v1`, `sql_query_v1`, `sql_query_one_v1`, `sql_transaction_v1` | M0.W2 stub, M1.W5 pelne |
+| **Aliases (readonly)** | `alias_get_v1`, `alias_list_owned_v1` | M1.W5 |
+| **Camera** | `camera_add_v1`, `camera_list_v1`, `camera_get_v1`, `camera_snapshot_v1`, `camera_discover_v1`, `camera_test_connection_v1`, `camera_health_v1`, `camera_credentials_rotate_v1`, `camera_remove_v1`, `camera_update_v1` | M0.W2 stub, M2 pelne |
+| **Streaming** | `stream_subscribe_v1`, `stream_next_v1`, `stream_close_v1` | M0.W2 stub, M2 pelne |
+| **Recording** | `recording_save_segment_v1`, `recording_save_snapshot_v1`, `recording_get_url_v1`, `recording_stats_v1`, `frame_url_v1` | M0.W2 stub, M2 pelne (basic) |
+| **service_call (extended)** | `service_call_v1(alias, method, payload)` — istniejace `service_call` rozszerzone o parametr `method` | M0.W2 stub, M2 pelne |
+| **Vector** | `vector_upsert_v1`, `vector_search_v1`, `vector_count_v1`, `vector_delete_v1` | F2 |
+| **Claims/Gates** | `claim_add_v1`, `claim_check_v1`, `claim_revoke_v1`, `gate_check_v1`, `gate_enforce_v1` | F2 |
+| **Flow** | `flow_invoke_v1`, `flow_status_v1`, `flow_list_v1`, `flow_get_v1` | F2 |
+| **Audit** | `audit_log_with_risk_v1`, `audit_query_v1`, `audit_export_v1`, `audit_verify_v1` | M0.W3 risk_class, F2 export |
+
+**Konwencja nazewnictwa:** wszystkie nowe host functions koncza sie na `_v1`
+(versioning ABI). Kolejne wersje (`_v2`, ...) bedzie wprowadzane bez usuwania
+starszych, dopoki istnieje addon korzystajacy ze starej wersji.
+
+**Kody bledow:** nowy enum `AbiError` z 24 kodami z `tentavision-plan.md` §6.2.Y
+zostanie dodany w M0.W2 (`src/addon/errors.rs`). Najwazniejsze nowe kody:
+`ABI_ERR_PAYLOAD_TOO_LARGE`, `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (retry semantics
+z `*out_len_ptr` = required size), `ABI_ERR_GATE_NOT_SATISFIED`,
+`ABI_ERR_RATE_LIMITED`.
+
+**Status M0.W1 (manifest parser):** zaimplementowany. Dokumentacja sekcji
+manifestu: `docs/ADDON_MANIFEST.md`. Testy: `tests/addon_manifest_parsing.rs`.
+
+---
+
+## 11. SQL API (F1a M1.W4 — zaimplementowane)
+
+Per-addon SQLite. Kazdy addon dostaje wlasny plik bazy `~/.tentaflow/addons/<addon_id>/data.db`
+z WAL mode, `foreign_keys=ON`, `synchronous=NORMAL`, `busy_timeout=5s`. Izolacja
+przez FS sandbox (`addon/fs_sandbox.rs`) + walidacje `addon_id` regex
+`^[a-z0-9][a-z0-9-]{0,63}$`. DDL (CREATE/ALTER/DROP/VACUUM/PRAGMA itp.) jest
+zablokowane w runtime — schemat zmienia sie wylacznie przez migracje z bundle
+addona.
+
+### Wymagania manifestu
+
+Addon musi zadeklarowac:
+
+```toml
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"        # opcjonalnie, default "ansi"
+migrations_dir = "migrations" # opcjonalnie, default "migrations"
+encryption = "none"           # F1a: "at-rest" akceptowane ale nie wymuszone (F8: SQLCipher)
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt SQL"
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis SQL"
+risk = "medium"
+```
+
+Bez `[storage] sql = true` wszystkie host functions SQL zwracaja
+`AbiError::Permission` (1). Bez uprawnien `sql.read`/`sql.write` analogicznie.
+
+### Migracje
+
+Pliki `*.sql` w `<bundle>/<migrations_dir>/` z nazewnictwem `NNN_lowercase_name.sql`
+(>=3 cyfry numerujace + podkreslnik + nazwa). Aplikowane leksykograficznie przy
+`install_addon`. Kazda migracja runuje w transakcji per-addon SQLite
+(`execute_batch` w `BEGIN; ...; COMMIT;`); fail dowolnego statementu w pliku =
+rollback calej migracji.
+
+Idempotencja: tabela core DB `addon_migrations_applied` przechowuje
+`(addon_id, migration_name, migration_hash)`. Re-install z tym samym hash =
+skip. Hash mismatch (recznie zmodyfikowany plik po apply) = install fail
++ audit anomaly. Status `failed` umozliwia retry przy kolejnym install.
+
+Przyklad `migrations/001_init.sql`:
+
+```sql
+CREATE TABLE alarms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('info','warning','critical')),
+    note TEXT
+);
+CREATE INDEX idx_alarms_camera_ts ON alarms(camera_id, ts);
+```
+
+### DDL block w runtime
+
+Zapytania zaczynajace sie (po whitespace) od `CREATE`, `ALTER`, `DROP`,
+`TRUNCATE`, `REINDEX`, `VACUUM`, `ATTACH`, `DETACH`, `PRAGMA` sa odrzucane z
+`AbiError::Permission`. Cel: addony nie moga uciec sandboxowi schematu
+(np. dodajac kolumne pomijajaca aplikacja constraintu). Schemat zmienia sie
+wylacznie przez migrations, ktore sa wersjonowane przez hash.
+
+### SQL injection protection
+
+Wszystkie parametry sa bindowane przez `rusqlite::params_from_iter` — nigdy
+string concat. Wartosc `"'; DROP TABLE x;--"` jako parametr zostanie zapisana
+literalnie do TEXT kolumny, bez interpretacji jako SQL.
+
+### Limity i timeouts
+
+| Wlasciwosc | Wartosc |
+|------------|---------|
+| Payload combined (query + params) | 4 MB (`PayloadKind::SqlCombined`) |
+| Query timeout | 30 s (watchdog na `InterruptHandle::interrupt()`) |
+| Connection pool per addon | 5 polaczen (`r2d2`) |
+| Pool get timeout | 10 s |
+| SQLite `busy_timeout` | 5000 ms |
+
+### Encryption at-rest
+
+Deklaracja `encryption = "at-rest"` w manifescie jest akceptowana w F1a, ale
+NIE wymusza szyfrowania (SQLCipher integration planowane w F8). Runtime
+loguje warning przy install. Addon dziala normalnie — plik `data.db` jest
+plain SQLite.
+
+### sql_exec_v1
+
+DML (`INSERT`, `UPDATE`, `DELETE`). Uprawnienie: `sql.write`.
+
+ABI:
+
+```
+sql_exec_v1(
+    query_ptr: i32, query_len: i32,
+    params_json_ptr: i32, params_json_len: i32,
+    out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+) -> i32
+```
+
+Input `params_json` — JSON array (pusty `[]` = brak parametrow). Wartosci:
+
+| JSON | SQLite |
+|------|--------|
+| `null` | `NULL` |
+| `true`/`false` | `INTEGER 1/0` |
+| Integer | `INTEGER` |
+| Real (float) | `REAL` |
+| String | `TEXT` |
+| `{"$bytes": "<base64>"}` | `BLOB` |
+
+Output JSON: `{"rows_affected": <u64>, "last_insert_id": <i64>}`.
+
+Kody bledow: `0` OK, `1` Permission (brak `sql.write` / brak `[storage] sql=true` / DDL),
+`4` Timeout (>30s), `5` Operation (params parse fail), `8` SqlSyntax,
+`9` SqlConstraint (UNIQUE/FK/CHECK/NOT NULL), `21` PayloadTooLarge.
+
+### sql_query_v1
+
+`SELECT`, `WITH`, `EXPLAIN`. Uprawnienie: `sql.read`. Pisaca komenda
+zwraca `AbiError::Permission` z komunikatem audit "use sql_exec for writes".
+
+ABI identyczne jak `sql_exec_v1`. Output JSON:
+
+```json
+{
+  "columns": ["id", "ts", "severity"],
+  "rows": [
+    [1, 1715515200, "warning"],
+    [2, 1715515210, "info"]
+  ]
+}
+```
+
+Wartosci BLOB w wierszach zwracane jako `{"$bytes": "<base64>"}`.
+
+### sql_query_one_v1
+
+Jak `sql_query_v1`, ale zwraca pierwszy wiersz lub `null`. Output:
+`{"row": [<v1>, <v2>, ...]}` lub `{"row": null}`. Gdy wynik > 1 wiersz =
+audit warning, zwraca pierwszy.
+
+### sql_transaction_v1
+
+Atomic batch DML. Uprawnienie: `sql.write`.
+
+ABI:
+
+```
+sql_transaction_v1(
+    statements_json_ptr: i32, statements_json_len: i32,
+    out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+) -> i32
+```
+
+Input:
+
+```json
+{
+  "statements": [
+    {"query": "INSERT INTO alarms (camera_id, ts, severity) VALUES (?, ?, ?)",
+     "params": ["cam-1", 1715515200, "warning"]},
+    {"query": "INSERT INTO alarms (camera_id, ts, severity) VALUES (?, ?, ?)",
+     "params": ["cam-1", 1715515210, "info"]},
+    {"query": "UPDATE cameras SET last_alarm_ts = ? WHERE id = ?",
+     "params": [1715515210, "cam-1"]}
+  ]
+}
+```
+
+Wszystkie statementy w jednej transakcji. Fail dowolnego = rollback wszystkich.
+Output: `{"rows_affected_total": <i64>}`. DDL w ktoremkolwiek statemencie
+przed startem transakcji = `AbiError::Permission`.
+
+### Przyklad uzycia (Rust SDK)
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+fn save_alarm(camera_id: &str, ts: i64, severity: &str) -> Result<i64, i32> {
+    let res = sql_exec(
+        "INSERT INTO alarms (camera_id, ts, severity) VALUES (?, ?, ?)",
+        &[
+            SqlValue::String(camera_id.to_string()),
+            SqlValue::I64(ts),
+            SqlValue::String(severity.to_string()),
+        ],
+    )?;
+    Ok(res.last_insert_id)
+}
+
+fn recent_alarms(camera_id: &str, since: i64) -> Result<Vec<(i64, i64)>, i32> {
+    let rows = sql_query(
+        "SELECT id, ts FROM alarms WHERE camera_id = ? AND ts > ? ORDER BY ts DESC LIMIT 100",
+        &[
+            SqlValue::String(camera_id.to_string()),
+            SqlValue::I64(since),
+        ],
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| match (row.get(0), row.get(1)) {
+            (Some(SqlValue::I64(id)), Some(SqlValue::I64(ts))) => Some((*id, *ts)),
+            _ => None,
+        })
+        .collect())
+}
+
+fn batch_update(rows: &[(String, i64)]) -> Result<u64, i32> {
+    let stmts: Vec<(&str, &[SqlValue])> = rows
+        .iter()
+        .map(|(id, ts)| {
+            (
+                "UPDATE cameras SET last_seen = ? WHERE id = ?",
+                vec![SqlValue::I64(*ts), SqlValue::String(id.clone())].leak() as &[SqlValue],
+            )
+        })
+        .collect();
+    sql_transaction(&stmts)
+}
+```
+
+### Audit
+
+Kazde wywolanie SQL host function pisze do `audit_log` przez `audit_log_with_risk`:
+
+- `action` = `sql.exec` / `sql.query` / `sql.query_one` / `sql.transaction`
+- `resource_type` = `sql`
+- `resource_id` = pierwsze 16 znakow hex SHA256(query) (dla compliance bez ujawniania pelnej tresci)
+- `risk_class` = `A` (operacyjne)
+- `result` = `ok` / `denied` / `error`
+
+---
+
+## 12. Aliases (readonly)
+
+Readonly query metadanych aliasow AI w globalnej tabeli `model_aliases`.
+Addon **nie tworzy ani nie deaktywuje** aliasow przez ABI w runtime —
+zarzadzanie cyklem zycia aliasow nalezy do core (lifecycle hooks):
+
+- **install** → `install_manifest_aliases` czyta `[[alias]]` z manifestu i
+  zapisuje aliasy w `model_aliases` z `owner = addon:<addon_id>` plus rekordy
+  `model_alias_visibility` i `model_alias_consumers` na podstawie pol
+  `visibility` / `allowed_consumers`.
+- **uninstall** → `deactivate_aliases_owned_by_addon` ustawia `is_active=0`
+  na wszystkich aliasach z `owner_id = <addon_id>`. Wiersze pozostaja
+  (admin moze je trwale usunac z poziomu M16).
+- **upgrade** (F1b/F2) → diff manifestu starego vs nowego: nowe aliasy
+  dodawane, znikajace deaktywowane.
+
+Permission wymagana przez ponizsze host functions: `alias.read`
+(uprzednio nazywane `alias.manage`).
+
+### `alias_get_v1(alias_id_ptr, alias_id_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Zwraca metadane aliasu jako TOML. **Pola statystyczne**
+(`last_used_target`, `last_used_at`, `calls_24h`, `fallback_calls_24h`) sa
+stripowane gdy caller nie jest ownerem aliasu — chroni przed wyciekiem
+wzorcow uzycia miedzy addonami.
+
+| Parametr | Typ | Opis |
+|----------|-----|------|
+| `alias_id_ptr/len` | `i32` | Identyfikator aliasu (UTF-8) |
+| `out_ptr/out_cap/out_len_ptr` | `i32` | Bufor wyjsciowy z retry semantyka (sekcja "out_cap retry pattern") |
+
+**Output (TOML, AliasInfo):**
+
+```toml
+id = "teams-stt"
+display_name = "Teams meeting STT"
+owner = "addon:teams-bot"
+visibility = "restricted"
+current_target = "whisper-large-v3"
+fallback_targets = ["whisper-medium", "vosk-pl"]
+strategy = "first_available"
+is_active = true
+# nizsze pola tylko gdy caller == owner
+last_used_target = "whisper-large-v3"
+last_used_at = 1715515200
+calls_24h = 412
+fallback_calls_24h = 3
+```
+
+**Errors:**
+- `ABI_OK` (0) — sukces
+- `ABI_ERR_PERMISSION` (1) — brak `alias.read`
+- `ABI_ERR_NOT_FOUND` (2) — alias nie istnieje
+- `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (6) — `out_cap` za maly (`*out_len_ptr` ma wymagany rozmiar)
+
+### `alias_list_owned_v1(out_ptr, out_cap, out_len_ptr) -> i32`
+
+Listuje wszystkie aliasy, ktorych ownerem jest wywolujacy addon. Wynik to
+TOML array `AliasInfo` (z pelnymi statystykami, bo zawsze owner).
+
+**Errors:**
+- `ABI_OK` (0)
+- `ABI_ERR_PERMISSION` (1) — brak `alias.read`
+- `ABI_ERR_OUTPUT_BUFFER_TOO_SMALL` (6)
+
+### SDK API (Rust)
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+pub fn alias_get(id: &str) -> Result<AliasInfo, AbiError>;
+pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError>;
+```
+
+### Przyklad — addon sprawdza w `on_tick` czy jego alias jest aktywny
+
+Admin moze w panelu M16 deaktywowac alias mimo ze addon jest zainstalowany.
+Addon powinien wykrywac taki stan i graceful-fallback:
+
+```rust
+fn on_tick(_ts: i64) -> i32 {
+    match alias_get("teams-stt") {
+        Ok(info) if info.is_active => {
+            // alias dostepny — normalna sciezka
+            run_stt_pipeline();
+        }
+        Ok(_) => {
+            log_warn("alias 'teams-stt' jest nieaktywny — pomijam tick STT");
+        }
+        Err(AbiError::NotFound) => {
+            // wariant defensywny: alias zostal usuniety przez admina (M16)
+            log_error("alias 'teams-stt' nie istnieje juz w core");
+        }
+        Err(e) => return e.into(),
+    }
+    ABI_OK
+}
+```
+
