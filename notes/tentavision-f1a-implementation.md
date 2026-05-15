@@ -475,9 +475,18 @@ Mockupy: `~/.gstack/projects/Slyb00ts-TentaFlow/designs/tentavision-v1/`
 - **Chunk A** (5f8ebd0+a7595ac): cargo deps (gstreamer 0.21 + gstreamer-app), migracja v21 `cameras`, docs/ADDON_HOST_FUNCTIONS.md §13, recipe `assets/test/sample_traffic.mp4`.
 - **Chunk B** (27ef060+c9d10d5): `src/services/camera_ingest/` (fakefile + session + supervisor) — singleton tokio per kamera, GStreamer `filesrc ! decodebin ! videoconvert ! video/x-raw,format=RGB ! appsink`, replay loop, symlink guard po każdym komponencie path (Issue #6).
 - **Chunk C** (c1f6eb7+976f19b): 10 host functions ABI (`camera_add_v1` ... `camera_credentials_rotate_v1`), SDK bindings (`tentaflow_addon_sdk::camera_*`), DB persistence przez `repository::*_camera`, audit log z RiskClass na każdej ścieżce, 24 unit testów w `tests/camera_host_functions.rs`.
-- **Chunk D** (M1.W6 wrap): real WASM addon `addons/camera-test-addon/` + integration test `tests/camera_integration_e2e.rs` (4 testy, `#[ignore]` gated on WASM artifact + sample mp4), security suite `tests/camera_security.rs` (17 testów: SQL injection, length caps, symlink leaf/parent, traversal, special files, cross-addon isolation, supervisor vendor/fps guards).
+- **Chunk D** (M1.W6 wrap): real WASM addon `addons/camera-test-addon/` + integration test `tests/camera_integration_e2e.rs` (4 testy, `#[ignore]` gated on WASM artifact + sample mp4), security suite `tests/camera_security.rs` (21 testów: SQL injection, length caps, symlink leaf/parent, traversal, special files, cross-addon isolation, supervisor vendor/fps guards, malformed-TOML + payload-too-large via `camera_add_with_raw_input`, DoS quota per-addon + happy-path). Quota wired into `CameraIngestSupervisor::add_camera` (caps `MAX_CAMERAS_PER_ADDON=32`, `MAX_CAMERAS_GLOBAL=128`) — `CameraConfig.owner_addon_id` propagowane z `camera_add_v1`, `CameraIngestError::QuotaExceeded` mapowane na `AbiError::QuotaExceeded`.
 
-**Coverage M1.W6:** 24 unit + 4 e2e + 17 security = **45 testów** camera API w F1a.
+**Coverage M1.W6:** 26 unit + 4 e2e + 21 security = **51 testów** camera API w F1a.
+
+**DoD mapping — co Chunk D faktycznie weryfikuje** (a czego nie):
+- **DoD-9 ✓** Permission denied → `AbiError::Permission` + audit `denied` + `missing_permission` (test `camera_addon_permission_denied_without_write` w e2e).
+- **DoD-11 ✓** Path traversal w `camera_add` zablokowane: leaf symlink, symlinked parent dir, traversal do non-existent, /dev/* special files, katalogi (`resolve_file_url_*` w camera_security.rs).
+- **DoD-12 ✓** SQL injection guard działa (`sql_injection_in_camera_id_rejected_by_validator`).
+- **DoD-15 partial** Audit chain — e2e weryfikuje 4 entries lifecycle (add/health/snapshot/remove) z `risk_class` (A/B/A/A), ordering, oraz path-traversal i permission-denied audyty; pełny `risk_class_compute` + chain verify zostaje w M3.
+- **DoD-14 partial** Pokrycie błędów ABI — Chunk D dotyka `Permission`, `NotFound`, `InvalidArgument`/`Operation`, `PayloadTooLarge`, `QuotaExceeded`, `CameraVendorUnsupported`, `CameraUnreachable`; pełne 24 warianty w M3.
+- **DoD-6 partial** FakeFile lifecycle (add → health → snapshot → remove) potwierdzony; `stream_subscribe` / `service_call` / `pickup_frame` (M1.W7) nie sa tu testowane.
+- **NIE w scope Chunka D:** DoD-1 (wizard install — M2.M15) ani full DoD-6 (streaming + service-to-core API — M1.W7).
 
 **Scope:**
 - `tentaflow-core/src/services/camera_ingest/` (supervisor sesji tokio per kamera + registry)

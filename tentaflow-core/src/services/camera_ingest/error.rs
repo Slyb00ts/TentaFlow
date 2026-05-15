@@ -34,6 +34,8 @@ pub enum CameraIngestError {
     InvalidConfig(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
 }
 
 pub type Result<T> = std::result::Result<T, CameraIngestError>;

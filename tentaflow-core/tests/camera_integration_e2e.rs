@@ -187,13 +187,14 @@ struct AuditEntry {
     resource_id: Option<String>,
     result: String,
     error_message: Option<String>,
+    risk_class: String,
 }
 
 fn fetch_audit_entries(db: &db::DbPool, action_prefix: &str) -> Vec<AuditEntry> {
     let conn = db.lock().expect("lock db");
     let mut stmt = conn
         .prepare(
-            "SELECT action, resource_id, result, error_message \
+            "SELECT action, resource_id, result, error_message, risk_class \
              FROM audit_log \
              WHERE addon_id = ?1 AND action LIKE ?2 \
              ORDER BY id ASC",
@@ -208,6 +209,7 @@ fn fetch_audit_entries(db: &db::DbPool, action_prefix: &str) -> Vec<AuditEntry> 
                     resource_id: r.get(1)?,
                     result: r.get(2)?,
                     error_message: r.get(3)?,
+                    risk_class: r.get(4)?,
                 })
             },
         )
@@ -282,16 +284,66 @@ async fn camera_addon_lifecycle_e2e() {
         assert_eq!(len, w * h * 3, "RGB24 bytes mismatch");
     }
 
-    // Verify audit log: at minimum camera.add (ok) and camera.remove (ok).
+    // Verify audit log: every lifecycle stage MUST land an ok entry with the
+    // documented risk_class. The lifecycle visits camera.add (A), .health (B),
+    // .snapshot (A — Risk A even if the snapshot didn't fire), .remove (A).
+    //
+    // The snapshot entry is present iff the addon actually called camera_snapshot.
+    // The lifecycle tool always issues the call, so the snapshot audit row must
+    // exist regardless of whether a frame was buffered (the call audits on both
+    // ok and error paths).
     let entries = fetch_audit_entries(&db, "camera.");
-    let has_add = entries
+    let mine: Vec<&AuditEntry> = entries
         .iter()
-        .any(|e| e.action == "camera.add" && e.result == "ok" && e.resource_id.as_deref() == Some(camera_id.as_str()));
-    let has_remove = entries
+        .filter(|e| e.resource_id.as_deref() == Some(camera_id.as_str()))
+        .collect();
+
+    let find = |action: &str, result: &str| -> Option<&&AuditEntry> {
+        mine.iter().find(|e| e.action == action && e.result == result)
+    };
+
+    let add_entry = find("camera.add", "ok").unwrap_or_else(|| {
+        panic!("expected camera.add ok audit entry; got {entries:?}");
+    });
+    assert_eq!(add_entry.risk_class, "A", "camera.add must be risk A");
+
+    let health_entry = find("camera.health", "ok").unwrap_or_else(|| {
+        panic!("expected camera.health ok audit entry; got {entries:?}");
+    });
+    assert_eq!(health_entry.risk_class, "B", "camera.health must be risk B");
+
+    // Snapshot may be ok or error depending on warmup; whichever it is, the
+    // audit row MUST be Risk A.
+    let snap_entry = mine
         .iter()
-        .any(|e| e.action == "camera.remove" && e.result == "ok" && e.resource_id.as_deref() == Some(camera_id.as_str()));
-    assert!(has_add, "expected camera.add ok audit entry; got {entries:?}");
-    assert!(has_remove, "expected camera.remove ok audit entry; got {entries:?}");
+        .find(|e| e.action == "camera.snapshot")
+        .unwrap_or_else(|| panic!("expected camera.snapshot audit entry; got {entries:?}"));
+    assert_eq!(snap_entry.risk_class, "A", "camera.snapshot must be risk A");
+
+    let remove_entry = find("camera.remove", "ok").unwrap_or_else(|| {
+        panic!("expected camera.remove ok audit entry; got {entries:?}");
+    });
+    assert_eq!(remove_entry.risk_class, "A", "camera.remove must be risk A");
+
+    // Lifecycle ordering: add MUST come before health, health before snapshot,
+    // snapshot before remove. We assert via the audit_log id ordering which
+    // fetch_audit_entries already gives us.
+    let pos = |action: &str, result: &str| -> usize {
+        mine.iter()
+            .position(|e| e.action == action && e.result == result)
+            .unwrap_or(usize::MAX)
+    };
+    let p_add = pos("camera.add", "ok");
+    let p_health = pos("camera.health", "ok");
+    let p_snap = mine
+        .iter()
+        .position(|e| e.action == "camera.snapshot")
+        .unwrap_or(usize::MAX);
+    let p_remove = pos("camera.remove", "ok");
+    assert!(
+        p_add < p_health && p_health < p_snap && p_snap < p_remove,
+        "audit ordering must be add < health < snapshot < remove, got add={p_add} health={p_health} snapshot={p_snap} remove={p_remove}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -343,14 +395,19 @@ async fn camera_addon_path_traversal_blocked() {
     // host MUST refuse to register the camera.
     assert!(abi_error != 0, "abi_error must be non-zero");
 
-    // Audit log MUST contain a camera.add denial/error entry.
+    // Audit log MUST contain a camera.add error entry whose reason names the
+    // guard that fired. resolve_file_url rejects symlinks with
+    // SymlinkNotAllowed, which the host audits as session_start_failed
+    // wrapping the supervisor error string.
     let entries = fetch_audit_entries(&db, "camera.add");
-    let blocked = entries
-        .iter()
-        .any(|e| matches!(e.result.as_str(), "denied" | "error"));
+    let blocked = entries.iter().find(|e| e.result == "error").unwrap_or_else(|| {
+        panic!("expected error audit entry for camera.add; got {entries:?}");
+    });
+    assert_eq!(blocked.risk_class, "A", "camera.add must be risk A");
+    let reason = blocked.error_message.as_deref().unwrap_or("");
     assert!(
-        blocked,
-        "expected denied/error audit entry for camera.add; got {entries:?}"
+        reason.contains("symlink_not_allowed") || reason.contains("symlink not allowed") || reason.contains("file_not_found") || reason.contains("file not found"),
+        "expected guard reason in error_message, got: {reason:?}"
     );
 }
 
@@ -377,19 +434,22 @@ async fn camera_addon_permission_denied_without_write() {
     assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp={resp}");
     assert_eq!(resp["granted"], serde_json::Value::Bool(false), "must be denied");
 
-    // Audit log MUST record a camera.add denial with missing_permission reason.
+    // Audit log MUST record a camera.add denial with missing_permission reason
+    // and risk_class A.
     let entries = fetch_audit_entries(&db, "camera.add");
-    let denied = entries.iter().any(|e| {
-        e.result == "denied"
-            && e.error_message
-                .as_deref()
-                .map(|m| m.contains("missing_permission"))
-                .unwrap_or(false)
-    });
-    assert!(
-        denied,
-        "expected denied audit with missing_permission reason; got {entries:?}"
-    );
+    let denied = entries
+        .iter()
+        .find(|e| {
+            e.result == "denied"
+                && e.error_message
+                    .as_deref()
+                    .map(|m| m.contains("missing_permission"))
+                    .unwrap_or(false)
+        })
+        .unwrap_or_else(|| {
+            panic!("expected denied audit with missing_permission reason; got {entries:?}");
+        });
+    assert_eq!(denied.risk_class, "A", "permission-denied camera.add must be risk A");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

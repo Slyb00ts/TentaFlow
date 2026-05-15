@@ -18,44 +18,86 @@ use super::session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, SessionCommand, SnapshotData,
 };
 
+/// Maximum concurrent cameras the supervisor allows per owning addon.
+/// Bounds RAM, file descriptors, and GStreamer state machines against a
+/// malicious or buggy addon. The cap is intentionally generous for legit
+/// surveillance addons (32 streams) but tight enough to prevent runaway.
+pub const MAX_CAMERAS_PER_ADDON: usize = 32;
+
+/// Maximum concurrent cameras across the whole process. Last line of
+/// defence when many addons each stay under their per-addon cap.
+pub const MAX_CAMERAS_GLOBAL: usize = 128;
+
 pub struct CameraIngestSupervisor {
     registry: Arc<RwLock<HashMap<String, CameraHandle>>>,
+    per_addon_cap: usize,
+    global_cap: usize,
 }
 
 impl CameraIngestSupervisor {
     pub fn new() -> Self {
+        Self::with_caps(MAX_CAMERAS_PER_ADDON, MAX_CAMERAS_GLOBAL)
+    }
+
+    /// Test-only constructor that lets unit tests verify quota with much
+    /// smaller caps so we never need to spawn 100+ GStreamer pipelines.
+    pub fn with_caps(per_addon_cap: usize, global_cap: usize) -> Self {
         Self {
             registry: Arc::new(RwLock::new(HashMap::new())),
+            per_addon_cap,
+            global_cap,
         }
     }
 
     pub async fn add_camera(&self, config: CameraConfig) -> Result<()> {
+        // First-pass quota + duplicate check under a read lock. The write
+        // lock below re-checks both — racing adds between this snapshot and
+        // the insert could otherwise blow past the cap.
         {
             let g = self.registry.read().await;
+            check_caps(&g, self.global_cap, self.per_addon_cap, config.owner_addon_id.as_deref())?;
             if g.contains_key(&config.camera_id) {
                 return Err(CameraIngestError::AlreadyExists(config.camera_id.clone()));
             }
         }
         let handle = spawn_session(config)?;
-        let raced = {
+        enum Outcome {
+            Raced,
+            QuotaExceeded(String),
+        }
+        let outcome = {
             let mut g = self.registry.write().await;
-            if g.contains_key(&handle.id) {
-                // Race: another caller raced us in. We must release the
-                // write lock before awaiting Stop+join — holding the
-                // registry mutex across a potentially-blocking teardown
-                // would stall every other supervisor call.
-                true
+            if let Err(e) = check_caps(
+                &g,
+                self.global_cap,
+                self.per_addon_cap,
+                handle.owner_addon_id.as_deref(),
+            ) {
+                match e {
+                    CameraIngestError::QuotaExceeded(msg) => Outcome::QuotaExceeded(msg),
+                    _ => Outcome::QuotaExceeded("quota check failed".into()),
+                }
+            } else if g.contains_key(&handle.id) {
+                Outcome::Raced
             } else {
                 g.insert(handle.id.clone(), handle);
                 return Ok(());
             }
         };
-        if raced {
-            let id = handle.id.clone();
-            stop_and_join(handle, Duration::from_secs(10)).await;
-            return Err(CameraIngestError::AlreadyExists(id));
+        // The write lock is released; safe to await teardown without blocking
+        // other supervisor callers. `handle` was moved into the registry only
+        // in the Inserted branch above, so on Raced/QuotaExceeded we still own it.
+        match outcome {
+            Outcome::Raced => {
+                let id = handle.id.clone();
+                stop_and_join(handle, Duration::from_secs(10)).await;
+                Err(CameraIngestError::AlreadyExists(id))
+            }
+            Outcome::QuotaExceeded(msg) => {
+                stop_and_join(handle, Duration::from_secs(10)).await;
+                Err(CameraIngestError::QuotaExceeded(msg))
+            }
         }
-        Ok(())
     }
 
     pub async fn remove_camera(&self, camera_id: &str) -> Result<()> {
@@ -126,6 +168,35 @@ impl CameraIngestSupervisor {
             join_with_timeout(h.id, h.join_handle, Duration::from_secs(10)).await;
         }
     }
+}
+
+/// Enforce both the global and the per-addon camera caps. Caller must hold
+/// either a read or write lock on `registry`.
+fn check_caps(
+    registry: &HashMap<String, CameraHandle>,
+    global_cap: usize,
+    per_addon_cap: usize,
+    owner: Option<&str>,
+) -> Result<()> {
+    if registry.len() >= global_cap {
+        return Err(CameraIngestError::QuotaExceeded(format!(
+            "global cap {} reached",
+            global_cap
+        )));
+    }
+    if let Some(owner) = owner {
+        let owned = registry
+            .values()
+            .filter(|h| h.owner_addon_id.as_deref() == Some(owner))
+            .count();
+        if owned >= per_addon_cap {
+            return Err(CameraIngestError::QuotaExceeded(format!(
+                "addon '{}' has {} cameras (max {})",
+                owner, owned, per_addon_cap
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Send Stop to a session and await its task with a bounded timeout. On

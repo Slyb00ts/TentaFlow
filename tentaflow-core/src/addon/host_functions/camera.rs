@@ -169,6 +169,7 @@ fn map_ingest_error(e: &CameraIngestError) -> AbiError {
         GstInit(_) | PipelineBuild(_) | PipelineState(_) | Internal(_) => AbiError::Operation,
         SessionCrashed(_) | SnapshotFailed(_) => AbiError::CameraUnreachable,
         SnapshotTimeout => AbiError::Timeout,
+        QuotaExceeded(_) => AbiError::QuotaExceeded,
     }
 }
 
@@ -569,6 +570,7 @@ pub fn camera_add_v1(
             (Some(w), Some(h)) => Some((w, h)),
             _ => None,
         },
+        owner_addon_id: Some(addon_id.clone()),
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
@@ -1324,6 +1326,121 @@ pub fn camera_credentials_rotate_v1(
 // integration tests that do not spin up a wasmtime Store.
 // =============================================================================
 
+/// Pure-Rust core of `camera_add_v1` that operates on raw input bytes and
+/// an explicit `AddonState`, with no wasmtime caller. Production code goes
+/// through `camera_add_v1`; tests use this entry point to inject malformed
+/// TOML and oversized payloads without standing up an InstancePool.
+pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
+    if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {
+        audit(state, "camera.add", None, RiskClass::A, "error", Some("payload_too_large"));
+        return AbiError::PayloadTooLarge.as_i32();
+    }
+    let raw = match std::str::from_utf8(raw_input) {
+        Ok(s) => s,
+        Err(_) => {
+            audit(state, "camera.add", None, RiskClass::A, "error", Some("input_read_failed"));
+            return AbiError::Operation.as_i32();
+        }
+    };
+    if !check_permission(state, PERM_CAMERAS_WRITE, None) {
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some("missing_permission"));
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraAddInput = match toml::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => {
+            audit(state, "camera.add", None, RiskClass::A, "error", Some("invalid_toml"));
+            return AbiError::Operation.as_i32();
+        }
+    };
+    if let Err(reason) = validate_vendor(&input.vendor) {
+        let err = if reason == "unsupported_vendor" {
+            AbiError::CameraVendorUnsupported
+        } else {
+            AbiError::Operation
+        };
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        return err.as_i32();
+    }
+    if let Err(reason) = validate_url(&input.url) {
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        return AbiError::Operation.as_i32();
+    }
+    if !(1..=60).contains(&input.target_fps) {
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some("target_fps_out_of_range"));
+        return AbiError::Operation.as_i32();
+    }
+    if let Err(reason) = validate_retention(&input.retention_class) {
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        return AbiError::Operation.as_i32();
+    }
+    if let Err(reason) = validate_display_name(&input.display_name) {
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        return AbiError::Operation.as_i32();
+    }
+    if let Err(reason) = validate_profile(&input.profile) {
+        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        return AbiError::Operation.as_i32();
+    }
+
+    let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
+    let addon_id = state.addon_id.clone();
+    let db = state.db.clone();
+
+    let res_w = input.resolution_width.map(|v| v as i64);
+    let res_h = input.resolution_height.map(|v| v as i64);
+
+    let cfg = CameraConfig {
+        camera_id: camera_id.clone(),
+        vendor: input.vendor.clone(),
+        url: input.url.clone(),
+        target_fps: input.target_fps,
+        resolution: match (input.resolution_width, input.resolution_height) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        },
+        owner_addon_id: Some(addon_id.clone()),
+    };
+    let sup = match run_async(get_or_init_supervisor()) {
+        Ok(s) => s,
+        Err(e) => {
+            audit(state, "camera.add", Some(&camera_id), RiskClass::A, "error", Some("supervisor_init_failed"));
+            return e.as_i32();
+        }
+    };
+    if let Err(e) = run_async(sup.add_camera(cfg)) {
+        let mapped = map_ingest_error(&e);
+        let reason = match &e {
+            CameraIngestError::QuotaExceeded(_) => "quota_exceeded".to_string(),
+            other => format!("session_start_failed: {other}"),
+        };
+        audit(state, "camera.add", Some(&camera_id), RiskClass::A, "error", Some(&reason));
+        return mapped.as_i32();
+    }
+
+    if let Err(e) = insert_camera(
+        &db,
+        &camera_id,
+        &addon_id,
+        &input.display_name,
+        &input.vendor,
+        &input.url,
+        input.target_fps as i64,
+        res_w,
+        res_h,
+        &input.retention_class,
+        &input.profile,
+    ) {
+        warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
+        let _ = run_async(sup.remove_camera(&camera_id));
+        audit(state, "camera.add", Some(&camera_id), RiskClass::A, "error", Some("db_insert_failed"));
+        return AbiError::Operation.as_i32();
+    }
+
+    audit(state, "camera.add", Some(&camera_id), RiskClass::A, "ok", None);
+    AbiError::Ok.as_i32()
+}
+
 #[doc(hidden)]
 pub mod test_api {
     use super::*;
@@ -1331,6 +1448,15 @@ pub mod test_api {
     #[doc(hidden)]
     pub async fn supervisor_for_tests() -> Result<Arc<CameraIngestSupervisor>, AbiError> {
         get_or_init_supervisor().await
+    }
+
+    /// Direct entry point that skips the wasmtime caller so tests can
+    /// inject malformed TOML, oversized payloads, and exercise the quota
+    /// path with full audit-log coverage. Returns the ABI return code that
+    /// `camera_add_v1` would have produced.
+    #[doc(hidden)]
+    pub fn camera_add_with_raw_input(state: &AddonState, raw_input: &[u8]) -> i32 {
+        super::camera_add_core(state, raw_input)
     }
 
     /// Drains every session on the shared supervisor. Tests that mutate the

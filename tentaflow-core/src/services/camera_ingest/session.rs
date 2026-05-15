@@ -72,6 +72,33 @@ pub struct CameraConfig {
     pub url: String,
     pub target_fps: u32,
     pub resolution: Option<(u32, u32)>,
+    /// Owning addon id — set by `camera_add_v1` so the supervisor can
+    /// enforce per-addon DoS quotas. `None` only in pre-quota call sites
+    /// (legacy tests); global cap still applies.
+    #[doc(hidden)]
+    pub owner_addon_id: Option<String>,
+}
+
+impl CameraConfig {
+    /// Minimal constructor for tests + internal callers that do not need
+    /// owner tracking. Production `camera_add_v1` sets `owner_addon_id`
+    /// explicitly.
+    pub fn new_unowned(
+        camera_id: impl Into<String>,
+        vendor: impl Into<String>,
+        url: impl Into<String>,
+        target_fps: u32,
+        resolution: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            camera_id: camera_id.into(),
+            vendor: vendor.into(),
+            url: url.into(),
+            target_fps,
+            resolution,
+            owner_addon_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +125,9 @@ pub enum SessionCommand {
 pub struct CameraHandle {
     pub id: String,
     pub vendor: String,
+    /// Addon that called `camera_add_v1`. Used by the supervisor to count
+    /// per-addon cameras for the DoS quota.
+    pub owner_addon_id: Option<String>,
     pub cmd_tx: mpsc::Sender<SessionCommand>,
     pub health_rx: watch::Receiver<CameraHealth>,
     pub join_handle: tokio::task::JoinHandle<()>,
@@ -131,6 +161,7 @@ pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
 
     let id = config.camera_id.clone();
     let vendor = config.vendor.clone();
+    let owner_addon_id = config.owner_addon_id.clone();
 
     let join_handle = tokio::spawn(run_session(
         config,
@@ -144,6 +175,7 @@ pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
     Ok(CameraHandle {
         id,
         vendor,
+        owner_addon_id,
         cmd_tx,
         health_rx,
         join_handle,
@@ -390,6 +422,7 @@ mod tests {
             url: "rtsp://example/foo".into(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::UnsupportedVendor(_)));
@@ -403,6 +436,7 @@ mod tests {
             url: "/definitely/not/here.mp4".into(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::FileNotFound(_)));
@@ -422,6 +456,7 @@ mod tests {
             url: link.to_string_lossy().to_string(),
             target_fps: 30,
             resolution: None,
+            owner_addon_id: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::SymlinkNotAllowed(_)));
@@ -435,6 +470,7 @@ mod tests {
             url: "/tmp/whatever.mp4".into(),
             target_fps: 0,
             resolution: None,
+            owner_addon_id: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
@@ -448,6 +484,7 @@ mod tests {
             url: "/tmp/whatever.mp4".into(),
             target_fps: 61,
             resolution: None,
+            owner_addon_id: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
