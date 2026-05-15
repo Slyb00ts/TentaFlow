@@ -287,6 +287,22 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+
+    /// Streaming API (F1a M1.W7) — frame bus + PickupToken. Frame bytes are
+    /// NOT inlined in `stream_next` output; the addon receives `frame_ref`
+    /// + metadata and uses `service_call` to hand the frame to a service.
+    fn stream_subscribe_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn stream_next_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn stream_close_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -1608,6 +1624,121 @@ pub fn camera_credentials_rotate(
     let bytes = call_sql_with_one_input(camera_credentials_rotate_v1, s.as_bytes())?;
     let raw: CameraCredentialsRotateRaw = parse_toml(&bytes)?;
     Ok((raw.rotated, raw.reason))
+}
+
+// =============================================================================
+// Streaming API wrappers (F1a M1.W7) — `stream_subscribe / next / close`.
+//
+// **All `stream_*` wrappers require TentaFlow core built with
+// `--features camera`.** Without it the host functions are not registered and
+// module instantiation fails at link time with "missing import".
+// =============================================================================
+
+/// Payload metadata for a Frame message returned by `stream_next`. Bytes live
+/// in the core LRU and travel to a service via `service_call` + PickupToken —
+/// the addon never receives them inline.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamFrameMeta {
+    pub frame_ref: String,
+    pub camera_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: String,
+    pub timestamp_unix_ms: u64,
+}
+
+/// Message variants the addon can observe on a subscribed stream.
+#[derive(Debug, Clone)]
+pub enum StreamNextMessage {
+    Frame(StreamFrameMeta),
+    Drop { count: u64 },
+    CameraOffline { reason: String },
+    Timeout,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StreamNextRaw {
+    Frame {
+        frame_ref: String,
+        camera_id: String,
+        width: u32,
+        height: u32,
+        pixel_format: String,
+        timestamp_unix_ms: u64,
+    },
+    Drop {
+        count: u64,
+    },
+    CameraOffline {
+        reason: String,
+    },
+    Timeout,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamSubscribeOut {
+    stream_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamCloseOut {
+    #[allow(dead_code)]
+    closed: bool,
+}
+
+/// Subscribe to a camera's frame bus. F1a target format: `camera:<camera_id>`.
+/// Ownership is enforced — addons cannot subscribe to cameras owned by other
+/// addons (returns `NotFound`).
+pub fn stream_subscribe(target: &str, max_fps: Option<u32>) -> Result<String, AbiError> {
+    let mut s = format!("target = {}\n", toml::Value::String(target.to_string()));
+    if let Some(fps) = max_fps {
+        s.push_str(&format!("[filter]\nmax_fps = {}\nskip_frames = 0\n", fps));
+    }
+    let bytes = call_sql_with_one_input(stream_subscribe_v1, s.as_bytes())?;
+    let out: StreamSubscribeOut = parse_toml(&bytes)?;
+    Ok(out.stream_id)
+}
+
+/// Bounded-await poll for the next stream message. `timeout_ms` is clamped to
+/// 5000 ms by the host.
+pub fn stream_next(stream_id: &str, timeout_ms: u64) -> Result<StreamNextMessage, AbiError> {
+    let payload = format!(
+        "stream_id = {}\ntimeout_ms = {}\n",
+        toml::Value::String(stream_id.to_string()),
+        timeout_ms,
+    );
+    let bytes = call_sql_with_one_input(stream_next_v1, payload.as_bytes())?;
+    let raw: StreamNextRaw = parse_toml(&bytes)?;
+    Ok(match raw {
+        StreamNextRaw::Frame {
+            frame_ref,
+            camera_id,
+            width,
+            height,
+            pixel_format,
+            timestamp_unix_ms,
+        } => StreamNextMessage::Frame(StreamFrameMeta {
+            frame_ref,
+            camera_id,
+            width,
+            height,
+            pixel_format,
+            timestamp_unix_ms,
+        }),
+        StreamNextRaw::Drop { count } => StreamNextMessage::Drop { count },
+        StreamNextRaw::CameraOffline { reason } => StreamNextMessage::CameraOffline { reason },
+        StreamNextRaw::Timeout => StreamNextMessage::Timeout,
+    })
+}
+
+/// Drop the subscription. Subsequent `stream_next` calls for the same id
+/// return `StreamNotFound`.
+pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
+    let payload = format!("stream_id = {}\n", toml::Value::String(stream_id.to_string()));
+    let bytes = call_sql_with_one_input(stream_close_v1, payload.as_bytes())?;
+    let _: StreamCloseOut = parse_toml(&bytes)?;
+    Ok(())
 }
 
 // =============================================================================

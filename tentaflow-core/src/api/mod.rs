@@ -5,6 +5,8 @@
 
 pub mod openai;
 
+pub mod frame_pickup;
+
 #[cfg(feature = "dashboard-api")]
 pub mod dashboard;
 
