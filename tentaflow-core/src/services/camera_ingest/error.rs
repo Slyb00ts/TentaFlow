@@ -28,6 +28,10 @@ pub enum CameraIngestError {
     SessionCrashed(String),
     #[error("snapshot timeout")]
     SnapshotTimeout,
+    #[error("snapshot failed: {0}")]
+    SnapshotFailed(String),
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

@@ -37,15 +37,24 @@ impl CameraIngestSupervisor {
             }
         }
         let handle = spawn_session(config)?;
-        let mut g = self.registry.write().await;
-        if g.contains_key(&handle.id) {
-            // Race: another caller raced us in. Stop the freshly-spawned
-            // session and return the racing error so the registry stays
-            // single-writer per camera_id.
-            let _ = handle.cmd_tx.send(SessionCommand::Stop).await;
-            return Err(CameraIngestError::AlreadyExists(handle.id));
+        let raced = {
+            let mut g = self.registry.write().await;
+            if g.contains_key(&handle.id) {
+                // Race: another caller raced us in. We must release the
+                // write lock before awaiting Stop+join — holding the
+                // registry mutex across a potentially-blocking teardown
+                // would stall every other supervisor call.
+                true
+            } else {
+                g.insert(handle.id.clone(), handle);
+                return Ok(());
+            }
+        };
+        if raced {
+            let id = handle.id.clone();
+            stop_and_join(handle, Duration::from_secs(10)).await;
+            return Err(CameraIngestError::AlreadyExists(id));
         }
-        g.insert(handle.id.clone(), handle);
         Ok(())
     }
 
@@ -55,8 +64,7 @@ impl CameraIngestSupervisor {
             g.remove(camera_id)
                 .ok_or_else(|| CameraIngestError::NotFound(camera_id.to_string()))?
         };
-        let _ = handle.cmd_tx.send(SessionCommand::Stop).await;
-        let _ = handle.join_handle.await;
+        stop_and_join(handle, Duration::from_secs(10)).await;
         Ok(())
     }
 
@@ -105,9 +113,45 @@ impl CameraIngestSupervisor {
             let _ = h.cmd_tx.send(SessionCommand::Stop).await;
         }
         for h in handles {
-            let _ = h.join_handle.await;
+            join_with_timeout(h.id, h.join_handle, Duration::from_secs(10)).await;
         }
         Ok(())
+    }
+}
+
+/// Send Stop to a session and await its task with a bounded timeout. On
+/// timeout we abort the task — better to leak a GStreamer pipeline than to
+/// hang the entire supervisor on a misbehaving session.
+async fn stop_and_join(handle: CameraHandle, timeout: Duration) {
+    let _ = handle.cmd_tx.send(SessionCommand::Stop).await;
+    join_with_timeout(handle.id, handle.join_handle, timeout).await;
+}
+
+async fn join_with_timeout(
+    id: String,
+    join: tokio::task::JoinHandle<()>,
+    timeout: Duration,
+) {
+    let abort = join.abort_handle();
+    match tokio::time::timeout(timeout, join).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.is_panic() => {
+            tracing::error!(camera_id = %id, "camera session task panicked: {e}");
+        }
+        Ok(Err(e)) if e.is_cancelled() => {
+            tracing::info!(camera_id = %id, "camera session task cancelled");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(camera_id = %id, "camera session join error: {e}");
+        }
+        Err(_) => {
+            tracing::error!(
+                camera_id = %id,
+                "camera session join timed out after {:?}; aborting task",
+                timeout
+            );
+            abort.abort();
+        }
     }
 }
 

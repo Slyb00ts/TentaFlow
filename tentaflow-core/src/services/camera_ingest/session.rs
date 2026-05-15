@@ -115,6 +115,12 @@ pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
     if config.vendor != "fake_file" {
         return Err(CameraIngestError::UnsupportedVendor(config.vendor));
     }
+    if !(1..=60).contains(&config.target_fps) {
+        return Err(CameraIngestError::InvalidConfig(format!(
+            "target_fps must be 1..=60, got {}",
+            config.target_fps
+        )));
+    }
     let path = resolve_file_url(&config.url)?;
     ensure_gst_initialized()?;
 
@@ -168,7 +174,7 @@ async fn run_session(
             );
             // Drain commands until Stop so the supervisor's join completes
             // cleanly even on early failure.
-            drain_until_stop(&mut cmd_rx).await;
+            drain_until_stop(&mut cmd_rx, &health_tx).await;
             return;
         }
     };
@@ -183,7 +189,7 @@ async fn run_session(
             None,
         );
         let _ = pipeline.pipeline.set_state(gst::State::Null);
-        drain_until_stop(&mut cmd_rx).await;
+        drain_until_stop(&mut cmd_rx, &health_tx).await;
         return;
     }
 
@@ -222,16 +228,34 @@ async fn run_session(
                         let _ = reply.send(h);
                     }
                     Some(SessionCommand::Snapshot(reply)) => {
-                        let snap = match mailbox.get() {
-                            Some(f) => Ok(SnapshotData {
-                                camera_id: cam_id.clone(),
-                                width: f.width,
-                                height: f.height,
-                                pixel_format: PixelFormat::Rgb24,
-                                timestamp_unix_ms: f.timestamp_unix_ms,
-                                data: (*f.data).clone(),
-                            }),
-                            None => Err(CameraIngestError::SnapshotTimeout),
+                        // Wait up to 4.5s for the first frame to land (the
+                        // supervisor wrap-timeout is 5s — leave headroom).
+                        // We poll the mailbox + health watch so terminal
+                        // Error short-circuits without waiting the full
+                        // window.
+                        let deadline =
+                            tokio::time::Instant::now() + Duration::from_millis(4500);
+                        let snap = loop {
+                            if let Some(f) = mailbox.get() {
+                                break Ok(SnapshotData {
+                                    camera_id: cam_id.clone(),
+                                    width: f.width,
+                                    height: f.height,
+                                    pixel_format: PixelFormat::Rgb24,
+                                    timestamp_unix_ms: f.timestamp_unix_ms,
+                                    data: (*f.data).clone(),
+                                });
+                            }
+                            let h = health_tx.borrow().clone();
+                            if matches!(h.status, CameraStatus::Error) {
+                                break Err(CameraIngestError::SnapshotFailed(
+                                    h.status_message.unwrap_or_else(|| "session error".into()),
+                                ));
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                break Err(CameraIngestError::SnapshotTimeout);
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         };
                         let _ = reply.send(snap);
                     }
@@ -247,7 +271,7 @@ async fn run_session(
                             if let Err(e) = seek_to_start(&pipeline.pipeline) {
                                 publish(&health_tx, &cam_id, CameraStatus::Error, Some(e.to_string()), &counters, fps_window.back().copied());
                                 let _ = pipeline.pipeline.set_state(gst::State::Null);
-                                drain_until_stop(&mut cmd_rx).await;
+                                drain_until_stop(&mut cmd_rx, &health_tx).await;
                                 return;
                             }
                         }
@@ -255,7 +279,7 @@ async fn run_session(
                             let text = format!("{} ({})", err.error(), err.debug().unwrap_or_default());
                             publish(&health_tx, &cam_id, CameraStatus::Error, Some(text), &counters, fps_window.back().copied());
                             let _ = pipeline.pipeline.set_state(gst::State::Null);
-                            drain_until_stop(&mut cmd_rx).await;
+                            drain_until_stop(&mut cmd_rx, &health_tx).await;
                             return;
                         }
                         _ => {}
@@ -284,7 +308,7 @@ async fn run_session(
                     } else if tokio::time::Instant::now() >= warmup_deadline {
                         publish(&health_tx, &cam_id, CameraStatus::Error, Some("no frames within warmup window".into()), &counters, None);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
-                        drain_until_stop(&mut cmd_rx).await;
+                        drain_until_stop(&mut cmd_rx, &health_tx).await;
                         return;
                     }
                 }
@@ -324,10 +348,32 @@ fn publish(
     });
 }
 
-async fn drain_until_stop(rx: &mut mpsc::Receiver<SessionCommand>) {
+/// After a terminal error we keep the task alive so the supervisor can
+/// observe the failure state and issue Stop in its own time. Snapshot and
+/// GetHealth must still reply (with the cached terminal status) — silently
+/// dropping the oneshot would force every caller to wait the supervisor's
+/// outer 5 s timeout for every probe.
+async fn drain_until_stop(
+    rx: &mut mpsc::Receiver<SessionCommand>,
+    health_tx: &watch::Sender<CameraHealth>,
+) {
     while let Some(cmd) = rx.recv().await {
-        if matches!(cmd, SessionCommand::Stop) {
-            return;
+        match cmd {
+            SessionCommand::Stop => return,
+            SessionCommand::GetHealth(reply) => {
+                let _ = reply.send(health_tx.borrow().clone());
+            }
+            SessionCommand::Snapshot(reply) => {
+                let h = health_tx.borrow().clone();
+                let msg = h
+                    .status_message
+                    .unwrap_or_else(|| "session in terminal error state".into());
+                let _ = reply.send(Err(CameraIngestError::SnapshotFailed(msg)));
+            }
+            SessionCommand::UpdateConfig(_) => {
+                // Terminal state: config updates are no-ops; the supervisor
+                // is expected to remove/re-add the camera to recover.
+            }
         }
     }
 }
@@ -379,5 +425,53 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::SymlinkNotAllowed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_target_fps_zero_rejected() {
+        let err = spawn_session(CameraConfig {
+            camera_id: "c1".into(),
+            vendor: "fake_file".into(),
+            url: "/tmp/whatever.mp4".into(),
+            target_fps: 0,
+            resolution: None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn test_target_fps_over_60_rejected() {
+        let err = spawn_session(CameraConfig {
+            camera_id: "c1".into(),
+            vendor: "fake_file".into(),
+            url: "/tmp/whatever.mp4".into(),
+            target_fps: 61,
+            resolution: None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn test_symlink_in_parent_rejected() {
+        // The leaf is a regular file, but a parent directory on the path is
+        // a symlink. resolve_file_url must reject the path before
+        // canonicalize collapses the indirection.
+        let dir = tempfile::tempdir().unwrap();
+        let real_subdir = dir.path().join("real_dir");
+        std::fs::create_dir(&real_subdir).unwrap();
+        let target = real_subdir.join("file.mp4");
+        std::fs::write(&target, b"x").unwrap();
+        let link_dir = dir.path().join("link_dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_subdir, &link_dir).unwrap();
+        let path_via_link = link_dir.join("file.mp4");
+        let err = super::super::fakefile::resolve_file_url(path_via_link.to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(err, CameraIngestError::SymlinkNotAllowed(_)),
+            "expected SymlinkNotAllowed, got: {err:?}"
+        );
     }
 }
