@@ -107,6 +107,9 @@ impl CameraIngestSupervisor {
                 .ok_or_else(|| CameraIngestError::NotFound(camera_id.to_string()))?
         };
         stop_and_join(handle, Duration::from_secs(10)).await;
+        crate::services::streaming_bus()
+            .close_camera(camera_id, "removed")
+            .await;
         Ok(())
     }
 
@@ -164,8 +167,11 @@ impl CameraIngestSupervisor {
         for h in &handles {
             let _ = h.cmd_tx.send(SessionCommand::Stop).await;
         }
+        let bus = crate::services::streaming_bus();
         for h in handles {
+            let id = h.id.clone();
             join_with_timeout(h.id, h.join_handle, Duration::from_secs(10)).await;
+            bus.close_camera(&id, "shutdown").await;
         }
     }
 }
