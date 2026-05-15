@@ -19,6 +19,8 @@ pub mod secrets;
 pub mod service;
 pub mod sql;
 pub mod storage;
+#[cfg(feature = "camera")]
+pub mod streaming;
 pub mod ui;
 pub mod user;
 
@@ -248,6 +250,17 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
                 camera::camera_credentials_rotate_v1,
             )
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_credentials_rotate_v1: {e}"))?;
+
+        // --- Streaming API (F1a M1.W7 — TentaVision frame bus + PickupToken) ---
+        linker
+            .func_wrap("tentaflow", "stream_subscribe_v1", streaming::stream_subscribe_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja stream_subscribe_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "stream_next_v1", streaming::stream_next_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja stream_next_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "stream_close_v1", streaming::stream_close_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja stream_close_v1: {e}"))?;
     }
 
     Ok(())

@@ -1315,3 +1315,165 @@ fn on_tick(_ts: i64) -> i32 {
 }
 ```
 
+
+## 14. Streaming + Service-to-Core API (F1a M1.W7 — TentaVision)
+
+Wymaga `--features camera` w kompilacji core. Trzy host functions dla addona
+plus jeden Service-to-Core HTTP endpoint dla mikroserwisow AI.
+
+### Flow
+
+```
+camera_supervisor  →  FrameStorage LRU (frame_<uuid>)
+                  →  StreamingBus (per-camera bounded mpsc)
+                  →  stream_subscribe / stream_next        (addon, frame_ref + metadata)
+                  →  service_call(alias, {…, frame_ref})
+                       → core mints PickupToken (HMAC, TTL 30s, one-shot)
+                       → core injects pickup_token + request_id + service_id w payload
+                       → QUIC do service
+                  →  service: POST /core/frame/pickup
+                       + X-Pickup-Token: <wire>
+                       + X-Frame-Raw-Ref: frame_<uuid>
+                       + X-Service-Id: <service_id>
+                       + X-Request-Id: <uuid>
+                  →  core: verify HMAC + cross-check headers + remove from LRU
+                  →  response: bytes + X-Frame-Width/-Height/-Pixel-Format/-Timestamp-Ms/-Pts
+```
+
+### `stream_subscribe_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `streams.subscribe` |
+| Risk | B (read-only access do live frames) |
+| Input TOML | `target = "camera:<camera_id>"` + opcjonalnie `[filter] max_fps skip_frames` |
+| Output TOML | `stream_id = "stream_<uuid>"` |
+
+Ownership enforced — addon moze subscribe TYLKO do wlasnych kamer. Cross-addon
+subscribe zwraca `NotFound` (zapobiega enumeracji cudzych camera_id).
+
+### `stream_next_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `streams.subscribe` |
+| Risk | B |
+| Input TOML | `stream_id = "stream_<uuid>"` + `timeout_ms = <0..5000>` |
+| Output TOML | `type = "frame" \| "drop" \| "camera_offline" \| "timeout"` + pola zalezne |
+
+Frame bytes NIE sa inline w odpowiedzi — addon dostaje `frame_ref` + metadata.
+Zeby przekazac ramke do service uzyj `service_call_v1` z `frame_ref` w
+payloadzie (core wystawi `PickupToken` automatycznie).
+
+Warianty:
+
+```toml
+# Frame
+type = "frame"
+frame_ref = "frame_<uuid>"
+camera_id = "cam_<uuid>"
+width = 1280
+height = 720
+pixel_format = "rgb24"
+timestamp_unix_ms = 1715789000000
+
+# Drop (backpressure)
+type = "drop"
+count = 12
+
+# Kamera offline
+type = "camera_offline"
+reason = "removed"
+
+# Timeout — brak ramki w timeout_ms
+type = "timeout"
+```
+
+### `stream_close_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `streams.subscribe` |
+| Risk | B |
+| Input TOML | `stream_id = "stream_<uuid>"` |
+| Output TOML | `closed = true` |
+
+Drop slot → channel closes → kolejny `stream_next` z tym `stream_id` zwraca
+`StreamNotFound`.
+
+### PickupToken — security model
+
+```
+PickupToken wire = base64(json({raw_ref, service_id, request_id, expiry_unix_ms, one_shot})).base64(HMAC-SHA256(signing_key, payload_b64))
+```
+
+- **Signing key:** 32B random z `OsRng`, generowany przy starcie procesu.
+  Restart procesu invaliduje wszystkie outstanding tokeny (akceptowalne, TTL 30s).
+- **TTL:** 30s default (DEFAULT_TTL w `services/pickup_tokens/mod.rs`).
+- **One-shot:** `AtomicBool::compare_exchange(false, true)` — pierwszy
+  pickup wygrywa, drugi dostaje 403 `unauthorized` (replay detected).
+- **Cross-service:** payload zawiera `service_id`; pickup wymaga
+  `X-Service-Id == payload.service_id` — token wystawiony dla service A
+  zwroci 403 jezeli probowac uzyc dla service B.
+- **Constant-time HMAC verify** przez `subtle::ConstantTimeEq` — bez timing leaks.
+- **Inflight DashMap** sweep co 60s, retention 2× TTL.
+
+### Service-to-Core HTTP API
+
+`POST /core/frame/pickup` — bez JWT, bez Origin check (CSRF exempt). Service
+autoryzuje sie wylacznie przez token.
+
+| Header request | Opis |
+|----------------|------|
+| `X-Pickup-Token` | Wire token (payload_b64.signature_b64) |
+| `X-Frame-Raw-Ref` | `frame_<uuid>` — musi rownac sie `payload.raw_ref` |
+| `X-Service-Id` | Recipient service id — musi rownac sie `payload.service_id` |
+| `X-Request-Id` | UUID — musi rownac sie `payload.request_id` |
+
+| Status | Opis | `frame_pickup_log.result` |
+|--------|------|---------------------------|
+| 200 OK | Bajty RGB24 w body + metadata w headerach | `ok` |
+| 400 Bad Request | Brak/empty header | `token_invalid` |
+| 403 Forbidden | HMAC mismatch / replay / cross-service mismatch | `token_invalid` \| `unauthorized` |
+| 404 Not Found | Frame evicted z LRU przed pickup | `frame_purged` |
+| 410 Gone | Token wygasl | `token_expired` |
+
+Response headers przy 200:
+
+| Header | Wartosc |
+|--------|---------|
+| `Content-Type` | `application/octet-stream` |
+| `X-Frame-Width` | u32 |
+| `X-Frame-Height` | u32 |
+| `X-Frame-Pixel-Format` | `rgb24` (F1a only) |
+| `X-Frame-Timestamp-Ms` | u64 (Unix ms) |
+| `X-Frame-Pts` | u64 (GStreamer PTS, opcjonalny) |
+
+### SDK example (Rust addon)
+
+```rust
+use tentaflow_addon_sdk::{stream_subscribe, stream_next, stream_close, StreamNextMessage, service_request_call};
+
+fn process_camera(camera_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let stream_id = stream_subscribe(&format!("camera:{}", camera_id), Some(30))?;
+    loop {
+        match stream_next(&stream_id, 1000)? {
+            StreamNextMessage::Frame(meta) => {
+                let req = serde_json::json!({
+                    "frame_ref": meta.frame_ref,
+                    "task": "detect_persons",
+                });
+                let resp = service_request_call("yolo11m", &req.to_string())?;
+                // Core wstrzyknal pickup_token w payload; service uzyl go
+                // do POST /core/frame/pickup i dostal bajty z LRU.
+                log_info(&format!("yolo response: {}", resp));
+            }
+            StreamNextMessage::Drop { count } => log_warn(&format!("dropped {} frames", count)),
+            StreamNextMessage::CameraOffline { reason } => break,
+            StreamNextMessage::Timeout => continue,
+        }
+    }
+    stream_close(&stream_id).ok();
+    Ok(())
+}
+```

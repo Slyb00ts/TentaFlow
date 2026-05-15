@@ -383,7 +383,8 @@ pub async fn handle_request(
     // Wyklucz endpointy publiczne (login, SSO callback) — nie maja Auth header
     let csrf_exempt = path == "/api/auth/login"
         || path.contains("/oauth/callback")
-        || path.contains("/sso/callback");
+        || path.contains("/sso/callback")
+        || path == "/core/frame/pickup";
     if !csrf_exempt && (method == Method::POST || method == Method::PUT || method == Method::DELETE)
     {
         let has_origin = req.headers().get("origin").is_some();
@@ -717,6 +718,76 @@ pub async fn handle_request(
     }
 
     // Addon OAuth login — wymaga auth; obsluzony w bloku z JWT ponizej.
+
+    // Service-to-Core frame pickup — services authenticate via X-Pickup-Token
+    // (HMAC, scoped, one-shot) rather than JWT. Must be reachable WITHOUT the
+    // dashboard's auth gate. See `api::frame_pickup`.
+    if method == Method::POST && path == "/core/frame/pickup" {
+        use crate::api::frame_pickup::{
+            handle_pickup, PickupOutcome, PickupRequest, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT,
+            HDR_FRAME_PTS, HDR_FRAME_REF, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH, HDR_PICKUP_TOKEN,
+            HDR_REQUEST_ID, HDR_SERVICE_ID,
+        };
+        let hdr = |name: &str| -> Option<String> {
+            req.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+        };
+        let token = hdr(HDR_PICKUP_TOKEN);
+        let frame_ref = hdr(HDR_FRAME_REF);
+        let service_id = hdr(HDR_SERVICE_ID);
+        let request_id = hdr(HDR_REQUEST_ID);
+        let _ = req.collect().await?;
+
+        let pr = PickupRequest {
+            pickup_token: token.as_deref(),
+            frame_ref: frame_ref.as_deref(),
+            service_id: service_id.as_deref(),
+            request_id: request_id.as_deref(),
+        };
+        let issuer = crate::services::pickup_token_issuer();
+        let storage = crate::services::frame_storage();
+        let outcome = handle_pickup(pr, issuer, storage, &db);
+        let status = outcome.http_status();
+        match outcome {
+            PickupOutcome::Ok {
+                bytes,
+                width,
+                height,
+                pixel_format,
+                timestamp_unix_ms,
+                pts,
+            } => {
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/octet-stream")
+                    .header(HDR_FRAME_WIDTH, width.to_string())
+                    .header(HDR_FRAME_HEIGHT, height.to_string())
+                    .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
+                    .header(HDR_FRAME_TS_MS, timestamp_unix_ms.to_string());
+                if let Some(p) = pts {
+                    builder = builder.header(HDR_FRAME_PTS, p.to_string());
+                }
+                let body = Bytes::copy_from_slice(&bytes);
+                let resp = builder.body(Either::Left(Full::new(body))).unwrap();
+                return Ok(resp);
+            }
+            PickupOutcome::BadHeaders(why)
+            | PickupOutcome::HeaderMismatch(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            PickupOutcome::Unauthorized(_) | PickupOutcome::FramePurged => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(b"{\"error\":\"pickup_denied\"}"))))
+                    .unwrap());
+            }
+        }
+    }
 
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {

@@ -32,6 +32,13 @@ impl RawFrameRef {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    /// Rehydrate a ref handed back to us by a service over HTTP. The wrapped
+    /// string is compared by equality in the LRU index, so two refs built
+    /// from the same string hash to the same bucket.
+    pub fn from_string(s: String) -> Self {
+        Self(s)
+    }
 }
 
 impl Default for RawFrameRef {
