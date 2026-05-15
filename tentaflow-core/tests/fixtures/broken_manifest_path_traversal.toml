@@ -1,0 +1,13 @@
+[addon]
+id = "broken-path-traversal"
+name = "Broken Path Traversal"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[[ui_component]]
+id = "evil"
+display_name = "Evil"
+slot = "main"
+src = "../../etc/passwd"
+signature = "ed25519:<base64-signature-placeholder>"
+risk = "low"

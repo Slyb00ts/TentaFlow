@@ -9,8 +9,79 @@ use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+// =============================================================================
+// RiskClass — klasyfikacja RODO wpisu audytowego (F1a §6.2.Y)
+// =============================================================================
+
+/// Klasa ryzyka wpisu audit log. Wartosc zapisywana do kolumny `risk_class`.
+/// `Unclassified` — domyslna gdy wywolanie nie deklaruje klasy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RiskClass {
+    /// Klasa A — operacje administracyjne i operacyjne bez danych osobowych
+    /// wysokiej kategorii.
+    A,
+    /// Klasa B — operacje na danych osobowych zwyklych (RODO art. 6).
+    B,
+    /// Klasa C — operacje na danych wrazliwych / biometrycznych / decyzje
+    /// automatyczne (RODO art. 9, art. 22).
+    C,
+    /// Nieklasyfikowane — backward compat dla wpisow sprzed F1a.
+    Unclassified,
+}
+
+impl RiskClass {
+    /// Reprezentacja DB (kolumna TEXT).
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+impl std::fmt::Display for RiskClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_db_str())
+    }
+}
+
+impl FromStr for RiskClass {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "A" => Ok(Self::A),
+            "B" => Ok(Self::B),
+            "C" => Ok(Self::C),
+            "unclassified" => Ok(Self::Unclassified),
+            _ => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod risk_class_tests {
+    use super::*;
+
+    #[test]
+    fn risk_class_roundtrip() {
+        for rc in [RiskClass::A, RiskClass::B, RiskClass::C, RiskClass::Unclassified] {
+            assert_eq!(RiskClass::from_str(rc.as_db_str()).unwrap(), rc);
+        }
+    }
+
+    #[test]
+    fn risk_class_invalid() {
+        assert!(RiskClass::from_str("D").is_err());
+        assert!(RiskClass::from_str("").is_err());
+    }
+}
 
 // =============================================================================
 // Stale konfiguracyjne

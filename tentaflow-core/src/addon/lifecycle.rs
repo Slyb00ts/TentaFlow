@@ -44,6 +44,13 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // 2. Walidacja
     validate_manifest(&manifest)?;
 
+    // Sprawdzenie kompatybilnosci SDK addona z rdzeniem (F1a §6.2.Y).
+    // None → kompatybilny (addon nie deklaruje wymagan); Some(req) → musi
+    // matchowac CORE_SDK_VERSION.
+    if let Err(e) = crate::addon::sdk_version::check_compatibility(manifest.sdk_version.as_deref()) {
+        bail!("Addon '{}': {}", manifest.addon_id, e);
+    }
+
     // 3. Odczytaj plik WASM
     let wasm_path = addon_dir.join(&manifest.wasm_file);
 
@@ -192,6 +199,14 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &manifest)?;
 
+    // F1a §6.5 M1.W4: jezeli addon deklaruje [storage] sql=true — utworz
+    // per-addon SQLite (przez fs_sandbox::addon_data_dir) i zaaplikuj migracje.
+    // Bez deklaracji storage.sql nic sie nie dzieje — backward compat z istniejacymi
+    // addonami (test-app, teams-bot).
+    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+    }
+
     info!(
         "Addon '{}' v{} installed ({} WASM bytes, {} permissions, {} tools, {} network rules)",
         manifest.addon_id,
@@ -203,6 +218,60 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     );
 
     Ok(manifest)
+}
+
+/// Otwiera per-addon SQLite i aplikuje migracje z `<bundle>/<migrations_dir>/`.
+/// Wywolywane tylko gdy `manifest.storage.sql == true`. Migration fail =
+/// install fail z rollbackiem: czyscimy zarejestrowanego addona z core DB
+/// oraz purgujemy pool, zeby kolejna proba install nie kolidowala.
+fn apply_addon_sql_migrations(
+    manifest: &AddonManifest,
+    addon_dir: &Path,
+    db: &DbPool,
+) -> Result<()> {
+    let storage = manifest.storage.as_ref().expect("checked by caller");
+    let migrations_dir = storage.migrations_dir.as_str();
+
+    if storage.encryption == "at-rest" {
+        // F1a: deklaracja akceptowana, ale SQLCipher integracja przyjdzie w F8.
+        tracing::warn!(
+            "addon '{}': [storage].encryption='at-rest' — F1a nie wymusza szyfrowania (planowane F8 SQLCipher)",
+            manifest.addon_id
+        );
+    }
+
+    match crate::addon::migrations::apply_migrations(
+        &manifest.addon_id,
+        &manifest.version,
+        migrations_dir,
+        addon_dir,
+        db,
+    ) {
+        Ok(n) => {
+            info!(
+                "addon '{}': SQL storage gotowy ({} migracji zaaplikowanych w tej sesji)",
+                manifest.addon_id, n
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Rollback rejestracji addonu — usuwamy go z DB i zamykamy pool,
+            // zeby kolejny install_addon nie trafil na "addon juz istnieje".
+            tracing::error!(
+                "addon '{}': migracje SQL FAILED ({}) — rollback install",
+                manifest.addon_id,
+                e.as_i32()
+            );
+            crate::addon::storage_sql::close_addon_db(&manifest.addon_id);
+            // Usun z DB (best-effort, install i tak juz failuje).
+            let _ = uninstall(&manifest.addon_id, db);
+            bail!(
+                "addon '{}': blad migracji SQL (kod {})",
+                manifest.addon_id,
+                e.as_i32()
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -314,6 +383,9 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
         "addon_resource_limits",
         "addon_config",
         "addon_network_rules",
+        // Bez tego ponowny install innej wersji o tej samej nazwie pliku
+        // migracji ale roznym hashu trafia na "hash mismatch" guard.
+        "addon_migrations_applied",
     ];
 
     for table in &tables {
@@ -332,6 +404,10 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("Nie udalo sie usunac addonu z DB: {e}"))?;
 
     conn.execute("COMMIT", [])?;
+
+    // F1a §6.5 M1.W4: zamknij per-addon SQLite pool. Plik data.db pozostaje
+    // na dysku (user moze chciec backup) — czyszczenie tylko manualne.
+    crate::addon::storage_sql::close_addon_db(addon_id);
 
     info!("Addon '{}' odinstalowany", addon_id);
 
@@ -973,6 +1049,33 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
             })
         });
 
+    let sdk_version = addon
+        .get("sdk_version")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let storage = parse_storage_section(top.get("storage"))?;
+    let aliases = parse_aliases(top.get("alias"))?;
+    let gates = parse_gates(top.get("gate"))?;
+    let vector_namespaces = parse_vector_namespaces(top.get("vector_namespace"))?;
+    let flow_templates = parse_flow_templates(top.get("flow_template"))?;
+    let ui_components = parse_ui_components(top.get("ui_component"))?;
+    let gpu = parse_gpu_section(top.get("gpu"));
+    let uses_aliases = parse_uses_aliases(top.get("uses_alias"))?;
+    let uses_models = parse_uses_models(top.get("uses_model"))?;
+
+    crate::addon::manifest::validate_manifest_extensions(
+        storage.as_ref(),
+        &aliases,
+        &gates,
+        &vector_namespaces,
+        &flow_templates,
+        &ui_components,
+        sdk_version.as_deref(),
+        &uses_aliases,
+        &uses_models,
+    )?;
+
     let resources = top.get("resources").map(|res| ResourceRequirements {
         storage_total_mb: res
             .get("storage_total_mb")
@@ -1030,6 +1133,371 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         show_in_catalog,
         service,
         application,
+        storage,
+        aliases,
+        gates,
+        vector_namespaces,
+        flow_templates,
+        ui_components,
+        gpu,
+        sdk_version,
+        uses_aliases,
+        uses_models,
+    })
+}
+
+// Parsery sekcji rozszerzonych (F1a). Trzymamy je w lifecycle.rs zeby utrzymac
+// jeden punkt wejscia parsowania (parse_manifest_toml) i nie dublowac iteracji
+// po toml::Value w manifest.rs.
+
+fn parse_storage_section(
+    val: Option<&toml::Value>,
+) -> Result<Option<crate::addon::manifest::StorageConfig>> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    let tbl = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[storage] must be a table"))?;
+    let cfg = crate::addon::manifest::StorageConfig {
+        kv: tbl.get("kv").and_then(|v| v.as_bool()).unwrap_or(true),
+        sql: tbl.get("sql").and_then(|v| v.as_bool()).unwrap_or(false),
+        sql_backends: tbl
+            .get("sql_backends")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sql_dialect: tbl
+            .get("sql_dialect")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ansi")
+            .to_string(),
+        migrations_dir: tbl
+            .get("migrations_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("migrations")
+            .to_string(),
+        encryption: tbl
+            .get("encryption")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+            .to_string(),
+    };
+    Ok(Some(cfg))
+}
+
+fn parse_aliases(val: Option<&toml::Value>) -> Result<Vec<crate::addon::manifest::AliasSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[alias]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let methods = item
+            .get("methods")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let suggested_default = item
+            .get("suggested_default")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let gate = item
+            .get("gate")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let visibility = match item.get("visibility").and_then(|v| v.as_str()) {
+            Some(s) => crate::addon::manifest::AliasVisibility::parse(s)?,
+            None => crate::addon::manifest::AliasVisibility::Private,
+        };
+        let allowed_consumers = item
+            .get("allowed_consumers")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(crate::addon::manifest::AliasSpec {
+            id,
+            display_name,
+            methods,
+            suggested_default,
+            gate,
+            visibility,
+            allowed_consumers,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_uses_aliases(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::UsesAliasSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[uses_alias]][{idx}] missing 'id'"))?
+            .to_string();
+        let required = item.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+        let reason = item
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::addon::manifest::UsesAliasSpec { id, required, reason });
+    }
+    Ok(out)
+}
+
+fn parse_uses_models(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::UsesModelSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[uses_model]][{idx}] missing 'id'"))?
+            .to_string();
+        let required = item.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+        let reason = item
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::addon::manifest::UsesModelSpec { id, required, reason });
+    }
+    Ok(out)
+}
+
+fn parse_gates(val: Option<&toml::Value>) -> Result<Vec<crate::addon::manifest::GateSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[gate]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let required_claims = item
+            .get("required_claims")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(parse_claim_requirement)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        out.push(crate::addon::manifest::GateSpec {
+            id,
+            display_name,
+            required_claims,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_claim_requirement(
+    val: &toml::Value,
+) -> Result<crate::addon::manifest::ClaimRequirement> {
+    let claim_type = val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("claim requirement missing 'type'"))?
+        .to_string();
+    Ok(crate::addon::manifest::ClaimRequirement {
+        claim_type,
+        subject: val.get("subject").and_then(|v| v.as_str()).map(String::from),
+        scope: val.get("scope").and_then(|v| v.as_str()).map(String::from),
+        status: val.get("status").and_then(|v| v.as_str()).map(String::from),
+        value: val.get("value").and_then(|v| v.as_str()).map(String::from),
+        oneof: val
+            .get("oneof")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        valid: val.get("valid").and_then(|v| v.as_bool()),
+        has_expiry: val.get("has_expiry").and_then(|v| v.as_bool()),
+    })
+}
+
+fn parse_vector_namespaces(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::VectorNamespaceSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'name'"))?
+            .to_string();
+        let dimensions = item
+            .get("dimensions")
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| {
+                anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'dimensions'")
+            })? as u32;
+        let distance = item
+            .get("distance")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'distance'"))?
+            .to_string();
+        let data_class = item
+            .get("data_class")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'data_class'"))?
+            .to_string();
+        let gate = item.get("gate").and_then(|v| v.as_str()).map(String::from);
+        out.push(crate::addon::manifest::VectorNamespaceSpec {
+            name,
+            dimensions,
+            distance,
+            data_class,
+            gate,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_flow_templates(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::FlowTemplateSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[flow_template]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let path = item
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[flow_template]][{idx}] missing 'path'"))?
+            .to_string();
+        let description = item
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(crate::addon::manifest::FlowTemplateSpec {
+            id,
+            display_name,
+            path,
+            description,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_ui_components(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::UiComponentSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'id'"))?
+            .to_string();
+        let display_name = item
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let slot = item
+            .get("slot")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'slot'"))?
+            .to_string();
+        let src = item
+            .get("src")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'src'"))?
+            .to_string();
+        let signature = item
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[ui_component]][{idx}] missing 'signature'"))?
+            .to_string();
+        let risk = item
+            .get("risk")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low")
+            .to_string();
+        out.push(crate::addon::manifest::UiComponentSpec {
+            id,
+            display_name,
+            slot,
+            src,
+            signature,
+            risk,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_gpu_section(val: Option<&toml::Value>) -> Option<crate::addon::manifest::GpuInfo> {
+    let tbl = val?.as_table()?;
+    Some(crate::addon::manifest::GpuInfo {
+        recommended_vram_mb: tbl
+            .get("recommended_vram_mb")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
+        notes: tbl.get("notes").and_then(|v| v.as_str()).map(String::from),
     })
 }
 

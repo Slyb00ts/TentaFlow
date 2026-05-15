@@ -5,6 +5,8 @@
 //       do audit trail i operuje na liniowej pamieci WASM.
 // =============================================================================
 
+pub mod abi_helpers;
+pub mod aliases;
 pub mod events;
 pub mod http;
 pub mod llm;
@@ -13,6 +15,7 @@ pub mod network;
 pub mod oauth;
 pub mod secrets;
 pub mod service;
+pub mod sql;
 pub mod storage;
 pub mod ui;
 pub mod user;
@@ -176,6 +179,32 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .func_wrap("tentaflow", "oauth_get_token", oauth::oauth_get_token)
         .map_err(|e| anyhow::anyhow!("Rejestracja oauth_get_token: {e}"))?;
 
+    // --- SQL API (F1a M1.W4 — per-addon SQLite z migracjami) ---
+    linker
+        .func_wrap("tentaflow", "sql_exec_v1", sql::sql_exec_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_exec_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "sql_query_v1", sql::sql_query_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_query_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "sql_query_one_v1", sql::sql_query_one_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_query_one_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "sql_transaction_v1", sql::sql_transaction_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja sql_transaction_v1: {e}"))?;
+
+    // --- Alias API (F1a M1.W5 — readonly: alias_get / alias_list_owned) ---
+    linker
+        .func_wrap("tentaflow", "alias_get_v1", aliases::alias_get_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja alias_get_v1: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "alias_list_owned_v1",
+            aliases::alias_list_owned_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja alias_list_owned_v1: {e}"))?;
+
     Ok(())
 }
 
@@ -275,7 +304,9 @@ pub fn get_memory(caller: &mut WasmCaller<'_, AddonState>) -> Option<WasmMemory>
     caller.get_export("memory")?.into_memory()
 }
 
-/// Loguje operacje do audit log w DB
+/// Loguje operacje do audit log w DB (backward-compat — deleguje do
+/// `audit_log_with_risk` z RiskClass::Unclassified). Uzywane przez host
+/// functions sprzed F1a (storage, http, llm, ui, events, secrets, ...).
 pub fn audit_log(
     state: &AddonState,
     action: &str,
@@ -284,15 +315,47 @@ pub fn audit_log(
     result: &str,
     error_message: Option<&str>,
 ) {
+    audit_log_with_risk(
+        state,
+        action,
+        resource_type,
+        resource_id,
+        crate::audit::RiskClass::Unclassified,
+        None,
+        None,
+        result,
+        error_message,
+    );
+}
+
+/// Loguje operacje do audit log z pelnym kontekstem F1a:
+/// - `risk_class` — klasyfikacja RODO wpisu (A/B/C/unclassified).
+/// - `related_claim_id` — powiazany claim (gate evaluation, F2).
+/// - `request_id` — korelacja wielu wpisow w obrebie jednego wywolania.
+///
+/// Wpisy klasy B/C maja indeks partial w DB — szybkie kwerendy zgodnosciowe.
+#[allow(clippy::too_many_arguments)]
+pub fn audit_log_with_risk(
+    state: &AddonState,
+    action: &str,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+    risk_class: crate::audit::RiskClass,
+    related_claim_id: Option<&str>,
+    request_id: Option<&str>,
+    result: &str,
+    error_message: Option<&str>,
+) {
     let action_hash = fnv1a_hash(action);
     if let Ok(conn) = state.db.lock() {
         let _ = conn.execute(
-            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 state.user_id, &state.addon_id, &state.instance_id,
                 action, resource_type, resource_id,
-                result, error_message, action_hash
+                result, error_message, action_hash,
+                risk_class.as_db_str(), related_claim_id, request_id
             ],
         );
     }

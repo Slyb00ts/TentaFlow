@@ -1,0 +1,15 @@
+[addon]
+id = "broken-duplicate-alias"
+name = "Broken Duplicate Alias"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[[alias]]
+id = "tentavision-yolo"
+display_name = "TentaVision YOLO detector"
+methods = ["detect"]
+
+[[alias]]
+id = "tentavision-yolo"
+display_name = "TentaVision YOLO duplikat"
+methods = ["track"]

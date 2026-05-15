@@ -7,3 +7,5 @@ description = "SDK dla addonow TentaFlow — helpery, bindingi do host functions
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Base64 dla BLOB (SqlValue::Bytes) w SQL API. Wersja zgodna z core.
+base64 = "0.22"

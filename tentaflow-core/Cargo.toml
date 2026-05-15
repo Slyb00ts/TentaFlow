@@ -92,6 +92,11 @@ rkyv = { version = "0.8.16", features = ["unaligned"] }
 
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+# Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
+# zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
+# konfigurowane w addon/storage_sql.rs.
+r2d2 = "0.8"
+r2d2_sqlite = "0.34.0"
 
 # Crypto
 argon2 = "0.5.3"
@@ -146,6 +151,7 @@ getrandom = "0.4"
 base64 = "0.22.1"
 hex = "0.4.3"
 regex = "1.12.3"
+semver = "1.0"
 
 # Multipart form data parsing
 multer = "3.1"
