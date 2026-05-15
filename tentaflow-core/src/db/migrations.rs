@@ -151,7 +151,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 const CAMERAS_TABLE: &str = r#"
 CREATE TABLE cameras (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    camera_id TEXT NOT NULL UNIQUE,
+    camera_id TEXT NOT NULL,
     owner_addon_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     vendor TEXT NOT NULL CHECK(vendor IN ('fake_file')),
@@ -170,6 +170,7 @@ CREATE TABLE cameras (
     updated_at INTEGER NOT NULL,
     removed_at INTEGER NULL
 );
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
 CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
 CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
 "#;
