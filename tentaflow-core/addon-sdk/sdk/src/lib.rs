@@ -982,6 +982,13 @@ const INITIAL_CAP: usize = 1024;
 /// rather than allocating unboundedly inside the guest.
 const MAX_OUT_CAP: usize = 4 * 1024 * 1024;
 
+/// Hard cap for camera_snapshot responses (RGB24 + base64 expansion). Matches
+/// `PayloadKind::ServiceCall` (8 MiB) on the host side. A 1280x720 RGB24 frame
+/// is ~3.7 MiB raw → ~4.9 MiB base64-encoded, which would overshoot
+/// `MAX_OUT_CAP`; the per-API cap allows the snapshot wrapper to land legit
+/// payloads without raising the cap for every other call.
+const MAX_OUT_CAP_SNAPSHOT: usize = 8 * 1024 * 1024;
+
 /// Maksymalna liczba prob retry (bez bedu) na pojedynczym callu.
 /// W praktyce 1 attempt = sukces, 2 attempt = sukces po znalezieniu rozmiaru.
 /// Trzecia proba sugeruje host bug — zwracamy OutputBufferTooSmall.
@@ -1046,6 +1053,14 @@ fn call_sql_with_one_input(
     host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
     a: &[u8],
 ) -> Result<Vec<u8>, AbiError> {
+    call_sql_with_one_input_capped(host_fn, a, MAX_OUT_CAP)
+}
+
+fn call_sql_with_one_input_capped(
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+    a: &[u8],
+    max_out_cap: usize,
+) -> Result<Vec<u8>, AbiError> {
     let mut cap = INITIAL_CAP;
     let mut attempts: u32 = 0;
     loop {
@@ -1073,7 +1088,7 @@ fn call_sql_with_one_input(
             if required <= cap {
                 return Err(AbiError::OutputBufferTooSmall);
             }
-            if required > MAX_OUT_CAP {
+            if required > max_out_cap {
                 return Err(AbiError::PayloadTooLarge);
             }
             cap = required;
@@ -1275,6 +1290,11 @@ pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError> {
 //
 // Wrapper-y woke host functions camera_*_v1. Payload to TOML; bledy mapowane na
 // `AbiError`. Pelna specyfikacja: `docs/ADDON_HOST_FUNCTIONS.md` sekcja 13.
+//
+// **All `camera_*` wrappers require TentaFlow core built with
+// `--features camera`.** Without that feature the host does not register the
+// imports and addon instantiation fails at module-link time with a
+// "missing import" error from wasmtime — there is no silent-fail path.
 
 /// Specyfikacja nowej kamery do `camera_add`. F1a obsluguje wylacznie
 /// `vendor = "fake_file"`; pozostale vendor-y dadza `CameraVendorUnsupported`.
@@ -1522,9 +1542,16 @@ pub fn camera_remove(camera_id: &str) -> Result<(), AbiError> {
 /// Snapshot ostatniej ramki — RGB24 zdekodowany z base64. Maks ~5.5MB raw
 /// (1280x720 mieci sie w PayloadKind::ServiceCall; 1920x1080 przekroczy limit
 /// i zwroci `PayloadTooLarge`).
+///
+/// Requires TentaFlow core built with `--features camera`. Without it
+/// addon instantiation fails at module-link time with "missing import".
 pub fn camera_snapshot(camera_id: &str) -> Result<SnapshotInfo, AbiError> {
     let payload = format!("camera_id = {}\n", toml::Value::String(camera_id.to_string()));
-    let bytes = call_sql_with_one_input(camera_snapshot_v1, payload.as_bytes())?;
+    let bytes = call_sql_with_one_input_capped(
+        camera_snapshot_v1,
+        payload.as_bytes(),
+        MAX_OUT_CAP_SNAPSHOT,
+    )?;
     let raw: SnapshotRaw = parse_toml(&bytes)?;
     let data = base64::engine::general_purpose::STANDARD
         .decode(raw.data_b64.as_bytes())

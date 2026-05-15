@@ -105,6 +105,16 @@ impl CameraIngestSupervisor {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        self.drain().await;
+        Ok(())
+    }
+
+    /// Stops every running camera session but leaves the supervisor itself
+    /// intact. Required for graceful global shutdown of the camera singleton
+    /// (which holds the supervisor inside an `Arc<OnceCell>` and so cannot
+    /// consume `self`). Safe to call multiple times: subsequent calls drain
+    /// an already-empty registry.
+    pub async fn drain(&self) {
         let handles: Vec<CameraHandle> = {
             let mut g = self.registry.write().await;
             g.drain().map(|(_, h)| h).collect()
@@ -115,7 +125,6 @@ impl CameraIngestSupervisor {
         for h in handles {
             join_with_timeout(h.id, h.join_handle, Duration::from_secs(10)).await;
         }
-        Ok(())
     }
 }
 
