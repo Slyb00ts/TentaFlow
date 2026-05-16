@@ -13,6 +13,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { TfWindow } from '/js/components/tf-window.js';
 
 // Wizard state (singleton — only one wizard at a time).
 let state = null;
@@ -37,6 +38,7 @@ export function openInstallWizard(opts = {}) {
       kvEnabled: true,
       kvQuotaBytes: 0,
       sqlEnabled: true,
+      sqlQuotaBytes: 0,
       sqlBackend: 'sqlite',
       sqlEncryption: false,
     },
@@ -66,18 +68,70 @@ export function openInstallWizard(opts = {}) {
   footer.id = 'install-wizard-footer';
   win.appendChild(footer);
 
-  win.addEventListener('action', (e) => {
-    if (e.detail?.action !== 'close') return;
-    if (hasUnsavedProgress()) {
-      e.preventDefault();
-      const ok = window.confirm(I18n.t('install_wizard.discard_confirm'));
+  // Intercept every close path (X button, ESC, future outside-click) via the
+  // cancelable close-request event so the dirty check fires uniformly.
+  win.addEventListener('close-request', (e) => {
+    if (!hasUnsavedProgress()) return;
+    e.preventDefault();
+    TfWindow.confirm({
+      title: I18n.t('install_wizard.discard_title'),
+      message: I18n.t('install_wizard.discard_confirm'),
+      confirmLabel: I18n.t('install_wizard.discard_yes'),
+      cancelLabel: I18n.t('common.cancel'),
+      danger: true,
+      icon: 'alert',
+    }).then((ok) => {
       if (ok) win.close(true);
-    }
+    });
   });
 
   document.body.appendChild(win);
   state.win = win;
+  state.existingAliases = [];
   renderStep();
+  // Background-load the existing alias list so Step 3 can compute conflicts
+  // against actual server state instead of trusting the manifest hint.
+  loadExistingAliases();
+}
+
+async function loadExistingAliases() {
+  try {
+    const list = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
+    state.existingAliases = Array.isArray(list) ? list : [];
+    recomputeAliasStatuses();
+    if (state.currentStep === 3) renderStep();
+  } catch (_) {
+    // Leave manifest-provided statuses untouched on failure.
+    state.existingAliases = [];
+  }
+}
+
+function recomputeAliasStatuses() {
+  if (!state.aliases) return;
+  const existing = state.existingAliases || [];
+  const addonId = String(state.addonId || '').toLowerCase();
+  for (const [name, a] of state.aliases.entries()) {
+    const hit = existing.find((e) => String(e.alias || '').toLowerCase() === String(name).toLowerCase());
+    if (!hit) {
+      a.conflictStatus = 'will-create';
+      a.conflictOwner = null;
+      continue;
+    }
+    // Defensive read — backend may not yet expose owner fields; treat unknown
+    // ownership as a hard conflict so admin must resolve in M16.
+    const ownerType = hit.owner_type || hit.ownerType || null;
+    const ownerId = String(hit.owner_id || hit.ownerId || '').toLowerCase();
+    if (ownerType === 'manual') {
+      a.conflictStatus = 'exists-compatible';
+      a.conflictOwner = 'manual';
+    } else if (ownerType === 'addon' && ownerId === addonId) {
+      a.conflictStatus = 'exists-compatible';
+      a.conflictOwner = ownerId;
+    } else {
+      a.conflictStatus = 'exists-conflict';
+      a.conflictOwner = ownerId || ownerType || 'unknown';
+    }
+  }
 }
 
 function initFromManifest() {
@@ -102,6 +156,7 @@ function initFromManifest() {
   state.storage.kvEnabled = storage.kv !== false;
   state.storage.sqlEnabled = !!storage.sql;
   state.storage.kvQuotaBytes = Number(storage.kv_quota_bytes || 0);
+  state.storage.sqlQuotaBytes = Number(storage.sql_quota_bytes || 0);
   if (Array.isArray(storage.sql_backends) && storage.sql_backends.length > 0) {
     state.storage.sqlBackend = String(storage.sql_backends[0]);
   }
@@ -256,16 +311,50 @@ function renderPermissionsStep() {
 
 // --- Step 2: Storage -------------------------------------------------------
 
+// F1a supports only sqlite for the per-addon SQL store. Postgres is on the
+// F8 roadmap; if a manifest declares it we surface a banner explaining the
+// downgrade instead of silently dropping the option.
+const SQL_BACKENDS_SUPPORTED_F1A = ['sqlite'];
+
+// F1a default quotas (bytes). Used when manifest does not declare a quota.
+const KV_QUOTA_DEFAULT = 100 * 1024 * 1024;   // 100 MiB
+const SQL_QUOTA_DEFAULT = 500 * 1024 * 1024;  // 500 MiB
+const KV_QUOTA_MIN = 1 * 1024 * 1024;
+const KV_QUOTA_MAX = 1024 * 1024 * 1024;
+const SQL_QUOTA_MIN = 16 * 1024 * 1024;
+const SQL_QUOTA_MAX = 4 * 1024 * 1024 * 1024;
+
+function formatBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1024 * 1024 * 1024) return `${(v / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  if (v >= 1024 * 1024) return `${Math.round(v / (1024 * 1024))} MiB`;
+  if (v >= 1024) return `${Math.round(v / 1024)} KiB`;
+  return `${v} B`;
+}
+
 function renderStorageStep() {
   const s = state.storage;
   const manifestStorage = state.manifest?.storage || {};
-  const sqlBackends = Array.isArray(manifestStorage.sql_backends) && manifestStorage.sql_backends.length > 0
-    ? manifestStorage.sql_backends
+  const manifestBackends = Array.isArray(manifestStorage.sql_backends) && manifestStorage.sql_backends.length > 0
+    ? manifestStorage.sql_backends.map(String)
     : ['sqlite'];
+  const sqlBackends = manifestBackends.filter((b) => SQL_BACKENDS_SUPPORTED_F1A.includes(b));
+  const unsupportedBackends = manifestBackends.filter((b) => !SQL_BACKENDS_SUPPORTED_F1A.includes(b));
+  if (sqlBackends.length === 0) sqlBackends.push('sqlite');
+  if (!sqlBackends.includes(s.sqlBackend)) {
+    s.sqlBackend = sqlBackends[0];
+  }
 
   return `
     <h2 class="wizard-section-title">${escapeHtml(I18n.t('install_wizard.step2_title'))}</h2>
     <p class="wizard-section-sub">${escapeHtml(I18n.t('install_wizard.step2_sub'))}</p>
+
+    ${unsupportedBackends.length > 0 ? `
+      <div class="wizard-warning">
+        <svg class="icon"><use href="#i-alert"/></svg>
+        ${escapeHtml(I18n.t('install_wizard.storage_backend_downgrade').replace('{list}', unsupportedBackends.join(', ')))}
+      </div>
+    ` : ''}
 
     <div class="wizard-storage-row">
       <div class="wizard-storage-head">
@@ -275,6 +364,21 @@ function renderStorageStep() {
       </div>
       <div class="wizard-storage-body">
         <div class="muted">${escapeHtml(I18n.t('install_wizard.storage_kv_sub'))}</div>
+        <div class="wizard-storage-field">
+          <label>${escapeHtml(I18n.t('install_wizard.storage_quota'))}</label>
+          <!-- tf-slider does not exist yet; using native <input type="range"> is
+               the documented escape hatch (CLAUDE.md rule 8 — "tf-slider extension
+               planned"). Replace once the component lands. -->
+          <input type="range"
+                 data-role="kv-quota"
+                 min="${KV_QUOTA_MIN}"
+                 max="${KV_QUOTA_MAX}"
+                 step="${1024 * 1024}"
+                 value="${s.kvQuotaBytes || KV_QUOTA_DEFAULT}"
+                 ${s.kvEnabled ? '' : 'disabled'}
+                 class="wizard-quota-slider">
+          <span class="mono" data-role="kv-quota-display">${escapeHtml(formatBytes(s.kvQuotaBytes || KV_QUOTA_DEFAULT))}</span>
+        </div>
       </div>
     </div>
 
@@ -293,8 +397,20 @@ function renderStorageStep() {
           </tf-select>
         </div>
         <div class="wizard-storage-field">
+          <label>${escapeHtml(I18n.t('install_wizard.storage_quota'))}</label>
+          <input type="range"
+                 data-role="sql-quota"
+                 min="${SQL_QUOTA_MIN}"
+                 max="${SQL_QUOTA_MAX}"
+                 step="${16 * 1024 * 1024}"
+                 value="${s.sqlQuotaBytes || SQL_QUOTA_DEFAULT}"
+                 ${s.sqlEnabled ? '' : 'disabled'}
+                 class="wizard-quota-slider">
+          <span class="mono" data-role="sql-quota-display">${escapeHtml(formatBytes(s.sqlQuotaBytes || SQL_QUOTA_DEFAULT))}</span>
+        </div>
+        <div class="wizard-storage-field">
           <label>${escapeHtml(I18n.t('install_wizard.storage_migrations'))}</label>
-          <span class="mono">${escapeHtml(state.storage.migrationsDir || 'migrations/')}</span>
+          <span class="iw-mono">${escapeHtml(state.storage.migrationsDir || 'migrations/')}</span>
         </div>
       </div>
     </div>
@@ -326,11 +442,15 @@ function renderAliasesStep() {
       'exists-compatible': { status: 'info', label: I18n.t('install_wizard.alias_compatible') },
     })[a.conflictStatus] || { status: 'info', label: a.conflictStatus };
     const blocked = a.conflictStatus === 'exists-conflict';
+    const conflictDetail = blocked && a.conflictOwner
+      ? `<div class="wizard-alias-desc">${escapeHtml(I18n.t('install_wizard.alias_conflict_owner').replace('{owner}', a.conflictOwner))}</div>`
+      : '';
     return `
       <div class="wizard-alias-row ${blocked ? 'is-blocked' : ''}" data-alias="${escapeAttr(name)}">
         <div class="wizard-alias-main">
           <div class="wizard-alias-name mono">${escapeHtml(name)}</div>
           ${a.description ? `<div class="wizard-alias-desc">${escapeHtml(a.description)}</div>` : ''}
+          ${conflictDetail}
           ${a.gated ? `<div class="wizard-alias-gated"><tf-chip status="warn" icon="lock">${escapeHtml(I18n.t('install_wizard.alias_gated'))}</tf-chip></div>` : ''}
         </div>
         <div class="wizard-alias-target">
@@ -380,10 +500,18 @@ function attachStepHandlers(root) {
       if (!p) return;
       const grantToggle = row.querySelector('tf-toggle[data-role="grant"]');
       const reviewedToggle = row.querySelector('tf-toggle[data-role="reviewed"]');
-      grantToggle?.addEventListener('change', (e) => {
+      grantToggle?.addEventListener('change', async (e) => {
         const next = !!(e.detail?.checked ?? grantToggle.hasAttribute('checked'));
         if (next && p.risk === 'critical' && !p.criticalConfirmed) {
-          const ok = window.confirm(I18n.t('install_wizard.critical_confirm').replace('{pid}', pid));
+          const ok = await TfWindow.confirm({
+            title: I18n.t('install_wizard.critical_confirm_title'),
+            message: I18n.t('install_wizard.critical_confirm').replace('{pid}', pid),
+            description: p.description || '',
+            confirmLabel: I18n.t('install_wizard.critical_confirm_grant'),
+            cancelLabel: I18n.t('common.cancel'),
+            danger: true,
+            icon: 'alert',
+          });
           if (!ok) {
             grantToggle.removeAttribute('checked');
             return;
@@ -410,6 +538,24 @@ function attachStepHandlers(root) {
     root.querySelector('tf-select[data-role="sql-backend"]')?.addEventListener('change', (e) => {
       state.storage.sqlBackend = e.detail?.value || e.target.value || 'sqlite';
     });
+    const kvSlider = root.querySelector('input[data-role="kv-quota"]');
+    const kvDisplay = root.querySelector('[data-role="kv-quota-display"]');
+    if (kvSlider && kvDisplay) {
+      kvSlider.addEventListener('input', () => {
+        const v = Number(kvSlider.value) || 0;
+        state.storage.kvQuotaBytes = v;
+        kvDisplay.textContent = formatBytes(v);
+      });
+    }
+    const sqlSlider = root.querySelector('input[data-role="sql-quota"]');
+    const sqlDisplay = root.querySelector('[data-role="sql-quota-display"]');
+    if (sqlSlider && sqlDisplay) {
+      sqlSlider.addEventListener('input', () => {
+        const v = Number(sqlSlider.value) || 0;
+        state.storage.sqlQuotaBytes = v;
+        sqlDisplay.textContent = formatBytes(v);
+      });
+    }
   } else if (state.currentStep === 3) {
     root.querySelectorAll('.wizard-alias-row').forEach((row) => {
       const name = row.dataset.alias;
@@ -475,7 +621,13 @@ function canAdvance() {
 }
 
 async function finalizeInstall() {
-  const ok = window.confirm(I18n.t('install_wizard.final_confirm'));
+  const ok = await TfWindow.confirm({
+    title: I18n.t('install_wizard.final_confirm_title'),
+    message: I18n.t('install_wizard.final_confirm'),
+    confirmLabel: I18n.t('install_wizard.install'),
+    cancelLabel: I18n.t('common.cancel'),
+    icon: 'check',
+  });
   if (!ok) return;
   const payload = {
     addonId: state.addonId || '',

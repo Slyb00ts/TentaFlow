@@ -71,6 +71,7 @@ class TfWindow extends HTMLElement {
     this._onPointerDownFront = this._onPointerDownFront.bind(this);
     this._onViewportResize = this._onViewportResize.bind(this);
     this._onWinResize = this._onWinResize.bind(this);
+    this._onKeyDown = this._onKeyDown.bind(this);
   }
 
   connectedCallback() {
@@ -91,6 +92,9 @@ class TfWindow extends HTMLElement {
     }
     window.addEventListener('resize', this._onViewportResize);
     window.addEventListener('orientationchange', this._onViewportResize);
+    // ESC closes the top-most window (re-uses the close-request cancelable
+    // event so consumers can intercept and prompt e.g. for unsaved changes).
+    document.addEventListener('keydown', this._onKeyDown);
   }
 
   disconnectedCallback() {
@@ -98,6 +102,7 @@ class TfWindow extends HTMLElement {
     window.removeEventListener('pointerup', this._onPointerUp);
     window.removeEventListener('resize', this._onViewportResize);
     window.removeEventListener('orientationchange', this._onViewportResize);
+    document.removeEventListener('keydown', this._onKeyDown);
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
@@ -354,6 +359,24 @@ class TfWindow extends HTMLElement {
     this._recenterIfNeeded();
   }
 
+  _onKeyDown(e) {
+    if (e.key !== 'Escape') return;
+    if (this._closing || !this._win) return;
+    if (this._win.classList.contains('minimized')) return;
+    // Only the top-most window reacts; lower windows ignore ESC so the
+    // stack behaves like a true modal pile.
+    const mine = parseInt(this._win.style.zIndex || '0', 10);
+    const all = document.querySelectorAll('tf-window');
+    let topZ = mine;
+    all.forEach((w) => {
+      if (w === this || !w._win) return;
+      const z = parseInt(w._win.style.zIndex || '0', 10);
+      if (z > topZ) topZ = z;
+    });
+    if (mine < topZ) return;
+    this.close();
+  }
+
   _onViewportResize() {
     // Re-clamp height/width gdy viewport sie zmniejszyl (np. mobile rotate,
     // window resize) - bez tego content moze wystawac poza ekran. CSS
@@ -570,6 +593,14 @@ TfWindow.open = function openWindow(opts = {}) {
       document.body.appendChild(backdrop);
     }
 
+    // Helper bound after window is created; supports both modal backdrop click
+    // and the outside-pointer path. Goes through the cancelable close-request
+    // event so consumers (e.g. install wizard) can intercept for dirty checks.
+    const requestClose = () => {
+      if (!win.isConnected || win._closing) return;
+      win.close();
+    };
+
     const win = document.createElement('tf-window');
     win.setAttribute('title', title);
     if (subtitle) win.setAttribute('subtitle', subtitle);
@@ -649,6 +680,10 @@ TfWindow.open = function openWindow(opts = {}) {
     });
 
     document.body.appendChild(win);
+
+    if (backdrop) {
+      backdrop.addEventListener('click', requestClose);
+    }
   });
 };
 

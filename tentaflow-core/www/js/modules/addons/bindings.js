@@ -34,9 +34,11 @@ export const BindingsTab = {
   },
 };
 
-// Fetches the global alias list and filters client-side to those whose
-// alias name starts with the addon id (best-effort heuristic until backend
-// exposes owner_addon_id on ModelAliasEntry).
+// NOTE: prefix heuristic is a STAND-IN until ModelAliasEntry exposes
+// owner_addon_id (see backend-todo in CHANGELOG). False positive risk:
+// alias 'teams-spy' would appear under addon 'teams' even if owned by
+// another addon. Admin should verify ownership via M16 Aliasy page.
+// This view is READ-ONLY — no destructive action possible on misattributed alias.
 async function loadAliases() {
   try {
     const list = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
@@ -60,7 +62,7 @@ function render() {
     </div>
   `;
   currentContainer.querySelector('#bindings-open-m16')?.addEventListener('click', () => {
-    Router.navigate('services');
+    Router.navigate('services', { tab: 'aliases' });
   });
   currentContainer.querySelector('#bindings-refresh')?.addEventListener('click', async () => {
     await loadAliases();
@@ -100,6 +102,13 @@ function renderAliasesSection() {
     `;
   }
 
+  const heuristicBanner = `
+    <div class="bindings-info bindings-info-warn">
+      <tf-chip status="warn">${escapeHtml(I18n.t('addon_bindings.heuristic_chip'))}</tf-chip>
+      <span>${escapeHtml(I18n.t('addon_bindings.heuristic_note'))}</span>
+    </div>
+  `;
+
   const rows = aliases.map((a) => {
     const active = !!a.is_active;
     const statusLabel = active
@@ -129,6 +138,11 @@ function renderAliasesSection() {
     <section class="section-card">
       ${head}
       ${info}
+      ${heuristicBanner}
+      <!-- Raw <table class="tf-table"> is a project-wide class-only convention
+           (see logs.js, profiling-sessions.js). The <tf-table> component
+           expects array-driven .rows + <tf-column> children; this view stays
+           on the convention to match its siblings. -->
       <table class="tf-table bindings-alias-table">
         <thead>
           <tr>

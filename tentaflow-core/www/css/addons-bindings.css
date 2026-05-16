@@ -51,6 +51,12 @@
   margin-bottom: 12px;
 }
 
+.addon-bindings .bindings-info-warn {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.35);
+  align-items: center;
+}
+
 .addon-bindings .bindings-info .icon {
   width: 14px;
   height: 14px;

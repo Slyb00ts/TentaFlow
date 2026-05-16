@@ -61,9 +61,9 @@ export const Router = {
     // Tryb 2: render() + mount() — standardowe ekrany sidebar.
     content.innerHTML = '<div style="padding:48px;text-align:center;color:var(--text-3);">Ładowanie…</div>';
     try {
-      const html = await screen.render();
+      const html = await screen.render(params || {});
       content.innerHTML = html;
-      if (screen.mount) await screen.mount();
+      if (screen.mount) await screen.mount(params || {});
     } catch (e) {
       console.error(`[router] render ${id} failed`, e);
       content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${e.message}</pre></div>`;
