@@ -23,6 +23,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, watch};
 
+use super::credentials::{credentials_cipher, overlay_credentials};
 use super::error::{CameraIngestError, Result};
 use super::fakefile::{ensure_gst_initialized, FrameCounters, FrameMailbox, LatestFrame};
 use super::session::{
@@ -322,9 +323,29 @@ pub async fn run_rtsp_session(
     publish(&health_tx, &cam_id, CameraStatus::Starting, None, &counters, None);
 
     'outer: loop {
+        // Resolve credentials at every (re)build so an in-flight
+        // `camera_credentials_rotate_v1` takes effect on the next reconnect
+        // without us holding a stale plaintext across iterations.
+        let final_url = match resolve_pipeline_url(&config) {
+            Ok(u) => u,
+            Err(e) => {
+                let reason = redact_url_in_text(&format!("creds: {e}"));
+                publish(
+                    &health_tx,
+                    &cam_id,
+                    CameraStatus::Error,
+                    Some(reason.clone()),
+                    &counters,
+                    None,
+                );
+                streaming_bus().close_camera(&cam_id, &reason).await;
+                drain_until_stop(&mut cmd_rx, &health_tx).await;
+                return;
+            }
+        };
         let pipeline = match build_rtsp_pipeline(
             cam_id.clone(),
-            &config.url,
+            &final_url,
             timeout_secs,
             mailbox.clone(),
             counters.clone(),
@@ -556,6 +577,23 @@ pub async fn run_rtsp_session(
         }
         backoff = next_backoff(backoff, policy.max_backoff);
     }
+}
+
+/// Build the URL handed to GStreamer's `rtspsrc`. When the camera has an
+/// encrypted credentials blob attached, we decrypt it on demand and overlay
+/// `user:pass` into the URL right before the pipeline is wired. The
+/// resulting plaintext lives only on the stack of this helper — it never
+/// touches the DB and never appears in logs (we route any error through
+/// `redact_url_in_text` at the call site so a malformed credential cannot
+/// leak via the status_message field).
+fn resolve_pipeline_url(config: &CameraConfig) -> std::result::Result<String, String> {
+    let Some(blob) = config.credentials_encrypted.as_ref() else {
+        return Ok(config.url.clone());
+    };
+    let creds = credentials_cipher()
+        .decrypt(blob)
+        .map_err(|e| e.to_string())?;
+    overlay_credentials(&config.url, &creds).map_err(|e| e.to_string())
 }
 
 fn jittered(policy: &ReconnectPolicy, base: Duration) -> Duration {
