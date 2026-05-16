@@ -12,10 +12,13 @@
 //   1. `resolve_model_alias_for_addon` — read transaction across
 //      `model_aliases`, `model_alias_owners`, `model_alias_visibility`,
 //      `addon_uses_alias`, `model_alias_consumers` (F1a §6.6 alias gate).
-//   2. `alias_calls` insert — durable per-call audit row (FK to
+//   2. `alias_id` lookup in `model_aliases` — `log_alias_call` re-queries
+//      the id on every dispatch (no caching across calls).
+//   3. `alias_calls` insert — durable per-call audit row (FK to
 //      `model_aliases`, indexed on `alias_id` + `ts`).
-//   3. `audit_log` insert with risk class — the same A-class compliance row
-//      every host fn writes.
+//   4. `audit_log` insert with risk class — the same A-class compliance row
+//      every host fn writes; `action_hash` computed via the production
+//      FNV-1a (i64) routine used by `audit_log_with_risk`.
 //
 // We bench (1)+(2)+(3) on an in-memory SQLite that has the full production
 // schema applied via `db::migrations::run`. The remaining cost of the host
@@ -107,15 +110,28 @@ fn insert_alias_call(conn: &Connection, alias_id: i64, request_id: &str) {
     .expect("alias_calls insert");
 }
 
+// Production FNV-1a (i64) hash used by `audit_log_with_risk` for `action_hash`.
+// Replicated here so the bench charges the same compute as the host fn instead
+// of inserting a constant 0.
+fn fnv1a_hash(s: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash as i64
+}
+
 // Mirrors `audit_log_with_risk` but uses a held connection so the bench
 // stays in-process and does not contend on the Mutex on every iter.
 fn insert_audit_log(conn: &Connection, request_id: &str) {
+    let action_hash = fnv1a_hash("service.request");
     conn.execute(
         "INSERT INTO audit_log \
              (user_id, addon_id, instance_id, action, resource_type, resource_id, \
               result, error_message, action_hash, risk_class, related_claim_id, request_id) \
-         VALUES (NULL, ?1, NULL, 'service.request', 'service', ?2, 'ok', NULL, 0, 'A', NULL, ?3)",
-        params![CALLER_ADDON, ALIAS_NAME, request_id],
+         VALUES (NULL, ?1, NULL, 'service.request', 'service', ?2, 'ok', NULL, ?3, 'A', NULL, ?4)",
+        params![CALLER_ADDON, ALIAS_NAME, action_hash, request_id],
     )
     .expect("audit_log insert");
 }
@@ -143,15 +159,6 @@ fn bench_alias_resolve(c: &mut Criterion) {
     // production `service_call_v1` charges per call before dispatching to the
     // backend service.
     group.bench_function("full_overhead", |b| {
-        let alias_id: i64 = {
-            let conn = pool.lock().unwrap();
-            conn.query_row(
-                "SELECT id FROM model_aliases WHERE alias = ?1",
-                params![ALIAS_NAME],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
         let mut req_seq: u64 = 0;
         b.iter(|| {
             req_seq = req_seq.wrapping_add(1);
@@ -165,6 +172,16 @@ fn bench_alias_resolve(c: &mut Criterion) {
             )
             .expect("resolve");
             let conn = pool.lock().unwrap();
+            // Per-call alias_id lookup mirrors `log_alias_call` in
+            // `service.rs` — production pays this query on every dispatch
+            // because the host fn does not cache the id across calls.
+            let alias_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM model_aliases WHERE alias = ?1",
+                    params![ALIAS_NAME],
+                    |row| row.get(0),
+                )
+                .expect("alias id lookup");
             insert_alias_call(&conn, alias_id, &request_id);
             insert_audit_log(&conn, &request_id);
             drop(conn);
