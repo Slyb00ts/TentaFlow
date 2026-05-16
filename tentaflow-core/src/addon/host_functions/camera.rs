@@ -22,6 +22,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -55,10 +56,24 @@ const PERM_CAMERAS_SNAPSHOT: &str = "cameras.snapshot";
 // Vendor whitelist (F1a)
 // =============================================================================
 
-const SUPPORTED_VENDORS: &[&str] = &["fake_file", "rtsp"];
+/// Vendors that `camera_add_v1` will persist as a managed session. ONVIF
+/// stays off this list because the device-service URL is not a streamable
+/// URL — operators must first run `camera_discover_v1`, pull the RTSP media
+/// URI off the discovered profile, and call `camera_add_v1` with
+/// `vendor='rtsp'`. Wiring GetStreamUri into the add path is a later
+/// milestone (it requires WS-Security UsernameToken auth on top of SOAP).
+const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp"];
 
-fn vendor_supported(v: &str) -> bool {
-    SUPPORTED_VENDORS.iter().any(|s| *s == v)
+/// Vendors `camera_test_connection_v1` knows how to probe. ONVIF is included
+/// — we probe its device-service HTTP endpoint as a reachability check.
+const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif"];
+
+fn vendor_addable(v: &str) -> bool {
+    ADDABLE_VENDORS.iter().any(|s| *s == v)
+}
+
+fn vendor_testable(v: &str) -> bool {
+    TESTABLE_VENDORS.iter().any(|s| *s == v)
 }
 
 fn retention_class_valid(rc: &str) -> bool {
@@ -299,9 +314,21 @@ struct CameraRemoveOut {
     removed: bool,
 }
 
+/// Single entry in the `camera_discover_v1` response. Discovered devices
+/// are not yet persisted (no `camera_id`), so this is a leaner shape than
+/// `CameraInfoOut`.
+#[derive(Debug, Serialize)]
+struct DiscoveredCameraOut {
+    address: String,
+    xaddrs: Vec<String>,
+    types: Vec<String>,
+    manufacturer: String,
+    model: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CameraDiscoverOut {
-    discovered: Vec<CameraInfoOut>,
+    discovered: Vec<DiscoveredCameraOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -468,7 +495,7 @@ fn validate_vendor(v: &str) -> Result<(), &'static str> {
     if v.is_empty() || v.len() > MAX_VENDOR {
         return Err("vendor_length");
     }
-    if !vendor_supported(v) {
+    if !vendor_addable(v) {
         return Err("unsupported_vendor");
     }
     Ok(())
@@ -545,6 +572,99 @@ fn validate_userinfo_plaintext(plain: &str) -> Result<(), &'static str> {
         return Err("credentials_pass_unsafe_chars");
     }
     Ok(())
+}
+
+// =============================================================================
+// Live-probe helpers used by camera_test_connection_v1
+// =============================================================================
+
+/// One-shot RTSP OPTIONS probe. Opens a plain TCP connection (RTSP/1.0 over
+/// TCP), sends an OPTIONS request and reads up to 1 KiB of reply. Anything
+/// other than a `RTSP/1.0 2xx` / `RTSP/2.0 2xx` / `401 Unauthorized` status
+/// line is reported as failure. `401` is accepted as a positive signal that
+/// the server responded — `test_connection` is anonymous so an auth-required
+/// camera should not be flagged unreachable. All embedded credentials are
+/// stripped from error messages via `redact_rtsp_url` / `redact_url_in_text`.
+async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String> {
+    use crate::services::camera_ingest::rtsp::{redact_rtsp_url, redact_url_in_text};
+    let parsed = url::Url::parse(url)
+        .map_err(|e| format!("invalid URL: {}", redact_url_in_text(&e.to_string())))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "missing host".to_string())?
+        .to_string();
+    let port = parsed.port().unwrap_or(554);
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    let request_uri = format!("rtsp://{host}:{port}{path}");
+    let redacted = redact_rtsp_url(url);
+
+    let dur = Duration::from_secs(timeout_secs);
+    let stream = tokio::time::timeout(
+        dur,
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| format!("connect timeout: {redacted}"))?
+    .map_err(|e| format!("tcp connect failed: {e}"))?;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = stream;
+    let req = format!(
+        "OPTIONS {request_uri} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: TentaFlow/F1b\r\n\r\n"
+    );
+    tokio::time::timeout(dur, stream.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| "write timeout".to_string())?
+        .map_err(|e| format!("write failed: {e}"))?;
+
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(dur, stream.read(&mut buf))
+        .await
+        .map_err(|_| "read timeout".to_string())?
+        .map_err(|e| format!("read failed: {e}"))?;
+    if n == 0 {
+        return Err("server closed connection without reply".into());
+    }
+    let response = std::str::from_utf8(&buf[..n]).unwrap_or("(non-utf8 response)");
+    let status = response.lines().next().unwrap_or("");
+    // Accept 2xx and 401 (auth challenge means the server is alive).
+    let ok = (status.starts_with("RTSP/1.0 2") || status.starts_with("RTSP/2.0 2"))
+        || status.starts_with("RTSP/1.0 401")
+        || status.starts_with("RTSP/2.0 401");
+    if !ok {
+        return Err(format!(
+            "RTSP server returned: {}",
+            redact_url_in_text(status)
+        ));
+    }
+    Ok(())
+}
+
+/// HTTP HEAD probe against the ONVIF device-service endpoint. The input URL
+/// is expected to either be the full device-service URL (as returned by
+/// `camera_discover_v1` in `xaddrs`) or a bare `http(s)://host[:port]/...`
+/// — in the latter case we still hit whatever path the caller passed. Any
+/// HTTP reply (200 / 401 / 405) means the device is reachable; only network
+/// failures / timeouts are reported as unreachable.
+async fn onvif_test_connection(url: &str, timeout_secs: u64) -> Result<String, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("ONVIF probe requires http(s) URL, got: {}", parsed.scheme()));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("http client init: {e}"))?;
+    let resp = client
+        .head(parsed.clone())
+        .send()
+        .await
+        .map_err(|e| format!("http: {e}"))?;
+    Ok(format!("ONVIF endpoint responded HTTP {}", resp.status().as_u16()))
 }
 
 // =============================================================================
@@ -1249,7 +1369,7 @@ pub fn camera_health_v1(
 }
 
 // =============================================================================
-// Host function: camera_discover_v1 — F1a no-op (enumeration only → Risk B)
+// Host function: camera_discover_v1 — WS-Discovery on the local LAN (Risk B)
 // =============================================================================
 
 pub fn camera_discover_v1(
@@ -1266,8 +1386,38 @@ pub fn camera_discover_v1(
         audit(caller.data(), "camera.discover", None, RiskClass::B, "denied", Some("missing_permission"));
         return AbiError::Permission.as_i32();
     }
-    audit(caller.data(), "camera.discover", None, RiskClass::B, "ok", Some("f1a_empty"));
-    let out = CameraDiscoverOut { discovered: Vec::new() };
+    let cameras = run_async(async {
+        crate::services::camera_ingest::onvif_discovery::discover(
+            crate::services::camera_ingest::onvif_discovery::DiscoveryOptions::default(),
+        )
+        .await
+    });
+    let discovered: Vec<DiscoveredCameraOut> = match cameras {
+        Ok(list) => list
+            .into_iter()
+            .map(|c| DiscoveredCameraOut {
+                address: c.address,
+                xaddrs: c.xaddrs,
+                types: c.types,
+                manufacturer: c.manufacturer,
+                model: c.model,
+            })
+            .collect(),
+        Err(e) => {
+            warn!("camera.discover ws-discovery failed: {e}");
+            audit(caller.data(), "camera.discover", None, RiskClass::B, "error", Some("ws_discovery_failed"));
+            Vec::new()
+        }
+    };
+    audit(
+        caller.data(),
+        "camera.discover",
+        None,
+        RiskClass::B,
+        "ok",
+        Some(&format!("count={}", discovered.len())),
+    );
+    let out = CameraDiscoverOut { discovered };
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
@@ -1314,7 +1464,7 @@ pub fn camera_test_connection_v1(
         audit(caller.data(), "camera.test_connection", None, RiskClass::A, "denied", Some(reason));
         return AbiError::Operation.as_i32();
     }
-    if !vendor_supported(&input.vendor) {
+    if !vendor_testable(&input.vendor) {
         audit(caller.data(), "camera.test_connection", None, RiskClass::A, "ok", Some("unsupported_vendor"));
         let out = CameraTestConnectionOut {
             ok: false,
@@ -1333,18 +1483,22 @@ pub fn camera_test_connection_v1(
                 message: e.to_string(),
             },
         },
-        "rtsp" => match crate::services::camera_ingest::rtsp::validate_rtsp_url(&input.url) {
-            // Surface-level URL validation only — a real RTSP DESCRIBE probe
-            // is intentionally out of scope here. Live connectivity is
-            // verified by the supervisor once the camera is added.
-            Ok(_) => CameraTestConnectionOut {
-                ok: true,
-                message: "rtsp url well-formed".to_string(),
-            },
-            Err(e) => CameraTestConnectionOut {
-                ok: false,
-                message: e.to_string(),
-            },
+        "rtsp" => {
+            if let Err(e) = crate::services::camera_ingest::rtsp::validate_rtsp_url(&input.url) {
+                CameraTestConnectionOut { ok: false, message: e.to_string() }
+            } else {
+                match run_async(rtsp_test_connection(&input.url, 5)) {
+                    Ok(()) => CameraTestConnectionOut {
+                        ok: true,
+                        message: "rtsp OPTIONS 200 OK".to_string(),
+                    },
+                    Err(msg) => CameraTestConnectionOut { ok: false, message: msg },
+                }
+            }
+        }
+        "onvif" => match run_async(onvif_test_connection(&input.url, 5)) {
+            Ok(note) => CameraTestConnectionOut { ok: true, message: note },
+            Err(msg) => CameraTestConnectionOut { ok: false, message: msg },
         },
         other => CameraTestConnectionOut {
             ok: false,
