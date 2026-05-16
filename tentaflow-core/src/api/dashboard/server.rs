@@ -917,6 +917,35 @@ pub async fn handle_request(
             HDR_FRAME_PTS, HDR_FRAME_REF, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH, HDR_PICKUP_TOKEN,
             HDR_REQUEST_ID, HDR_SERVICE_ID,
         };
+        // mTLS pinning gate: if the operator enabled `pickup_required`, the
+        // connecting peer MUST present a client cert whose SHA-256 fingerprint
+        // is on the allowlist. Default (single-node F1a/F1b) is `false`, in
+        // which case this check is a no-op and HMAC token auth stands alone.
+        let mtls_cfg = crate::api::mtls::pickup_mtls_config();
+        if mtls_cfg.pickup_required {
+            let peer_der = req
+                .extensions()
+                .get::<crate::api::mtls::ClientCertDer>()
+                .map(|c| c.0.clone());
+            let allowed = peer_der
+                .as_deref()
+                .map(|der| mtls_cfg.matches(der))
+                .unwrap_or(false);
+            if !allowed {
+                warn!(
+                    "/core/frame/pickup: mTLS pinning denied from {} (peer_cert_present={})",
+                    client_ip,
+                    peer_der.is_some()
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"mtls_required\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
         if let Err(resp) =
             check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/core/frame/pickup")
         {
