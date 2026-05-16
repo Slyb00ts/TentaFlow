@@ -381,13 +381,42 @@ fn apply_signed_url_security_headers(
 /// 429 denial, plus the count of denials inside the current window. We do
 /// not want to write one row per refused token, so we coalesce: at most one
 /// row per `AUDIT_429_WINDOW` per IP, carrying the in-window count.
+///
+/// Bounded by both an idle sweep (entries whose window has fully elapsed
+/// twice over are useless) and a hard cap (LRU-evict the oldest 25 % once
+/// `MAX_AUDIT_ENTRIES` is reached). Without these the map would grow
+/// unbounded under a flood of unique forged-token attackers.
 static RATE_LIMIT_AUDIT: std::sync::OnceLock<
     dashmap::DashMap<String, (std::time::Instant, u32)>,
 > = std::sync::OnceLock::new();
 const AUDIT_429_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const AUDIT_IDLE_EVICT_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_AUDIT_ENTRIES: usize = 10_000;
 
 fn rate_limit_audit_map() -> &'static dashmap::DashMap<String, (std::time::Instant, u32)> {
     RATE_LIMIT_AUDIT.get_or_init(dashmap::DashMap::new)
+}
+
+/// Amortized cleanup: called from `build_rate_limit_response`. Cheap when the
+/// map is small (early-returns), aggressive once it crosses 1 000 entries.
+fn sweep_rate_limit_audit(now: std::time::Instant) {
+    let map = rate_limit_audit_map();
+    if map.len() < 1_000 {
+        return;
+    }
+    map.retain(|_, (last_seen, _)| now.saturating_duration_since(*last_seen) < AUDIT_IDLE_EVICT_AFTER);
+    if map.len() >= MAX_AUDIT_ENTRIES {
+        let target = MAX_AUDIT_ENTRIES * 3 / 4;
+        let mut snapshot: Vec<(String, std::time::Instant)> = map
+            .iter()
+            .map(|e| (e.key().clone(), e.value().0))
+            .collect();
+        snapshot.sort_by_key(|(_, ts)| *ts);
+        let drop_count = snapshot.len().saturating_sub(target);
+        for (key, _) in snapshot.into_iter().take(drop_count) {
+            map.remove(&key);
+        }
+    }
 }
 
 /// Build a 429 response and emit a collapsed-audit row if the per-IP window
@@ -404,6 +433,7 @@ fn build_rate_limit_response(
     let retry_after = retry_after_secs.ceil().max(1.0) as u64;
     let key = format!("{ip}|{endpoint}");
     let now = std::time::Instant::now();
+    sweep_rate_limit_audit(now);
     let mut entry = rate_limit_audit_map().entry(key).or_insert((now, 0));
     let elapsed = now.saturating_duration_since(entry.0);
     entry.1 = entry.1.saturating_add(1);
