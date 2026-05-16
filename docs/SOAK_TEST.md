@@ -186,6 +186,26 @@ Logs and `CameraHealth.status_message` redact RTSP credentials (`user:pass@`
 is replaced with `***:***@`) before emission, so it is safe to attach raw
 logs to bug reports.
 
+## ONVIF camera testing (F1b P1.D)
+
+ONVIF discovery uses UDP multicast 239.255.255.250:3702 (WS-Discovery).
+Requirements:
+- Network: outbound multicast permitted (firewall/router)
+- LAN ONVIF camera (Hikvision, Axis, Dahua, etc.) responding to Probe
+- Or ONVIF simulator: https://github.com/Vorlent/onvif-discovery-server
+
+Integration test paths:
+- `cargo test --features camera,dashboard-api --test camera_onvif_integration -- --include-ignored`
+  (requires live ONVIF device on LAN)
+
+ONVIF cameras are discovery-only in F1b. To add as camera, operator
+extracts the RTSP stream URI from discovery output (manufacturer scope)
+and adds via `vendor='rtsp'`. ONVIF profile retrieval (GetStreamUri SOAP)
+deferred to F1c.
+
+`camera_test_connection_v1` for ONVIF forces path `/onvif/device_service`
+to prevent arbitrary HTTP target probing.
+
 ## Troubleshooting
 
 - **`tentaflow died during warm-up`** — see `logs/tentaflow.log`. Usually a

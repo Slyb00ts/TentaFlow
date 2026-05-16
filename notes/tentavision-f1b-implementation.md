@@ -1,6 +1,6 @@
 # TentaVision F1b — Implementation Plan
 
-**Status:** Phase 1 in progress (RTSP/ONVIF camera vendors)
+**Status:** Phase 1 done (P1.A/B/C/D — RTSP/ONVIF camera vendors)
 **Source:** `notes/tentavision-f1b-handoff.md` (F1a → F1b)
 **Started:** 2026-05-16 (post v0.1.0-f1a tag)
 
@@ -113,7 +113,14 @@ ustalona.
 - Testy: 13 unit (credentials.rs::tests) + 6 integration
   (tests/credentials_rotation.rs) — wszystkie zielone.
 
-### P1.D — ONVIF discovery (pending)
+### P1.D — ONVIF discovery (done, commit 3acf1b8 + SSRF hardening)
+
+`onvif_test_connection` forces the probe URL path under `/onvif/` so an
+addon cannot use `camera_test_connection_v1` to HEAD arbitrary HTTP
+targets on the local network. Unit test
+`test_onvif_test_connection_forces_onvif_path` covers the three branches
+(bare host, ONVIF sub-service preserved, arbitrary path rewritten).
+
 
 **Scope:**
 - WS-Discovery przez UDP multicast 239.255.255.250:3702.
