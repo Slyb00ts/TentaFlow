@@ -326,6 +326,40 @@ fn handle_result(result: anyhow::Result<(u16, String)>, error_status: u16) -> (u
     }
 }
 
+/// Reject any GET that smuggles a body onto an unauthenticated signed-URL
+/// endpoint. Returns a pre-built 413 response when the request carries a
+/// non-empty `Content-Length` or any `Transfer-Encoding` — preventing
+/// pre-HMAC memory exhaustion. The body is *never* read here; the caller
+/// should drop the request after this check so the connection terminates
+/// without slurping bytes off the socket.
+fn reject_unauth_get_body(
+    headers: &hyper::HeaderMap,
+) -> std::result::Result<(), Response<DashboardBody>> {
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
+        return Err(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from_static(
+                b"{\"error\":\"body_not_allowed\"}",
+            ))))
+            .unwrap());
+    }
+    let cl = headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    match cl {
+        None | Some(0) => Ok(()),
+        Some(_) => Err(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from_static(
+                b"{\"error\":\"body_not_allowed\"}",
+            ))))
+            .unwrap()),
+    }
+}
+
 /// Wyciaga Bearer token z naglowka Authorization
 fn extract_bearer_token(req: &Request<Incoming>) -> Option<&str> {
     req.headers()
@@ -824,25 +858,22 @@ pub async fn handle_request(
             handle_frame_url, parse_query, FrameOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT,
             HDR_FRAME_PTS, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
         };
-        const URL_BODY_LIMIT: u64 = 1024;
-        let content_length: u64 = req
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        if content_length > URL_BODY_LIMIT {
-            return Ok(Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .header("Content-Type", "application/json")
-                .body(Either::Left(Full::new(Bytes::from_static(
-                    b"{\"error\":\"payload_too_large\"}",
-                ))))
-                .unwrap());
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
         }
-        let _ = req.collect().await?;
+        drop(req);
         let path_ref = path.strip_prefix("/frames/").unwrap_or("");
-        let q = parse_query(&query_string);
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
         let issuer = crate::services::frame_url_issuer();
         let storage = crate::services::frame_storage();
         let outcome = handle_frame_url(path_ref, &q, issuer, storage, &db);
@@ -895,50 +926,70 @@ pub async fn handle_request(
     // (snapshot encoder + segment muxer + DB row helpers) is camera-gated.
     #[cfg(feature = "camera")]
     if method == Method::GET && path.starts_with("/recordings/") && path.len() > "/recordings/".len() {
-        use crate::api::recording::{handle_recording_url, parse_query, RecordingOutcome};
-        const URL_BODY_LIMIT: u64 = 1024;
-        let content_length: u64 = req
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        if content_length > URL_BODY_LIMIT {
-            return Ok(Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .header("Content-Type", "application/json")
-                .body(Either::Left(Full::new(Bytes::from_static(
-                    b"{\"error\":\"payload_too_large\"}",
-                ))))
-                .unwrap());
+        use crate::api::recording::{
+            handle_recording_url, parse_query, read_recording_file, RecordingFileOutcome,
+            RecordingOutcome,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
         }
-        let _ = req.collect().await?;
+        drop(req);
         let path_ref = path.strip_prefix("/recordings/").unwrap_or("");
-        let q = parse_query(&query_string);
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
         let issuer = crate::services::recording_url_issuer();
         let outcome = handle_recording_url(path_ref, &q, issuer, &db);
-        let status = outcome.http_status();
+        let auth_status = outcome.http_status();
         match outcome {
             RecordingOutcome::Ok {
-                bytes,
                 content_type,
                 hash_sha256,
                 created_at,
-                file_size_bytes: _,
+                file_size_bytes,
+                file_path,
+                retention_class,
+                owner_addon_id,
             } => {
-                let body = Bytes::from(bytes);
-                return Ok(Response::builder()
-                    .status(status)
-                    .header("Content-Type", content_type)
-                    .header("X-Recording-Hash", hash_sha256)
-                    .header("X-Recording-Created-At", created_at.to_string())
-                    .body(Either::Left(Full::new(body)))
-                    .unwrap());
+                let file_outcome = read_recording_file(
+                    &db,
+                    path_ref,
+                    &file_path,
+                    &retention_class,
+                    &owner_addon_id,
+                    file_size_bytes,
+                )
+                .await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    RecordingFileOutcome::Ok { bytes } => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", content_type)
+                        .header("X-Recording-Hash", hash_sha256)
+                        .header("X-Recording-Created-At", created_at.to_string())
+                        .body(Either::Left(Full::new(Bytes::from(bytes))))
+                        .unwrap()),
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"recording_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
             }
             RecordingOutcome::BadRequest(why) => {
                 let body = format!("{{\"error\":\"{}\"}}", why);
                 return Ok(Response::builder()
-                    .status(status)
+                    .status(400)
                     .header("Content-Type", "application/json")
                     .body(Either::Left(Full::new(Bytes::from(body))))
                     .unwrap());
@@ -947,7 +998,7 @@ pub async fn handle_request(
             | RecordingOutcome::NotFound
             | RecordingOutcome::InternalError(_) => {
                 return Ok(Response::builder()
-                    .status(status)
+                    .status(auth_status)
                     .header("Content-Type", "application/json")
                     .body(Either::Left(Full::new(Bytes::from_static(
                         b"{\"error\":\"recording_denied\"}",

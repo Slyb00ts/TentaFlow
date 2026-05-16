@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -33,7 +33,8 @@ use tentaflow_core::api::frames::{
     HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
 };
 use tentaflow_core::api::recording::{
-    handle_recording_url, parse_query as parse_rec_query, RecordingOutcome,
+    handle_recording_url, parse_query as parse_rec_query, read_recording_file,
+    RecordingFileOutcome, RecordingOutcome,
 };
 use tentaflow_core::db::repository::insert_recording;
 use tentaflow_core::db::DbPool;
@@ -129,29 +130,86 @@ async fn router(
     let uri = req.uri().clone();
     let path = uri.path().to_string();
     let query_string = uri.query().unwrap_or("").to_string();
-    let _ = req.into_body().collect().await.ok();
+    let headers = req.headers().clone();
+    drop(req);
+
+    // Mirror production: any non-empty body on these GETs is a 413.
+    if (path.starts_with("/recordings/") || path.starts_with("/frames/"))
+        && method == Method::GET
+    {
+        if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from_static(b"{\"error\":\"body_not_allowed\"}")))
+                .unwrap();
+        }
+        let cl = headers
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if cl > 0 {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from_static(b"{\"error\":\"body_not_allowed\"}")))
+                .unwrap();
+        }
+    }
 
     if method == Method::GET && path.starts_with("/recordings/") {
         let path_ref = path.strip_prefix("/recordings/").unwrap_or("");
-        let q = parse_rec_query(&query_string);
+        let q = match parse_rec_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap();
+            }
+        };
         let outcome = handle_recording_url(path_ref, &q, rec_issuer, db);
-        let status = outcome.http_status();
+        let auth_status = outcome.http_status();
         return match outcome {
             RecordingOutcome::Ok {
-                bytes,
                 content_type,
                 hash_sha256,
                 created_at,
-                file_size_bytes: _,
-            } => Response::builder()
-                .status(status)
-                .header("Content-Type", content_type)
-                .header("X-Recording-Hash", hash_sha256)
-                .header("X-Recording-Created-At", created_at.to_string())
-                .body(Full::new(Bytes::from(bytes)))
-                .unwrap(),
+                file_size_bytes,
+                file_path,
+                retention_class,
+                owner_addon_id,
+            } => {
+                let file_outcome = read_recording_file(
+                    db,
+                    path_ref,
+                    &file_path,
+                    &retention_class,
+                    &owner_addon_id,
+                    file_size_bytes,
+                )
+                .await;
+                let status = file_outcome.http_status();
+                match file_outcome {
+                    RecordingFileOutcome::Ok { bytes } => Response::builder()
+                        .status(status)
+                        .header("Content-Type", content_type)
+                        .header("X-Recording-Hash", hash_sha256)
+                        .header("X-Recording-Created-At", created_at.to_string())
+                        .body(Full::new(Bytes::from(bytes)))
+                        .unwrap(),
+                    _ => Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from_static(b"{\"error\":\"unavailable\"}")))
+                        .unwrap(),
+                }
+            }
             _ => Response::builder()
-                .status(status)
+                .status(auth_status)
                 .header("Content-Type", "application/json")
                 .body(Full::new(Bytes::from_static(b"{\"error\":\"denied\"}")))
                 .unwrap(),
@@ -160,7 +218,17 @@ async fn router(
 
     if method == Method::GET && path.starts_with("/frames/") {
         let path_ref = path.strip_prefix("/frames/").unwrap_or("");
-        let q = parse_frame_query(&query_string);
+        let q = match parse_frame_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap();
+            }
+        };
         let outcome = handle_frame_url(path_ref, &q, frame_issuer, storage, db);
         let status = outcome.http_status();
         return match outcome {
@@ -452,6 +520,168 @@ async fn test_e2e_frame_url_multi_fetch_in_ttl_ok() {
         assert_eq!(body.as_ref(), payload.as_slice());
     }
     assert_eq!(audit_log_count(&env.db, "frame_url_access", "ok"), 3);
+}
+
+// -----------------------------------------------------------------------------
+// New regression tests — body DoS / size cap / strict query parsing
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_e2e_recording_url_duplicate_token_returns_400() {
+    let env = spawn_server().await;
+    let (rec_ref, _home, _) = save_and_register(&env, "addon-dup", "cam_e2e_dup").await;
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    let url = format!(
+        "http://{}/recordings/{}?token={}&token=XX&exp={}&ref={}",
+        env.addr,
+        rec_ref,
+        urlencoding::encode(&signed.token_b64),
+        signed.expiry_unix_ms,
+        rec_ref,
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn test_e2e_recording_url_unknown_key_returns_400() {
+    let env = spawn_server().await;
+    let (rec_ref, _home, _) = save_and_register(&env, "addon-uk", "cam_e2e_uk").await;
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    let url = format!(
+        "http://{}/recordings/{}?token={}&exp={}&ref={}&extra=foo",
+        env.addr,
+        rec_ref,
+        urlencoding::encode(&signed.token_b64),
+        signed.expiry_unix_ms,
+        rec_ref,
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn test_e2e_recording_url_chunked_body_rejected_413() {
+    let env = spawn_server().await;
+    let (rec_ref, _home, _) = save_and_register(&env, "addon-chunk", "cam_e2e_chunk").await;
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    // Hand-roll the request because reqwest collapses GET-with-body in odd
+    // ways. We use a raw TCP write of an HTTP/1.1 request with
+    // `Transfer-Encoding: chunked` so the server's pre-collect gate fires.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(env.addr).await.expect("connect");
+    let request = format!(
+        "GET /recordings/{rec_ref}?{query} HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        rec_ref = rec_ref,
+        query = signed.query_string(),
+        host = env.addr,
+    );
+    sock.write_all(request.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sock.read_to_end(&mut buf)).await;
+    let head = String::from_utf8_lossy(&buf);
+    assert!(
+        head.starts_with("HTTP/1.1 413"),
+        "expected 413, got: {}",
+        head.lines().next().unwrap_or("")
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_recording_url_content_length_nonzero_rejected_413() {
+    let env = spawn_server().await;
+    let (rec_ref, _home, _) = save_and_register(&env, "addon-cl", "cam_e2e_cl").await;
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(env.addr).await.expect("connect");
+    let body = "x";
+    let request = format!(
+        "GET /recordings/{rec_ref}?{query} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {clen}\r\n\r\n{body}",
+        rec_ref = rec_ref,
+        query = signed.query_string(),
+        host = env.addr,
+        clen = body.len(),
+        body = body,
+    );
+    sock.write_all(request.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sock.read_to_end(&mut buf)).await;
+    let head = String::from_utf8_lossy(&buf);
+    assert!(
+        head.starts_with("HTTP/1.1 413"),
+        "expected 413, got: {}",
+        head.lines().next().unwrap_or("")
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_recording_url_missing_file_returns_404() {
+    let env = spawn_server().await;
+    let (rec_ref, _home, _) = save_and_register(&env, "addon-miss", "cam_e2e_miss").await;
+    // Delete the file on disk; DB row is still there.
+    {
+        let conn = env.db.lock().expect("db lock");
+        let file_path: String = conn
+            .query_row(
+                "SELECT file_path FROM recordings WHERE ref = ?1",
+                rusqlite::params![rec_ref],
+                |row| row.get(0),
+            )
+            .expect("file_path");
+        drop(conn);
+        let _ = std::fs::remove_file(&file_path);
+    }
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    let url = format!(
+        "http://{}/recordings/{}?{}",
+        env.addr,
+        rec_ref,
+        signed.query_string()
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_e2e_recording_url_file_size_mismatch_returns_500() {
+    let env = spawn_server().await;
+    let (rec_ref, _home, _) = save_and_register(&env, "addon-int", "cam_e2e_int").await;
+    // Bump the DB-recorded size so it disagrees with on-disk reality.
+    {
+        let conn = env.db.lock().expect("db lock");
+        conn.execute(
+            "UPDATE recordings SET file_size_bytes = file_size_bytes + 999 WHERE ref = ?1",
+            rusqlite::params![rec_ref],
+        )
+        .expect("bump size");
+    }
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    let url = format!(
+        "http://{}/recordings/{}?{}",
+        env.addr,
+        rec_ref,
+        signed.query_string()
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    assert_eq!(resp.status().as_u16(), 500);
+}
+
+#[tokio::test]
+async fn test_e2e_frame_url_duplicate_key_returns_400() {
+    let env = spawn_server().await;
+    let payload = vec![0x11u8; 8 * 4 * 3];
+    let frame_ref = frame_storage_insert(&env.storage, "cam_dup_f", payload);
+    let signed = env.frame_issuer.issue(frame_ref.clone(), 120).expect("issue");
+    let url = format!(
+        "http://{}/frames/{}?token={}&token=XX&exp={}&ref={}",
+        env.addr,
+        frame_ref,
+        urlencoding::encode(&signed.token_b64),
+        signed.expiry_unix_ms,
+        frame_ref,
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    assert_eq!(resp.status().as_u16(), 400);
 }
 
 #[tokio::test]
