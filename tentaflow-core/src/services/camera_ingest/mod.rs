@@ -9,6 +9,7 @@
 pub mod credentials;
 pub mod error;
 pub mod fakefile;
+pub mod onvif_discovery;
 pub mod rtsp;
 pub mod session;
 pub mod supervisor;
