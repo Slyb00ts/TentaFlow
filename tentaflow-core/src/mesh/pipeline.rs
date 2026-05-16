@@ -1996,6 +1996,57 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
+                Ok(IrohMeshEvent::FrameProxyRequestReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    // P3.C-1 stage: wire wiring only; server/client logic
+                    // lands in P3.C-2. The dispatch arm is reachable now
+                    // that the protocol discriminants are connected to the
+                    // event bus, but we intentionally do not look up the
+                    // local frame store or send a response yet. Silently
+                    // dropping the request avoids storms of NotFound
+                    // replies while the server-side handler is in flight.
+                    debug!(
+                        peer = %from_node_id,
+                        raw_ref = %payload.raw_ref,
+                        request_id = %payload.request_id,
+                        "FrameProxyRequest received (P3.C-1 placeholder dispatch)"
+                    );
+                }
+                Ok(IrohMeshEvent::FrameProxyResponseReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    // P3.C-1 stage: wire wiring only; pending-map resolve
+                    // lands in P3.C-2. No requests are issued at this
+                    // stage, so any response we observe is either from a
+                    // peer ahead of us in the rollout or a race; logging
+                    // the discriminant variant is enough for diagnostics.
+                    let (raw_ref, request_id, kind) = match &payload {
+                        tentaflow_protocol::mesh::FrameProxyResponsePayload::Found {
+                            raw_ref,
+                            request_id,
+                            ..
+                        } => (raw_ref.as_str(), request_id.as_str(), "found"),
+                        tentaflow_protocol::mesh::FrameProxyResponsePayload::NotFound {
+                            raw_ref,
+                            request_id,
+                        } => (raw_ref.as_str(), request_id.as_str(), "not_found"),
+                        tentaflow_protocol::mesh::FrameProxyResponsePayload::Unavailable {
+                            raw_ref,
+                            request_id,
+                            ..
+                        } => (raw_ref.as_str(), request_id.as_str(), "unavailable"),
+                    };
+                    debug!(
+                        peer = %from_node_id,
+                        raw_ref = %raw_ref,
+                        request_id = %request_id,
+                        kind = %kind,
+                        "FrameProxyResponse received (P3.C-1 placeholder dispatch)"
+                    );
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Event receiver opuscil {} wiadomosci", n);

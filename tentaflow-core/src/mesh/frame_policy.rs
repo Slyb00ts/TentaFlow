@@ -104,4 +104,19 @@ mod tests {
         assert!(!is_pre_trust_frame(0xFF));
         assert!(!is_pre_trust_frame(0x00));
     }
+
+    #[test]
+    fn test_frame_proxy_request_is_not_pre_trust() {
+        // F1b P3.C — a frame proxy request must only be honored from a
+        // trust-paired peer; otherwise any untrusted node on the network
+        // could pull arbitrary frame_url-targeted frames out of us.
+        assert!(!is_pre_trust_frame(MESH_MSG_FRAME_PROXY_REQUEST));
+    }
+
+    #[test]
+    fn test_frame_proxy_response_is_not_pre_trust() {
+        // F1b P3.C — responses too: accepting a forged response pre-trust
+        // would let an attacker inject frame bytes into our pending-map.
+        assert!(!is_pre_trust_frame(MESH_MSG_FRAME_PROXY_RESPONSE));
+    }
 }
