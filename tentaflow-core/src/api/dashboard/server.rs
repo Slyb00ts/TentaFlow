@@ -360,6 +360,118 @@ fn reject_unauth_get_body(
     }
 }
 
+/// Adds the always-on security headers we send back with every byte body
+/// served from the HMAC-only signed-URL endpoints (`/frames`, `/recordings`).
+/// `Cross-Origin-Resource-Policy: same-site` blocks cross-origin embedding
+/// (a hostile page cannot pull a frame into a `<canvas>`); `Cache-Control:
+/// private, no-store` keeps the bytes out of intermediate caches; the rest
+/// are the standard browser-side hardening trio.
+fn apply_signed_url_security_headers(
+    mut builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    builder = builder
+        .header("Cross-Origin-Resource-Policy", "same-site")
+        .header("Referrer-Policy", "no-referrer")
+        .header("Cache-Control", "private, no-store")
+        .header("X-Content-Type-Options", "nosniff");
+    builder
+}
+
+/// Collapse-audit map: per-IP timestamp of the LAST audit row emitted for a
+/// 429 denial, plus the count of denials inside the current window. We do
+/// not want to write one row per refused token, so we coalesce: at most one
+/// row per `AUDIT_429_WINDOW` per IP, carrying the in-window count.
+static RATE_LIMIT_AUDIT: std::sync::OnceLock<
+    dashmap::DashMap<String, (std::time::Instant, u32)>,
+> = std::sync::OnceLock::new();
+const AUDIT_429_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn rate_limit_audit_map() -> &'static dashmap::DashMap<String, (std::time::Instant, u32)> {
+    RATE_LIMIT_AUDIT.get_or_init(dashmap::DashMap::new)
+}
+
+/// Build a 429 response and emit a collapsed-audit row if the per-IP window
+/// has elapsed. `retry_after_secs` is rounded up to whole seconds for the
+/// `Retry-After` header (HTTP requires integer seconds).
+fn build_rate_limit_response(
+    db: &DbPool,
+    ip: &str,
+    user_agent: Option<&str>,
+    endpoint: &str,
+    retry_after_secs: f64,
+    global: bool,
+) -> Response<DashboardBody> {
+    let retry_after = retry_after_secs.ceil().max(1.0) as u64;
+    let key = format!("{ip}|{endpoint}");
+    let now = std::time::Instant::now();
+    let mut entry = rate_limit_audit_map().entry(key).or_insert((now, 0));
+    let elapsed = now.saturating_duration_since(entry.0);
+    entry.1 = entry.1.saturating_add(1);
+    let should_emit = elapsed >= AUDIT_429_WINDOW || entry.0 == now;
+    if should_emit {
+        let denied_count = entry.1;
+        let details = serde_json::json!({
+            "endpoint": endpoint,
+            "denied_count": denied_count,
+            "window_secs": AUDIT_429_WINDOW.as_secs(),
+            "source_ip": ip,
+            "user_agent": user_agent.map(|s| s.chars().take(256).collect::<String>()).unwrap_or_default(),
+            "global": global,
+        })
+        .to_string();
+        if let Ok(conn) = db.lock() {
+            let _ = conn.execute(
+                "INSERT INTO audit_log \
+                    (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+                     result, error_message, severity, risk_class, details) \
+                 VALUES (datetime('now'), NULL, NULL, 'rate_limit_denied', \
+                         'http_endpoint', ?1, 'denied', NULL, 'warn', 'B', ?2)",
+                rusqlite::params![endpoint, details],
+            );
+        }
+        entry.0 = now;
+        entry.1 = 0;
+    }
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("Content-Type", "application/json")
+        .header("Retry-After", retry_after.to_string())
+        .body(Either::Left(Full::new(Bytes::from_static(
+            b"{\"error\":\"rate_limited\"}",
+        ))))
+        .unwrap()
+}
+
+/// Single helper that rate-limits the signed-URL endpoints. Returns Err with
+/// a pre-built 429 if the request must be refused.
+fn check_signed_url_rate_limit(
+    db: &DbPool,
+    ip: &str,
+    user_agent: Option<&str>,
+    endpoint: &str,
+) -> std::result::Result<(), Response<DashboardBody>> {
+    use crate::api::rate_limit::{rate_limiter, RateLimitResult};
+    match rate_limiter().check(ip) {
+        RateLimitResult::Allow => Ok(()),
+        RateLimitResult::IpLimit { retry_after_secs, .. } => Err(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            false,
+        )),
+        RateLimitResult::GlobalLimit { retry_after_secs } => Err(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            true,
+        )),
+    }
+}
+
 /// Wyciaga Bearer token z naglowka Authorization
 fn extract_bearer_token(req: &Request<Incoming>) -> Option<&str> {
     req.headers()
@@ -386,12 +498,25 @@ pub async fn handle_request(
     license: Arc<dyn LicenseChecker>,
     mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
-    _remote_addr: String,
+    remote_addr: String,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
+    // Use the raw socket peer for rate-limiting + audit. We deliberately do
+    // not honour `X-Forwarded-For` here: F1b core is meant to terminate the
+    // TLS connection itself, and a reverse-proxy deployment must explicitly
+    // opt in to XFF (not implemented in F1b — documented in the audit notes).
+    let client_ip: String = remote_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(|c| c == '[' || c == ']').to_string())
+        .unwrap_or_else(|| remote_addr.clone());
+    let user_agent: Option<String> = req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     // Wyciagnij i zwaliduj origin dla CORS
     let cors_origin: Option<String> = req
@@ -762,6 +887,11 @@ pub async fn handle_request(
             HDR_FRAME_PTS, HDR_FRAME_REF, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH, HDR_PICKUP_TOKEN,
             HDR_REQUEST_ID, HDR_SERVICE_ID,
         };
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/core/frame/pickup")
+        {
+            return Ok(resp);
+        }
         let hdr = |name: &str| -> Option<String> {
             req.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
         };
@@ -855,10 +985,15 @@ pub async fn handle_request(
     // HMAC token only (no JWT, no cookies, no CSRF surface).
     if method == Method::GET && path.starts_with("/frames/") && path.len() > "/frames/".len() {
         use crate::api::frames::{
-            handle_frame_url, parse_query, FrameOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT,
-            HDR_FRAME_PTS, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
+            handle_frame_url, parse_query, FrameOutcome, RequestContext, HDR_FRAME_HEIGHT,
+            HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_PTS, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
         };
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/frames")
+        {
             return Ok(resp);
         }
         drop(req);
@@ -876,7 +1011,11 @@ pub async fn handle_request(
         };
         let issuer = crate::services::frame_url_issuer();
         let storage = crate::services::frame_storage();
-        let outcome = handle_frame_url(path_ref, &q, issuer, storage, &db);
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_frame_url(path_ref, &q, issuer, storage, &db, ctx);
         let status = outcome.http_status();
         match outcome {
             FrameOutcome::Ok {
@@ -897,6 +1036,7 @@ pub async fn handle_request(
                 if let Some(p) = pts {
                     builder = builder.header(HDR_FRAME_PTS, p.to_string());
                 }
+                builder = apply_signed_url_security_headers(builder);
                 let body = Bytes::copy_from_slice(&bytes);
                 return Ok(builder.body(Either::Left(Full::new(body))).unwrap());
             }
@@ -928,9 +1068,14 @@ pub async fn handle_request(
     if method == Method::GET && path.starts_with("/recordings/") && path.len() > "/recordings/".len() {
         use crate::api::recording::{
             handle_recording_url, parse_query, read_recording_file, RecordingFileOutcome,
-            RecordingOutcome,
+            RecordingOutcome, RequestContext,
         };
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/recordings")
+        {
             return Ok(resp);
         }
         drop(req);
@@ -947,7 +1092,11 @@ pub async fn handle_request(
             }
         };
         let issuer = crate::services::recording_url_issuer();
-        let outcome = handle_recording_url(path_ref, &q, issuer, &db);
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_recording_url(path_ref, &q, issuer, &db, ctx);
         let auth_status = outcome.http_status();
         match outcome {
             RecordingOutcome::Ok {
@@ -966,17 +1115,20 @@ pub async fn handle_request(
                     &retention_class,
                     &owner_addon_id,
                     file_size_bytes,
+                    ctx,
                 )
                 .await;
                 let status = file_outcome.http_status();
                 return match file_outcome {
-                    RecordingFileOutcome::Ok { bytes } => Ok(Response::builder()
-                        .status(status)
-                        .header("Content-Type", content_type)
-                        .header("X-Recording-Hash", hash_sha256)
-                        .header("X-Recording-Created-At", created_at.to_string())
-                        .body(Either::Left(Full::new(Bytes::from(bytes))))
-                        .unwrap()),
+                    RecordingFileOutcome::Ok { bytes } => Ok(apply_signed_url_security_headers(
+                        Response::builder()
+                            .status(status)
+                            .header("Content-Type", content_type)
+                            .header("X-Recording-Hash", hash_sha256)
+                            .header("X-Recording-Created-At", created_at.to_string()),
+                    )
+                    .body(Either::Left(Full::new(Bytes::from(bytes))))
+                    .unwrap()),
                     _ => Ok(Response::builder()
                         .status(status)
                         .header("Content-Type", "application/json")

@@ -7,6 +7,8 @@ pub mod openai;
 
 pub mod frame_pickup;
 
+pub mod rate_limit;
+
 pub mod frames;
 
 #[cfg(feature = "camera")]
