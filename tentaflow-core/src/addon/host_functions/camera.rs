@@ -644,17 +644,24 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
     Ok(())
 }
 
-/// HTTP HEAD probe against the ONVIF device-service endpoint. The input URL
-/// is expected to either be the full device-service URL (as returned by
-/// `camera_discover_v1` in `xaddrs`) or a bare `http(s)://host[:port]/...`
-/// — in the latter case we still hit whatever path the caller passed. Any
-/// HTTP reply (200 / 401 / 405) means the device is reachable; only network
-/// failures / timeouts are reported as unreachable.
-async fn onvif_test_connection(url: &str, timeout_secs: u64) -> Result<String, String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+/// HTTP HEAD probe against the ONVIF device-service endpoint. We force the
+/// URL path under `/onvif/` so an addon cannot use this entry point to probe
+/// arbitrary HTTP targets on the local network. Any HTTP reply (200 / 401 /
+/// 405) means the device is reachable; only network failures / timeouts are
+/// reported as unreachable.
+fn force_onvif_path(url: &str) -> Result<url::Url, String> {
+    let mut parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("ONVIF probe requires http(s) URL, got: {}", parsed.scheme()));
     }
+    if !parsed.path().contains("/onvif/") {
+        parsed.set_path("/onvif/device_service");
+    }
+    Ok(parsed)
+}
+
+async fn onvif_test_connection(url: &str, timeout_secs: u64) -> Result<String, String> {
+    let parsed = force_onvif_path(url)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
@@ -1810,5 +1817,28 @@ pub mod test_api {
     #[doc(hidden)]
     pub fn profile_valid_for_test(s: &str) -> bool {
         super::profile_valid(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_onvif_test_connection_forces_onvif_path() {
+        // Bare host → forced to /onvif/device_service.
+        let u = force_onvif_path("http://10.0.0.1/").unwrap();
+        assert_eq!(u.path(), "/onvif/device_service");
+
+        // Already an ONVIF sub-service path → preserved.
+        let u = force_onvif_path("http://10.0.0.1/onvif/media_service").unwrap();
+        assert_eq!(u.path(), "/onvif/media_service");
+
+        // Arbitrary non-ONVIF path → rewritten (SSRF defense).
+        let u = force_onvif_path("http://10.0.0.1/api/admin").unwrap();
+        assert_eq!(u.path(), "/onvif/device_service");
+
+        // Non-http(s) scheme rejected.
+        assert!(force_onvif_path("file:///etc/passwd").is_err());
     }
 }
