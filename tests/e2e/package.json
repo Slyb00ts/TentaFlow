@@ -1,0 +1,22 @@
+{
+  "name": "e2e",
+  "version": "1.0.0",
+  "description": "TentaFlow end-to-end tests (mesh + UI).",
+  "main": "mesh-pairing.spec.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:e2e": "playwright test",
+    "test:mesh": "playwright test --project=mesh-pairing",
+    "test:ui": "playwright test --project=m16-aliases --project=m14-bindings --project=m15-wizard",
+    "test:m14": "playwright test --project=m14-bindings",
+    "test:m15": "playwright test --project=m15-wizard",
+    "test:m16": "playwright test --project=m16-aliases"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}

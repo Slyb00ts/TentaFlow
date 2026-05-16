@@ -1,0 +1,19 @@
+# =============================================================================
+# File: tests/e2e/docker-compose.yml
+# Description: Placeholder mock-service stack for the M3.W14 soak test
+#              (4-camera + mock YOLO/HTTP services). UI e2e tests in M3.W12
+#              (M14/M15/M16) do NOT require this stack — they exercise the
+#              tentaflow binary directly with no backend services. This file
+#              is kept here so M3.W14 can extend it without restructuring the
+#              tree. It is intentionally not referenced from .github/workflows/
+#              e2e-ui.yml.
+# =============================================================================
+
+version: '3.8'
+services:
+  mock-yolo:
+    image: alpine:latest
+    container_name: tentaflow-e2e-mock-yolo
+    command: ["sh", "-c", "echo 'mock yolo placeholder for M3.W14 soak test' && sleep infinity"]
+    ports:
+      - "9099:9099"

@@ -152,8 +152,6 @@ jailbreak-dataset/
 IMPLEMENTATION_PLAN.md
 CURRENT_API.md
 tests/e2e/node_modules/
-tests/e2e/package.json
-tests/e2e/package-lock.json
 tests/e2e/test-results/
 test-results/
 *.backup

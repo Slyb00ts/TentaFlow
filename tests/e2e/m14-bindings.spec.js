@@ -15,14 +15,16 @@ const {
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 
+const PORT = 18099;
+const DB = '/tmp/e2e-m14.db';
 let proc;
 
 test.beforeAll(async () => {
   if (!binaryExists()) {
     test.skip(true, 'tentaflow release binary not built');
   }
-  proc = startBinary();
-  await waitForServer();
+  proc = startBinary({ port: PORT, db: DB });
+  await waitForServer(PORT);
 });
 
 test.afterAll(async () => {
@@ -32,8 +34,8 @@ test.afterAll(async () => {
 
 test.describe('M14 — Addon detail > Bindings', () => {
   test.beforeEach(async ({ page }) => {
-    await loginAsAdmin(page);
-    await page.goto(`${baseUrl()}/#/addons`);
+    await loginAsAdmin(page, { port: PORT });
+    await page.goto(`${baseUrl(PORT)}/#/addons`);
     await page.waitForLoadState('networkidle');
   });
 

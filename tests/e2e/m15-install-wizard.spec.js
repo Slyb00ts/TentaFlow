@@ -15,14 +15,16 @@ const {
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 
+const PORT = 18100;
+const DB = '/tmp/e2e-m15.db';
 let proc;
 
 test.beforeAll(async () => {
   if (!binaryExists()) {
     test.skip(true, 'tentaflow release binary not built');
   }
-  proc = startBinary();
-  await waitForServer();
+  proc = startBinary({ port: PORT, db: DB });
+  await waitForServer(PORT);
 });
 
 test.afterAll(async () => {
@@ -32,8 +34,8 @@ test.afterAll(async () => {
 
 test.describe('M15 — Install wizard', () => {
   test.beforeEach(async ({ page }) => {
-    await loginAsAdmin(page);
-    await page.goto(`${baseUrl()}/#/addons`);
+    await loginAsAdmin(page, { port: PORT });
+    await page.goto(`${baseUrl(PORT)}/#/addons`);
     await page.waitForLoadState('networkidle');
   });
 
@@ -64,24 +66,35 @@ test.describe('M15 — Install wizard', () => {
       test.skip(true, 'configure button missing');
     }
     await configureBtn.click();
-    await expect(page.locator('tf-window').last()).toBeVisible({ timeout: 5000 });
+    const wizard = page.locator('tf-window').last();
+    await expect(wizard).toBeVisible({ timeout: 5000 });
 
-    // Toggle a permission to mark state dirty. We click any permission toggle
-    // we can find; if none exist (manifest has no permissions), skip.
+    // Mark state dirty by toggling a permission. Without permissions in the
+    // manifest there is no dirty state to test, so we skip.
     const toggle = page.locator('tf-toggle, tf-button[data-perm]').first();
-    if ((await toggle.count()) > 0) {
-      await toggle.click();
+    if ((await toggle.count()) === 0) {
+      test.skip(true, 'no permission toggles — cannot create dirty state');
     }
+    await toggle.click();
 
+    const windowsBefore = await page.locator('tf-window').count();
     await page.keyboard.press('Escape');
-    // Discard confirm dialog should appear (TfWindow.confirm spawns a second
-    // tf-window). It is acceptable that the wizard simply closed if state
-    // was not dirty — we assert at least the wizard responded to ESC.
-    const allWindows = page.locator('tf-window');
-    // After ESC either: discard dialog visible OR wizard closed entirely.
-    await page.waitForTimeout(500);
-    const count = await allWindows.count();
-    expect(count).toBeGreaterThanOrEqual(0);
+
+    // The wizard listens to ESC via TfWindow's close-request event. When state
+    // is dirty it spawns a second tf-window (TfWindow.confirm) with the
+    // discard message. We assert the count grew AND the original wizard
+    // remained mounted (close was prevented).
+    await expect(async () => {
+      const c = await page.locator('tf-window').count();
+      expect(c).toBeGreaterThan(windowsBefore);
+    }).toPass({ timeout: 3000 });
+    await expect(wizard).toBeVisible();
+
+    // The confirm dialog carries the discard message text from i18n. We match
+    // by role/text on the newest tf-window.
+    const confirm = page.locator('tf-window').last();
+    await expect(confirm).toBeVisible();
+    await expect(confirm).toContainText(/discard|odrzuć|niezapisan|unsaved/i);
   });
 
   test('wizard step navigation 1 -> 2 (Permissions -> Storage)', async ({ page }) => {
