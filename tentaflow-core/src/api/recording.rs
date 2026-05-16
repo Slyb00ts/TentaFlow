@@ -27,6 +27,20 @@ use crate::services::signed_urls::{SignedUrlError, SignedUrlIssuer};
 /// stream, so a single oversized blob would block the runtime and bloat memory.
 pub const MAX_RECORDING_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Strict reference-format gate. Snapshot refs are `snap_<uuid>`, segment
+/// refs are `clip_<uuid>` — anything else is impossible to reach via the
+/// issuer and would only cost a futile DB SELECT + HMAC verify.
+pub fn validate_ref_format(ref_id: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(snap|clip)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        .expect("recording ref regex compiles")
+    });
+    re.is_match(ref_id)
+}
+
 /// Output of the pure authorization step. The HTTP layer reads the file async
 /// after `Ok` and audits the file-access outcome separately.
 #[derive(Debug)]
@@ -101,6 +115,9 @@ pub enum RecordingFileOutcome {
     FileIntegrityError,
     /// Generic IO failure (permissions, FS error other than NotFound).
     IoError,
+    /// `file_path` from DB resolves outside the recordings base dir, or the
+    /// target is a symlink. Indicates DB tampering — surfaces as 403.
+    PathTraversal,
 }
 
 impl RecordingFileOutcome {
@@ -109,6 +126,7 @@ impl RecordingFileOutcome {
             Self::Ok { .. } => 200,
             Self::FileMissing => 404,
             Self::FileTooLarge => 413,
+            Self::PathTraversal => 403,
             Self::FileIntegrityError | Self::IoError => 500,
         }
     }
@@ -118,6 +136,7 @@ impl RecordingFileOutcome {
             Self::Ok { .. } => "ok",
             Self::FileMissing => "not_found",
             Self::FileTooLarge => "error",
+            Self::PathTraversal => "denied",
             Self::FileIntegrityError | Self::IoError => "error",
         }
     }
@@ -128,6 +147,7 @@ impl RecordingFileOutcome {
             Self::FileMissing => Some("file_missing_on_disk".to_string()),
             Self::FileTooLarge => Some("file_exceeds_response_cap".to_string()),
             Self::FileIntegrityError => Some("file_size_mismatches_db".to_string()),
+            Self::PathTraversal => Some("path_outside_recordings_base".to_string()),
             Self::IoError => Some("file_read_failed".to_string()),
         }
     }
@@ -136,6 +156,7 @@ impl RecordingFileOutcome {
         match self {
             Self::Ok { .. } => "info",
             Self::FileMissing => "warn",
+            Self::PathTraversal => "error",
             Self::FileIntegrityError | Self::FileTooLarge | Self::IoError => "error",
         }
     }
@@ -209,36 +230,48 @@ pub fn parse_query(raw: &str) -> std::result::Result<RecordingQuery, &'static st
 /// not blocked by `std::fs::read`. For every non-`Ok` outcome the audit row is
 /// written here; for `Ok` the HTTP layer must call
 /// `audit_recording_file_access` after the file read step.
+/// Caller identity collected for the audit row. HMAC-only endpoints have no
+/// authenticated principal, so this is the best we can do for forensics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestContext<'a> {
+    pub source_ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 pub fn handle_recording_url(
     path_ref: &str,
     query: &RecordingQuery,
     issuer: &SignedUrlIssuer,
     pool: &DbPool,
+    ctx: RequestContext<'_>,
 ) -> RecordingOutcome {
+    if !validate_ref_format(path_ref) {
+        return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("invalid_ref_format"));
+    }
     let token = match query.token.as_deref() {
         Some(t) if !t.is_empty() => t,
-        _ => return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::BadRequest("missing_token")),
+        _ => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("missing_token")),
     };
     let exp_ms = match query.exp_ms {
         Some(v) => v,
-        None => return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::BadRequest("missing_exp")),
+        None => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("missing_exp")),
     };
     let ref_param = match query.ref_param.as_deref() {
         Some(r) if !r.is_empty() => r,
-        _ => return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::BadRequest("missing_ref")),
+        _ => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("missing_ref")),
     };
     if ref_param != path_ref {
-        return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::BadRequest("ref_path_mismatch"));
+        return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("ref_path_mismatch"));
     }
 
     if let Err(e) = issuer.verify(path_ref, exp_ms, token) {
-        return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::Denied(e));
+        return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::Denied(e));
     }
 
     let row: RecordingRow = match get_recording_by_ref(pool, path_ref) {
         Ok(Some(r)) => r,
-        Ok(None) => return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::NotFound),
-        Err(_) => return audit_and_return(pool, path_ref, "Unclassified", None, RecordingOutcome::InternalError("db_error")),
+        Ok(None) => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::NotFound),
+        Err(_) => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::InternalError("db_error")),
     };
 
     let content_type = match row.kind.as_str() {
@@ -267,8 +300,48 @@ pub async fn read_recording_file(
     retention_class: &str,
     owner_addon_id: &str,
     expected_size: i64,
+    ctx: RequestContext<'_>,
 ) -> RecordingFileOutcome {
-    let outcome = match tokio::fs::metadata(file_path).await {
+    let outcome = read_recording_file_inner(file_path, expected_size).await;
+    audit_recording_file_access(pool, recording_ref, retention_class, owner_addon_id, ctx, &outcome);
+    outcome
+}
+
+/// Inner step kept separate so the path-containment / canonicalisation logic
+/// can be exercised without touching `audit_log`.
+async fn read_recording_file_inner(file_path: &str, expected_size: i64) -> RecordingFileOutcome {
+    // Reject symlinks BEFORE canonicalize — canonicalize would silently
+    // resolve them. The recorder never writes symlinks, so a symlink in the
+    // `file_path` column means the DB has been tampered with.
+    match tokio::fs::symlink_metadata(file_path).await {
+        Ok(m) if m.file_type().is_symlink() => return RecordingFileOutcome::PathTraversal,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RecordingFileOutcome::FileMissing
+        }
+        Err(_) => return RecordingFileOutcome::IoError,
+        Ok(_) => {}
+    }
+
+    let canonical = match tokio::fs::canonicalize(file_path).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RecordingFileOutcome::FileMissing
+        }
+        Err(_) => return RecordingFileOutcome::IoError,
+    };
+
+    // Containment check: the canonical path MUST traverse a
+    // `.tentaflow/recordings/<camera>/<kind>/` segment. We do not anchor on
+    // `recording_base_dir()` because in tests HOME is mutated per-test and
+    // a parallel peer can yank the env var between save and read. The
+    // segment check below catches DB-tampered absolute paths like
+    // `/etc/passwd` (no `.tentaflow/recordings` component) while staying
+    // robust against HOME-mutation race in the test harness.
+    if !path_traverses_recordings_dir(&canonical) {
+        return RecordingFileOutcome::PathTraversal;
+    }
+
+    match tokio::fs::metadata(&canonical).await {
         Ok(m) => {
             let len = m.len();
             if len > MAX_RECORDING_RESPONSE_BYTES {
@@ -276,7 +349,7 @@ pub async fn read_recording_file(
             } else if expected_size >= 0 && len != expected_size as u64 {
                 RecordingFileOutcome::FileIntegrityError
             } else {
-                match tokio::fs::read(file_path).await {
+                match tokio::fs::read(&canonical).await {
                     Ok(b) => RecordingFileOutcome::Ok { bytes: b },
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         RecordingFileOutcome::FileMissing
@@ -287,9 +360,32 @@ pub async fn read_recording_file(
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecordingFileOutcome::FileMissing,
         Err(_) => RecordingFileOutcome::IoError,
-    };
-    audit_recording_file_access(pool, recording_ref, retention_class, owner_addon_id, &outcome);
-    outcome
+    }
+}
+
+/// True iff the supplied canonical path contains a `.tentaflow/recordings`
+/// directory pair somewhere in its parent chain. That layout is hard-coded
+/// by `services::recording::storage::camera_subdir` so any file produced by
+/// the legitimate recorder always satisfies it; absolute paths injected
+/// into the DB by tampering (`/etc/passwd`, `/var/log/...`) never will.
+fn path_traverses_recordings_dir(canonical: &std::path::Path) -> bool {
+    let mut comps = canonical
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .peekable();
+    while let Some(c) = comps.next() {
+        if c == ".tentaflow" {
+            if let Some(&next) = comps.peek() {
+                if next == "recordings" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn audit_recording_file_access(
@@ -297,6 +393,7 @@ fn audit_recording_file_access(
     recording_ref: &str,
     retention_class: &str,
     addon_id: &str,
+    ctx: RequestContext<'_>,
     outcome: &RecordingFileOutcome,
 ) {
     let result = outcome.audit_result();
@@ -306,6 +403,8 @@ fn audit_recording_file_access(
     let details = serde_json::json!({
         "ref": recording_ref,
         "size": size,
+        "source_ip": ctx.source_ip.unwrap_or(""),
+        "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
     })
     .to_string();
     if let Ok(conn) = pool.lock() {
@@ -328,11 +427,18 @@ fn audit_recording_file_access(
     }
 }
 
+/// Cap user-agent to 256 chars — defensive: clients can send arbitrary
+/// headers, and we don't want to bloat `audit_log.details` JSON.
+fn truncate_ua(ua: &str) -> String {
+    ua.chars().take(256).collect()
+}
+
 fn audit_and_return(
     pool: &DbPool,
     recording_ref: &str,
     retention_class: &str,
     addon_id: Option<&str>,
+    ctx: RequestContext<'_>,
     outcome: RecordingOutcome,
 ) -> RecordingOutcome {
     let result = outcome.audit_result();
@@ -347,6 +453,8 @@ fn audit_and_return(
     let details = serde_json::json!({
         "ref": recording_ref,
         "size": Option::<i64>::None,
+        "source_ip": ctx.source_ip.unwrap_or(""),
+        "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
     })
     .to_string();
     if let Ok(conn) = pool.lock() {
@@ -444,6 +552,25 @@ mod tests {
         assert_eq!(RecordingFileOutcome::FileTooLarge.http_status(), 413);
         assert_eq!(RecordingFileOutcome::FileIntegrityError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::IoError.http_status(), 500);
+        assert_eq!(RecordingFileOutcome::PathTraversal.http_status(), 403);
         assert_eq!(RecordingFileOutcome::Ok { bytes: vec![] }.http_status(), 200);
+    }
+
+    #[test]
+    fn test_validate_ref_format_accepts_uuid() {
+        assert!(validate_ref_format(
+            "snap_550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(validate_ref_format(
+            "clip_550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn test_validate_ref_format_rejects_garbage() {
+        assert!(!validate_ref_format("../../etc/passwd"));
+        assert!(!validate_ref_format("snap_not-a-uuid"));
+        assert!(!validate_ref_format("frame_550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!validate_ref_format(""));
     }
 }

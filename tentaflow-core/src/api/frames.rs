@@ -23,6 +23,21 @@ pub const HDR_FRAME_PIXEL_FORMAT: &str = "X-Frame-Pixel-Format";
 pub const HDR_FRAME_TS_MS: &str = "X-Frame-Timestamp-Ms";
 pub const HDR_FRAME_PTS: &str = "X-Frame-Pts";
 
+/// Strict reference-format gate. Garbage refs (random paths, traversal
+/// attempts, wrong scope prefix) are rejected before the HMAC verify and the
+/// `audit_log` INSERT — cheap pre-filter shaving CPU under forged-token
+/// floods. Pattern matches the issuer's `frame_<uuid v4>` shape.
+pub fn validate_ref_format(ref_id: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^frame_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        .expect("frame ref regex compiles")
+    });
+    re.is_match(ref_id)
+}
+
 #[derive(Debug)]
 pub enum FrameOutcome {
     Ok {
@@ -117,36 +132,48 @@ pub fn parse_query(raw: &str) -> std::result::Result<FrameQuery, &'static str> {
     Ok(q)
 }
 
+/// Caller identity collected for audit. HMAC-only endpoint has no authenticated
+/// principal beyond what the source socket reveals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestContext<'a> {
+    pub source_ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 pub fn handle_frame_url(
     path_ref: &str,
     query: &FrameQuery,
     issuer: &SignedUrlIssuer,
     storage: &FrameStorage,
     pool: &DbPool,
+    ctx: RequestContext<'_>,
 ) -> FrameOutcome {
+    if !validate_ref_format(path_ref) {
+        return audit_and_return(pool, path_ref, ctx, FrameOutcome::BadRequest("invalid_ref_format"));
+    }
     let token = match query.token.as_deref() {
         Some(t) if !t.is_empty() => t,
-        _ => return audit_and_return(pool, path_ref, FrameOutcome::BadRequest("missing_token")),
+        _ => return audit_and_return(pool, path_ref, ctx, FrameOutcome::BadRequest("missing_token")),
     };
     let exp_ms = match query.exp_ms {
         Some(v) => v,
-        None => return audit_and_return(pool, path_ref, FrameOutcome::BadRequest("missing_exp")),
+        None => return audit_and_return(pool, path_ref, ctx, FrameOutcome::BadRequest("missing_exp")),
     };
     let ref_param = match query.ref_param.as_deref() {
         Some(r) if !r.is_empty() => r,
-        _ => return audit_and_return(pool, path_ref, FrameOutcome::BadRequest("missing_ref")),
+        _ => return audit_and_return(pool, path_ref, ctx, FrameOutcome::BadRequest("missing_ref")),
     };
     if ref_param != path_ref {
-        return audit_and_return(pool, path_ref, FrameOutcome::BadRequest("ref_path_mismatch"));
+        return audit_and_return(pool, path_ref, ctx, FrameOutcome::BadRequest("ref_path_mismatch"));
     }
 
     if let Err(e) = issuer.verify(path_ref, exp_ms, token) {
-        return audit_and_return(pool, path_ref, FrameOutcome::Denied(e));
+        return audit_and_return(pool, path_ref, ctx, FrameOutcome::Denied(e));
     }
 
     let stored: StoredFrame = match storage.get(&RawFrameRef::from_string(path_ref.to_string())) {
         Some(s) => s,
-        None => return audit_and_return(pool, path_ref, FrameOutcome::NotFound),
+        None => return audit_and_return(pool, path_ref, ctx, FrameOutcome::NotFound),
     };
     let pf = match stored.metadata.pixel_format {
         FramePixelFormat::Rgb24 => "rgb24",
@@ -159,10 +186,19 @@ pub fn handle_frame_url(
         timestamp_unix_ms: stored.metadata.timestamp_unix_ms,
         pts: stored.metadata.pts,
     };
-    audit_and_return(pool, path_ref, outcome)
+    audit_and_return(pool, path_ref, ctx, outcome)
 }
 
-fn audit_and_return(pool: &DbPool, frame_ref: &str, outcome: FrameOutcome) -> FrameOutcome {
+fn truncate_ua(ua: &str) -> String {
+    ua.chars().take(256).collect()
+}
+
+fn audit_and_return(
+    pool: &DbPool,
+    frame_ref: &str,
+    ctx: RequestContext<'_>,
+    outcome: FrameOutcome,
+) -> FrameOutcome {
     let result = outcome.audit_result();
     let reason = outcome.audit_reason();
     let severity = match &outcome {
@@ -173,7 +209,13 @@ fn audit_and_return(pool: &DbPool, frame_ref: &str, outcome: FrameOutcome) -> Fr
         FrameOutcome::Ok { bytes, .. } => Some(bytes.len() as i64),
         _ => None,
     };
-    let details = serde_json::json!({ "ref": frame_ref, "size": size }).to_string();
+    let details = serde_json::json!({
+        "ref": frame_ref,
+        "size": size,
+        "source_ip": ctx.source_ip.unwrap_or(""),
+        "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
+    })
+    .to_string();
     if let Ok(conn) = pool.lock() {
         // FrameUrl access has no addon identity at the HTTP layer (HMAC-only
         // auth), so addon_id stays NULL. Risk class B matches host-fn
@@ -217,5 +259,20 @@ mod tests {
             FrameOutcome::Denied(SignedUrlError::InvalidSignature).http_status(),
             403
         );
+    }
+
+    #[test]
+    fn test_validate_ref_format_accepts_uuid() {
+        assert!(validate_ref_format(
+            "frame_550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn test_validate_ref_format_rejects_garbage() {
+        assert!(!validate_ref_format("../../etc/passwd"));
+        assert!(!validate_ref_format("frame_not-a-uuid"));
+        assert!(!validate_ref_format("snap_550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!validate_ref_format(""));
     }
 }

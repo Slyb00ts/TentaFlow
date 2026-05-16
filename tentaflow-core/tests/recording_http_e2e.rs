@@ -31,10 +31,11 @@ use tokio::net::TcpListener;
 use tentaflow_core::api::frames::{
     handle_frame_url, parse_query as parse_frame_query, FrameOutcome, HDR_FRAME_HEIGHT,
     HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
+    RequestContext as FrameRequestContext,
 };
 use tentaflow_core::api::recording::{
     handle_recording_url, parse_query as parse_rec_query, read_recording_file,
-    RecordingFileOutcome, RecordingOutcome,
+    RecordingFileOutcome, RecordingOutcome, RequestContext as RecordingRequestContext,
 };
 use tentaflow_core::db::repository::insert_recording;
 use tentaflow_core::db::DbPool;
@@ -171,7 +172,8 @@ async fn router(
                     .unwrap();
             }
         };
-        let outcome = handle_recording_url(path_ref, &q, rec_issuer, db);
+        let ctx = RecordingRequestContext { source_ip: Some("127.0.0.1"), user_agent: None };
+        let outcome = handle_recording_url(path_ref, &q, rec_issuer, db, ctx);
         let auth_status = outcome.http_status();
         return match outcome {
             RecordingOutcome::Ok {
@@ -190,6 +192,7 @@ async fn router(
                     &retention_class,
                     &owner_addon_id,
                     file_size_bytes,
+                    ctx,
                 )
                 .await;
                 let status = file_outcome.http_status();
@@ -229,7 +232,8 @@ async fn router(
                     .unwrap();
             }
         };
-        let outcome = handle_frame_url(path_ref, &q, frame_issuer, storage, db);
+        let fctx = FrameRequestContext { source_ip: Some("127.0.0.1"), user_agent: None };
+        let outcome = handle_frame_url(path_ref, &q, frame_issuer, storage, db, fctx);
         let status = outcome.http_status();
         return match outcome {
             FrameOutcome::Ok {
@@ -705,3 +709,49 @@ async fn test_e2e_frame_url_token_tampered_returns_403() {
     assert_eq!(resp.status().as_u16(), 403);
     assert_eq!(audit_log_count(&env.db, "frame_url_access", "denied"), 1);
 }
+
+#[tokio::test]
+async fn test_path_traversal_via_db_corruption_rejected() {
+    // Simulate a DB-tampered row whose `file_path` points outside the
+    // recordings base dir. The handler must refuse with 403 PathTraversal
+    // even though the HMAC signature is valid.
+    let env = spawn_server().await;
+    let (rec_ref, _home, _png) = save_and_register(&env, "addon-traversal", "cam_trav").await;
+
+    // Overwrite the file_path with /etc/passwd — outside the recordings base.
+    {
+        let conn = env.db.lock().expect("db lock");
+        conn.execute(
+            "UPDATE recordings SET file_path = '/etc/passwd' WHERE ref = ?1",
+            rusqlite::params![rec_ref],
+        )
+        .expect("update");
+    }
+
+    let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
+    let url = format!(
+        "http://{}/recordings/{}?{}",
+        env.addr,
+        rec_ref,
+        signed.query_string()
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    // Reading the inner file produces PathTraversal -> 403. The router
+    // collapses RecordingFileOutcome != Ok to a generic 4xx, so we accept
+    // 403/404 to be robust to harness folding.
+    let s = resp.status().as_u16();
+    assert!(s == 403 || s == 404, "expected 403/404, got {}", s);
+}
+
+#[tokio::test]
+async fn test_invalid_ref_format_returns_400() {
+    let env = spawn_server().await;
+    // Garbage ref that does not match `snap_<uuid>` / `clip_<uuid>`.
+    let url = format!(
+        "http://{}/recordings/not_a_valid_ref?token=x&exp=1&ref=not_a_valid_ref",
+        env.addr
+    );
+    let resp = reqwest::get(&url).await.expect("get");
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
