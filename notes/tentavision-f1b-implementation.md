@@ -209,8 +209,14 @@ Receiver state:
 Lifecycle:
 
 - `handle_peer_connected` (`mesh/pipeline.rs`) pushes a fresh advertise
-  after the existing `TrustedKeysSync` block, gated on the same
-  `is_trusted` check + `last_sync_sent` cooldown (30 s).
+  after the existing `TrustedKeysSync` block. It shares the same
+  `is_trusted` gate as `TrustedKeysSync` but is intentionally **outside**
+  the `last_sync_sent` cooldown — every trusted `PeerConnected` event
+  re-advertises HMAC keys. Reason: HMAC keys can rotate via
+  `tentaflow-cli keys rotate`, so a fresh advertise on every reconnect
+  guarantees peers see the current key set without waiting for the 30 s
+  cooldown to expire. The payload is small and `PeerConnected` is rare
+  (post-pairing), so the extra traffic is negligible.
 - `handle_peer_disconnected` drops every scope held for that peer; the
   next reconnect re-advertises. No on-disk persistence, by design — a
   revoked peer cannot leave stale verifiers behind.
