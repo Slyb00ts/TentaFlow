@@ -654,6 +654,15 @@ impl AddonManager {
     /// inserted in this call (the audit table has no FK on the alias, so
     /// a row-by-row `DELETE` style rollback would leave orphan audit
     /// entries that look like duplicate "create" events on the next try).
+    ///
+    /// Visibility note: kept `pub` (not `pub(crate)`) because integration
+    /// tests under `tests/install_flow_e2e.rs` and `tests/abi_error_sweep.rs`
+    /// are a separate crate from `tentaflow-core` and need direct access to
+    /// drive the manifest install path without spinning up a full WASM
+    /// instance. Moving these tests under `src/addon/mod.rs::tests` would
+    /// pull in heavy fixtures (DB pool, cipher, runtime) that are already
+    /// owned by the integration layer — the cost outweighs the surface
+    /// reduction.
     pub fn install_manifest_aliases(&self, manifest: &AddonManifest) -> Result<()> {
         use crate::db::repository::{
             add_alias_consumer_within_tx, audit_consumer_revoked_by_manifest_within_tx,

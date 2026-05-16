@@ -2,15 +2,35 @@
 // File: tests/security_fs_isolation.rs — F1a M2.W11 security suite §17.5
 // =============================================================================
 //
-// Per-addon FS sandbox guarantees beyond the unit-level path-traversal tests
-// already in `addon::fs_sandbox::tests`:
+// Per-addon storage isolation guarantees beyond the unit-level path-traversal
+// tests already in `addon::fs_sandbox::tests`.
+//
+// Scope (precise — earlier revisions overclaimed "storage write traversal"
+// coverage that the host ABI does not actually expose):
 //   1. Two addons get distinct on-disk paths even when their IDs share a
-//      common prefix (regex collision attempt).
-//   2. The per-addon SQLite pool is keyed by addon_id — opening pool A then
-//      writing through pool B never touches A's underlying file.
-//   3. Symlinks pointing outside the sandbox root are rejected when the
-//      addon_id validator runs over a sanitized id.
-//   4. Closing pool B does not affect pool A (lifetimes isolated).
+//      common prefix (regex collision attempt) — `addon_data_dir`.
+//   2. The per-addon SQLite pool is keyed by addon_id; opening pool A then
+//      writing through pool B never touches A's underlying file
+//      (`storage_sql::open_addon_db` keyed lookup).
+//   3. The lexical addon_id validator rejects any traversal-shaped id
+//      (`legit/../etc`, `/etc/passwd`, embedded NUL) before any FS
+//      resolution happens.
+//   4. Closing pool B does not affect pool A (lifetime isolation).
+//   5. An attacker-controlled symlink inside addon A's directory that
+//      points at addon B's data dir cannot make B observe A's tables —
+//      pool keying is purely by id, not by filesystem walk.
+//   6. SQL-bound parameters that look like filesystem paths
+//      (`../../etc/passwd`) are stored as plain text and cannot escape the
+//      per-addon SQLite file — defence-in-depth against an addon trying to
+//      smuggle path traversal through INSERT/SELECT payloads.
+//
+// Not in scope: host-side file IO traversal — F1a does not expose any
+// file-path-taking host function to addons. `storage_get`/`storage_set` are
+// opaque KV writes keyed by string (no path component); `sql_query` /
+// `sql_exec` bind parameters into a per-addon SQLite file opened via
+// `open_addon_db(addon_id)` and cannot reach the host filesystem. When F2
+// adds `fs_storage_*` host functions this file gains the corresponding
+// traversal tests.
 //
 // These tests run sequentially under a HOME env guard exposed via the
 // `fs_sandbox` test_home_lock — fs_sandbox itself does the same for its
@@ -214,5 +234,84 @@ fn symlink_between_addon_dirs_does_not_punch_through_pool_keying() {
         let _ = std::fs::remove_file(&leak);
         // Quiet `dir_a unused`.
         assert!(Path::new(&dir_a).is_dir());
+    });
+}
+
+// =============================================================================
+// 7. SQL bound parameters cannot escape the per-addon SQLite file even when
+//    they LOOK like filesystem paths. This is the addon-facing equivalent of
+//    "storage write traversal" — addons can only get bytes into storage via
+//    `storage_set` (opaque KV) or `sql_exec`/`sql_query` (bound params on a
+//    per-addon DB). Path-shaped strings are inert data, never resolved.
+// =============================================================================
+
+#[test]
+fn sql_bound_parameters_with_path_shape_stay_inside_addon_db() {
+    with_tmp_home(|| {
+        let pool_a = storage_sql::open_addon_db("sql-iso-a").expect("A");
+        let pool_b = storage_sql::open_addon_db("sql-iso-b").expect("B");
+
+        // Addon A creates a table and inserts a traversal-shaped string.
+        // SQLite stores it verbatim — no path resolution happens because
+        // the value goes through a bound parameter, not the file API.
+        let traversal = "../../../../etc/passwd";
+        {
+            let conn = pool_a.get().expect("A conn");
+            conn.execute(
+                "CREATE TABLE files (path TEXT NOT NULL, blob BLOB NOT NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, blob) VALUES (?1, ?2)",
+                rusqlite::params![traversal, b"sensitive".as_slice()],
+            )
+            .unwrap();
+
+            // Read it back through the same pool — bytes round-trip
+            // unchanged. This confirms SQLite treats the param as data.
+            let (got_path, got_blob): (String, Vec<u8>) = conn
+                .query_row(
+                    "SELECT path, blob FROM files LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(got_path, traversal);
+            assert_eq!(got_blob, b"sensitive");
+        }
+
+        // Addon B's DB must not see A's table at all — keyed lookup means
+        // the SQLite file backing pool B is a different inode from A's.
+        let b_sees_files: i64 = {
+            let conn = pool_b.get().expect("B conn");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            b_sees_files, 0,
+            "addon B must not observe addon A's 'files' table — \
+             SQL-level isolation breach"
+        );
+
+        // Host filesystem outside the addon root must be untouched: the
+        // traversal string never reached any file-IO call site, so
+        // /etc/passwd (or any host path) was not opened. We assert the
+        // observable side: A's data dir still does NOT contain a file
+        // literally named after the traversal payload.
+        let a_dir = tentaflow_core::addon::fs_sandbox::addon_data_dir("sql-iso-a").unwrap();
+        let candidate = a_dir.join(traversal);
+        assert!(
+            !candidate.exists(),
+            "traversal-shaped SQL param must not have materialized a file: {:?}",
+            candidate
+        );
+
+        storage_sql::close_addon_db("sql-iso-a");
+        storage_sql::close_addon_db("sql-iso-b");
     });
 }

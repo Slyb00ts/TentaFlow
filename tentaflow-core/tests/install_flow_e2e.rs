@@ -1,22 +1,29 @@
 // =============================================================================
-// File: tests/install_flow_e2e.rs — F1a M2.W11 integration sweep
+// File: tests/install_flow_e2e.rs — F1a M2.W11 install + resolver integration
 // =============================================================================
 //
-// End-to-end install flow for the manifest alias subsystem:
-//   1. AddonManager builds a manifest in code (no on-disk WASM required).
-//   2. install_manifest_aliases() drives the full transactional path —
-//      model_aliases / model_alias_owners / model_alias_visibility /
-//      model_alias_consumers / addon_uses_alias / addon_uses_model writes
-//      plus reconciliation audit (model_alias_changes / audit_log).
-//   3. Each test then queries the public repository views and verifies the
-//      observable state, not the implementation details.
+// Scope (precise — earlier revisions over-claimed):
+//   * Covers `install_manifest_aliases()` end-to-end: the manifest-driven
+//     transactional path that writes model_aliases / model_alias_owners /
+//     model_alias_visibility / model_alias_consumers / addon_uses_alias /
+//     addon_uses_model plus the reconciliation audit (model_alias_changes /
+//     audit_log).
+//   * Covers two TOML round-trip cases via `lifecycle::parse_manifest_toml`
+//     -> `install_manifest_aliases` so reviewers see the exact entry point
+//     a real `install_addon()` invocation takes (minus WASM load).
+//   * Covers the resolver gate `repository::resolve_model_alias_for_addon`
+//     with `caller_addon_id = Some(...)`, asserting both the granted and
+//     denied paths produce the right outcome (Ok(target) vs
+//     AliasPermissionDenied + `alias_calls` row with
+//     `result='permission_denied'`).
 //
-// These tests complement `addon_manifest_parsing.rs` (TOML → struct) and
-// `alias_host_functions.rs` (runtime resolve) by covering the install-time
-// glue that wires the two together.
+// Out of scope (deliberately not claimed): full `install_addon(path)` —
+// that requires a WASM artifact on disk plus wasmtime instantiation, which
+// is exercised by the camera/recording WASM e2e suites instead.
 
 use std::sync::Arc;
 
+use tentaflow_core::addon::lifecycle::parse_manifest_toml;
 use tentaflow_core::addon::manifest::{AliasSpec, AliasVisibility, UsesAliasSpec, UsesModelSpec};
 use tentaflow_core::addon::{AddonManager, AddonManifest};
 use tentaflow_core::crypto::SettingsCipher;
@@ -515,5 +522,206 @@ async fn reconciliation_writes_audit_row() {
     assert!(
         changes >= 1,
         "expected >=1 audit entries in model_alias_changes, got {changes}"
+    );
+}
+
+// =============================================================================
+// 10. TOML round-trip — owner manifest parses, then installs cleanly.
+// =============================================================================
+//
+// Proves the TOML format documented in addon-author-facing docs lines up with
+// the in-memory `AddonManifest` shape consumed by `install_manifest_aliases`.
+
+#[tokio::test(flavor = "current_thread")]
+async fn toml_round_trip_owner_manifest_installs() {
+    let (mgr, db) = make_manager();
+
+    let manifest_toml = r#"
+[addon]
+id = "toml-owner"
+name = "TOML Owner"
+version = "1.0.0"
+wasm_file = "addon.wasm"
+
+[[alias]]
+id = "toml-public"
+display_name = "TOML Public Alias"
+suggested_default = "model-toml-pub"
+visibility = "public"
+
+[[alias]]
+id = "toml-restricted"
+display_name = "TOML Restricted Alias"
+suggested_default = "model-toml-r"
+visibility = "restricted"
+allowed_consumers = ["whitelisted-toml"]
+"#;
+
+    let manifest = parse_manifest_toml(manifest_toml).expect("parse TOML manifest");
+    assert_eq!(manifest.addon_id, "toml-owner");
+    assert_eq!(manifest.aliases.len(), 2);
+
+    mgr.install_manifest_aliases(&manifest)
+        .expect("install parsed manifest");
+
+    let n_aliases = count_no_params(
+        &db,
+        "SELECT COUNT(*) FROM model_aliases \
+         WHERE alias IN ('toml-public','toml-restricted')",
+    );
+    assert_eq!(n_aliases, 2, "both parsed aliases must land in DB");
+
+    let n_consumers = count_no_params(
+        &db,
+        "SELECT COUNT(*) FROM model_alias_consumers c \
+         JOIN model_aliases a ON a.id = c.alias_id \
+         WHERE a.alias = 'toml-restricted'",
+    );
+    assert_eq!(n_consumers, 1, "restricted whitelist must persist");
+}
+
+// =============================================================================
+// 11. TOML round-trip — consumer manifest with uses_alias.
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn toml_round_trip_consumer_manifest_installs_pending() {
+    let (mgr, db) = make_manager();
+
+    let manifest_toml = r#"
+[addon]
+id = "toml-consumer"
+name = "TOML Consumer"
+version = "1.0.0"
+wasm_file = "addon.wasm"
+
+[[uses_alias]]
+id = "future-alias"
+required = false
+reason = "needs upstream alias"
+"#;
+
+    let manifest = parse_manifest_toml(manifest_toml).expect("parse consumer TOML");
+    assert_eq!(manifest.uses_aliases.len(), 1);
+    assert_eq!(manifest.uses_aliases[0].id, "future-alias");
+
+    mgr.install_manifest_aliases(&manifest)
+        .expect("install consumer-only TOML manifest");
+
+    assert_eq!(
+        grant_status(&db, "toml-consumer", "future-alias").as_deref(),
+        Some("pending"),
+        "uses_alias against missing target must land as 'pending'"
+    );
+}
+
+// =============================================================================
+// 12. Resolver gate — after install + reconcile, granted consumer resolves.
+// =============================================================================
+//
+// Closes the loop: install owner + consumer through install_manifest_aliases,
+// then exercise `resolve_model_alias_for_addon` with the consumer's id and
+// assert the gate returns the target. This is the production codepath every
+// runtime alias resolution takes.
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_flow_resolver_grants_access_after_install_and_reconcile() {
+    let (mgr, db) = make_manager();
+
+    // Owner publishes a public alias.
+    mgr.install_manifest_aliases(&manifest_with(
+        "addon-a",
+        vec![alias(
+            "shared-stt",
+            "model-stt",
+            AliasVisibility::Public,
+            vec![],
+        )],
+        vec![],
+        vec![],
+    ))
+    .expect("owner install");
+
+    // Consumer declares uses_alias against the public alias; reconcile flips
+    // grant_status to 'auto_granted' inside the same install call.
+    mgr.install_manifest_aliases(&manifest_with(
+        "addon-b",
+        vec![],
+        vec![uses_alias("shared-stt", true, "needs STT")],
+        vec![],
+    ))
+    .expect("consumer install");
+
+    assert_eq!(
+        grant_status(&db, "addon-b", "shared-stt").as_deref(),
+        Some("auto_granted"),
+        "consumer must be auto_granted after reconcile"
+    );
+
+    // Resolver path: consumer is allowed through the gate.
+    let resolved = resolve_model_alias_for_addon(
+        &db,
+        "shared-stt",
+        Some("addon-b"),
+        Some("infer"),
+        Some("req-grant-1"),
+    )
+    .expect("resolver must return Ok for granted consumer");
+    let target = resolved.expect("alias row must exist");
+    assert_eq!(target.alias, "shared-stt");
+    assert_eq!(target.target_model, "model-stt");
+}
+
+// =============================================================================
+// 13. Resolver gate — undeclared consumer is denied and logged.
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_flow_resolver_denies_access_without_uses_alias_declaration() {
+    let (mgr, db) = make_manager();
+
+    // Owner publishes a public alias.
+    mgr.install_manifest_aliases(&manifest_with(
+        "addon-a",
+        vec![alias(
+            "shared-stt2",
+            "model-stt2",
+            AliasVisibility::Public,
+            vec![],
+        )],
+        vec![],
+        vec![],
+    ))
+    .expect("owner install");
+
+    // Addon-c never declares uses_alias for shared-stt2 — gate must reject.
+    let err = resolve_model_alias_for_addon(
+        &db,
+        "shared-stt2",
+        Some("addon-c"),
+        Some("infer"),
+        Some("req-deny-1"),
+    )
+    .expect_err("resolver must deny undeclared consumer");
+
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("denied")
+            || msg.contains("permission")
+            || msg.contains("public_no_uses"),
+        "expected permission-denied error, got: {msg}"
+    );
+
+    // `alias_calls` must contain a permission_denied row for this attempt.
+    let denied_rows = count_no_params(
+        &db,
+        "SELECT COUNT(*) FROM alias_calls \
+         WHERE alias_name = 'shared-stt2' \
+           AND caller_addon_id = 'addon-c' \
+           AND result = 'permission_denied'",
+    );
+    assert!(
+        denied_rows >= 1,
+        "expected >=1 permission_denied row in alias_calls, got {denied_rows}"
     );
 }
