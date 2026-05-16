@@ -261,6 +261,25 @@ pub struct ServerConfig {
     /// Format logow (json lub pretty)
     #[serde(default = "default_log_format")]
     pub log_format: String,
+
+    /// Opcjonalna konfiguracja mTLS pinning dla Service-to-Core endpointu
+    /// `/core/frame/pickup`. Domyslnie wylaczona (F1a/F1b compat) — production
+    /// deploy powinien wlaczyc `pickup_required = true` i wpisac fingerprinty.
+    #[serde(default)]
+    pub mtls: Option<MtlsConfig>,
+}
+
+/// Pinning client certificates for HTTP REST tier endpoints. SHA-256
+/// fingerprints of DER leaf certs (lower-case hex, with or without colons).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct MtlsConfig {
+    /// Gdy `true`, rustls request client cert na handshake'u i `/core/frame/pickup`
+    /// odrzuca polaczenia bez pasujacego fingerprintu.
+    #[serde(default)]
+    pub pickup_required: bool,
+    /// Lista SHA-256 fingerprintow dozwolonych client certow.
+    #[serde(default)]
+    pub client_cert_fingerprints: Vec<String>,
 }
 
 // =============================================================================
@@ -863,6 +882,7 @@ impl Default for NodeConfig {
                 cpu_affinity: true,
                 log_level: "info".to_string(),
                 log_format: "json".to_string(),
+                mtls: None,
             },
             protocols: ProtocolsConfig {
                 openai_api: ProtocolConfig {
