@@ -100,6 +100,14 @@ and the pickup mTLS allowlist are process-local OR file-based per node.
 Multi-node cluster requires P3 mesh key sync (deferred). In single-node
 deployments this is acceptable. Multi-node deployments must wait for P3.
 
+Single-node deployment (post F1b P3.A): HMAC keys persist on disk at
+`<tentaflow_home>/keys/{pickup_token,frame_url,recording_url}.key` (mode
+0600 on Unix). Restart no longer invalidates outstanding URLs or pickup
+tokens. Rotation: `tentaflow-cli keys rotate <name>` — running issuers
+keep the previous key as a verify-only secondary for `max_ttl + 5 s` so a
+rotation does not invalidate tokens already in flight. Multi-node mesh
+sync of these three keys remains pending P3.B.
+
 ### Logging warning
 
 NEVER enable hyper access logging (`RUST_LOG=hyper=debug`) in production without

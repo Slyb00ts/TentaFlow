@@ -23,6 +23,7 @@ pub mod catalog;
 pub mod deploy;
 pub mod frame_storage;
 pub mod handles_cache;
+pub mod key_storage;
 pub mod lifecycle;
 pub mod mesh_registry;
 pub mod pickup_tokens;

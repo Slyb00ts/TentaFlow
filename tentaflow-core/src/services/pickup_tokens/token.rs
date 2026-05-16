@@ -99,27 +99,43 @@ pub(crate) fn sign_payload(key: &[u8], payload: &TokenPayload) -> PickupToken {
     }
 }
 
-/// Split + base64-decode + HMAC-check. Constant-time compare via `subtle`.
-/// Returns the deserialized payload on success; the caller still has to
-/// check expiry + inflight store + consume the one-shot bit.
-pub(crate) fn parse_and_verify(
-    key: &[u8],
+/// Split + base64-decode + HMAC-check against every key in `keys` in order.
+/// Used to support the 2-key rotation window: callers pass `[current,
+/// previous]` so tokens minted under the old key keep verifying until the
+/// previous-key window expires. Constant-time HMAC compare is still
+/// performed for every candidate key (no early-exit timing leak — the same
+/// HMAC compute + ct_eq runs on every iteration).
+pub(crate) fn parse_and_verify_multi<'a, I>(
+    keys: I,
     wire: &str,
-) -> Result<(TokenPayload, String), PickupVerifyError> {
+) -> Result<(TokenPayload, String), PickupVerifyError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
     let (payload_b64, sig_b64) = wire
         .split_once('.')
         .ok_or(PickupVerifyError::Malformed)?;
     if payload_b64.is_empty() || sig_b64.is_empty() {
         return Err(PickupVerifyError::Malformed);
     }
-    let expected = hmac_sign(key, payload_b64);
     let provided = B64
         .decode(sig_b64.as_bytes())
         .map_err(|_| PickupVerifyError::Malformed)?;
-    // Constant-time comparison: bool::from(ct_eq()) is the only safe path.
-    if provided.len() != expected.len()
-        || !bool::from(provided.ct_eq(&expected))
-    {
+    let mut any_key_seen = false;
+    let mut matched = false;
+    for key in keys {
+        any_key_seen = true;
+        let expected = hmac_sign(key, payload_b64);
+        if provided.len() == expected.len()
+            && bool::from(provided.ct_eq(&expected))
+        {
+            matched = true;
+        }
+    }
+    if !any_key_seen {
+        return Err(PickupVerifyError::InvalidSignature);
+    }
+    if !matched {
         return Err(PickupVerifyError::InvalidSignature);
     }
     let json = B64
@@ -152,7 +168,7 @@ mod tests {
     fn sign_then_verify_roundtrip() {
         let t = sign_payload(&key(), &payload());
         let wire = t.wire();
-        let (decoded, _) = parse_and_verify(&key(), &wire).expect("verify ok");
+        let (decoded, _) = parse_and_verify_multi(std::iter::once(key().as_slice()), &wire).expect("verify ok");
         assert_eq!(decoded, payload());
     }
 
@@ -165,7 +181,7 @@ mod tests {
         let flipped = if last == 'A' { 'B' } else { 'A' };
         wire.push(flipped);
         assert_eq!(
-            parse_and_verify(&key(), &wire).unwrap_err(),
+            parse_and_verify_multi(std::iter::once(key().as_slice()), &wire).unwrap_err(),
             PickupVerifyError::InvalidSignature
         );
     }
@@ -175,7 +191,7 @@ mod tests {
         let t = sign_payload(&key(), &payload());
         let wire = t.wire();
         assert_eq!(
-            parse_and_verify(&[0u8; 32], &wire).unwrap_err(),
+            parse_and_verify_multi(std::iter::once([0u8; 32].as_slice()), &wire).unwrap_err(),
             PickupVerifyError::InvalidSignature
         );
     }
@@ -183,15 +199,15 @@ mod tests {
     #[test]
     fn malformed_wire_rejected() {
         assert_eq!(
-            parse_and_verify(&key(), "no-dot").unwrap_err(),
+            parse_and_verify_multi(std::iter::once(key().as_slice()), "no-dot").unwrap_err(),
             PickupVerifyError::Malformed
         );
         assert_eq!(
-            parse_and_verify(&key(), ".onlysig").unwrap_err(),
+            parse_and_verify_multi(std::iter::once(key().as_slice()), ".onlysig").unwrap_err(),
             PickupVerifyError::Malformed
         );
         assert_eq!(
-            parse_and_verify(&key(), "onlypayload.").unwrap_err(),
+            parse_and_verify_multi(std::iter::once(key().as_slice()), "onlypayload.").unwrap_err(),
             PickupVerifyError::Malformed
         );
     }

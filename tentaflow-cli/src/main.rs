@@ -31,6 +31,11 @@ enum TopCommand {
         #[command(subcommand)]
         sub: commands::camera::CameraCommand,
     },
+    /// Rotate persistent HMAC keys (pickup_token, frame_url, recording_url)
+    Keys {
+        #[command(subcommand)]
+        sub: commands::keys::KeysCommand,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -38,5 +43,6 @@ fn main() -> std::process::ExitCode {
     match cli.command {
         TopCommand::Addon { sub } => commands::addon::run(sub),
         TopCommand::Camera { sub } => commands::camera::run(sub),
+        TopCommand::Keys { sub } => commands::keys::run(sub),
     }
 }
