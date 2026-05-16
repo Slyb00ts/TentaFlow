@@ -15,14 +15,16 @@ const {
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 
+const PORT = 18101;
+const DB = '/tmp/e2e-m16.db';
 let proc;
 
 test.beforeAll(async () => {
   if (!binaryExists()) {
     test.skip(true, 'tentaflow release binary not built — run cargo build --release');
   }
-  proc = startBinary();
-  await waitForServer();
+  proc = startBinary({ port: PORT, db: DB });
+  await waitForServer(PORT);
 });
 
 test.afterAll(async () => {
@@ -32,8 +34,8 @@ test.afterAll(async () => {
 
 test.describe('M16 — Services > Aliases', () => {
   test.beforeEach(async ({ page }) => {
-    await loginAsAdmin(page);
-    await page.goto(`${baseUrl()}/#/services?tab=aliases`);
+    await loginAsAdmin(page, { port: PORT });
+    await page.goto(`${baseUrl(PORT)}/#/services?tab=aliases`);
     await page.waitForLoadState('networkidle');
   });
 

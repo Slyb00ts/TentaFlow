@@ -15,7 +15,7 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const BINARY = path.join(__dirname, '../../../tentaflow/target/release/tentaflow');
 const DEFAULT_PORT = 18099;
 const DEFAULT_DB = '/tmp/e2e-ui-test.db';
-const DEFAULT_CONFIG = path.join(__dirname, '../config-ui-test.toml');
+const CONFIG_TEMPLATE = path.join(__dirname, '../config-ui-test.toml');
 
 function binaryExists() {
   return fs.existsSync(BINARY);
@@ -31,12 +31,41 @@ function removeDbFiles(db) {
   }
 }
 
-function startBinary({ port = DEFAULT_PORT, configFile = DEFAULT_CONFIG, db = DEFAULT_DB } = {}) {
+// Produces a config file at `outPath` derived from the template with the
+// default port (18099) rewritten to `port`. Allows running multiple UI
+// suites in parallel without colliding on ports or sqlite databases.
+function renderConfig(outPath, port) {
+  const tpl = fs.readFileSync(CONFIG_TEMPLATE, 'utf8');
+  // Replace bind addresses "0.0.0.0:18099" and `port = 18099` mesh line.
+  const rendered = tpl
+    .replace(/"0\.0\.0\.0:18099"/g, `"0.0.0.0:${port}"`)
+    .replace(/^port = 18099$/m, `port = ${port}`);
+  fs.writeFileSync(outPath, rendered);
+  return outPath;
+}
+
+function registerCleanup(child) {
+  const cleanup = () => {
+    try { if (child && !child.killed) child.kill('SIGTERM'); } catch {}
+  };
+  process.on('exit', cleanup);
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+  process.on('uncaughtException', cleanup);
+}
+
+function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB } = {}) {
   removeDbFiles(db);
-  const proc = spawn(BINARY, ['-c', configFile, '--db', db], {
+  let cfg = configFile;
+  if (!cfg) {
+    cfg = `/tmp/e2e-ui-config-${port}.toml`;
+    renderConfig(cfg, port);
+  }
+  const proc = spawn(BINARY, ['-c', cfg, '--db', db], {
     env: { ...process.env, RUST_LOG: 'warn' },
   });
-  proc.stderr.on('data', (d) => process.stderr.write(`[ui] ${d}`));
+  proc.stderr.on('data', (d) => process.stderr.write(`[ui:${port}] ${d}`));
+  registerCleanup(proc);
   return proc;
 }
 
@@ -66,9 +95,11 @@ module.exports = {
   BINARY,
   DEFAULT_PORT,
   DEFAULT_DB,
-  DEFAULT_CONFIG,
+  CONFIG_TEMPLATE,
   binaryExists,
   baseUrl,
+  renderConfig,
+  registerCleanup,
   startBinary,
   waitForServer,
   stopBinary,

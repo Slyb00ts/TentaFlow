@@ -24,6 +24,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install GStreamer system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -35,17 +49,25 @@ jobs:
 
       - name: Build tentaflow release
         working-directory: tentaflow
-        run: cargo build --release --features dashboard-api
+        run: cargo build --release --features dashboard-api,camera
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tests/e2e/package-lock.json
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('tests/e2e/package-lock.json') }}
 
       - name: Install Playwright deps
         working-directory: tests/e2e
         run: |
-          npm ci || npm install
+          npm ci
           npx playwright install --with-deps chromium
 
       - name: Run UI e2e tests
