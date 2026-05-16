@@ -24,6 +24,25 @@ pub use token::{PickupToken, PickupVerifyError, TokenPayload};
 use self::store::{sweep, InflightMap, IssuedToken};
 use self::token::{parse_and_verify_multi, sign_payload};
 
+/// F1b P3.C-2 — verifier provenance. `Local` means the token's HMAC matched
+/// the local issuer's current or previous-window key (the issuing node is
+/// us). `Peer(node_id)` means we matched a peer-synced key from the mesh
+/// key pool, i.e. the token was minted on that peer; the pickup is a
+/// cross-node mesh-fallback. Caller logs this into
+/// `frame_pickup_log.source_node_id` for audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifySource {
+    Local,
+    Peer(String),
+}
+
+/// F1b P3.C-2 — B-side replay protection retention. Mesh-fallback consumes
+/// are tracked in a separate inflight map keyed by the full wire token; we
+/// keep the entry around for `2 × token TTL` so a delayed retry that
+/// arrives just past expiry still collides with the original consume row
+/// and surfaces as `AlreadyConsumed` instead of silently passing again.
+pub const MESH_CONSUMED_RETAIN: Duration = Duration::from_secs(60);
+
 use crate::services::key_storage::PersistentKey;
 
 /// Default lifetime for issued tokens. Picked to be just long enough for a
@@ -65,6 +84,12 @@ impl KeyState {
 pub struct PickupTokenIssuer {
     keys: Arc<RwLock<KeyState>>,
     inflight: InflightMap,
+    /// F1b P3.C-2 — B-side replay protection. Wire token → consume timestamp.
+    /// Entry written on the first successful mesh-fallback consume; further
+    /// consumes for the same wire return `AlreadyConsumed`. Lazy eviction:
+    /// stale entries (>= MESH_CONSUMED_RETAIN old) are pruned on every
+    /// `mesh_inflight_consume` call before we check for an existing hit.
+    mesh_consumed: Arc<DashMap<String, Instant>>,
     ttl: Duration,
 }
 
@@ -83,6 +108,7 @@ impl PickupTokenIssuer {
         let this = Self {
             keys: Arc::new(RwLock::new(KeyState::new(key))),
             inflight: Arc::new(DashMap::new()),
+            mesh_consumed: Arc::new(DashMap::new()),
             ttl: DEFAULT_TTL,
         };
         this.spawn_sweeper();
@@ -98,6 +124,7 @@ impl PickupTokenIssuer {
         Self {
             keys: Arc::new(RwLock::new(KeyState::new(key))),
             inflight: Arc::new(DashMap::new()),
+            mesh_consumed: Arc::new(DashMap::new()),
             ttl,
         }
     }
@@ -235,6 +262,94 @@ impl PickupTokenIssuer {
         Ok(payload)
     }
 
+    /// Like `verify_only` but also reports whether the token verified
+    /// against a local key (current/previous window) or a peer-synced key
+    /// from the mesh key pool. Caller logs the source into
+    /// `frame_pickup_log.source_node_id`. To preserve constant-time HMAC
+    /// behaviour we always evaluate every candidate key — both local and
+    /// peer — before deciding which path matched.
+    pub fn verify_only_with_source(
+        &self,
+        wire: &str,
+    ) -> Result<(TokenPayload, VerifySource), PickupVerifyError> {
+        let local = self.active_verify_keys();
+        let local_match = parse_and_verify_multi(local.iter().map(|k| k.as_slice()), wire);
+
+        let peer_entries = crate::services::mesh_keys::mesh_key_pool()
+            .verify_keys_with_peers_for(crate::services::mesh_keys::KeyScope::PickupToken);
+        let peer_keys: Vec<[u8; 32]> = peer_entries.iter().map(|(_, k)| *k).collect();
+        let peer_match =
+            parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire);
+
+        if let Ok((payload, key)) = local_match {
+            // Local match wins — it owns the inflight + one-shot lifecycle.
+            let entry = self
+                .inflight
+                .get(&key)
+                .ok_or(PickupVerifyError::InvalidToken)?;
+            if now_unix_ms() > entry.payload.expiry_unix_ms {
+                return Err(PickupVerifyError::Expired);
+            }
+            if entry.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PickupVerifyError::AlreadyConsumed);
+            }
+            debug_assert_eq!(payload, entry.payload);
+            return Ok((entry.payload.clone(), VerifySource::Local));
+        }
+
+        match peer_match {
+            Ok((payload, _wire_key)) => {
+                if now_unix_ms() > payload.expiry_unix_ms {
+                    return Err(PickupVerifyError::Expired);
+                }
+                // Identify which peer's key matched. We recompute HMAC per
+                // candidate key — same constant-time helper used inside
+                // `parse_and_verify_multi`. This costs ~N small HMAC
+                // computations on an already-rare path (mesh fallback only).
+                let node_id = identify_matching_peer(&peer_entries, wire)
+                    .unwrap_or_else(|| "<unknown-peer>".to_string());
+                Ok((payload, VerifySource::Peer(node_id)))
+            }
+            Err(_) => Err(local_match.unwrap_err()),
+        }
+    }
+
+    /// F1b P3.C-2 — B-side replay protection for mesh-fallback consumes.
+    /// First call for a given wire token records the consume timestamp and
+    /// returns `Ok(())`; every subsequent call returns
+    /// `AlreadyConsumed`. Stale entries (older than `MESH_CONSUMED_RETAIN`)
+    /// are pruned lazily on each call so a long-running process does not
+    /// leak memory at high QPS.
+    pub fn mesh_inflight_consume(&self, wire: &str) -> Result<(), PickupVerifyError> {
+        // Lazy eviction first — bounded work, only scans entries already
+        // past retention so it is cheap on a healthy map.
+        let cutoff = Instant::now() - MESH_CONSUMED_RETAIN;
+        self.mesh_consumed.retain(|_, ts| *ts > cutoff);
+
+        match self.mesh_consumed.entry(wire.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(PickupVerifyError::AlreadyConsumed)
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(Instant::now());
+                Ok(())
+            }
+        }
+    }
+
+    /// Test/diagnostic peek — number of entries in the mesh-consumed map.
+    #[doc(hidden)]
+    pub fn mesh_consumed_len(&self) -> usize {
+        self.mesh_consumed.len()
+    }
+
+    /// Test helper — force-expire mesh-consumed entries older than `age`.
+    #[doc(hidden)]
+    pub fn mesh_consumed_sweep_for_tests(&self, age: Duration) {
+        let cutoff = Instant::now() - age;
+        self.mesh_consumed.retain(|_, ts| *ts > cutoff);
+    }
+
     /// Atomic one-shot consume. Caller must have already run `verify_only`
     /// and cross-checked the headers against the returned payload. Returns
     /// `AlreadyConsumed` if a concurrent caller won the race.
@@ -294,6 +409,34 @@ impl Default for PickupTokenIssuer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Find which peer's HMAC key signs `wire`'s payload — used to attach a
+/// `Peer(node_id)` provenance tag to a successful mesh-fallback verify. The
+/// HMAC has already been validated by `parse_and_verify_multi`; this pass
+/// runs constant-time comparisons against every candidate key to avoid a
+/// timing channel that would leak "which peer's token did I just receive".
+fn identify_matching_peer(
+    peer_entries: &[(String, [u8; 32])],
+    wire: &str,
+) -> Option<String> {
+    use subtle::ConstantTimeEq;
+    let (payload_b64, sig_b64) = wire.split_once('.')?;
+    let provided = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        sig_b64.as_bytes(),
+    )
+    .ok()?;
+    let mut found: Option<String> = None;
+    for (node_id, key) in peer_entries {
+        let expected = self::token::hmac_sign(key, payload_b64);
+        let hit = provided.len() == expected.len()
+            && bool::from(provided.ct_eq(&expected));
+        if hit && found.is_none() {
+            found = Some(node_id.clone());
+        }
+    }
+    found
 }
 
 /// Current Unix timestamp in milliseconds. We use `SystemTime` so expiry
@@ -404,6 +547,100 @@ mod tests {
         let (t, _) = iss.issue("frame_p".into(), "svc".into(), "req-p".into());
         let p = iss.consume_one_shot(&t.wire()).expect("disk-loaded key verifies");
         assert_eq!(p.raw_ref, "frame_p");
+    }
+
+    #[test]
+    fn test_mesh_inflight_consume_first_succeeds() {
+        let i = issuer();
+        let wire = "fake-wire-token-aaa".to_string();
+        i.mesh_inflight_consume(&wire).expect("first consume ok");
+        assert_eq!(i.mesh_consumed_len(), 1);
+    }
+
+    #[test]
+    fn test_mesh_inflight_consume_second_returns_replay() {
+        let i = issuer();
+        let wire = "fake-wire-token-bbb".to_string();
+        i.mesh_inflight_consume(&wire).expect("first ok");
+        assert_eq!(
+            i.mesh_inflight_consume(&wire).unwrap_err(),
+            PickupVerifyError::AlreadyConsumed
+        );
+    }
+
+    #[test]
+    fn test_mesh_inflight_expires_after_ttl() {
+        let i = issuer();
+        let wire = "fake-wire-token-ccc".to_string();
+        i.mesh_inflight_consume(&wire).expect("first ok");
+        // Sweep with a zero-duration retention forces eviction of every
+        // entry. The next consume must succeed instead of replay-rejecting.
+        i.mesh_consumed_sweep_for_tests(Duration::from_millis(0));
+        // Tiny pause to ensure Instant::now() advances past the inserted ts
+        // on platforms with coarse monotonic clocks.
+        std::thread::sleep(Duration::from_millis(2));
+        i.mesh_consumed_sweep_for_tests(Duration::from_millis(0));
+        i.mesh_inflight_consume(&wire)
+            .expect("after expiry, fresh consume ok");
+    }
+
+    #[test]
+    fn test_verify_with_source_returns_local() {
+        let i = issuer();
+        let (t, _) = i.issue("frame_l".into(), "svc".into(), "req-l".into());
+        let (_p, src) = i.verify_only_with_source(&t.wire()).expect("local verify");
+        assert_eq!(src, VerifySource::Local);
+    }
+
+    #[test]
+    fn test_verify_with_source_returns_peer_node_id() {
+        // Mint with a key that is NOT the local issuer's key; insert that
+        // key into the mesh key pool tagged as "peer-X" and expect the
+        // local verify path to fall through to the mesh-fallback branch
+        // and tag the source as Peer("peer-X").
+        let peer_key = [0x99u8; 32];
+        let peer_node = format!(
+            "peer-x-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // Mint the token under peer_key. We bypass the issuer's inflight map
+        // entirely because mesh-fallback only checks signature + expiry.
+        let payload = TokenPayload {
+            raw_ref: "frame_peer".into(),
+            service_id: "svc".into(),
+            request_id: "req-peer".into(),
+            expiry_unix_ms: now_unix_ms() + 30_000,
+            one_shot: true,
+        };
+        let tok = sign_payload(&peer_key, &payload);
+
+        crate::services::mesh_keys::mesh_key_pool().upsert(
+            &peer_node,
+            crate::services::mesh_keys::KeyScope::PickupToken,
+            crate::services::mesh_keys::PeerKeyState {
+                current: peer_key,
+                previous: None,
+                previous_expires_unix_ms: 0,
+            },
+        );
+
+        // Local issuer uses a different key (the default test key 5u8).
+        let i = issuer();
+        let (got_payload, src) = i
+            .verify_only_with_source(&tok.wire())
+            .expect("peer verify");
+        assert_eq!(got_payload.raw_ref, "frame_peer");
+        match src {
+            VerifySource::Peer(id) => assert_eq!(id, peer_node),
+            VerifySource::Local => panic!("expected Peer source, got Local"),
+        }
+
+        // Cleanup so other tests sharing the static mesh_key_pool are
+        // unaffected.
+        crate::services::mesh_keys::mesh_key_pool().remove_peer(&peer_node);
     }
 
     #[test]

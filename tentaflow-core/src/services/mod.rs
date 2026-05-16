@@ -21,6 +21,7 @@ pub mod backend;
 pub mod camera_ingest;
 pub mod catalog;
 pub mod deploy;
+pub mod frame_proxy;
 pub mod frame_storage;
 pub mod handles_cache;
 pub mod key_storage;
