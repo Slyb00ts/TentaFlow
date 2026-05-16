@@ -216,23 +216,6 @@ async fn test_save_snapshot_cross_addon_frame_denied() {
 }
 
 #[test]
-fn test_save_segment_invalid_url_scheme() {
-    let _home = temp_home_guard();
-    let db = make_db();
-    let addon = uniq("addon-seg-http");
-    let camera = uniq("cam_seg_http");
-    seed_camera(&db, &addon, &camera);
-    let state = make_state(&db, &addon, vec!["recording.write".into()]);
-    let payload = format!(
-        "camera_id = {}\nsource_url = {}\nduration_secs = 2\n",
-        toml::Value::String(camera),
-        toml::Value::String("http://example.com/x.mp4".into()),
-    );
-    let (rc, _) = rec::save_segment_with_raw_input(&state, payload.as_bytes());
-    assert_eq!(rc, AbiError::Operation.as_i32());
-}
-
-#[test]
 fn test_save_segment_duration_out_of_range() {
     let _home = temp_home_guard();
     let db = make_db();
@@ -242,13 +225,61 @@ fn test_save_segment_duration_out_of_range() {
     let state = make_state(&db, &addon, vec!["recording.write".into()]);
     for bad in [0u32, 61] {
         let payload = format!(
-            "camera_id = {}\nsource_url = {}\nduration_secs = {}\n",
+            "camera_id = {}\nduration_secs = {}\n",
             toml::Value::String(camera.clone()),
-            toml::Value::String("file:///tmp/x.mp4".into()),
             bad,
         );
         let (rc, _) = rec::save_segment_with_raw_input(&state, payload.as_bytes());
         assert_eq!(rc, AbiError::Operation.as_i32(), "duration_secs={bad} must reject");
+    }
+}
+
+/// Addon-supplied `source_url` must be ignored entirely — the host always
+/// derives the segment source from the owned camera row. We probe by feeding
+/// a hostile `file:///etc/passwd` URL alongside a real camera with a benign
+/// fake-file URL and asserting that the only thing failing is the GStreamer
+/// pipeline against the (nonexistent) `/tmp/whatever.mp4` from the camera row —
+/// never the hostile path the addon tried to inject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_save_segment_uses_camera_url_not_input() {
+    let _home = temp_home_guard();
+    let db = make_db();
+    let addon = uniq("addon-seg-src");
+    let camera = uniq("cam_seg_src");
+    seed_camera(&db, &addon, &camera); // seeds url=/tmp/whatever.mp4
+    let state = make_state(&db, &addon, vec!["recording.write".into()]);
+    let payload = format!(
+        "camera_id = {}\nsource_url = {}\nduration_secs = 1\n",
+        toml::Value::String(camera),
+        toml::Value::String("file:///etc/passwd".into()),
+    );
+    let (rc, _) = rec::save_segment_with_raw_input(&state, payload.as_bytes());
+    // Either Operation (pipeline failure on the missing /tmp/whatever.mp4) or
+    // PayloadTooLarge — what must NOT happen is success (Ok=0), which would
+    // mean the host honored the addon-supplied source_url and read /etc/passwd.
+    assert_ne!(rc, AbiError::Ok.as_i32(), "addon-supplied source_url must never be honored");
+}
+
+/// Recording ref must follow the strict `(snap|clip)_<uuidv4>` regex —
+/// path-traversal payloads must be rejected before any DB lookup.
+#[test]
+fn test_recording_ref_invalid_format_rejected() {
+    let _home = temp_home_guard();
+    let db = make_db();
+    let addon = uniq("addon-refbad");
+    let state = make_state(&db, &addon, vec!["recording.read".into()]);
+    for hostile in [
+        "snap_../../../etc/passwd",
+        "snap_not-a-uuid",
+        "clip_12345678-1234-1234-1234-12345678901Z",
+        "frame_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", // wrong prefix for recording ref
+    ] {
+        let payload = format!(
+            "recording_ref = {}\nttl_secs = 120\n",
+            toml::Value::String(hostile.into()),
+        );
+        let (rc, _) = rec::get_url_with_raw_input(&state, payload.as_bytes());
+        assert_eq!(rc, AbiError::Operation.as_i32(), "must reject hostile recording_ref {hostile:?}");
     }
 }
 
@@ -355,6 +386,80 @@ async fn test_get_stream_basic() {
     let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
     let on_disk = std::fs::read(&row.file_path).unwrap();
     assert_eq!(decoded, on_disk, "get_stream bytes must match the on-disk file");
+}
+
+/// Oversized get_stream must be rejected by the host-side pre-check (using the
+/// file_size_bytes from the DB row + base64 expansion estimate) BEFORE the
+/// host reads the file from disk. We seed a recording row pointing at a real
+/// (small) file but lie about its size in DB — the pre-check should still
+/// fire on the lie alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_stream_oversized_rejected_before_read() {
+    let _home = temp_home_guard();
+    let db = make_db();
+    let addon = uniq("addon-stream-big");
+    let camera = uniq("cam_stream_big");
+    seed_camera(&db, &addon, &camera);
+    let state = make_state(&db, &addon, vec!["recording.write".into(), "recording.read".into()]);
+    let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
+    let (_rc, out) = rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
+    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+    let recording_ref = parsed["recording_ref"].as_str().unwrap().to_string();
+
+    // Forge the DB row's file_size_bytes to 7 MiB — base64 expands to >9 MiB
+    // which exceeds the ServiceCall 8 MiB cap.
+    {
+        let conn = db.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE recordings SET file_size_bytes = ?1 WHERE ref = ?2",
+            rusqlite::params![7i64 * 1024 * 1024, recording_ref],
+        ).unwrap();
+        assert_eq!(n, 1);
+    }
+    let payload = format!("recording_ref = {}\n", toml::Value::String(recording_ref.clone()));
+    let (rc, _) = rec::get_stream_with_raw_input(&state, payload.as_bytes());
+    assert_eq!(rc, AbiError::PayloadTooLarge.as_i32(), "oversized recording must be rejected before read");
+}
+
+/// Purge must surface an error (and NOT soft-delete the DB row, NOT audit
+/// `ok`) when the underlying filesystem remove fails for any reason other
+/// than NotFound. We simulate that by pointing the catalog row at a path
+/// whose parent is a regular file — `unlink` then returns ENOTDIR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_purge_io_error_returns_error_no_db_soft_delete() {
+    let _home = temp_home_guard();
+    let db = make_db();
+    let addon = uniq("addon-purge-io");
+    let camera = uniq("cam_purge_io");
+    seed_camera(&db, &addon, &camera);
+    let state = make_state(&db, &addon, vec!["recording.write".into()]);
+    let frame_ref = insert_frame(&camera, 8, 8, rgb_buf(8, 8));
+    let (_rc, out) = rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
+    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+    let recording_ref = parsed["recording_ref"].as_str().unwrap().to_string();
+
+    // Repoint the on-disk file at a bogus path whose parent is a file — any
+    // `unlink` against it surfaces a non-NotFound IO error.
+    let bogus_parent = std::env::temp_dir().join(format!("tf_purge_io_{}.dat", uuid::Uuid::new_v4()));
+    std::fs::write(&bogus_parent, b"x").unwrap();
+    let bogus_target = bogus_parent.join("never.png");
+    {
+        let conn = db.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE recordings SET file_path = ?1 WHERE ref = ?2",
+            rusqlite::params![bogus_target.to_string_lossy().to_string(), recording_ref],
+        ).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    let payload = format!("recording_ref = {}\n", toml::Value::String(recording_ref.clone()));
+    let (rc, _) = rec::purge_with_raw_input(&state, payload.as_bytes());
+    assert_eq!(rc, AbiError::Operation.as_i32(), "fs-level purge failure must surface as Operation");
+    // DB row must still be active (purged_at IS NULL) — host did NOT lie that
+    // the purge succeeded.
+    let row = get_recording_for_addon(&db, &addon, &recording_ref).unwrap();
+    assert!(row.is_some(), "DB row must remain active after a failed purge");
+    std::fs::remove_file(&bogus_parent).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

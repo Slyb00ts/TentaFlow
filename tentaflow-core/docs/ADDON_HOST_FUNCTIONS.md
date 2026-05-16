@@ -1565,10 +1565,17 @@ created_at = 1715789000
 **Input (TOML):**
 ```toml
 camera_id = "cam_<uuid>"
-source_url = "file:///abs/path/sample.mp4"   # F1a: tylko file://
 duration_secs = 5                             # 1..=60
 retention_class = "C"                         # opcjonalne
 ```
+
+`source_url` jest **wyprowadzane host-side** z wiersza `cameras.url` dla
+`camera_id` przypisanego do wolajacego addona — addon nigdy nie podaje go
+sam, co eliminuje wektor czytania dowolnych plikow hosta przez segment.
+W F1a akceptujemy wylacznie `vendor='fake_file'`. Plik segmentu jest zawsze
+najpierw zapisywany do `<final>.mp4.tmp` i atomowo (`rename`) promowany do
+`<final>.mp4` dopiero po pomyslnej finalizacji `mp4mux` — niepelnych mp4
+nie ma na dysku.
 
 **Output:** identyczny `SavedRecordingOut` jak snapshot, z `duration_ms`
 zamiast `width/height`. Brak `pixel_format` (mp4 nie probujemy probowac w F1a).
@@ -1589,10 +1596,15 @@ expires_unix_ms = ...
 
 ### 15.4 `recording_get_stream_v1` (read, risk B)
 
-Zwraca bajty inline. `data_b64` w odpowiedzi nigdy nie przekracza 8 MiB
-(`PayloadKind::ServiceCall`); jesli plik > 8 MiB → `AbiError::PayloadTooLarge`,
-audit `error / payload_too_large`. Hash z DB jest dolaczany do odpowiedzi tak
-zeby addon mogl zweryfikowac integralnosc po dekodzie.
+Zwraca bajty inline w polu `data_b64`. Calosc odpowiedzi TOML jest hard-capped
+8 MiB (`PayloadKind::ServiceCall`). Po uwzglednieniu rozszerzenia base64
+(`ceil(N/3)*4`) + ~256 B na nazwy pol i hash, praktyczny limit to ~6 MiB
+surowego pliku → ~8 MiB TOML odpowiedzi. Host odrzuca request **przed** odczytem
+pliku z dysku jesli oszacowany rozmiar odpowiedzi przekracza limit
+(`AbiError::PayloadTooLarge`, audit `error / payload_too_large`). Wieksze
+artefakty trzeba pobierac przez `recording_get_url_v1` + HTTP handler.
+Hash z DB jest dolaczany do odpowiedzi, zeby addon mogl zweryfikowac
+integralnosc po dekodzie.
 
 ### 15.5 `recording_purge_v1` (write, risk A)
 
