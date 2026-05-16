@@ -2,15 +2,28 @@
 // File: tests/abi_error_sweep.rs — F1a M2.W11 AbiError comprehensive sweep
 // =============================================================================
 //
-// Goal: prove every AbiError variant (0..=24) is wired correctly and either
-//   (a) demonstrably triggerable from a guest-visible code path, or
-//   (b) explicitly classified as an internal-only / cross-cutting variant
-//       whose final emission happens inside a deeper subsystem (camera
-//       supervisor, streaming bus, recording manager, fuel metering, etc.)
-//       and is already covered by the dedicated suite for that subsystem.
+// Goal: prove every AbiError variant (0..=24) is wired correctly and audit
+// where each one is actually triggered from a guest-visible code path.
 //
-// This file does NOT duplicate those subsystem tests — each cross-referenced
-// path is named below so reviewers can audit the chain end-to-end.
+// Variant classification (precise — earlier revisions overstated coverage):
+//   (a) Concretely triggered in THIS file (6 variants):
+//         Ok, NotFound, Operation, Conflict, PayloadTooLarge (via shared
+//         enforce_payload_size in install path), CameraVendorUnsupported.
+//   (b) Concretely triggered in dedicated subsystem suites (17 variants) —
+//       each row in ALL_VARIANTS below names the owning test file. The
+//       audit table `_force_use_alias_types` + `all_variants_have_unique_*`
+//       sweep here is purely a wiring check, not a replacement for those
+//       suites.
+//   (c) Legitimately internal-only in F1a (2 variants): CameraAuthFailed
+//       (no real RTSP auth implemented yet) and GateNotSatisfied (F2 policy
+//       engine — parsed but not enforced). These are flagged below with an
+//       `internal_only_in_f1a = true` note and intentionally have no
+//       guest-visible trigger in this milestone.
+//
+// Net: 23/25 variants reachable from a guest in F1a; 2 reserved for later
+// milestones. Drift detection: `all_variants_have_unique_codes_and_descriptions`
+// fails the build the moment a new variant is added without updating both
+// the production table in `errors.rs::tests::ALL` and this audit table.
 
 use std::sync::Arc;
 
@@ -104,12 +117,12 @@ const ALL_VARIANTS: &[(AbiError, i32, &str)] = &[
     (
         AbiError::CameraAuthFailed,
         13,
-        "RTSP credential failure path; internal-only in F1a (no real auth yet)",
+        "RTSP credential failure path; INTERNAL-ONLY in F1a (no real auth yet, reserved for M3)",
     ),
     (
         AbiError::CameraVendorUnsupported,
         14,
-        "vendor probe; internal-only in F1a (FakeFile is the only supported vendor)",
+        "camera_add with vendor != 'fake_file' (F1a only supports fake_file); triggered below",
     ),
     (
         AbiError::StreamNotFound,
@@ -149,7 +162,7 @@ const ALL_VARIANTS: &[(AbiError, i32, &str)] = &[
     (
         AbiError::GateNotSatisfied,
         22,
-        "F2 policy engine; internal-only in F1a (gates parsed, not enforced)",
+        "F2 policy engine; INTERNAL-ONLY in F1a (gates parsed but not enforced until F2)",
     ),
     (
         AbiError::FrameTokenInvalid,
@@ -197,17 +210,18 @@ fn trigger_not_found_via_alias_get() {
 }
 
 /// AbiError::Operation — alias_get with a malformed alias id (validator
-/// rejects before the DB lookup).
+/// rejects before the DB lookup). The validator is the only synchronous
+/// failure between the ABI boundary and the DB query, so `Operation` here
+/// is the exact `validate_alias_id` rejection path.
 #[test]
 fn trigger_operation_via_invalid_alias_id() {
     let db = make_db();
-    // Contains uppercase + `/` — both forbidden by the validator. The
-    // validator returns InvalidArgument-class via Operation in this codepath.
+    // Contains uppercase + `/` — both forbidden by the validator.
     let res = test_api::alias_get_internal(&db, "Bad/Name", "addon");
-    assert!(
-        matches!(res, Err(AbiError::Operation) | Err(AbiError::NotFound)),
-        "expected Operation or NotFound for invalid id, got {:?}",
-        res
+    assert_eq!(
+        res.unwrap_err(),
+        AbiError::Operation,
+        "validator must reject malformed alias id with Operation"
     );
 }
 
@@ -359,4 +373,60 @@ fn _force_use_alias_types() {
         visibility: AliasVisibility::Private,
         allowed_consumers: vec![],
     };
+}
+
+// =============================================================================
+// AbiError::CameraVendorUnsupported — F1a accepts only `vendor='fake_file'`.
+// camera_add with any other vendor must reject with code 14.
+// =============================================================================
+
+#[cfg(feature = "camera")]
+#[test]
+fn trigger_camera_vendor_unsupported_via_camera_add() {
+    use parking_lot::Mutex as ParkingMutex;
+    use tentaflow_core::addon::event_bus::EventBus;
+    use tentaflow_core::addon::host_functions::camera::test_api as camera_test_api;
+    use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
+    use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
+    use tentaflow_core::addon::permissions::PermissionChecker;
+    use tentaflow_core::addon::AddonState;
+
+    let db = make_db();
+    let state = AddonState {
+        addon_id: "vendor-test-addon".to_string(),
+        instance_id: "v-1".to_string(),
+        user_id: None,
+        db: db.clone(),
+        permissions: vec!["cameras.write".to_string()],
+        event_bus: Arc::new(EventBus::new()),
+        permission_checker: Arc::new(PermissionChecker::new(db)),
+        fuel_consumed: 0,
+        is_system_call: true,
+        rate_limiter: None,
+        net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
+        settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),
+        manifest: Arc::new(AddonManifest::default()),
+        memory_limit: 16 * 1024 * 1024,
+        router: None,
+        oauth_refresh_guard: Arc::new(OAuthRefreshGuard::new()),
+        ui_panels: None,
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+    };
+
+    // vendor='rtsp' is rejected by validate_vendor (only fake_file in F1a).
+    let raw = br#"
+vendor = "rtsp"
+url = "rtsp://example.com/stream"
+target_fps = 15
+retention_class = "short"
+display_name = "Test cam"
+profile = "default"
+"#;
+    let rc = camera_test_api::camera_add_with_raw_input(&state, raw);
+    assert_eq!(
+        rc,
+        AbiError::CameraVendorUnsupported.as_i32(),
+        "camera_add with vendor='rtsp' must return CameraVendorUnsupported (14), got {rc}"
+    );
 }
