@@ -100,6 +100,28 @@ impl CameraIngestSupervisor {
         }
     }
 
+    /// Signal a running session to tear its pipeline down and rebuild it
+    /// using `new_config`. Used by `camera_credentials_rotate_v1` so an
+    /// active RTSP session picks up rotated credentials within one backoff
+    /// cycle instead of holding the stale plaintext until the next
+    /// disconnect. Returns `NotFound` if the camera is not registered.
+    pub async fn restart_camera(&self, camera_id: &str, new_config: CameraConfig) -> Result<()> {
+        // Hold the read lock only long enough to clone the sender; if the
+        // channel is full we must not block the registry.
+        let cmd_tx = {
+            let g = self.registry.read().await;
+            let handle = g
+                .get(camera_id)
+                .ok_or_else(|| CameraIngestError::NotFound(camera_id.to_string()))?;
+            handle.cmd_tx.clone()
+        };
+        cmd_tx
+            .send(SessionCommand::Restart(new_config))
+            .await
+            .map_err(|_| CameraIngestError::SessionCrashed(camera_id.to_string()))?;
+        Ok(())
+    }
+
     pub async fn remove_camera(&self, camera_id: &str) -> Result<()> {
         let handle = {
             let mut g = self.registry.write().await;

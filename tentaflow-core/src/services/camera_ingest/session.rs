@@ -123,6 +123,12 @@ pub struct SnapshotData {
 pub enum SessionCommand {
     Stop,
     UpdateConfig(CameraConfig),
+    /// Tear down the current pipeline and rebuild it with `CameraConfig`.
+    /// Used by `camera_credentials_rotate_v1` so an in-flight session
+    /// picks up freshly rotated credentials without an operator-visible
+    /// remove/re-add cycle. Restart resets reconnect backoff so the new
+    /// credentials are tried immediately.
+    Restart(CameraConfig),
     GetHealth(oneshot::Sender<CameraHealth>),
     Snapshot(oneshot::Sender<std::result::Result<SnapshotData, CameraIngestError>>),
 }
@@ -278,6 +284,13 @@ async fn run_session(
                         // down and rebuild the pipeline when source params
                         // change.
                     }
+                    Some(SessionCommand::Restart(_new)) => {
+                        // fake_file has no credentials and no remote endpoint
+                        // — a Restart signal cannot happen in the normal path
+                        // (only rtsp sessions receive it). Treat as no-op so
+                        // the match stays exhaustive and a stray signal does
+                        // not crash the task.
+                    }
                     Some(SessionCommand::GetHealth(reply)) => {
                         let h = health_tx.borrow().clone();
                         let _ = reply.send(h);
@@ -430,9 +443,10 @@ async fn drain_until_stop(
                     .unwrap_or_else(|| "session in terminal error state".into());
                 let _ = reply.send(Err(CameraIngestError::SnapshotFailed(msg)));
             }
-            SessionCommand::UpdateConfig(_) => {
-                // Terminal state: config updates are no-ops; the supervisor
-                // is expected to remove/re-add the camera to recover.
+            SessionCommand::UpdateConfig(_) | SessionCommand::Restart(_) => {
+                // Terminal state: config updates and restart signals are
+                // no-ops; the supervisor is expected to remove/re-add the
+                // camera to recover.
             }
         }
     }
