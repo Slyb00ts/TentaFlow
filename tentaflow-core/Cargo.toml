@@ -279,5 +279,10 @@ harness = false
 name = "streaming_pickup_perf"
 harness = false
 
+[[bench]]
+name = "recording_perf"
+harness = false
+required-features = ["camera"]
+
 [patch.crates-io]
 ed25519-dalek = { path = "../vendor/ed25519-dalek" }

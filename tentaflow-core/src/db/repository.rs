@@ -11155,6 +11155,24 @@ pub fn get_recording_for_addon(
     Ok(row)
 }
 
+/// Look up an active recording row by `ref` alone, without scoping to an
+/// addon. Used by the HTTP handler that serves signed URLs: the HMAC token
+/// has already authenticated the caller, and the ref itself is the
+/// capability — there is no addon identity at the wire level. Cross-addon
+/// scoping is enforced at issuance time by `get_recording_for_addon`.
+#[cfg(feature = "camera")]
+pub fn get_recording_by_ref(pool: &DbPool, recording_ref: &str) -> Result<Option<RecordingRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {RECORDING_SELECT_COLS} FROM recordings \
+         WHERE ref = ?1 AND purged_at IS NULL"
+    );
+    let row = conn
+        .query_row(&sql, rusqlite::params![recording_ref], row_to_recording)
+        .optional()?;
+    Ok(row)
+}
+
 /// Soft-deletes a recording by stamping `purged_at`. Returns `Ok(true)` when
 /// an active row was found and stamped, `Ok(false)` for "not found / not owned
 /// / already purged" (the host-function layer treats `false` as idempotent OK

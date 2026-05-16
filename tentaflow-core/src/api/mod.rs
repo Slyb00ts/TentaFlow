@@ -7,6 +7,11 @@ pub mod openai;
 
 pub mod frame_pickup;
 
+pub mod frames;
+
+#[cfg(feature = "camera")]
+pub mod recording;
+
 #[cfg(feature = "dashboard-api")]
 pub mod dashboard;
 

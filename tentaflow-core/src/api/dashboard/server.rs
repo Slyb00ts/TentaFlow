@@ -816,6 +816,147 @@ pub async fn handle_request(
         }
     }
 
+    // GET /frames/<ref>?token=&exp=&ref= — addon-facing multi-use signed URL
+    // for raw RGB24 frames out of `services::frame_storage`. Authenticated by
+    // HMAC token only (no JWT, no cookies, no CSRF surface).
+    if method == Method::GET && path.starts_with("/frames/") && path.len() > "/frames/".len() {
+        use crate::api::frames::{
+            handle_frame_url, parse_query, FrameOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT,
+            HDR_FRAME_PTS, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
+        };
+        const URL_BODY_LIMIT: u64 = 1024;
+        let content_length: u64 = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if content_length > URL_BODY_LIMIT {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"payload_too_large\"}",
+                ))))
+                .unwrap());
+        }
+        let _ = req.collect().await?;
+        let path_ref = path.strip_prefix("/frames/").unwrap_or("");
+        let q = parse_query(&query_string);
+        let issuer = crate::services::frame_url_issuer();
+        let storage = crate::services::frame_storage();
+        let outcome = handle_frame_url(path_ref, &q, issuer, storage, &db);
+        let status = outcome.http_status();
+        match outcome {
+            FrameOutcome::Ok {
+                bytes,
+                width,
+                height,
+                pixel_format,
+                timestamp_unix_ms,
+                pts,
+            } => {
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/octet-stream")
+                    .header(HDR_FRAME_WIDTH, width.to_string())
+                    .header(HDR_FRAME_HEIGHT, height.to_string())
+                    .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
+                    .header(HDR_FRAME_TS_MS, timestamp_unix_ms.to_string());
+                if let Some(p) = pts {
+                    builder = builder.header(HDR_FRAME_PTS, p.to_string());
+                }
+                let body = Bytes::copy_from_slice(&bytes);
+                return Ok(builder.body(Either::Left(Full::new(body))).unwrap());
+            }
+            FrameOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            FrameOutcome::Denied(_) | FrameOutcome::NotFound => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"frame_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
+    // GET /recordings/<ref>?token=&exp=&ref= — addon-facing signed URL for
+    // snapshot PNG / segment MP4. HMAC-only auth, exactly like /frames/.
+    // Wired under `feature = "camera"` because the recording subsystem
+    // (snapshot encoder + segment muxer + DB row helpers) is camera-gated.
+    #[cfg(feature = "camera")]
+    if method == Method::GET && path.starts_with("/recordings/") && path.len() > "/recordings/".len() {
+        use crate::api::recording::{handle_recording_url, parse_query, RecordingOutcome};
+        const URL_BODY_LIMIT: u64 = 1024;
+        let content_length: u64 = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if content_length > URL_BODY_LIMIT {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"payload_too_large\"}",
+                ))))
+                .unwrap());
+        }
+        let _ = req.collect().await?;
+        let path_ref = path.strip_prefix("/recordings/").unwrap_or("");
+        let q = parse_query(&query_string);
+        let issuer = crate::services::recording_url_issuer();
+        let outcome = handle_recording_url(path_ref, &q, issuer, &db);
+        let status = outcome.http_status();
+        match outcome {
+            RecordingOutcome::Ok {
+                bytes,
+                content_type,
+                hash_sha256,
+                created_at,
+                file_size_bytes: _,
+            } => {
+                let body = Bytes::from(bytes);
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", content_type)
+                    .header("X-Recording-Hash", hash_sha256)
+                    .header("X-Recording-Created-At", created_at.to_string())
+                    .body(Either::Left(Full::new(body)))
+                    .unwrap());
+            }
+            RecordingOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            RecordingOutcome::Denied(_)
+            | RecordingOutcome::NotFound
+            | RecordingOutcome::InternalError(_) => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"recording_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {
         let (status, content_type, body) = static_files::serve(&path);
