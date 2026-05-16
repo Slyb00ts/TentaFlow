@@ -1,0 +1,381 @@
+/* =============================================================================
+   File: install-wizard.css
+   Description: Styles for the generic addon install wizard (M15). Hosted in
+                tf-window; layout matches the m15-install-wizard mockup with
+                a header, step progress indicator and per-step bodies for
+                permissions / storage / aliases / placeholder steps.
+   ============================================================================= */
+
+#install-wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 4px 2px;
+}
+
+.install-header {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.install-header .big-ico {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-sm);
+  background: var(--gradient-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.install-header .big-ico svg {
+  width: 24px;
+  height: 24px;
+  stroke: white;
+  fill: none;
+  stroke-width: 1.75;
+}
+
+.install-header h1 {
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.install-header h1 .version {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  padding: 2px 8px;
+  background: var(--bg-3);
+  border-radius: 10px;
+}
+
+.install-header .sub {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-top: 4px;
+}
+
+/* Step progress */
+.install-progress {
+  display: flex;
+  gap: 4px;
+}
+
+.install-progress .install-step {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.install-progress .install-step .num {
+  font-weight: 800;
+  background: var(--bg);
+  padding: 1px 7px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.install-progress .install-step.active {
+  background: rgba(96, 165, 250, 0.12);
+  border-color: var(--accent-1, #60a5fa);
+  color: var(--text);
+}
+
+.install-progress .install-step.active .num {
+  background: var(--accent-1, #60a5fa);
+  color: white;
+}
+
+.install-progress .install-step.done {
+  border-color: rgba(34, 197, 94, 0.3);
+  color: var(--success, #22c55e);
+}
+
+.install-progress .install-step.done .num {
+  background: var(--success, #22c55e);
+  color: white;
+}
+
+.install-progress .install-step .label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Step body shared */
+.install-step-body {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.wizard-section-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.wizard-section-sub {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 14px;
+}
+
+.mono {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--text-3);
+}
+
+/* Step 1: permissions */
+.wizard-perm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wizard-perm-row {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.wizard-perm-row.is-critical {
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.05);
+}
+
+.wizard-perm-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.wizard-perm-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.wizard-perm-display {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.wizard-perm-desc {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.wizard-perm-controls {
+  display: flex;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.wizard-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+/* Step 2: storage */
+.wizard-storage-row {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.wizard-storage-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.wizard-storage-head .icon {
+  width: 16px;
+  height: 16px;
+  stroke: var(--accent-2);
+  fill: none;
+  stroke-width: 2;
+}
+
+.wizard-storage-head .wizard-storage-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.wizard-storage-body {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wizard-storage-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.wizard-storage-field label {
+  min-width: 130px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.wizard-warning {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.wizard-warning .icon {
+  width: 14px;
+  height: 14px;
+  stroke: var(--warning, #f59e0b);
+  fill: none;
+  stroke-width: 2;
+}
+
+/* Step 3: aliases */
+.wizard-alias-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wizard-alias-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1.4fr 0.6fr;
+  gap: 14px;
+  align-items: center;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.wizard-alias-row.is-blocked {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.04);
+}
+
+.wizard-alias-name {
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--accent-2);
+}
+
+.wizard-alias-desc {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 3px;
+}
+
+.wizard-alias-gated {
+  margin-top: 6px;
+}
+
+.wizard-alias-target {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wizard-alias-target label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  font-weight: 700;
+}
+
+.wizard-alias-side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+/* Placeholder steps (4-6) */
+.wizard-placeholder {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 18px;
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+}
+
+.wizard-placeholder .icon {
+  width: 18px;
+  height: 18px;
+  stroke: var(--info, #60a5fa);
+  fill: none;
+  stroke-width: 2;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.wizard-placeholder strong {
+  display: block;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+#install-wizard-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
