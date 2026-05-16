@@ -12,7 +12,7 @@
 | **P2** | Lab pilot 4 fizyczne kamery | 1 week | pending |
 | **P3** | Multi-node mesh key sync | 2 weeks | pending |
 | **P4** | Audit Merkle chain (DoD-15 full) | 1 week | done |
-| **P5** | service_call rate limit | 0.5 week | pending |
+| **P5** | service_call rate limit | 0.5 week | done |
 | **P6** | Bug bash z F1a soak run | open | pending |
 
 ## Phase 1 — RTSP/ONVIF camera vendors
@@ -412,4 +412,90 @@ seeded on first write per process.
 - Per-row signature with the operator's private key — would harden against
   a DB-level attacker forging both content + hash. Deferred to F3
   (evidence signing with HSM + RFC 3161 TSA).
+
+## Phase 5 — service_call rate limit (done)
+
+Per-addon token-bucket limiter guarding `service_call_v1`
+(`addon::host_functions::service::service_request`). Without it a single
+buggy or malicious addon spamming 10 000 req/s drains shared backend
+services (yolo, whisper, ...) — this is the first line of defence before
+the alias resolver / QUIC dispatch.
+
+### Design
+
+- **One bucket per addon_id**, keyed in a `DashMap`. Bounded by an LRU
+  eviction at `MAX_ADDON_ENTRIES = 10 000` plus an idle sweep
+  (`IDLE_EVICT_AFTER = 600 s`). Same shape as the per-IP HMAC limiter in
+  `api::rate_limit` — that one's `TokenBucket` was extracted to
+  `src/util/token_bucket.rs` and is now reused by both limiters (zero
+  duplication of the refill/peek/commit primitive).
+- **Defaults** (per handoff): burst capacity 100, sustain
+  16.67 req/s = 1000 req/min. Generous enough for a legitimate vision-loop
+  addon fanning a frame to multiple backends, strict enough that a
+  self-DoS bug can't saturate a shared yolo service.
+- **Denial path**: returns `AbiError::QuotaExceeded` (code 11, reused from
+  M1.W7 streaming subs). Each denial calls `note_denial_for_audit` which
+  collapses the audit row to **at most one row per addon per 60 s
+  window**, carrying `denied_count` for the in-window total — without
+  this an attacker would turn a request DoS into an audit-log DoS.
+  Audit row uses `risk_class='C'` (low-severity denial).
+
+### Files
+
+| File | Role | LOC |
+|------|------|-----|
+| `src/util/mod.rs` | New util module (token-bucket reuse home) | 9 |
+| `src/util/token_bucket.rs` | Extracted `TokenBucket` (was inline in api/rate_limit.rs) | 85 |
+| `src/services/service_call_rate_limit.rs` | Limiter + collapsed-audit map + tests | ~320 |
+| `src/services/mod.rs` | Module registration | +1 line |
+| `src/lib.rs` | `pub mod util;` | +1 line |
+| `src/api/rate_limit.rs` | Use shared `TokenBucket` (removed local copy) | -48 / +2 |
+| `src/addon/host_functions/service.rs` | Inserted rate-limit gate after `addon_id` capture | +35 |
+| `tests/service_call_rate_limit.rs` | 5 integration tests | ~110 |
+
+### Tests
+
+Unit (in `src/services/service_call_rate_limit.rs`):
+- `per_addon_burst_allowed` — 100 calls one addon all pass.
+- `per_addon_burst_exceeded_denied` — 101-st call → `AddonLimit`.
+- `different_addons_independent` — addon-a exhausted, addon-b still fresh.
+- `eviction_at_hard_cap` — 11 k unique ids → ≤10 k entries after sweep.
+- `refill_resumes_after_quota` — burst, sleep 1.1 s, allow again.
+- `audit_collapse_first_emits_subsequent_skip` — first denial Emit, rest Skip.
+
+Integration (`tests/service_call_rate_limit.rs`):
+- `burst_of_100_allowed_then_101_denied` — default-shaped config.
+- `addon_isolation` — addon-a denied while addon-b still allowed.
+- `quota_refills_with_time` — 300 ms sleep restores 1.25 tokens at 5/s.
+- `audit_emit_collapses_inside_window` — 1 emit + 1000 skips.
+- `map_bounded_under_addon_id_churn` — 11 k addons, map ≤10 k.
+
+All 11 tests green (`cargo test --features dashboard-api`).
+
+### Decisions
+
+- **TokenBucket reuse** — extracted to `src/util/token_bucket.rs`
+  (~85 LOC, zero deps beyond `std`) rather than duplicating inline. Both
+  rate limiters now share one implementation. E1 tests still green
+  post-extraction.
+- **Burst 100, refill 16.67/s** — matches handoff §5 spec (1000 req/min)
+  plus a 6-second burst headroom for vision-loop fan-out patterns.
+- **Audit window 60 s** — same as `api::dashboard::server` HTTP-side
+  collapse (one row per addon per minute carrying denied_count).
+- **No config knob yet** — `ServerConfig` does not currently expose a
+  `[server.rate_limit]` section (the existing `RateLimitingConfig` lives
+  at top level and targets API-key throttling). Adding a parallel
+  per-addon block would be a new schema. Kept defaults hardcoded for P5;
+  if operators need tuning, the singleton's `ServiceCallRateLimiter::new`
+  takes a `ServiceCallRateLimitConfig` and the OnceLock can be replaced
+  with a config-aware initialiser in a follow-up.
+
+### Out of P5 scope
+
+- Manifest-side `[runtime] rate_limit_per_min` per-addon override
+  (mentioned in handoff §5). Deferred — the manifest schema work would
+  carry its own DoD-12 review and is orthogonal to the host-side gate.
+- Distributed rate limiting across mesh nodes — each node enforces
+  locally. A coordinated addon spread across N nodes can do N× the
+  budget. Acceptable for F1b (mesh is opt-in).
 

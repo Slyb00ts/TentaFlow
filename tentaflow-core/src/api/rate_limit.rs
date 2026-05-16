@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
+use crate::util::token_bucket::TokenBucket;
+
 /// Bucket parameters — capacity is the burst depth, `refill_per_sec` is the
 /// sustained refill rate. Defaults sized for HMAC-only endpoints (cheap when
 /// the token is valid, but every miss pays a few microseconds of HMAC +
@@ -52,55 +54,6 @@ pub enum RateLimitResult {
     Allow,
     IpLimit { ip: String, retry_after_secs: f64 },
     GlobalLimit { retry_after_secs: f64 },
-}
-
-#[derive(Debug)]
-struct TokenBucket {
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(capacity: u32) -> Self {
-        Self {
-            tokens: capacity as f64,
-            last_refill: Instant::now(),
-        }
-    }
-
-    /// Refill based on elapsed time without consuming. Returns `Ok(())` if at
-    /// least one token is available post-refill, otherwise `Err(retry_secs)`.
-    /// Caller must explicitly `commit_one` after deciding to charge.
-    fn refill_and_peek(
-        &mut self,
-        capacity: u32,
-        refill_per_sec: f64,
-        now: Instant,
-    ) -> std::result::Result<(), f64> {
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
-        if elapsed > 0.0 {
-            self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity as f64);
-            self.last_refill = now;
-        }
-        if self.tokens >= 1.0 {
-            Ok(())
-        } else {
-            let missing = 1.0 - self.tokens;
-            let retry = if refill_per_sec > 0.0 {
-                missing / refill_per_sec
-            } else {
-                f64::INFINITY
-            };
-            Err(retry)
-        }
-    }
-
-    /// Charge one token. Precondition: a prior `refill_and_peek` on the same
-    /// `now` returned `Ok(())`. Splitting peek from commit lets the limiter
-    /// validate per-IP AND global before debiting either bucket.
-    fn commit_one(&mut self) {
-        self.tokens -= 1.0;
-    }
 }
 
 #[derive(Debug)]
