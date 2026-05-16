@@ -117,8 +117,11 @@ One-shot pickup-token semantics are owned by the issuing node — mesh
 fallback verifies HMAC + expiry but does not enforce one-shot on the
 verifying side (the 30 s pickup TTL keeps the replay window tight). An
 explicit broadcast-on-rotate hop (push new keys without waiting for the
-next `PeerConnected`) is deferred; today rotation propagates lazily via
-the cooldown-gated advertise on the next connect cycle.
+next `PeerConnected`) is deferred; today rotation propagates lazily on
+the next connect cycle. Unlike `TrustedKeysSync`, the HMAC advertise is
+**not** gated by the 30 s `last_sync_sent` cooldown — every trusted
+`PeerConnected` re-advertises so a rotated key reaches peers on the
+first reconnect.
 
 ### Logging warning
 

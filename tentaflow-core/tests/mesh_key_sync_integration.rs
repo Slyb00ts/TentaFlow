@@ -228,6 +228,55 @@ fn rotation_grace_window_propagated_through_advertise() {
     forget_peer(peer_id);
 }
 
+/// Source-level contract test: the `HmacKeysSyncReceived` handler in
+/// `pipeline.rs` MUST gate ingest on `is_trusted(...)` BEFORE calling into
+/// `mesh_keys::sync::ingest_advertise`. The pool layer is trust-agnostic by
+/// design (see `untrusted_sender_gate_is_enforced_by_pipeline_not_pool`),
+/// so the boundary lives entirely in the dispatch handler — a refactor that
+/// drops it would silently let unpaired peers plant HMAC keys in our verify
+/// pool and mint tokens we would accept. This test reads the source file and
+/// asserts the gate pattern is still present in the handler scope.
+#[test]
+fn receive_handler_has_is_trusted_gate() {
+    let src = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/mesh/pipeline.rs"),
+    )
+    .expect("pipeline.rs must be readable from CARGO_MANIFEST_DIR");
+
+    // Locate the handler arm; everything we care about lives in the block
+    // immediately after this match arm header until the next top-level arm.
+    let handler_start = src
+        .find("IrohMeshEvent::HmacKeysSyncReceived")
+        .expect("HmacKeysSyncReceived handler must exist in pipeline.rs");
+
+    // Bound the scope: read a generous window after the arm header. The
+    // handler body is well under 2 KiB; this avoids matching `is_trusted`
+    // from unrelated handlers (e.g. TrustedKeysSync, RelayFrameReceived).
+    let scope_end = (handler_start + 2048).min(src.len());
+    let scope = &src[handler_start..scope_end];
+
+    assert!(
+        scope.contains("is_trusted("),
+        "HmacKeysSyncReceived handler lost its is_trusted() gate — \
+         this is a security regression. Restore the trust check BEFORE \
+         calling mesh_keys::sync::ingest_advertise."
+    );
+
+    // The gate must guard ingest_advertise — i.e. the trust check appears
+    // textually before the ingest call inside the handler.
+    let trust_pos = scope
+        .find("is_trusted(")
+        .expect("is_trusted assertion above already verified presence");
+    let ingest_pos = scope
+        .find("ingest_advertise")
+        .expect("handler must call ingest_advertise");
+    assert!(
+        trust_pos < ingest_pos,
+        "is_trusted() gate must run BEFORE ingest_advertise() — \
+         current source order is inverted, which is a security regression."
+    );
+}
+
 #[test]
 fn untrusted_sender_gate_is_enforced_by_pipeline_not_pool() {
     // The pool itself is trust-agnostic by design (it is the verify oracle,
