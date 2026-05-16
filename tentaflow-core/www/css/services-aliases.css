@@ -1,0 +1,211 @@
+/* ============================================================================
+ * services-aliases.css — M16 admin UI for model aliases (Services → Aliasy).
+ * Layout: 7-column grid (alias / owner / target+fallback / strategy / visibility
+ * / active / actions) + inline edit panel with drag-to-reorder fallbacks.
+ * Used exclusively by `js/modules/services.js`, aliases tab.
+ * ============================================================================ */
+
+.svc-alias-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 12px 0;
+}
+.svc-alias-toolbar tf-searchbox { flex: 1 1 280px; min-width: 220px; max-width: 420px; }
+
+.svc-alias-filters {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-bottom: 12px;
+}
+.svc-alias-filter-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 999px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-2); font-size: 11.5px; font-weight: 600;
+  cursor: pointer; user-select: none;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.svc-alias-filter-chip:hover { background: var(--bg-card-hover); color: var(--text); }
+.svc-alias-filter-chip.active {
+  background: var(--accent-glow);
+  border-color: var(--accent-1);
+  color: var(--accent-2);
+}
+.svc-alias-filter-chip .count {
+  font-weight: 400; color: var(--text-3); margin-left: 2px;
+}
+.svc-alias-filter-chip.active .count { color: var(--accent-2); }
+
+/* 7-column table */
+.svc-alias-grid {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.svc-alias-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1.4fr) minmax(120px, 0.9fr) minmax(220px, 2fr) 110px 110px 64px 80px;
+  gap: 10px; padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+}
+.svc-alias-row:last-child { border-bottom: 0; }
+.svc-alias-row.h {
+  font-size: 10.5px; text-transform: uppercase; color: var(--text-3);
+  font-weight: 700; letter-spacing: 0.06em; padding: 9px 14px;
+  background: var(--bg-2);
+}
+.svc-alias-row.empty-target { border-left: 3px solid var(--warning); }
+.svc-alias-row.inactive { opacity: 0.55; }
+
+.svc-alias-name {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 12.5px; font-weight: 700; color: var(--accent-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.svc-alias-owner {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.svc-alias-owner.addon { background: rgba(167, 139, 250, 0.15); color: var(--accent-2); }
+.svc-alias-owner.manual { background: rgba(96, 165, 250, 0.15); color: var(--info); }
+.svc-alias-owner svg { width: 12px; height: 12px; flex-shrink: 0; }
+
+.svc-alias-target { font-size: 12px; overflow: hidden; }
+.svc-alias-target .primary {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-weight: 700; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.svc-alias-target .fallbacks {
+  font-size: 10.5px; color: var(--text-3); margin-top: 3px;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.svc-alias-target .empty { color: var(--warning); font-style: italic; }
+
+.svc-alias-strategy {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 10.5px; padding: 3px 8px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: 4px; display: inline-block;
+}
+
+.svc-alias-vis {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 12px;
+  font-size: 10.5px; font-weight: 700; border: 1px solid transparent;
+}
+.svc-alias-vis svg { width: 11px; height: 11px; }
+.svc-alias-vis.private  { background: rgba(239, 68, 68, 0.12); color: var(--danger); border-color: rgba(239, 68, 68, 0.3); }
+.svc-alias-vis.restricted { background: rgba(245, 158, 11, 0.12); color: var(--warning); border-color: rgba(245, 158, 11, 0.3); }
+.svc-alias-vis.public  { background: rgba(34, 197, 94, 0.12); color: var(--success); border-color: rgba(34, 197, 94, 0.3); }
+.svc-alias-vis.unknown  { background: var(--bg-3); color: var(--text-3); border-color: var(--border); }
+
+.svc-alias-actions {
+  display: inline-flex; align-items: center; gap: 4px; justify-self: end;
+}
+
+/* Inline edit panel (slot pod wierszem) */
+.svc-alias-edit {
+  background: var(--bg-2);
+  border-left: 3px solid var(--accent-1);
+  padding: 16px 18px;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 14px;
+}
+.svc-alias-edit .edit-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 13px; font-weight: 700; color: var(--text);
+}
+.svc-alias-edit .edit-head .name {
+  font-family: ui-monospace, 'JetBrains Mono', monospace; color: var(--accent-2);
+  margin-left: 6px;
+}
+.svc-alias-edit .form-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+}
+.svc-alias-edit .form-row {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.svc-alias-edit .form-row > label {
+  font-size: 11.5px; font-weight: 600; color: var(--text-2);
+}
+.svc-alias-edit .meta-block {
+  font-size: 11px; color: var(--text-3); line-height: 1.6;
+}
+.svc-alias-edit .meta-block code { color: var(--accent-2); }
+
+/* Fallback drag-and-drop builder */
+.svc-fallback-builder {
+  background: var(--bg-3);
+  border: 1px dashed var(--border-hover, var(--text-3));
+  border-radius: var(--radius-sm);
+  padding: 8px; display: flex; flex-direction: column; gap: 6px;
+}
+.svc-fallback-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  display: grid; grid-template-columns: 20px 16px 24px 1fr auto;
+  align-items: center; gap: 8px; font-size: 12px;
+}
+.svc-fallback-item.primary { border-color: var(--accent-1); background: rgba(99, 102, 241, 0.08); }
+.svc-fallback-item.primary .pos { color: var(--accent-2); font-weight: 800; }
+.svc-fallback-item.drag-over { border-style: dashed; border-color: var(--accent-2); }
+.svc-fallback-item.dragging { opacity: 0.45; }
+.svc-fallback-item .grip {
+  width: 16px; height: 16px; color: var(--text-3); cursor: grab;
+}
+.svc-fallback-item .grip:active { cursor: grabbing; }
+.svc-fallback-item .pos {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text-3); text-align: center;
+}
+.svc-fallback-item .name {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-weight: 700; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.svc-fallback-builder .add-row {
+  display: flex; align-items: center; gap: 8px; margin-top: 2px;
+}
+.svc-fallback-builder .add-row tf-select { flex: 1; }
+
+/* Strategy as segmented control */
+.svc-strategy-segmented .tf-segmented { width: 100%; }
+
+.svc-alias-edit .edit-foot {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  border-top: 1px dashed var(--border); padding-top: 12px;
+}
+.svc-alias-edit .edit-foot .right { display: flex; gap: 8px; }
+.svc-alias-edit .form-error {
+  color: var(--danger); font-size: 12px;
+  background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: var(--radius-sm); padding: 8px 10px;
+}
+
+/* Empty state for filtered view */
+.svc-alias-empty-filter {
+  text-align: center; padding: 36px 16px;
+  color: var(--text-3); font-size: 13px;
+}
+
+/* Mobile collapse: stack rows as cards */
+@media (max-width: 880px) {
+  .svc-alias-row {
+    grid-template-columns: 1fr 1fr;
+    grid-auto-flow: row;
+    row-gap: 6px;
+  }
+  .svc-alias-row.h { display: none; }
+  .svc-alias-row .svc-alias-name { grid-column: 1 / -1; }
+  .svc-alias-row .svc-alias-target { grid-column: 1 / -1; }
+  .svc-alias-row .svc-alias-actions { grid-column: 1 / -1; justify-self: start; }
+  .svc-alias-edit .form-grid { grid-template-columns: 1fr; }
+}
