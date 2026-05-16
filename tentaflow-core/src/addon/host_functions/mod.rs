@@ -15,6 +15,8 @@ pub mod llm;
 pub mod log;
 pub mod network;
 pub mod oauth;
+#[cfg(feature = "camera")]
+pub mod recording;
 pub mod secrets;
 pub mod service;
 pub mod sql;
@@ -261,6 +263,53 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "stream_close_v1", streaming::stream_close_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja stream_close_v1: {e}"))?;
+
+        // --- Recording API (F1a M1.W8 — TentaVision recording manager + frame_url) ---
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_save_snapshot_v1",
+                recording::recording_save_snapshot_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_save_snapshot_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_save_segment_v1",
+                recording::recording_save_segment_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_save_segment_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_get_url_v1",
+                recording::recording_get_url_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_get_url_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_get_stream_v1",
+                recording::recording_get_stream_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_get_stream_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_purge_v1",
+                recording::recording_purge_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_purge_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "recording_stats_v1",
+                recording::recording_stats_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_stats_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "frame_url_v1", recording::frame_url_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja frame_url_v1: {e}"))?;
     }
 
     Ok(())
