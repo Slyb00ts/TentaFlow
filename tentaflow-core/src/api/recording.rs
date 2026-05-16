@@ -20,6 +20,7 @@ use rusqlite::params;
 
 use crate::db::repository::{get_recording_by_ref, RecordingRow};
 use crate::db::DbPool;
+use crate::services::recording::recording_base_dir;
 use crate::services::signed_urls::{SignedUrlError, SignedUrlIssuer};
 
 /// Hard cap on the file size we are willing to return in a single response.
@@ -330,14 +331,18 @@ async fn read_recording_file_inner(file_path: &str, expected_size: i64) -> Recor
         Err(_) => return RecordingFileOutcome::IoError,
     };
 
-    // Containment check: the canonical path MUST traverse a
-    // `.tentaflow/recordings/<camera>/<kind>/` segment. We do not anchor on
-    // `recording_base_dir()` because in tests HOME is mutated per-test and
-    // a parallel peer can yank the env var between save and read. The
-    // segment check below catches DB-tampered absolute paths like
-    // `/etc/passwd` (no `.tentaflow/recordings` component) while staying
-    // robust against HOME-mutation race in the test harness.
-    if !path_traverses_recordings_dir(&canonical) {
+    // Containment check. Strict production rule: canonical path must live
+    // under canonical(recording_base_dir()). The segment scan is an extra
+    // defence-in-depth — both must agree. A DB-tampered `/etc/passwd`, or
+    // a planted `/some/other/.tentaflow/recordings/blob` outside the real
+    // base, are rejected.
+    //
+    // If `recording_base_dir()` or its canonicalisation fails (only happens
+    // in test harnesses that yank HOME mid-flight), we fall back to the
+    // segment scan alone. In tests the traversal vector `/etc/passwd` still
+    // fails the segment scan, so the security guarantee for the attack
+    // surface is preserved either way.
+    if !path_within_recordings_base(&canonical).await {
         return RecordingFileOutcome::PathTraversal;
     }
 
@@ -361,6 +366,26 @@ async fn read_recording_file_inner(file_path: &str, expected_size: i64) -> Recor
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecordingFileOutcome::FileMissing,
         Err(_) => RecordingFileOutcome::IoError,
     }
+}
+
+/// Strict containment: canonical path lives under
+/// `canonical(recording_base_dir())`. AND-composed with the segment scan so
+/// the check passes only when BOTH agree (defence-in-depth: a planted
+/// `/elsewhere/.tentaflow/recordings/blob` would pass the segment scan but
+/// fail the prefix check in production).
+///
+/// Falls back to segment-scan-only if the base directory cannot be resolved
+/// or canonicalised — this branch is only taken when HOME is mid-flight
+/// mutated by parallel test setup. The traversal vector `/etc/passwd` fails
+/// the segment scan regardless, so the security guarantee is preserved.
+async fn path_within_recordings_base(canonical: &std::path::Path) -> bool {
+    if let Ok(base) = recording_base_dir() {
+        if let Ok(canonical_base) = tokio::fs::canonicalize(&base).await {
+            return canonical.starts_with(&canonical_base)
+                && path_traverses_recordings_dir(canonical);
+        }
+    }
+    path_traverses_recordings_dir(canonical)
 }
 
 /// True iff the supplied canonical path contains a `.tentaflow/recordings`

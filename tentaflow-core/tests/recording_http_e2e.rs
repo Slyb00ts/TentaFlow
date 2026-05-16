@@ -278,10 +278,34 @@ fn rgb_buf(w: u32, h: u32) -> Vec<u8> {
     v
 }
 
+/// Process-wide HOME mutation lock. Strict path-containment in
+/// `read_recording_file` anchors on the canonical `recording_base_dir()`,
+/// which reads `HOME`. Without serialisation, a peer test setting HOME
+/// between save (where the file lands under tmp-A) and read (where the
+/// containment check resolves tmp-B) yields a spurious PathTraversal/403.
+/// Tests that call `save_and_register` MUST hold the returned guard across
+/// every subsequent HTTP fetch that touches the saved recording.
+fn home_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Save a snapshot via the real `save_snapshot_rgb24` and insert into DB.
 /// HOME is mutated to a TempDir so the recording lands somewhere
-/// per-test-process; the returned TempDir must outlive the test body.
-async fn save_and_register(env: &Env, addon_id: &str, camera_id: &str) -> (String, tempfile::TempDir, Vec<u8>) {
+/// per-test-process; the returned TempDir AND lock guard must outlive the
+/// test body so that no peer test yanks HOME mid-fetch.
+async fn save_and_register(
+    env: &Env,
+    addon_id: &str,
+    camera_id: &str,
+) -> (
+    String,
+    tempfile::TempDir,
+    Vec<u8>,
+    tokio::sync::OwnedMutexGuard<()>,
+) {
+    let guard = home_lock().lock_owned().await;
     let tmp_home = tempfile::tempdir().expect("tempdir");
     std::env::set_var("HOME", tmp_home.path());
 
@@ -307,7 +331,7 @@ async fn save_and_register(env: &Env, addon_id: &str, camera_id: &str) -> (Strin
     )
     .expect("insert");
 
-    (saved.recording_ref.as_str().to_string(), tmp_home, png_bytes)
+    (saved.recording_ref.as_str().to_string(), tmp_home, png_bytes, guard)
 }
 
 fn frame_storage_insert(storage: &FrameStorage, camera_id: &str, payload: Vec<u8>) -> String {
@@ -335,7 +359,7 @@ fn frame_storage_insert(storage: &FrameStorage, camera_id: &str, payload: Vec<u8
 #[tokio::test]
 async fn test_e2e_recording_url_returns_png() {
     let env = spawn_server().await;
-    let (rec_ref, _home, png_bytes) = save_and_register(&env, "addon-a", "cam_e2e_ok").await;
+    let (rec_ref, _home, png_bytes, _home_guard) = save_and_register(&env, "addon-a", "cam_e2e_ok").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
@@ -356,7 +380,7 @@ async fn test_e2e_recording_url_returns_png() {
 #[tokio::test]
 async fn test_e2e_recording_url_token_tampered_returns_403() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-tamper", "cam_e2e_tamper").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-tamper", "cam_e2e_tamper").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     // Flip the last byte of the token b64. base64 padding chars are common at
@@ -381,7 +405,7 @@ async fn test_e2e_recording_url_token_tampered_returns_403() {
 #[tokio::test]
 async fn test_e2e_recording_url_multi_fetch_in_ttl() {
     let env = spawn_server().await;
-    let (rec_ref, _home, png_bytes) = save_and_register(&env, "addon-multi", "cam_e2e_multi").await;
+    let (rec_ref, _home, png_bytes, _home_guard) = save_and_register(&env, "addon-multi", "cam_e2e_multi").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
@@ -400,7 +424,7 @@ async fn test_e2e_recording_url_multi_fetch_in_ttl() {
 #[tokio::test]
 async fn test_e2e_recording_url_purged_returns_404() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-purge", "cam_e2e_purge").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-purge", "cam_e2e_purge").await;
 
     // Soft-delete directly via SQL — bypassing the host-fn purge path so the
     // test stays focused on the HTTP layer's NotFound branch.
@@ -425,7 +449,7 @@ async fn test_e2e_recording_url_purged_returns_404() {
 #[tokio::test]
 async fn test_e2e_recording_url_missing_query_params_returns_400() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-q", "cam_e2e_q").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-q", "cam_e2e_q").await;
 
     // No query at all.
     let url = format!("http://{}/recordings/{}", env.addr, rec_ref);
@@ -443,7 +467,7 @@ async fn test_e2e_recording_url_missing_query_params_returns_400() {
 #[tokio::test]
 async fn test_e2e_recording_url_ref_mismatch_returns_400() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-mismatch", "cam_e2e_mm").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-mismatch", "cam_e2e_mm").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     // Path ref differs from query ref — must reject before signature verify.
@@ -533,7 +557,7 @@ async fn test_e2e_frame_url_multi_fetch_in_ttl_ok() {
 #[tokio::test]
 async fn test_e2e_recording_url_duplicate_token_returns_400() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-dup", "cam_e2e_dup").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-dup", "cam_e2e_dup").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
         "http://{}/recordings/{}?token={}&token=XX&exp={}&ref={}",
@@ -550,7 +574,7 @@ async fn test_e2e_recording_url_duplicate_token_returns_400() {
 #[tokio::test]
 async fn test_e2e_recording_url_unknown_key_returns_400() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-uk", "cam_e2e_uk").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-uk", "cam_e2e_uk").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
         "http://{}/recordings/{}?token={}&exp={}&ref={}&extra=foo",
@@ -567,7 +591,7 @@ async fn test_e2e_recording_url_unknown_key_returns_400() {
 #[tokio::test]
 async fn test_e2e_recording_url_chunked_body_rejected_413() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-chunk", "cam_e2e_chunk").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-chunk", "cam_e2e_chunk").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     // Hand-roll the request because reqwest collapses GET-with-body in odd
     // ways. We use a raw TCP write of an HTTP/1.1 request with
@@ -594,7 +618,7 @@ async fn test_e2e_recording_url_chunked_body_rejected_413() {
 #[tokio::test]
 async fn test_e2e_recording_url_content_length_nonzero_rejected_413() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-cl", "cam_e2e_cl").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-cl", "cam_e2e_cl").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut sock = tokio::net::TcpStream::connect(env.addr).await.expect("connect");
@@ -621,7 +645,7 @@ async fn test_e2e_recording_url_content_length_nonzero_rejected_413() {
 #[tokio::test]
 async fn test_e2e_recording_url_missing_file_returns_404() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-miss", "cam_e2e_miss").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-miss", "cam_e2e_miss").await;
     // Delete the file on disk; DB row is still there.
     {
         let conn = env.db.lock().expect("db lock");
@@ -649,7 +673,7 @@ async fn test_e2e_recording_url_missing_file_returns_404() {
 #[tokio::test]
 async fn test_e2e_recording_url_file_size_mismatch_returns_500() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _) = save_and_register(&env, "addon-int", "cam_e2e_int").await;
+    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-int", "cam_e2e_int").await;
     // Bump the DB-recorded size so it disagrees with on-disk reality.
     {
         let conn = env.db.lock().expect("db lock");
@@ -716,7 +740,7 @@ async fn test_path_traversal_via_db_corruption_rejected() {
     // recordings base dir. The handler must refuse with 403 PathTraversal
     // even though the HMAC signature is valid.
     let env = spawn_server().await;
-    let (rec_ref, _home, _png) = save_and_register(&env, "addon-traversal", "cam_trav").await;
+    let (rec_ref, _home, _png, _home_guard) = save_and_register(&env, "addon-traversal", "cam_trav").await;
 
     // Overwrite the file_path with /etc/passwd — outside the recordings base.
     {
@@ -736,11 +760,11 @@ async fn test_path_traversal_via_db_corruption_rejected() {
         signed.query_string()
     );
     let resp = reqwest::get(&url).await.expect("get");
-    // Reading the inner file produces PathTraversal -> 403. The router
-    // collapses RecordingFileOutcome != Ok to a generic 4xx, so we accept
-    // 403/404 to be robust to harness folding.
-    let s = resp.status().as_u16();
-    assert!(s == 403 || s == 404, "expected 403/404, got {}", s);
+    // `/etc/passwd` is canonicalisable but lives outside the recordings
+    // base — `read_recording_file` must return PathTraversal, which maps
+    // strictly to 403. A 404 here would mean the containment check is
+    // silently degraded into a missing-file branch, hiding a regression.
+    assert_eq!(resp.status().as_u16(), 403, "path traversal must produce 403, not the missing-file branch");
 }
 
 #[tokio::test]

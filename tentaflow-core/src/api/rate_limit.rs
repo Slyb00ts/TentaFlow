@@ -68,17 +68,22 @@ impl TokenBucket {
         }
     }
 
-    /// Refill based on elapsed time, then try to take one token. Returns
-    /// `None` on success, or `Some(retry_after_secs)` if a token is short.
-    fn try_take(&mut self, capacity: u32, refill_per_sec: f64, now: Instant) -> Option<f64> {
+    /// Refill based on elapsed time without consuming. Returns `Ok(())` if at
+    /// least one token is available post-refill, otherwise `Err(retry_secs)`.
+    /// Caller must explicitly `commit_one` after deciding to charge.
+    fn refill_and_peek(
+        &mut self,
+        capacity: u32,
+        refill_per_sec: f64,
+        now: Instant,
+    ) -> std::result::Result<(), f64> {
         let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
         if elapsed > 0.0 {
             self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity as f64);
             self.last_refill = now;
         }
         if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            None
+            Ok(())
         } else {
             let missing = 1.0 - self.tokens;
             let retry = if refill_per_sec > 0.0 {
@@ -86,8 +91,15 @@ impl TokenBucket {
             } else {
                 f64::INFINITY
             };
-            Some(retry)
+            Err(retry)
         }
+    }
+
+    /// Charge one token. Precondition: a prior `refill_and_peek` on the same
+    /// `now` returned `Ok(())`. Splitting peek from commit lets the limiter
+    /// validate per-IP AND global before debiting either bucket.
+    fn commit_one(&mut self) {
+        self.tokens -= 1.0;
     }
 }
 
@@ -120,21 +132,17 @@ impl RateLimiter {
         }
     }
 
-    /// Acquire one token charged against both the global and the per-IP bucket.
-    /// Order: global first (cheaper; protects the process even if `ip` is new
-    /// to the map), per-IP second. A global denial does NOT consume a per-IP
-    /// token, by design — recovering from a global storm should not also blow
-    /// out every quiet client's bucket.
+    /// Acquire one token charged against both the per-IP and the global
+    /// bucket. Order: per-IP first, global second. An IP already over its
+    /// burst budget must NOT drain the global bucket — otherwise a hot
+    /// attacker IP would starve unrelated clients of the global budget.
+    ///
+    /// Both buckets are validated with `refill_and_peek` BEFORE either is
+    /// charged (`commit_one`). This avoids the classic double-debit bug
+    /// where the per-IP token is consumed and then the global denies the
+    /// request: the per-IP would have lost a token for nothing.
     pub fn check(&self, ip: &str) -> RateLimitResult {
         let now = Instant::now();
-
-        if let Ok(mut g) = self.global.lock() {
-            if let Some(retry) =
-                g.try_take(self.config.global_capacity, self.config.global_refill_per_sec, now)
-            {
-                return RateLimitResult::GlobalLimit { retry_after_secs: retry };
-            }
-        }
 
         self.sweep_if_needed(now);
 
@@ -143,25 +151,44 @@ impl RateLimiter {
             last_seen: now,
         });
         entry.last_seen = now;
-        match entry.bucket.try_take(
+        if let Err(retry) = entry.bucket.refill_and_peek(
             self.config.per_ip_capacity,
             self.config.per_ip_refill_per_sec,
             now,
         ) {
-            None => RateLimitResult::Allow,
-            Some(retry) => RateLimitResult::IpLimit {
+            return RateLimitResult::IpLimit {
                 ip: ip.to_string(),
                 retry_after_secs: retry,
-            },
+            };
         }
+
+        let Ok(mut g) = self.global.lock() else {
+            // Poisoned mutex — fail-open is unacceptable; treat as global
+            // denial with conservative 1 s retry. Process is in a bad state
+            // and a poisoned global is a strong signal of broader breakage.
+            return RateLimitResult::GlobalLimit { retry_after_secs: 1.0 };
+        };
+        if let Err(retry) = g.refill_and_peek(
+            self.config.global_capacity,
+            self.config.global_refill_per_sec,
+            now,
+        ) {
+            return RateLimitResult::GlobalLimit { retry_after_secs: retry };
+        }
+
+        entry.bucket.commit_one();
+        g.commit_one();
+        RateLimitResult::Allow
     }
 
     /// Cheap idle eviction. Walks up to 64 random entries per call and removes
-    /// any whose `last_seen` is older than `IDLE_EVICT_AFTER`. If the map is
-    /// over the hard cap we sweep aggressively (no per-call limit) until the
-    /// map fits.
+    /// any whose `last_seen` is older than `IDLE_EVICT_AFTER`. If after the
+    /// idle pass the map is still at or above the hard cap (e.g. a flood of
+    /// 10 000+ actively-firing unique IPs), we evict the oldest 25 % by
+    /// `last_seen` — an approximate LRU that keeps memory bounded under any
+    /// flood pattern, not just the idle one.
     fn sweep_if_needed(&self, now: Instant) {
-        let over_cap = self.per_ip.len() > MAX_PER_IP_ENTRIES;
+        let over_cap = self.per_ip.len() >= MAX_PER_IP_ENTRIES;
         let limit = if over_cap { usize::MAX } else { 64 };
         let mut scanned = 0;
         self.per_ip.retain(|_k, v| {
@@ -171,6 +198,20 @@ impl RateLimiter {
             }
             now.saturating_duration_since(v.last_seen) < IDLE_EVICT_AFTER
         });
+
+        if self.per_ip.len() >= MAX_PER_IP_ENTRIES {
+            let target = MAX_PER_IP_ENTRIES * 3 / 4;
+            let mut snapshot: Vec<(String, Instant)> = self
+                .per_ip
+                .iter()
+                .map(|e| (e.key().clone(), e.value().last_seen))
+                .collect();
+            snapshot.sort_by_key(|(_, ts)| *ts);
+            let drop_count = snapshot.len().saturating_sub(target);
+            for (key, _) in snapshot.into_iter().take(drop_count) {
+                self.per_ip.remove(&key);
+            }
+        }
     }
 
     /// Test/diagnostic helper — number of live per-IP buckets currently
@@ -242,6 +283,56 @@ mod tests {
             }
             other => panic!("expected GlobalLimit, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn per_ip_denial_does_not_drain_global() {
+        // Hot IP exhausts its 3-burst budget, then keeps hammering. The
+        // global bucket (capacity 100) must NOT be drained by the denied
+        // requests — otherwise unrelated clients would see 429.
+        let rl = RateLimiter::new(cfg());
+        for _ in 0..3 {
+            assert_eq!(rl.check("hot"), RateLimitResult::Allow);
+        }
+        // 100 more requests from the same hot IP. Each should be IpLimit,
+        // and crucially must NOT touch the global bucket.
+        for _ in 0..100 {
+            assert!(matches!(rl.check("hot"), RateLimitResult::IpLimit { .. }));
+        }
+        // Global budget: started at 100, 3 successful requests above consumed
+        // 3 tokens. Refill at 1 000/s means after the few-microsecond test
+        // duration the bucket is back near 100. Fresh IPs must still be
+        // served — i.e. no GlobalLimit.
+        for n in 0..50 {
+            let ip = format!("fresh-{n}");
+            match rl.check(&ip) {
+                RateLimitResult::Allow => {}
+                other => panic!("fresh IP {ip} got {other:?}, expected Allow"),
+            }
+        }
+    }
+
+    #[test]
+    fn per_ip_eviction_at_hard_cap() {
+        // Pump 12 000 unique IPs in rapid succession. With idle eviction
+        // alone the map would settle around 12 000 (none idle yet); the
+        // hard-cap LRU pass must trim it down toward MAX_PER_IP_ENTRIES.
+        let rl = RateLimiter::new(RateLimitConfig {
+            per_ip_capacity: 1,
+            per_ip_refill_per_sec: 1.0,
+            global_capacity: 1_000_000,
+            global_refill_per_sec: 1_000_000.0,
+        });
+        for n in 0..12_000 {
+            let ip = format!("ip-{n}");
+            let _ = rl.check(&ip);
+        }
+        assert!(
+            rl.ip_entry_count() <= MAX_PER_IP_ENTRIES,
+            "map size {} exceeded hard cap {}",
+            rl.ip_entry_count(),
+            MAX_PER_IP_ENTRIES
+        );
     }
 
     #[test]
