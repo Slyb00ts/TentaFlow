@@ -455,14 +455,52 @@ pub fn audit_log_with_risk(
 ) {
     let action_hash = fnv1a_hash(action);
     if let Ok(conn) = state.db.lock() {
+        // F1b P4 (DoD-15) — extend each row with a Merkle hash linked to the
+        // previous row's hash. The shared `DbPool` Mutex serializes us against
+        // every other writer, so the SELECT(latest hash) + INSERT pair is
+        // atomic without an explicit transaction. Pre-bind the timestamp the
+        // same way SQLite's `datetime('now')` default would render it
+        // ("YYYY-MM-DD HH:MM:SS" UTC) so the hash input matches the value
+        // the verifier reads back from the row.
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let risk_class_db = risk_class.as_db_str();
+        let hash_input = crate::audit::chain::AuditRowHashInput {
+            user_id: state.user_id,
+            addon_id: Some(state.addon_id.as_str()),
+            instance_id: Some(state.instance_id.as_str()),
+            action,
+            resource: None,
+            resource_type,
+            resource_id,
+            result: Some(result),
+            error_message,
+            details: None,
+            ip_address: None,
+            node_id: None,
+            severity: Some("info"),
+            risk_class: risk_class_db,
+            related_claim_id,
+            request_id,
+            timestamp: &timestamp,
+        };
+        let (prev_hash_blob, hash_blob) =
+            match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("audit chain: compute_chain_for_insert failed: {e}");
+                    return;
+                }
+            };
+
         let _ = conn.execute(
-            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 state.user_id, &state.addon_id, &state.instance_id,
                 action, resource_type, resource_id,
                 result, error_message, action_hash,
-                risk_class.as_db_str(), related_claim_id, request_id
+                risk_class_db, related_claim_id, request_id,
+                timestamp, prev_hash_blob, hash_blob
             ],
         );
     }

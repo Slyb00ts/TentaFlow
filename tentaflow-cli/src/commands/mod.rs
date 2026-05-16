@@ -4,5 +4,6 @@
 // =============================================================================
 
 pub mod addon;
+pub mod audit;
 pub mod camera;
 pub mod keys;

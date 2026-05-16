@@ -36,6 +36,11 @@ enum TopCommand {
         #[command(subcommand)]
         sub: commands::keys::KeysCommand,
     },
+    /// Audit log Merkle chain verification (F1b P4, DoD-15)
+    Audit {
+        #[command(subcommand)]
+        sub: commands::audit::AuditCommand,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -44,5 +49,6 @@ fn main() -> std::process::ExitCode {
         TopCommand::Addon { sub } => commands::addon::run(sub),
         TopCommand::Camera { sub } => commands::camera::run(sub),
         TopCommand::Keys { sub } => commands::keys::run(sub),
+        TopCommand::Audit { sub } => commands::audit::run(sub),
     }
 }

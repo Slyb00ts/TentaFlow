@@ -810,13 +810,34 @@ fn record_alias_resolve_denied_within_tx(
         "request_id": request_id,
     })
     .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(caller_addon_id),
+        instance_id: None,
+        action: "alias_resolve_denied",
+        resource: None,
+        resource_type: Some("model_alias"),
+        resource_id: Some(alias_name),
+        result: Some("denied"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("warn"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
     tx.execute(
         "INSERT INTO audit_log \
             (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-             result, error_message, severity, risk_class, details) \
-         VALUES (datetime('now'), NULL, ?1, 'alias_resolve_denied', \
-                 'model_alias', ?2, 'denied', NULL, 'warn', 'A', ?3)",
-        rusqlite::params![caller_addon_id, alias_name, details],
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'alias_resolve_denied', \
+                 'model_alias', ?3, 'denied', NULL, 'warn', 'A', ?4, ?5, ?6)",
+        rusqlite::params![timestamp, caller_addon_id, alias_name, details, prev_hash, hash],
     )?;
     Ok(())
 }
@@ -1197,13 +1218,34 @@ pub fn audit_reconcile_uses_alias_within_tx(
         "after": after,
     })
     .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(consumer_addon_id),
+        instance_id: None,
+        action: "uses_alias.reconcile",
+        resource: None,
+        resource_type: Some("model_alias"),
+        resource_id: Some(alias_name),
+        result: Some("reconciled"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("info"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
     tx.execute(
         "INSERT INTO audit_log \
             (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-             result, error_message, severity, risk_class, details) \
-         VALUES (datetime('now'), NULL, ?1, 'uses_alias.reconcile', \
-                 'model_alias', ?2, 'reconciled', NULL, 'info', 'A', ?3)",
-        rusqlite::params![consumer_addon_id, alias_name, details],
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'uses_alias.reconcile', \
+                 'model_alias', ?3, 'reconciled', NULL, 'info', 'A', ?4, ?5, ?6)",
+        rusqlite::params![timestamp, consumer_addon_id, alias_name, details, prev_hash, hash],
     )?;
     Ok(())
 }
@@ -1226,13 +1268,34 @@ pub fn audit_consumer_revoked_by_manifest_within_tx(
         "reason": "manifest_no_longer_lists_consumer",
     })
     .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(owner_addon_id),
+        instance_id: None,
+        action: "consumer_revoked_by_manifest_change",
+        resource: None,
+        resource_type: Some("model_alias"),
+        resource_id: Some(alias_name),
+        result: Some("revoked"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("info"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
     tx.execute(
         "INSERT INTO audit_log \
             (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-             result, error_message, severity, risk_class, details) \
-         VALUES (datetime('now'), NULL, ?1, 'consumer_revoked_by_manifest_change', \
-                 'model_alias', ?2, 'revoked', NULL, 'info', 'A', ?3)",
-        rusqlite::params![owner_addon_id, alias_name, details],
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'consumer_revoked_by_manifest_change', \
+                 'model_alias', ?3, 'revoked', NULL, 'info', 'A', ?4, ?5, ?6)",
+        rusqlite::params![timestamp, owner_addon_id, alias_name, details, prev_hash, hash],
     )?;
     Ok(())
 }
@@ -3379,10 +3442,31 @@ pub fn log_audit(
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id,
+        addon_id,
+        instance_id: None,
+        action,
+        resource,
+        resource_type: None,
+        resource_id: None,
+        result: None,
+        error_message: None,
+        details,
+        ip_address,
+        node_id,
+        severity: Some("info"),
+        risk_class: "unclassified",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
     conn.execute(
-        "INSERT INTO audit_log (user_id, addon_id, action, resource, details, ip_address, node_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![user_id, addon_id, action, resource, details, ip_address, node_id],
+        "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, prev_hash, hash],
     )?;
     Ok(())
 }
@@ -6367,12 +6451,33 @@ pub fn log_audit_full(
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id,
+        addon_id,
+        instance_id: None,
+        action,
+        resource: None,
+        resource_type,
+        resource_id,
+        result: None,
+        error_message: None,
+        details,
+        ip_address,
+        node_id,
+        severity: Some(severity),
+        risk_class: "unclassified",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log \
-           (user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+           (timestamp, user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
-            user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id,
+            timestamp, user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id, prev_hash, hash,
         ],
     )?;
     Ok(())

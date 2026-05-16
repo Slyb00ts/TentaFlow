@@ -288,6 +288,32 @@ Soak monitoring:
 - The `replay` row should be near-zero on a healthy soak; non-zero means
   either a buggy client retrying after a 200, or a real replay attempt.
 
+## Audit chain verify (F1b P4)
+
+Every audit_log row written after migration v25 is linked into a SHA-256
+Merkle chain (`prev_hash`, `hash`). The CLI verifier walks the chain
+end-to-end and reports tampering.
+
+```
+tentaflow-cli audit verify
+# → exit 0 + report when clean
+# → exit 1 + per-row tamper kind when something was modified / inserted /
+#           deleted out of band
+# → exit 2 when the DB cannot be opened
+```
+
+What to do during / after a soak:
+
+- Run `tentaflow-cli audit verify` at the start of the soak (records the
+  baseline `legacy_unchained` count from any pre-P4 history that survived
+  the upgrade).
+- Run again after each phase / at the end. The `chained_ok` count must
+  grow; `legacy_unchained` must stay flat; `tampered` must be zero.
+- If `tampered` is non-zero on a healthy box, the most likely cause is an
+  out-of-tree tool that writes to `audit_log` directly. Find the writer
+  and route it through `db::repository::log_audit` (or the appropriate
+  `log_audit_full` / `audit_log_with_risk`) so it picks up the chain.
+
 ## Troubleshooting
 
 - **`tentaflow died during warm-up`** — see `logs/tentaflow.log`. Usually a
