@@ -63,19 +63,72 @@ pub fn streaming_bus() -> &'static Arc<streaming::StreamingBus> {
     STREAMING_BUS.get_or_init(|| Arc::new(streaming::StreamingBus::new()))
 }
 
+/// Poll interval for the on-disk key watchers. 5 s is the standard
+/// compromise: fast enough that an operator running `tentaflow-cli keys
+/// rotate <name>` sees the new key engage before the next outstanding
+/// signature minted under the previous key is checked, slow enough that
+/// the cost (one `stat()` per key per 5 s) is invisible.
+const KEY_WATCHER_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
-    PICKUP_TOKEN_ISSUER.get_or_init(|| Arc::new(pickup_tokens::PickupTokenIssuer::new()))
+    PICKUP_TOKEN_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(pickup_tokens::PickupTokenIssuer::new());
+        if let Ok(path) = key_storage::key_path(pickup_tokens::KEY_NAME) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                pickup_tokens::KEY_NAME,
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                },
+            );
+        }
+        issuer
+    })
 }
 
 pub fn frame_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
-    FRAME_URL_ISSUER
-        .get_or_init(|| Arc::new(signed_urls::SignedUrlIssuer::new(signed_urls::UrlScope::FrameUrl)))
+    FRAME_URL_ISSUER.get_or_init(|| {
+        let issuer =
+            Arc::new(signed_urls::SignedUrlIssuer::new(signed_urls::UrlScope::FrameUrl));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::FrameUrl.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::FrameUrl.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                },
+            );
+        }
+        issuer
+    })
 }
 
 pub fn recording_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
     RECORDING_URL_ISSUER.get_or_init(|| {
-        Arc::new(signed_urls::SignedUrlIssuer::new(
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
             signed_urls::UrlScope::Recording,
-        ))
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::Recording.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::Recording.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                },
+            );
+        }
+        issuer
     })
 }
