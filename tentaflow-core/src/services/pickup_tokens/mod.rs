@@ -162,6 +162,24 @@ impl PickupTokenIssuer {
         (token, payload)
     }
 
+    /// Snapshot the signing key state for mesh advertise (F1b P3.B). Returns
+    /// the current key and, if the rotation grace window is still open, the
+    /// previous key plus its absolute unix-ms expiry. Used only to push our
+    /// own keys to trust-paired peers — never used for verify.
+    pub fn snapshot_for_mesh(&self) -> ([u8; 32], Option<[u8; 32]>, u64) {
+        let state = self.keys.read();
+        let now = Instant::now();
+        let (prev, prev_expiry_ms) = match state.previous {
+            Some(p) if now < state.previous_expires_at => {
+                let remaining = state.previous_expires_at - now;
+                let unix_ms = now_unix_ms() + remaining.as_millis() as u64;
+                (Some(p), unix_ms)
+            }
+            _ => (None, 0u64),
+        };
+        (state.current, prev, prev_expiry_ms)
+    }
+
     /// Returns the keys we accept for verify: always the current key, plus
     /// the previous key if it has not yet expired.
     fn active_verify_keys(&self) -> Vec<[u8; 32]> {
@@ -181,45 +199,75 @@ impl PickupTokenIssuer {
     /// not burn a still-good token (which would let an attacker DoS the real
     /// recipient by forging the headers with a stolen wire string).
     pub fn verify_only(&self, wire: &str) -> Result<TokenPayload, PickupVerifyError> {
-        let candidates = self.active_verify_keys();
-        let (payload, key) = parse_and_verify_multi(
-            candidates.iter().map(|k| k.as_slice()),
-            wire,
-        )?;
-        let entry = self
-            .inflight
-            .get(&key)
-            .ok_or(PickupVerifyError::InvalidToken)?;
-        if now_unix_ms() > entry.payload.expiry_unix_ms {
+        // Try LOCAL keys first — a hit there must satisfy the full inflight +
+        // one-shot contract (the local issuer owns the token's lifecycle).
+        let local = self.active_verify_keys();
+        let local_result = parse_and_verify_multi(local.iter().map(|k| k.as_slice()), wire);
+        if let Ok((payload, key)) = local_result {
+            let entry = self
+                .inflight
+                .get(&key)
+                .ok_or(PickupVerifyError::InvalidToken)?;
+            if now_unix_ms() > entry.payload.expiry_unix_ms {
+                return Err(PickupVerifyError::Expired);
+            }
+            if entry.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PickupVerifyError::AlreadyConsumed);
+            }
+            debug_assert_eq!(payload, entry.payload);
+            return Ok(entry.payload.clone());
+        }
+        // F1b P3.B fallback — token was minted on a peer node whose HMAC key
+        // we mirror through the mesh key pool. Verifier-only path: we never
+        // consume the one-shot bit (the issuing node owns that), but we DO
+        // run expiry + signature checks so an expired or forged token still
+        // gets rejected.
+        let peer_keys = crate::services::mesh_keys::mesh_key_pool()
+            .verify_keys_for(crate::services::mesh_keys::KeyScope::PickupToken);
+        if peer_keys.is_empty() {
+            return Err(local_result.unwrap_err());
+        }
+        let (payload, _key) =
+            parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire)?;
+        if now_unix_ms() > payload.expiry_unix_ms {
             return Err(PickupVerifyError::Expired);
         }
-        if entry.consumed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(PickupVerifyError::AlreadyConsumed);
-        }
-        debug_assert_eq!(payload, entry.payload);
-        Ok(entry.payload.clone())
+        Ok(payload)
     }
 
     /// Atomic one-shot consume. Caller must have already run `verify_only`
     /// and cross-checked the headers against the returned payload. Returns
     /// `AlreadyConsumed` if a concurrent caller won the race.
     pub fn consume_one_shot(&self, wire: &str) -> Result<TokenPayload, PickupVerifyError> {
-        let candidates = self.active_verify_keys();
-        let (_payload, key) = parse_and_verify_multi(
-            candidates.iter().map(|k| k.as_slice()),
-            wire,
-        )?;
-        let entry = self
-            .inflight
-            .get(&key)
-            .ok_or(PickupVerifyError::InvalidToken)?;
-        if now_unix_ms() > entry.payload.expiry_unix_ms {
+        let local = self.active_verify_keys();
+        let local_result = parse_and_verify_multi(local.iter().map(|k| k.as_slice()), wire);
+        if let Ok((_payload, key)) = local_result {
+            let entry = self
+                .inflight
+                .get(&key)
+                .ok_or(PickupVerifyError::InvalidToken)?;
+            if now_unix_ms() > entry.payload.expiry_unix_ms {
+                return Err(PickupVerifyError::Expired);
+            }
+            if !entry.try_consume() {
+                return Err(PickupVerifyError::AlreadyConsumed);
+            }
+            return Ok(entry.payload.clone());
+        }
+        // F1b P3.B mesh fallback — see `verify_only` doc. We accept the token
+        // exactly once per local pickup call, but we do not (cannot) enforce
+        // the one-shot bit globally: the issuing node owns the inflight map.
+        let peer_keys = crate::services::mesh_keys::mesh_key_pool()
+            .verify_keys_for(crate::services::mesh_keys::KeyScope::PickupToken);
+        if peer_keys.is_empty() {
+            return Err(local_result.unwrap_err());
+        }
+        let (payload, _key) =
+            parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire)?;
+        if now_unix_ms() > payload.expiry_unix_ms {
             return Err(PickupVerifyError::Expired);
         }
-        if !entry.try_consume() {
-            return Err(PickupVerifyError::AlreadyConsumed);
-        }
-        Ok(entry.payload.clone())
+        Ok(payload)
     }
 
     /// Revoke an issued but not-yet-consumed token. Used by callers that

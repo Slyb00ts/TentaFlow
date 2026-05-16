@@ -705,6 +705,7 @@ impl PeerManager {
             | IrohMeshEvent::KeyRotationReceived { .. }
             | IrohMeshEvent::KeyRotationResponseReceived { .. }
             | IrohMeshEvent::TrustedKeysSyncReceived { .. }
+            | IrohMeshEvent::HmacKeysSyncReceived { .. }
             | IrohMeshEvent::NodeLeavingReceived { .. }
             | IrohMeshEvent::RelayFrameReceived { .. }
             | IrohMeshEvent::AliasSyncReceived { .. }
