@@ -16,7 +16,7 @@ use tentaflow_core::db::repository::{
 };
 use tentaflow_core::paths;
 use tentaflow_core::services::camera_ingest::credentials::{
-    default_key_path, write_key_bytes, CredentialsCipher,
+    default_key_path, fsync_parent_dir, write_key_bytes, CredentialsCipher,
 };
 
 #[derive(Subcommand, Debug)]
@@ -82,44 +82,82 @@ fn rotate_key(
     rand::rng().fill_bytes(&mut new_key);
     let new_cipher = CredentialsCipher::from_raw_key(new_key);
 
-    // Step 3 — open DB and walk every row carrying an encrypted blob.
+    // Step 3 — write the new key bytes to `*.key.staging`. While the file
+    // sits at `.staging` the DB transaction has NOT committed yet; startup
+    // recovery treats `.staging` as garbage and deletes it. The rename in
+    // step 6 to `.key.new` is the durable commit marker proving "every DB
+    // blob is now encrypted under this key".
+    let staging_path = key_path.with_extension("key.staging");
+    let new_path = key_path.with_extension("key.new");
+    write_key_bytes(&staging_path, &new_key)
+        .map_err(|e| anyhow::anyhow!("write new key (.staging): {e}"))?;
+    fsync_parent_dir(&staging_path)
+        .map_err(|e| anyhow::anyhow!("fsync parent dir after .staging: {e}"))?;
+
+    // Step 4 — open DB and walk every row carrying an encrypted blob.
     let pool = tentaflow_core::db::init(&db_path)
-        .map_err(|e| anyhow::anyhow!("open db {}: {e}", db_path.display()))?;
-    let rows = list_all_camera_credentials_blobs(&pool)
-        .map_err(|e| anyhow::anyhow!("list credentials: {e}"))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&staging_path);
+            anyhow::anyhow!("open db {}: {e}", db_path.display())
+        })?;
+    let rows = list_all_camera_credentials_blobs(&pool).map_err(|e| {
+        let _ = std::fs::remove_file(&staging_path);
+        anyhow::anyhow!("list credentials: {e}")
+    })?;
 
     let mut re_encrypted: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
     for (id, blob) in &rows {
-        let plain = old_cipher
-            .decrypt_raw(blob)
-            .map_err(|e| anyhow::anyhow!("decrypt row id={id}: {e}"))?;
-        let new_blob = new_cipher
-            .encrypt_raw(&plain)
-            .map_err(|e| anyhow::anyhow!("encrypt row id={id}: {e}"))?;
+        let plain = old_cipher.decrypt_raw(blob).map_err(|e| {
+            let _ = std::fs::remove_file(&staging_path);
+            anyhow::anyhow!("decrypt row id={id}: {e}")
+        })?;
+        let new_blob = new_cipher.encrypt_raw(&plain).map_err(|e| {
+            let _ = std::fs::remove_file(&staging_path);
+            anyhow::anyhow!("encrypt row id={id}: {e}")
+        })?;
         re_encrypted.push((*id, new_blob));
     }
 
-    // Step 4 — commit DB transaction first; if it fails we still have the
-    // old key on disk and the DB untouched.
+    // Step 5 — commit DB transaction. From this point on every DB blob is
+    // encrypted under `new_key`. A crash between here and step 6 still
+    // leaves `.staging` on disk; recovery would discard it AND the DB would
+    // be undecryptable. Step 6 closes that gap.
     let n = if re_encrypted.is_empty() {
         0
     } else {
-        replace_camera_credentials_blobs(&pool, &re_encrypted)
-            .map_err(|e| anyhow::anyhow!("bulk update: {e}"))?
+        replace_camera_credentials_blobs(&pool, &re_encrypted).map_err(|e| {
+            // DB never committed — discard the staging key bytes so the
+            // next process start does not see a misleading commit marker.
+            let _ = std::fs::remove_file(&staging_path);
+            anyhow::anyhow!("bulk update: {e}")
+        })?
     };
 
-    // Step 5 — archive old key BEFORE overwriting (so a failure here still
-    // leaves the operator with the live old key + matching DB blobs).
-    let archive_path = archive_path_for(&key_path);
-    std::fs::copy(&key_path, &archive_path).map_err(|e| {
-        anyhow::anyhow!("archive old key to {}: {e}", archive_path.display())
-    })?;
+    // Step 6 — atomically promote `.staging → .new`. The presence of `.new`
+    // is the durable commit marker: it implies "DB is on this key". fsync
+    // the parent dir so a crash immediately after this still preserves the
+    // rename across reboot.
+    std::fs::rename(&staging_path, &new_path)
+        .map_err(|e| anyhow::anyhow!("promote .staging to .new: {e}"))?;
+    fsync_parent_dir(&new_path)
+        .map_err(|e| anyhow::anyhow!("fsync parent dir after .new: {e}"))?;
 
-    // Step 6 — atomically swap in the new key (tmp + rename).
-    let tmp = key_path.with_extension("key.new");
-    write_key_bytes(&tmp, &new_key).map_err(|e| anyhow::anyhow!("write new key: {e}"))?;
-    std::fs::rename(&tmp, &key_path)
+    // Step 7 — archive the old key (best-effort; DB is already migrated).
+    let archive_path = archive_path_for(&key_path);
+    if let Err(e) = std::fs::copy(&key_path, &archive_path) {
+        eprintln!(
+            "warning: archive old key to {} failed (non-fatal): {e}",
+            archive_path.display()
+        );
+    }
+
+    // Step 8 — atomically swap `.new` into the live path. A crash here is
+    // recovered on next start: `load_or_generate_at` sees `.new` next to a
+    // (stale) live file and promotes it.
+    std::fs::rename(&new_path, &key_path)
         .map_err(|e| anyhow::anyhow!("rename new key into place: {e}"))?;
+    fsync_parent_dir(&key_path)
+        .map_err(|e| anyhow::anyhow!("fsync parent dir after swap: {e}"))?;
 
     Ok(format!(
         "rotated: {n} camera credential blobs re-encrypted\n\

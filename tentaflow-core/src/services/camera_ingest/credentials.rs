@@ -88,7 +88,15 @@ impl CredentialsCipher {
     /// Same as [`load_or_generate`] but with an explicit file path. Used by
     /// the rotate-key CLI to load the *previous* key from an archived path
     /// without touching the live one.
+    ///
+    /// Startup recovery: if a sibling `*.key.new` file is found, an earlier
+    /// `rotate-key` run was interrupted between writing the new key and the
+    /// final rename. The DB blobs at that point may already be encrypted
+    /// under the new key, so we finish the rotation by renaming `*.new` over
+    /// the live path before loading. Any leftover `*.key.tmp` (failed
+    /// initial generation) is removed instead — it is never the active key.
     pub fn load_or_generate_at(path: &PathBuf) -> Result<Self, CredentialsError> {
+        recover_interrupted_rotation(path)?;
         if !path.exists() {
             generate_key_file(path)?;
         }
@@ -187,6 +195,46 @@ pub fn default_key_path() -> PathBuf {
         .join(KEY_FILE)
 }
 
+/// Resolve an interrupted rotation before the cipher is loaded. The CLI's
+/// `rotate-key` writes the new key bytes to a `*.key.staging` file FIRST,
+/// then commits the DB transaction that re-encrypts every blob, then
+/// atomically renames `*.staging → *.key.new` (this rename is the commit
+/// marker — its presence proves the DB transaction succeeded). The last
+/// step renames `*.key.new → *.key`. Recovery cases:
+///
+///   * `*.key.new` exists → DB is already on the new key; promote it.
+///   * `*.key.staging` exists → DB never committed; discard the partial.
+///   * `*.key.tmp` exists → aborted first-time generation; discard.
+fn recover_interrupted_rotation(path: &PathBuf) -> Result<(), CredentialsError> {
+    let new_path = path.with_extension("key.new");
+    let staging_path = path.with_extension("key.staging");
+    let tmp_path = path.with_extension("key.tmp");
+    if new_path.exists() {
+        tracing::warn!(
+            target: "tentaflow::credentials",
+            new = %new_path.display(),
+            live = %path.display(),
+            "detected interrupted rotation; promoting .new key to live"
+        );
+        std::fs::rename(&new_path, path)?;
+        let _ = fsync_parent_dir(path);
+    }
+    if staging_path.exists() {
+        // Staging means the operator started a rotation but the DB
+        // transaction never committed — the live key is still authoritative.
+        tracing::warn!(
+            target: "tentaflow::credentials",
+            staging = %staging_path.display(),
+            "discarding stale .staging key (rotation never committed)"
+        );
+        let _ = std::fs::remove_file(&staging_path);
+    }
+    if tmp_path.exists() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    Ok(())
+}
+
 /// Write a fresh random 32-byte key to `path` atomically: random bytes go
 /// to `<path>.tmp` with mode 0600 first, then rename in place. Creates the
 /// parent directory if missing.
@@ -213,11 +261,17 @@ fn generate_key_file(path: &PathBuf) -> Result<(), CredentialsError> {
 /// Persist `bytes` to `path` with mode 0600 on Unix. On non-Unix the file
 /// inherits the default umask (Windows enforcement happens via the parent
 /// directory's ACL, which is out of scope for F1b).
+///
+/// On Unix the mode is enforced twice: at `open()` with `OpenOptions::mode`
+/// (covers the create case) and again with `set_permissions()` after the
+/// write completes (covers the case where a stale `*.new` left behind by an
+/// interrupted rotation already exists with a wider mode — `O_TRUNC` would
+/// otherwise preserve the existing inode's permission bits).
 pub fn write_key_bytes(path: &PathBuf, bytes: &[u8; 32]) -> Result<(), CredentialsError> {
     use std::io::Write;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -226,12 +280,37 @@ pub fn write_key_bytes(path: &PathBuf, bytes: &[u8; 32]) -> Result<(), Credentia
             .open(path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        // Force-set mode AFTER write so a pre-existing file with a wider
+        // mode (e.g. 0644 left by an aborted rotation) ends up 0600.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
         let mut f = std::fs::File::create(path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+    }
+    Ok(())
+}
+
+/// fsync the directory containing `path` so a subsequent `rename()` of a
+/// child file is durable across crashes. On platforms where directory fsync
+/// is not meaningful (Windows) this is a no-op. Errors are wrapped as
+/// `CredentialsError::Io` so callers can short-circuit a rotation.
+pub fn fsync_parent_dir(path: &PathBuf) -> Result<(), CredentialsError> {
+    if let Some(parent) = path.parent() {
+        // Opening a directory for read on Unix lets us call fsync on it.
+        // On Windows std::fs::File::open on a directory fails; we silently
+        // skip — rename durability there is the FS journal's concern.
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+        }
     }
     Ok(())
 }

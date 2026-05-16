@@ -507,13 +507,44 @@ fn prepare_credentials_blob(
     if plain.len() > crate::services::camera_ingest::credentials::MAX_PLAINTEXT_LEN {
         return Err("credentials_plaintext_too_long");
     }
-    if !plain.contains(':') {
-        return Err("credentials_missing_user_pass_separator");
-    }
+    validate_userinfo_plaintext(plain)?;
     let blob = credentials_cipher()
         .encrypt(plain)
         .map_err(|_| "credentials_encrypt_failed")?;
     Ok(Some(blob))
+}
+
+/// Reject `user:pass` plaintexts that would break URL parsing or open up
+/// URL-injection vectors when later overlaid into the rtsp:// location.
+/// Accepts RFC 3986 `unreserved` plus a small set of `sub-delims` that are
+/// safe inside the userinfo component (`!$&'()*+,;=`). Anything that would
+/// require percent-encoding (`@`, `/`, `?`, `#`, `[`, `]`, `%`, whitespace,
+/// control chars, multi-byte) is rejected so callers cannot smuggle a
+/// `user:pass@evil.host/x` into the eventual GStreamer URL.
+fn validate_userinfo_plaintext(plain: &str) -> Result<(), &'static str> {
+    let (user, pass) = plain
+        .split_once(':')
+        .ok_or("credentials_missing_user_pass_separator")?;
+    if user.is_empty() {
+        return Err("credentials_user_empty");
+    }
+    if pass.is_empty() {
+        return Err("credentials_pass_empty");
+    }
+    let safe = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '-' | '.' | '_' | '~' | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+            )
+    };
+    if !user.chars().all(safe) {
+        return Err("credentials_user_unsafe_chars");
+    }
+    if !pass.chars().all(safe) {
+        return Err("credentials_pass_unsafe_chars");
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -1402,11 +1433,47 @@ pub fn camera_credentials_rotate_v1(
         audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed"));
         return AbiError::Operation.as_i32();
     }
-    // The active session keeps decrypting `credentials_encrypted` on each
-    // pipeline (re)build, so the new credentials take effect at the next
-    // reconnect tick without an explicit supervisor poke. The bus-error /
-    // reconnect path already handles the resulting Unauthorized fault.
-    let reason = format!("blob_len={blob_len} cleared={}", new_blob.is_none());
+
+    // Signal the live session to restart with the fresh credentials. The
+    // session task otherwise keeps the previous plaintext in its in-memory
+    // `CameraConfig` and would not pick up the rotation until its next
+    // independent disconnect — which on a healthy RTSP feed never happens.
+    // We build a CameraConfig from the persisted row so the restart sees
+    // exactly what `camera_add_v1` would have configured today (vendor +
+    // url + fps + resolution + new blob).
+    let restart_cfg = CameraConfig {
+        camera_id: row.camera_id.clone(),
+        vendor: row.vendor.clone(),
+        url: row.url.clone(),
+        target_fps: row.target_fps as u32,
+        resolution: match (row.resolution_width, row.resolution_height) {
+            (Some(w), Some(h)) => Some((w as u32, h as u32)),
+            _ => None,
+        },
+        owner_addon_id: Some(addon_id.clone()),
+        credentials_encrypted: new_blob.clone(),
+    };
+    let restart_result = run_async(async {
+        let sup = get_or_init_supervisor().await?;
+        sup.restart_camera(&row.camera_id, restart_cfg)
+            .await
+            .map_err(|e| map_ingest_error(&e))
+    });
+    let restart_note = match restart_result {
+        Ok(()) => "session_restart_signaled",
+        // A missing session (e.g. process restarted before the rotation but
+        // host singleton not yet warmed) is non-fatal — the persisted blob
+        // will be picked up when the supervisor reconciles. Surface it in
+        // the audit reason so operators can correlate.
+        Err(AbiError::NotFound) => "session_not_running",
+        Err(_) => "session_restart_failed",
+    };
+
+    let reason = format!(
+        "blob_len={blob_len} cleared={} {}",
+        new_blob.is_none(),
+        restart_note
+    );
     audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "ok", Some(&reason));
     let out = CameraCredentialsRotateOut {
         rotated: true,
