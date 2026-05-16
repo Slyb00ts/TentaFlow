@@ -93,20 +93,32 @@ Production TLS profile (enforced in `api::unified_server`):
 - AEAD cipher suites only (no CBC, no RC4 — implied by TLS 1.3 lockout)
 - HSTS header on every response (200, 401, 403, 404, 429 — no exception)
 
-### Cluster constraint (F1a/F1b single-node only)
+### Cluster constraint
 
 HMAC signing keys (PickupToken + frame_url + recording_url + cameras AES-GCM)
 and the pickup mTLS allowlist are process-local OR file-based per node.
-Multi-node cluster requires P3 mesh key sync (deferred). In single-node
-deployments this is acceptable. Multi-node deployments must wait for P3.
 
-Single-node deployment (post F1b P3.A): HMAC keys persist on disk at
+Single-node (F1b P3.A): HMAC keys persist on disk at
 `<tentaflow_home>/keys/{pickup_token,frame_url,recording_url}.key` (mode
 0600 on Unix). Restart no longer invalidates outstanding URLs or pickup
 tokens. Rotation: `tentaflow-cli keys rotate <name>` — running issuers
 keep the previous key as a verify-only secondary for `max_ttl + 5 s` so a
-rotation does not invalidate tokens already in flight. Multi-node mesh
-sync of these three keys remains pending P3.B.
+rotation does not invalidate tokens already in flight.
+
+Multi-node (F1b P3.B): each peer mirrors its three HMAC issuer keys to
+every trust-paired peer over the existing mTLS mesh stream
+(`MESH_MSG_HMAC_KEYS_SYNC = 0x44`,
+`tentaflow_protocol::mesh::HmacKeysSyncPayload`). Tokens minted on node A
+verify on node B for the lifetime of the trust pairing. State is held in
+`services::mesh_keys::MeshKeyPool` (in-memory only, never persisted to
+disk — a revoked peer cannot leave stale verifiers behind). Disconnect /
+trust-revoke drops the peer's pool entries; reconnect re-advertises.
+One-shot pickup-token semantics are owned by the issuing node — mesh
+fallback verifies HMAC + expiry but does not enforce one-shot on the
+verifying side (the 30 s pickup TTL keeps the replay window tight). An
+explicit broadcast-on-rotate hop (push new keys without waiting for the
+next `PeerConnected`) is deferred; today rotation propagates lazily via
+the cooldown-gated advertise on the next connect cycle.
 
 ### Logging warning
 

@@ -146,6 +146,14 @@ pub enum IrohMeshEvent {
         node_id: String,
         keys: Vec<(String, String)>,
     },
+    /// F1b P3.B — peer pushed its HMAC issuer keys (pickup_token, frame_url,
+    /// recording_url). Payload carries raw 32-byte secrets + optional
+    /// previous-window key per scope; receiver must already trust the sender
+    /// (the dispatcher enforces this in `pipeline.rs`).
+    HmacKeysSyncReceived {
+        node_id: String,
+        payload: tentaflow_protocol::mesh::HmacKeysSyncPayload,
+    },
     NodeLeavingReceived {
         node_id: String,
     },
@@ -1128,6 +1136,18 @@ impl IrohMeshManager {
         .await
     }
 
+    /// F1b P3.B — push this node's HMAC issuer keys to a trust-paired peer.
+    /// Caller is responsible for trust + cooldown gating; this is a thin
+    /// wrapper around `send_to_peer` with the right discriminant.
+    pub async fn send_hmac_keys_sync(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_HMAC_KEYS_SYNC,
+            data,
+        )
+        .await
+    }
+
     pub async fn send_node_leaving(&self) {
         let data = vec![];
         let _ = self
@@ -1829,6 +1849,26 @@ impl IrohMeshManagerRef {
                     },
                     Err(e) => {
                         warn!(peer = %remote_hex, "iroh_mesh: nie udalo sie zdekodowac TrustedKeysSync: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_HMAC_KEYS_SYNC => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::HmacKeysSyncPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::HmacKeysSyncReceived {
+                        node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode HmacKeysSync: {}",
+                            e
+                        );
                         return Ok(());
                     }
                 }
