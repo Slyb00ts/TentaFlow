@@ -141,6 +141,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (21, "cameras_table", MigrationStep::Sql(CAMERAS_TABLE)),
         (22, "recordings_table", MigrationStep::Sql(RECORDINGS_TABLE)),
+        (
+            23,
+            "cameras_vendor_check_rtsp_onvif",
+            MigrationStep::Sql(CAMERAS_VENDOR_CHECK_RTSP_ONVIF),
+        ),
     ]
 }
 
@@ -205,6 +210,63 @@ CREATE TABLE cameras (
 CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
 CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
 CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+"#;
+
+// F1b P1.A — extend `cameras.vendor` CHECK to allow `rtsp` and `onvif` next to
+// the existing `fake_file`. SQLite cannot ALTER a CHECK constraint in-place,
+// so we rebuild the table: create `cameras_new` with the new CHECK, copy rows
+// 1:1, drop the old table, rename, recreate indexes. Foreign keys are turned
+// off during the rebuild (SQLite requirement for safe table swap) and
+// re-enabled at the end. `DROP TABLE IF EXISTS cameras_new` guards against a
+// partial earlier run leaving the scratch table behind.
+const CAMERAS_VENDOR_CHECK_RTSP_ONVIF: &str = r#"
+PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS cameras_new;
+
+CREATE TABLE cameras_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file', 'rtsp', 'onvif')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL
+);
+
+INSERT INTO cameras_new (
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at
+)
+SELECT
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at
+FROM cameras;
+
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+
+PRAGMA foreign_keys = ON;
 "#;
 
 // F1a §6.6 v0.6.0 — readonly aliases per Chunk C decision. Permission was
