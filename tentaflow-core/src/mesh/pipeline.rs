@@ -1701,9 +1701,13 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::HmacKeysSyncReceived { node_id, payload }) => {
-                    // Accept only from a trusted sender — mirror of the
-                    // TrustedKeysSync gate. HMAC keys are secrets so we
-                    // must not let an unpaired peer plant them in our pool.
+                    // SECURITY: HMAC keys sync MUST be post-trust. Reject from
+                    // untrusted peers — otherwise an attacker could inject fake
+                    // HMAC keys into our verify pool and mint tokens we would
+                    // accept. The `is_trusted` check below is a load-bearing
+                    // security boundary; the `mesh_key_sync_integration`
+                    // contract test (`receive_handler_has_is_trusted_gate`)
+                    // greps this file to prove the gate did not regress.
                     let sender_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
                         None => false,
