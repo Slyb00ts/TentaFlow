@@ -306,7 +306,7 @@ fn install_frame_callback(
 /// and bus events into health updates. Exits cleanly on
 /// `SessionCommand::Stop` or when the cancel signal fires.
 pub async fn run_rtsp_session(
-    config: CameraConfig,
+    mut config: CameraConfig,
     policy: ReconnectPolicy,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     health_tx: watch::Sender<CameraHealth>,
@@ -400,7 +400,7 @@ pub async fn run_rtsp_session(
                 &counters,
                 None,
             );
-            if !sleep_with_cancel(&mut cmd_rx, &health_tx, wait).await {
+            if !sleep_with_cancel(&mut cmd_rx, &health_tx, wait, &mut config).await {
                 return;
             }
             backoff = next_backoff(backoff, policy.max_backoff);
@@ -417,6 +417,10 @@ pub async fn run_rtsp_session(
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Tracks whether the inner loop exited because of an operator-driven
+        // restart (e.g. credentials rotation). On restart we want to skip
+        // the reconnect backoff and try the new config immediately.
+        let mut restart_requested = false;
         // Inner loop owns the running pipeline. Terminate it by `break` →
         // outer reconnects; or `return` for a final stop.
         let inner_reason: Option<String> = loop {
@@ -441,6 +445,16 @@ pub async fn run_rtsp_session(
                         Some(SessionCommand::UpdateConfig(_)) => {
                             // Hot reconfigure not yet implemented for RTSP —
                             // operator must remove+re-add the camera.
+                        }
+                        Some(SessionCommand::Restart(new_config)) => {
+                            // Credentials rotation (or other supervisor-driven
+                            // restart) — swap config and rebuild the pipeline
+                            // immediately. The new config carries the freshly
+                            // encrypted credentials blob the rotate-v1 host
+                            // function just persisted.
+                            config = new_config;
+                            restart_requested = true;
+                            break None;
                         }
                         Some(SessionCommand::GetHealth(reply)) => {
                             let _ = reply.send(health_tx.borrow().clone());
@@ -541,8 +555,17 @@ pub async fn run_rtsp_session(
             }
         };
 
-        // Pipeline failed — tear it down and schedule a reconnect.
+        // Pipeline tear-down (either operator-driven restart or pipeline
+        // failure). On a restart we skip backoff entirely and reset the
+        // attempt counter so the new credentials are tried immediately.
         let _ = pipeline.set_state(gst::State::Null);
+        if restart_requested {
+            tracing::info!(camera_id = %cam_id, "rtsp session restart requested; rebuilding pipeline");
+            streaming_bus().close_camera(&cam_id, "restart").await;
+            attempt = 0;
+            backoff = policy.initial_backoff;
+            continue 'outer;
+        }
         let reason = redact_url_in_text(
             &inner_reason.unwrap_or_else(|| "unknown pipeline failure".into()),
         );
@@ -572,7 +595,7 @@ pub async fn run_rtsp_session(
             &counters,
             None,
         );
-        if !sleep_with_cancel(&mut cmd_rx, &health_tx, wait).await {
+        if !sleep_with_cancel(&mut cmd_rx, &health_tx, wait, &mut config).await {
             return;
         }
         backoff = next_backoff(backoff, policy.max_backoff);
@@ -607,11 +630,14 @@ fn reached_max(policy: &ReconnectPolicy, attempt: u32) -> bool {
 
 /// Sleep `wait`, but respond promptly to a `Stop` arriving on `cmd_rx`.
 /// Returns `false` if the caller should exit immediately (Stop received or
-/// channel closed); `true` if the wait completed normally.
+/// channel closed); `true` if the wait completed normally OR a `Restart`
+/// arrived (in which case `config` has been updated in place so the caller
+/// reconnects on the new credentials).
 async fn sleep_with_cancel(
     cmd_rx: &mut mpsc::Receiver<SessionCommand>,
     health_tx: &watch::Sender<CameraHealth>,
     wait: Duration,
+    config: &mut CameraConfig,
 ) -> bool {
     let sleeper = tokio::time::sleep(wait);
     tokio::pin!(sleeper);
@@ -634,6 +660,10 @@ async fn sleep_with_cancel(
                         let _ = reply.send(Err(CameraIngestError::SnapshotTimeout));
                     }
                     Some(SessionCommand::UpdateConfig(_)) => {}
+                    Some(SessionCommand::Restart(new_config)) => {
+                        *config = new_config;
+                        return true;
+                    }
                 }
             }
             _ = &mut sleeper => return true,
@@ -682,7 +712,7 @@ async fn drain_until_stop(
                     .unwrap_or_else(|| "session in terminal error state".into());
                 let _ = reply.send(Err(CameraIngestError::SnapshotFailed(msg)));
             }
-            SessionCommand::UpdateConfig(_) => {}
+            SessionCommand::UpdateConfig(_) | SessionCommand::Restart(_) => {}
         }
     }
 }
@@ -848,8 +878,9 @@ mod tests {
             let _ = cancel_tx.send(SessionCommand::Stop).await;
         });
 
+        let mut cfg = CameraConfig::new_unowned("cam_test", "rtsp", "rtsp://x/y", 30, None);
         let start = tokio::time::Instant::now();
-        let completed = sleep_with_cancel(&mut rx, &htx, total_wait).await;
+        let completed = sleep_with_cancel(&mut rx, &htx, total_wait, &mut cfg).await;
         let elapsed = start.elapsed();
         assert!(!completed, "sleep_with_cancel must return false on Stop");
         assert!(
