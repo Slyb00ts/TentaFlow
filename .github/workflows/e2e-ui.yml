@@ -1,0 +1,60 @@
+# =============================================================================
+# File: .github/workflows/e2e-ui.yml
+# Description: Playwright UI e2e tests for M14/M15/M16. Builds the tentaflow
+#              release binary, installs Playwright Chromium, and runs the
+#              UI test suites. Triggered on PRs that touch UI or API code.
+# =============================================================================
+
+name: E2E UI Tests
+
+on:
+  pull_request:
+    paths:
+      - 'tentaflow-core/www/**'
+      - 'tentaflow-core/src/api/**'
+      - 'tentaflow/**'
+      - 'tests/e2e/**'
+
+jobs:
+  e2e-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tentaflow/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build tentaflow release
+        working-directory: tentaflow
+        run: cargo build --release --features dashboard-api
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright deps
+        working-directory: tests/e2e
+        run: |
+          npm ci || npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run UI e2e tests
+        working-directory: tests/e2e
+        run: npm run test:ui
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e/test-results
