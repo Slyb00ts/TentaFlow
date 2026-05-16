@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod fakefile;
+pub mod rtsp;
 pub mod session;
 pub mod supervisor;
 

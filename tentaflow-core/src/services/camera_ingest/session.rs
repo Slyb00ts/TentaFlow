@@ -142,35 +142,25 @@ impl CameraHandle {
 /// Spawn a session task driving a single camera. Returns a handle the
 /// supervisor stores under `camera_id`.
 pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
-    if config.vendor != "fake_file" {
-        return Err(CameraIngestError::UnsupportedVendor(config.vendor));
-    }
     if !(1..=60).contains(&config.target_fps) {
         return Err(CameraIngestError::InvalidConfig(format!(
             "target_fps must be 1..=60, got {}",
             config.target_fps
         )));
     }
-    let path = resolve_file_url(&config.url)?;
-    ensure_gst_initialized()?;
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
-    let (health_tx, health_rx) = watch::channel(CameraHealth::initial(&config.camera_id));
-    let mailbox = Arc::new(FrameMailbox::new());
-    let counters = Arc::new(FrameCounters::new());
 
     let id = config.camera_id.clone();
     let vendor = config.vendor.clone();
     let owner_addon_id = config.owner_addon_id.clone();
 
-    let join_handle = tokio::spawn(run_session(
-        config,
-        path,
-        cmd_rx,
-        health_tx,
-        mailbox,
-        counters,
-    ));
+    let (cmd_tx, health_rx, join_handle) = match vendor.as_str() {
+        "fake_file" => spawn_fakefile_inner(config)?,
+        "rtsp" => {
+            use super::rtsp::{spawn_rtsp_session, ReconnectPolicy};
+            spawn_rtsp_session(config, ReconnectPolicy::default())?
+        }
+        other => return Err(CameraIngestError::UnsupportedVendor(other.to_string())),
+    };
 
     Ok(CameraHandle {
         id,
@@ -180,6 +170,27 @@ pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
         health_rx,
         join_handle,
     })
+}
+
+fn spawn_fakefile_inner(
+    config: CameraConfig,
+) -> Result<(
+    mpsc::Sender<SessionCommand>,
+    watch::Receiver<CameraHealth>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let path = resolve_file_url(&config.url)?;
+    ensure_gst_initialized()?;
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
+    let (health_tx, health_rx) = watch::channel(CameraHealth::initial(&config.camera_id));
+    let mailbox = Arc::new(FrameMailbox::new());
+    let counters = Arc::new(FrameCounters::new());
+
+    let join_handle = tokio::spawn(run_session(
+        config, path, cmd_rx, health_tx, mailbox, counters,
+    ));
+    Ok((cmd_tx, health_rx, join_handle))
 }
 
 async fn run_session(
@@ -425,17 +436,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_vendor_whitelist_rejects_rtsp() {
+    async fn test_vendor_whitelist_rejects_onvif() {
+        // ONVIF is reserved for F1b P1.D and must be rejected today.
         let err = spawn_session(CameraConfig {
             camera_id: "c1".into(),
-            vendor: "rtsp".into(),
-            url: "rtsp://example/foo".into(),
+            vendor: "onvif".into(),
+            url: "http://example/onvif/device_service".into(),
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::UnsupportedVendor(_)));
+    }
+
+    #[tokio::test]
+    async fn test_rtsp_invalid_url_rejected() {
+        // RTSP vendor accepted, but URL must carry the rtsp:// scheme.
+        let err = spawn_session(CameraConfig {
+            camera_id: "c1".into(),
+            vendor: "rtsp".into(),
+            url: "http://example/foo".into(),
+            target_fps: 30,
+            resolution: None,
+            owner_addon_id: None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, CameraIngestError::InvalidUrl(_)));
     }
 
     #[tokio::test]
