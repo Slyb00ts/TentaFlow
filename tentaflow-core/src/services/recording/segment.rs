@@ -2,13 +2,14 @@
 // File: services/recording/segment.rs — GStreamer MP4 segment recorder
 // =============================================================================
 //
-// F1a: ad-hoc recording from a `file://` source via parse_launch. We re-encode
-// through `x264enc tune=zerolatency` + `mp4mux` so unit tests can drive the
-// path off the bundled sample mp4 without depending on a live camera. F1b
-// will swap this for a tee tap off the existing camera supervisor pipeline
-// so live RTSP segments record without re-encode.
+// F1a: ad-hoc recording from a `file://` source built via typed GStreamer
+// elements (no parse_launch). We re-encode through `x264enc tune=zerolatency`
+// + `mp4mux` so unit tests can drive the path off the bundled sample mp4
+// without depending on a live camera. F1b will swap this for a tee tap off
+// the existing camera supervisor pipeline so live RTSP segments record
+// without re-encode.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -35,24 +36,15 @@ pub async fn save_segment_mp4(
 
     gst::init().map_err(|e| RecordingError::GstPipeline(format!("gst init: {e}")))?;
 
+    let source_path = parse_file_url(source_url)?;
+
     let recording_ref = RecordingRef(format!("clip_{}", uuid::Uuid::new_v4()));
     let base = recording_base_dir()?;
     let dir = camera_subdir(&base, camera_id, RecordingKind::Segment);
     tokio::fs::create_dir_all(&dir).await?;
     let file_path: PathBuf = dir.join(format!("{}.mp4", recording_ref.0));
 
-    let src = source_url.trim_start_matches("file://");
-    let pipeline_desc = format!(
-        "filesrc location=\"{}\" ! decodebin ! videoconvert ! x264enc tune=zerolatency ! mp4mux ! filesink location=\"{}\"",
-        src.replace('"', "\\\""),
-        file_path.display().to_string().replace('"', "\\\"")
-    );
-
-    let element = gst::parse::launch(&pipeline_desc)
-        .map_err(|e| RecordingError::GstPipeline(format!("parse_launch: {e}")))?;
-    let pipeline = element
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| RecordingError::GstPipeline("not a pipeline".into()))?;
+    let pipeline = build_segment_pipeline(&source_path, &file_path)?;
 
     pipeline
         .set_state(gst::State::Playing)
@@ -90,11 +82,13 @@ pub async fn save_segment_mp4(
         }
     };
 
-    // Send EOS so mp4mux finalizes the moov atom, then wait briefly for the
-    // pipeline to drain. Without this the mp4 is unplayable.
-    let _ = pipeline.send_event(gst::event::Eos::new());
+    // Send EOS so mp4mux finalizes the moov atom. Without a successful
+    // finalization the mp4 is unplayable, so we MUST confirm the EOS made it
+    // through the bus — a timeout or downstream Error here means the file is
+    // truncated and the caller has to know.
+    pipeline.send_event(gst::event::Eos::new());
     let bus_finalize = bus.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let finalize_join = tokio::task::spawn_blocking(move || {
         bus_finalize.timed_pop_filtered(
             gst::ClockTime::from_seconds(2),
             &[gst::MessageType::Eos, gst::MessageType::Error],
@@ -104,6 +98,30 @@ pub async fn save_segment_mp4(
     let _ = pipeline.set_state(gst::State::Null);
 
     drain_result?;
+
+    let finalize_msg = finalize_join
+        .map_err(|e| RecordingError::GstPipeline(format!("finalize join: {e}")))?;
+    match finalize_msg {
+        Some(m) => match m.view() {
+            gst::MessageView::Eos(_) => {}
+            gst::MessageView::Error(e) => {
+                return Err(RecordingError::GstPipeline(format!(
+                    "mp4mux finalize error: {}",
+                    e.error()
+                )));
+            }
+            _ => {
+                return Err(RecordingError::GstPipeline(
+                    "unexpected bus message during finalize".into(),
+                ));
+            }
+        },
+        None => {
+            return Err(RecordingError::GstPipeline(
+                "mp4mux finalize timeout after 2s".into(),
+            ));
+        }
+    }
 
     let meta = tokio::fs::metadata(&file_path).await.map_err(|e| {
         RecordingError::GstPipeline(format!(
@@ -127,6 +145,108 @@ pub async fn save_segment_mp4(
         hash_sha256: hash,
         created_at: now_unix_secs(),
     })
+}
+
+/// Reject anything that isn't a `file://` URL. We do not yet support remote
+/// schemes for ad-hoc segments — the live RTSP path goes through F1b's tee.
+fn parse_file_url(source_url: &str) -> Result<PathBuf> {
+    let rest = source_url.strip_prefix("file://").ok_or_else(|| {
+        RecordingError::GstPipeline(format!(
+            "unsupported URL scheme (expected file://): {source_url}"
+        ))
+    })?;
+    if rest.is_empty() {
+        return Err(RecordingError::GstPipeline(
+            "file:// URL has empty path".into(),
+        ));
+    }
+    Ok(PathBuf::from(rest))
+}
+
+/// Build the segment recording pipeline programmatically. Using typed
+/// ElementFactory calls (instead of parse_launch) means caller-controlled
+/// strings — paths, URLs — can never be interpreted as pipeline syntax.
+fn build_segment_pipeline(
+    source_path: &Path,
+    output_path: &Path,
+) -> Result<gst::Pipeline> {
+    let source_str = source_path.to_str().ok_or_else(|| {
+        RecordingError::GstPipeline("source path is not valid UTF-8".into())
+    })?;
+    let output_str = output_path.to_str().ok_or_else(|| {
+        RecordingError::GstPipeline("output path is not valid UTF-8".into())
+    })?;
+
+    let pipeline = gst::Pipeline::with_name("tentaflow-segment");
+
+    let filesrc = gst::ElementFactory::make("filesrc")
+        .property("location", source_str)
+        .build()
+        .map_err(|e| RecordingError::GstPipeline(format!("filesrc: {e}")))?;
+    let decodebin = gst::ElementFactory::make("decodebin")
+        .build()
+        .map_err(|e| RecordingError::GstPipeline(format!("decodebin: {e}")))?;
+    let videoconvert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| RecordingError::GstPipeline(format!("videoconvert: {e}")))?;
+    let x264enc = gst::ElementFactory::make("x264enc")
+        .property_from_str("tune", "zerolatency")
+        .build()
+        .map_err(|e| RecordingError::GstPipeline(format!("x264enc: {e}")))?;
+    let mp4mux = gst::ElementFactory::make("mp4mux")
+        .build()
+        .map_err(|e| RecordingError::GstPipeline(format!("mp4mux: {e}")))?;
+    let filesink = gst::ElementFactory::make("filesink")
+        .property("location", output_str)
+        .build()
+        .map_err(|e| RecordingError::GstPipeline(format!("filesink: {e}")))?;
+
+    pipeline
+        .add_many([&filesrc, &decodebin, &videoconvert, &x264enc, &mp4mux, &filesink])
+        .map_err(|e| RecordingError::GstPipeline(format!("add_many: {e}")))?;
+
+    filesrc
+        .link(&decodebin)
+        .map_err(|e| RecordingError::GstPipeline(format!("filesrc->decodebin: {e}")))?;
+    videoconvert
+        .link(&x264enc)
+        .map_err(|e| RecordingError::GstPipeline(format!("videoconvert->x264enc: {e}")))?;
+    x264enc
+        .link(&mp4mux)
+        .map_err(|e| RecordingError::GstPipeline(format!("x264enc->mp4mux: {e}")))?;
+    mp4mux
+        .link(&filesink)
+        .map_err(|e| RecordingError::GstPipeline(format!("mp4mux->filesink: {e}")))?;
+
+    // decodebin builds its src pads only once it knows the stream type, so we
+    // wire the video branch lazily via pad-added. Weak ref on videoconvert
+    // avoids keeping the element alive past pipeline teardown.
+    let videoconvert_weak = videoconvert.downgrade();
+    decodebin.connect_pad_added(move |_, src_pad| {
+        let Some(videoconvert) = videoconvert_weak.upgrade() else {
+            return;
+        };
+        let Some(sink_pad) = videoconvert.static_pad("sink") else {
+            return;
+        };
+        if sink_pad.is_linked() {
+            return;
+        }
+        // Only link video pads — audio streams from the input get dropped.
+        let caps = src_pad
+            .current_caps()
+            .unwrap_or_else(|| src_pad.query_caps(None));
+        let is_video = caps
+            .structure(0)
+            .map(|s| s.name().starts_with("video/"))
+            .unwrap_or(false);
+        if !is_video {
+            return;
+        }
+        let _ = src_pad.link(&sink_pad);
+    });
+
+    Ok(pipeline)
 }
 
 fn now_unix_secs() -> u64 {
@@ -167,6 +287,29 @@ mod tests {
         let _home = temp_home_guard();
         let err = save_segment_mp4("cam_seg", "file:///dev/null", 0).await.unwrap_err();
         assert!(matches!(err, RecordingError::GstPipeline(_)));
+    }
+
+    #[tokio::test]
+    async fn test_save_segment_invalid_url_scheme_rejected() {
+        let _home = temp_home_guard();
+        // Non-file:// schemes must be rejected before any pipeline is built.
+        for url in [
+            "http://example.com/video.mp4",
+            "rtsp://10.0.0.1/stream",
+            "/etc/passwd",
+            "",
+        ] {
+            let err = save_segment_mp4("cam_seg", url, 1).await.unwrap_err();
+            match err {
+                RecordingError::GstPipeline(msg) => {
+                    assert!(
+                        msg.contains("unsupported URL scheme") || msg.contains("empty path"),
+                        "unexpected error for {url:?}: {msg}"
+                    );
+                }
+                other => panic!("expected GstPipeline error for {url:?}, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
