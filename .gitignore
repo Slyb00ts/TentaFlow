@@ -159,3 +159,6 @@ test-results/
 notes/*.md.claude/
 
 .claude/
+
+# Python
+__pycache__/
