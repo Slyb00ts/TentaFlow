@@ -206,6 +206,57 @@ deferred to F1c.
 `camera_test_connection_v1` for ONVIF forces path `/onvif/device_service`
 to prevent arbitrary HTTP target probing.
 
+## Key persistence (F1b P3.A)
+
+Three HMAC keys live on disk under `<tentaflow_home>/keys/` and survive
+restarts:
+
+| File | Used by | TTL window | Rotation impact |
+|------|---------|------------|-----------------|
+| `pickup_token.key` | `PickupTokenIssuer` (M1.W7 one-shot frame pickup) | 30 s | tokens minted under old key keep verifying for ~35 s |
+| `frame_url.key` | `SignedUrlIssuer{FrameUrl}` (M1.W8) | up to 10 min | URLs keep verifying until natural TTL expiry |
+| `recording_url.key` | `SignedUrlIssuer{Recording}` (M1.W8) | up to 1 h | URLs keep verifying until natural TTL expiry |
+
+All three files are 32 raw bytes, mode 0600. They are generated on first
+host start with `getrandom`; the operator should back them up alongside
+`cameras.key` — losing them does not corrupt anything (the host
+regenerates on next start) but does invalidate every outstanding URL and
+pickup token.
+
+### Rotation
+
+```
+tentaflow-cli keys rotate pickup_token
+tentaflow-cli keys rotate frame_url
+tentaflow-cli keys rotate recording_url
+```
+
+Each command:
+
+1. Writes a fresh 32-byte CSPRNG key to `<name>.key.staging` (mode 0600).
+2. fsyncs the parent dir.
+3. Renames `.staging → .key.new` (durable commit marker).
+4. Archives the current live key as `<name>.key.YYYYMMDD-HHMMSS`.
+5. Renames `.new → <name>.key` and fsyncs the parent.
+
+Crash recovery: on the next host start, `PersistentKey::load_or_generate`
+promotes any leftover `.key.new` (commit marker survived) and discards any
+leftover `.key.staging` (commit marker never written). The host must be
+restarted after rotation for the new key to be used for signing — running
+issuers keep the previous key as a verify-only secondary for `max_ttl + 5
+s` so a rotation does not invalidate tokens that are already in flight.
+
+### Soak monitoring
+
+Mid-soak the operator can rotate a key and verify:
+
+- The archive file `<name>.key.<UTC>` appears alongside the live file.
+- `ls -l <tentaflow_home>/keys/*.key` shows mode `-rw-------` on every key.
+- Outstanding signed URLs continue to verify until their natural TTL
+  expires (issuer's previous-key window).
+- After host restart, signed URLs minted under the OLD key fail with
+  `InvalidSignature` (previous key was only an in-memory window).
+
 ## Troubleshooting
 
 - **`tentaflow died during warm-up`** — see `logs/tentaflow.log`. Usually a

@@ -10,13 +10,16 @@
 // until expiry.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+
+use crate::services::key_storage::PersistentKey;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -47,6 +50,16 @@ impl UrlScope {
         match self {
             Self::FrameUrl => 600,
             Self::Recording => 3600,
+        }
+    }
+
+    /// Name of the on-disk key file under `<tentaflow_home>/keys/`. Each
+    /// scope gets its own key file so a rotation on frame URLs does not
+    /// invalidate outstanding recording URLs (and vice versa).
+    pub fn key_name(&self) -> &'static str {
+        match self {
+            Self::FrameUrl => "frame_url",
+            Self::Recording => "recording_url",
         }
     }
 }
@@ -85,20 +98,41 @@ pub enum SignedUrlError {
     RefInvalid,
 }
 
+/// Rotation state: current signing key plus an optional previous key kept
+/// valid for verify until `previous_expires_at`. The grace window is sized
+/// to the scope's max TTL so any token minted right before the rotate still
+/// verifies until its natural expiry.
+struct KeyState {
+    current: [u8; 32],
+    previous: Option<[u8; 32]>,
+    previous_expires_at: Instant,
+}
+
+impl KeyState {
+    fn new(current: [u8; 32]) -> Self {
+        Self {
+            current,
+            previous: None,
+            previous_expires_at: Instant::now(),
+        }
+    }
+}
+
 pub struct SignedUrlIssuer {
     scope: UrlScope,
-    signing_key: Arc<[u8; 32]>,
+    keys: Arc<RwLock<KeyState>>,
 }
 
 impl SignedUrlIssuer {
-    /// Generate a fresh signing key from `OsRng`. Process-local; restart
-    /// invalidates every outstanding token (acceptable: max TTL is 1 h).
+    /// Load (or generate on first run) the persistent signing key for this
+    /// scope from `<tentaflow_home>/keys/<scope>.key` (since F1b P3.A).
+    /// Restart no longer invalidates outstanding tokens.
     pub fn new(scope: UrlScope) -> Self {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).expect("OS RNG fill for SignedUrlIssuer signing key");
+        let key = PersistentKey::load_or_generate(scope.key_name())
+            .unwrap_or_else(|e| panic!("load signed_url key for {:?}: {e}", scope));
         Self {
             scope,
-            signing_key: Arc::new(key),
+            keys: Arc::new(RwLock::new(KeyState::new(*key.bytes()))),
         }
     }
 
@@ -107,12 +141,26 @@ impl SignedUrlIssuer {
     pub fn new_for_tests(scope: UrlScope, key: [u8; 32]) -> Self {
         Self {
             scope,
-            signing_key: Arc::new(key),
+            keys: Arc::new(RwLock::new(KeyState::new(key))),
         }
     }
 
     pub fn scope(&self) -> UrlScope {
         self.scope
+    }
+
+    /// In-place key swap used by `tentaflow-cli keys rotate <frame_url |
+    /// recording_url>`. The previous key is retained as a verify-only
+    /// secondary for `max_ttl + grace` so any URL minted right before the
+    /// rotate still verifies until its natural expiry.
+    pub fn rotate_in_memory(&self, new_key: [u8; 32]) {
+        let mut state = self.keys.write();
+        let old = state.current;
+        state.previous = Some(old);
+        state.previous_expires_at = Instant::now()
+            + Duration::from_secs(self.scope.max_ttl_secs())
+            + Duration::from_secs(5);
+        state.current = new_key;
     }
 
     pub fn issue(&self, ref_id: String, ttl_secs: u64) -> Result<SignedUrl, SignedUrlError> {
@@ -126,7 +174,10 @@ impl SignedUrlIssuer {
         }
         let expiry_unix_ms = now_unix_ms() + ttl_secs * 1000;
         let payload = format!("{}:{}:{}", self.scope.as_str(), ref_id, expiry_unix_ms);
-        let sig = hmac_sign(&*self.signing_key, payload.as_bytes());
+        let sig = {
+            let state = self.keys.read();
+            hmac_sign(&state.current, payload.as_bytes())
+        };
         let token_b64 = B64.encode(sig);
         Ok(SignedUrl {
             ref_id,
@@ -138,6 +189,10 @@ impl SignedUrlIssuer {
     /// Multi-use verify. Does NOT mark the token consumed — callers may verify
     /// the same `(ref_id, expiry_unix_ms, token_b64)` triple as many times as
     /// they like until `expiry_unix_ms` passes.
+    ///
+    /// Verifies against current key and (if its window is still open) the
+    /// previous key. Constant-time HMAC compare is run for every candidate
+    /// (no early-exit timing leak).
     pub fn verify(
         &self,
         ref_id: &str,
@@ -154,8 +209,26 @@ impl SignedUrlIssuer {
             return Err(SignedUrlError::Expired);
         }
         let payload = format!("{}:{}:{}", self.scope.as_str(), ref_id, expiry_unix_ms);
-        let expected = hmac_sign(&*self.signing_key, payload.as_bytes());
-        if provided.len() != expected.len() || !bool::from(provided.ct_eq(&expected)) {
+
+        let state = self.keys.read();
+        let mut matched = false;
+        let expected_current = hmac_sign(&state.current, payload.as_bytes());
+        if provided.len() == expected_current.len()
+            && bool::from(provided.ct_eq(&expected_current))
+        {
+            matched = true;
+        }
+        if let Some(prev) = state.previous {
+            if Instant::now() < state.previous_expires_at {
+                let expected_prev = hmac_sign(&prev, payload.as_bytes());
+                if provided.len() == expected_prev.len()
+                    && bool::from(provided.ct_eq(&expected_prev))
+                {
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
             return Err(SignedUrlError::InvalidSignature);
         }
         Ok(())
@@ -225,7 +298,7 @@ mod tests {
     #[test]
     fn test_verify_expired() {
         let i = frame_issuer();
-        let u = i.issue("frame_a".into(), 60).unwrap();
+        let _u = i.issue("frame_a".into(), 60).unwrap();
         // Forge an expiry in the past — signature won't match, but the expiry
         // check must run BEFORE signature compare and surface `Expired`.
         let past = now_unix_ms().saturating_sub(10_000);
@@ -320,5 +393,44 @@ mod tests {
         assert_eq!(i.issue("".into(), 120).unwrap_err(), SignedUrlError::RefInvalid);
         let big = "a".repeat(257);
         assert_eq!(i.issue(big, 120).unwrap_err(), SignedUrlError::RefInvalid);
+    }
+
+    #[test]
+    fn test_signed_url_persists_across_issuer_recreate() {
+        // Persistent key under a tempdir: two issuers loaded from the same
+        // file must produce HMAC-compatible tokens (issuer A mints, issuer B
+        // verifies). Replaces the pre-P3.A behavior where a process restart
+        // invalidated every outstanding URL.
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("frame_url.key");
+        let k1 =
+            crate::services::key_storage::PersistentKey::load_or_generate_at("frame_url", &path)
+                .unwrap();
+        let k2 =
+            crate::services::key_storage::PersistentKey::load_or_generate_at("frame_url", &path)
+                .unwrap();
+        assert_eq!(k1.bytes(), k2.bytes());
+
+        let a = SignedUrlIssuer::new_for_tests(UrlScope::FrameUrl, *k1.bytes());
+        let b = SignedUrlIssuer::new_for_tests(UrlScope::FrameUrl, *k2.bytes());
+        let u = a.issue("frame_persist".into(), 120).unwrap();
+        b.verify(&u.ref_id, u.expiry_unix_ms, &u.token_b64)
+            .expect("token minted by A verifies under B (same persistent key)");
+    }
+
+    #[test]
+    fn test_rotation_previous_key_window_verifies() {
+        // Mint under old key, rotate to new key in-memory, verify the old
+        // URL still passes through the previous_key window.
+        let i = SignedUrlIssuer::new_for_tests(UrlScope::FrameUrl, [0xAAu8; 32]);
+        let u = i.issue("frame_rot".into(), 120).unwrap();
+        i.rotate_in_memory([0xBBu8; 32]);
+        i.verify(&u.ref_id, u.expiry_unix_ms, &u.token_b64)
+            .expect("old URL verifies through previous-key window");
+
+        // New URL minted under the new key also works.
+        let u2 = i.issue("frame_new".into(), 120).unwrap();
+        i.verify(&u2.ref_id, u2.expiry_unix_ms, &u2.token_b64)
+            .expect("new URL verifies under current key");
     }
 }
