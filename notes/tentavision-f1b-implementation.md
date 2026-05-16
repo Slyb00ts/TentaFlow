@@ -140,6 +140,41 @@ targets on the local network. Unit test
 - ONVIF discovery zwraca co najmniej 1 kamerę na sieci lab z jednym
   urządzeniem ONVIF (P1.D).
 
+## Phase 3 — Persistent HMAC keys
+
+### P3.A — Single-node key persistence (done)
+
+Three HMAC signing keys used by `PickupTokenIssuer` (M1.W7),
+`SignedUrlIssuer{FrameUrl}` and `SignedUrlIssuer{Recording}` (M1.W8) are now
+persisted on disk under `<tentaflow_home>/keys/`:
+
+- `pickup_token.key` (32 B, mode 0600) — 30 s one-shot tokens.
+- `frame_url.key` (32 B, mode 0600) — frame signed URLs (max 10 min TTL).
+- `recording_url.key` (32 B, mode 0600) — recording signed URLs (max 1 h TTL).
+
+Each file is read on first issuer access (lazy `OnceLock` singletons in
+`services::mod.rs`) and generated atomically with `getrandom::fill` + `tmp
+→ rename + chmod 0600` if absent. Interrupted rotations are recovered on
+startup: a `<name>.key.new` next to the live file is promoted (durable
+commit marker), a `<name>.key.staging` is discarded (never committed).
+
+Operator-driven rotation: `tentaflow-cli keys rotate <name>` (mirrors the
+`camera rotate-key` staging → .new → live atomic flow). On a running host
+the issuer keeps the previous key in memory as a verify-only secondary for
+`max_ttl + 5 s` so any token minted seconds before the rotate still
+verifies until its natural expiry. The operator must restart the host to
+load the new key for signing.
+
+Restart impact: pre-P3.A every restart invalidated all outstanding signed
+URLs and pickup tokens (process-local `OsRng` key); post-P3.A the same
+keys come back from disk so URLs minted before the restart remain valid
+until their TTL expires.
+
+### P3.B / P3.C — Mesh sync (deferred)
+
+Cross-node key sync over QUIC requires a real cluster to validate (we have
+no end-to-end mesh harness yet). Out of scope for F1b; tracked separately.
+
 ## DB schema notes
 
 Po P1.A schema cameras wygląda identycznie jak v21 z jedną zmianą:

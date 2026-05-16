@@ -5,3 +5,4 @@
 
 pub mod addon;
 pub mod camera;
+pub mod keys;
