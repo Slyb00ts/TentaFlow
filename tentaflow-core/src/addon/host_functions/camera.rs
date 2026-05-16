@@ -54,7 +54,7 @@ const PERM_CAMERAS_SNAPSHOT: &str = "cameras.snapshot";
 // Vendor whitelist (F1a)
 // =============================================================================
 
-const SUPPORTED_VENDORS: &[&str] = &["fake_file"];
+const SUPPORTED_VENDORS: &[&str] = &["fake_file", "rtsp"];
 
 fn vendor_supported(v: &str) -> bool {
     SUPPORTED_VENDORS.iter().any(|s| *s == v)
@@ -1237,18 +1237,37 @@ pub fn camera_test_connection_v1(
         audit(caller.data(), "camera.test_connection", None, RiskClass::A, "ok", Some("unsupported_vendor"));
         let out = CameraTestConnectionOut {
             ok: false,
-            message: format!("vendor '{}' not supported (F1a: fake_file only)", input.vendor),
+            message: format!("vendor '{}' not supported", input.vendor),
         };
         return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
     }
-    let out = match crate::services::camera_ingest::fakefile::resolve_file_url(&input.url) {
-        Ok(_) => CameraTestConnectionOut {
-            ok: true,
-            message: "fake_file path readable".to_string(),
+    let out = match input.vendor.as_str() {
+        "fake_file" => match crate::services::camera_ingest::fakefile::resolve_file_url(&input.url) {
+            Ok(_) => CameraTestConnectionOut {
+                ok: true,
+                message: "fake_file path readable".to_string(),
+            },
+            Err(e) => CameraTestConnectionOut {
+                ok: false,
+                message: e.to_string(),
+            },
         },
-        Err(e) => CameraTestConnectionOut {
+        "rtsp" => match crate::services::camera_ingest::rtsp::validate_rtsp_url(&input.url) {
+            // Surface-level URL validation only — a real RTSP DESCRIBE probe
+            // is intentionally out of scope here. Live connectivity is
+            // verified by the supervisor once the camera is added.
+            Ok(_) => CameraTestConnectionOut {
+                ok: true,
+                message: "rtsp url well-formed".to_string(),
+            },
+            Err(e) => CameraTestConnectionOut {
+                ok: false,
+                message: e.to_string(),
+            },
+        },
+        other => CameraTestConnectionOut {
             ok: false,
-            message: e.to_string(),
+            message: format!("vendor '{other}' has no test_connection handler"),
         },
     };
     audit(caller.data(), "camera.test_connection", None, RiskClass::A, "ok", Some(&format!("ok={}", out.ok)));
