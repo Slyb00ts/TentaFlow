@@ -151,7 +151,51 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "frame_pickup_log_source_node_id",
             MigrationStep::Rust(frame_pickup_log_add_source_node_id),
         ),
+        (
+            25,
+            "audit_log_merkle_chain",
+            MigrationStep::Rust(audit_log_add_merkle_chain_columns),
+        ),
     ]
+}
+
+// F1b P4 — Merkle hash chain for `audit_log` (DoD-15). Adds two BLOB columns:
+//   - `prev_hash` (32 B) — copy of the previous row's `hash`, or NULL when
+//     the chain has not started yet (pre-P4 legacy rows).
+//   - `hash` (32 B) — `SHA256(canonical(row) || prev_hash)`.
+//
+// Existing F1a / pre-P4 rows keep NULL in both columns — `audit/verify.rs`
+// counts them as `legacy_unchained` so a verify-after-upgrade run does not
+// flag the entire pre-upgrade history as tampered. Every new row written
+// through `audit_log_with_risk` after this migration MUST populate both
+// columns.
+//
+// Idempotent via PRAGMA table_info — re-running the migration on a DB that
+// already has the columns (e.g. partial earlier run that committed the
+// _migrations row separately) is a no-op.
+fn audit_log_add_merkle_chain_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(audit_log)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_prev_hash = false;
+    let mut has_hash = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "prev_hash" {
+            has_prev_hash = true;
+        } else if name == "hash" {
+            has_hash = true;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_prev_hash {
+        conn.execute_batch("ALTER TABLE audit_log ADD COLUMN prev_hash BLOB NULL;")?;
+    }
+    if !has_hash {
+        conn.execute_batch("ALTER TABLE audit_log ADD COLUMN hash BLOB NULL;")?;
+    }
+    Ok(())
 }
 
 // F1b P3.C-2 — add a nullable `source_node_id` column to `frame_pickup_log`
