@@ -154,6 +154,20 @@ pub enum IrohMeshEvent {
         node_id: String,
         payload: tentaflow_protocol::mesh::HmacKeysSyncPayload,
     },
+    /// F1b P3.C-1 — trust-paired peer asked us for a frame whose `frame_url`
+    /// they hold. Server-side handling (lookup in local frame store, build
+    /// `FrameProxyResponsePayload`) is wired in P3.C-2.
+    FrameProxyRequestReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::FrameProxyRequestPayload,
+    },
+    /// F1b P3.C-1 — trust-paired peer replied to one of our outstanding
+    /// proxy requests. Client-side completion (pending-map lookup, oneshot
+    /// resolve) is wired in P3.C-2.
+    FrameProxyResponseReceived {
+        from_node_id: String,
+        payload: tentaflow_protocol::mesh::FrameProxyResponsePayload,
+    },
     NodeLeavingReceived {
         node_id: String,
     },
@@ -1148,6 +1162,32 @@ impl IrohMeshManager {
         .await
     }
 
+    /// F1b P3.C-1 — send a frame proxy request to a trust-paired peer.
+    /// Caller is responsible for trust gating + correlating the
+    /// `request_id` with a pending response slot (P3.C-2 wires the slot
+    /// map). `data` is the rkyv-encoded `FrameProxyRequestPayload`.
+    pub async fn send_frame_proxy_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_REQUEST,
+            data,
+        )
+        .await
+    }
+
+    /// F1b P3.C-1 — send a frame proxy response to a trust-paired peer.
+    /// Caller (P3.C-2 server handler) builds the encoded
+    /// `FrameProxyResponsePayload` (Found / NotFound / Unavailable) and
+    /// pushes it back on the same trust link.
+    pub async fn send_frame_proxy_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_RESPONSE,
+            data,
+        )
+        .await
+    }
+
     pub async fn send_node_leaving(&self) {
         let data = vec![];
         let _ = self
@@ -1867,6 +1907,46 @@ impl IrohMeshManagerRef {
                         warn!(
                             peer = %remote_hex,
                             "iroh_mesh: failed to decode HmacKeysSync: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_FRAME_PROXY_REQUEST => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::FrameProxyRequestPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::FrameProxyRequestReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode FrameProxyRequest: {}",
+                            e
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_FRAME_PROXY_RESPONSE => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::FrameProxyResponsePayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::FrameProxyResponseReceived {
+                        from_node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(
+                            peer = %remote_hex,
+                            "iroh_mesh: failed to decode FrameProxyResponse: {}",
                             e
                         );
                         return Ok(());
