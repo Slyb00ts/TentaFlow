@@ -43,12 +43,19 @@ pub async fn save_segment_mp4(
     let dir = camera_subdir(&base, camera_id, RecordingKind::Segment);
     tokio::fs::create_dir_all(&dir).await?;
     let file_path: PathBuf = dir.join(format!("{}.mp4", recording_ref.0));
+    // Atomic write: GStreamer mp4mux scribbles to `<final>.tmp`; on success we
+    // rename to the final path, on any error/timeout we delete the partial. The
+    // final path therefore only ever exists if the moov atom was finalized.
+    let tmp_path: PathBuf = dir.join(format!("{}.mp4.tmp", recording_ref.0));
+    // Stale tmp from a previous crash — drop it before opening filesink.
+    let _ = tokio::fs::remove_file(&tmp_path).await;
 
-    let pipeline = build_segment_pipeline(&source_path, &file_path)?;
+    let pipeline = build_segment_pipeline(&source_path, &tmp_path)?;
 
-    pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|e| RecordingError::GstPipeline(format!("set Playing: {e}")))?;
+    if let Err(e) = pipeline.set_state(gst::State::Playing) {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(RecordingError::GstPipeline(format!("set Playing: {e}")));
+    }
 
     let bus = pipeline
         .bus()
@@ -97,30 +104,60 @@ pub async fn save_segment_mp4(
     .await;
     let _ = pipeline.set_state(gst::State::Null);
 
-    drain_result?;
+    // Helper that wipes the partial tmp on any failure path. `_ =` because
+    // there is nothing useful the caller can do with a cleanup error; the
+    // primary cause is what matters.
+    let cleanup_tmp = || {
+        let p = tmp_path.clone();
+        async move {
+            let _ = tokio::fs::remove_file(&p).await;
+        }
+    };
 
-    let finalize_msg = finalize_join
-        .map_err(|e| RecordingError::GstPipeline(format!("finalize join: {e}")))?;
+    if let Err(e) = drain_result {
+        cleanup_tmp().await;
+        return Err(e);
+    }
+
+    let finalize_msg = match finalize_join {
+        Ok(m) => m,
+        Err(e) => {
+            cleanup_tmp().await;
+            return Err(RecordingError::GstPipeline(format!("finalize join: {e}")));
+        }
+    };
     match finalize_msg {
         Some(m) => match m.view() {
             gst::MessageView::Eos(_) => {}
             gst::MessageView::Error(e) => {
+                let msg = e.error().to_string();
+                cleanup_tmp().await;
                 return Err(RecordingError::GstPipeline(format!(
-                    "mp4mux finalize error: {}",
-                    e.error()
+                    "mp4mux finalize error: {msg}"
                 )));
             }
             _ => {
+                cleanup_tmp().await;
                 return Err(RecordingError::GstPipeline(
                     "unexpected bus message during finalize".into(),
                 ));
             }
         },
         None => {
+            cleanup_tmp().await;
             return Err(RecordingError::GstPipeline(
                 "mp4mux finalize timeout after 2s".into(),
             ));
         }
+    }
+
+    // Pipeline drained cleanly — promote tmp → final atomically. After this
+    // point the final path is observable; before it, only the .tmp exists.
+    if let Err(e) = tokio::fs::rename(&tmp_path, &file_path).await {
+        cleanup_tmp().await;
+        return Err(RecordingError::GstPipeline(format!(
+            "rename tmp -> final failed: {e}"
+        )));
     }
 
     let meta = tokio::fs::metadata(&file_path).await.map_err(|e| {
@@ -268,6 +305,33 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", d.path());
         (guard, d)
+    }
+
+    /// On any pipeline failure the partial `.mp4.tmp` must be removed and the
+    /// final `.mp4` must never appear. We hit a guaranteed failure path —
+    /// missing source — and assert both invariants.
+    #[tokio::test]
+    async fn test_save_segment_partial_files_cleaned_up_on_error() {
+        let _home = temp_home_guard();
+        let _ = save_segment_mp4("cam_seg_partial", "file:///no/such/source.mp4", 2).await;
+        // Walk the per-camera segments directory (if it exists) and assert
+        // there is no `.mp4` or `.mp4.tmp` file lingering after a failure.
+        let base = match super::super::storage::recording_base_dir() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let dir = base.join("cam_seg_partial").join("segments");
+        if !dir.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            let s = p.to_string_lossy();
+            assert!(
+                !s.ends_with(".mp4") && !s.ends_with(".mp4.tmp"),
+                "leftover partial after error: {s}"
+            );
+        }
     }
 
     #[tokio::test]
