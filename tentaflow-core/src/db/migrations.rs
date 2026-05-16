@@ -140,8 +140,40 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             MigrationStep::Sql(ADDON_USES_MODEL),
         ),
         (21, "cameras_table", MigrationStep::Sql(CAMERAS_TABLE)),
+        (22, "recordings_table", MigrationStep::Sql(RECORDINGS_TABLE)),
     ]
 }
+
+// F1a M1.W8 — TentaVision recording manager registry. One row per artifact
+// (snapshot PNG or segment MP4) saved by an addon via `recording_save_*_v1`
+// host functions. `ref` is the public addon-facing identifier
+// (`snap_<uuid>` / `clip_<uuid>`). `file_path` is the absolute on-disk
+// location under `~/.tentaflow/recordings/<camera_id>/{snapshots,segments}/`.
+// `hash_sha256` is content hash for integrity / dedup, `retention_class` is
+// copied from `cameras.retention_class` at save time (audit chain). F1a does
+// no automatic purge — `purged_at` is set by `recording_purge_v1`.
+const RECORDINGS_TABLE: &str = r#"
+CREATE TABLE recordings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('snapshot','segment')),
+    owner_addon_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    duration_ms INTEGER NULL,
+    width INTEGER NULL,
+    height INTEGER NULL,
+    pixel_format TEXT NULL,
+    hash_sha256 TEXT NOT NULL,
+    retention_class TEXT NOT NULL CHECK(retention_class IN ('A','B','C','Unclassified')),
+    created_at INTEGER NOT NULL,
+    purged_at INTEGER NULL
+);
+CREATE UNIQUE INDEX idx_recordings_ref_active ON recordings(ref) WHERE purged_at IS NULL;
+CREATE INDEX idx_recordings_owner ON recordings(owner_addon_id, purged_at);
+CREATE INDEX idx_recordings_camera ON recordings(camera_id, purged_at);
+"#;
 
 // F1a M1.W6 — TentaVision camera ingest registry. One row per camera owned
 // by an addon. F1a only supports `fake_file` vendor (mp4 loop via GStreamer
