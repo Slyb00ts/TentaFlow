@@ -180,6 +180,24 @@ impl MeshKeyPool {
         out
     }
 
+    /// Like `verify_keys_for` but also returns, for each candidate key, the
+    /// node id that contributed it. Used by `verify_only_with_source` so the
+    /// caller can record which peer's HMAC key matched a verified token
+    /// (audit chain for mesh-fallback pickups, F1b P3.C-2).
+    pub fn verify_keys_with_peers_for(&self, scope: KeyScope) -> Vec<(String, [u8; 32])> {
+        let now = now_unix_ms();
+        let peers = self.peers.read();
+        let mut out = Vec::with_capacity(peers.len() * 2);
+        for (node_id, per) in peers.iter() {
+            if let Some(state) = per.slot(scope) {
+                for k in state.candidates(now) {
+                    out.push((node_id.clone(), *k));
+                }
+            }
+        }
+        out
+    }
+
     /// Diagnostic — number of peers currently contributing to the pool.
     pub fn peer_count(&self) -> usize {
         self.peers.read().len()
