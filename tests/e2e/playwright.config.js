@@ -1,6 +1,8 @@
 // =============================================================================
-// Plik: tests/e2e/playwright.config.js
-// Opis: Konfiguracja Playwright dla testow E2E mesh pairing.
+// File: tests/e2e/playwright.config.js
+// Description: Playwright config — mesh-pairing tests plus M14/M15/M16 UI
+//              e2e tests. Each suite runs as a separate project so failures
+//              are isolated and binary spawning does not conflict.
 // =============================================================================
 
 const { defineConfig } = require('@playwright/test');
@@ -16,9 +18,9 @@ module.exports = defineConfig({
     ignoreHTTPSErrors: true,
   },
   projects: [
-    {
-      name: 'mesh-pairing',
-      testMatch: 'mesh-pairing.spec.js',
-    },
+    { name: 'mesh-pairing', testMatch: 'mesh-pairing.spec.js' },
+    { name: 'm16-aliases', testMatch: 'm16-services-aliases.spec.js' },
+    { name: 'm14-bindings', testMatch: 'm14-bindings.spec.js' },
+    { name: 'm15-wizard', testMatch: 'm15-install-wizard.spec.js' },
   ],
 });
