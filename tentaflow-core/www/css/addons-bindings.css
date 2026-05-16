@@ -1,0 +1,173 @@
+/* =============================================================================
+   File: addons-bindings.css
+   Description: Styles for the Bindings tab inside addon detail (M14).
+                Includes the readonly alias table and the four storage usage
+                cards (KV / SQL / Vector / Recording).
+   ============================================================================= */
+
+.addon-bindings {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.addon-bindings .section-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.addon-bindings .section-card-head .title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.addon-bindings .section-card-head .title .muted {
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+.addon-bindings .section-card-head .actions {
+  display: flex;
+  gap: 8px;
+}
+
+.addon-bindings .bindings-info {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  background: rgba(96, 165, 250, 0.06);
+  border: 1px solid rgba(96, 165, 250, 0.25);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 12px;
+}
+
+.addon-bindings .bindings-info .icon {
+  width: 14px;
+  height: 14px;
+  stroke: var(--info);
+  fill: none;
+  stroke-width: 2;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.bindings-alias-table .alias-name {
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--accent-2);
+}
+
+.bindings-alias-table .alias-target {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.bindings-alias-table .alias-fallback {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.bindings-alias-table .muted {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+/* Four-card storage grid */
+.addon-bindings .usage-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+@media (max-width: 1100px) {
+  .addon-bindings .usage-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .addon-bindings .usage-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.addon-bindings .usage-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.addon-bindings .usage-card.is-f2 {
+  opacity: 0.6;
+}
+
+.addon-bindings .usage-card .h {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-3);
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.addon-bindings .usage-card .h .icon {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}
+
+.addon-bindings .usage-card .v {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--text);
+}
+
+.addon-bindings .usage-card .v.muted {
+  color: var(--text-3);
+}
+
+.addon-bindings .usage-card .sub {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.addon-bindings .usage-card .bar-thin {
+  height: 5px;
+  background: var(--bg-3);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.addon-bindings .usage-card .bar-thin .fill {
+  height: 100%;
+  background: var(--gradient-accent);
+  border-radius: 3px;
+}
+
+.addon-bindings .usage-card .card-foot {
+  margin-top: 6px;
+  display: flex;
+}
