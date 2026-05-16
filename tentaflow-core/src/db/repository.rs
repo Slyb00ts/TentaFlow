@@ -11022,6 +11022,211 @@ pub fn soft_delete_camera(pool: &DbPool, addon_id: &str, camera_id: &str) -> Res
     Ok(n > 0)
 }
 
+// =============================================================================
+// Recording registry — F1a M1.W8 (TentaVision)
+// =============================================================================
+//
+// Per-addon view over the `recordings` table (migration v22). Ownership guard
+// (`owner_addon_id = ?`) is enforced in every query. Soft delete is driven by
+// `purged_at` — once stamped, the row hides from active selects but stays
+// present for audit lookups.
+
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct RecordingRow {
+    pub id: i64,
+    pub recording_ref: String,
+    pub kind: String,
+    pub owner_addon_id: String,
+    pub camera_id: String,
+    pub file_path: String,
+    pub file_size_bytes: i64,
+    pub duration_ms: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub pixel_format: Option<String>,
+    pub hash_sha256: String,
+    pub retention_class: String,
+    pub created_at: i64,
+    pub purged_at: Option<i64>,
+}
+
+#[cfg(feature = "camera")]
+const RECORDING_SELECT_COLS: &str =
+    "id, ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, duration_ms, \
+     width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at";
+
+#[cfg(feature = "camera")]
+fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
+    Ok(RecordingRow {
+        id: row.get(0)?,
+        recording_ref: row.get(1)?,
+        kind: row.get(2)?,
+        owner_addon_id: row.get(3)?,
+        camera_id: row.get(4)?,
+        file_path: row.get(5)?,
+        file_size_bytes: row.get(6)?,
+        duration_ms: row.get(7)?,
+        width: row.get(8)?,
+        height: row.get(9)?,
+        pixel_format: row.get(10)?,
+        hash_sha256: row.get(11)?,
+        retention_class: row.get(12)?,
+        created_at: row.get(13)?,
+        purged_at: row.get(14)?,
+    })
+}
+
+/// Per-camera aggregate row used by `recording_stats_for_addon`. Tuple layout:
+/// `(camera_id, snapshots, segments, size_bytes)`.
+#[cfg(feature = "camera")]
+#[derive(Debug, Default, Clone)]
+pub struct RecordingStatsAggregate {
+    pub per_camera: Vec<(String, u64, u64, u64)>,
+    pub total_snapshots: u64,
+    pub total_segments: u64,
+    pub total_size_bytes: u64,
+}
+
+/// Insert a recording catalog row. The supplied `kind` must be `"snapshot"` or
+/// `"segment"` (the CHECK constraint enforces this at SQL level). Caller is
+/// responsible for placing the file on disk first; on a DB failure the caller
+/// must compensate by `purge_recording(file_path)` to avoid orphaned files.
+#[cfg(feature = "camera")]
+#[allow(clippy::too_many_arguments)]
+pub fn insert_recording(
+    pool: &DbPool,
+    recording_ref: &str,
+    kind: &str,
+    owner_addon_id: &str,
+    camera_id: &str,
+    file_path: &str,
+    file_size_bytes: i64,
+    duration_ms: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    pixel_format: Option<&str>,
+    hash_sha256: &str,
+    retention_class: &str,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO recordings \
+         (ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, \
+          duration_ms, width, height, pixel_format, hash_sha256, \
+          retention_class, created_at, purged_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+        rusqlite::params![
+            recording_ref, kind, owner_addon_id, camera_id, file_path,
+            file_size_bytes, duration_ms, width, height, pixel_format,
+            hash_sha256, retention_class, now,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Returns an active (`purged_at IS NULL`) recording row when owned by
+/// `addon_id`. Cross-addon lookups return `Ok(None)` so the caller surfaces
+/// `NotFound` (no side-channel leak of foreign refs).
+#[cfg(feature = "camera")]
+pub fn get_recording_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    recording_ref: &str,
+) -> Result<Option<RecordingRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {RECORDING_SELECT_COLS} FROM recordings \
+         WHERE owner_addon_id = ?1 AND ref = ?2 AND purged_at IS NULL"
+    );
+    let row = conn
+        .query_row(&sql, rusqlite::params![addon_id, recording_ref], row_to_recording)
+        .optional()?;
+    Ok(row)
+}
+
+/// Soft-deletes a recording by stamping `purged_at`. Returns `Ok(true)` when
+/// an active row was found and stamped, `Ok(false)` for "not found / not owned
+/// / already purged" (the host-function layer treats `false` as idempotent OK
+/// when the file is missing).
+#[cfg(feature = "camera")]
+pub fn soft_delete_recording(
+    pool: &DbPool,
+    addon_id: &str,
+    recording_ref: &str,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE recordings SET purged_at = ?1 \
+         WHERE owner_addon_id = ?2 AND ref = ?3 AND purged_at IS NULL",
+        rusqlite::params![now, addon_id, recording_ref],
+    )?;
+    Ok(n > 0)
+}
+
+/// Aggregate stats for an addon's active recordings, optionally narrowed to a
+/// single camera. Runs as a single `GROUP BY camera_id, kind` scan and stitches
+/// per-camera rows on the host side so the public struct can carry both the
+/// per-camera breakdown and the totals.
+#[cfg(feature = "camera")]
+pub fn recording_stats_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: Option<&str>,
+) -> Result<RecordingStatsAggregate> {
+    let conn = acquire(pool)?;
+    let mut out = RecordingStatsAggregate::default();
+    // Stitch (camera_id -> (snapshots, segments, size)) into the order rows
+    // were encountered, then flatten. We avoid HashMap to keep the order stable
+    // for callers that surface the breakdown directly to addons.
+    let mut acc: Vec<(String, u64, u64, u64)> = Vec::new();
+    let push_or_merge = |acc: &mut Vec<(String, u64, u64, u64)>, cam: String, kind: String, cnt: u64, size: u64| {
+        if let Some(entry) = acc.iter_mut().find(|e| e.0 == cam) {
+            if kind == "snapshot" { entry.1 += cnt; } else { entry.2 += cnt; }
+            entry.3 += size;
+        } else {
+            let (s, g) = if kind == "snapshot" { (cnt, 0) } else { (0, cnt) };
+            acc.push((cam, s, g, size));
+        }
+    };
+    if let Some(cam) = camera_id {
+        let sql = "SELECT camera_id, kind, COUNT(*), COALESCE(SUM(file_size_bytes), 0) \
+                   FROM recordings \
+                   WHERE owner_addon_id = ?1 AND camera_id = ?2 AND purged_at IS NULL \
+                   GROUP BY camera_id, kind";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![addon_id, cam], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+        })?;
+        for r in rows {
+            let (cam, kind, cnt, size) = r?;
+            push_or_merge(&mut acc, cam, kind, cnt as u64, size as u64);
+        }
+    } else {
+        let sql = "SELECT camera_id, kind, COUNT(*), COALESCE(SUM(file_size_bytes), 0) \
+                   FROM recordings \
+                   WHERE owner_addon_id = ?1 AND purged_at IS NULL \
+                   GROUP BY camera_id, kind";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![addon_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+        })?;
+        for r in rows {
+            let (cam, kind, cnt, size) = r?;
+            push_or_merge(&mut acc, cam, kind, cnt as u64, size as u64);
+        }
+    }
+    for (_, snaps, segs, size) in &acc {
+        out.total_snapshots += *snaps;
+        out.total_segments += *segs;
+        out.total_size_bytes += *size;
+    }
+    out.per_camera = acc;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod chunk_c_visibility_consumer_tests {
     use super::*;

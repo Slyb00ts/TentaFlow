@@ -1478,3 +1478,197 @@ fn process_camera(camera_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## 15. Recording API + frame_url (F1a M1.W8 — TentaVision)
+
+7 host functions zarzadzaja trwalymi nagraniami (PNG snapshot, MP4 segment) plus
+multi-use signed URL-ami do raw frames z LRU. Wszystkie wywolania chronione sa
+parami `recording.read` / `recording.write`. Wymaga buildu core'a z
+`--features camera`; bez tego host functions nie sa zarejestrowane i guest
+otrzyma "missing import" przy instancjonowaniu.
+
+### Permission + risk map
+
+| Host function | Permission | Risk (audit) |
+|---|---|---|
+| `recording_save_snapshot_v1` | `recording.write` | A (z `retention_class` kamery) |
+| `recording_save_segment_v1` | `recording.write` | A |
+| `recording_get_url_v1` | `recording.read` | B |
+| `recording_get_stream_v1` | `recording.read` | B |
+| `recording_purge_v1` | `recording.write` | A |
+| `recording_stats_v1` | `recording.read` | B |
+| `frame_url_v1` | `recording.read` | B |
+
+`audit_log_with_risk` wpisuje klase ryzyka rownego `retention_class` rekordu
+(`A`/`B`/`C`/`Unclassified`) — niezalezna kopia jest zapisana w wierszu
+`recordings.retention_class`, wiec audit chain zachowuje sie nawet jesli
+kamera zostanie pozniej zmodyfikowana.
+
+### F1a limitations
+
+- Tylko snapshot PNG (RGB24 → `image::codecs::png`).
+- Segmenty MP4 przez GStreamer `x264enc tune=zerolatency` + `mp4mux` z
+  `file://` source (np. fakefile loop). RTSP live tap dochodzi w F1b.
+- Brak automatycznej retencji — wszystkie nagrania trzeba czyscic recznie przez
+  `recording_purge_v1`.
+- `recording_get_stream_v1` zwraca bajty inline (base64 w TOML) z hard-cap 8 MiB.
+  Dla wiekszych artefaktow trzeba uzyc `recording_get_url_v1` + HTTP handler
+  (Chunk D).
+
+### Signed URL flow
+
+```
+addon → recording_get_url_v1(ref, ttl_secs)
+        ↓
+HMAC-SHA256 over "recording:<ref>:<exp_ms>" using per-process recording key
+        ↓
+URL: /recordings/<ref>?token=<b64>&exp=<ms>&ref=<ref>
+        ↓
+HTTP GET → (Chunk D handler) verify HMAC + expiry, stream bytes from disk
+```
+
+`frame_url_v1` ma identyczna mechanike, ale:
+- inny scope w HMAC payload (`"frame:<ref>:<exp_ms>"`),
+- inny per-process key,
+- TTL `60..=600s` (vs `60..=3600s` recording).
+
+### 15.1 `recording_save_snapshot_v1` (write, risk A)
+
+**Input (TOML):**
+```toml
+camera_id = "cam_<uuid>"
+frame_ref = "frame_<uuid>"      # musi byc w LRU + nalezec do camera_id
+retention_class = "C"           # opcjonalne; default = cameras.retention_class
+```
+
+**Output (TOML):**
+```toml
+recording_ref = "snap_<uuid>"
+file_path = "/home/.../.tentaflow/recordings/<camera>/snapshots/snap_<uuid>.png"
+file_size_bytes = 12345
+hash_sha256 = "..."
+width = 1280
+height = 720
+created_at = 1715789000
+```
+
+**Logika:**
+1. ownership: `cameras WHERE camera_id=? AND owner_addon_id=AddonState.id`,
+2. `frame_storage().get(...)` — peek, brak remove,
+3. weryfikacja `frame.metadata.camera_id == camera_id` (defense-in-depth),
+4. `save_snapshot_rgb24(...)` → PNG na dysku,
+5. `INSERT INTO recordings` z `kind='snapshot'` + retention,
+6. `audit_log_with_risk(...)` z `risk = retention_class`.
+
+### 15.2 `recording_save_segment_v1` (write, risk A)
+
+**Input (TOML):**
+```toml
+camera_id = "cam_<uuid>"
+source_url = "file:///abs/path/sample.mp4"   # F1a: tylko file://
+duration_secs = 5                             # 1..=60
+retention_class = "C"                         # opcjonalne
+```
+
+**Output:** identyczny `SavedRecordingOut` jak snapshot, z `duration_ms`
+zamiast `width/height`. Brak `pixel_format` (mp4 nie probujemy probowac w F1a).
+
+### 15.3 `recording_get_url_v1` (read, risk B)
+
+**Input:**
+```toml
+recording_ref = "snap_..."     # lub "clip_..."
+ttl_secs = 300                  # 60..=3600
+```
+
+**Output:**
+```toml
+url = "/recordings/snap_xxx?token=<b64>&exp=<ms>&ref=snap_xxx"
+expires_unix_ms = ...
+```
+
+### 15.4 `recording_get_stream_v1` (read, risk B)
+
+Zwraca bajty inline. `data_b64` w odpowiedzi nigdy nie przekracza 8 MiB
+(`PayloadKind::ServiceCall`); jesli plik > 8 MiB → `AbiError::PayloadTooLarge`,
+audit `error / payload_too_large`. Hash z DB jest dolaczany do odpowiedzi tak
+zeby addon mogl zweryfikowac integralnosc po dekodzie.
+
+### 15.5 `recording_purge_v1` (write, risk A)
+
+Idempotent: usuwa plik na dysku (NotFound z systemu plikow nie jest bledem) +
+`UPDATE recordings SET purged_at = ?`. Powtorne wywolanie na tym samym ref
+zwraca `AbiError::NotFound` (wiersz juz nie jest aktywny).
+
+### 15.6 `recording_stats_v1` (read, risk B)
+
+**Input (opcjonalny):**
+```toml
+camera_id = "cam_<uuid>"        # opcjonalny filtr
+```
+
+**Output:**
+```toml
+[stats]
+total_snapshots = 12
+total_segments = 3
+total_size_bytes = 5123456
+
+[[per_camera]]
+camera_id = "cam_xxx"
+snapshots = 10
+segments = 2
+size_bytes = 4096000
+```
+
+### 15.7 `frame_url_v1` (read, risk B)
+
+**Input:**
+```toml
+frame_ref = "frame_<uuid>"
+ttl_secs = 120                  # 60..=600
+```
+
+**Output:**
+```toml
+url = "/frames/<frame_ref>?token=<b64>&exp=<ms>&ref=<frame_ref>"
+expires_unix_ms = ...
+```
+
+**Logika:** weryfikacja ze frame istnieje (peek przez `frame_storage.get`,
+brak remove), nastepnie weryfikacja ownership posrednio: `cameras WHERE
+camera_id = frame.metadata.camera_id AND owner_addon_id = AddonState.id`. URL
+jest multi-use az do `exp` — addon moze pobrac frame wiele razy w obrebie TTL.
+
+### SDK example (Rust addon)
+
+```rust
+use tentaflow_addon_sdk::{
+    recording_save_snapshot, recording_get_url, recording_stats,
+    recording_purge, frame_url, stream_subscribe, stream_next, StreamNextMessage,
+};
+
+fn capture_and_share(camera_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let stream_id = stream_subscribe(&format!("camera:{}", camera_id), Some(5))?;
+    if let StreamNextMessage::Frame(meta) = stream_next(&stream_id, 1000)? {
+        // 1. Wez signed URL na ramke (np. dla zewnetrznego service'u OCR).
+        let url = frame_url(&meta.frame_ref, 120)?;
+        log_info(&format!("frame_url: {} (exp={})", url.url, url.expires_unix_ms));
+
+        // 2. Zapisz snapshot do trwalej pamieci.
+        let saved = recording_save_snapshot(camera_id, &meta.frame_ref, None)?;
+        log_info(&format!("snapshot ref={} ({}B)", saved.recording_ref, saved.file_size_bytes));
+
+        // 3. Wystaw long-TTL URL na zapis.
+        let signed = recording_get_url(&saved.recording_ref, 600)?;
+        log_info(&format!("recording_url: {}", signed.url));
+
+        // 4. Stats + purge po skopiowaniu do storage.
+        let stats = recording_stats(Some(camera_id))?;
+        log_info(&format!("total snapshots={}", stats.total_snapshots));
+        recording_purge(&saved.recording_ref)?;
+    }
+    Ok(())
+}
+```
+

@@ -303,6 +303,37 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+
+    /// Recording API (F1a M1.W8) — snapshot PNG, segment MP4, signed URLs.
+    /// All inputs / outputs are TOML. Requires `recording.read` / `recording.write`.
+    fn recording_save_snapshot_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn recording_save_segment_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn recording_get_url_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn recording_get_stream_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn recording_purge_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn recording_stats_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn frame_url_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -1748,6 +1779,202 @@ pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
     let bytes = call_sql_with_one_input_capped(stream_close_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
     let _: StreamCloseOut = parse_toml(&bytes)?;
     Ok(())
+}
+
+// =============================================================================
+// Recording API wrappers (F1a M1.W8) — snapshots, segments, signed URLs.
+//
+// All wrappers require TentaFlow core built with `--features camera`.
+// =============================================================================
+
+/// Metadata for a recording artifact persisted on the host (PNG snapshot or
+/// MP4 segment). `recording_ref` is the public handle (`snap_<uuid>` /
+/// `clip_<uuid>`) used by the other recording APIs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SavedRecordingInfo {
+    pub recording_ref: String,
+    pub file_path: String,
+    pub file_size_bytes: u64,
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    pub hash_sha256: String,
+    pub created_at: u64,
+}
+
+/// Signed URL for a stored recording or a raw frame. Multi-use until expiry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingUrl {
+    pub url: String,
+    pub expires_unix_ms: u64,
+}
+
+/// Signed URL for a raw frame in the LRU. Shape mirrors `RecordingUrl` so the
+/// SDK surface stays symmetric; lives as its own type for self-documenting
+/// call sites.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FrameUrl {
+    pub url: String,
+    pub expires_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingStatsPerCamera {
+    pub camera_id: String,
+    pub snapshots: u64,
+    pub segments: u64,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingStats {
+    pub total_snapshots: u64,
+    pub total_segments: u64,
+    pub total_size_bytes: u64,
+    #[serde(default)]
+    pub per_camera: Vec<RecordingStatsPerCamera>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingStatsRaw {
+    stats: RecordingStatsTotalsRaw,
+    #[serde(default)]
+    per_camera: Vec<RecordingStatsPerCamera>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingStatsTotalsRaw {
+    total_snapshots: u64,
+    total_segments: u64,
+    total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingGetStreamRaw {
+    data_b64: String,
+    #[allow(dead_code)]
+    file_size_bytes: u64,
+    #[allow(dead_code)]
+    hash_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingPurgeRaw {
+    #[allow(dead_code)]
+    purged: bool,
+}
+
+fn push_kv_str(s: &mut String, key: &str, value: &str) {
+    s.push_str(&format!("{} = {}\n", key, toml::Value::String(value.to_string())));
+}
+
+/// Persist a PNG snapshot for a frame already living in the host's LRU.
+/// Requires TentaFlow core built with `--features camera`.
+pub fn recording_save_snapshot(
+    camera_id: &str,
+    frame_ref: &str,
+    retention_class: Option<&str>,
+) -> Result<SavedRecordingInfo, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "camera_id", camera_id);
+    push_kv_str(&mut s, "frame_ref", frame_ref);
+    if let Some(rc) = retention_class {
+        push_kv_str(&mut s, "retention_class", rc);
+    }
+    let bytes = call_sql_with_one_input(recording_save_snapshot_v1, s.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Capture `duration_secs` of `source_url` (file://) into an MP4 segment.
+/// Requires TentaFlow core built with `--features camera`.
+pub fn recording_save_segment(
+    camera_id: &str,
+    source_url: &str,
+    duration_secs: u32,
+    retention_class: Option<&str>,
+) -> Result<SavedRecordingInfo, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "camera_id", camera_id);
+    push_kv_str(&mut s, "source_url", source_url);
+    s.push_str(&format!("duration_secs = {}\n", duration_secs));
+    if let Some(rc) = retention_class {
+        push_kv_str(&mut s, "retention_class", rc);
+    }
+    let bytes = call_sql_with_one_input(recording_save_segment_v1, s.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Issue a multi-use signed URL for a stored recording. TTL must be in
+/// `60..=3600` seconds.
+/// Requires TentaFlow core built with `--features camera`.
+pub fn recording_get_url(recording_ref: &str, ttl_secs: u64) -> Result<RecordingUrl, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "recording_ref", recording_ref);
+    s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
+    let bytes = call_sql_with_one_input(recording_get_url_v1, s.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Fetch the raw bytes (PNG or MP4) of a stored recording inline. Hard-capped
+/// at 8 MiB by the host — larger artifacts must be fetched via the signed URL
+/// + HTTP handler.
+/// Requires TentaFlow core built with `--features camera`.
+pub fn recording_get_stream(recording_ref: &str) -> Result<Vec<u8>, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "recording_ref", recording_ref);
+    let bytes = call_sql_with_one_input_capped(
+        recording_get_stream_v1,
+        s.as_bytes(),
+        MAX_OUT_CAP_SNAPSHOT,
+    )?;
+    let raw: RecordingGetStreamRaw = parse_toml(&bytes)?;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw.data_b64.as_bytes())
+        .map_err(|_| AbiError::Operation)
+}
+
+/// Soft-delete + filesystem purge. Idempotent: a second call on the same ref
+/// returns `NotFound`.
+/// Requires TentaFlow core built with `--features camera`.
+pub fn recording_purge(recording_ref: &str) -> Result<(), AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "recording_ref", recording_ref);
+    let bytes = call_sql_with_one_input(recording_purge_v1, s.as_bytes())?;
+    let _: RecordingPurgeRaw = parse_toml(&bytes)?;
+    Ok(())
+}
+
+/// Aggregate recording counts + size per addon (optionally narrowed to a
+/// single camera).
+/// Requires TentaFlow core built with `--features camera`.
+pub fn recording_stats(camera_id: Option<&str>) -> Result<RecordingStats, AbiError> {
+    let mut s = String::new();
+    if let Some(cam) = camera_id {
+        push_kv_str(&mut s, "camera_id", cam);
+    }
+    let bytes = call_sql_with_one_input(recording_stats_v1, s.as_bytes())?;
+    let raw: RecordingStatsRaw = parse_toml(&bytes)?;
+    Ok(RecordingStats {
+        total_snapshots: raw.stats.total_snapshots,
+        total_segments: raw.stats.total_segments,
+        total_size_bytes: raw.stats.total_size_bytes,
+        per_camera: raw.per_camera,
+    })
+}
+
+/// Issue a multi-use signed URL for a raw frame in the host LRU. TTL must be
+/// in `60..=600` seconds. Frame must belong to a camera owned by the calling
+/// addon.
+/// Requires TentaFlow core built with `--features camera`.
+pub fn frame_url(frame_ref: &str, ttl_secs: u64) -> Result<FrameUrl, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "frame_ref", frame_ref);
+    s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
+    let bytes = call_sql_with_one_input(frame_url_v1, s.as_bytes())?;
+    parse_toml(&bytes)
 }
 
 // =============================================================================

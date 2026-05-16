@@ -36,6 +36,18 @@ display_name = "Subscribe to camera streams"
 description = "Receive live frames via stream_subscribe/next/close."
 risk = "low"
 
+[[permission]]
+id = "recording.read"
+display_name = "Read recordings"
+description = "Issue signed URLs and inline-fetch stored snapshots / segments."
+risk = "low"
+
+[[permission]]
+id = "recording.write"
+display_name = "Manage recordings"
+description = "Save snapshots / segments and purge recordings owned by this addon."
+risk = "medium"
+
 [visibility]
 admin_only = true
 default_groups = []
