@@ -202,7 +202,7 @@ fn resolve_file_url_rejects_empty_input() {
 fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
     insert_camera(
         db, camera_id, owner, "display", "fake_file", url, 30, None, None, "C",
-        "default",
+        "default", None,
     )
     .expect("insert");
 }
@@ -262,6 +262,7 @@ async fn supervisor_rejects_unsupported_vendor() {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .await
         .unwrap_err();
@@ -283,6 +284,7 @@ async fn supervisor_rejects_zero_and_oversized_fps() {
                 target_fps: bad_fps,
                 resolution: None,
                 owner_addon_id: None,
+                credentials_encrypted: None,
             })
             .await
             .unwrap_err();
@@ -304,6 +306,7 @@ async fn supervisor_rejects_missing_file_url() {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .await
         .unwrap_err();
@@ -468,6 +471,7 @@ async fn dos_quota_per_addon_blocks_after_cap() {
             target_fps: 30,
             resolution: None,
             owner_addon_id: Some(owner.clone()),
+            credentials_encrypted: None,
         };
         match sup.add_camera(cfg).await {
             Ok(()) => added += 1,
@@ -493,6 +497,7 @@ async fn dos_quota_per_addon_blocks_after_cap() {
             target_fps: 30,
             resolution: None,
             owner_addon_id: Some(owner.clone()),
+            credentials_encrypted: None,
         })
         .await;
     let err = one_past.expect_err("33rd camera for the same owner MUST be QuotaExceeded");
@@ -522,6 +527,7 @@ async fn dos_quota_below_cap_succeeds() {
         target_fps: 30,
         resolution: None,
         owner_addon_id: Some(owner),
+        credentials_encrypted: None,
     };
     match sup.add_camera(cfg).await {
         Ok(()) => {}

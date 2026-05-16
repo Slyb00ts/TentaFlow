@@ -35,11 +35,12 @@ use super::{
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    get_camera_for_addon, insert_camera, list_cameras_for_addon, soft_delete_camera,
-    update_camera, CameraPatch, CameraRow,
+    get_camera_for_addon, insert_camera, list_cameras_for_addon,
+    set_camera_credentials_encrypted, soft_delete_camera, update_camera, CameraPatch, CameraRow,
 };
 use crate::services::camera_ingest::{
-    start_supervisor, CameraConfig, CameraIngestError, CameraIngestSupervisor,
+    credentials::credentials_cipher, start_supervisor, CameraConfig, CameraIngestError,
+    CameraIngestSupervisor,
 };
 
 // =============================================================================
@@ -190,6 +191,12 @@ struct CameraAddInput {
     retention_class: String,
     #[serde(default = "default_profile")]
     profile: String,
+    /// Optional base64-encoded `user:pass` for the RTSP connector. When
+    /// present, decoded, validated, encrypted with the cameras master key,
+    /// and stored in `cameras.credentials_encrypted`. The plaintext never
+    /// touches the DB and is never logged.
+    #[serde(default)]
+    credentials_b64: Option<String>,
 }
 
 fn default_target_fps() -> u32 {
@@ -227,7 +234,9 @@ struct CameraTestConnectionInput {
 #[derive(Debug, Deserialize)]
 struct CameraCredentialsRotateInput {
     camera_id: String,
-    #[allow(dead_code)]
+    /// Base64-encoded new `user:pass` string. `None` clears the field,
+    /// turning the camera into an open-stream endpoint (URL must then
+    /// already work without auth).
     #[serde(default)]
     new_credentials_b64: Option<String>,
 }
@@ -475,6 +484,38 @@ fn validate_retention(rc: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Decode and encrypt an optional `credentials_b64` field. Returns the
+/// AES-GCM blob ready for storage, or a static error tag describing why the
+/// input was rejected. The decoded plaintext is wiped from the temporary
+/// `String` by going out of scope; it is never logged or returned in errors.
+fn prepare_credentials_blob(
+    b64: Option<&str>,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let Some(s) = b64 else {
+        return Ok(None);
+    };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if s.len() > MAX_CREDENTIALS_B64 {
+        return Err("credentials_b64_too_long");
+    }
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|_| "credentials_b64_invalid")?;
+    let plain = std::str::from_utf8(&raw).map_err(|_| "credentials_not_utf8")?;
+    if plain.len() > crate::services::camera_ingest::credentials::MAX_PLAINTEXT_LEN {
+        return Err("credentials_plaintext_too_long");
+    }
+    if !plain.contains(':') {
+        return Err("credentials_missing_user_pass_separator");
+    }
+    let blob = credentials_cipher()
+        .encrypt(plain)
+        .map_err(|_| "credentials_encrypt_failed")?;
+    Ok(Some(blob))
+}
+
 // =============================================================================
 // Host function: camera_add_v1
 // =============================================================================
@@ -549,6 +590,13 @@ pub fn camera_add_v1(
         audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
         return AbiError::Operation.as_i32();
     }
+    let credentials_blob = match prepare_credentials_blob(input.credentials_b64.as_deref()) {
+        Ok(v) => v,
+        Err(reason) => {
+            audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+            return AbiError::Operation.as_i32();
+        }
+    };
 
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let addon_id = caller.data().addon_id.clone();
@@ -571,6 +619,7 @@ pub fn camera_add_v1(
             _ => None,
         },
         owner_addon_id: Some(addon_id.clone()),
+        credentials_encrypted: credentials_blob.clone(),
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
@@ -604,6 +653,7 @@ pub fn camera_add_v1(
         res_h,
         &input.retention_class,
         &input.profile,
+        credentials_blob.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         // Compensate the started session so the registry stays consistent.
@@ -1313,16 +1363,17 @@ pub fn camera_credentials_rotate_v1(
         audit(caller.data(), "camera.credentials_rotate", None, RiskClass::A, "denied", Some("camera_id_invalid"));
         return AbiError::Operation.as_i32();
     }
-    if let Some(c) = input.new_credentials_b64.as_ref() {
-        if c.len() > MAX_CREDENTIALS_B64 {
-            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("credentials_b64_too_long"));
+    let new_blob = match prepare_credentials_blob(input.new_credentials_b64.as_deref()) {
+        Ok(v) => v,
+        Err(reason) => {
+            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some(reason));
             return AbiError::Operation.as_i32();
         }
-    }
+    };
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
-        Ok(Some(_)) => {}
+    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+        Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
             return AbiError::NotFound.as_i32();
@@ -1331,11 +1382,39 @@ pub fn camera_credentials_rotate_v1(
             audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_error"));
             return AbiError::Operation.as_i32();
         }
+    };
+    // Only RTSP carries user-info credentials; fake_file is local filesystem
+    // playback and has no auth, so a rotation request makes no sense and is
+    // rejected explicitly to avoid storing dead blobs against it.
+    if row.vendor != "rtsp" {
+        audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("vendor_has_no_credentials"));
+        let out = CameraCredentialsRotateOut {
+            rotated: false,
+            reason: format!("vendor '{}' has no credentials field", row.vendor),
+        };
+        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
     }
-    audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "ok", Some("f1a_noop"));
+    let blob_ref = new_blob.as_deref();
+    let blob_len = blob_ref.map(|b| b.len()).unwrap_or(0);
+    if set_camera_credentials_encrypted(&db, &addon_id, &input.camera_id, blob_ref)
+        .is_err()
+    {
+        audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed"));
+        return AbiError::Operation.as_i32();
+    }
+    // The active session keeps decrypting `credentials_encrypted` on each
+    // pipeline (re)build, so the new credentials take effect at the next
+    // reconnect tick without an explicit supervisor poke. The bus-error /
+    // reconnect path already handles the resulting Unauthorized fault.
+    let reason = format!("blob_len={blob_len} cleared={}", new_blob.is_none());
+    audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "ok", Some(&reason));
     let out = CameraCredentialsRotateOut {
-        rotated: false,
-        reason: "f1a_noop_fake_file_has_no_credentials".to_string(),
+        rotated: true,
+        reason: if new_blob.is_some() {
+            "credentials updated".to_string()
+        } else {
+            "credentials cleared".to_string()
+        },
     };
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
@@ -1401,6 +1480,13 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
         return AbiError::Operation.as_i32();
     }
+    let credentials_blob = match prepare_credentials_blob(input.credentials_b64.as_deref()) {
+        Ok(v) => v,
+        Err(reason) => {
+            audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+            return AbiError::Operation.as_i32();
+        }
+    };
 
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let addon_id = state.addon_id.clone();
@@ -1419,6 +1505,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
             _ => None,
         },
         owner_addon_id: Some(addon_id.clone()),
+        credentials_encrypted: credentials_blob.clone(),
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
@@ -1449,6 +1536,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         res_h,
         &input.retention_class,
         &input.profile,
+        credentials_blob.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         let _ = run_async(sup.remove_camera(&camera_id));

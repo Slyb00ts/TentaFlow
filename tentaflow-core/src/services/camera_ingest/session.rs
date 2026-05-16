@@ -77,6 +77,12 @@ pub struct CameraConfig {
     /// (legacy tests); global cap still applies.
     #[doc(hidden)]
     pub owner_addon_id: Option<String>,
+    /// AES-GCM blob carrying the RTSP `user:pass` portion. `None` for
+    /// open streams (e.g. `fake_file` or a public RTSP camera). The RTSP
+    /// connector decrypts this on each pipeline build and overlays the
+    /// resulting credentials onto `url` before handing the URL to
+    /// GStreamer — `url` itself never persists credentials in plaintext.
+    pub credentials_encrypted: Option<Vec<u8>>,
 }
 
 impl CameraConfig {
@@ -97,6 +103,7 @@ impl CameraConfig {
             target_fps,
             resolution,
             owner_addon_id: None,
+            credentials_encrypted: None,
         }
     }
 }
@@ -445,6 +452,7 @@ mod tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::UnsupportedVendor(_)));
@@ -460,6 +468,7 @@ mod tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidUrl(_)));
@@ -474,6 +483,7 @@ mod tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::FileNotFound(_)));
@@ -494,6 +504,7 @@ mod tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::SymlinkNotAllowed(_)));
@@ -508,6 +519,7 @@ mod tests {
             target_fps: 0,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
@@ -522,6 +534,7 @@ mod tests {
             target_fps: 61,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));

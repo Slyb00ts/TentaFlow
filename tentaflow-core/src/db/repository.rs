@@ -10799,8 +10799,10 @@ mod settings_to_peer_hints_migration_tests {
 // can never read or mutate another addon's cameras through the host ABI.
 
 /// Row materialized from `cameras` for the camera host functions. Mirrors
-/// the columns persisted by the supervisor sync, minus `credentials_encrypted`
-/// (only `vendor='fake_file'` is supported in F1a and it carries no auth).
+/// the columns persisted by the supervisor sync. `credentials_encrypted`
+/// is populated for RTSP cameras whose connect string carries auth — the
+/// RTSP connector decrypts it on each pipeline build and overlays the
+/// resulting `user:pass` onto `url`.
 #[cfg(feature = "camera")]
 #[derive(Debug, Clone)]
 pub struct CameraRow {
@@ -10821,6 +10823,7 @@ pub struct CameraRow {
     pub last_frame_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub credentials_encrypted: Option<Vec<u8>>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -10857,6 +10860,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         last_frame_at: row.get(14)?,
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
+        credentials_encrypted: row.get(17)?,
     })
 }
 
@@ -10864,7 +10868,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
 const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
-     fps_actual, last_frame_at, created_at, updated_at";
+     fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -10886,6 +10890,7 @@ pub fn insert_camera(
     resolution_height: Option<i64>,
     retention_class: &str,
     profile: &str,
+    credentials_encrypted: Option<&[u8]>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
@@ -10893,14 +10898,78 @@ pub fn insert_camera(
         "INSERT INTO cameras \
          (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
           resolution_width, resolution_height, retention_class, status, status_message, \
-          fps_actual, last_frame_at, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?11)",
+          fps_actual, last_frame_at, credentials_encrypted, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?12)",
         rusqlite::params![
             camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
-            resolution_width, resolution_height, retention_class, now,
+            resolution_width, resolution_height, retention_class, credentials_encrypted, now,
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Replace the `credentials_encrypted` blob for one camera (per-camera
+/// credentials rotation called by `camera_credentials_rotate_v1`). Ownership
+/// guard means a misbehaving addon cannot rotate another addon's camera.
+/// Passing `None` clears the field (e.g. after the operator removes auth).
+#[cfg(feature = "camera")]
+pub fn set_camera_credentials_encrypted(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    blob: Option<&[u8]>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE cameras SET credentials_encrypted = ?1, updated_at = ?2 \
+         WHERE owner_addon_id = ?3 AND camera_id = ?4 AND removed_at IS NULL",
+        rusqlite::params![blob, now, addon_id, camera_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns `(rowid, blob)` for every camera that currently has an encrypted
+/// credentials blob. Used by the rotate-key CLI to walk and re-encrypt every
+/// row under a single transaction. Includes soft-deleted rows so historical
+/// secrets are also rotated (an attacker stealing the old master key should
+/// not be able to decrypt them either).
+#[cfg(feature = "camera")]
+pub fn list_all_camera_credentials_blobs(pool: &DbPool) -> Result<Vec<(i64, Vec<u8>)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, credentials_encrypted FROM cameras \
+         WHERE credentials_encrypted IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Bulk update of credentials blobs by rowid. Runs inside a single
+/// transaction so a partial rotation cannot leave the table half re-encrypted
+/// with the new master key and half with the old one.
+#[cfg(feature = "camera")]
+pub fn replace_camera_credentials_blobs(
+    pool: &DbPool,
+    updates: &[(i64, Vec<u8>)],
+) -> Result<usize> {
+    let mut conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let tx = conn.transaction()?;
+    let mut n = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE cameras SET credentials_encrypted = ?1, updated_at = ?2 WHERE id = ?3",
+        )?;
+        for (id, blob) in updates {
+            stmt.execute(rusqlite::params![blob, now, id])?;
+            n += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
 }
 
 /// Hard-delete a row by `camera_id` regardless of `removed_at`. Reserved for

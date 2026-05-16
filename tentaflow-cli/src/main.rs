@@ -26,11 +26,17 @@ enum TopCommand {
         #[command(subcommand)]
         sub: commands::addon::AddonCommand,
     },
+    /// Operacje na kamerach (rotate-key)
+    Camera {
+        #[command(subcommand)]
+        sub: commands::camera::CameraCommand,
+    },
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         TopCommand::Addon { sub } => commands::addon::run(sub),
+        TopCommand::Camera { sub } => commands::camera::run(sub),
     }
 }

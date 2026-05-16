@@ -137,6 +137,8 @@ pub fn validate(path: &Path) -> anyhow::Result<ValidationReport> {
         &manifest.flow_templates,
         &manifest.ui_components,
         manifest.sdk_version.as_deref(),
+        &manifest.uses_aliases,
+        &manifest.uses_models,
     ) {
         report
             .errors
