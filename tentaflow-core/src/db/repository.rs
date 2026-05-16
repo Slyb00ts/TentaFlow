@@ -11077,12 +11077,21 @@ fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
     })
 }
 
-/// Per-camera aggregate row used by `recording_stats_for_addon`. Tuple layout:
-/// `(camera_id, snapshots, segments, size_bytes)`.
+/// Per-camera breakdown row used by `recording_stats_for_addon`. One row per
+/// `camera_id` with both kinds collapsed.
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct RecordingStatsPerCamera {
+    pub camera_id: String,
+    pub snapshots: u64,
+    pub segments: u64,
+    pub size_bytes: u64,
+}
+
 #[cfg(feature = "camera")]
 #[derive(Debug, Default, Clone)]
 pub struct RecordingStatsAggregate {
-    pub per_camera: Vec<(String, u64, u64, u64)>,
+    pub per_camera: Vec<RecordingStatsPerCamera>,
     pub total_snapshots: u64,
     pub total_segments: u64,
     pub total_size_bytes: u64,
@@ -11167,9 +11176,8 @@ pub fn soft_delete_recording(
 }
 
 /// Aggregate stats for an addon's active recordings, optionally narrowed to a
-/// single camera. Runs as a single `GROUP BY camera_id, kind` scan and stitches
-/// per-camera rows on the host side so the public struct can carry both the
-/// per-camera breakdown and the totals.
+/// single camera. One row per camera with snapshots/segments collapsed via
+/// `SUM(CASE ...)`; `ORDER BY camera_id` so addon-visible output is stable.
 #[cfg(feature = "camera")]
 pub fn recording_stats_for_addon(
     pool: &DbPool,
@@ -11178,52 +11186,48 @@ pub fn recording_stats_for_addon(
 ) -> Result<RecordingStatsAggregate> {
     let conn = acquire(pool)?;
     let mut out = RecordingStatsAggregate::default();
-    // Stitch (camera_id -> (snapshots, segments, size)) into the order rows
-    // were encountered, then flatten. We avoid HashMap to keep the order stable
-    // for callers that surface the breakdown directly to addons.
-    let mut acc: Vec<(String, u64, u64, u64)> = Vec::new();
-    let push_or_merge = |acc: &mut Vec<(String, u64, u64, u64)>, cam: String, kind: String, cnt: u64, size: u64| {
-        if let Some(entry) = acc.iter_mut().find(|e| e.0 == cam) {
-            if kind == "snapshot" { entry.1 += cnt; } else { entry.2 += cnt; }
-            entry.3 += size;
-        } else {
-            let (s, g) = if kind == "snapshot" { (cnt, 0) } else { (0, cnt) };
-            acc.push((cam, s, g, size));
-        }
+    let base_select = "SELECT camera_id, \
+                       SUM(CASE WHEN kind = 'snapshot' THEN 1 ELSE 0 END) AS snapshots, \
+                       SUM(CASE WHEN kind = 'segment' THEN 1 ELSE 0 END) AS segments, \
+                       COALESCE(SUM(file_size_bytes), 0) AS size_bytes \
+                       FROM recordings";
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RecordingStatsPerCamera> {
+        Ok(RecordingStatsPerCamera {
+            camera_id: r.get::<_, String>(0)?,
+            snapshots: r.get::<_, i64>(1)? as u64,
+            segments: r.get::<_, i64>(2)? as u64,
+            size_bytes: r.get::<_, i64>(3)? as u64,
+        })
     };
-    if let Some(cam) = camera_id {
-        let sql = "SELECT camera_id, kind, COUNT(*), COALESCE(SUM(file_size_bytes), 0) \
-                   FROM recordings \
-                   WHERE owner_addon_id = ?1 AND camera_id = ?2 AND purged_at IS NULL \
-                   GROUP BY camera_id, kind";
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params![addon_id, cam], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
-        })?;
-        for r in rows {
-            let (cam, kind, cnt, size) = r?;
-            push_or_merge(&mut acc, cam, kind, cnt as u64, size as u64);
-        }
+    let rows: Vec<RecordingStatsPerCamera> = if let Some(cam) = camera_id {
+        let sql = format!(
+            "{base_select} \
+             WHERE owner_addon_id = ?1 AND camera_id = ?2 AND purged_at IS NULL \
+             GROUP BY camera_id ORDER BY camera_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![addon_id, cam], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
     } else {
-        let sql = "SELECT camera_id, kind, COUNT(*), COALESCE(SUM(file_size_bytes), 0) \
-                   FROM recordings \
-                   WHERE owner_addon_id = ?1 AND purged_at IS NULL \
-                   GROUP BY camera_id, kind";
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params![addon_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
-        })?;
-        for r in rows {
-            let (cam, kind, cnt, size) = r?;
-            push_or_merge(&mut acc, cam, kind, cnt as u64, size as u64);
-        }
+        let sql = format!(
+            "{base_select} \
+             WHERE owner_addon_id = ?1 AND purged_at IS NULL \
+             GROUP BY camera_id ORDER BY camera_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![addon_id], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for r in &rows {
+        out.total_snapshots += r.snapshots;
+        out.total_segments += r.segments;
+        out.total_size_bytes += r.size_bytes;
     }
-    for (_, snaps, segs, size) in &acc {
-        out.total_snapshots += *snaps;
-        out.total_segments += *segs;
-        out.total_size_bytes += *size;
-    }
-    out.per_camera = acc;
+    out.per_camera = rows;
     Ok(out)
 }
 

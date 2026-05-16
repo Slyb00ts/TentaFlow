@@ -1250,6 +1250,11 @@ pub mod prelude {
         camera_credentials_rotate,
         CameraAddSpec, CameraAddResult, CameraInfo, CameraUpdateSpec,
         CameraHealthInfo, SnapshotInfo, CameraTestResult,
+        stream_subscribe, stream_next, stream_close,
+        StreamNextMessage, StreamFrameMeta,
+        recording_save_snapshot, recording_save_segment, recording_get_url,
+        recording_get_stream, recording_purge, recording_stats, frame_url,
+        SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
         AbiError,
         log,
     };
@@ -1852,12 +1857,19 @@ struct RecordingStatsTotalsRaw {
     total_size_bytes: u64,
 }
 
+/// Inline raw bytes of a stored recording plus integrity metadata so the addon
+/// can verify the payload against the host's SHA-256 hash before consuming it.
+#[derive(Debug, Clone)]
+pub struct RecordingStream {
+    pub bytes: Vec<u8>,
+    pub file_size_bytes: u64,
+    pub hash_sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RecordingGetStreamRaw {
     data_b64: String,
-    #[allow(dead_code)]
     file_size_bytes: u64,
-    #[allow(dead_code)]
     hash_sha256: String,
 }
 
@@ -1888,17 +1900,18 @@ pub fn recording_save_snapshot(
     parse_toml(&bytes)
 }
 
-/// Capture `duration_secs` of `source_url` (file://) into an MP4 segment.
+/// Capture `duration_secs` of the camera's bound source into an MP4 segment.
+/// The source is always derived host-side from the owning camera row — addons
+/// cannot supply an arbitrary `source_url`. F1a accepts only cameras with
+/// `vendor='fake_file'`.
 /// Requires TentaFlow core built with `--features camera`.
 pub fn recording_save_segment(
     camera_id: &str,
-    source_url: &str,
     duration_secs: u32,
     retention_class: Option<&str>,
 ) -> Result<SavedRecordingInfo, AbiError> {
     let mut s = String::new();
     push_kv_str(&mut s, "camera_id", camera_id);
-    push_kv_str(&mut s, "source_url", source_url);
     s.push_str(&format!("duration_secs = {}\n", duration_secs));
     if let Some(rc) = retention_class {
         push_kv_str(&mut s, "retention_class", rc);
@@ -1918,11 +1931,12 @@ pub fn recording_get_url(recording_ref: &str, ttl_secs: u64) -> Result<Recording
     parse_toml(&bytes)
 }
 
-/// Fetch the raw bytes (PNG or MP4) of a stored recording inline. Hard-capped
-/// at 8 MiB by the host — larger artifacts must be fetched via the signed URL
-/// + HTTP handler.
+/// Fetch the raw bytes (PNG or MP4) of a stored recording inline together with
+/// the host's reported size and SHA-256 hash. The TOML envelope is hard-capped
+/// at 8 MiB; after base64 expansion this admits files up to ~6 MiB raw. Larger
+/// artifacts must be fetched via the signed URL + HTTP handler.
 /// Requires TentaFlow core built with `--features camera`.
-pub fn recording_get_stream(recording_ref: &str) -> Result<Vec<u8>, AbiError> {
+pub fn recording_get_stream(recording_ref: &str) -> Result<RecordingStream, AbiError> {
     let mut s = String::new();
     push_kv_str(&mut s, "recording_ref", recording_ref);
     let bytes = call_sql_with_one_input_capped(
@@ -1931,9 +1945,14 @@ pub fn recording_get_stream(recording_ref: &str) -> Result<Vec<u8>, AbiError> {
         MAX_OUT_CAP_SNAPSHOT,
     )?;
     let raw: RecordingGetStreamRaw = parse_toml(&bytes)?;
-    base64::engine::general_purpose::STANDARD
+    let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw.data_b64.as_bytes())
-        .map_err(|_| AbiError::Operation)
+        .map_err(|_| AbiError::Operation)?;
+    Ok(RecordingStream {
+        bytes: decoded,
+        file_size_bytes: raw.file_size_bytes,
+        hash_sha256: raw.hash_sha256,
+    })
 }
 
 /// Soft-delete + filesystem purge. Idempotent: a second call on the same ref

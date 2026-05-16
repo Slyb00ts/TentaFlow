@@ -20,7 +20,10 @@
 #![cfg(feature = "camera")]
 #![allow(clippy::too_many_arguments)]
 
+use std::sync::OnceLock;
+
 use base64::Engine;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -53,32 +56,44 @@ const PERM_RECORDING_WRITE: &str = "recording.write";
 // Validators + length caps
 // =============================================================================
 
-const MAX_REF: usize = 256;
-const MAX_SOURCE_URL: usize = 4096;
 const MAX_RETENTION_CLASS: usize = 32;
 
 fn retention_class_valid(rc: &str) -> bool {
     matches!(rc, "A" | "B" | "C" | "Unclassified")
 }
 
+// Strict format checkers: prefix + exactly one canonical UUIDv4 string. This
+// rules out path-traversal payloads ("snap_../../../etc/passwd") and any other
+// character outside `[0-9a-f-]` — letting downstream code interpolate the ref
+// into URL paths and filesystem helpers without further escaping.
 fn validate_recording_ref(s: &str) -> Result<(), &'static str> {
-    if s.is_empty() || s.len() > MAX_REF {
-        return Err("recording_ref_invalid");
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"^(snap|clip)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        .expect("recording_ref regex compiles")
+    });
+    if re.is_match(s) {
+        Ok(())
+    } else {
+        Err("recording_ref_invalid_format")
     }
-    if !(s.starts_with("snap_") || s.starts_with("clip_")) {
-        return Err("recording_ref_invalid_prefix");
-    }
-    Ok(())
 }
 
 fn validate_frame_ref(s: &str) -> Result<(), &'static str> {
-    if s.is_empty() || s.len() > MAX_REF {
-        return Err("frame_ref_invalid");
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"^frame_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        .expect("frame_ref regex compiles")
+    });
+    if re.is_match(s) {
+        Ok(())
+    } else {
+        Err("frame_ref_invalid_format")
     }
-    if !s.starts_with("frame_") {
-        return Err("frame_ref_invalid_prefix");
-    }
-    Ok(())
 }
 
 // =============================================================================
@@ -95,7 +110,6 @@ struct SaveSnapshotInput {
 #[derive(Debug, Deserialize)]
 struct SaveSegmentInput {
     camera_id: String,
-    source_url: String,
     duration_secs: u32,
     retention_class: Option<String>,
 }
@@ -268,6 +282,20 @@ fn map_recording_error(e: &RecordingError) -> AbiError {
     }
 }
 
+/// Estimate the TOML output size for `recording_get_stream_v1` given a raw
+/// file size in bytes. Returns `None` if any arithmetic step would overflow.
+/// `data_b64` expands to `ceil(N/3)*4` bytes; we add a 256 B TOML envelope
+/// allowance for keys, the SHA-256 hex (64 B) and numeric fields.
+fn estimate_get_stream_output(file_size_bytes: i64) -> Option<usize> {
+    if file_size_bytes < 0 {
+        return None;
+    }
+    let n = file_size_bytes as u64;
+    let b64 = n.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
+    let total = b64.checked_add(256)?;
+    usize::try_from(total).ok()
+}
+
 fn run_async<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -438,14 +466,6 @@ pub fn recording_save_segment_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    if input.source_url.is_empty() || input.source_url.len() > MAX_SOURCE_URL {
-        audit(caller.data(), "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("source_url_length"));
-        return AbiError::Operation.as_i32();
-    }
-    if !input.source_url.starts_with("file://") {
-        audit(caller.data(), "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("source_url_scheme_unsupported"));
-        return AbiError::Operation.as_i32();
-    }
     if !(1..=60).contains(&input.duration_secs) {
         audit(caller.data(), "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("duration_out_of_range"));
         return AbiError::Operation.as_i32();
@@ -473,8 +493,20 @@ pub fn recording_save_segment_v1(
     let retention_class = input.retention_class.clone().unwrap_or_else(|| cam_row.retention_class.clone());
     let risk = risk_for_retention(&retention_class);
 
+    // Source URL is always the camera row's stored URL — never accepted from
+    // the addon — so an addon can't pivot recording into reading arbitrary
+    // host files. F1a only supports `vendor='fake_file'`; reject anything else
+    // before invoking the GStreamer pipeline.
+    if cam_row.vendor != "fake_file" {
+        audit(caller.data(), "recording.save_segment", Some(&input.camera_id), risk, "denied", Some("vendor_unsupported"));
+        return AbiError::Operation.as_i32();
+    }
     let camera_id = input.camera_id.clone();
-    let source_url = input.source_url.clone();
+    let source_url = if cam_row.url.starts_with("file://") {
+        cam_row.url.clone()
+    } else {
+        format!("file://{}", cam_row.url)
+    };
     let saved: SavedRecording = match run_async(save_segment_mp4(&camera_id, &source_url, input.duration_secs)) {
         Ok(v) => v,
         Err(e) => {
@@ -582,6 +614,8 @@ pub fn recording_get_url_v1(
             return AbiError::Operation.as_i32();
         }
     };
+    // ref validated by `validate_recording_ref` — safe to interpolate into a
+    // URL path (only [a-f0-9-] plus the snap_/clip_ prefix).
     let url = format!("/recordings/{}?{}", input.recording_ref, issued.query_string());
     audit(caller.data(), "recording.get_url", Some(&input.recording_ref), RiskClass::B, "ok", None);
     let out = UrlOut { url, expires_unix_ms: issued.expiry_unix_ms };
@@ -641,10 +675,17 @@ pub fn recording_get_stream_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    // Enforce the absolute ServiceCall ceiling BEFORE reading the file —
-    // bails fast on a multi-MB segment without pulling it into RAM only to
-    // reject the response.
-    if row.file_size_bytes > 0 && (row.file_size_bytes as usize) > PayloadKind::ServiceCall.max_bytes() {
+    // Enforce the ServiceCall ceiling BEFORE reading the file, accounting for
+    // base64 expansion + TOML envelope. ceil(N/3)*4 bytes of base64 plus a
+    // 256 B headroom for TOML keys (`data_b64=`, `file_size_bytes=`, hash hex,
+    // newlines) — addons calling get_stream on a multi-MB file shouldn't blow
+    // host RAM only to have the response rejected after the read.
+    if let Some(est) = estimate_get_stream_output(row.file_size_bytes) {
+        if est > PayloadKind::ServiceCall.max_bytes() {
+            audit(caller.data(), "recording.get_stream", Some(&input.recording_ref), RiskClass::B, "error", Some("payload_too_large"));
+            return AbiError::PayloadTooLarge.as_i32();
+        }
+    } else {
         audit(caller.data(), "recording.get_stream", Some(&input.recording_ref), RiskClass::B, "error", Some("payload_too_large"));
         return AbiError::PayloadTooLarge.as_i32();
     }
@@ -727,8 +768,14 @@ pub fn recording_purge_v1(
     };
 
     let file_path = std::path::PathBuf::from(&row.file_path);
+    // Honest audit: if FS removal fails, do not soft-delete the DB row and do
+    // not claim success — the addon must be able to retry. `purge_recording`
+    // already treats NotFound as Ok (idempotent), so a returned Err here means
+    // a real I/O failure.
     if let Err(e) = run_async(purge_recording(&file_path)) {
-        warn!("recording.purge file removal failed (continuing with DB soft-delete): {e}");
+        warn!("recording.purge file removal failed (aborting purge): {e}");
+        audit(caller.data(), "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("purge_io_error"));
+        return AbiError::Operation.as_i32();
     }
     if let Err(_e) = soft_delete_recording(&db, &addon_id, &input.recording_ref) {
         audit(caller.data(), "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("db_soft_delete_failed"));
@@ -756,8 +803,14 @@ pub fn recording_stats_v1(
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
     };
-    // Empty payload is OK — `StatsInput` defaults to "no filter".
-    let raw = if input_len <= 0 {
+    // Empty payload is OK — `StatsInput` defaults to "no filter". A negative
+    // `input_len` is always a protocol error and must surface as InvalidArgument
+    // rather than being silently re-interpreted as "no filter".
+    if input_len < 0 {
+        audit(caller.data(), "recording.stats", None, RiskClass::B, "error", Some("invalid_input_len"));
+        return AbiError::Operation.as_i32();
+    }
+    let raw = if input_len == 0 {
         String::new()
     } else {
         match read_input_toml(&memory, &caller, input_ptr, input_len) {
@@ -799,11 +852,11 @@ pub fn recording_stats_v1(
     let per_camera: Vec<StatsPerCamera> = agg
         .per_camera
         .into_iter()
-        .map(|(camera_id, snapshots, segments, size_bytes)| StatsPerCamera {
-            camera_id,
-            snapshots,
-            segments,
-            size_bytes,
+        .map(|r| StatsPerCamera {
+            camera_id: r.camera_id,
+            snapshots: r.snapshots,
+            segments: r.segments,
+            size_bytes: r.size_bytes,
         })
         .collect();
     let out = StatsOut {
@@ -1078,14 +1131,6 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::Operation.as_i32());
         }
     };
-    if input.source_url.is_empty() || input.source_url.len() > MAX_SOURCE_URL {
-        audit(state, "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("source_url_length"));
-        return CoreResult::Err(AbiError::Operation.as_i32());
-    }
-    if !input.source_url.starts_with("file://") {
-        audit(state, "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("source_url_scheme_unsupported"));
-        return CoreResult::Err(AbiError::Operation.as_i32());
-    }
     if !(1..=60).contains(&input.duration_secs) {
         audit(state, "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("duration_out_of_range"));
         return CoreResult::Err(AbiError::Operation.as_i32());
@@ -1110,7 +1155,16 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
     let retention_class = input.retention_class.clone().unwrap_or_else(|| cam_row.retention_class.clone());
     let risk = risk_for_retention(&retention_class);
 
-    let saved: SavedRecording = match run_async(save_segment_mp4(&input.camera_id, &input.source_url, input.duration_secs)) {
+    if cam_row.vendor != "fake_file" {
+        audit(state, "recording.save_segment", Some(&input.camera_id), risk, "denied", Some("vendor_unsupported"));
+        return CoreResult::Err(AbiError::Operation.as_i32());
+    }
+    let source_url = if cam_row.url.starts_with("file://") {
+        cam_row.url.clone()
+    } else {
+        format!("file://{}", cam_row.url)
+    };
+    let saved: SavedRecording = match run_async(save_segment_mp4(&input.camera_id, &source_url, input.duration_secs)) {
         Ok(v) => v,
         Err(e) => {
             let mapped = map_recording_error(&e);
@@ -1219,9 +1273,12 @@ fn get_stream_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::Operation.as_i32());
         }
     };
-    if row.file_size_bytes > 0 && (row.file_size_bytes as usize) > PayloadKind::ServiceCall.max_bytes() {
-        audit(state, "recording.get_stream", Some(&input.recording_ref), RiskClass::B, "error", Some("payload_too_large"));
-        return CoreResult::Err(AbiError::PayloadTooLarge.as_i32());
+    match estimate_get_stream_output(row.file_size_bytes) {
+        Some(est) if est <= PayloadKind::ServiceCall.max_bytes() => {}
+        _ => {
+            audit(state, "recording.get_stream", Some(&input.recording_ref), RiskClass::B, "error", Some("payload_too_large"));
+            return CoreResult::Err(AbiError::PayloadTooLarge.as_i32());
+        }
     }
     let file_path = std::path::PathBuf::from(&row.file_path);
     let bytes = match run_async(read_recording(&file_path)) {
@@ -1273,7 +1330,9 @@ fn purge_core(state: &AddonState, raw: &str) -> CoreResult {
     };
     let file_path = std::path::PathBuf::from(&row.file_path);
     if let Err(e) = run_async(purge_recording(&file_path)) {
-        warn!("recording.purge file removal failed (continuing with DB soft-delete): {e}");
+        warn!("recording.purge file removal failed (aborting purge): {e}");
+        audit(state, "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("purge_io_error"));
+        return CoreResult::Err(AbiError::Operation.as_i32());
     }
     if soft_delete_recording(&state.db, &state.addon_id, &input.recording_ref).is_err() {
         audit(state, "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("db_soft_delete_failed"));
@@ -1309,11 +1368,11 @@ fn stats_core(state: &AddonState, raw: &str) -> CoreResult {
     let per_camera: Vec<StatsPerCamera> = agg
         .per_camera
         .into_iter()
-        .map(|(camera_id, snapshots, segments, size_bytes)| StatsPerCamera {
-            camera_id,
-            snapshots,
-            segments,
-            size_bytes,
+        .map(|r| StatsPerCamera {
+            camera_id: r.camera_id,
+            snapshots: r.snapshots,
+            segments: r.segments,
+            size_bytes: r.size_bytes,
         })
         .collect();
     let out = StatsOut {
