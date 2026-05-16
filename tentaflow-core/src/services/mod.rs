@@ -33,6 +33,7 @@ pub mod ports;
 pub mod recording;
 pub mod registry;
 pub mod runtime;
+pub mod service_call_rate_limit;
 pub mod signed_urls;
 pub mod snapshot_builder;
 pub mod streaming;
