@@ -167,6 +167,25 @@ Alternatively, add the `dhat` crate as an optional dependency, wire a
 and rebuild with `--features dhat-heap`. This is a code change, not part of
 the soak infra.
 
+## RTSP camera testing (F1b P1.B)
+
+For RTSP integration tests (`tests/camera_rtsp_integration.rs`, marked
+`#[ignore]` so they do not run in the default suite):
+
+- Install a local RTSP test server, e.g. `mediamtx` (Go) or `gst-rtsp-server`
+  (C). The default URL the tests expect is `rtsp://127.0.0.1:8554/test`.
+- System GStreamer plugins required on the host running the tests:
+  - Debian/Ubuntu: `gstreamer1.0-plugins-good` (rtspsrc, rtph264depay),
+    `gstreamer1.0-plugins-bad` (h264parse), `gstreamer1.0-libav` (avdec_h264),
+    `gstreamer1.0-rtsp`.
+  - macOS: `brew install gstreamer`.
+- Sanity check the toolchain before running the suite:
+  `gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/test ! fakesink`.
+
+Logs and `CameraHealth.status_message` redact RTSP credentials (`user:pass@`
+is replaced with `***:***@`) before emission, so it is safe to attach raw
+logs to bug reports.
+
 ## Troubleshooting
 
 - **`tentaflow died during warm-up`** — see `logs/tentaflow.log`. Usually a
