@@ -1,6 +1,14 @@
 # TentaVision F1a — implementation plan (week-by-week)
 
-**Wersja:** v0.3.4 · **M1 acceptance gate ZAMKNIĘTY** — M1.W4-W8 wszystkie chunki ukończone. M1.W8 (Chunks A/B/C/D) dodaje recording manager (snapshot PNG + segment MP4) + signed URL issuer (frame + recording, multi-use HMAC) + 7 host functions recording + 2 HTTP handlery `/recordings/<ref>` i `/frames/<ref>` + 10 e2e testów + 5 criterion benchów. snapshot_save 282 µs (320x240) / 3.12 ms (1280x720) ≪ 50 ms target (DoD-13). DoD-7 (curl → 200 PNG) PASS przez `test_e2e_recording_url_returns_png`.
+**Wersja:** v1.0.0-f1a · **F1a RELEASE READY** — M3.W15 ukończony. Trzy dokumenty wydane: `RELEASE-F1a.md` (release notes + breaking changes + teams-bot migration guide + known limitations), `notes/tentavision-f1a-acceptance-report.md` (DoD 11 PASS / 3 PARTIAL / 3 DEFERRED / 0 FAIL), `notes/tentavision-f1b-handoff.md` (RTSP/ONVIF + lab pilot + audit chain + rate limit + multi-node mesh — ~7-8 tygodni). Git tag `v0.1.0-f1a` jako **manual step** po stakeholder sign-off (komenda w acceptance report).
+
+**Final recap M0-M3:**
+- M0 (W1-W3): manifest parser + SDK boilerplate + CLI validate + DB migracje v1-v13 → CLOSED
+- M1 (W4-W8): SQL + Alias readonly + Camera FakeFile + Streaming + Recording — ~124 testów + 14 benchów, wszystkie targety §17.8 PASS → CLOSED
+- M2 (W9-W11): M16 + M14 + M15 wizard steps 1-3 + integration + security → CLOSED (M15 steps 4-6 placeholder per F1a scope §1.1)
+- M3 (W12-W15): Playwright e2e + Criterion perf + soak infra + release docs → CLOSED (24h soak run = manual acceptance step)
+
+**Poprzednia:** v0.3.4 · M1 acceptance gate ZAMKNIĘTY — M1.W4-W8 wszystkie chunki ukończone. M1.W8 (Chunks A/B/C/D) dodaje recording manager (snapshot PNG + segment MP4) + signed URL issuer (frame + recording, multi-use HMAC) + 7 host functions recording + 2 HTTP handlery `/recordings/<ref>` i `/frames/<ref>` + 10 e2e testów + 5 criterion benchów. snapshot_save 282 µs (320x240) / 3.12 ms (1280x720) ≪ 50 ms target (DoD-13). DoD-7 (curl → 200 PNG) PASS przez `test_e2e_recording_url_returns_png`.
 
 **Poprzednia:** v0.3.3 · M1.W7 ukończony (Chunks A/B/C/D) — streaming bus + frame_storage LRU + pickup tokens HMAC + 3 streaming ABIs + /core/frame/pickup + service_call extension + 6 e2e testów (mock yolo pickup) + 9 criterion benchów. Wszystkie targety §17.8 spełnione z marginesem.
 
