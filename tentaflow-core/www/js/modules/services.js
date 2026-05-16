@@ -26,6 +26,15 @@ let modelsCache = [];
 let refresher = null;
 let currentTab = 'list';
 let lastQuery = '';
+// M16 alias view state. Filter is one of: all | addon | manual | active | inactive
+// | fallback | empty_target. Search is a case-insensitive substring on alias name.
+// editingId !== null means an inline edit panel is open under the row.
+let aliasFilter = 'all';
+let aliasSearch = '';
+let aliasEditingId = null;
+// Per-alias staged edit state: { targetModel, strategy, fallbackTargets[] }.
+// Keyed by alias id so opening another row resets cleanly.
+let aliasEditDraft = null;
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -245,19 +254,232 @@ function bindTabEvents() {
     b.onclick = () => Router.navigate('catalog');
   });
 
-  // Aliases tab
-  body.querySelectorAll('[data-alias-edit]').forEach((b) => {
-    b.onclick = () => {
-      const a = aliases.find((x) => String(x.id) === b.dataset.aliasEdit);
-      if (a) openAliasModal(a);
-    };
-  });
-  body.querySelectorAll('[data-alias-delete]').forEach((b) => {
-    b.onclick = () => deleteAlias(b.dataset.aliasDelete, b.dataset.aliasName);
-  });
+  // Aliases tab — M16 layout: filter chips, search, inline edit, drag-reorder.
+  bindAliasFilterChips(body);
+  bindAliasSearch(body);
+  bindAliasRowActions(body);
+  bindAliasInlineEditEvents(body);
   body.querySelectorAll('[data-new-alias]').forEach((b) => {
     b.onclick = () => openAliasModal(null);
   });
+}
+
+function bindAliasFilterChips(root) {
+  root.querySelectorAll('[data-alias-filter]').forEach((chip) => {
+    const trigger = () => {
+      const id = chip.dataset.aliasFilter;
+      if (!id || id === aliasFilter) return;
+      aliasFilter = id;
+      patchAliasesTab();
+    };
+    chip.onclick = trigger;
+    chip.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        trigger();
+      }
+    };
+  });
+}
+
+function bindAliasSearch(root) {
+  const sb = root.querySelector('#svc-alias-search');
+  if (!sb) return;
+  // tf-searchbox emits "search" with debounce baked in. We re-patch the tab on
+  // every keystroke; the grid is small (<200 rows typical) so it stays cheap.
+  sb.addEventListener('search', (e) => {
+    aliasSearch = String(e.detail?.value ?? sb.value ?? '');
+    patchAliasesTab();
+  });
+}
+
+function bindAliasRowActions(root) {
+  root.querySelectorAll('[data-alias-edit]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const id = parseInt(b.dataset.aliasEdit, 10);
+      if (aliasEditingId === id) {
+        aliasEditingId = null;
+        aliasEditDraft = null;
+      } else {
+        aliasEditingId = id;
+        aliasEditDraft = null;
+      }
+      patchAliasesTab();
+    };
+  });
+  root.querySelectorAll('[data-alias-delete]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      deleteAlias(parseInt(b.dataset.aliasDelete, 10), b.dataset.aliasName);
+    };
+  });
+  root.querySelectorAll('[data-alias-toggle]').forEach((tg) => {
+    tg.addEventListener('change', async (e) => {
+      const id = parseInt(tg.dataset.aliasToggle, 10);
+      const checked = !!e.detail?.checked;
+      await updateAliasActive(id, checked);
+    });
+  });
+}
+
+function bindAliasInlineEditEvents(root) {
+  // Cancel button → close panel without applying draft.
+  root.querySelectorAll('[data-alias-cancel]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      aliasEditingId = null;
+      aliasEditDraft = null;
+      patchAliasesTab();
+    };
+  });
+  // Save button → push update via binary RPC.
+  root.querySelectorAll('[data-alias-save]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      const id = parseInt(b.dataset.aliasSave, 10);
+      await saveAliasInline(id);
+    };
+  });
+  // Primary target select → mirror into draft + re-render fallback candidate list.
+  root.querySelectorAll('[id^="al-target-"]').forEach((sel) => {
+    sel.addEventListener('change', (e) => {
+      if (!aliasEditDraft) return;
+      aliasEditDraft.targetModel = String(e.detail?.value ?? sel.value ?? '').trim();
+      // Re-render so the fallback add-list excludes the newly-chosen primary.
+      patchAliasesTab();
+    });
+  });
+  // Strategy segmented → mirror into draft (no re-render needed; visual handled
+  // by the component itself).
+  root.querySelectorAll('[id^="al-strategy-"]').forEach((seg) => {
+    seg.addEventListener('change', (e) => {
+      if (!aliasEditDraft) return;
+      aliasEditDraft.strategy = String(e.detail?.value ?? seg.value ?? 'first_available').toLowerCase();
+    });
+  });
+  // Fallback add → push name into draft, re-render.
+  root.querySelectorAll('[data-fallback-add]').forEach((sel) => {
+    sel.addEventListener('change', (e) => {
+      if (!aliasEditDraft) return;
+      const val = String(e.detail?.value ?? sel.value ?? '').trim();
+      if (!val || aliasEditDraft.fallbacks.includes(val)) return;
+      if (val === aliasEditDraft.targetModel) return;
+      aliasEditDraft.fallbacks.push(val);
+      patchAliasesTab();
+    });
+  });
+  // Fallback remove → splice by index, re-render.
+  root.querySelectorAll('[data-fallback-remove]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      if (!aliasEditDraft) return;
+      const idx = parseInt(b.dataset.fallbackRemove, 10);
+      if (Number.isNaN(idx)) return;
+      aliasEditDraft.fallbacks.splice(idx, 1);
+      patchAliasesTab();
+    };
+  });
+  // Drag-and-drop reorder. We use the native HTML5 API on .svc-fallback-item
+  // elements with draggable=true. Dropping reorders the draft array; the
+  // primary row is non-draggable (no draggable attribute).
+  root.querySelectorAll('[data-fallback-list]').forEach((list) => {
+    attachFallbackDrag(list);
+  });
+}
+
+function attachFallbackDrag(listEl) {
+  let dragIdx = null;
+  listEl.querySelectorAll('.svc-fallback-item[draggable="true"]').forEach((item) => {
+    item.addEventListener('dragstart', (e) => {
+      dragIdx = parseInt(item.dataset.fallbackIdx, 10);
+      item.classList.add('dragging');
+      // dataTransfer is required for Firefox to start the drag.
+      e.dataTransfer?.setData('text/plain', String(dragIdx));
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    });
+    item.addEventListener('dragend', () => {
+      item.classList.remove('dragging');
+      listEl.querySelectorAll('.drag-over').forEach((el) => el.classList.remove('drag-over'));
+      dragIdx = null;
+    });
+    item.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      item.classList.add('drag-over');
+    });
+    item.addEventListener('dragleave', () => {
+      item.classList.remove('drag-over');
+    });
+    item.addEventListener('drop', (e) => {
+      e.preventDefault();
+      item.classList.remove('drag-over');
+      if (!aliasEditDraft || dragIdx === null) return;
+      const dropIdx = parseInt(item.dataset.fallbackIdx, 10);
+      if (Number.isNaN(dropIdx) || dragIdx === dropIdx) return;
+      const arr = aliasEditDraft.fallbacks;
+      const [moved] = arr.splice(dragIdx, 1);
+      arr.splice(dropIdx, 0, moved);
+      dragIdx = null;
+      patchAliasesTab();
+    });
+  });
+}
+
+// Inline save — pushes ModelAliasUpdateRequest with the draft state. Keeps
+// is_active and alias name unchanged (toggle handles is_active, rename is not
+// part of the inline edit by design — rename forces a re-create flow).
+async function saveAliasInline(id) {
+  const alias = aliases.find((x) => x.id === id);
+  if (!alias || !aliasEditDraft || aliasEditDraft.id !== id) return;
+  const errEl = document.querySelector(`[data-edit-error="${CSS.escape(String(id))}"]`);
+  const target = aliasEditDraft.targetModel.trim();
+  if (!target) {
+    if (errEl) { errEl.textContent = I18n.t('services.alias_required'); errEl.hidden = false; }
+    return;
+  }
+  const fbJson = aliasEditDraft.fallbacks.length > 0
+    ? JSON.stringify(aliasEditDraft.fallbacks)
+    : null;
+  try {
+    await ApiBinary.action('modelAliasUpdateRequest', {
+      id,
+      alias: alias.alias,
+      targetModel: target,
+      isActive: alias.is_active,
+      strategy: aliasEditDraft.strategy,
+      fallbackTargets: fbJson,
+    });
+    toast(I18n.t('services.alias_updated'), 'success');
+    aliasEditingId = null;
+    aliasEditDraft = null;
+    await loadAll();
+  } catch (err) {
+    if (errEl) { errEl.textContent = err.message; errEl.hidden = false; }
+  }
+}
+
+// Toggle handler — flips is_active via the same update RPC. Optimistic UI:
+// the toggle has already animated by the time we get here.
+async function updateAliasActive(id, checked) {
+  const alias = aliases.find((x) => x.id === id);
+  if (!alias) return;
+  try {
+    await ApiBinary.action('modelAliasUpdateRequest', {
+      id,
+      alias: alias.alias,
+      targetModel: alias.target_model,
+      isActive: checked,
+      strategy: alias.strategy ?? null,
+      fallbackTargets: alias.fallback_targets ?? null,
+    });
+    alias.is_active = checked;
+    toast(I18n.t('services.alias_updated'), 'success');
+  } catch (err) {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    // Re-load to revert visual state if RPC failed.
+    await loadAll();
+  }
 }
 
 // ---- List tab -------------------------------------------------------------
@@ -471,39 +693,134 @@ function renderAliasesTab() {
   // wertykalne, spojne z innymi strzalkami w UI.
   const arrowIcon = '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px;margin:0 4px;color:var(--accent-2)"><use href="#i-chevron-right"/></svg>';
   const body = escapeHtml(I18n.t('services.aliases_info_body')).replace('→', arrowIcon);
-  return `
-    <div class="info-card">
-      ${sprite('info')}
-      <div><strong>${title}</strong> — ${body}</div>
-    </div>
-    ${aliases.length === 0 ? `
+  if (aliases.length === 0) {
+    return `
+      <div class="info-card">
+        ${sprite('info')}
+        <div><strong>${title}</strong> — ${body}</div>
+      </div>
       <div class="empty-big">
         ${sprite('share')}
         <h3>${escapeHtml(I18n.t('services.aliases_empty'))}</h3>
         <p>${escapeHtml(I18n.t('services.aliases_empty_hint'))}</p>
         <tf-button variant="primary" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
       </div>
-    ` : `
-      <div class="svc-aliases-toolbar">
-        <tf-button variant="primary" size="sm" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
+    `;
+  }
+
+  const counts = computeAliasFilterCounts(aliases);
+  const filterChips = [
+    { id: 'all', label: I18n.t('services.alias_filter_all'), count: counts.all },
+    { id: 'addon', label: I18n.t('services.alias_filter_addon'), count: counts.addon },
+    { id: 'manual', label: I18n.t('services.alias_filter_manual'), count: counts.manual },
+    { id: 'active', label: I18n.t('services.alias_filter_active'), count: counts.active },
+    { id: 'inactive', label: I18n.t('services.alias_filter_inactive'), count: counts.inactive },
+    { id: 'fallback', label: I18n.t('services.alias_filter_with_fallback'), count: counts.fallback },
+    { id: 'empty_target', label: I18n.t('services.alias_filter_empty_target'), count: counts.empty_target },
+  ].map((c) => `
+    <span class="svc-alias-filter-chip${aliasFilter === c.id ? ' active' : ''}"
+          data-alias-filter="${escapeAttr(c.id)}"
+          role="button" tabindex="0">
+      ${escapeHtml(c.label)}<span class="count">${c.count}</span>
+    </span>`).join('');
+
+  const visible = filterAliases(aliases, aliasFilter, aliasSearch);
+
+  const rowsHtml = visible.length === 0
+    ? `<div class="svc-alias-empty-filter">${escapeHtml(I18n.t('services.alias_no_match'))}</div>`
+    : visible.map(renderAliasRow).join('');
+
+  return `
+    <div class="info-card">
+      ${sprite('info')}
+      <div><strong>${title}</strong> — ${body}</div>
+    </div>
+
+    <div class="svc-alias-toolbar">
+      <tf-searchbox id="svc-alias-search"
+        placeholder="${escapeAttr(I18n.t('services.alias_search_placeholder'))}"
+        value="${escapeAttr(aliasSearch)}"></tf-searchbox>
+      <tf-button variant="primary" size="sm" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
+    </div>
+
+    <div class="svc-alias-filters" id="svc-alias-filters">${filterChips}</div>
+
+    <div class="svc-alias-grid">
+      <div class="svc-alias-row h">
+        <div>${escapeHtml(I18n.t('services.alias_col_name'))}</div>
+        <div>${escapeHtml(I18n.t('services.alias_col_owner'))}</div>
+        <div>${escapeHtml(I18n.t('services.alias_col_target'))}</div>
+        <div>${escapeHtml(I18n.t('services.alias_col_strategy'))}</div>
+        <div>${escapeHtml(I18n.t('services.alias_col_visibility'))}</div>
+        <div>${escapeHtml(I18n.t('services.alias_col_active'))}</div>
+        <div></div>
       </div>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>${escapeHtml(I18n.t('services.alias_col_name'))}</th>
-            <th>${escapeHtml(I18n.t('services.alias_col_target'))}</th>
-            <th>${escapeHtml(I18n.t('services.alias_col_strategy'))}</th>
-            <th>${escapeHtml(I18n.t('services.alias_col_fallback'))}</th>
-            <th>${escapeHtml(I18n.t('services.alias_col_active'))}</th>
-            <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${aliases.map(renderAliasRow).join('')}
-        </tbody>
-      </table>
-    `}
+      ${rowsHtml}
+    </div>
   `;
+}
+
+// Filter chip counts. Single pass — order matches the chip array so the badge
+// stays in sync as backend gradually populates owner/visibility fields.
+function computeAliasFilterCounts(list) {
+  const counts = { all: list.length, addon: 0, manual: 0, active: 0, inactive: 0, fallback: 0, empty_target: 0 };
+  for (const a of list) {
+    const owner = aliasOwnerInfo(a);
+    if (owner.type === 'addon') counts.addon += 1;
+    else counts.manual += 1;
+    if (a.is_active) counts.active += 1;
+    else counts.inactive += 1;
+    const fbs = parseFallbackTargets(a.fallback_targets).values;
+    if (fbs.length > 0) counts.fallback += 1;
+    if (!a.target_model || !String(a.target_model).trim()) counts.empty_target += 1;
+  }
+  return counts;
+}
+
+function filterAliases(list, filter, search) {
+  const q = (search || '').trim().toLowerCase();
+  return list.filter((a) => {
+    if (q && !String(a.alias || '').toLowerCase().includes(q)) return false;
+    const owner = aliasOwnerInfo(a);
+    const fbs = parseFallbackTargets(a.fallback_targets).values;
+    const emptyTarget = !a.target_model || !String(a.target_model).trim();
+    switch (filter) {
+      case 'addon': return owner.type === 'addon';
+      case 'manual': return owner.type === 'manual';
+      case 'active': return !!a.is_active;
+      case 'inactive': return !a.is_active;
+      case 'fallback': return fbs.length > 0;
+      case 'empty_target': return emptyTarget;
+      case 'all':
+      default: return true;
+    }
+  });
+}
+
+// Backend currently does NOT return owner info on ModelAliasEntry (the
+// model_alias_owners table exists in DB but is not joined into the wire
+// payload — see TODO in raport). We infer ownership only when an explicit
+// `owner_type` / `owner_id` field is present (forward-compatible), otherwise
+// default to `manual` so existing admin-created aliases keep their UI badge.
+function aliasOwnerInfo(a) {
+  const type = String(a.owner_type || a.ownerType || 'manual').toLowerCase();
+  const id = a.owner_id || a.ownerId || '';
+  if (type === 'addon') {
+    return { type: 'addon', label: id || 'addon', icon: 'puzzle' };
+  }
+  return { type: 'manual', label: id || I18n.t('services.alias_owner_manual'), icon: 'users' };
+}
+
+// Visibility is also not exposed on ModelAliasEntry yet (model_alias_visibility
+// table exists, no dispatch handler). We render an `unknown` chip so admin can
+// see the column structure but cannot yet act on it from this screen.
+function aliasVisibilityInfo(a) {
+  const v = String(a.visibility || '').toLowerCase();
+  if (v === 'private' || v === 'restricted' || v === 'public') {
+    const iconMap = { private: 'lock', restricted: 'shield', public: 'unlock' };
+    return { value: v, icon: iconMap[v], label: I18n.t(`services.alias_visibility_${v}`) };
+  }
+  return { value: 'unknown', icon: 'lock', label: I18n.t('services.alias_visibility_unknown') };
 }
 
 // fallback_targets na wire/DB to JSON array string (CLAUDE.md §9 — "No CSV").
@@ -535,22 +852,179 @@ function parseFallbackTargets(raw) {
 
 function renderAliasRow(a) {
   const fallbacks = parseFallbackTargets(a.fallback_targets).values;
-  const activeBadge = a.is_active
-    ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.alias_active'))}</span>`
-    : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.alias_inactive'))}</span>`;
+  const owner = aliasOwnerInfo(a);
+  const vis = aliasVisibilityInfo(a);
+  const emptyTarget = !a.target_model || !String(a.target_model).trim();
+  const fallbackText = fallbacks.length === 0
+    ? `<div class="fallbacks">${escapeHtml(I18n.t('services.alias_no_fallbacks'))}</div>`
+    : `<div class="fallbacks">→ ${escapeHtml(fallbacks.join(' → '))}</div>`;
+  const primary = emptyTarget
+    ? `<div class="empty">${escapeHtml(I18n.t('services.alias_empty_target'))}</div>`
+    : `<div class="primary">${escapeHtml(a.target_model)}</div>`;
+  const strategyText = (a.strategy || 'first_available').toLowerCase();
+  const rowClasses = [
+    'svc-alias-row',
+    !a.is_active ? 'inactive' : '',
+    emptyTarget ? 'empty-target' : '',
+  ].filter(Boolean).join(' ');
+  const isEditing = aliasEditingId === a.id;
+  const editPanel = isEditing ? renderAliasInlineEdit(a) : '';
+
   return `
-    <tr data-key="alias-${escapeAttr(a.id)}">
-      <td data-label="${escapeAttr(I18n.t('services.alias_col_name'))}"><strong style="color:var(--accent-2);">${escapeHtml(a.alias)}</strong></td>
-      <td data-label="${escapeAttr(I18n.t('services.alias_col_target'))}"><code style="font-size:11px;">${escapeHtml(a.target_model)}</code></td>
-      <td data-label="${escapeAttr(I18n.t('services.alias_col_strategy'))}"><span class="scope-chip chat">${escapeHtml(a.strategy || 'FirstAvailable')}</span></td>
-      <td data-label="${escapeAttr(I18n.t('services.alias_col_fallback'))}">${fallbacks.length > 0 ? fallbacks.map((f) => `<span class="scope-chip mesh-read">${escapeHtml(f)}</span>`).join(' ') : '<span style="color:var(--text-3);">—</span>'}</td>
-      <td data-label="${escapeAttr(I18n.t('services.alias_col_active'))}">${activeBadge}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
-        <tf-button variant="ghost" size="sm" icon="settings" data-alias-edit="${escapeAttr(a.id)}" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>
-        <tf-button variant="danger" size="sm" icon="trash" data-alias-delete="${escapeAttr(a.id)}" data-alias-name="${escapeAttr(a.alias)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
-      </td>
-    </tr>
+    <div class="${rowClasses}" data-key="alias-${escapeAttr(a.id)}">
+      <div class="svc-alias-name" title="${escapeAttr(a.alias)}">${escapeHtml(a.alias)}</div>
+      <div>
+        <span class="svc-alias-owner ${owner.type}" title="${escapeAttr(owner.type + ':' + owner.label)}">
+          ${sprite(owner.icon)}${escapeHtml(owner.label)}
+        </span>
+      </div>
+      <div class="svc-alias-target">${primary}${fallbackText}</div>
+      <div><span class="svc-alias-strategy">${escapeHtml(strategyText)}</span></div>
+      <div>
+        <span class="svc-alias-vis ${vis.value}" title="${escapeAttr(I18n.t('services.alias_visibility_pending_label'))}">
+          ${sprite(vis.icon)}${escapeHtml(vis.label)}
+        </span>
+      </div>
+      <div>
+        <tf-toggle ${a.is_active ? 'checked' : ''} data-alias-toggle="${escapeAttr(a.id)}"></tf-toggle>
+      </div>
+      <div class="svc-alias-actions">
+        <tf-button variant="ghost" size="sm" icon="${isEditing ? 'chevron-down' : 'edit'}"
+                   data-alias-edit="${escapeAttr(a.id)}"
+                   title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>
+        <tf-button variant="danger" size="sm" icon="trash"
+                   data-alias-delete="${escapeAttr(a.id)}"
+                   data-alias-name="${escapeAttr(a.alias)}"
+                   title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
+      </div>
+    </div>
+    ${editPanel}
   `;
+}
+
+// Inline edit panel rendered directly under the row. Uses the per-alias draft
+// state so unrelated row clicks do not clobber unsaved input. Drag handlers
+// bind in `bindAliasInlineEditEvents` (called from bindTabEvents).
+function renderAliasInlineEdit(a) {
+  if (!aliasEditDraft || aliasEditDraft.id !== a.id) {
+    const fbParse = parseFallbackTargets(a.fallback_targets);
+    aliasEditDraft = {
+      id: a.id,
+      targetModel: a.target_model || '',
+      strategy: (a.strategy || 'first_available').toLowerCase(),
+      fallbacks: fbParse.values.slice(),
+      parseFailed: !fbParse.ok,
+    };
+  }
+  const owner = aliasOwnerInfo(a);
+  const targets = buildTargetOptionList(a.alias);
+  const targetOptions = targets.map((t) =>
+    `<option value="${escapeAttr(t.value)}" ${t.value === aliasEditDraft.targetModel ? 'selected' : ''}>${escapeHtml(t.label)}</option>`,
+  ).join('');
+  // List of fallback targets EXCLUDING currently-selected primary and already-added
+  // fallbacks, so the user cannot stack duplicates. Re-filtered on every render.
+  const fbCandidates = targets.filter((t) =>
+    t.value !== aliasEditDraft.targetModel
+    && !aliasEditDraft.fallbacks.includes(t.value));
+  const fbCandidateOpts = fbCandidates.map((t) =>
+    `<option value="${escapeAttr(t.value)}">${escapeHtml(t.label)}</option>`,
+  ).join('');
+
+  return `
+    <div class="svc-alias-edit" data-edit-for="${escapeAttr(a.id)}">
+      <div class="edit-head">
+        <div>
+          ${sprite('edit')} ${escapeHtml(I18n.t('services.alias_edit'))}:
+          <span class="name">${escapeHtml(a.alias)}</span>
+        </div>
+        <tf-button variant="ghost" size="sm" icon="x" data-alias-cancel="${escapeAttr(a.id)}"
+                   title="${escapeAttr(I18n.t('services.alias_cancel'))}"></tf-button>
+      </div>
+
+      <div class="form-grid">
+        <div class="form-row">
+          <label>${escapeHtml(I18n.t('services.alias_col_target'))}</label>
+          <tf-select id="al-target-${escapeAttr(a.id)}" value="${escapeAttr(aliasEditDraft.targetModel)}">
+            <option value="">— ${escapeHtml(I18n.t('services.alias_target_placeholder'))} —</option>
+            ${targetOptions}
+          </tf-select>
+        </div>
+        <div class="form-row svc-strategy-segmented">
+          <label>${escapeHtml(I18n.t('services.alias_col_strategy'))}</label>
+          <tf-segmented value="${escapeAttr(aliasEditDraft.strategy)}" id="al-strategy-${escapeAttr(a.id)}">
+            <option value="first_available">${escapeHtml(I18n.t('services.strategy_first_available'))}</option>
+            <option value="round_robin">${escapeHtml(I18n.t('services.strategy_round_robin'))}</option>
+            <option value="least_loaded">${escapeHtml(I18n.t('services.strategy_least_loaded'))}</option>
+          </tf-segmented>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label>${escapeHtml(I18n.t('services.alias_col_fallback'))}</label>
+        <div class="svc-fallback-builder" data-fallback-list="${escapeAttr(a.id)}">
+          ${renderFallbackItems(aliasEditDraft)}
+          <div class="add-row">
+            <tf-select id="al-fb-add-${escapeAttr(a.id)}" data-fallback-add="${escapeAttr(a.id)}">
+              <option value="">— ${escapeHtml(I18n.t('services.alias_add_fallback'))} —</option>
+              ${fbCandidateOpts}
+            </tf-select>
+          </div>
+        </div>
+      </div>
+
+      <div class="meta-block">
+        <strong>${escapeHtml(I18n.t('services.alias_meta_owner'))}:</strong>
+        <code>${escapeHtml(owner.type)}${owner.label && owner.type === 'addon' ? ':' + owner.label : ''}</code>
+        · <strong>${escapeHtml(I18n.t('services.alias_meta_id'))}:</strong>
+        <code>${escapeHtml(String(a.id))}</code>
+      </div>
+
+      ${aliasEditDraft.parseFailed
+        ? `<div class="form-error">${escapeHtml(I18n.t('services.alias_fallback_parse_failed'))}</div>`
+        : ''}
+      <div class="form-error" hidden data-edit-error="${escapeAttr(a.id)}"></div>
+
+      <div class="edit-foot">
+        <tf-button variant="ghost" size="sm" icon="x" data-alias-cancel="${escapeAttr(a.id)}">${escapeHtml(I18n.t('services.alias_cancel'))}</tf-button>
+        <div class="right">
+          <tf-button variant="primary" icon="check" data-alias-save="${escapeAttr(a.id)}">${escapeHtml(I18n.t('services.alias_save'))}</tf-button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderFallbackItems(draft) {
+  // Primary slot is the currently-selected target_model (read-only here — change
+  // it via the "Primary target" select above). Indexed 1..N for the chain.
+  const primaryLabel = draft.targetModel
+    ? draft.targetModel
+    : `— ${I18n.t('services.alias_target_placeholder')} —`;
+  const items = [];
+  items.push(`
+    <div class="svc-fallback-item primary" data-fallback-primary>
+      <span class="pos">${escapeHtml(I18n.t('services.alias_primary_target_pos'))}</span>
+      <span></span>
+      <span></span>
+      <span class="name">${escapeHtml(primaryLabel)}</span>
+      <span></span>
+    </div>
+  `);
+  draft.fallbacks.forEach((name, idx) => {
+    items.push(`
+      <div class="svc-fallback-item" draggable="true"
+           data-fallback-idx="${idx}" data-fallback-name="${escapeAttr(name)}">
+        <span class="pos">${idx + 1}</span>
+        <span class="grip" title="${escapeAttr(I18n.t('services.alias_drag_handle'))}">${sprite('grip')}</span>
+        <span></span>
+        <span class="name">${escapeHtml(name)}</span>
+        <tf-button variant="ghost" size="sm" icon="trash"
+                   data-fallback-remove="${idx}"
+                   title="${escapeAttr(I18n.t('services.alias_fallback_remove'))}"></tf-button>
+      </div>
+    `);
+  });
+  return items.join('');
 }
 
 // ---- Models tab -----------------------------------------------------------
