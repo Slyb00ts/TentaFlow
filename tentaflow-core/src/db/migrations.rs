@@ -146,7 +146,42 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_vendor_check_rtsp_onvif",
             MigrationStep::Sql(CAMERAS_VENDOR_CHECK_RTSP_ONVIF),
         ),
+        (
+            24,
+            "frame_pickup_log_source_node_id",
+            MigrationStep::Rust(frame_pickup_log_add_source_node_id),
+        ),
     ]
+}
+
+// F1b P3.C-2 — add a nullable `source_node_id` column to `frame_pickup_log`
+// so the pickup handler can record which peer's HMAC key validated the
+// token (NULL when the token verified locally). The audit query
+// "from which node was this frame fetched?" needs the column even though
+// SQLite has no easy `ADD COLUMN IF NOT EXISTS` — we read PRAGMA
+// table_info first and skip the ALTER when the column already exists so
+// the migration is idempotent if a partial earlier run committed the
+// _migrations row separately from the ALTER (or if an operator added
+// the column out of band).
+fn frame_pickup_log_add_source_node_id(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(frame_pickup_log)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "source_node_id" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE frame_pickup_log ADD COLUMN source_node_id TEXT NULL;",
+        )?;
+    }
+    Ok(())
 }
 
 // F1a M1.W8 — TentaVision recording manager registry. One row per artifact

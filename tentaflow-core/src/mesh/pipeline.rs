@@ -2000,52 +2000,46 @@ fn spawn_quic_event_handler(
                     from_node_id,
                     payload,
                 }) => {
-                    // P3.C-1 stage: wire wiring only; server/client logic
-                    // lands in P3.C-2. The dispatch arm is reachable now
-                    // that the protocol discriminants are connected to the
-                    // event bus, but we intentionally do not look up the
-                    // local frame store or send a response yet. Silently
-                    // dropping the request avoids storms of NotFound
-                    // replies while the server-side handler is in flight.
-                    debug!(
-                        peer = %from_node_id,
-                        raw_ref = %payload.raw_ref,
-                        request_id = %payload.request_id,
-                        "FrameProxyRequest received (P3.C-1 placeholder dispatch)"
-                    );
+                    // Trust gate — only peers we have completed pairing
+                    // with may pull frame bytes out of our LRU. Mirrors
+                    // the gate applied to ServicesAnnounce / KeysSync.
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            raw_ref = %payload.raw_ref,
+                            request_id = %payload.request_id,
+                            "FrameProxyRequest from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    let iroh = qm_events.clone();
+                    tokio::spawn(crate::services::frame_proxy::handle_request(
+                        iroh,
+                        from_node_id,
+                        payload,
+                    ));
                 }
                 Ok(IrohMeshEvent::FrameProxyResponseReceived {
                     from_node_id,
                     payload,
                 }) => {
-                    // P3.C-1 stage: wire wiring only; pending-map resolve
-                    // lands in P3.C-2. No requests are issued at this
-                    // stage, so any response we observe is either from a
-                    // peer ahead of us in the rollout or a race; logging
-                    // the discriminant variant is enough for diagnostics.
-                    let (raw_ref, request_id, kind) = match &payload {
-                        tentaflow_protocol::mesh::FrameProxyResponsePayload::Found {
-                            raw_ref,
-                            request_id,
-                            ..
-                        } => (raw_ref.as_str(), request_id.as_str(), "found"),
-                        tentaflow_protocol::mesh::FrameProxyResponsePayload::NotFound {
-                            raw_ref,
-                            request_id,
-                        } => (raw_ref.as_str(), request_id.as_str(), "not_found"),
-                        tentaflow_protocol::mesh::FrameProxyResponsePayload::Unavailable {
-                            raw_ref,
-                            request_id,
-                            ..
-                        } => (raw_ref.as_str(), request_id.as_str(), "unavailable"),
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
                     };
-                    debug!(
-                        peer = %from_node_id,
-                        raw_ref = %raw_ref,
-                        request_id = %request_id,
-                        kind = %kind,
-                        "FrameProxyResponse received (P3.C-1 placeholder dispatch)"
-                    );
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            "FrameProxyResponse from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    crate::services::frame_proxy::frame_proxy_client()
+                        .handle_response(payload);
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
