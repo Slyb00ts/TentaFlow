@@ -45,9 +45,20 @@ function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
 
+// Allowed tab ids — guards against arbitrary input from Router params.
+const VALID_TABS = new Set(['list', 'aliases', 'models']);
+
+export function setActiveTab(tabName) {
+  if (!VALID_TABS.has(tabName)) return;
+  currentTab = tabName;
+}
+
 const ServicesScreen = {
   get title() { return I18n.t('nav.services'); },
-  render() {
+  render(params = {}) {
+    if (params.tab && VALID_TABS.has(params.tab)) {
+      currentTab = params.tab;
+    }
     return `
       <div class="page-header">
         <div>

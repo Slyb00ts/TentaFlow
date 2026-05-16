@@ -141,13 +141,20 @@
   margin-bottom: 14px;
 }
 
-.mono {
+#install-wizard-body .mono,
+#install-wizard-body .iw-mono {
   font-family: ui-monospace, monospace;
   font-size: 12px;
 }
 
-.muted {
+#install-wizard-body .muted,
+#install-wizard-body .iw-muted {
   color: var(--text-3);
+}
+
+.wizard-quota-slider {
+  width: 100%;
+  margin: 4px 0;
 }
 
 /* Step 1: permissions */
