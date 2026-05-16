@@ -153,6 +153,24 @@ impl SignedUrlIssuer {
     /// recording_url>`. The previous key is retained as a verify-only
     /// secondary for `max_ttl + grace` so any URL minted right before the
     /// rotate still verifies until its natural expiry.
+    /// Snapshot signing key state for mesh advertise (F1b P3.B). Returns the
+    /// current key plus, if the rotation grace window is still open, the
+    /// previous key with its absolute unix-ms expiry. Verifier-only consumers
+    /// — never used by anyone to sign.
+    pub fn snapshot_for_mesh(&self) -> ([u8; 32], Option<[u8; 32]>, u64) {
+        let state = self.keys.read();
+        let now = Instant::now();
+        let (prev, prev_expiry_ms) = match state.previous {
+            Some(p) if now < state.previous_expires_at => {
+                let remaining = state.previous_expires_at - now;
+                let unix_ms = now_unix_ms() + remaining.as_millis() as u64;
+                (Some(p), unix_ms)
+            }
+            _ => (None, 0u64),
+        };
+        (state.current, prev, prev_expiry_ms)
+    }
+
     pub fn rotate_in_memory(&self, new_key: [u8; 32]) {
         let mut state = self.keys.write();
         let old = state.current;
@@ -226,6 +244,20 @@ impl SignedUrlIssuer {
                 {
                     matched = true;
                 }
+            }
+        }
+        drop(state);
+        // F1b P3.B — fold in HMAC keys mirrored from trust-paired peers so a
+        // URL signed on node A still verifies on node B. Constant-time compare
+        // is run against every candidate (no early-exit timing leak).
+        let scope = match self.scope {
+            UrlScope::FrameUrl => crate::services::mesh_keys::KeyScope::FrameUrl,
+            UrlScope::Recording => crate::services::mesh_keys::KeyScope::RecordingUrl,
+        };
+        for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {
+            let expected = hmac_sign(&peer_key, payload.as_bytes());
+            if provided.len() == expected.len() && bool::from(provided.ct_eq(&expected)) {
+                matched = true;
             }
         }
         if !matched {

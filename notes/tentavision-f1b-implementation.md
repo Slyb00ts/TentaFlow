@@ -170,10 +170,73 @@ URLs and pickup tokens (process-local `OsRng` key); post-P3.A the same
 keys come back from disk so URLs minted before the restart remain valid
 until their TTL expires.
 
-### P3.B / P3.C — Mesh sync (deferred)
+### P3.B — Mesh sync (done)
 
-Cross-node key sync over QUIC requires a real cluster to validate (we have
-no end-to-end mesh harness yet). Out of scope for F1b; tracked separately.
+Each peer now mirrors its three HMAC issuer keys (`pickup_token`,
+`frame_url`, `recording_url`) to every trust-paired peer over the existing
+mTLS-protected mesh stream. Effect: a `PickupToken` minted on node A
+verifies when picked up at node B, and a `SignedUrl` signed on A verifies
+on B, without sharing on-disk key files. Tokens stay scoped to the issuing
+key + scope literal, so a frame URL still cannot replay as a recording URL.
+
+Wire layer:
+
+- New discriminant `MESH_MSG_HMAC_KEYS_SYNC = 0x44` carrying
+  `HmacKeysSyncPayload { from_node_id, keys: [HmacKeyEntry] }`. Each
+  `HmacKeyEntry` has `scope` (`"pickup_token"` / `"frame_url"` /
+  `"recording_url"`), `current_key` (32 B), an optional `previous_key`
+  (rotation grace), and a diagnostic 8-byte `key_id`.
+- `IrohMeshManager::send_hmac_keys_sync` + `IrohMeshEvent::HmacKeysSyncReceived`
+  mirror the existing `TrustedKeysSync` shape; the dispatcher in
+  `mesh::pipeline` re-uses the same trust gate (sender must be `is_trusted`,
+  otherwise the message is logged and dropped).
+
+Receiver state:
+
+- `services::mesh_keys::MeshKeyPool` — process-wide singleton holding
+  `RwLock<HashMap<NodeId, PerPeerKeys>>`. Each scope's verify hot path
+  (`PickupTokenIssuer::verify_only` / `consume_one_shot` /
+  `SignedUrlIssuer::verify`) takes one read lock, collects the candidate
+  key set, drops the lock, then runs constant-time HMAC compares for every
+  candidate (no early-exit timing leak).
+- Local keys verify first under the full inflight + one-shot contract; the
+  mesh fallback runs only when the local-key path returns
+  `InvalidSignature`. One-shot semantics for mesh-issued pickup tokens are
+  owned by the issuing node — receiver-side replay protection is out of
+  scope for F1b (the token still HMAC-verifies + has a 30 s expiry, so the
+  attacker window is tight).
+
+Lifecycle:
+
+- `handle_peer_connected` (`mesh/pipeline.rs`) pushes a fresh advertise
+  after the existing `TrustedKeysSync` block, gated on the same
+  `is_trusted` check + `last_sync_sent` cooldown (30 s).
+- `handle_peer_disconnected` drops every scope held for that peer; the
+  next reconnect re-advertises. No on-disk persistence, by design — a
+  revoked peer cannot leave stale verifiers behind.
+- `TrustRevokedReceived` propagation also drops the revoked peer's
+  entries (both the "I was revoked" branch and the "someone else was
+  revoked" branch).
+
+Rotation: a running `tentaflow-cli keys rotate <name>` triggers the file
+watcher (`services::key_storage::watcher`) which calls
+`rotate_in_memory` on the local issuer. The 2-key in-memory window keeps
+tokens minted under the old key valid for `ttl + grace`; peers re-pick the
+fresh key on their next `PeerConnected` advertise. An explicit
+broadcast-on-rotate path (push new keys to all connected peers without
+waiting for reconnect) is deferred — flagged in the README so operators
+who rotate a hot key know to expect lazy propagation.
+
+Tests:
+
+- `services::mesh_keys` unit suite (8 tests) covers pool upsert, expired
+  previous-window exclusion, peer drop, scope round-trip, and ingest
+  validation (wrong length, unknown scope).
+- `tests/mesh_key_sync_integration.rs` (4 tests) drives the full advertise
+  → ingest → verify path: pickup token cross-node, signed URL cross-node
+  for both scopes, rotation grace propagation, and a trust-boundary
+  contract test that documents why the pool itself is trust-agnostic
+  (the gate lives in `pipeline.rs`).
 
 ## DB schema notes
 

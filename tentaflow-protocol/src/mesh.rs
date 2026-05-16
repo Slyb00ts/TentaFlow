@@ -716,6 +716,12 @@ pub const MESH_MSG_SERVICES_GET_RESPONSE: u8 = 0x41;
 pub const MESH_MSG_SERVICES_ANNOUNCE: u8 = 0x42;
 /// Push delta — pojedyncza zmiana (deploy/stop/pin/pause/rename/delete).
 pub const MESH_MSG_SERVICES_UPDATE: u8 = 0x43;
+/// Multi-node HMAC issuer key sync (F1b P3.B). Carries this peer's
+/// pickup_token / frame_url / recording_url 32-byte HMAC keys (current +
+/// optional previous-window key) so the receiver can verify tokens issued
+/// by this peer. Sent only between trust-paired peers; verifier-only, never
+/// used by the receiver for signing.
+pub const MESH_MSG_HMAC_KEYS_SYNC: u8 = 0x44;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
@@ -764,6 +770,35 @@ pub struct MeshHelloPayload {
 #[rkyv(derive(Debug))]
 pub struct TrustedKeysSyncPayload {
     pub keys: Vec<TrustedKeyEntry>,
+}
+
+/// One scope of the local node's HMAC issuer key state, mirrored to a trusted
+/// peer so it can verify tokens we issued.
+///
+/// `scope` is the wire-stable issuer name: "pickup_token", "frame_url",
+/// "recording_url" (matches `services::key_storage` file names). `current_key`
+/// is the active 32-byte HMAC secret. `previous_key` carries the still-valid
+/// previous-window key after a rotation; `previous_expires_unix_ms = 0`
+/// signals no previous-window key is active.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct HmacKeyEntry {
+    pub scope: String,
+    pub current_key: Vec<u8>,
+    pub previous_key: Vec<u8>,
+    pub previous_expires_unix_ms: u64,
+    /// Truncated SHA-256 of `current_key` — diagnostic only, never used as
+    /// trust input. Kept short (8 bytes) to keep log lines readable.
+    pub key_id: Vec<u8>,
+}
+
+/// Payload of `MESH_MSG_HMAC_KEYS_SYNC` — one entry per issuer scope held by
+/// the sender. F1b P3.B sends three: pickup_token, frame_url, recording_url.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct HmacKeysSyncPayload {
+    pub from_node_id: String,
+    pub keys: Vec<HmacKeyEntry>,
 }
 
 /// Wire payload dla `MESH_MSG_PAIRING_REQUEST` — wysylany przez istniejacy mesh

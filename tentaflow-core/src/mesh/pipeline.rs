@@ -582,6 +582,18 @@ async fn handle_peer_connected(
 
                 last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
             }
+
+            // F1b P3.B — push our HMAC issuer keys (pickup_token, frame_url,
+            // recording_url) so the peer can verify tokens we mint. Only sent
+            // to already-trusted peers; the receiver enforces the same gate.
+            let advertise =
+                crate::services::mesh_keys::sync::build_local_advertise(&local_node_id);
+            if let Some(bytes) = crate::services::mesh_keys::sync::encode_advertise(&advertise)
+            {
+                if let Err(e) = qm_events.send_hmac_keys_sync(&node_id, &bytes).await {
+                    warn!("Blad wysylania HmacKeysSync do {}: {}", node_id, e);
+                }
+            }
         }
 
         // Pull-on-connect: poprosic peera o pelny snapshot jego serwisow.
@@ -710,6 +722,11 @@ async fn handle_peer_disconnected(
     peer_store.set_status(&node_id, "disconnected");
     peer_store.clear_heartbeat(&node_id);
     info!(peer_id = %node_id, "QUIC peer rozlaczony");
+
+    // F1b P3.B — disconnected peer's HMAC keys are no longer trustworthy
+    // for verifying new tokens; drop them from the pool. They will be
+    // re-acquired on the next reconnect's advertise.
+    crate::services::mesh_keys::sync::forget_peer(&node_id);
 
     let hostname = peer_store.get_hostname(&node_id).unwrap_or_default();
     crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
@@ -1565,6 +1582,9 @@ fn spawn_quic_event_handler(
                             let all_trusted = sec.get_all_trusted_keys();
                             for (trusted_id, _) in &all_trusted {
                                 let _ = sec.unpair(trusted_id);
+                                // F1b P3.B — drop the peer's mirrored HMAC keys
+                                // so their tokens stop verifying immediately.
+                                crate::services::mesh_keys::sync::forget_peer(trusted_id);
                             }
                             info!(
                                 "Odlaczony z mesh przez {} — usunieto {} kluczy",
@@ -1593,6 +1613,7 @@ fn spawn_quic_event_handler(
                         // Przypadek 2: ktos inny zostal odlaczony — usun TYLKO jego klucz
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.unpair(&revoked_node_id);
+                            crate::services::mesh_keys::sync::forget_peer(&revoked_node_id);
                             info!(
                                 "Usunieto {} z mesh (propagacja od {})",
                                 revoked_node_id, node_id
@@ -1677,6 +1698,28 @@ fn spawn_quic_event_handler(
                                 Some(&node_id),
                             );
                         }
+                    }
+                }
+                Ok(IrohMeshEvent::HmacKeysSyncReceived { node_id, payload }) => {
+                    // Accept only from a trusted sender — mirror of the
+                    // TrustedKeysSync gate. HMAC keys are secrets so we
+                    // must not let an unpaired peer plant them in our pool.
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        warn!("Odrzucono HmacKeysSync od niezaufanego noda {}", node_id);
+                        continue;
+                    }
+                    let accepted =
+                        crate::services::mesh_keys::sync::ingest_advertise(&node_id, payload);
+                    if accepted > 0 {
+                        info!(
+                            from = %node_id,
+                            scopes = accepted,
+                            "HmacKeysSync przyjety — peer keys zalezone do verify pool"
+                        );
                     }
                 }
                 Ok(IrohMeshEvent::RelayFrameReceived {
