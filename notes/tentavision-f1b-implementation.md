@@ -63,7 +63,7 @@ ustalona.
 - WS-Discovery `camera_discover_v1` + RTSP probing
   `camera_test_connection_v1` — Chunk D.
 
-### P1.B — RTSP connector (pending)
+### P1.B — RTSP connector (done, commit e301071 + redact/test fix)
 
 **Scope:**
 - `tentaflow-core/src/services/camera_ingest/rtsp.rs` z pipeline:

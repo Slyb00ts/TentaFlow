@@ -414,10 +414,11 @@ fn trigger_camera_vendor_unsupported_via_camera_add() {
         wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
     };
 
-    // vendor='rtsp' is rejected by validate_vendor (only fake_file in F1a).
+    // F1b P1.B accepts `fake_file` and `rtsp`. `onvif` is still rejected
+    // (planned for P1.D) and is used here to exercise the rejection path.
     let raw = br#"
-vendor = "rtsp"
-url = "rtsp://example.com/stream"
+vendor = "onvif"
+url = "http://example.com/onvif/device_service"
 target_fps = 15
 retention_class = "short"
 display_name = "Test cam"
@@ -427,6 +428,6 @@ profile = "default"
     assert_eq!(
         rc,
         AbiError::CameraVendorUnsupported.as_i32(),
-        "camera_add with vendor='rtsp' must return CameraVendorUnsupported (14), got {rc}"
+        "camera_add with vendor='onvif' must return CameraVendorUnsupported (14), got {rc}"
     );
 }
