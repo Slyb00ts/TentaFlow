@@ -654,7 +654,7 @@ impl AddonManager {
     /// inserted in this call (the audit table has no FK on the alias, so
     /// a row-by-row `DELETE` style rollback would leave orphan audit
     /// entries that look like duplicate "create" events on the next try).
-    fn install_manifest_aliases(&self, manifest: &AddonManifest) -> Result<()> {
+    pub fn install_manifest_aliases(&self, manifest: &AddonManifest) -> Result<()> {
         use crate::db::repository::{
             add_alias_consumer_within_tx, audit_consumer_revoked_by_manifest_within_tx,
             audit_reconcile_uses_alias_within_tx, create_or_reactivate_model_alias_within_tx,
