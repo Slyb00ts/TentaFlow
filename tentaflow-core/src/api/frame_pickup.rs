@@ -16,7 +16,9 @@ use rusqlite::params;
 
 use crate::db::DbPool;
 use crate::services::frame_storage::{FramePixelFormat, FrameStorage, RawFrameRef, StoredFrame};
-use crate::services::pickup_tokens::{PickupTokenIssuer, PickupVerifyError};
+use crate::services::pickup_tokens::{
+    PickupTokenIssuer, PickupVerifyError, TokenPayload, VerifySource,
+};
 
 /// Header names — kept here so the test suite, the host-side service_call_v1
 /// wiring, and the HTTP handler agree on a single source of truth.
@@ -53,6 +55,14 @@ pub enum PickupOutcome {
     HeaderMismatch(&'static str),
     /// Frame already evicted from the LRU before pickup.
     FramePurged,
+    /// F1b P3.C-3 — peer reported NotFound for a cross-node fetch.
+    UpstreamNotFound,
+    /// F1b P3.C-3 — peer reported Unavailable / dispatch failure / timeout.
+    /// Caller MUST send `Retry-After: 5` along with the 503.
+    UpstreamUnavailable(&'static str),
+    /// F1b P3.C-3 — cross-node B-side replay protection rejected the token
+    /// (a previous mesh-fallback consume for the same wire already won).
+    Replay,
 }
 
 impl PickupOutcome {
@@ -63,7 +73,9 @@ impl PickupOutcome {
             Self::Unauthorized(PickupVerifyError::Expired) => 410,
             Self::Unauthorized(_) => 403,
             Self::HeaderMismatch(_) => 403,
-            Self::FramePurged => 404,
+            Self::FramePurged | Self::UpstreamNotFound => 404,
+            Self::UpstreamUnavailable(_) => 503,
+            Self::Replay => 403,
         }
     }
 
@@ -75,6 +87,9 @@ impl PickupOutcome {
             Self::Unauthorized(e) => e.as_log_result(),
             Self::HeaderMismatch(_) => "unauthorized",
             Self::FramePurged => "frame_purged",
+            Self::UpstreamNotFound => "frame_purged",
+            Self::UpstreamUnavailable(_) => "upstream_unavailable",
+            Self::Replay => "replay",
         }
     }
 }
@@ -88,59 +103,111 @@ pub struct PickupRequest<'a> {
     pub request_id: Option<&'a str>,
 }
 
-/// Single point of truth for the pickup logic — pure function over the
-/// extracted headers + injected dependencies. The hyper handler in
-/// `dashboard/server.rs` just maps request → `PickupRequest` and the outcome
-/// back to a `Response`.
+/// F1b P3.C-3 — outcome of the header-verify split. On success the caller
+/// inspects the `VerifySource` to decide between the local fast path
+/// (`handle_pickup`) and the cross-node mesh-fallback path
+/// (`dashboard/server.rs` → `frame_proxy::client::fetch_from_peer`). On
+/// failure the caller emits the same audit row + HTTP response it would
+/// have emitted before the split — the failure-mode contract is unchanged.
+#[derive(Debug)]
+pub struct VerifiedPickup {
+    pub token: String,
+    pub payload: TokenPayload,
+    pub source: VerifySource,
+}
+
+/// F1b P3.C-3 — header extraction + HMAC verify + header cross-check, WITHOUT
+/// consuming the one-shot bit and WITHOUT touching the local LRU. The hyper
+/// handler runs this first; on `Ok(VerifiedPickup)` it dispatches by
+/// `source` (Local → `handle_pickup`, Peer → frame proxy fetch). On `Err`
+/// the audit row is already written and the caller maps the outcome to the
+/// HTTP response.
+pub fn verify_pickup_headers(
+    req: &PickupRequest<'_>,
+    issuer: &PickupTokenIssuer,
+    db: &DbPool,
+) -> Result<VerifiedPickup, PickupOutcome> {
+    let token = match req.pickup_token {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_token"), None)),
+    };
+    let frame_ref = match req.frame_ref {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_frame_ref"), None)),
+    };
+    let service_id = match req.service_id {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_service_id"), None)),
+    };
+    let request_id = match req.request_id {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_request_id"), None)),
+    };
+
+    let (payload, source) = match issuer.verify_only_with_source(token) {
+        Ok(p) => p,
+        Err(e) => return Err(log_outcome(db, req, PickupOutcome::Unauthorized(e), None)),
+    };
+    let source_node = match &source {
+        VerifySource::Local => None,
+        VerifySource::Peer(id) => Some(id.clone()),
+    };
+    if payload.raw_ref != frame_ref {
+        return Err(log_outcome(
+            db,
+            req,
+            PickupOutcome::HeaderMismatch("frame_ref_mismatch"),
+            source_node,
+        ));
+    }
+    if payload.service_id != service_id {
+        return Err(log_outcome(
+            db,
+            req,
+            PickupOutcome::HeaderMismatch("service_id_mismatch"),
+            source_node,
+        ));
+    }
+    if payload.request_id != request_id {
+        return Err(log_outcome(
+            db,
+            req,
+            PickupOutcome::HeaderMismatch("request_id_mismatch"),
+            source_node,
+        ));
+    }
+    Ok(VerifiedPickup {
+        token: token.to_string(),
+        payload,
+        source,
+    })
+}
+
+/// Local-source pickup. Header verify already passed; consume the one-shot
+/// inflight entry, then remove the bytes from the local LRU. Cross-node
+/// callers go through `dashboard/server.rs` proxy dispatch instead — this
+/// function never reaches a peer.
 pub fn handle_pickup(
     req: PickupRequest<'_>,
     issuer: &PickupTokenIssuer,
     storage: &FrameStorage,
     db: &DbPool,
 ) -> PickupOutcome {
-    let token = match req.pickup_token {
-        Some(t) if !t.is_empty() => t,
-        _ => return log_and_return(db, &req, PickupOutcome::BadHeaders("missing_token")),
+    let verified = match verify_pickup_headers(&req, issuer, db) {
+        Ok(v) => v,
+        Err(outcome) => return outcome,
     };
-    let frame_ref = match req.frame_ref {
-        Some(t) if !t.is_empty() => t,
-        _ => return log_and_return(db, &req, PickupOutcome::BadHeaders("missing_frame_ref")),
-    };
-    let service_id = match req.service_id {
-        Some(t) if !t.is_empty() => t,
-        _ => return log_and_return(db, &req, PickupOutcome::BadHeaders("missing_service_id")),
-    };
-    let request_id = match req.request_id {
-        Some(t) if !t.is_empty() => t,
-        _ => return log_and_return(db, &req, PickupOutcome::BadHeaders("missing_request_id")),
-    };
+    // Local path only — Peer source is handled by the HTTP layer dispatch.
+    debug_assert!(matches!(verified.source, VerifySource::Local));
 
-    // 1) Verify-only: HMAC + inflight + expiry, but DO NOT consume.
-    // 2) Cross-check headers against the payload.
-    // 3) Only when everything matches do we run the atomic one-shot consume.
-    // Order matters: if an attacker holds a valid wire and lies in a header,
-    // we must not burn the token — the legitimate recipient still needs it.
-    let payload = match issuer.verify_only(token) {
-        Ok(p) => p,
-        Err(e) => return log_and_return(db, &req, PickupOutcome::Unauthorized(e)),
-    };
-    if payload.raw_ref != frame_ref {
-        return log_and_return(db, &req, PickupOutcome::HeaderMismatch("frame_ref_mismatch"));
-    }
-    if payload.service_id != service_id {
-        return log_and_return(db, &req, PickupOutcome::HeaderMismatch("service_id_mismatch"));
-    }
-    if payload.request_id != request_id {
-        return log_and_return(db, &req, PickupOutcome::HeaderMismatch("request_id_mismatch"));
-    }
-    if let Err(e) = issuer.consume_one_shot(token) {
-        return log_and_return(db, &req, PickupOutcome::Unauthorized(e));
+    if let Err(e) = issuer.consume_one_shot(&verified.token) {
+        return log_outcome(db, &req, PickupOutcome::Unauthorized(e), None);
     }
 
-    let raw_ref = RawFrameRef::from_string(frame_ref.to_string());
+    let raw_ref = RawFrameRef::from_string(verified.payload.raw_ref.clone());
     let stored: StoredFrame = match storage.remove(&raw_ref) {
         Some(s) => s,
-        None => return log_and_return(db, &req, PickupOutcome::FramePurged),
+        None => return log_outcome(db, &req, PickupOutcome::FramePurged, None),
     };
 
     let pf = match stored.metadata.pixel_format {
@@ -154,21 +221,36 @@ pub fn handle_pickup(
         timestamp_unix_ms: stored.metadata.timestamp_unix_ms,
         pts: stored.metadata.pts,
     };
-    log_pickup(db, &req, &outcome);
+    log_pickup(db, &req, &outcome, None);
     outcome
 }
 
-fn log_and_return(db: &DbPool, req: &PickupRequest<'_>, outcome: PickupOutcome) -> PickupOutcome {
-    log_pickup(db, req, &outcome);
+/// Same-shape helper for the HTTP-layer cross-node path: write the
+/// `frame_pickup_log` row with `source_node_id` set, then return the outcome.
+pub fn log_outcome(
+    db: &DbPool,
+    req: &PickupRequest<'_>,
+    outcome: PickupOutcome,
+    source_node_id: Option<String>,
+) -> PickupOutcome {
+    log_pickup(db, req, &outcome, source_node_id.as_deref());
     outcome
 }
 
-/// Best-effort INSERT into `frame_pickup_log`. Schema (v12):
-/// `(raw_frame_ref, service_id, caller_addon_id, request_id, picked_up_at, result)`.
+/// Best-effort INSERT into `frame_pickup_log`. Schema (v12 + v24):
+/// `(raw_frame_ref, service_id, caller_addon_id, request_id, picked_up_at,
+///   result, source_node_id)`.
 /// `caller_addon_id` is unknown at the HTTP layer (services authenticate as
 /// themselves via the token, not as the originating addon), so we leave it
 /// NULL and rely on the matching `alias_calls` row to bridge addon → service.
-fn log_pickup(db: &DbPool, req: &PickupRequest<'_>, outcome: &PickupOutcome) {
+/// `source_node_id` is `Some(<peer>)` only for cross-node mesh-fallback
+/// pickups (F1b P3.C-3); local-source pickups leave it NULL.
+fn log_pickup(
+    db: &DbPool,
+    req: &PickupRequest<'_>,
+    outcome: &PickupOutcome,
+    source_node_id: Option<&str>,
+) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -177,14 +259,16 @@ fn log_pickup(db: &DbPool, req: &PickupRequest<'_>, outcome: &PickupOutcome) {
     if let Ok(conn) = db.lock() {
         let _ = conn.execute(
             "INSERT INTO frame_pickup_log \
-                 (raw_frame_ref, service_id, caller_addon_id, request_id, picked_up_at, result) \
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
+                 (raw_frame_ref, service_id, caller_addon_id, request_id, \
+                  picked_up_at, result, source_node_id) \
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
             params![
                 req.frame_ref.unwrap_or(""),
                 req.service_id.unwrap_or(""),
                 req.request_id.unwrap_or(""),
                 ts,
                 result,
+                source_node_id,
             ],
         );
     }

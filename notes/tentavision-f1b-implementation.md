@@ -244,6 +244,65 @@ Tests:
   contract test that documents why the pool itself is trust-agnostic
   (the gate lives in `pipeline.rs`).
 
+### P3.C — Cross-node frame pickup (done)
+
+Closes the cross-node loop opened by P3.B. When node A signs a pickup token
+for a frame whose bytes live in A's LRU but the service calling
+`/core/frame/pickup` is connected to node B (mesh-fallback HMAC verify),
+B fetches the bytes from A over the trust-paired mesh stream and serves
+them to the service as if the pickup had been local.
+
+Wire layer (P3.C-1, commit db226d3): new discriminants
+`MESH_MSG_FRAME_PROXY_REQUEST = 0x45` and
+`MESH_MSG_FRAME_PROXY_RESPONSE = 0x46`. Payloads
+`FrameProxyRequestPayload { raw_ref, request_id }` and the three-variant
+enum `FrameProxyResponsePayload { Found / NotFound / Unavailable }`. The
+matching `IrohMeshEvent::FrameProxyRequestReceived` /
+`FrameProxyResponseReceived` events are emitted by `handle_mesh_uni`
+after the same pre-trust gate as every other 0x4* discriminant.
+
+Verifier provenance + replay (P3.C-2, commit 200974d):
+`PickupTokenIssuer::verify_only_with_source` returns
+`(TokenPayload, VerifySource::{Local, Peer(node_id)})` in constant time
+(always evaluates both candidate key sets). `mesh_inflight_consume` adds
+B-side replay protection: the first cross-node consume for a given wire
+records the timestamp, every subsequent one returns `AlreadyConsumed`
+for `2 × token TTL`. DB v24 adds the nullable
+`frame_pickup_log.source_node_id` column for audit.
+
+HTTP integration (P3.C-3): `api::frame_pickup::verify_pickup_headers`
+splits the header-verify step out of `handle_pickup` so the hyper handler
+in `dashboard/server.rs` can dispatch by `VerifySource`. `Local` runs the
+existing local-LRU one-shot consume; `Peer(node_id)` calls
+`issuer.mesh_inflight_consume(wire)` first (replay guard), then
+`frame_proxy::client::fetch_from_peer(iroh, peer, raw_ref, 5 s)` over
+the mesh stream. Response mapping:
+
+| Outcome | HTTP | `frame_pickup_log.result` | `source_node_id` |
+|---|---|---|---|
+| `Found{bytes,meta}` | 200 + body + width/height/pf/ts headers | `ok` | `Some(peer)` |
+| `NotFound` | 404 | `frame_purged` | `Some(peer)` |
+| `Unavailable{reason}` | 503 + `Retry-After: 5` | `upstream_unavailable` | `Some(peer)` |
+| Timeout (5 s) | 503 + `Retry-After: 5` | `upstream_unavailable` | `Some(peer)` |
+| Replay (B-side) | 403 | `replay` | `Some(peer)` |
+| `mesh_unavailable` (no IrohMeshManager) | 503 + `Retry-After: 5` | `upstream_unavailable` | `Some(peer)` |
+
+Hardening that stays unchanged: the 1 KiB GET body cap (P1.C-2), the
+signed-URL rate limit (E1), and the universal security headers (E2) all
+apply BEFORE the verify split, so cross-node and local pickups land on
+the same rate-limit + body-size + header surface.
+
+Tests:
+
+- `tests/mesh_frame_proxy_dispatch.rs` (P3.C-1, 2 tests) — wire-level
+  round-trip via two real `IrohMeshManager` instances.
+- `tests/frame_pickup_cross_node.rs` (P3.C-3, 5 tests) — outcome → HTTP
+  status / log_result mapping, plus the `mesh_inflight_consume` first-ok /
+  second-replay contract.
+- Existing `tests/streaming_pickup.rs` (12) + `streaming_pickup_e2e.rs`
+  (6) continue to pass; the split keeps the local-path contract
+  byte-for-byte identical.
+
 ## DB schema notes
 
 Po P1.A schema cameras wygląda identycznie jak v21 z jedną zmianą:

@@ -105,6 +105,16 @@ tokens. Rotation: `tentaflow-cli keys rotate <name>` — running issuers
 keep the previous key as a verify-only secondary for `max_ttl + 5 s` so a
 rotation does not invalidate tokens already in flight.
 
+Cross-node frame pickup (F1b P3.C — done): when a pickup token mesh-verifies
+against a peer's HMAC key, the verifying node fetches the frame bytes from
+the issuing peer over the mesh stream (`MESH_MSG_FRAME_PROXY_REQUEST = 0x45`
+/ `MESH_MSG_FRAME_PROXY_RESPONSE = 0x46`, 5 s timeout) and serves them to
+the calling service. B-side replay protection lives in
+`PickupTokenIssuer::mesh_inflight_consume`. `frame_pickup_log` gains a
+nullable `source_node_id` column (DB v24) — local pickups leave it NULL,
+cross-node pickups record the peer's NodeId. 503 responses always carry
+`Retry-After: 5`.
+
 Multi-node (F1b P3.B): each peer mirrors its three HMAC issuer keys to
 every trust-paired peer over the existing mTLS mesh stream
 (`MESH_MSG_HMAC_KEYS_SYNC = 0x44`,

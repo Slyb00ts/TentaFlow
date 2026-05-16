@@ -257,6 +257,37 @@ Mid-soak the operator can rotate a key and verify:
 - After host restart, signed URLs minted under the OLD key fail with
   `InvalidSignature` (previous key was only an in-memory window).
 
+## Cross-node frame pickup (F1b P3.C)
+
+When two nodes are trust-paired (P3.B HMAC key sync active), a service
+attached to node B can pick up a frame whose bytes live in node A's LRU.
+The pickup HTTP request lands on B; B's `PickupTokenIssuer` mesh-fallback
+HMAC-verifies the token against A's shared key, then B fetches the
+bytes from A over the mesh `frame_proxy` stream (5 s timeout) and returns
+them to the calling service.
+
+Audit:
+
+- Every `/core/frame/pickup` request writes a row to `frame_pickup_log`.
+  Local pickups leave `source_node_id` NULL; cross-node pickups record
+  the peer's NodeId hex.
+- `result` enum values used by the cross-node path: `ok`, `frame_purged`
+  (peer reported NotFound), `upstream_unavailable` (timeout or peer
+  reported Unavailable), `replay` (B-side double-pickup guard).
+- 503 responses from the cross-node path always carry `Retry-After: 5`
+  so a well-behaved service backs off instead of hammering.
+
+Soak monitoring:
+
+- During a multi-node soak, periodic `SELECT result, COUNT(*) FROM
+  frame_pickup_log WHERE source_node_id IS NOT NULL GROUP BY result;`
+  should show `ok` dominant and the failure modes negligible.
+- A sustained `upstream_unavailable` rate above ~1 % usually means the
+  mesh stream between the two nodes is flapping — inspect
+  `mesh_relay_health` and the iroh connection events.
+- The `replay` row should be near-zero on a healthy soak; non-zero means
+  either a buggy client retrying after a 200, or a real replay attempt.
+
 ## Troubleshooting
 
 - **`tentaflow died during warm-up`** — see `logs/tentaflow.log`. Usually a

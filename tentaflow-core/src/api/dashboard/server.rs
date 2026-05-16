@@ -377,6 +377,93 @@ fn apply_signed_url_security_headers(
     builder
 }
 
+/// F1b P3.C-3 — map a `PickupOutcome` to the HTTP response. Shared by the
+/// local fast path (`handle_pickup`) and the cross-node mesh-fallback path
+/// (`frame_proxy::fetch_from_peer`) so both routes apply the same security
+/// headers and emit the same body shape per status code.
+fn pickup_outcome_to_response(
+    outcome: crate::api::frame_pickup::PickupOutcome,
+) -> Response<DashboardBody> {
+    use crate::api::frame_pickup::{
+        PickupOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_PTS,
+        HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
+    };
+    let status = outcome.http_status();
+    match outcome {
+        PickupOutcome::Ok {
+            bytes,
+            width,
+            height,
+            pixel_format,
+            timestamp_unix_ms,
+            pts,
+        } => {
+            let mut builder = Response::builder()
+                .status(status)
+                .header("Content-Type", "application/octet-stream")
+                .header(HDR_FRAME_WIDTH, width.to_string())
+                .header(HDR_FRAME_HEIGHT, height.to_string())
+                .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
+                .header(HDR_FRAME_TS_MS, timestamp_unix_ms.to_string());
+            if let Some(p) = pts {
+                builder = builder.header(HDR_FRAME_PTS, p.to_string());
+            }
+            builder = apply_signed_url_security_headers(builder);
+            let body = Bytes::copy_from_slice(&bytes);
+            builder.body(Either::Left(Full::new(body))).unwrap()
+        }
+        PickupOutcome::BadHeaders(why) | PickupOutcome::HeaderMismatch(why) => {
+            let body = format!("{{\"error\":\"{}\"}}", why);
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from(body))))
+                .unwrap()
+        }
+        PickupOutcome::UpstreamUnavailable(reason) => {
+            let body = format!("{{\"error\":\"{}\"}}", reason);
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", "5"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from(body))))
+                .unwrap()
+        }
+        PickupOutcome::Replay => {
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"replay\"}",
+                ))))
+                .unwrap()
+        }
+        PickupOutcome::Unauthorized(_)
+        | PickupOutcome::FramePurged
+        | PickupOutcome::UpstreamNotFound => {
+            let builder = apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            );
+            builder
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"pickup_denied\"}",
+                ))))
+                .unwrap()
+        }
+    }
+}
+
 /// Collapse-audit map: per-IP timestamp of the LAST audit row emitted for a
 /// 429 denial, plus the count of denials inside the current window. We do
 /// not want to write one row per refused token, so we coalesce: at most one
@@ -913,10 +1000,10 @@ pub async fn handle_request(
     // dashboard's auth gate. See `api::frame_pickup`.
     if method == Method::POST && path == "/core/frame/pickup" {
         use crate::api::frame_pickup::{
-            handle_pickup, PickupOutcome, PickupRequest, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT,
-            HDR_FRAME_PTS, HDR_FRAME_REF, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH, HDR_PICKUP_TOKEN,
-            HDR_REQUEST_ID, HDR_SERVICE_ID,
+            handle_pickup, log_outcome, verify_pickup_headers, PickupOutcome, PickupRequest,
+            HDR_FRAME_REF, HDR_PICKUP_TOKEN, HDR_REQUEST_ID, HDR_SERVICE_ID,
         };
+        use crate::services::pickup_tokens::{PickupVerifyError, VerifySource};
         // mTLS pinning gate: if the operator enabled `pickup_required`, the
         // connecting peer MUST present a client cert whose SHA-256 fingerprint
         // is on the allowlist. Default (single-node F1a/F1b) is `false`, in
@@ -995,48 +1082,100 @@ pub async fn handle_request(
         };
         let issuer = crate::services::pickup_token_issuer();
         let storage = crate::services::frame_storage();
-        let outcome = handle_pickup(pr, issuer, storage, &db);
-        let status = outcome.http_status();
-        match outcome {
-            PickupOutcome::Ok {
-                bytes,
-                width,
-                height,
-                pixel_format,
-                timestamp_unix_ms,
-                pts,
-            } => {
-                let mut builder = Response::builder()
-                    .status(status)
-                    .header("Content-Type", "application/octet-stream")
-                    .header(HDR_FRAME_WIDTH, width.to_string())
-                    .header(HDR_FRAME_HEIGHT, height.to_string())
-                    .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
-                    .header(HDR_FRAME_TS_MS, timestamp_unix_ms.to_string());
-                if let Some(p) = pts {
-                    builder = builder.header(HDR_FRAME_PTS, p.to_string());
+
+        // F1b P3.C-3 — split verify from consume so a Peer-source token can
+        // be routed through frame_proxy instead of touching the local LRU.
+        let verified = match verify_pickup_headers(&pr, issuer, &db) {
+            Ok(v) => v,
+            Err(outcome) => return Ok(pickup_outcome_to_response(outcome)),
+        };
+
+        let outcome = match &verified.source {
+            VerifySource::Local => handle_pickup(pr, issuer, storage, &db),
+            VerifySource::Peer(peer_node_id) => {
+                // B-side replay protection: the mesh-fallback issuing node
+                // owns the one-shot inflight contract, so we maintain a
+                // process-local "this wire was already proxied through me"
+                // map to stop double-spend on the verifying node.
+                if let Err(PickupVerifyError::AlreadyConsumed) =
+                    issuer.mesh_inflight_consume(&verified.token)
+                {
+                    return Ok(pickup_outcome_to_response(log_outcome(
+                        &db,
+                        &pr,
+                        PickupOutcome::Replay,
+                        Some(peer_node_id.clone()),
+                    )));
                 }
-                let body = Bytes::copy_from_slice(&bytes);
-                let resp = builder.body(Either::Left(Full::new(body))).unwrap();
-                return Ok(resp);
+                match quic_mesh.as_ref() {
+                    Some(iroh) => {
+                        let fetch = crate::services::frame_proxy::fetch_from_peer(
+                            iroh,
+                            peer_node_id,
+                            &verified.payload.raw_ref,
+                            crate::services::frame_proxy::DEFAULT_FETCH_TIMEOUT,
+                        )
+                        .await;
+                        match fetch {
+                            Ok((bytes, meta)) => {
+                                let pixel_format: &'static str = match meta.pixel_format.as_str()
+                                {
+                                    "rgb24" => "rgb24",
+                                    _ => "rgb24",
+                                };
+                                let outcome = PickupOutcome::Ok {
+                                    bytes: std::sync::Arc::<[u8]>::from(bytes.into_boxed_slice()),
+                                    width: meta.width,
+                                    height: meta.height,
+                                    pixel_format,
+                                    timestamp_unix_ms: meta.timestamp_unix_ms,
+                                    pts: None,
+                                };
+                                log_outcome(&db, &pr, outcome, Some(peer_node_id.clone()))
+                            }
+                            Err(crate::services::frame_proxy::FrameProxyError::NotFound(_)) => {
+                                log_outcome(
+                                    &db,
+                                    &pr,
+                                    PickupOutcome::UpstreamNotFound,
+                                    Some(peer_node_id.clone()),
+                                )
+                            }
+                            Err(crate::services::frame_proxy::FrameProxyError::Timeout(_)) => {
+                                log_outcome(
+                                    &db,
+                                    &pr,
+                                    PickupOutcome::UpstreamUnavailable("timeout"),
+                                    Some(peer_node_id.clone()),
+                                )
+                            }
+                            Err(crate::services::frame_proxy::FrameProxyError::Unavailable {
+                                ..
+                            }) => log_outcome(
+                                &db,
+                                &pr,
+                                PickupOutcome::UpstreamUnavailable("upstream_unavailable"),
+                                Some(peer_node_id.clone()),
+                            ),
+                            Err(_) => log_outcome(
+                                &db,
+                                &pr,
+                                PickupOutcome::UpstreamUnavailable("proxy_error"),
+                                Some(peer_node_id.clone()),
+                            ),
+                        }
+                    }
+                    None => log_outcome(
+                        &db,
+                        &pr,
+                        PickupOutcome::UpstreamUnavailable("mesh_unavailable"),
+                        Some(peer_node_id.clone()),
+                    ),
+                }
             }
-            PickupOutcome::BadHeaders(why)
-            | PickupOutcome::HeaderMismatch(why) => {
-                let body = format!("{{\"error\":\"{}\"}}", why);
-                return Ok(Response::builder()
-                    .status(status)
-                    .header("Content-Type", "application/json")
-                    .body(Either::Left(Full::new(Bytes::from(body))))
-                    .unwrap());
-            }
-            PickupOutcome::Unauthorized(_) | PickupOutcome::FramePurged => {
-                return Ok(Response::builder()
-                    .status(status)
-                    .header("Content-Type", "application/json")
-                    .body(Either::Left(Full::new(Bytes::from_static(b"{\"error\":\"pickup_denied\"}"))))
-                    .unwrap());
-            }
-        }
+        };
+
+        return Ok(pickup_outcome_to_response(outcome));
     }
 
     // GET /frames/<ref>?token=&exp=&ref= — addon-facing multi-use signed URL
