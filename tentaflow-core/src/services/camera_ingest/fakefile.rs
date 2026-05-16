@@ -77,6 +77,13 @@ impl FrameCounters {
         g.last_frame_at_unix_s = Some(ts_unix_s);
     }
 
+    /// Crate-visible alias for the private `increment` so sibling connector
+    /// modules (rtsp.rs, future onvif.rs) can publish frame counts through
+    /// the same primitive without re-implementing the lock dance.
+    pub(crate) fn increment_public(&self, ts_unix_s: u64) {
+        self.increment(ts_unix_s);
+    }
+
     pub fn snapshot(&self) -> (u64, u64, Option<u64>) {
         let g = self.inner.lock();
         (g.frames_total, g.frames_dropped, g.last_frame_at_unix_s)
