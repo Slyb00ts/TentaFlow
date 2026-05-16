@@ -15,24 +15,12 @@
   display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
   margin-bottom: 12px;
 }
-.svc-alias-filter-chip {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 10px; border-radius: 999px;
-  background: var(--bg-3); border: 1px solid var(--border);
-  color: var(--text-2); font-size: 11.5px; font-weight: 600;
-  cursor: pointer; user-select: none;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+/* Filter chips reuse <tf-chip clickable active>. The count is rendered inside
+ * the chip slot; we only need to style its weight/colour. tf-chip itself
+ * handles hover, focus ring, active background. */
+.svc-alias-chip-count {
+  font-weight: 400; opacity: 0.7; margin-left: 2px;
 }
-.svc-alias-filter-chip:hover { background: var(--bg-card-hover); color: var(--text); }
-.svc-alias-filter-chip.active {
-  background: var(--accent-glow);
-  border-color: var(--accent-1);
-  color: var(--accent-2);
-}
-.svc-alias-filter-chip .count {
-  font-weight: 400; color: var(--text-3); margin-left: 2px;
-}
-.svc-alias-filter-chip.active .count { color: var(--accent-2); }
 
 /* 7-column table */
 .svc-alias-grid {
@@ -116,6 +104,24 @@
   margin: 0;
   border-bottom: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 14px;
+  transition: border-left-color 0.2s;
+}
+/* Niezapisany draft — warning border + badge sygnalizuja ze D&D reorder lub
+ * inne zmiany nie zostaly jeszcze utrwalone przez Zapisz. */
+.svc-alias-edit.unsaved {
+  border-left-color: var(--warning);
+}
+.svc-alias-edit .unsaved-badge {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 }
 .svc-alias-edit .edit-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -160,8 +166,14 @@
 .svc-fallback-item.dragging { opacity: 0.45; }
 .svc-fallback-item .grip {
   width: 16px; height: 16px; color: var(--text-3); cursor: grab;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 3px; outline: none;
 }
 .svc-fallback-item .grip:active { cursor: grabbing; }
+.svc-fallback-item .grip:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-2);
+  color: var(--accent-2);
+}
 .svc-fallback-item .pos {
   font-family: ui-monospace, 'JetBrains Mono', monospace;
   font-size: 11px; color: var(--text-3); text-align: center;
