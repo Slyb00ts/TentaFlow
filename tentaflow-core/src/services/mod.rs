@@ -27,8 +27,10 @@ pub mod lifecycle;
 pub mod mesh_registry;
 pub mod pickup_tokens;
 pub mod ports;
+pub mod recording;
 pub mod registry;
 pub mod runtime;
+pub mod signed_urls;
 pub mod snapshot_builder;
 pub mod streaming;
 pub mod supervisor;
@@ -49,6 +51,8 @@ use std::sync::{Arc, OnceLock};
 static FRAME_STORAGE: OnceLock<Arc<frame_storage::FrameStorage>> = OnceLock::new();
 static STREAMING_BUS: OnceLock<Arc<streaming::StreamingBus>> = OnceLock::new();
 static PICKUP_TOKEN_ISSUER: OnceLock<Arc<pickup_tokens::PickupTokenIssuer>> = OnceLock::new();
+static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 
 pub fn frame_storage() -> &'static Arc<frame_storage::FrameStorage> {
     FRAME_STORAGE.get_or_init(|| Arc::new(frame_storage::FrameStorage::new(1024)))
@@ -60,4 +64,17 @@ pub fn streaming_bus() -> &'static Arc<streaming::StreamingBus> {
 
 pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
     PICKUP_TOKEN_ISSUER.get_or_init(|| Arc::new(pickup_tokens::PickupTokenIssuer::new()))
+}
+
+pub fn frame_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    FRAME_URL_ISSUER
+        .get_or_init(|| Arc::new(signed_urls::SignedUrlIssuer::new(signed_urls::UrlScope::FrameUrl)))
+}
+
+pub fn recording_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    RECORDING_URL_ISSUER.get_or_init(|| {
+        Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::Recording,
+        ))
+    })
 }
