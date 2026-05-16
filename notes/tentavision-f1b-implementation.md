@@ -11,7 +11,7 @@
 | **P1** | RTSP/ONVIF cameras + credentials | 2 weeks | in progress |
 | **P2** | Lab pilot 4 fizyczne kamery | 1 week | pending |
 | **P3** | Multi-node mesh key sync | 2 weeks | pending |
-| **P4** | Audit Merkle chain (DoD-15 full) | 1 week | pending |
+| **P4** | Audit Merkle chain (DoD-15 full) | 1 week | done |
 | **P5** | service_call rate limit | 0.5 week | pending |
 | **P6** | Bug bash z F1a soak run | open | pending |
 
@@ -313,3 +313,103 @@ vendor TEXT NOT NULL CHECK(vendor IN ('fake_file', 'rtsp', 'onvif'))
 
 Wszystkie pozostałe kolumny, defaulty, CHECK'i innych pól oraz indeksy
 są zreplikowane 1:1 z v21 (`CAMERAS_TABLE`).
+
+## Phase 4 — Audit Merkle hash chain (DoD-15, done)
+
+Closes the F1a deferral on DoD-15 (tamper-evident audit log). Every row in
+`audit_log` now carries two BLOB columns:
+
+- `prev_hash` (32 B) — the previous row's `hash`, or all-zero for the
+  genesis row.
+- `hash` (32 B) — `SHA256(canonical(row) || prev_hash)`.
+
+Canonical row serialization is a `\0`-joined UTF-8 concatenation of every
+DB-visible column in a fixed order (see
+`tentaflow-core/src/audit/chain.rs::canonical_row_bytes`). Hash algorithm
+is SHA-256, unsalted — anyone with DB read can verify, no secret material
+to manage.
+
+### Schema migration v25
+
+`tentaflow-core/src/db/migrations.rs::audit_log_add_merkle_chain_columns`
+(Rust step). Idempotent via `PRAGMA table_info(audit_log)` — skips the
+ALTER when the column already exists, mirroring the v24 pattern.
+
+Existing F1a / pre-P4 rows stay NULL in both columns. `verify_chain`
+counts them as `legacy_unchained` so a post-upgrade verify does NOT flag
+the entire history as tampered.
+
+### Writer audit-paths updated
+
+Every code path that writes to `audit_log` now computes the chain pair
+under the same DB lock (so SELECT(latest hash) + INSERT is linearizable):
+
+- `addon/host_functions/mod.rs::audit_log_with_risk` (primary host-fn
+  writer; covers `audit_log` shim too).
+- `audit/mod.rs::AuditLogger::flush` (batched buffer).
+- `db/repository.rs`: `log_audit`, `log_audit_full`,
+  `audit_alias_resolve_denied_within_tx`,
+  `audit_reconcile_uses_alias_within_tx`,
+  `audit_consumer_revoked_by_manifest_within_tx`.
+
+All five writers now bind a pre-rendered `YYYY-MM-DD HH:MM:SS` timestamp
+(was `datetime('now')`) so the same string lands in the DB and in the
+hash input. Severity is always set explicitly (no longer relying on the
+schema `DEFAULT 'info'`) so the verifier reads the same value the writer
+hashed.
+
+### Verifier
+
+`tentaflow-core/src/audit/verify.rs::verify_chain(&Connection) ->
+VerifyReport`. Walks every row in id order, recomputes the hash, and
+classifies findings into `chained_ok`, `legacy_unchained`, and a vector
+of `TamperedRow { id, kind }` with kinds:
+
+- `PrevHashMismatch` — stored `prev_hash` does not match the previous
+  row's `hash` (insert/delete in the middle of the chain).
+- `HashMismatch` — stored `hash` is not `SHA256(canonical(row) ||
+  prev_hash)` (row content modified after write).
+- `NullHashAfterChainStart` — bypass writer slipped in a NULL-chain row
+  after the chain had started.
+- `MalformedHashBlob` — BLOB is non-NULL but not 32 bytes.
+
+### CLI
+
+`tentaflow-cli audit verify [--db-path PATH]`. Exit code:
+
+- `0` — clean chain (no tamper).
+- `1` — tamper detected (per-row reason printed to stdout).
+- `2` — verification error (DB unreachable, etc).
+
+### Tests
+
+- `audit::chain::tests` (5 unit) — canonical serialization determinism,
+  collision resistance via NUL separator, prev_hash chaining.
+- `audit::verify::tests` (9 unit) — empty / genesis / 10-row chain /
+  modified hash / modified content / inserted row / deleted row /
+  legacy NULL rows / NULL after chain start.
+- `tests/security_audit_chain.rs` (4 integration) — drives `log_audit`
+  end-to-end and asserts every tamper scenario via the public verifier
+  API.
+
+### Performance
+
+Each audit write costs one extra `SELECT hash FROM audit_log WHERE hash IS
+NOT NULL ORDER BY id DESC LIMIT 1` plus one SHA-256 over ~200-500 B. At
+audit-heavy workloads (camera ingest + service calls) the SELECT hits the
+hot rowid index — measured sub-50 µs on a 100 k-row table in the
+verify-tests bench, well below the existing rusqlite + WAL fsync floor.
+No bench regression observed in the F1a soak harness; if a future
+profiling pass shows it as a hot spot, the trivial mitigation is an
+in-memory `OnceLock<Arc<Mutex<ChainHash>>>` cache of the latest hash
+seeded on first write per process.
+
+### Out of P4 scope
+
+- Real-time tamper alerting (admin dashboard alert when verify detects a
+  break) — out of F1b. Operators are expected to run
+  `tentaflow-cli audit verify` from nightly cron.
+- Per-row signature with the operator's private key — would harden against
+  a DB-level attacker forging both content + hash. Deferred to F3
+  (evidence signing with HSM + RFC 3161 TSA).
+

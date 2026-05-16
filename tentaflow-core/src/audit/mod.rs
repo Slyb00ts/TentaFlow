@@ -13,6 +13,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+pub mod chain;
+pub mod verify;
+
 // =============================================================================
 // RiskClass — klasyfikacja RODO wpisu audytowego (F1a §6.2.Y)
 // =============================================================================
@@ -278,10 +281,12 @@ impl AuditLogger {
             return;
         }
 
-        // W9: Przygotuj statement raz przed petla — unika parsowania SQL przy kazdym wpisie
+        // W9: Przygotuj statement raz przed petla — unika parsowania SQL przy kazdym wpisie.
+        // F1b P4: kazdy wiersz w aktywnym chain'ie musi miec policzone prev_hash/hash,
+        // wiec wstawiamy je takze tutaj (bufor `AuditLogger`).
         let mut stmt = match conn.prepare(
-            "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, risk_class, prev_hash, hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unclassified', ?9, ?10)"
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -293,8 +298,36 @@ impl AuditLogger {
 
         let mut inserted = 0u64;
         for entry in &entries {
+            let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+            let hash_input = chain::AuditRowHashInput {
+                user_id: entry.user_id,
+                addon_id: entry.addon_id.as_deref(),
+                instance_id: None,
+                action: &entry.action,
+                resource: entry.resource.as_deref(),
+                resource_type: None,
+                resource_id: None,
+                result: None,
+                error_message: None,
+                details: entry.details.as_deref(),
+                ip_address: entry.ip_address.as_deref(),
+                node_id: entry.node_id.as_deref(),
+                severity: Some("info"),
+                risk_class: "unclassified",
+                related_claim_id: None,
+                request_id: None,
+                timestamp: &timestamp,
+            };
+            let (prev_hash_blob, hash_blob) = match chain::compute_chain_for_insert(&conn, &hash_input) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Blad obliczenia hash audit chain: {}", e);
+                    continue;
+                }
+            };
+
             let result = stmt.execute(rusqlite::params![
-                entry.timestamp.to_rfc3339(),
+                timestamp,
                 entry.user_id,
                 entry.addon_id,
                 entry.action,
@@ -302,6 +335,8 @@ impl AuditLogger {
                 entry.details,
                 entry.ip_address,
                 entry.node_id,
+                prev_hash_blob,
+                hash_blob,
             ]);
 
             match result {

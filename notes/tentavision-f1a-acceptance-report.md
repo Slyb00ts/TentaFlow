@@ -191,13 +191,21 @@ nie ma jeszcze trigger paths w F1a kodzie (`PolicyClaimMissing`, `RateLimited`,
 
 ## DoD-15 — Audit chain verify (Merkle hash chain)
 
-**Status:** ⊘ DEFERRED do F1b
-**Weryfikacja:** F1a zapisuje `audit_log` rows z `risk_class` (kolumna v7
-schema) i `related_claim_id` przez `audit_log_with_risk`. Chain hash kolumna
-nie istnieje, brak `audit_verify_chain` API.
-**Notes:** Świadomy scope F1b (`tentavision-f1a-implementation.md` M1 DoD recap:
-"DoD-15 partial Audit chain — pełny risk_class_compute + chain verify zostaje
-w M3" — finalna decyzja przeniosła do F1b dla zachowania uczciwego scope F1a).
+**Status:** ✓ PASS (F1b P4, 2026-05-16)
+**Weryfikacja:** DB migration v25 dodaje `prev_hash` + `hash` (BLOB 32 B)
+do `audit_log`. Każdy production writer (`audit_log_with_risk`,
+`AuditLogger::flush`, `log_audit`, `log_audit_full`, trzy
+`audit_*_within_tx` w `db/repository.rs`) liczy
+`hash = SHA256(canonical(row) || prev_hash)` pod tym samym DB lock'iem.
+Verifier `audit::verify::verify_chain` zwraca `VerifyReport` z liczbą
+chained_ok / legacy_unchained / tampered (id + kind). CLI
+`tentaflow-cli audit verify` (exit 0/1/2).
+**Tests:** 14 unit (`audit::chain`, `audit::verify`) + 4 integration
+(`tests/security_audit_chain.rs`) — tamper przez UPDATE / DELETE / raw
+INSERT są wykrywane z konkretnym `TamperKind`.
+**Notes:** Wcześniejsze rowy F1a (NULL chain columns) liczone osobno
+jako `legacy_unchained` — nie flagowane jako tamper. Każdy nowy row
+musi mieć chain (sprawdzane przez `NullHashAfterChainStart`).
 
 ## DoD-16 — Migration apply idempotent
 
