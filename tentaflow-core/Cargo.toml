@@ -284,5 +284,17 @@ name = "recording_perf"
 harness = false
 required-features = ["camera"]
 
+[[bench]]
+name = "sql_host_perf"
+harness = false
+
+[[bench]]
+name = "migration_perf"
+harness = false
+
+[[bench]]
+name = "service_call_perf"
+harness = false
+
 [patch.crates-io]
 ed25519-dalek = { path = "../vendor/ed25519-dalek" }
