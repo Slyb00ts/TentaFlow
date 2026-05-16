@@ -656,7 +656,7 @@ Wszystkie krytyczne targety z `tentavision-plan.md` §17.8 spełnione z dwoma rz
 - Performance benchmarks (DoD-13): ✅ wszystkie metryki w targetach z marginesem
   - M1.W7 §17.8: pickup_token_issue, stream_next, pickup_roundtrip, service_call segment — PASS
   - M1.W8 §17.8: snapshot_save (282 µs / 3.12 ms ≪ 50 ms), signed URL issue/verify (300-360 ns ≪ 1 ms) — PASS
-- Coverage > 75% dla nowego kodu w M1: cumulative ~124 tests + 14 benchów obejmuje host functions ABI + e2e wire path + security/tamper/expiry/replay + perf. Detailed coverage measurement deferred do M3 (tarpaulin run + report).
+- Test-count coverage: cumulative ~131 tests + 14 benchów obejmuje host functions ABI + e2e wire path + security/tamper/expiry/replay + body-DoS + signed-URL strict-parse + perf. Numeric line/function coverage (`tarpaulin`) deferred do M3.W12.
 - 5 nowych sekcji w `docs/ADDON_HOST_FUNCTIONS.md`: **FLAG** — sekcje 13 (alias), 14 (streaming + service-to-core), 15 (camera ingest), 16 (recording + frame_url) zostają do uzupełnienia w M3.W12 (Doc pass). Plik istnieje, sekcje partial — nie blokuje M1 gate bo deliverable to backend, nie docs.
 
 **M1 DoD recap (M1.W4-W8):**
