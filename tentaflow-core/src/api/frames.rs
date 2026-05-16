@@ -74,21 +74,47 @@ pub struct FrameQuery {
     pub ref_param: Option<String>,
 }
 
-pub fn parse_query(raw: &str) -> FrameQuery {
+/// Strict parse. Duplicate keys, unknown keys, or a non-numeric `exp` all
+/// yield an error string suitable for a 400-class `error_message`.
+pub fn parse_query(raw: &str) -> std::result::Result<FrameQuery, &'static str> {
     let mut q = FrameQuery::default();
+    if raw.is_empty() {
+        return Ok(q);
+    }
     for piece in raw.split('&') {
+        if piece.is_empty() {
+            continue;
+        }
         let mut it = piece.splitn(2, '=');
         let k = it.next().unwrap_or("");
         let v = it.next().unwrap_or("");
-        let decoded = urlencoding::decode(v).map(|c| c.into_owned()).unwrap_or_else(|_| v.to_string());
+        let decoded = urlencoding::decode(v)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| v.to_string());
         match k {
-            "token" if q.token.is_none() => q.token = Some(decoded),
-            "exp" if q.exp_ms.is_none() => q.exp_ms = decoded.parse::<u64>().ok(),
-            "ref" if q.ref_param.is_none() => q.ref_param = Some(decoded),
-            _ => {}
+            "token" => {
+                if q.token.is_some() {
+                    return Err("duplicate_token");
+                }
+                q.token = Some(decoded);
+            }
+            "exp" => {
+                if q.exp_ms.is_some() {
+                    return Err("duplicate_exp");
+                }
+                let parsed: u64 = decoded.parse().map_err(|_| "invalid_exp")?;
+                q.exp_ms = Some(parsed);
+            }
+            "ref" => {
+                if q.ref_param.is_some() {
+                    return Err("duplicate_ref");
+                }
+                q.ref_param = Some(decoded);
+            }
+            _ => return Err("unknown_query_key"),
         }
     }
-    q
+    Ok(q)
 }
 
 pub fn handle_frame_url(
@@ -170,10 +196,17 @@ mod tests {
 
     #[test]
     fn test_parse_query_full() {
-        let q = parse_query("token=a&exp=99&ref=frame_xyz");
+        let q = parse_query("token=a&exp=99&ref=frame_xyz").expect("ok");
         assert_eq!(q.token.as_deref(), Some("a"));
         assert_eq!(q.exp_ms, Some(99));
         assert_eq!(q.ref_param.as_deref(), Some("frame_xyz"));
+    }
+
+    #[test]
+    fn test_parse_query_rejects_duplicate_and_unknown() {
+        assert_eq!(parse_query("token=a&token=b").unwrap_err(), "duplicate_token");
+        assert_eq!(parse_query("token=a&extra=x").unwrap_err(), "unknown_query_key");
+        assert_eq!(parse_query("token=a&exp=nope").unwrap_err(), "invalid_exp");
     }
 
     #[test]
