@@ -49,6 +49,7 @@ pub mod api;
 pub mod audit;
 pub mod auth;
 pub mod dispatch;
+pub mod util;
 
 pub mod addon;
 pub mod deploy;

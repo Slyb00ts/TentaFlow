@@ -10,11 +10,17 @@
 use tracing::{error, info, warn};
 
 use super::{
-    audit_log, check_permission, get_memory, read_guest_string, write_guest_output, AddonState,
-    WasmCaller, ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_ERR_RATE_LIMIT,
+    audit_log, audit_log_with_risk, check_permission, get_memory, read_guest_string,
+    write_guest_output, AddonState, WasmCaller, ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION,
+    ABI_ERR_PERMISSION, ABI_ERR_RATE_LIMIT,
 };
 
+use crate::addon::errors::AbiError;
 use crate::addon::rate_limiter::ResourceType;
+use crate::services::service_call_rate_limit::{
+    note_denial_for_audit, service_call_rate_limiter, AuditEmitDecision, RateLimitResult,
+    AUDIT_DENY_WINDOW,
+};
 
 // =============================================================================
 // service_request — wyslanie requestu do nazwanego serwisu przez QUIC
@@ -90,6 +96,38 @@ pub fn service_request(
     }
 
     let addon_id = caller.data().addon_id.clone();
+
+    // F1b §5 (P5) per-addon rate limit for `service_call_v1`. Default budget:
+    // 100 burst + 1000 req/min sustain. Denials emit a collapsed `audit_log`
+    // row (at most one per 60 s per addon, carrying the in-window count) and
+    // return `AbiError::QuotaExceeded` so the WASM caller can react.
+    match service_call_rate_limiter().check(&addon_id) {
+        RateLimitResult::Allow => {}
+        RateLimitResult::AddonLimit { retry_after_secs, .. } => {
+            if let AuditEmitDecision::Emit { denied_count } = note_denial_for_audit(&addon_id) {
+                let details = serde_json::json!({
+                    "reason": "rate_limit_exceeded",
+                    "retry_after_secs": retry_after_secs.ceil().max(1.0) as u64,
+                    "denied_count": denied_count,
+                    "window_secs": AUDIT_DENY_WINDOW.as_secs(),
+                    "service_name": service_name,
+                })
+                .to_string();
+                audit_log_with_risk(
+                    caller.data(),
+                    "service.request",
+                    Some("service"),
+                    Some(&service_name),
+                    crate::audit::RiskClass::C,
+                    None,
+                    None,
+                    "denied",
+                    Some(&details),
+                );
+            }
+            return AbiError::QuotaExceeded.into();
+        }
+    }
 
     // F1a §6.6 alias gate. `service_name` may be an alias resolving to a
     // backend service — apply the same visibility / addon_uses_alias check

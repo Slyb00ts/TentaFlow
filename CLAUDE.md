@@ -133,6 +133,17 @@ the next connect cycle. Unlike `TrustedKeysSync`, the HMAC advertise is
 `PeerConnected` re-advertises so a rotated key reaches peers on the
 first reconnect.
 
+### service_call rate limit (F1b P5)
+
+`service_call_v1` (host fn `service_request`) is rate-limited per addon:
+burst 100, sustain ~16.67 req/s (1000 req/min). Implementation in
+`src/services/service_call_rate_limit.rs`; limiter is a process-wide
+singleton sharing the `TokenBucket` primitive from `src/util/token_bucket.rs`
+with `api::rate_limit`. Denials return `AbiError::QuotaExceeded` (11) and
+emit at most one collapsed `audit_log` row per addon per 60 s window
+(`risk_class='C'`, `result='denied'`, `details.denied_count` carries the
+in-window total) — prevents an addon DoS from turning into an audit-log DoS.
+
 ### Logging warning
 
 NEVER enable hyper access logging (`RUST_LOG=hyper=debug`) in production without
