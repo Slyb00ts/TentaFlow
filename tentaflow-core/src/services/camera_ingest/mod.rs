@@ -6,12 +6,14 @@
 // via GStreamer) is supported in this chunk. Host-functions ABI, DB sync,
 // and streaming bus arrive in later chunks.
 
+pub mod credentials;
 pub mod error;
 pub mod fakefile;
 pub mod rtsp;
 pub mod session;
 pub mod supervisor;
 
+pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use error::{CameraIngestError, Result};
 pub use session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, CameraStatus, PixelFormat,
@@ -57,6 +59,7 @@ mod integration_tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -88,6 +91,7 @@ mod integration_tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -109,6 +113,7 @@ mod integration_tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .await
         .expect("add");
@@ -142,6 +147,7 @@ mod integration_tests {
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
+            credentials_encrypted: None,
         })
         .await
         .expect("add");

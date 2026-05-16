@@ -79,15 +79,39 @@ ustalona.
   Debian/Ubuntu — `gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
   gstreamer1.0-libav gstreamer1.0-rtsp`; macOS — `brew install gstreamer`.
 
-### P1.C — Credentials encryption (pending)
+### P1.C — Credentials encryption (in progress)
 
 **Scope:**
 - AES-GCM encrypt/decrypt dla `cameras.credentials_encrypted` z kluczem
-  z `~/.tentaflow/keys/cameras.key` (256-bit, generowany przy pierwszym
+  z `<tentaflow_home>/keys/cameras.key` (256-bit, generowany przy pierwszym
   uruchomieniu, rotacja przez CLI).
 - Real implementacja `camera_credentials_rotate_v1` (F1a noop).
-- CLI: `tentaflow-cli keys rotate --scope cameras`.
-- Audit row w `audit_log` z `risk_class='B'` przy każdej rotacji.
+- CLI: `tentaflow-cli camera rotate-key`.
+- Audit row w `audit_log` z `risk_class='A'` przy każdej rotacji (kontekst:
+  zmiana sekretów RTSP).
+
+**Status:**
+- `services::camera_ingest::credentials` — AES-256-GCM cipher (nonce 12B,
+  tag 16B), `load_or_generate()` z atomic write + 0o600 na Unix. Env
+  override `TENTAFLOW_CAMERAS_KEY`. Singleton `credentials_cipher()`.
+- `camera_add_v1` przyjmuje optional `credentials_b64` (base64 z `user:pass`),
+  walidacja długości + separator, encrypt z master key, store w
+  `cameras.credentials_encrypted`.
+- RTSP connector dekryptuje przed każdym `build_rtsp_pipeline`; helper
+  `overlay_credentials(url, "user:pass")` odmawia overlay gdy URL już
+  zawiera credentials.
+- `camera_credentials_rotate_v1` — real: walidacja b64, encrypt z bieżącym
+  master key, `set_camera_credentials_encrypted` (UPDATE z ownership guard),
+  audit `result=ok` z `details=blob_len=X cleared=bool` (nigdy plaintext).
+- CLI `tentaflow-cli camera rotate-key`: generuje nowy klucz, walk
+  `list_all_camera_credentials_blobs`, re-encrypt każdy blob w transakcji
+  (`replace_camera_credentials_blobs`), archiwum starego klucza jako
+  `cameras.key.YYYYMMDD-HHMMSS`, atomic rename nowego klucza.
+- DB: nowe helpery `set_camera_credentials_encrypted`,
+  `list_all_camera_credentials_blobs`, `replace_camera_credentials_blobs`.
+  `CameraRow` + `insert_camera` rozszerzone o `credentials_encrypted`.
+- Testy: 13 unit (credentials.rs::tests) + 6 integration
+  (tests/credentials_rotation.rs) — wszystkie zielone.
 
 ### P1.D — ONVIF discovery (pending)
 
