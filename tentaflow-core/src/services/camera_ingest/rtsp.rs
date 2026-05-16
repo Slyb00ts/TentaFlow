@@ -19,6 +19,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use rand::RngExt;
+use regex::Regex;
+use std::sync::OnceLock;
 use tokio::sync::{mpsc, watch};
 
 use super::error::{CameraIngestError, Result};
@@ -49,6 +51,32 @@ impl Default for ReconnectPolicy {
             max_attempts: None,
         }
     }
+}
+
+/// Replace `user:password` credentials in an RTSP URL with `***:***`.
+/// Operates on the canonical `rtsp[s]://[user[:pass]@]host[:port]/path` form
+/// and is safe to call on already-redacted or scheme-less strings (those are
+/// returned unchanged or passed through the regex-based fallback).
+pub fn redact_rtsp_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            let host_part = &after_scheme[at_pos..];
+            return format!("{}://***:***{}", &url[..scheme_end], host_part);
+        }
+    }
+    url.to_string()
+}
+
+/// Redact any RTSP credentials embedded inside a free-form string (e.g. a
+/// GStreamer error message that quoted the original location). Anchored on
+/// `rtsp://` or `rtsps://` followed by anything up to `@`.
+pub fn redact_url_in_text(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(rtsps?)://[^@\s/]+@").expect("redact regex must compile")
+    });
+    re.replace_all(text, "$1://***:***@").into_owned()
 }
 
 /// Compute the next sleep duration before a reconnect attempt. Pure function
@@ -90,7 +118,8 @@ pub fn validate_rtsp_url(url: &str) -> Result<()> {
     // Accept rtsp:// and rtsps:// (TLS) — both are routed through rtspsrc.
     if !(url.starts_with("rtsp://") || url.starts_with("rtsps://")) {
         return Err(CameraIngestError::InvalidUrl(format!(
-            "missing rtsp:// or rtsps:// scheme: {url}"
+            "missing rtsp:// or rtsps:// scheme: {}",
+            redact_rtsp_url(url)
         )));
     }
     // After the scheme there must be at least one host character.
@@ -100,7 +129,8 @@ pub fn validate_rtsp_url(url: &str) -> Result<()> {
         .unwrap_or("");
     if after_scheme.is_empty() {
         return Err(CameraIngestError::InvalidUrl(format!(
-            "missing host: {url}"
+            "missing host: {}",
+            redact_rtsp_url(url)
         )));
     }
     Ok(())
@@ -192,14 +222,18 @@ pub fn build_rtsp_pipeline(
             return;
         }
         // Filter on media=video so audio/metadata streams do not get wired
-        // into the H.264 decoder.
-        if let Some(caps) = src_pad.current_caps() {
-            if let Some(s) = caps.structure(0) {
-                let media: std::result::Result<String, _> = s.get("media");
-                if media.as_deref().ok() != Some("video") {
-                    return;
-                }
-            }
+        // into the H.264 decoder. Default-deny: if caps are missing or the
+        // `media` field is unreadable, refuse the link instead of forwarding
+        // arbitrary payloads to the H.264 path.
+        let Some(caps) = src_pad.current_caps() else {
+            return;
+        };
+        let Some(structure) = caps.structure(0) else {
+            return;
+        };
+        let media: Option<String> = structure.get::<String>("media").ok();
+        if media.as_deref() != Some("video") {
+            return;
         }
         if let Err(e) = src_pad.link(&sink_pad) {
             tracing::warn!("rtsp: failed to link rtspsrc → depay: {e:?}");
@@ -297,7 +331,7 @@ pub async fn run_rtsp_session(
         ) {
             Ok(p) => p,
             Err(e) => {
-                let reason = format!("build failed: {e}");
+                let reason = redact_url_in_text(&format!("build failed: {e}"));
                 publish(
                     &health_tx,
                     &cam_id,
@@ -313,35 +347,39 @@ pub async fn run_rtsp_session(
         };
 
         if let Err(e) = pipeline.set_state(gst::State::Playing) {
-            let reason = format!("set_state(Playing) failed: {e}");
-            publish(
-                &health_tx,
-                &cam_id,
-                CameraStatus::Error,
-                Some(reason.clone()),
-                &counters,
-                None,
-            );
+            let raw_reason = format!("set_state(Playing) failed: {e}");
+            let reason = redact_url_in_text(&raw_reason);
             let _ = pipeline.set_state(gst::State::Null);
             streaming_bus().close_camera(&cam_id, &reason).await;
             // A pure state-set failure is recoverable in principle, but it
             // usually means a misconfigured element — fall into the
             // reconnect path so the operator's intervention (e.g. fixing
             // the URL) is observed without a process restart.
-            if !sleep_with_cancel(&mut cmd_rx, &health_tx, jittered(&policy, backoff)).await {
-                return;
-            }
             attempt = attempt.saturating_add(1);
             if reached_max(&policy, attempt) {
                 publish(
                     &health_tx,
                     &cam_id,
                     CameraStatus::Error,
-                    Some("max reconnect attempts exceeded".into()),
+                    Some(format!("max reconnect attempts exceeded: {reason}")),
                     &counters,
                     None,
                 );
                 drain_until_stop(&mut cmd_rx, &health_tx).await;
+                return;
+            }
+            let wait = jittered(&policy, backoff);
+            publish(
+                &health_tx,
+                &cam_id,
+                CameraStatus::Starting,
+                Some(format!(
+                    "reconnect attempt {attempt} in {wait:?}: {reason}"
+                )),
+                &counters,
+                None,
+            );
+            if !sleep_with_cancel(&mut cmd_rx, &health_tx, wait).await {
                 return;
             }
             backoff = next_backoff(backoff, policy.max_backoff);
@@ -424,12 +462,12 @@ pub async fn run_rtsp_session(
                                 break;
                             }
                             MessageView::Error(err) => {
-                                let text = format!(
+                                let raw = format!(
                                     "{} ({})",
                                     err.error(),
                                     err.debug().unwrap_or_default()
                                 );
-                                terminate = Some(text);
+                                terminate = Some(redact_url_in_text(&raw));
                                 break;
                             }
                             _ => {}
@@ -484,7 +522,9 @@ pub async fn run_rtsp_session(
 
         // Pipeline failed — tear it down and schedule a reconnect.
         let _ = pipeline.set_state(gst::State::Null);
-        let reason = inner_reason.unwrap_or_else(|| "unknown pipeline failure".into());
+        let reason = redact_url_in_text(
+            &inner_reason.unwrap_or_else(|| "unknown pipeline failure".into()),
+        );
         tracing::warn!(camera_id = %cam_id, reason = %reason, "rtsp pipeline failed; reconnecting");
         streaming_bus().close_camera(&cam_id, &reason).await;
 
@@ -719,6 +759,66 @@ mod tests {
         assert_eq!(p.max_backoff, Duration::from_secs(60));
         assert!((p.jitter_pct - 0.20).abs() < 1e-9);
         assert!(p.max_attempts.is_none());
+    }
+
+    #[test]
+    fn redact_rtsp_url_strips_credentials() {
+        assert_eq!(
+            redact_rtsp_url("rtsp://alice:s3cret@cam.local:554/h264"),
+            "rtsp://***:***@cam.local:554/h264"
+        );
+        assert_eq!(
+            redact_rtsp_url("rtsps://bob:p%40ss@10.0.0.5/stream"),
+            "rtsps://***:***@10.0.0.5/stream"
+        );
+        // No credentials → unchanged.
+        assert_eq!(
+            redact_rtsp_url("rtsp://cam.local/stream"),
+            "rtsp://cam.local/stream"
+        );
+        // Non-rtsp scheme → unchanged (caller's responsibility to validate).
+        assert_eq!(redact_rtsp_url("http://x/y"), "http://x/y");
+    }
+
+    #[test]
+    fn redact_url_in_text_handles_embedded_url() {
+        let err = "rtspsrc: could not open resource: rtsp://u:p@cam:554/x (server unreachable)";
+        let out = redact_url_in_text(err);
+        assert!(!out.contains("u:p"), "credentials leaked: {out}");
+        assert!(out.contains("rtsp://***:***@cam:554/x"));
+    }
+
+    #[test]
+    fn validate_rtsp_url_error_does_not_leak_credentials() {
+        // rtsp:// with empty host is rejected — the formatted error must not
+        // echo any credentials should the caller pass an oddly-shaped URL.
+        let err = validate_rtsp_url("rtsp://").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("password"), "leaked: {msg}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sleep_with_cancel_responds_to_stop_during_backoff() {
+        let (tx, mut rx) = mpsc::channel::<SessionCommand>(4);
+        let (htx, _hrx) = watch::channel(CameraHealth::initial("cam_test"));
+        let cancel_after = Duration::from_millis(100);
+        let total_wait = Duration::from_secs(30);
+
+        let cancel_tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(cancel_after).await;
+            let _ = cancel_tx.send(SessionCommand::Stop).await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let completed = sleep_with_cancel(&mut rx, &htx, total_wait).await;
+        let elapsed = start.elapsed();
+        assert!(!completed, "sleep_with_cancel must return false on Stop");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop should interrupt backoff promptly, took {elapsed:?}"
+        );
+        drop(tx);
     }
 
     #[test]

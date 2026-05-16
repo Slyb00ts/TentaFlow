@@ -272,8 +272,8 @@ async fn supervisor_rejects_unsupported_vendor() {
     let err = sup
         .add_camera(CameraConfig {
             camera_id: id,
-            vendor: "rtsp".into(),
-            url: "rtsp://example/foo".into(),
+            vendor: "onvif".into(),
+            url: "http://example/onvif/device_service".into(),
             target_fps: 30,
             resolution: None,
             owner_addon_id: None,
