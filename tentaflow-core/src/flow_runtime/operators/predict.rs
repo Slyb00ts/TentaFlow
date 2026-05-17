@@ -4,8 +4,13 @@
 //
 // Per-record dispatch over `services::service_call::dispatch`. The operator
 // owns the alias resolve and the response→record merge; the dispatch layer
-// owns permission/rate-limit/audit/pickup-token semantics so this operator
-// stays minimal.
+// owns permission/rate-limit/audit/pickup-token semantics.
+//
+// The alias resolve happens per record (not once at start) so a midstream
+// alias revoke is observed on the very next record — closing a TOCTOU
+// window where `dispatch` would otherwise fall back to a same-named live
+// service when the alias becomes `Ok(None)`. The first record's resolve
+// also serves as the fail-fast check on bad params.
 //
 // Errors are classified once:
 //   * Alias not found / inactive  → `AliasNotFound` / `AliasInactive`
@@ -41,53 +46,6 @@ pub async fn run(
     let on_error = OnError::from_params(&ctx.params, OnError::Fail);
     let timeout_ms = timeout_ms_from_params(&ctx.params);
 
-    // Resolve once at start so a missing alias fails fast before pulling
-    // records. `Ok(None)` means the alias does not exist; `Err(...)` carries
-    // the permission-denied variant separately.
-    match crate::db::repository::resolve_model_alias_for_addon(
-        &ctx.db,
-        &alias,
-        Some(&ctx.addon_id),
-        Some("flow.op.predict"),
-        None,
-    ) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            emit_op_audit(
-                &ctx.db,
-                &ctx.addon_id,
-                &ctx.flow_id,
-                &ctx.invocation_id,
-                &ctx.operator_id,
-                "predict",
-                "error",
-                "error",
-                Some(serde_json::json!({"reason": "alias_not_found", "alias": alias})),
-            );
-            close_outbound(&outbound);
-            return Err(OperatorError::AliasNotFound(alias));
-        }
-        Err(e) => {
-            if e.downcast_ref::<AliasPermissionDenied>().is_some() {
-                emit_op_audit(
-                    &ctx.db,
-                    &ctx.addon_id,
-                    &ctx.flow_id,
-                    &ctx.invocation_id,
-                    &ctx.operator_id,
-                    "predict",
-                    "error",
-                    "error",
-                    Some(serde_json::json!({"reason": "alias_inactive", "alias": alias})),
-                );
-                close_outbound(&outbound);
-                return Err(OperatorError::AliasInactive(alias));
-            }
-            close_outbound(&outbound);
-            return Err(OperatorError::Internal(format!("alias_gate: {e}")));
-        }
-    }
-
     let caller = ctx.caller();
     let mut eof_received = vec![false; inbound.len()];
     let mut ok_count: u64 = 0;
@@ -102,6 +60,110 @@ pub async fn run(
                 return Ok(());
             }
             Some(Ok(record)) => {
+                // Per-record alias resolve closes the TOCTOU window: a
+                // revoke that lands between record N and N+1 must reject
+                // record N+1 even though the operator already started.
+                // `Ok(None)` from resolve means the alias no longer exists
+                // — without this check `dispatch` would treat the name as
+                // a concrete service and call it directly.
+                match crate::db::repository::resolve_model_alias_for_addon(
+                    &ctx.db,
+                    &alias,
+                    Some(&ctx.addon_id),
+                    Some("flow.op.predict"),
+                    None,
+                ) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        err_count += 1;
+                        emit_op_audit(
+                            &ctx.db,
+                            &ctx.addon_id,
+                            &ctx.flow_id,
+                            &ctx.invocation_id,
+                            &ctx.operator_id,
+                            "predict",
+                            "alias_check_failed",
+                            "error",
+                            Some(serde_json::json!({
+                                "reason": "alias_not_found",
+                                "alias": alias,
+                            })),
+                        );
+                        match on_error {
+                            OnError::Skip => continue,
+                            OnError::EmitNull => {
+                                let mut wrap = match record {
+                                    toml::Value::Table(t) => t,
+                                    other => {
+                                        let mut t = toml::value::Table::new();
+                                        t.insert("input".to_string(), other);
+                                        t
+                                    }
+                                };
+                                wrap.insert(
+                                    "prediction".to_string(),
+                                    toml::Value::Table(toml::value::Table::new()),
+                                );
+                                for (_, edge) in &outbound {
+                                    edge.send(FlowMessage::Record(toml::Value::Table(wrap.clone())));
+                                }
+                                continue;
+                            }
+                            OnError::Fail => {
+                                close_outbound(&outbound);
+                                return Err(OperatorError::AliasNotFound(alias));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.downcast_ref::<AliasPermissionDenied>().is_some() {
+                            err_count += 1;
+                            emit_op_audit(
+                                &ctx.db,
+                                &ctx.addon_id,
+                                &ctx.flow_id,
+                                &ctx.invocation_id,
+                                &ctx.operator_id,
+                                "predict",
+                                "alias_check_failed",
+                                "error",
+                                Some(serde_json::json!({
+                                    "reason": "permission_denied",
+                                    "alias": alias,
+                                })),
+                            );
+                            match on_error {
+                                OnError::Skip => continue,
+                                OnError::EmitNull => {
+                                    let mut wrap = match record {
+                                        toml::Value::Table(t) => t,
+                                        other => {
+                                            let mut t = toml::value::Table::new();
+                                            t.insert("input".to_string(), other);
+                                            t
+                                        }
+                                    };
+                                    wrap.insert(
+                                        "prediction".to_string(),
+                                        toml::Value::Table(toml::value::Table::new()),
+                                    );
+                                    for (_, edge) in &outbound {
+                                        edge.send(FlowMessage::Record(toml::Value::Table(wrap.clone())));
+                                    }
+                                    continue;
+                                }
+                                OnError::Fail => {
+                                    close_outbound(&outbound);
+                                    return Err(OperatorError::AliasInactive(alias));
+                                }
+                            }
+                        }
+                        close_outbound(&outbound);
+                        return Err(OperatorError::Internal(format!("alias_gate: {e}")));
+                    }
+                }
+
                 let payload_json = toml_to_json(&record).to_string();
                 let req = ServiceCallRequest {
                     caller: caller.clone(),
