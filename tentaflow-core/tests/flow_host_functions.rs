@@ -168,6 +168,7 @@ async fn flow_invoke_not_found_for_unknown_flow_id() {
                 "ghost-flow",
                 toml::Value::Table(Default::default()),
                 0,
+                None,
             )
         }
     })
@@ -196,6 +197,7 @@ async fn flow_invoke_sync_returns_completed_within_wait_ms() {
                 &flow_id,
                 toml::Value::String("payload".into()),
                 5_000,
+                None,
             )
         }
     })
@@ -226,6 +228,7 @@ async fn flow_invoke_async_returns_running_when_wait_ms_zero() {
                 &flow_id,
                 toml::Value::Table(Default::default()),
                 0,
+                None,
             )
         }
     })
@@ -262,6 +265,7 @@ async fn flow_status_cross_addon_returns_not_found() {
                 &flow_id,
                 toml::Value::Table(Default::default()),
                 5_000,
+                None,
             )
         }
     })
@@ -300,6 +304,7 @@ async fn flow_cancel_marks_invocation_cancelled() {
                 &flow_id,
                 toml::Value::Table(Default::default()),
                 0,
+                None,
             )
         }
     })
@@ -347,6 +352,7 @@ async fn flow_invoke_concurrency_cap_quota_exceeded() {
                     &flow_id,
                     toml::Value::Integer(i as i64),
                     10_000,
+                    None,
                 )
             })
             .await

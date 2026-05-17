@@ -247,7 +247,12 @@ pub fn dispatch_invoke(
         return DispatchOutcome::Err(AbiError::Permission);
     }
 
-    match run_invoke(scheduler, &state.addon_id, &input.flow_id, input.input.clone(), input.wait_ms) {
+    // P7: per-user audit attribution — propagate the operator's user_id from
+    // AddonState into flow_invocations so DoD-9 / DoD-10 reports can attribute
+    // the invocation to the human actor instead of `actor=system`. System
+    // callers (is_system_call=true with no user_id) record NULL.
+    let actor_user_id = state.user_id;
+    match run_invoke(scheduler, &state.addon_id, &input.flow_id, input.input.clone(), input.wait_ms, actor_user_id) {
         Ok(out) => {
             audit(
                 state,
@@ -280,9 +285,10 @@ pub fn run_invoke(
     flow_id: &str,
     input: toml::Value,
     wait_ms: u32,
+    actor_user_id: Option<i64>,
 ) -> Result<FlowInvocationOutput, (AbiError, &'static str)> {
     let wait_ms = wait_ms.min(MAX_SYNC_WAIT_MS);
-    let res = block_on_runtime(scheduler.invoke(addon_id, flow_id, input, wait_ms));
+    let res = block_on_runtime(scheduler.invoke(addon_id, flow_id, input, wait_ms, actor_user_id));
     match res {
         Ok(status) => Ok(FlowInvocationOutput::from(status)),
         Err(e) => Err(map_invoke_error(&e)),
