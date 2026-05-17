@@ -67,6 +67,11 @@ pub struct OperatorContext {
     /// Shared collector for Sink kind="invocation_result". The scheduler
     /// owns the Vec; every Sink task appends into it.
     pub sink_outputs: Arc<AsyncMutex<Vec<toml::Value>>>,
+    /// Tenant scope for SQL sinks, audit rows, and any per-org subsystem the
+    /// operator touches. `None` when the invocation was started outside a
+    /// resolved OrgContext (legacy host-fn callers, boot recovery sweeps);
+    /// SQL sink falls back to `org-default` with a warn in that case.
+    pub org_id: Option<String>,
 }
 
 impl OperatorContext {
@@ -76,7 +81,7 @@ impl OperatorContext {
             user_id: None,
             instance_id: None,
             is_system_call: true,
-            org_id: None,
+            org_id: self.org_id.clone(),
         }
     }
 }
@@ -241,6 +246,7 @@ pub fn emit_op_audit(
     outcome: &str,
     result: &str,
     details: Option<serde_json::Value>,
+    org_id: Option<&str>,
 ) {
     let action = format!("flow.op.{op_name}.{outcome}");
     let conn = match db.lock() {
@@ -294,12 +300,13 @@ pub fn emit_op_audit(
             return;
         }
     };
+    let org_for_row = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let _ = conn.execute(
         "INSERT INTO audit_log \
             (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-             result, error_message, severity, risk_class, details, prev_hash, hash) \
-         VALUES (?1, NULL, ?2, ?3, 'flow', ?4, ?5, NULL, 'info', 'C', ?6, ?7, ?8)",
-        rusqlite::params![timestamp, addon_id, action, flow_id, result, details_json, prev_hash, hash],
+             result, error_message, severity, risk_class, details, prev_hash, hash, org_id) \
+         VALUES (?1, NULL, ?2, ?3, 'flow', ?4, ?5, NULL, 'info', 'C', ?6, ?7, ?8, ?9)",
+        rusqlite::params![timestamp, addon_id, action, flow_id, result, details_json, prev_hash, hash, org_for_row],
     );
 }
 

@@ -133,12 +133,26 @@ pub async fn run(
                         let q = query.as_deref().unwrap();
                         let (sql, params_vec) = substitute_placeholders(q, &record);
                         let addon_id = ctx.addon_id.clone();
-                        // Flow operators run system-side; per-org pinning will
-                        // arrive in P1.c when the flow scheduler threads
-                        // OrgContext from the invoking handler. For now we
-                        // default to `org-default` so single-tenant nodes
-                        // keep working.
-                        let org_id = crate::services::org::DEFAULT_ORG_ID.to_string();
+                        // Prefer the org the invocation was started under;
+                        // fall back to `org-default` (with a one-line warn)
+                        // when the scheduler had no resolved OrgContext —
+                        // e.g. legacy host-fn callers or boot recovery
+                        // sweeps. Single-tenant nodes keep working without
+                        // any config change.
+                        let org_id = match ctx.org_id.as_deref() {
+                            Some(o) => o.to_string(),
+                            None => {
+                                tracing::warn!(
+                                    "flow_runtime sink sql_exec: addon='{}' flow='{}' inv='{}' \
+                                     has no org_id — falling back to '{}'",
+                                    ctx.addon_id,
+                                    ctx.flow_id,
+                                    ctx.invocation_id,
+                                    crate::services::org::DEFAULT_ORG_ID
+                                );
+                                crate::services::org::DEFAULT_ORG_ID.to_string()
+                            }
+                        };
                         // `exec_for_addon` is sync and can block for up to the
                         // 30 s SQL watchdog; without `spawn_blocking` the
                         // current tokio worker is pinned and `cancel` cannot
@@ -197,6 +211,7 @@ pub async fn run(
                             "ok",
                             "ok",
                             Some(json!({"kind": kind_str})),
+                            ctx.org_id.as_deref(),
                         );
                     }
                     Err(e) => {
@@ -211,6 +226,7 @@ pub async fn run(
                             "error",
                             "error",
                             Some(json!({"kind": kind_str, "reason": e})),
+                            ctx.org_id.as_deref(),
                         );
                         // PM rule: Sink always Skip on error — flow continues.
                     }
@@ -230,6 +246,7 @@ pub async fn run(
         "completed",
         "ok",
         Some(json!({"kind": kind_str, "ok_count": ok_count, "err_count": err_count})),
+        ctx.org_id.as_deref(),
     );
     Ok(())
 }
