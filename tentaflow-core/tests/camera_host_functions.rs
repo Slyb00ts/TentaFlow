@@ -110,7 +110,7 @@ fn db_update_patches_only_provided_fields() {
         retention_class: Some("B".into()),
         ..Default::default()
     };
-    assert!(update_camera(&db, "addon-a", "cam_u", &patch).expect("update"));
+    assert!(update_camera(&db, "addon-a", "cam_u", &patch, None).expect("update"));
     let row = get_camera_for_addon(&db, "addon-a", "cam_u", None).unwrap().unwrap();
     assert_eq!(row.display_name, "new name");
     assert_eq!(row.target_fps, 15);
@@ -128,7 +128,7 @@ fn db_update_foreign_owner_does_not_match() {
         display_name: Some("hijack".into()),
         ..Default::default()
     };
-    assert!(!update_camera(&db, "addon-b", "cam_u2", &patch).expect("update"));
+    assert!(!update_camera(&db, "addon-b", "cam_u2", &patch, None).expect("update"));
     let row = get_camera_for_addon(&db, "addon-a", "cam_u2", None).unwrap().unwrap();
     assert_eq!(row.display_name, "display");
 }
@@ -137,7 +137,7 @@ fn db_update_foreign_owner_does_not_match() {
 fn db_soft_delete_then_get_returns_none() {
     let db = make_db();
     insert(&db, "cam_s", "addon-a", "/tmp/s.mp4");
-    assert!(soft_delete_camera(&db, "addon-a", "cam_s").expect("delete"));
+    assert!(soft_delete_camera(&db, "addon-a", "cam_s", None).expect("delete"));
     let row = get_camera_for_addon(&db, "addon-a", "cam_s", None).unwrap();
     assert!(row.is_none(), "soft-deleted row must not appear in active queries");
 }
@@ -146,8 +146,8 @@ fn db_soft_delete_then_get_returns_none() {
 fn db_soft_delete_idempotent_for_already_removed() {
     let db = make_db();
     insert(&db, "cam_s2", "addon-a", "/tmp/s2.mp4");
-    assert!(soft_delete_camera(&db, "addon-a", "cam_s2").unwrap());
-    assert!(!soft_delete_camera(&db, "addon-a", "cam_s2").unwrap());
+    assert!(soft_delete_camera(&db, "addon-a", "cam_s2", None).unwrap());
+    assert!(!soft_delete_camera(&db, "addon-a", "cam_s2", None).unwrap());
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn db_re_insert_after_soft_delete_allowed_by_partial_unique_index() {
     // re-using the same camera_id after a soft-delete must be accepted.
     let db = make_db();
     insert(&db, "cam_recycle", "addon-a", "/tmp/r.mp4");
-    soft_delete_camera(&db, "addon-a", "cam_recycle").unwrap();
+    soft_delete_camera(&db, "addon-a", "cam_recycle", None).unwrap();
     // Second insert must succeed.
     insert(&db, "cam_recycle", "addon-a", "/tmp/r2.mp4");
     let row = get_camera_for_addon(&db, "addon-a", "cam_recycle", None).unwrap().unwrap();
@@ -518,7 +518,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
     .expect("first add");
 
     // Soft-delete row first (mirrors host fn camera_remove order).
-    assert!(soft_delete_camera(&db, "addon-recycle", &id).expect("soft delete"));
+    assert!(soft_delete_camera(&db, "addon-recycle", &id, None).expect("soft delete"));
     sup.remove_camera(&id).await.expect("remove");
 
     // Re-insert with same id must succeed (partial unique index).

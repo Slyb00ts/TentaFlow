@@ -328,6 +328,7 @@ async fn save_and_register(
         saved.pixel_format.as_deref(),
         &saved.hash_sha256,
         "B",
+        None,
     )
     .expect("insert");
 

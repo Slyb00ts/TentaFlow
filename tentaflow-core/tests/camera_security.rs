@@ -223,7 +223,7 @@ fn cross_addon_soft_delete_no_op_for_foreign_owner() {
     let db = make_db();
     let id = uniq("cam_iso_del");
     insert(&db, &id, "addon-a", "/tmp/a.mp4");
-    let removed = soft_delete_camera(&db, "addon-b", &id).unwrap();
+    let removed = soft_delete_camera(&db, "addon-b", &id, None).unwrap();
     assert!(!removed, "foreign soft-delete must be no-op");
     let mine = get_camera_for_addon(&db, "addon-a", &id, None).unwrap();
     assert!(mine.is_some(), "owner's camera survives foreign delete attempt");

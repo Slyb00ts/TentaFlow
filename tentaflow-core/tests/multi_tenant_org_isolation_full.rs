@@ -151,6 +151,134 @@ fn vector_namespace_get_returns_not_found_for_cross_org_lookup() {
     );
 }
 
+// Helper: inserts one recording row for `(addon_id, ref, org_id)`. Keeps the
+// recording tests below short and self-documenting.
+fn insert_recording_in_org(
+    pool: &DbPool,
+    addon_id: &str,
+    recording_ref: &str,
+    camera_id: &str,
+    org_id: &str,
+) -> i64 {
+    repo::insert_recording(
+        pool,
+        recording_ref,
+        "snapshot",
+        addon_id,
+        camera_id,
+        "/tmp/r.png",
+        128,
+        None,
+        Some(16),
+        Some(12),
+        Some("rgb24"),
+        "deadbeef",
+        "B",
+        Some(org_id),
+    )
+    .expect("insert_recording ok")
+}
+
+#[test]
+fn recording_get_returns_none_for_cross_org_lookup() {
+    let (_d, pool) = open_pool();
+    // Same addon_id present in both orgs (worst-case for the SQL filter).
+    insert_recording_in_org(&pool, "vision-adr", "snap_a", "cam-1", "org-a");
+    insert_recording_in_org(&pool, "vision-adr", "snap_b", "cam-1", "org-b");
+
+    // Caller in org B asking for the org-A ref must get None — not the row.
+    let row_b = repo::get_recording_for_addon(&pool, "vision-adr", "snap_a", Some("org-b"))
+        .expect("get ok");
+    assert!(row_b.is_none(), "cross-org get leaked the org-A recording");
+
+    // Sanity: org-A caller sees its own row.
+    let row_a = repo::get_recording_for_addon(&pool, "vision-adr", "snap_a", Some("org-a"))
+        .expect("get ok")
+        .expect("row present");
+    assert_eq!(row_a.recording_ref, "snap_a");
+}
+
+#[test]
+fn recording_purge_does_not_affect_other_org() {
+    let (_d, pool) = open_pool();
+    insert_recording_in_org(&pool, "vision-adr", "snap_a", "cam-1", "org-a");
+    insert_recording_in_org(&pool, "vision-adr", "snap_b", "cam-1", "org-b");
+
+    // Org-B tries to soft-delete a ref that only exists in org-A. Must be a
+    // no-op (0 rows touched) — the WHERE clause filters on org_id.
+    let touched = repo::soft_delete_recording(&pool, "vision-adr", "snap_a", Some("org-b"))
+        .expect("delete ok");
+    assert!(!touched, "cross-org purge must not touch the org-A row");
+
+    // The org-A row is still live.
+    let still = repo::get_recording_for_addon(&pool, "vision-adr", "snap_a", Some("org-a"))
+        .expect("get ok");
+    assert!(still.is_some(), "org-A row must survive the cross-org purge");
+
+    // The org-B row is also untouched (sanity for the test setup).
+    let other = repo::get_recording_for_addon(&pool, "vision-adr", "snap_b", Some("org-b"))
+        .expect("get ok");
+    assert!(other.is_some());
+}
+
+#[test]
+fn recording_stats_for_addon_are_org_scoped() {
+    let (_d, pool) = open_pool();
+    insert_recording_in_org(&pool, "vision-adr", "snap_a1", "cam-1", "org-a");
+    insert_recording_in_org(&pool, "vision-adr", "snap_a2", "cam-1", "org-a");
+    insert_recording_in_org(&pool, "vision-adr", "snap_b1", "cam-1", "org-b");
+
+    let agg_a = repo::recording_stats_for_addon(&pool, "vision-adr", None, Some("org-a"))
+        .expect("stats ok");
+    assert_eq!(agg_a.total_snapshots, 2, "org-A must see only its own rows");
+
+    let agg_b = repo::recording_stats_for_addon(&pool, "vision-adr", None, Some("org-b"))
+        .expect("stats ok");
+    assert_eq!(agg_b.total_snapshots, 1, "org-B must see only its own rows");
+}
+
+#[test]
+fn camera_update_under_wrong_org_is_no_op() {
+    let (_d, pool) = open_pool();
+    // Row owned by org-A. An org-B caller addressing the same (addon, camera_id)
+    // must NOT match — defends against any TOCTOU between a host-fn pre-check
+    // and the UPDATE. (The active `camera_id` unique index prevents inserting
+    // a parallel org-B row, so we assert the no-op shape on a single row.)
+    insert_camera_in_org(&pool, "vision-adr", "cam-only-a", "org-a");
+
+    let patch = repo::CameraPatch {
+        display_name: Some("hijacked".into()),
+        ..Default::default()
+    };
+    let touched_b = repo::update_camera(&pool, "vision-adr", "cam-only-a", &patch, Some("org-b"))
+        .expect("update ok");
+    assert!(!touched_b, "org-B must NOT be able to mutate an org-A row");
+
+    let row_a = repo::get_camera_for_addon(&pool, "vision-adr", "cam-only-a", Some("org-a"))
+        .expect("get ok")
+        .expect("row present");
+    assert_eq!(row_a.display_name, "Test camera");
+
+    // Sanity: org-A still owns the row and CAN update it.
+    let touched_a = repo::update_camera(&pool, "vision-adr", "cam-only-a", &patch, Some("org-a"))
+        .expect("update ok");
+    assert!(touched_a);
+}
+
+#[test]
+fn camera_soft_delete_under_wrong_org_is_no_op() {
+    let (_d, pool) = open_pool();
+    insert_camera_in_org(&pool, "vision-adr", "cam-only-a-del", "org-a");
+
+    let removed_b = repo::soft_delete_camera(&pool, "vision-adr", "cam-only-a-del", Some("org-b"))
+        .expect("delete ok");
+    assert!(!removed_b, "org-B must NOT be able to soft-delete an org-A row");
+
+    let row_a = repo::get_camera_for_addon(&pool, "vision-adr", "cam-only-a-del", Some("org-a"))
+        .expect("get ok");
+    assert!(row_a.is_some(), "org-A row survives the cross-org delete attempt");
+}
+
 #[test]
 fn audit_log_for_addon_in_org_a_carries_org_id_a() {
     // Already covered by tests/multi_tenant_isolation.rs in P1.b. We
