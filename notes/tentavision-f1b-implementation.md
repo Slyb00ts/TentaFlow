@@ -1,8 +1,24 @@
 # TentaVision F1b — Implementation Plan
 
-**Status:** Phase 1 done (P1.A/B/C/D — RTSP/ONVIF camera vendors)
+**Version:** 1.0.0-f1b
+**Status:** Code-only acceptance DONE (P1.A-D + E1 + E2 + P3.A-C + P4 + P5);
+P2 lab pilot + P6 soak bug-bash deferred to F1c-opening gates
 **Source:** `notes/tentavision-f1b-handoff.md` (F1a → F1b)
 **Started:** 2026-05-16 (post v0.1.0-f1a tag)
+**Code-complete:** 2026-05-17
+**Related:** `RELEASE-F1b.md`, `notes/tentavision-f1b-acceptance-report.md`,
+`notes/tentavision-f1c-handoff.md`
+
+## Final recap (post-code-complete)
+
+All 11 phase commits landed (`0361d73`, `e301071`+`459d33c`, `3071b36`+`6ffa700`,
+`3acf1b8`+`bb10dca`, `72c762a`+`e64ca82`, `d50064c`, `0789a04`+`7d31139`,
+`793f197`+`99a5ad1`, `db226d3`+`200974d`+`28d4706`, `753d0fe`, `bea2bb3`).
+~9.5 k LOC, ~50 new tests, every codex review iteration applied. DoD-15
+moved from DEFERRED to PASS via P4 (cumulative F1a+F1b: 12 PASS / 3 PARTIAL
+/ 2 DEFERRED / 0 FAIL of 17). P2 (lab cameras) and P6 (24 h soak bug-bash)
+require physical hardware + real-runtime infra and are explicit F1c-opening
+manual gates — see `notes/tentavision-f1c-handoff.md` §6 and §7.
 
 ## Roadmap (z handoff)
 
