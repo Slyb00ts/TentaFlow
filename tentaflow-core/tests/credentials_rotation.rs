@@ -74,6 +74,7 @@ fn set_camera_credentials_round_trip_through_db() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -86,7 +87,7 @@ fn set_camera_credentials_round_trip_through_db() {
         set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, Some(&blob)).unwrap();
     assert!(updated, "row should be touched");
 
-    let row = tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id)
+    let row = tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id, None)
         .unwrap()
         .expect("row");
     let stored = row.credentials_encrypted.expect("blob persisted");
@@ -99,7 +100,7 @@ fn set_camera_credentials_round_trip_through_db() {
         set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, None).unwrap();
     assert!(cleared);
     let row =
-        tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id)
+        tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id, None)
             .unwrap()
             .expect("row");
     assert!(row.credentials_encrypted.is_none());
@@ -111,7 +112,7 @@ fn cross_owner_set_credentials_returns_false() {
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     insert_camera(
         &db, &camera_id, "addon-owner", "front gate", "rtsp",
-        "rtsp://cam.local/stream", 30, None, None, "C", "default", None, None, None,
+        "rtsp://cam.local/stream", 30, None, None, "C", "default", None, None, None, None,
     )
     .unwrap();
     let td = tempfile::tempdir().unwrap();
@@ -149,6 +150,7 @@ fn rotate_key_re_encrypts_every_row() {
             Some(&blob),
             None,
             None,
+            None,
         )
         .unwrap();
         ids.push((cid, *c));
@@ -175,7 +177,7 @@ fn rotate_key_re_encrypts_every_row() {
     // old one.
     for (cid, expected) in &ids {
         let row =
-            tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-bulk", cid)
+            tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-bulk", cid, None)
                 .unwrap()
                 .expect("row");
         let blob = row.credentials_encrypted.unwrap();

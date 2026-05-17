@@ -468,6 +468,11 @@ pub fn vector_upsert_v1(
     };
 
     let addon_id = caller.data().addon_id.clone();
+    let org_id_for_query = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let mgr = manager(caller.data()).clone();
 
     // upsert_with_quota holds an IMMEDIATE SQLite transaction across the
@@ -475,6 +480,7 @@ pub fn vector_upsert_v1(
     // upserts cannot both pass the cap. The backend persists internally,
     // so a successful return implies a durable write.
     let count = match mgr.upsert_with_quota(
+        &org_id_for_query,
         &addon_id,
         &input.namespace,
         input.ref_id,
@@ -648,6 +654,11 @@ pub fn vector_search_v1(
     };
 
     let addon_id = caller.data().addon_id.clone();
+    let org_id_for_query = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let mgr = manager(caller.data()).clone();
 
     // Read path: validate spec metric matches the on-disk geometry but do
@@ -669,7 +680,7 @@ pub fn vector_search_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    let backend = match mgr.get(&addon_id, &input.namespace) {
+    let backend = match mgr.get(&org_id_for_query, &addon_id, &input.namespace) {
         Ok(b) => Some(b),
         Err(VectorError::NamespaceNotFound { .. }) => None,
         Err(e) => {
@@ -828,13 +839,18 @@ pub fn vector_delete_v1(
     }
 
     let addon_id = caller.data().addon_id.clone();
+    let org_id_for_query = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let mgr = manager(caller.data()).clone();
 
     // Delete is idempotent at the namespace level: a delete on a namespace
     // that was never written to is reported as removed=false, count=0
     // rather than NotFound — matches REST DELETE semantics and lets addons
     // call this without first checking existence.
-    let backend = match mgr.get(&addon_id, &input.namespace) {
+    let backend = match mgr.get(&org_id_for_query, &addon_id, &input.namespace) {
         Ok(b) => Some(b),
         Err(VectorError::NamespaceNotFound { .. }) => None,
         Err(e) => {
@@ -890,7 +906,7 @@ pub fn vector_delete_v1(
 
     let count = backend.count();
     if removed {
-        let _ = mgr.update_count(&addon_id, &input.namespace, count);
+        let _ = mgr.update_count(&org_id_for_query, &addon_id, &input.namespace, count);
     }
 
     audit(
