@@ -276,16 +276,6 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     conn.execute("COMMIT", [])?;
     drop(conn);
 
-    // F1c P5 — publish compiled flows now that the addon is persisted. Prior
-    // validation guarantees every flow compiled cleanly; registration cannot
-    // fail.
-    {
-        let registry = crate::flow_runtime::registry::global();
-        for flow in compiled_flows {
-            registry.register(&manifest.addon_id, flow);
-        }
-    }
-
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &manifest)?;
 
@@ -295,6 +285,18 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // addonami (test-app, teams-bot).
     if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
         apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+    }
+
+    // F1c P5 — publish compiled flows as the final install step. Done after
+    // every fallible side-effect (DB tx, metadata sync, per-addon SQL migrate)
+    // so an error path never leaves orphaned registry entries pointing at an
+    // addon row that did not finish landing. Compilation already happened
+    // pre-tx; registration itself is infallible.
+    {
+        let registry = crate::flow_runtime::registry::global();
+        for flow in compiled_flows {
+            registry.register(&manifest.addon_id, flow);
+        }
     }
 
     info!(
@@ -558,6 +560,12 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         bail!("Brak pliku WASM: {:?}", wasm_path);
     }
 
+    // F1c P5 — compile the new flow templates BEFORE touching the DB. Any
+    // compile error (cycle, schema, missing file) aborts the upgrade with the
+    // old registry entries intact. Registry swap happens at the bottom, after
+    // every fallible step.
+    let new_compiled_flows = compile_flow_templates(&new_manifest, new_dir)?;
+
     // Size is captured from the WASM file on disk; metadata() avoids reading
     // the module contents twice (install() does a full read for validation,
     // upgrade() trusts the lifecycle path traversal check above).
@@ -652,6 +660,18 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
 
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &new_manifest)?;
+
+    // F1c P5 — swap compiled flows: drop every previous-version entry for this
+    // addon and publish the new set atomically (from the perspective of new
+    // flow_invoke_v1 calls; in-flight invocations holding an Arc to the old
+    // CompiledFlow keep running against the old graph until they finish).
+    {
+        let registry = crate::flow_runtime::registry::global();
+        registry.unregister_addon(addon_id);
+        for flow in new_compiled_flows {
+            registry.register(addon_id, flow);
+        }
+    }
 
     info!(
         "Addon '{}' zaktualizowany do v{}",
