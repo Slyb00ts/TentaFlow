@@ -10,8 +10,10 @@
 // `FlowRegistry` singleton; uninstall drops every flow owned by the addon.
 
 pub mod boot;
+pub mod bounded_drop_oldest;
 pub mod parser;
 pub mod registry;
+pub mod scheduler;
 pub mod types;
 
 #[cfg(test)]
