@@ -155,7 +155,7 @@ async fn test_save_snapshot_basic() {
     let recording_ref = parsed["recording_ref"].as_str().unwrap();
     assert!(recording_ref.starts_with("snap_"));
     // DB row persisted + readable through the repo helper.
-    let row = get_recording_for_addon(&db, &addon, recording_ref).unwrap().expect("row");
+    let row = get_recording_for_addon(&db, &addon, recording_ref, None).unwrap().expect("row");
     assert_eq!(row.kind, "snapshot");
     assert_eq!(row.camera_id, camera);
     assert_eq!(row.owner_addon_id, addon);
@@ -380,7 +380,7 @@ async fn test_get_stream_basic() {
     let (_rc, out) = rec::save_snapshot_with_raw_input(&state, snapshot_payload(&camera, &frame_ref).as_bytes());
     let parsed: toml::Value = toml::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
     let recording_ref = parsed["recording_ref"].as_str().unwrap();
-    let row = get_recording_for_addon(&db, &addon, recording_ref).unwrap().unwrap();
+    let row = get_recording_for_addon(&db, &addon, recording_ref, None).unwrap().unwrap();
 
     let payload = format!("recording_ref = {}\n", toml::Value::String(recording_ref.into()));
     let (rc, body) = rec::get_stream_with_raw_input(&state, payload.as_bytes());
@@ -462,7 +462,7 @@ async fn test_purge_io_error_returns_error_no_db_soft_delete() {
     assert_eq!(rc, AbiError::Operation.as_i32(), "fs-level purge failure must surface as Operation");
     // DB row must still be active (purged_at IS NULL) — host did NOT lie that
     // the purge succeeded.
-    let row = get_recording_for_addon(&db, &addon, &recording_ref).unwrap();
+    let row = get_recording_for_addon(&db, &addon, &recording_ref, None).unwrap();
     assert!(row.is_some(), "DB row must remain active after a failed purge");
     std::fs::remove_file(&bogus_parent).ok();
 }
@@ -481,7 +481,7 @@ async fn test_purge_idempotent_and_file_missing_ok() {
     let recording_ref = parsed["recording_ref"].as_str().unwrap().to_string();
 
     // Manually drop the file first to test idempotency when the file is gone.
-    let row = get_recording_for_addon(&db, &addon, &recording_ref).unwrap().unwrap();
+    let row = get_recording_for_addon(&db, &addon, &recording_ref, None).unwrap().unwrap();
     std::fs::remove_file(&row.file_path).ok();
 
     let payload = format!("recording_ref = {}\n", toml::Value::String(recording_ref.clone()));
@@ -516,7 +516,7 @@ async fn test_stats_basic_aggregation() {
     let total_size = stats["total_size_bytes"].as_integer().unwrap();
     assert!(total_size > 0);
     // Cross-check against the repo helper directly.
-    let agg = recording_stats_for_addon(&db, &addon, None).unwrap();
+    let agg = recording_stats_for_addon(&db, &addon, None, None).unwrap();
     assert_eq!(agg.total_snapshots, 3);
     assert_eq!(agg.total_size_bytes as i64, total_size);
 }

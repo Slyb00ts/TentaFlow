@@ -1184,7 +1184,7 @@ pub fn camera_update_v1(
         profile: input.profile.clone(),
     };
 
-    if update_camera(&db, &addon_id, &input.camera_id, &patch).is_err() {
+    if update_camera(&db, &addon_id, &input.camera_id, &patch, caller.data().org_id.as_deref()).is_err() {
         audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed"));
         return AbiError::Operation.as_i32();
     }
@@ -1286,7 +1286,7 @@ pub fn camera_remove_v1(
     // is effectively gone from the addon's perspective. A leftover in-memory
     // session is bounded by process lifetime and falls off at next restart
     // because reconciliation skips `removed_at IS NOT NULL` rows.
-    match soft_delete_camera(&db, &addon_id, &input.camera_id) {
+    match soft_delete_camera(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(true) => {}
         Ok(false) => {
             audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found"));
@@ -1739,7 +1739,7 @@ pub fn camera_credentials_rotate_v1(
         (row.url.clone(), row.onvif_profile_token.clone())
     };
 
-    if set_camera_credentials_encrypted(&db, &addon_id, &input.camera_id, blob_ref)
+    if set_camera_credentials_encrypted(&db, &addon_id, &input.camera_id, blob_ref, caller.data().org_id.as_deref())
         .is_err()
     {
         audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed"));
@@ -1755,6 +1755,7 @@ pub fn camera_credentials_rotate_v1(
             &input.camera_id,
             &rotated_url,
             rotated_profile_token.as_deref(),
+            caller.data().org_id.as_deref(),
         ) {
             audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed_onvif"));
             return AbiError::Operation.as_i32();

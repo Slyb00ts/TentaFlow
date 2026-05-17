@@ -11036,13 +11036,15 @@ pub fn set_camera_credentials_encrypted(
     addon_id: &str,
     camera_id: &str,
     blob: Option<&[u8]>,
+    org_id: Option<&str>,
 ) -> Result<bool> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let n = conn.execute(
         "UPDATE cameras SET credentials_encrypted = ?1, updated_at = ?2 \
-         WHERE owner_addon_id = ?3 AND camera_id = ?4 AND removed_at IS NULL",
-        rusqlite::params![blob, now, addon_id, camera_id],
+         WHERE owner_addon_id = ?3 AND camera_id = ?4 AND org_id = ?5 AND removed_at IS NULL",
+        rusqlite::params![blob, now, addon_id, camera_id, resolved_org],
     )?;
     Ok(n > 0)
 }
@@ -11059,13 +11061,15 @@ pub fn set_camera_onvif_resolved(
     camera_id: &str,
     new_rtsp_url: &str,
     profile_token: Option<&str>,
+    org_id: Option<&str>,
 ) -> Result<bool> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let n = conn.execute(
         "UPDATE cameras SET url = ?1, onvif_profile_token = ?2, updated_at = ?3 \
-         WHERE owner_addon_id = ?4 AND camera_id = ?5 AND removed_at IS NULL",
-        rusqlite::params![new_rtsp_url, profile_token, now, addon_id, camera_id],
+         WHERE owner_addon_id = ?4 AND camera_id = ?5 AND org_id = ?6 AND removed_at IS NULL",
+        rusqlite::params![new_rtsp_url, profile_token, now, addon_id, camera_id, resolved_org],
     )?;
     Ok(n > 0)
 }
@@ -11190,9 +11194,11 @@ pub fn update_camera(
     addon_id: &str,
     camera_id: &str,
     patch: &CameraPatch,
+    org_id: Option<&str>,
 ) -> Result<bool> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     // Build SET clause dynamically. Avoid string concat of values — every
     // user-supplied piece flows through bind parameters.
     let mut sets: Vec<&'static str> = Vec::new();
@@ -11225,8 +11231,9 @@ pub fn update_camera(
     params.push(Box::new(now));
     params.push(Box::new(addon_id.to_string()));
     params.push(Box::new(camera_id.to_string()));
+    params.push(Box::new(resolved_org.to_string()));
     let sql = format!(
-        "UPDATE cameras SET {} WHERE owner_addon_id = ? AND camera_id = ? AND removed_at IS NULL",
+        "UPDATE cameras SET {} WHERE owner_addon_id = ? AND camera_id = ? AND org_id = ? AND removed_at IS NULL",
         sets.join(", ")
     );
     let bound: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
@@ -11237,13 +11244,19 @@ pub fn update_camera(
 /// Soft-deletes the active row by stamping `removed_at`. Returns `Ok(true)`
 /// when a row was matched, `Ok(false)` for "not found / not owned".
 #[cfg(feature = "camera")]
-pub fn soft_delete_camera(pool: &DbPool, addon_id: &str, camera_id: &str) -> Result<bool> {
+pub fn soft_delete_camera(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<bool> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let n = conn.execute(
         "UPDATE cameras SET removed_at = ?1, updated_at = ?1 \
-         WHERE owner_addon_id = ?2 AND camera_id = ?3 AND removed_at IS NULL",
-        rusqlite::params![now, addon_id, camera_id],
+         WHERE owner_addon_id = ?2 AND camera_id = ?3 AND org_id = ?4 AND removed_at IS NULL",
+        rusqlite::params![now, addon_id, camera_id, resolved_org],
     )?;
     Ok(n > 0)
 }
@@ -11343,19 +11356,23 @@ pub fn insert_recording(
     pixel_format: Option<&str>,
     hash_sha256: &str,
     retention_class: &str,
+    org_id: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    // Stamp recording rows with the addon's owning org so cross-tenant
+    // queries cannot bleed catalog entries between organizations.
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     conn.execute(
         "INSERT INTO recordings \
          (ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, \
           duration_ms, width, height, pixel_format, hash_sha256, \
-          retention_class, created_at, purged_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+          retention_class, created_at, purged_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
         rusqlite::params![
             recording_ref, kind, owner_addon_id, camera_id, file_path,
             file_size_bytes, duration_ms, width, height, pixel_format,
-            hash_sha256, retention_class, now,
+            hash_sha256, retention_class, now, resolved_org,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -11369,14 +11386,20 @@ pub fn get_recording_for_addon(
     pool: &DbPool,
     addon_id: &str,
     recording_ref: &str,
+    org_id: Option<&str>,
 ) -> Result<Option<RecordingRow>> {
     let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {RECORDING_SELECT_COLS} FROM recordings \
-         WHERE owner_addon_id = ?1 AND ref = ?2 AND purged_at IS NULL"
+         WHERE owner_addon_id = ?1 AND ref = ?2 AND org_id = ?3 AND purged_at IS NULL"
     );
     let row = conn
-        .query_row(&sql, rusqlite::params![addon_id, recording_ref], row_to_recording)
+        .query_row(
+            &sql,
+            rusqlite::params![addon_id, recording_ref, resolved_org],
+            row_to_recording,
+        )
         .optional()?;
     Ok(row)
 }
@@ -11408,13 +11431,15 @@ pub fn soft_delete_recording(
     pool: &DbPool,
     addon_id: &str,
     recording_ref: &str,
+    org_id: Option<&str>,
 ) -> Result<bool> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let n = conn.execute(
         "UPDATE recordings SET purged_at = ?1 \
-         WHERE owner_addon_id = ?2 AND ref = ?3 AND purged_at IS NULL",
-        rusqlite::params![now, addon_id, recording_ref],
+         WHERE owner_addon_id = ?2 AND ref = ?3 AND org_id = ?4 AND purged_at IS NULL",
+        rusqlite::params![now, addon_id, recording_ref, resolved_org],
     )?;
     Ok(n > 0)
 }
@@ -11427,8 +11452,10 @@ pub fn recording_stats_for_addon(
     pool: &DbPool,
     addon_id: &str,
     camera_id: Option<&str>,
+    org_id: Option<&str>,
 ) -> Result<RecordingStatsAggregate> {
     let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let mut out = RecordingStatsAggregate::default();
     let base_select = "SELECT camera_id, \
                        SUM(CASE WHEN kind = 'snapshot' THEN 1 ELSE 0 END) AS snapshots, \
@@ -11446,23 +11473,23 @@ pub fn recording_stats_for_addon(
     let rows: Vec<RecordingStatsPerCamera> = if let Some(cam) = camera_id {
         let sql = format!(
             "{base_select} \
-             WHERE owner_addon_id = ?1 AND camera_id = ?2 AND purged_at IS NULL \
+             WHERE owner_addon_id = ?1 AND camera_id = ?2 AND org_id = ?3 AND purged_at IS NULL \
              GROUP BY camera_id ORDER BY camera_id"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(rusqlite::params![addon_id, cam], map_row)?
+            .query_map(rusqlite::params![addon_id, cam, resolved_org], map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     } else {
         let sql = format!(
             "{base_select} \
-             WHERE owner_addon_id = ?1 AND purged_at IS NULL \
+             WHERE owner_addon_id = ?1 AND org_id = ?2 AND purged_at IS NULL \
              GROUP BY camera_id ORDER BY camera_id"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(rusqlite::params![addon_id], map_row)?
+            .query_map(rusqlite::params![addon_id, resolved_org], map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
