@@ -147,6 +147,7 @@ pub async fn run(
                     "count_saturated",
                     "warn",
                     Some(serde_json::json!({"raw_count_u64": count})),
+                    ctx.org_id.as_deref(),
                 );
             }
             break;
@@ -179,6 +180,7 @@ pub async fn run(
                         "count_saturated",
                         "warn",
                         Some(serde_json::json!({"raw_count_u64": count})),
+                        ctx.org_id.as_deref(),
                     );
                 }
                 count = 0;
@@ -225,6 +227,7 @@ pub async fn run(
         "completed",
         "ok",
         Some(serde_json::json!({"windows_emitted": windows_emitted, "op": op_str})),
+        ctx.org_id.as_deref(),
     );
     Ok(())
 }

@@ -59,7 +59,7 @@ async fn source_threshold_sink_end_to_end() {
     // Pass case: v=0.9 above threshold → 3 records survive.
     let input_pass = toml::from_str::<toml::Value>("v = 0.9").unwrap();
     let s_pass = sched
-        .invoke(&addon, &flow_id, input_pass, 5_000, None)
+        .invoke(&addon, &flow_id, input_pass, 5_000, None, None)
         .await
         .expect("invoke pass");
     assert_eq!(s_pass.status, "completed");
@@ -75,7 +75,7 @@ async fn source_threshold_sink_end_to_end() {
     // Drop case: v=0.1 below threshold → 0 records.
     let input_drop = toml::from_str::<toml::Value>("v = 0.1").unwrap();
     let s_drop = sched
-        .invoke(&addon, &flow_id, input_drop, 5_000, None)
+        .invoke(&addon, &flow_id, input_drop, 5_000, None, None)
         .await
         .expect("invoke drop");
     assert_eq!(s_drop.status, "completed");

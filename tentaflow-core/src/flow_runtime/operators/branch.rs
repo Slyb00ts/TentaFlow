@@ -267,6 +267,7 @@ pub async fn run(
                                 "error",
                                 "error",
                                 Some(serde_json::json!({"reason": "eval_failed", "field": expr.field})),
+                                ctx.org_id.as_deref(),
                             );
                             close_outbound(&outbound);
                             return Err(OperatorError::ExpressionFailed(format!(
@@ -291,6 +292,7 @@ pub async fn run(
         "completed",
         "ok",
         Some(serde_json::json!({"true": t_count, "false": f_count, "error": e_count})),
+        ctx.org_id.as_deref(),
     );
     Ok(())
 }

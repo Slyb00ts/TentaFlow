@@ -48,6 +48,7 @@ pub async fn run(
             "error",
             "error",
             Some(serde_json::json!({"reason": "camera_source_unsupported", "stream": stream})),
+            ctx.org_id.as_deref(),
         );
         close_outbound(&outbound);
         return Err(OperatorError::BadParams(
@@ -71,6 +72,7 @@ pub async fn run(
         "start",
         "ok",
         Some(serde_json::json!({"stream": stream, "count": count, "fps": fps})),
+        ctx.org_id.as_deref(),
     );
 
     let sleep_ms = if fps > 0 { 1000u32 / fps.max(1) } else { 0 };
@@ -104,6 +106,7 @@ pub async fn run(
         "completed",
         "ok",
         Some(serde_json::json!({"records_emitted": emitted})),
+        ctx.org_id.as_deref(),
     );
     Ok(())
 }

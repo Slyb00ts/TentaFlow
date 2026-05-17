@@ -216,6 +216,7 @@ impl FlowScheduler {
         input: toml::Value,
         wait_ms: u32,
         actor_user_id: Option<i64>,
+        org_id: Option<String>,
     ) -> Result<InvocationStatus, InvokeError> {
         let flow = registry::global()
             .get(addon_id, flow_id)
@@ -231,7 +232,9 @@ impl FlowScheduler {
         // invocation never leaves an orphan row behind. The returned guard
         // releases the slot automatically if any subsequent step (DB insert,
         // task spawn, panic in run_invocation) fails before normal finalize.
-        let guard = self.reserve_slot(addon_id, &invocation_id).await?;
+        let guard = self
+            .reserve_slot(addon_id, &invocation_id, org_id.as_deref())
+            .await?;
 
         let operators_total = flow.def.operators.len() as i64;
 
@@ -309,6 +312,7 @@ impl FlowScheduler {
             started_at.clone(),
             operators_total,
             guard,
+            org_id.clone(),
         );
 
         if wait_ms == 0 {
@@ -423,6 +427,7 @@ impl FlowScheduler {
         self: &Arc<Self>,
         addon_id: &str,
         invocation_id: &str,
+        org_id: Option<&str>,
     ) -> Result<CapGuard, InvokeError> {
         let denied = {
             let mut g = self.by_addon.lock();
@@ -435,7 +440,7 @@ impl FlowScheduler {
             }
         };
         if denied {
-            self.emit_concurrency_cap_audit(addon_id).await;
+            self.emit_concurrency_cap_audit(addon_id, org_id).await;
             return Err(InvokeError::ConcurrencyCapExceeded {
                 addon_id: addon_id.to_string(),
                 cap: PER_ADDON_CONCURRENCY_CAP,
@@ -458,9 +463,12 @@ impl FlowScheduler {
         }
     }
 
-    async fn emit_concurrency_cap_audit(&self, addon_id: &str) {
+    async fn emit_concurrency_cap_audit(&self, addon_id: &str, org_id: Option<&str>) {
         let db = self.db.clone();
         let addon = addon_id.to_string();
+        let org = org_id
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
+            .to_string();
         let _ = tokio::task::spawn_blocking(move || {
             let conn = match db.lock() {
                 Ok(c) => c,
@@ -502,10 +510,10 @@ impl FlowScheduler {
             let _ = conn.execute(
                 "INSERT INTO audit_log \
                     (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-                     result, error_message, severity, risk_class, details, prev_hash, hash) \
+                     result, error_message, severity, risk_class, details, prev_hash, hash, org_id) \
                  VALUES (?1, NULL, ?2, 'flow.invoke', 'flow', NULL, \
-                         'denied', NULL, 'warn', 'C', ?3, ?4, ?5)",
-                rusqlite::params![timestamp, addon, details, prev_hash, hash],
+                         'denied', NULL, 'warn', 'C', ?3, ?4, ?5, ?6)",
+                rusqlite::params![timestamp, addon, details, prev_hash, hash, org],
             );
         })
         .await;
@@ -517,6 +525,7 @@ impl FlowScheduler {
         flow_id: &str,
         invocation_id: &str,
         dropped_total: u64,
+        org_id: Option<&str>,
     ) {
         if dropped_total == 0 {
             return;
@@ -525,6 +534,9 @@ impl FlowScheduler {
         let addon = addon_id.to_string();
         let flow = flow_id.to_string();
         let inv = invocation_id.to_string();
+        let org = org_id
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
+            .to_string();
         let _ = tokio::task::spawn_blocking(move || {
             let conn = match db.lock() {
                 Ok(c) => c,
@@ -567,10 +579,10 @@ impl FlowScheduler {
             let _ = conn.execute(
                 "INSERT INTO audit_log \
                     (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-                     result, error_message, severity, risk_class, details, prev_hash, hash) \
+                     result, error_message, severity, risk_class, details, prev_hash, hash, org_id) \
                  VALUES (?1, NULL, ?2, 'flow.backpressure_drop', 'flow', ?3, \
-                         'backpressure_drop', NULL, 'warn', 'C', ?4, ?5, ?6)",
-                rusqlite::params![timestamp, addon, flow, details, prev_hash, hash],
+                         'backpressure_drop', NULL, 'warn', 'C', ?4, ?5, ?6, ?7)",
+                rusqlite::params![timestamp, addon, flow, details, prev_hash, hash, org],
             );
         })
         .await;
@@ -585,12 +597,16 @@ impl FlowScheduler {
         flow_id: &str,
         invocation_id: &str,
         error_message: &str,
+        org_id: Option<&str>,
     ) {
         let db = self.db.clone();
         let addon = addon_id.to_string();
         let flow = flow_id.to_string();
         let inv = invocation_id.to_string();
         let err = error_message.to_string();
+        let org = org_id
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
+            .to_string();
         let _ = tokio::task::spawn_blocking(move || {
             let conn = match db.lock() {
                 Ok(c) => c,
@@ -633,10 +649,10 @@ impl FlowScheduler {
             let _ = conn.execute(
                 "INSERT INTO audit_log \
                     (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-                     result, error_message, severity, risk_class, details, prev_hash, hash) \
+                     result, error_message, severity, risk_class, details, prev_hash, hash, org_id) \
                  VALUES (?1, NULL, ?2, 'flow.finalize.db_error', 'flow', ?3, \
-                         'error', ?4, 'warn', 'C', ?5, ?6, ?7)",
-                rusqlite::params![timestamp, addon, flow, err, details, prev_hash, hash],
+                         'error', ?4, 'warn', 'C', ?5, ?6, ?7, ?8)",
+                rusqlite::params![timestamp, addon, flow, err, details, prev_hash, hash, org],
             );
         })
         .await;
@@ -656,6 +672,7 @@ impl FlowScheduler {
         started_at: String,
         operators_total: i64,
         guard: CapGuard,
+        org_id: Option<String>,
     ) -> InvocationStatus {
         // Build the per-invocation PermissionChecker once and share by Arc.
         // The operators that need it (Predict, Sink event/ui_notify) clone
@@ -695,6 +712,7 @@ impl FlowScheduler {
                 service_manager: self.service_manager(),
                 event_bus: self.event_bus(),
                 sink_outputs: sink_outputs.clone(),
+                org_id: org_id.clone(),
             };
             let op_type = op.op_type;
             let token = cancel.clone();
@@ -750,8 +768,14 @@ impl FlowScheduler {
                 .map(|inf| inf.edges.iter().map(|e| e.dropped()).sum())
                 .unwrap_or(0)
         };
-        self.emit_backpressure_audit(&addon_id, &flow.def.id, &invocation_id, dropped_total)
-            .await;
+        self.emit_backpressure_audit(
+            &addon_id,
+            &flow.def.id,
+            &invocation_id,
+            dropped_total,
+            org_id.as_deref(),
+        )
+        .await;
 
         let ops_done = operators_completed.load(Ordering::Relaxed);
         let finished_at = Utc::now().to_rfc3339();
@@ -801,6 +825,7 @@ impl FlowScheduler {
                     &flow.def.id,
                     &invocation_id,
                     &db_err.to_string(),
+                    org_id.as_deref(),
                 )
                 .await;
             }
@@ -814,6 +839,7 @@ impl FlowScheduler {
                     &flow.def.id,
                     &invocation_id,
                     &format!("join error: {join_err}"),
+                    org_id.as_deref(),
                 )
                 .await;
             }
