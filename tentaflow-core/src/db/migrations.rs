@@ -181,7 +181,43 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_onvif_metadata",
             MigrationStep::Rust(cameras_add_onvif_metadata_columns),
         ),
+        (
+            31,
+            "flow_invocations_actor_user_id",
+            MigrationStep::Rust(flow_invocations_add_actor_user_id),
+        ),
     ]
+}
+
+// F1c P7 — per-user audit attribution. Existing rows pre-dating this migration
+// stay with NULL (system / unknown actor); WASM-driven flow invokes from this
+// point forward carry `state.user_id` so DoD-9 / DoD-10 reports can join the
+// row back to a concrete operator account. NULL remains valid for boot
+// recovery, scheduled tasks, and mesh-originated invocations.
+//
+// SQLite has no `ADD COLUMN IF NOT EXISTS`. We probe PRAGMA table_info first
+// so a partial reopen does not redo the ALTER.
+fn flow_invocations_add_actor_user_id(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(flow_invocations)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "actor_user_id" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE flow_invocations ADD COLUMN actor_user_id INTEGER NULL \
+                 REFERENCES users(id);",
+        )?;
+    }
+    Ok(())
 }
 
 // F1c P6 — persist the ONVIF device-service URL and the profile token chosen
