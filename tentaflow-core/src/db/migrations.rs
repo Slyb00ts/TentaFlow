@@ -186,7 +186,234 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flow_invocations_actor_user_id",
             MigrationStep::Rust(flow_invocations_add_actor_user_id),
         ),
+        (
+            32,
+            "multi_tenant_rbac_org_isolation",
+            MigrationStep::Rust(setup_multi_tenant),
+        ),
     ]
+}
+
+// F2 P1.a — multi-tenant foundation. Creates the three control tables
+// (organizations, roles, org_memberships), seeds the `org-default` row + the
+// five standard roles, then PRAGMA-guards eight existing tables to grow a
+// nullable `org_id` column and backfills every pre-existing row to
+// `org-default`. Idempotent at every step:
+//   * CREATE TABLE / CREATE INDEX use IF NOT EXISTS.
+//   * Seeds use INSERT OR IGNORE so a second run leaves the rows untouched.
+//   * ADD COLUMN is gated by a PRAGMA table_info probe.
+//   * Backfill UPDATE only touches rows where org_id IS NULL — a second run
+//     finds zero such rows and is a no-op.
+// Backfill is small enough (single SQLite UPDATE per table) to run inline;
+// no batching is required because the migration runs inside the per-version
+// transaction opened by `db::migrations::run`.
+fn setup_multi_tenant(conn: &Connection) -> Result<()> {
+    // Step 1: control tables.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS organizations (
+            org_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
+            contact_email TEXT NULL,
+            dpo_contact TEXT NULL,
+            retention_policy_json TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active','suspended','deleted')),
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_organizations_status ON organizations(status);
+        CREATE INDEX IF NOT EXISTS idx_organizations_slug ON organizations(slug);
+
+        CREATE TABLE IF NOT EXISTS roles (
+            role_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            permissions_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS org_memberships (
+            org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL,
+            role_id TEXT NOT NULL REFERENCES roles(role_id),
+            granted_at TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            PRIMARY KEY (org_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_org_memberships_user ON org_memberships(user_id);
+        CREATE INDEX IF NOT EXISTS idx_org_memberships_role ON org_memberships(role_id);
+        "#,
+    )?;
+
+    // Step 2: seed `org-default`. INSERT OR IGNORE keeps the migration
+    // idempotent across re-runs and across operators who created the row by
+    // hand before re-applying the migration.
+    conn.execute(
+        "INSERT OR IGNORE INTO organizations \
+            (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status, created_at) \
+         VALUES ('org-default', 'Default Organization', 'default', NULL, NULL, NULL, 'active', \
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        [],
+    )?;
+
+    // Step 3: seed five preseed roles. Permission keys chosen to align with
+    // the host-fn permission checks already in flight across the codebase
+    // (camera.*, service.*, sql.*, vector.*, policy.*, gate.check, flow.invoke,
+    // legal.*) plus the new RBAC-specific keys (org.*, user.*, addon.*,
+    // rbac.elevate).
+    let role_seeds: &[(&str, &str, &[&str])] = &[
+        (
+            "role-org-admin",
+            "org_admin",
+            &[
+                "org.read", "org.write", "org.admin",
+                "user.read", "user.write", "user.assign_role",
+                "addon.install", "addon.upgrade", "addon.uninstall",
+                "camera.read", "camera.write", "camera.discover", "camera.metadata",
+                "service.read", "service.call",
+                "sql.read", "sql.write",
+                "vector.read", "vector.write",
+                "policy.read", "policy.write",
+                "gate.check", "flow.invoke",
+                "legal.read", "legal.write",
+                "rbac.elevate",
+            ],
+        ),
+        (
+            "role-org-operator",
+            "org_operator",
+            &[
+                "org.read",
+                "camera.read", "camera.write", "camera.discover",
+                "service.read", "service.call",
+                "sql.read",
+                "vector.read",
+                "policy.read",
+                "gate.check", "flow.invoke",
+                "legal.read",
+            ],
+        ),
+        (
+            "role-org-viewer",
+            "org_viewer",
+            &[
+                "org.read",
+                "camera.read",
+                "service.read",
+                "sql.read",
+                "vector.read",
+                "policy.read",
+                "legal.read",
+            ],
+        ),
+        (
+            "role-dpo",
+            "dpo",
+            &[
+                "org.read",
+                "policy.read", "policy.write",
+                "gate.check",
+                "legal.read", "legal.write",
+                "rbac.elevate",
+            ],
+        ),
+        (
+            "role-supervisor",
+            "supervisor",
+            &[
+                "org.read",
+                "policy.read",
+                "gate.check",
+                "rbac.elevate",
+            ],
+        ),
+    ];
+    for (role_id, name, perms) in role_seeds {
+        let perms_json = serialize_perms_json(perms);
+        conn.execute(
+            "INSERT OR IGNORE INTO roles (role_id, name, permissions_json, created_at) \
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            rusqlite::params![role_id, name, perms_json],
+        )?;
+    }
+
+    // Step 4 + 5 + 6: per-table ADD COLUMN (PRAGMA-guarded) + backfill +
+    // index. The eight target tables hold every row that must scope to a
+    // tenant from F2 onward. `addon_installations` lives under the name
+    // `addons` in this schema (sole canonical addon registry — there is no
+    // separate `addon_installations` table); we use the real name to avoid
+    // creating a phantom column on a non-existent table.
+    let tables: &[&str] = &[
+        "users",
+        "addons",
+        "policy_claims",
+        "cameras",
+        "recordings",
+        "addon_vector_namespaces",
+        "audit_log",
+        "frame_pickup_log",
+    ];
+    for table in tables {
+        add_org_id_column_if_missing(conn, table)?;
+        let sql_backfill = format!(
+            "UPDATE {} SET org_id = 'org-default' WHERE org_id IS NULL",
+            table
+        );
+        conn.execute(&sql_backfill, [])?;
+        let sql_index = format!(
+            "CREATE INDEX IF NOT EXISTS idx_{tbl}_org_id ON {tbl}(org_id)",
+            tbl = table
+        );
+        conn.execute_batch(&sql_index)?;
+    }
+
+    Ok(())
+}
+
+// PRAGMA-guarded `ALTER TABLE <tbl> ADD COLUMN org_id TEXT NULL`. Idempotent:
+// a second run finds the column already present and skips. The column is
+// intentionally NULLABLE so the backfill UPDATE that follows is the single
+// source of truth for the default-org assignment (an `NOT NULL DEFAULT
+// 'org-default'` would silently mask a partial-fail backfill).
+fn add_org_id_column_if_missing(conn: &Connection, table: &str) -> Result<()> {
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&pragma_sql)?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "org_id" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_col {
+        let alter_sql = format!("ALTER TABLE {} ADD COLUMN org_id TEXT NULL", table);
+        conn.execute_batch(&alter_sql)?;
+    }
+    Ok(())
+}
+
+// Serialize a permission list to canonical JSON without pulling in
+// serde_json's value tree. Permission keys never contain `"` or `\` (they
+// are dot-delimited ASCII identifiers, validated implicitly by the host-fn
+// permission checks elsewhere in the codebase), so a hand-rolled writer is
+// safe and avoids the serde_json dependency at the migrations layer.
+fn serialize_perms_json(perms: &[&str]) -> String {
+    let mut out = String::from("[");
+    for (i, p) in perms.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(p);
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 // F1c P7 — per-user audit attribution. Existing rows pre-dating this migration
