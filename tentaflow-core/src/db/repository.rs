@@ -11423,6 +11423,86 @@ pub fn recording_stats_for_addon(
     Ok(out)
 }
 
+// =============================================================================
+// Trusted publishers (F1c P2, migration v26)
+// =============================================================================
+
+/// Row in `trusted_publishers`. `added_by_user` stays `None` for keys added
+/// via CLI before RBAC lands (F1c P7).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrustedPublisher {
+    pub key_b64: String,
+    pub label: String,
+    pub added_at: String,
+    pub added_by_user: Option<String>,
+    pub contact: Option<String>,
+}
+
+/// Inserts a publisher key into the trust store. Returns the row count
+/// (1 = new entry, 0 = duplicate ignored). Caller should validate the key
+/// format (44-char base64 → 32 raw bytes) before calling — repository does
+/// not re-validate to keep DB layer free of crypto concerns.
+pub fn insert_trusted_publisher(
+    pool: &DbPool,
+    key_b64: &str,
+    label: &str,
+    contact: Option<&str>,
+    added_by_user: Option<&str>,
+) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let added_at = chrono::Utc::now().to_rfc3339();
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO trusted_publishers (key_b64, label, added_at, added_by_user, contact) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![key_b64, label, added_at, added_by_user, contact],
+    )?;
+    Ok(n)
+}
+
+/// Lists all trusted publishers ordered by `label`.
+pub fn list_trusted_publishers(pool: &DbPool) -> Result<Vec<TrustedPublisher>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT key_b64, label, added_at, added_by_user, contact \
+         FROM trusted_publishers ORDER BY label ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TrustedPublisher {
+                key_b64: r.get(0)?,
+                label: r.get(1)?,
+                added_at: r.get(2)?,
+                added_by_user: r.get(3)?,
+                contact: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Removes a publisher key from the trust store. Returns `true` if a row
+/// was deleted. Removing an already-trusted key does NOT retroactively
+/// uninstall addons signed by it — it only blocks future installs.
+pub fn remove_trusted_publisher(pool: &DbPool, key_b64: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM trusted_publishers WHERE key_b64 = ?1",
+        rusqlite::params![key_b64],
+    )?;
+    Ok(n > 0)
+}
+
+/// Boolean shortcut used by the signature module during install verify.
+pub fn is_publisher_trusted(pool: &DbPool, key_b64: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trusted_publishers WHERE key_b64 = ?1",
+        rusqlite::params![key_b64],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 #[cfg(test)]
 mod chunk_c_visibility_consumer_tests {
     use super::*;

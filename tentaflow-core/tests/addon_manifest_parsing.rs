@@ -321,6 +321,10 @@ required_claims = [
   { type = "deployment_profile", oneof = ["lea", "critical_infra"] },
 ]
 
+[publisher]
+ed25519_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+label = "TentaVision Inc"
+
 [[ui_component]]
 id = "tv-video-grid"
 display_name = "Video grid"
@@ -671,6 +675,10 @@ name = "x"
 version = "0.1.0"
 wasm_file = "a.wasm"
 
+[publisher]
+ed25519_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+label = "Test"
+
 [[ui_component]]
 id = "u1"
 display_name = "U1"
@@ -694,6 +702,10 @@ name = "x"
 version = "0.1.0"
 wasm_file = "a.wasm"
 
+[publisher]
+ed25519_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+label = "Test"
+
 [[ui_component]]
 id = "u1"
 display_name = "U1"
@@ -714,6 +726,10 @@ id = "with-perms"
 name = "x"
 version = "0.1.0"
 wasm_file = "a.wasm"
+
+[publisher]
+ed25519_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+label = "Test"
 
 [[ui_component]]
 id = "u-with-perms"

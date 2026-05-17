@@ -344,6 +344,56 @@ pub struct UiComponentSpec {
 }
 
 // =============================================================================
+// Sekcja [publisher]
+// =============================================================================
+
+/// Deklaracja wydawcy addona — Ed25519 public key + display name. Obecnosc
+/// `[publisher]` w manifescie oznacza, ze addon dostarcza zaufane bundle
+/// UI: kazdy `[[ui_component]]` musi miec `signature` weryfikowalny tym
+/// kluczem, a klucz musi byc w trust store (`trusted_publishers` v26).
+///
+/// Brak `[publisher]` jest dozwolony tylko gdy addon nie deklaruje
+/// `[[ui_component]]` (czysty backend) — w przeciwnym razie install jest
+/// odrzucany. Polityka default-deny: pusta tabela trust = zaden zewnetrzny
+/// addon z UI nie zainstaluje sie, dopoki admin nie wykona
+/// `tentaflow-cli addon trust-key <pk> --label "..."`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublisherInfo {
+    /// Ed25519 public key (32 bajty raw → 44 znakow base64 z paddingiem `=`).
+    pub ed25519_public_key: String,
+    /// Czytelna nazwa wyswietlana w admin UI / install wizard
+    /// (np. "TentaFlow Inc", "ACME Sp. z o.o.").
+    pub label: String,
+    /// Opcjonalny kanal kontaktu (email lub URL) — pokazywany przy
+    /// pytaniu o zaufanie nowego wydawcy.
+    #[serde(default)]
+    pub contact: Option<String>,
+}
+
+/// Format Ed25519 pub key w manifescie i trust store: standard base64,
+/// 32 bajty raw → 44 znaki (43 base64 + 1 padding `=`).
+pub fn validate_publisher_pk_b64(pk_b64: &str) -> Result<()> {
+    if pk_b64.len() != 44 {
+        bail!(
+            "publisher.ed25519_public_key '{}' has invalid length {} (expected 44 base64 chars for 32-byte key)",
+            pk_b64,
+            pk_b64.len()
+        );
+    }
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(pk_b64.as_bytes())
+        .map_err(|e| anyhow::anyhow!("publisher.ed25519_public_key not valid base64: {}", e))?;
+    if raw.len() != 32 {
+        bail!(
+            "publisher.ed25519_public_key decoded to {} bytes (expected 32 for Ed25519)",
+            raw.len()
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Sekcja [gpu] (info-only)
 // =============================================================================
 
@@ -382,6 +432,7 @@ pub fn validate_manifest_extensions(
     sdk_version: Option<&str>,
     uses_aliases: &[UsesAliasSpec],
     uses_models: &[UsesModelSpec],
+    publisher: Option<&PublisherInfo>,
 ) -> Result<()> {
     if let Some(cfg) = storage {
         validate_storage(cfg)?;
@@ -530,6 +581,27 @@ pub fn validate_manifest_extensions(
         }
     }
 
+    // Publisher coherence: if any [[ui_component]] is declared the manifest
+    // must also carry a [publisher] block (so install can verify signatures).
+    // A standalone [publisher] without ui_components is allowed (an addon may
+    // pre-declare its publisher identity for future UI bundles).
+    match (publisher, ui_components.is_empty()) {
+        (Some(p), _) => {
+            if p.label.trim().is_empty() {
+                bail!("publisher.label must not be empty");
+            }
+            validate_publisher_pk_b64(&p.ed25519_public_key)?;
+        }
+        (None, false) => {
+            bail!(
+                "manifest declares {} [[ui_component]] entries but no [publisher] block — \
+                 signed UI bundles require publisher.ed25519_public_key",
+                ui_components.len()
+            );
+        }
+        (None, true) => {}
+    }
+
     if let Some(req) = sdk_version {
         // Akceptujemy zarowno czyste `Version` ("0.2.0"), jak i `VersionReq`
         // (">=0.2.0", "^0.3"). semver::VersionReq parsuje oba.
@@ -650,7 +722,54 @@ mod chunk_c_validation_tests {
             None,
             uses_aliases,
             uses_models,
+            None,
         )
+    }
+
+    #[test]
+    fn ui_component_without_publisher_is_rejected() {
+        let uic = UiComponentSpec {
+            id: "panel".into(),
+            display_name: "Panel".into(),
+            slot: "main".into(),
+            src: "ui/panel.js".into(),
+            signature: SIGNATURE_PLACEHOLDER.into(),
+            risk: "low".into(),
+            host_permissions: vec![],
+        };
+        let err = validate_manifest_extensions(
+            None, &[], &[], &[], &[], &[uic], None, &[], &[], None,
+        )
+        .expect_err("missing publisher must reject");
+        assert!(err.to_string().contains("no [publisher] block"));
+    }
+
+    #[test]
+    fn publisher_with_bad_pk_length_is_rejected() {
+        let pub_info = PublisherInfo {
+            ed25519_public_key: "too-short".into(),
+            label: "ACME".into(),
+            contact: None,
+        };
+        let err = validate_manifest_extensions(
+            None, &[], &[], &[], &[], &[], None, &[], &[], Some(&pub_info),
+        )
+        .expect_err("bad pk must reject");
+        assert!(err.to_string().contains("invalid length"));
+    }
+
+    #[test]
+    fn publisher_with_empty_label_is_rejected() {
+        let pub_info = PublisherInfo {
+            ed25519_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            label: "   ".into(),
+            contact: None,
+        };
+        let err = validate_manifest_extensions(
+            None, &[], &[], &[], &[], &[], None, &[], &[], Some(&pub_info),
+        )
+        .expect_err("empty label must reject");
+        assert!(err.to_string().contains("publisher.label"));
     }
 
     #[test]

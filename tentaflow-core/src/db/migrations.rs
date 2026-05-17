@@ -156,8 +156,31 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "audit_log_merkle_chain",
             MigrationStep::Rust(audit_log_add_merkle_chain_columns),
         ),
+        (
+            26,
+            "trusted_publishers",
+            MigrationStep::Sql(TRUSTED_PUBLISHERS),
+        ),
     ]
 }
+
+// F1c P2 — admin-managed allowlist of Ed25519 public keys that may sign
+// addon UI bundles. `key_b64` is the canonical 44-char base64 form (32 raw
+// bytes). The table is intentionally NOT seeded: an empty trust store means
+// no externally-published UI addon installs until an operator explicitly
+// runs `tentaflow-cli addon trust-key`. `added_by_user` is reserved for the
+// future RBAC subject (F1c P7); NULL for keys added pre-RBAC or via CLI
+// without an authenticated session.
+const TRUSTED_PUBLISHERS: &str = r#"
+CREATE TABLE IF NOT EXISTS trusted_publishers (
+    key_b64 TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    added_by_user TEXT NULL,
+    contact TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trusted_publishers_label ON trusted_publishers(label);
+"#;
 
 // F1b P4 — Merkle hash chain for `audit_log` (DoD-15). Adds two BLOB columns:
 //   - `prev_hash` (32 B) — copy of the previous row's `hash`, or NULL when
