@@ -238,6 +238,25 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Vector API (F1c P3) — embedded HNSW per-addon per-namespace vector
+    /// indexes (usearch + mmap on disk). Requires `vector.read` (search) /
+    /// `vector.write` (upsert/delete) permissions. Wire format is TOML;
+    /// vector payloads are base64-encoded little-endian f32 bytes.
+    fn vector_upsert_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn vector_search_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn vector_delete_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Alias API (F1a M1.W5) — readonly inspection of aliases.
     /// Requires `alias.read` permission. Lifecycle (create/deactivate) is
     /// driven implicitly by addon install/uninstall from the manifest.
@@ -1255,6 +1274,7 @@ pub mod prelude {
         recording_save_snapshot, recording_save_segment, recording_get_url,
         recording_get_stream, recording_purge, recording_stats, frame_url,
         SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
+        vector_upsert, vector_search, vector_delete, encode_vector_b64, VectorHit,
         AbiError,
         log,
     };
@@ -1994,6 +2014,97 @@ pub fn frame_url(frame_ref: &str, ttl_secs: u64) -> Result<FrameUrl, AbiError> {
     s.push_str(&format!("ttl_secs = {}\n", ttl_secs));
     let bytes = call_sql_with_one_input(frame_url_v1, s.as_bytes())?;
     parse_toml(&bytes)
+}
+
+// =============================================================================
+// Vector API wrappers (F1c P3) — embedded HNSW per-namespace storage
+// =============================================================================
+
+/// One hit returned by `vector_search`. `ref_id` is the key the addon supplied
+/// during `vector_upsert`; `score` is the raw metric distance (lower = closer
+/// for cosine/euclidean; `1 - dot` for dot).
+#[derive(Debug, Clone, Deserialize)]
+pub struct VectorHit {
+    pub ref_id: u64,
+    pub score: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct VectorUpsertResponse {
+    pub namespace: String,
+    pub ref_id: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct VectorSearchResponse {
+    pub namespace: String,
+    #[serde(default)]
+    pub hits: Vec<VectorHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VectorDeleteResponse {
+    pub namespace: String,
+    pub ref_id: u64,
+    pub removed: bool,
+    pub count: u64,
+}
+
+/// Encode a `&[f32]` slice as base64(little-endian f32 bytes) for the vector
+/// host functions. Exposed publicly so addons can pre-encode embeddings once
+/// and reuse the string across upsert/search calls.
+pub fn encode_vector_b64(vector: &[f32]) -> String {
+    let mut raw = Vec::with_capacity(vector.len() * 4);
+    for f in vector {
+        raw.extend_from_slice(&f.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(&raw)
+}
+
+/// Insert or replace a vector under `ref_id` in `namespace`. Returns the
+/// total vector count after the upsert. Requires `vector.write` permission
+/// and the namespace must be declared in the addon manifest under
+/// `[[vector_namespace]]`.
+pub fn vector_upsert(namespace: &str, ref_id: u64, vector: &[f32]) -> Result<u64, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "namespace", namespace);
+    s.push_str(&format!("ref_id = {}\n", ref_id));
+    push_kv_str(&mut s, "vector_b64", &encode_vector_b64(vector));
+    let bytes = call_sql_with_one_input(vector_upsert_v1, s.as_bytes())?;
+    let resp: VectorUpsertResponse = parse_toml(&bytes)?;
+    Ok(resp.count)
+}
+
+/// Top-k k-NN search. Pass `gate_claim_id = Some(...)` when the namespace
+/// declares a `gate` in the manifest (P4 policy/claims engine validates the
+/// claim; P3 only enforces the structural presence).
+pub fn vector_search(
+    namespace: &str,
+    query: &[f32],
+    k: u32,
+    gate_claim_id: Option<&str>,
+) -> Result<Vec<VectorHit>, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "namespace", namespace);
+    push_kv_str(&mut s, "query_b64", &encode_vector_b64(query));
+    s.push_str(&format!("k = {}\n", k));
+    if let Some(c) = gate_claim_id {
+        push_kv_str(&mut s, "gate_claim_id", c);
+    }
+    let bytes = call_sql_with_one_input(vector_search_v1, s.as_bytes())?;
+    let resp: VectorSearchResponse = parse_toml(&bytes)?;
+    Ok(resp.hits)
+}
+
+/// Remove the vector under `ref_id`. Returns `true` if the key existed.
+pub fn vector_delete(namespace: &str, ref_id: u64) -> Result<bool, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "namespace", namespace);
+    s.push_str(&format!("ref_id = {}\n", ref_id));
+    let bytes = call_sql_with_one_input(vector_delete_v1, s.as_bytes())?;
+    let resp: VectorDeleteResponse = parse_toml(&bytes)?;
+    Ok(resp.removed)
 }
 
 // =============================================================================

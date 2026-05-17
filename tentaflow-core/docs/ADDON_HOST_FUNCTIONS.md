@@ -727,7 +727,7 @@ implementacja w odpowiednich tygodniach planu F1a. Zarys w
 | **Streaming** | `stream_subscribe_v1`, `stream_next_v1`, `stream_close_v1` | M0.W2 stub, M2 pelne |
 | **Recording** | `recording_save_segment_v1`, `recording_save_snapshot_v1`, `recording_get_url_v1`, `recording_stats_v1`, `frame_url_v1` | M0.W2 stub, M2 pelne (basic) |
 | **service_call (extended)** | `service_call_v1(alias, method, payload)` — istniejace `service_call` rozszerzone o parametr `method` | M0.W2 stub, M2 pelne |
-| **Vector** | `vector_upsert_v1`, `vector_search_v1`, `vector_count_v1`, `vector_delete_v1` | F2 |
+| **Vector** | `vector_upsert_v1`, `vector_search_v1`, `vector_delete_v1` | F1c P3 (see section 16) |
 | **Claims/Gates** | `claim_add_v1`, `claim_check_v1`, `claim_revoke_v1`, `gate_check_v1`, `gate_enforce_v1` | F2 |
 | **Flow** | `flow_invoke_v1`, `flow_status_v1`, `flow_list_v1`, `flow_get_v1` | F2 |
 | **Audit** | `audit_log_with_risk_v1`, `audit_query_v1`, `audit_export_v1`, `audit_verify_v1` | M0.W3 risk_class, F2 export |
@@ -1683,4 +1683,146 @@ fn capture_and_share(camera_id: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 ```
+
+## 16. Vector API (F1c P3 — TentaVision)
+
+Embedded HNSW per-addon per-namespace vector indexes backed by
+[`usearch`](https://github.com/unum-cloud/usearch) with mmap on-disk
+persistence. Default metric is cosine; `euclidean` and `dot` are
+available per-namespace via the manifest.
+
+Per-addon hard quotas in F1c (configurable in F2+):
+- 10 namespaces per addon
+- 1 000 000 vectors per addon (summed across all its namespaces)
+
+Required permissions:
+
+| Permission | Gates |
+|------------|-------|
+| `vector.read` | `vector_search_v1` |
+| `vector.write` | `vector_upsert_v1`, `vector_delete_v1` |
+
+Every namespace must be declared in the addon manifest under
+`[[vector_namespace]]` — dim + metric + optional gate are pinned at
+install time, addons cannot create ad-hoc namespaces at runtime.
+
+```toml
+[[vector_namespace]]
+name = "faces"
+dimensions = 512
+distance = "cosine"      # cosine | euclidean | dot
+data_class = "B"
+gate = "d4-historical"   # optional — when present, vector_search MUST
+                         # carry a non-empty gate_claim_id
+```
+
+### Wire format
+
+All three calls use TOML for input and output. Vector payloads
+(`vector_b64`, `query_b64`) are base64-encoded little-endian f32 bytes
+— a 512-dim vector encodes to ~2.7 KB, well within the `VectorItem`
+1 MiB payload limit.
+
+### `vector_upsert_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Input TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+vector_b64 = "AAAAQAAAAAA..."
+```
+
+Output TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+count = 12453            # total vectors in the namespace after upsert
+```
+
+Replaces the vector under `ref_id` if it already existed (usearch
+`multi=false` semantics, implemented as remove-then-add inside the
+backend). Persists synchronously to disk before returning. Risk
+class B; audited as `vector.upsert`.
+
+### `vector_search_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Input TOML:
+```toml
+namespace = "faces"
+query_b64 = "AAAAQAAAAAA..."
+k = 10
+gate_claim_id = "claim_abc123"   # required only if the namespace declares a gate
+```
+
+Output TOML:
+```toml
+namespace = "faces"
+
+[[hits]]
+ref_id = 17
+score = 0.0234
+
+[[hits]]
+ref_id = 42
+score = 0.0731
+```
+
+`k` is capped at 1000. `score` is the raw metric distance — lower means
+closer for cosine/euclidean; for `dot` it is `1 - dot product`. Risk
+class B; audited as `vector.search`. Returns `GateNotSatisfied` (code
+22) when the namespace declares a gate and the claim id is missing or
+empty (P3 enforces structural presence; P4 will validate the claim
+against `policy_claims`).
+
+### `vector_delete_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Input TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+```
+
+Output TOML:
+```toml
+namespace = "faces"
+ref_id = 17
+removed = true           # false when the key did not exist
+count = 12452
+```
+
+Risk class B; audited as `vector.delete`.
+
+### SDK wrappers
+
+```rust
+use tentaflow_addon_sdk::prelude::*;
+
+// Upsert — returns the namespace count after the write.
+let embedding: [f32; 512] = compute_face_embedding(&frame);
+let count = vector_upsert("faces", 17, &embedding)?;
+
+// Search — gate_claim_id is None when the namespace declares no gate.
+let hits: Vec<VectorHit> = vector_search("faces", &embedding, 10, None)?;
+for h in &hits {
+    log_info(&format!("ref={} distance={:.4}", h.ref_id, h.score));
+}
+
+// Search a gated namespace.
+let hits = vector_search("faces_historical", &embedding, 10, Some(&claim_id))?;
+
+// Delete returns true when the key existed.
+let removed = vector_delete("faces", 17)?;
+```
+
+### Error codes
+
+| AbiError | Code | Meaning |
+|----------|------|---------|
+| `Permission` | 1 | Missing `vector.read` / `vector.write` |
+| `NotFound` | 2 | Namespace not declared in manifest, or `vector_delete`/`vector_search` against a namespace that has never been written |
+| `Operation` | 5 | Invalid payload, bad b64, dim mismatch, invalid namespace name, k=0 or k>1000 |
+| `OutputBufferTooSmall` | 6 | `out_cap` retry — `out_len_ptr` holds the required size |
+| `QuotaExceeded` | 11 | Per-addon namespace count > 10 or total vectors > 1 000 000 |
+| `PayloadTooLarge` | 21 | Input > 1 MiB or output > 1 MiB |
+| `GateNotSatisfied` | 22 | Namespace declares a gate; `gate_claim_id` missing or empty |
 
