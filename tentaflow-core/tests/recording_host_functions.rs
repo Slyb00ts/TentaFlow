@@ -97,6 +97,7 @@ fn seed_camera(db: &DbPool, owner: &str, camera_id: &str) {
         None,
         None,
         None,
+        None,
     )
     .expect("insert camera");
 }

@@ -56,6 +56,7 @@ fn insert(
         None,
         None,
         None,
+        None,
     )
     .expect("insert");
 }
@@ -81,8 +82,8 @@ fn db_insert_then_list_filters_by_owner() {
     insert(&db, "cam_beta", "addon-a", "/tmp/b.mp4");
     insert(&db, "cam_gamma", "addon-b", "/tmp/c.mp4");
 
-    let a = list_cameras_for_addon(&db, "addon-a").expect("list a");
-    let b = list_cameras_for_addon(&db, "addon-b").expect("list b");
+    let a = list_cameras_for_addon(&db, "addon-a", None).expect("list a");
+    let b = list_cameras_for_addon(&db, "addon-b", None).expect("list b");
     assert_eq!(a.len(), 2);
     assert_eq!(b.len(), 1);
     assert!(a.iter().all(|r| r.owner_addon_id == "addon-a"));
@@ -93,9 +94,9 @@ fn db_insert_then_list_filters_by_owner() {
 fn db_get_returns_none_for_foreign_owner() {
     let db = make_db();
     insert(&db, "cam_x", "addon-a", "/tmp/x.mp4");
-    let foreign = get_camera_for_addon(&db, "addon-b", "cam_x").expect("query");
+    let foreign = get_camera_for_addon(&db, "addon-b", "cam_x", None).expect("query");
     assert!(foreign.is_none());
-    let mine = get_camera_for_addon(&db, "addon-a", "cam_x").expect("query");
+    let mine = get_camera_for_addon(&db, "addon-a", "cam_x", None).expect("query");
     assert!(mine.is_some());
 }
 
@@ -110,7 +111,7 @@ fn db_update_patches_only_provided_fields() {
         ..Default::default()
     };
     assert!(update_camera(&db, "addon-a", "cam_u", &patch).expect("update"));
-    let row = get_camera_for_addon(&db, "addon-a", "cam_u").unwrap().unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_u", None).unwrap().unwrap();
     assert_eq!(row.display_name, "new name");
     assert_eq!(row.target_fps, 15);
     assert_eq!(row.retention_class, "B");
@@ -128,7 +129,7 @@ fn db_update_foreign_owner_does_not_match() {
         ..Default::default()
     };
     assert!(!update_camera(&db, "addon-b", "cam_u2", &patch).expect("update"));
-    let row = get_camera_for_addon(&db, "addon-a", "cam_u2").unwrap().unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_u2", None).unwrap().unwrap();
     assert_eq!(row.display_name, "display");
 }
 
@@ -137,7 +138,7 @@ fn db_soft_delete_then_get_returns_none() {
     let db = make_db();
     insert(&db, "cam_s", "addon-a", "/tmp/s.mp4");
     assert!(soft_delete_camera(&db, "addon-a", "cam_s").expect("delete"));
-    let row = get_camera_for_addon(&db, "addon-a", "cam_s").unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_s", None).unwrap();
     assert!(row.is_none(), "soft-deleted row must not appear in active queries");
 }
 
@@ -158,7 +159,7 @@ fn db_re_insert_after_soft_delete_allowed_by_partial_unique_index() {
     soft_delete_camera(&db, "addon-a", "cam_recycle").unwrap();
     // Second insert must succeed.
     insert(&db, "cam_recycle", "addon-a", "/tmp/r2.mp4");
-    let row = get_camera_for_addon(&db, "addon-a", "cam_recycle").unwrap().unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_recycle", None).unwrap().unwrap();
     assert_eq!(row.url, "/tmp/r2.mp4");
 }
 
@@ -181,6 +182,7 @@ fn db_re_insert_active_id_collides() {
         None,
         None,
         None,
+        None,
     );
     assert!(res.is_err(), "active row must trigger unique index violation");
 }
@@ -191,10 +193,10 @@ fn db_delete_hard_only_matches_owner() {
     insert(&db, "cam_h", "addon-a", "/tmp/h.mp4");
     delete_camera_hard(&db, "addon-b", "cam_h").unwrap();
     // Owner-mismatch hard-delete must NOT remove the row.
-    let row = get_camera_for_addon(&db, "addon-a", "cam_h").unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_h", None).unwrap();
     assert!(row.is_some());
     delete_camera_hard(&db, "addon-a", "cam_h").unwrap();
-    let row = get_camera_for_addon(&db, "addon-a", "cam_h").unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_h", None).unwrap();
     assert!(row.is_none());
 }
 

@@ -275,7 +275,7 @@ pub fn stream_subscribe_v1(
 
     // Ownership enforcement — F1a forbids cross-addon subscribes. Result mapped
     // to `NotFound` so an addon cannot enumerate cameras owned by peers.
-    match get_camera_for_addon(&db, &addon_id, &camera_id) {
+    match get_camera_for_addon(&db, &addon_id, &camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(caller.data(), "stream.subscribe", Some(&camera_id), "denied", Some("not_found_or_not_owned"));

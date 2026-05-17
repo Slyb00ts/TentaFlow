@@ -11003,20 +11003,24 @@ pub fn insert_camera(
     credentials_encrypted: Option<&[u8]>,
     onvif_url: Option<&str>,
     onvif_profile_token: Option<&str>,
+    org_id: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
+    // Stamp the row with the addon's owning org so cross-tenant queries
+    // can never bleed cameras from one tenant into another.
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     conn.execute(
         "INSERT INTO cameras \
          (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
           resolution_width, resolution_height, retention_class, status, status_message, \
           fps_actual, last_frame_at, credentials_encrypted, onvif_url, onvif_profile_token, \
-          created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?14)",
+          created_at, updated_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?14, ?15)",
         rusqlite::params![
             camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
             resolution_width, resolution_height, retention_class, credentials_encrypted,
-            onvif_url, onvif_profile_token, now,
+            onvif_url, onvif_profile_token, now, resolved_org,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -11124,38 +11128,54 @@ pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) 
 }
 
 /// Returns every active camera (`removed_at IS NULL`) owned by `addon_id`,
-/// ordered by `camera_id` for stable output.
+/// ordered by `camera_id` for stable output. When `org_id` is `Some`, the
+/// query further narrows to rows that belong to the calling tenant — the
+/// F2 P1.c multi-tenant isolation guarantee for the camera surface. A None
+/// org_id is treated as "unknown context" (system / boot starts) and falls
+/// back to the seed `org-default` row so backfilled cameras stay reachable.
 #[cfg(feature = "camera")]
-pub fn list_cameras_for_addon(pool: &DbPool, addon_id: &str) -> Result<Vec<CameraRow>> {
+pub fn list_cameras_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    org_id: Option<&str>,
+) -> Result<Vec<CameraRow>> {
     let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras \
-         WHERE owner_addon_id = ?1 AND removed_at IS NULL \
+         WHERE owner_addon_id = ?1 AND org_id = ?2 AND removed_at IS NULL \
          ORDER BY camera_id"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(rusqlite::params![addon_id], row_to_camera)?
+        .query_map(rusqlite::params![addon_id, resolved_org], row_to_camera)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// Returns the active row identified by `camera_id` if owned by `addon_id`.
-/// Cross-addon lookups return `Ok(None)` so the caller surfaces `NotFound`
-/// rather than `PermissionDenied` (avoiding side-channel leak of camera ids).
+/// Returns the active row identified by `camera_id` if owned by `addon_id`
+/// in the supplied org. Cross-org or cross-addon lookups return `Ok(None)`
+/// so the caller surfaces `NotFound` rather than `PermissionDenied` —
+/// avoiding a side-channel leak of camera ids that exist in another tenant.
 #[cfg(feature = "camera")]
 pub fn get_camera_for_addon(
     pool: &DbPool,
     addon_id: &str,
     camera_id: &str,
+    org_id: Option<&str>,
 ) -> Result<Option<CameraRow>> {
     let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras \
-         WHERE owner_addon_id = ?1 AND camera_id = ?2 AND removed_at IS NULL"
+         WHERE owner_addon_id = ?1 AND camera_id = ?2 AND org_id = ?3 AND removed_at IS NULL"
     );
     let row = conn
-        .query_row(&sql, rusqlite::params![addon_id, camera_id], row_to_camera)
+        .query_row(
+            &sql,
+            rusqlite::params![addon_id, camera_id, resolved_org],
+            row_to_camera,
+        )
         .optional()?;
     Ok(row)
 }
