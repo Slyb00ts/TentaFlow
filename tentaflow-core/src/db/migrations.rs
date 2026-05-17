@@ -161,8 +161,35 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "trusted_publishers",
             MigrationStep::Sql(TRUSTED_PUBLISHERS),
         ),
+        (
+            27,
+            "addon_vector_namespaces",
+            MigrationStep::Sql(ADDON_VECTOR_NAMESPACES),
+        ),
     ]
 }
+
+// F1c P3 — per-addon per-namespace HNSW vector index registry. The on-disk
+// HNSW file lives at `file_path` (`<HOME>/.tentaflow/addons/<addon_id>/vectors/
+// <namespace>.usearch`); this table mirrors the (addon_id, namespace) pair to
+// the on-disk file plus the index geometry (`dim`, `metric`) so the namespace
+// can be reopened after process restart without consulting the manifest.
+// `count` is a best-effort cache updated on each upsert/delete — the
+// authoritative size lives inside usearch.
+const ADDON_VECTOR_NAMESPACES: &str = r#"
+CREATE TABLE IF NOT EXISTS addon_vector_namespaces (
+    addon_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    dim INTEGER NOT NULL CHECK(dim >= 1 AND dim <= 4096),
+    metric TEXT NOT NULL CHECK(metric IN ('cosine', 'euclidean', 'dot')),
+    count INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (addon_id, namespace)
+);
+CREATE INDEX IF NOT EXISTS idx_addon_vector_ns_addon ON addon_vector_namespaces(addon_id);
+"#;
 
 // F1c P2 — admin-managed allowlist of Ed25519 public keys that may sign
 // addon UI bundles. `key_b64` is the canonical 44-char base64 form (32 raw

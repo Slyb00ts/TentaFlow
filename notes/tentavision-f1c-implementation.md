@@ -117,8 +117,129 @@ Status: implemented. See `notes/tentavision-f1c-p0-design.md` §A.8.
   `[[ui_component]]`, so the install hook does not affect any
   installed addon today.
 
-## Phase 3 — Vector storage backend
-Not started.
+## Phase 3 — Vector storage backend (LANDED)
 
-## Phase 3 — Vector storage backend
-Not started.
+### Decisions (resolved from P0 Q5-Q7)
+
+- **Backend:** `usearch` 2.25 (Apache 2.0, C++ core with `cxx` Rust bindings,
+  HNSW + mmap on-disk persistence). Verified build on `linux x86_64` —
+  `cargo build --release` 1m30s clean from a fresh target. Cross-compile to
+  iOS/Android stays a P3.1 verification item; on those targets the trait
+  abstraction allows a fallback to `hnsw_rs` without touching the host fns.
+- **Deployment:** embedded (no extra process). `VectorBackend` trait abstracts
+  the implementation so F2+ can swap in `QdrantBackend` without breaking
+  callers.
+- **Default metric:** cosine. Manifest can override per-namespace via
+  `[[vector_namespace]].distance`.
+
+### Files / LOC (approximate)
+
+- `src/services/vector/mod.rs` (16) — re-exports.
+- `src/services/vector/error.rs` (75) — `VectorError` + `Result` alias.
+- `src/services/vector/backend.rs` (75) — `VectorBackend` trait, `Metric`
+  enum, `SearchHit` struct.
+- `src/services/vector/usearch_backend.rs` (300, incl. 9 unit tests) —
+  thin `RwLock<usearch::Index>` wrapper. `multi=false` HNSW; upsert is
+  implemented as `if contains { remove }; add` because the high-level
+  usearch wrapper rejects duplicate keys.
+- `src/services/vector/namespace.rs` (470, incl. 8 unit tests) —
+  `NamespaceManager` (per-process `(addon_id, namespace) -> Arc<dyn>`
+  cache via `dashmap`), DB-backed registry, per-addon quota enforcement,
+  `delete_namespace` admin op.
+- `src/addon/host_functions/vector.rs` (700) — 3 host fns
+  (`vector_upsert_v1`, `vector_search_v1`, `vector_delete_v1`) with TOML
+  input/output, permission gate, manifest-driven dim/metric resolution,
+  gate placeholder, full audit per exit path.
+- `src/db/migrations.rs` — adds migration v27 (`addon_vector_namespaces`).
+- `addon-sdk/sdk/src/lib.rs` — 3 SDK wrappers (`vector_upsert`,
+  `vector_search`, `vector_delete`) + `encode_vector_b64` helper +
+  `VectorHit` in prelude.
+- `tests/db_migrations_v27.rs` (7 tests).
+- `tests/vector_host_functions.rs` (16 tests).
+
+### Cargo deps added
+
+- `usearch = "2.25"` (pulls `cxx` + `numkong`; C++ toolchain required).
+
+### DB schema (v27)
+
+```sql
+CREATE TABLE addon_vector_namespaces (
+    addon_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    dim INTEGER NOT NULL CHECK(dim >= 1 AND dim <= 4096),
+    metric TEXT NOT NULL CHECK(metric IN ('cosine', 'euclidean', 'dot')),
+    count INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (addon_id, namespace)
+);
+CREATE INDEX idx_addon_vector_ns_addon ON addon_vector_namespaces(addon_id);
+```
+
+### Permissions (new)
+
+- `vector.read` — gates `vector_search_v1`.
+- `vector.write` — gates `vector_upsert_v1` + `vector_delete_v1`.
+
+Permissions are dynamic strings checked by `PermissionChecker`; no static
+registry needs updating.
+
+### Manifest extension
+
+The existing `[[vector_namespace]]` block (parsed since F1a as a structural
+placeholder) is now wired live:
+
+```toml
+[[vector_namespace]]
+name = "faces"
+dimensions = 512
+distance = "cosine"      # cosine | euclidean | dot
+data_class = "B"
+gate = "d4-historical"   # optional — when present vector_search MUST
+                         # carry a non-empty gate_claim_id (P4 validates
+                         # the claim itself; P3 only enforces presence)
+```
+
+Addons cannot create namespaces at runtime — every namespace must be
+declared in the manifest, and dim/metric are pinned at declaration time.
+
+### Quotas (hard-coded F1c, configurable F2+)
+
+- `MAX_NAMESPACES_PER_ADDON = 10`.
+- `MAX_VECTORS_PER_ADDON = 1_000_000` (sum of cached `count` column).
+
+Both map to `AbiError::QuotaExceeded` (code 11).
+
+### Persistence policy
+
+`save()` runs synchronously after every successful upsert/delete. F2 may
+introduce write batching once a real workload pushes back.
+
+### Flagged (per P0 risk register)
+
+- **usearch C++ cross-compile for iOS/Android** — not exercised in P3.
+  Desktop + Linux x86_64 work today. Mobile verification lands in P3.1;
+  the `VectorBackend` trait makes a switch to `hnsw_rs` a single-file
+  change if needed.
+- **Sync vs batched persistence** — F1c sync, F2 batch.
+- **`requires_claim` gate** — structural-only in P3 (claim must be
+  present, not validated). Real validation lands in P4.
+
+### Tests (all green)
+
+- 8 + 8 unit tests across `services::vector::*` (open/upsert/search/delete,
+  cosine distance, dim mismatch, persist+reopen, quota, isolation,
+  invalid names, etc.).
+- 7 migration tests in `tests/db_migrations_v27.rs`.
+- 16 integration tests in `tests/vector_host_functions.rs` covering the
+  decode helper, gate matrix, error mapping, end-to-end manager flow,
+  cross-addon isolation, quota, persist+reopen, namespace delete, and an
+  AbiError code-stability sweep.
+
+### Build status
+
+`cargo build --lib --features dashboard-api` clean. Pre-existing
+`dashboard-api` resolution errors when the flag is omitted are unrelated
+to P3 (they predate this branch).
