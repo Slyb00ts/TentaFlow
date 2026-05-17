@@ -171,8 +171,32 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "policy_claims",
             MigrationStep::Sql(POLICY_CLAIMS),
         ),
+        (
+            29,
+            "flow_invocations",
+            MigrationStep::Sql(FLOW_INVOCATIONS),
+        ),
     ]
 }
+
+// F1c P5 — runtime tracking of in-flight and historical flow invocations
+// issued via flow_invoke_v1.
+const FLOW_INVOCATIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS flow_invocations (
+    id TEXT PRIMARY KEY,
+    addon_id TEXT NOT NULL,
+    flow_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    result_toml TEXT,
+    operators_completed INTEGER NOT NULL DEFAULT 0,
+    operators_total INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flow_invocations_addon ON flow_invocations(addon_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_invocations_running ON flow_invocations(status) WHERE status='running';
+"#;
 
 // F1c P4 — policy/claims engine tables. `policy_claims` records DPIA / FRIA
 // approvals or legal grants issued by an administrator (via CLI). Each claim

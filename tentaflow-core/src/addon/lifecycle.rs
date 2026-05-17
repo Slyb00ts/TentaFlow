@@ -145,6 +145,14 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     let wasm_bytes = std::fs::read(&wasm_path)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac pliku WASM: {e}"))?;
 
+    // F1c P5 — compile every declared [[flow_template]] before touching the
+    // DB. A flow.json that fails schema, edge, or cycle validation aborts
+    // install with a precise diagnostic rather than landing a half-installed
+    // addon whose templates silently no-op at runtime. Registry insertion
+    // happens after the DB COMMIT so a later failure does not leave a flow
+    // visible to invokers for an addon that is not actually installed.
+    let compiled_flows = compile_flow_templates(&manifest, addon_dir)?;
+
     let platforms_json =
         serde_json::to_string(&manifest.platforms).unwrap_or_else(|_| "[\"all\"]".to_string());
 
@@ -267,6 +275,16 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
 
     conn.execute("COMMIT", [])?;
     drop(conn);
+
+    // F1c P5 — publish compiled flows now that the addon is persisted. Prior
+    // validation guarantees every flow compiled cleanly; registration cannot
+    // fail.
+    {
+        let registry = crate::flow_runtime::registry::global();
+        for flow in compiled_flows {
+            registry.register(&manifest.addon_id, flow);
+        }
+    }
 
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &manifest)?;
@@ -480,6 +498,11 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     // F1a §6.5 M1.W4: zamknij per-addon SQLite pool. Plik data.db pozostaje
     // na dysku (user moze chciec backup) — czyszczenie tylko manualne.
     crate::addon::storage_sql::close_addon_db(addon_id);
+
+    // F1c P5 — drop any compiled flows this addon registered so a later
+    // invoke against a stale id reports "not found" instead of executing a
+    // template owned by an addon that no longer exists.
+    crate::flow_runtime::registry::global().unregister_addon(addon_id);
 
     info!("Addon '{}' odinstalowany", addon_id);
 
@@ -1505,6 +1528,36 @@ fn parse_vector_namespaces(
             data_class,
             gate,
         });
+    }
+    Ok(out)
+}
+
+/// F1c P5 — load + compile every `[[flow_template]].path` against the
+/// addon bundle directory. Returns the compiled flows on success; on
+/// failure aborts install with a precise per-template error.
+fn compile_flow_templates(
+    manifest: &AddonManifest,
+    addon_dir: &Path,
+) -> Result<Vec<std::sync::Arc<crate::flow_runtime::types::CompiledFlow>>> {
+    let mut out = Vec::with_capacity(manifest.flow_templates.len());
+    for template in &manifest.flow_templates {
+        let compiled = crate::flow_runtime::parser::load_from_addon_dir(addon_dir, &template.path)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "flow_template '{}' (path '{}'): compile failed: {}",
+                    template.id,
+                    template.path,
+                    e
+                )
+            })?;
+        if compiled.def.id != template.id {
+            bail!(
+                "flow_template '{}': manifest id does not match flow.json id '{}'",
+                template.id,
+                compiled.def.id
+            );
+        }
+        out.push(std::sync::Arc::new(compiled));
     }
     Ok(out)
 }

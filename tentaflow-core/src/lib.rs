@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod flow_engine;
+pub mod flow_runtime;
 pub mod hub;
 pub mod inference;
 pub mod memory;

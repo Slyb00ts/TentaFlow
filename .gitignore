@@ -2,6 +2,7 @@
 # Artefakty kompilacji
 # =============================================================================
 target/
+target_shared/
 obj/
 bin/
 *.o
