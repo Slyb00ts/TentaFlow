@@ -120,6 +120,14 @@ pub enum FlowCompileError {
     #[error("edge[{edge_idx}] has invalid port value '{port}' (allowed: true|false|error)")]
     InvalidPort { edge_idx: usize, port: String },
 
+    #[error("edge[{edge_idx}] duplicates an earlier edge from='{from}' to='{to}' port={port:?}")]
+    DuplicateEdge {
+        edge_idx: usize,
+        from: String,
+        to: String,
+        port: Option<String>,
+    },
+
     #[error("cycle detected involving operators: {involved:?}")]
     Cycle { involved: Vec<String> },
 

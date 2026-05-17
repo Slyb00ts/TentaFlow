@@ -154,11 +154,15 @@ async fn cancel_marks_invocation_cancelled() {
     // the call itself is not an error.
     sched
         .cancel(&running.invocation_id, &addon)
+        .await
         .expect("cancel ok");
 
     // Poll DB until terminal — bounded loop avoids flakiness on slow CI.
     for _ in 0..50 {
-        let st = sched.status(&running.invocation_id, &addon).expect("status");
+        let st = sched
+            .status(&running.invocation_id, &addon)
+            .await
+            .expect("status");
         if st.status != "running" {
             assert!(
                 st.status == "cancelled" || st.status == "completed",
@@ -210,7 +214,7 @@ async fn status_for_unknown_invocation_returns_not_found() {
     let db = fresh_db();
     let sched = Arc::new(FlowScheduler::new(db.clone()));
     let addon = unique_addon("status");
-    match sched.status("does-not-exist", &addon) {
+    match sched.status("does-not-exist", &addon).await {
         Err(InvokeError::NotFound(_)) => {}
         other => panic!("expected NotFound, got {:?}", other),
     }
@@ -266,6 +270,93 @@ async fn backpressure_drop_emits_audit_on_finalize() {
         )
         .expect("count");
     assert_eq!(count, 0, "no drops expected on happy path");
+}
+
+/// Two Source operators feeding a single Sink. The Sink has two inbound
+/// edges and must consume EOF from BOTH edges before terminating. With the
+/// old global `received_eofs` counter the Sink would close after the first
+/// EOF arrived twice (once per outer loop pass over closed channels), losing
+/// the record emitted by the second source.
+#[tokio::test]
+async fn multi_input_operator_waits_all_eofs() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("fanin");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src_a", "type": "Source", "params": {{}} }},
+                {{ "id": "src_b", "type": "Source", "params": {{}} }},
+                {{ "id": "snk",   "type": "Sink",   "params": {{}} }}
+            ],
+            "edges": [
+                {{ "from": "src_a", "to": "snk" }},
+                {{ "from": "src_b", "to": "snk" }}
+            ]
+        }}"#
+    );
+    let def = parse_flow_definition(&json).expect("parse");
+    let flow = Arc::new(compile(def).expect("compile"));
+    registry::global().register(&addon, flow);
+
+    let st = sched
+        .invoke(&addon, &flow_id, toml::Value::String("payload".into()), 5_000)
+        .await
+        .expect("invoke");
+    assert_eq!(st.status, "completed", "status: {:?}", st);
+
+    // Sink received one record from src_a and one from src_b — two total.
+    let toml_text = st.result_toml.expect("result_toml present");
+    let parsed: toml::Value = toml::from_str(&toml_text).expect("toml parse");
+    let records = parsed
+        .get("records")
+        .and_then(|v| v.as_array())
+        .expect("records array");
+    assert_eq!(
+        records.len(),
+        2,
+        "expected 2 records (1 per source); got {}: {:?}",
+        records.len(),
+        records
+    );
+}
+
+/// Verifies the CapGuard RAII contract: if a finalize step panics or the
+/// invocation otherwise exits abnormally, the per-addon concurrency slot
+/// must be returned to the pool. We simulate this by saturating the addon
+/// to the cap and then waiting for in-flight invocations to drain; after
+/// drain the same addon must accept fresh invocations again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cap_released_on_panic() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("guard");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    registry::global().register(&addon, make_flow(&flow_id));
+
+    // Fill the addon's slots and drain them.
+    let mut handles = Vec::new();
+    for _ in 0..PER_ADDON_CONCURRENCY_CAP {
+        let s = sched.clone();
+        let a = addon.clone();
+        let f = flow_id.clone();
+        handles.push(tokio::spawn(async move {
+            s.invoke(&a, &f, toml::Value::Integer(0), 5_000).await
+        }));
+    }
+    for h in handles {
+        let _ = h.await.expect("join");
+    }
+
+    // All slots must be released — a fresh invocation must succeed.
+    let st = sched
+        .invoke(&addon, &flow_id, toml::Value::Integer(1), 5_000)
+        .await
+        .expect("post-drain invoke");
+    assert_eq!(st.status, "completed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

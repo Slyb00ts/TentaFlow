@@ -39,7 +39,7 @@ use parking_lot::Mutex as PlMutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::db::DbPool;
 
@@ -120,6 +120,27 @@ pub struct FlowScheduler {
 
 static GLOBAL: OnceLock<Arc<FlowScheduler>> = OnceLock::new();
 
+/// RAII guard returned by `reserve_slot`. Releases the concurrency slot AND
+/// removes the in-flight entry on drop so a panic anywhere between
+/// reservation and the normal finalize path cannot leak a slot. Move the
+/// guard into the spawned background task whenever the invocation outlives
+/// the caller frame (e.g. `wait_ms` timeout) — dropping it early would free
+/// the slot before the DAG actually finishes.
+struct CapGuard {
+    scheduler: Arc<FlowScheduler>,
+    addon_id: String,
+    invocation_id: String,
+}
+
+impl Drop for CapGuard {
+    fn drop(&mut self) {
+        self.scheduler
+            .release_slot(&self.addon_id, &self.invocation_id);
+        let mut g = self.scheduler.in_flight.lock();
+        g.remove(&self.invocation_id);
+    }
+}
+
 impl FlowScheduler {
     pub fn new(db: DbPool) -> Self {
         Self {
@@ -166,8 +187,10 @@ impl FlowScheduler {
         let started_at = Utc::now().to_rfc3339();
 
         // Cap check + reservation happen BEFORE any DB write so a denied
-        // invocation never leaves an orphan row behind.
-        self.reserve_slot(addon_id, &invocation_id)?;
+        // invocation never leaves an orphan row behind. The returned guard
+        // releases the slot automatically if any subsequent step (DB insert,
+        // task spawn, panic in run_invocation) fails before normal finalize.
+        let guard = self.reserve_slot(addon_id, &invocation_id).await?;
 
         let operators_total = flow.def.operators.len() as i64;
 
@@ -198,13 +221,24 @@ impl FlowScheduler {
         .map_err(|e| InvokeError::Internal(format!("join error: {e}")))?;
 
         if let Err(e) = insert_res {
-            // Roll back the reservation — we never started the DAG.
-            self.release_slot(addon_id, &invocation_id);
+            // Roll back the reservation — we never started the DAG. The guard
+            // is dropped here implicitly when this function returns, freeing
+            // the slot and clearing the in-flight entry (which is empty —
+            // nothing was inserted yet).
+            drop(guard);
             return Err(InvokeError::Db(e.to_string()));
         }
 
         let cancel = CancellationToken::new();
-        let edges = build_edges(&flow);
+        let edges = match build_edges(&flow) {
+            Ok(e) => e,
+            Err(e) => {
+                // Guard drops here → slot released, in_flight entry never
+                // existed. DB row stays 'running' — boot recovery will sweep.
+                drop(guard);
+                return Err(e);
+            }
+        };
         let operators_completed = Arc::new(AtomicI64::new(0));
         let sink_outputs: Arc<AsyncMutex<Vec<toml::Value>>> =
             Arc::new(AsyncMutex::new(Vec::new()));
@@ -232,6 +266,7 @@ impl FlowScheduler {
             cancel.clone(),
             started_at.clone(),
             operators_total,
+            guard,
         );
 
         if wait_ms == 0 {
@@ -261,23 +296,33 @@ impl FlowScheduler {
                 Err(InvokeError::Internal(format!("task panic: {join_err}")))
             }
             Err(_elapsed) => {
-                // Timeout — task is still alive. Return current DB state.
-                self.status(&invocation_id, addon_id)
+                // Timeout — task is still alive (the guard moved into the
+                // spawned future keeps the slot reserved until the DAG
+                // finishes). Return current DB state.
+                self.status(&invocation_id, addon_id).await
             }
         }
     }
 
-    pub fn status(&self, invocation_id: &str, addon_id: &str) -> Result<InvocationStatus, InvokeError> {
-        let conn = self
-            .db
-            .lock()
-            .map_err(|e| InvokeError::Db(format!("pool poisoned: {e}")))?;
-        let row = conn
-            .query_row(
+    /// Reads the authoritative status row from the DB. Async because rusqlite
+    /// is sync and the connection mutex must be acquired off the tokio worker.
+    pub async fn status(
+        &self,
+        invocation_id: &str,
+        addon_id: &str,
+    ) -> Result<InvocationStatus, InvokeError> {
+        let db = self.db.clone();
+        let inv = invocation_id.to_string();
+        let addon = addon_id.to_string();
+        let row = tokio::task::spawn_blocking(move || -> Result<InvocationStatus, InvokeError> {
+            let conn = db
+                .lock()
+                .map_err(|e| InvokeError::Db(format!("pool poisoned: {e}")))?;
+            conn.query_row(
                 "SELECT id, status, started_at, finished_at, operators_completed, \
                         operators_total, error, result_toml \
                  FROM flow_invocations WHERE id = ?1 AND addon_id = ?2",
-                rusqlite::params![invocation_id, addon_id],
+                rusqlite::params![inv, addon],
                 |r| {
                     Ok(InvocationStatus {
                         invocation_id: r.get::<_, String>(0)?,
@@ -292,18 +337,19 @@ impl FlowScheduler {
                 },
             )
             .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    InvokeError::NotFound(invocation_id.to_string())
-                }
+                rusqlite::Error::QueryReturnedNoRows => InvokeError::NotFound(inv.clone()),
                 other => InvokeError::Db(other.to_string()),
-            })?;
+            })
+        })
+        .await
+        .map_err(|e| InvokeError::Internal(format!("join error: {e}")))??;
         Ok(row)
     }
 
     /// Requests cancellation. Idempotent: cancelling a finished invocation is
     /// a no-op (the token has no observers) and `status()` continues to
     /// surface the terminal state.
-    pub fn cancel(&self, invocation_id: &str, addon_id: &str) -> Result<(), InvokeError> {
+    pub async fn cancel(&self, invocation_id: &str, addon_id: &str) -> Result<(), InvokeError> {
         let token = {
             let g = self.in_flight.lock();
             match g.get(invocation_id) {
@@ -323,7 +369,7 @@ impl FlowScheduler {
                 // Verify the invocation exists for this addon — terminal
                 // invocations are not in the in-flight map but still exist
                 // in DB, so cancelling them is a quiet success.
-                let _ = self.status(invocation_id, addon_id)?;
+                let _ = self.status(invocation_id, addon_id).await?;
                 Ok(())
             }
         }
@@ -331,19 +377,33 @@ impl FlowScheduler {
 
     // ----- internals -------------------------------------------------------
 
-    fn reserve_slot(&self, addon_id: &str, invocation_id: &str) -> Result<(), InvokeError> {
-        let mut g = self.by_addon.lock();
-        let entry = g.entry(addon_id.to_string()).or_default();
-        if entry.len() >= PER_ADDON_CONCURRENCY_CAP {
-            drop(g);
-            self.emit_concurrency_cap_audit(addon_id);
+    async fn reserve_slot(
+        self: &Arc<Self>,
+        addon_id: &str,
+        invocation_id: &str,
+    ) -> Result<CapGuard, InvokeError> {
+        let denied = {
+            let mut g = self.by_addon.lock();
+            let entry = g.entry(addon_id.to_string()).or_default();
+            if entry.len() >= PER_ADDON_CONCURRENCY_CAP {
+                true
+            } else {
+                entry.insert(invocation_id.to_string());
+                false
+            }
+        };
+        if denied {
+            self.emit_concurrency_cap_audit(addon_id).await;
             return Err(InvokeError::ConcurrencyCapExceeded {
                 addon_id: addon_id.to_string(),
                 cap: PER_ADDON_CONCURRENCY_CAP,
             });
         }
-        entry.insert(invocation_id.to_string());
-        Ok(())
+        Ok(CapGuard {
+            scheduler: self.clone(),
+            addon_id: addon_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+        })
     }
 
     fn release_slot(&self, addon_id: &str, invocation_id: &str) {
@@ -356,55 +416,60 @@ impl FlowScheduler {
         }
     }
 
-    fn emit_concurrency_cap_audit(&self, addon_id: &str) {
-        let conn = match self.db.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let details = serde_json::json!({
-            "reason": "max_concurrent_invocations",
-            "cap": PER_ADDON_CONCURRENCY_CAP,
-        })
-        .to_string();
-        let hash_input = crate::audit::chain::AuditRowHashInput {
-            user_id: None,
-            addon_id: Some(addon_id),
-            instance_id: None,
-            action: "flow.invoke",
-            resource: None,
-            resource_type: Some("flow"),
-            resource_id: None,
-            result: Some("denied"),
-            error_message: None,
-            details: Some(&details),
-            ip_address: None,
-            node_id: None,
-            severity: Some("warn"),
-            risk_class: "C",
-            related_claim_id: None,
-            request_id: None,
-            timestamp: &timestamp,
-        };
-        let (prev_hash, hash) =
-            match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("flow_runtime: audit chain compute failed: {e}");
-                    return;
-                }
+    async fn emit_concurrency_cap_audit(&self, addon_id: &str) {
+        let db = self.db.clone();
+        let addon = addon_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let conn = match db.lock() {
+                Ok(c) => c,
+                Err(_) => return,
             };
-        let _ = conn.execute(
-            "INSERT INTO audit_log \
-                (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-                 result, error_message, severity, risk_class, details, prev_hash, hash) \
-             VALUES (?1, NULL, ?2, 'flow.invoke', 'flow', NULL, \
-                     'denied', NULL, 'warn', 'C', ?3, ?4, ?5)",
-            rusqlite::params![timestamp, addon_id, details, prev_hash, hash],
-        );
+            let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let details = serde_json::json!({
+                "reason": "max_concurrent_invocations",
+                "cap": PER_ADDON_CONCURRENCY_CAP,
+            })
+            .to_string();
+            let hash_input = crate::audit::chain::AuditRowHashInput {
+                user_id: None,
+                addon_id: Some(&addon),
+                instance_id: None,
+                action: "flow.invoke",
+                resource: None,
+                resource_type: Some("flow"),
+                resource_id: None,
+                result: Some("denied"),
+                error_message: None,
+                details: Some(&details),
+                ip_address: None,
+                node_id: None,
+                severity: Some("warn"),
+                risk_class: "C",
+                related_claim_id: None,
+                request_id: None,
+                timestamp: &timestamp,
+            };
+            let (prev_hash, hash) =
+                match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("flow_runtime: audit chain compute failed: {e}");
+                        return;
+                    }
+                };
+            let _ = conn.execute(
+                "INSERT INTO audit_log \
+                    (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+                     result, error_message, severity, risk_class, details, prev_hash, hash) \
+                 VALUES (?1, NULL, ?2, 'flow.invoke', 'flow', NULL, \
+                         'denied', NULL, 'warn', 'C', ?3, ?4, ?5)",
+                rusqlite::params![timestamp, addon, details, prev_hash, hash],
+            );
+        })
+        .await;
     }
 
-    fn emit_backpressure_audit(
+    async fn emit_backpressure_audit(
         &self,
         addon_id: &str,
         flow_id: &str,
@@ -414,52 +479,125 @@ impl FlowScheduler {
         if dropped_total == 0 {
             return;
         }
-        let conn = match self.db.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let details = serde_json::json!({
-            "flow_id": flow_id,
-            "invocation_id": invocation_id,
-            "dropped_count": dropped_total,
-        })
-        .to_string();
-        let hash_input = crate::audit::chain::AuditRowHashInput {
-            user_id: None,
-            addon_id: Some(addon_id),
-            instance_id: None,
-            action: "flow.backpressure_drop",
-            resource: None,
-            resource_type: Some("flow"),
-            resource_id: Some(flow_id),
-            result: Some("backpressure_drop"),
-            error_message: None,
-            details: Some(&details),
-            ip_address: None,
-            node_id: None,
-            severity: Some("warn"),
-            risk_class: "C",
-            related_claim_id: None,
-            request_id: None,
-            timestamp: &timestamp,
-        };
-        let (prev_hash, hash) =
-            match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("flow_runtime: backpressure audit chain failed: {e}");
-                    return;
-                }
+        let db = self.db.clone();
+        let addon = addon_id.to_string();
+        let flow = flow_id.to_string();
+        let inv = invocation_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let conn = match db.lock() {
+                Ok(c) => c,
+                Err(_) => return,
             };
-        let _ = conn.execute(
-            "INSERT INTO audit_log \
-                (timestamp, user_id, addon_id, action, resource_type, resource_id, \
-                 result, error_message, severity, risk_class, details, prev_hash, hash) \
-             VALUES (?1, NULL, ?2, 'flow.backpressure_drop', 'flow', ?3, \
-                     'backpressure_drop', NULL, 'warn', 'C', ?4, ?5, ?6)",
-            rusqlite::params![timestamp, addon_id, flow_id, details, prev_hash, hash],
-        );
+            let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let details = serde_json::json!({
+                "flow_id": flow,
+                "invocation_id": inv,
+                "dropped_count": dropped_total,
+            })
+            .to_string();
+            let hash_input = crate::audit::chain::AuditRowHashInput {
+                user_id: None,
+                addon_id: Some(&addon),
+                instance_id: None,
+                action: "flow.backpressure_drop",
+                resource: None,
+                resource_type: Some("flow"),
+                resource_id: Some(&flow),
+                result: Some("backpressure_drop"),
+                error_message: None,
+                details: Some(&details),
+                ip_address: None,
+                node_id: None,
+                severity: Some("warn"),
+                risk_class: "C",
+                related_claim_id: None,
+                request_id: None,
+                timestamp: &timestamp,
+            };
+            let (prev_hash, hash) =
+                match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("flow_runtime: backpressure audit chain failed: {e}");
+                        return;
+                    }
+                };
+            let _ = conn.execute(
+                "INSERT INTO audit_log \
+                    (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+                     result, error_message, severity, risk_class, details, prev_hash, hash) \
+                 VALUES (?1, NULL, ?2, 'flow.backpressure_drop', 'flow', ?3, \
+                         'backpressure_drop', NULL, 'warn', 'C', ?4, ?5, ?6)",
+                rusqlite::params![timestamp, addon, flow, details, prev_hash, hash],
+            );
+        })
+        .await;
+    }
+
+    /// Emits a warning audit row when the finalize UPDATE on `flow_invocations`
+    /// fails. The DB row stays in `running` state and `mark_orphaned_invocations`
+    /// at next boot will sweep it.
+    async fn emit_finalize_db_error_audit(
+        &self,
+        addon_id: &str,
+        flow_id: &str,
+        invocation_id: &str,
+        error_message: &str,
+    ) {
+        let db = self.db.clone();
+        let addon = addon_id.to_string();
+        let flow = flow_id.to_string();
+        let inv = invocation_id.to_string();
+        let err = error_message.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let conn = match db.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let details = serde_json::json!({
+                "flow_id": flow,
+                "invocation_id": inv,
+                "error": err,
+            })
+            .to_string();
+            let hash_input = crate::audit::chain::AuditRowHashInput {
+                user_id: None,
+                addon_id: Some(&addon),
+                instance_id: None,
+                action: "flow.finalize.db_error",
+                resource: None,
+                resource_type: Some("flow"),
+                resource_id: Some(&flow),
+                result: Some("error"),
+                error_message: Some(&err),
+                details: Some(&details),
+                ip_address: None,
+                node_id: None,
+                severity: Some("warn"),
+                risk_class: "C",
+                related_claim_id: None,
+                request_id: None,
+                timestamp: &timestamp,
+            };
+            let (prev_hash, hash) =
+                match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("flow_runtime: finalize-db-error audit chain failed: {e}");
+                        return;
+                    }
+                };
+            let _ = conn.execute(
+                "INSERT INTO audit_log \
+                    (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+                     result, error_message, severity, risk_class, details, prev_hash, hash) \
+                 VALUES (?1, NULL, ?2, 'flow.finalize.db_error', 'flow', ?3, \
+                         'error', ?4, 'warn', 'C', ?5, ?6, ?7)",
+                rusqlite::params![timestamp, addon, flow, err, details, prev_hash, hash],
+            );
+        })
+        .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -475,6 +613,7 @@ impl FlowScheduler {
         cancel: CancellationToken,
         started_at: String,
         operators_total: i64,
+        guard: CapGuard,
     ) -> InvocationStatus {
         let mut tasks: JoinSet<OperatorOutcome> = JoinSet::new();
         for op_id in &flow.topo_order {
@@ -555,7 +694,8 @@ impl FlowScheduler {
                 .map(|inf| inf.edges.iter().map(|e| e.dropped()).sum())
                 .unwrap_or(0)
         };
-        self.emit_backpressure_audit(&addon_id, &flow.def.id, &invocation_id, dropped_total);
+        self.emit_backpressure_audit(&addon_id, &flow.def.id, &invocation_id, dropped_total)
+            .await;
 
         let ops_done = operators_completed.load(Ordering::Relaxed);
         let finished_at = Utc::now().to_rfc3339();
@@ -574,7 +714,7 @@ impl FlowScheduler {
         };
         let result_toml_for_db = result_toml.clone();
         let finished_at_for_db = finished_at.clone();
-        let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let update_join = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db.lock().map_err(|e| anyhow!("pool poisoned: {e}"))?;
             conn.execute(
                 "UPDATE flow_invocations \
@@ -593,14 +733,41 @@ impl FlowScheduler {
             Ok(())
         })
         .await;
-
-        // Release reservation + in-flight entry BEFORE returning so a fast
-        // caller looping invoke()+wait_ms=0 cannot wedge against a stale cap.
-        self.release_slot(&addon_id, &invocation_id);
-        {
-            let mut g = self.in_flight.lock();
-            g.remove(&invocation_id);
+        match update_join {
+            Ok(Ok(())) => {}
+            Ok(Err(db_err)) => {
+                error!(
+                    "flow_runtime: finalize UPDATE failed for invocation {}: {}",
+                    invocation_id, db_err
+                );
+                self.emit_finalize_db_error_audit(
+                    &addon_id,
+                    &flow.def.id,
+                    &invocation_id,
+                    &db_err.to_string(),
+                )
+                .await;
+            }
+            Err(join_err) => {
+                error!(
+                    "flow_runtime: finalize UPDATE join failed for invocation {}: {}",
+                    invocation_id, join_err
+                );
+                self.emit_finalize_db_error_audit(
+                    &addon_id,
+                    &flow.def.id,
+                    &invocation_id,
+                    &format!("join error: {join_err}"),
+                )
+                .await;
+            }
         }
+
+        // Slot + in-flight entry are released by the CapGuard's Drop impl on
+        // function return. This keeps the contract: even if a panic unwinds
+        // run_invocation between the JoinSet drain and finalize, the slot is
+        // always returned to the addon's pool.
+        drop(guard);
 
         let final_error = match &final_status {
             FinalStatus::Failed(e) => Some(e.clone()),
@@ -671,10 +838,22 @@ async fn run_operator(
         return OperatorOutcome::Completed;
     }
 
-    let mut received_eofs = 0usize;
+    // Per-edge EOF tracking. A global `received_eofs` counter would race when
+    // a previously-closed edge re-emits None on the next outer iteration: the
+    // operator would tally one EOF per inbound edge per loop pass and exit
+    // before the still-active edges drained. Track EOF status against the
+    // concrete edge index instead.
     let inbound_total = inbound.len();
+    let mut eof_received: Vec<bool> = vec![false; inbound_total];
     'outer: loop {
-        for edge in &inbound {
+        if eof_received.iter().all(|done| *done) {
+            break 'outer;
+        }
+        let mut made_progress = false;
+        for (idx, edge) in inbound.iter().enumerate() {
+            if eof_received[idx] {
+                continue;
+            }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -683,6 +862,7 @@ async fn run_operator(
                 }
                 msg = edge.recv() => match msg {
                     Some(FlowMessage::Record(v)) => {
+                        made_progress = true;
                         if is_sink {
                             let mut g = sink_outputs.lock().await;
                             g.push(v);
@@ -692,20 +872,16 @@ async fn run_operator(
                             }
                         }
                     }
-                    Some(FlowMessage::Eof) => {
-                        received_eofs += 1;
-                        if received_eofs >= inbound_total {
-                            break 'outer;
-                        }
-                    }
-                    None => {
-                        received_eofs += 1;
-                        if received_eofs >= inbound_total {
-                            break 'outer;
-                        }
+                    Some(FlowMessage::Eof) | None => {
+                        eof_received[idx] = true;
+                        made_progress = true;
                     }
                 }
             }
+        }
+        if !made_progress {
+            // Every remaining edge is already EOF-flagged — defensive break.
+            break 'outer;
         }
     }
 
@@ -727,7 +903,9 @@ struct EdgeKey {
     port: Option<String>,
 }
 
-fn build_edges(flow: &CompiledFlow) -> HashMap<EdgeKey, Arc<BoundedDropOldest<FlowMessage>>> {
+fn build_edges(
+    flow: &CompiledFlow,
+) -> Result<HashMap<EdgeKey, Arc<BoundedDropOldest<FlowMessage>>>, InvokeError> {
     let mut m: HashMap<EdgeKey, Arc<BoundedDropOldest<FlowMessage>>> = HashMap::new();
     for e in &flow.def.edges {
         let key = EdgeKey {
@@ -735,9 +913,18 @@ fn build_edges(flow: &CompiledFlow) -> HashMap<EdgeKey, Arc<BoundedDropOldest<Fl
             to: e.to.clone(),
             port: e.port.clone(),
         };
+        // Parser already rejects duplicate edges at compile time; this is the
+        // belt-and-suspenders check that guarantees the scheduler never
+        // silently coalesces a model error into a single buffer.
+        if m.contains_key(&key) {
+            return Err(InvokeError::Internal(format!(
+                "duplicate edge in compiled flow: from='{}' to='{}' port={:?}",
+                key.from, key.to, key.port
+            )));
+        }
         m.insert(key, BoundedDropOldest::new(EDGE_BUFFER_CAPACITY));
     }
-    m
+    Ok(m)
 }
 
 /// Encodes the sink stream as a TOML document with a single `records` array.
