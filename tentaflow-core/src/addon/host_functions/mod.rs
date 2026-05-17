@@ -25,6 +25,7 @@ pub mod storage;
 pub mod streaming;
 pub mod ui;
 pub mod user;
+#[cfg(feature = "vector")]
 pub mod vector;
 
 use anyhow::Result;
@@ -201,15 +202,18 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .map_err(|e| anyhow::anyhow!("Rejestracja sql_transaction_v1: {e}"))?;
 
     // --- Vector API (F1c P3 — embedded usearch HNSW + mmap) ---
-    linker
-        .func_wrap("tentaflow", "vector_upsert_v1", vector::vector_upsert_v1)
-        .map_err(|e| anyhow::anyhow!("Rejestracja vector_upsert_v1: {e}"))?;
-    linker
-        .func_wrap("tentaflow", "vector_search_v1", vector::vector_search_v1)
-        .map_err(|e| anyhow::anyhow!("Rejestracja vector_search_v1: {e}"))?;
-    linker
-        .func_wrap("tentaflow", "vector_delete_v1", vector::vector_delete_v1)
-        .map_err(|e| anyhow::anyhow!("Rejestracja vector_delete_v1: {e}"))?;
+    #[cfg(feature = "vector")]
+    {
+        linker
+            .func_wrap("tentaflow", "vector_upsert_v1", vector::vector_upsert_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_upsert_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "vector_search_v1", vector::vector_search_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_search_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "vector_delete_v1", vector::vector_delete_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja vector_delete_v1: {e}"))?;
+    }
 
     // --- Alias API (F1a M1.W5 — readonly: alias_get / alias_list_owned) ---
     linker

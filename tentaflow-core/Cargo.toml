@@ -54,6 +54,11 @@ gpu-vulkan = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/vulkan", "
 # instalator setup.ps1 -Vulkan to obsluguje).
 gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/vulkan"]
 gpu-metal = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/metal", "whisper-rs/metal"]
+# Embedded vector storage (F1c P3). Opt-in because usearch ships a C++ core
+# (cxx) — cross-compile to ios/android requires extra toolchain wiring that
+# we have not validated yet. Server bin enables this explicitly; mobile and
+# desktop crates stay slim until the C++ toolchain is in place.
+vector = ["dep:usearch"]
 
 [dependencies]
 # Protocol (zawsze)
@@ -145,7 +150,7 @@ tempfile = "3.27.0"
 # (linux/macos/windows) bez problemu — wymaga toolchainu cc/c++. Mobile
 # (ios/android) potrzebuje weryfikacji w F1c P3.1 (opcjonalnie fallback
 # `hnsw_rs` pure-Rust). Domyslne features wystarcza (HNSW + save/load).
-usearch = "2.25"
+usearch = { version = "2.25", optional = true }
 
 # Synchronizacja
 parking_lot = "0.12.5"

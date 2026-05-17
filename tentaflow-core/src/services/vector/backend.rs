@@ -63,14 +63,22 @@ pub trait VectorBackend: Send + Sync {
     fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>>;
 
     /// Remove the vector under `ref_id`. Returns `true` if the key existed.
+    /// Implementations MUST persist to disk before returning Ok so that a
+    /// successful return implies durability — callers rely on this to expose
+    /// "delete succeeded" upstream without a separate save step.
     fn delete(&self, ref_id: u64) -> Result<bool>;
+
+    /// True when `ref_id` is currently stored. Used by the namespace manager
+    /// to decide whether an `upsert` is a replace (no quota delta) or a true
+    /// insert (must be counted against the per-addon vector cap).
+    fn has_ref(&self, ref_id: u64) -> bool;
 
     /// Current vector count (authoritative, queried from the native index).
     fn count(&self) -> u64;
 
-    /// Persist the index to disk. F1c calls this after every successful
-    /// upsert/delete so a crash does not lose committed writes; F2 may
-    /// switch to a batched policy.
+    /// Persist the index to disk. The upsert/delete paths call `save()`
+    /// internally before returning success, so external callers only need
+    /// this for explicit flush points (tests, shutdown hooks).
     fn save(&self) -> Result<()>;
 
     /// Geometry of this index — used by the namespace manager to validate
