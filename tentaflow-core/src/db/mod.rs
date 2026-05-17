@@ -71,6 +71,16 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // Uruchom migracje
     migrations::run(&conn)?;
 
+    // F1c P5 — flow_invocations rows left in `status='running'` after a
+    // crash/restart can never be finalized by a live scheduler, so reconcile
+    // them to `failed/core_restart` before the new process begins issuing
+    // invocations.
+    match crate::flow_runtime::boot::mark_orphaned_invocations(&conn) {
+        Ok(n) if n > 0 => info!("flow_runtime: reconciled {} orphaned flow_invocations", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("flow_runtime: orphan reconciliation failed: {}", e),
+    }
+
     // Seed domyslnych danych
     seed::seed_defaults(&conn)?;
 
