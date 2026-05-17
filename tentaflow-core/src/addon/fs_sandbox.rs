@@ -59,24 +59,31 @@ pub fn validate_addon_id(addon_id: &str) -> Result<(), AbiError> {
 // Lokalizacja katalogu danych
 // =============================================================================
 
-/// Korzen sandboxa dla addona w katalogu uzytkownika.
+/// F2 P1.b — root for per-org addon sandboxes: `~/.tentaflow/orgs/<org_id>/addons/`.
 ///
-/// W F1a uzywamy `~/.tentaflow/addons`. Mozna w przyszlosci podmieniac (env
-/// var TENTAFLOW_ADDONS_ROOT) na potrzeby testow E2E — w F1a testy uzywaja
-/// `tempfile::tempdir()` i mockuja przez parametr (nie przez to API).
-fn addons_root() -> Result<PathBuf, AbiError> {
+/// `org_id` is validated with the same path-safety regex as `addon_id`. Pre-F2
+/// installs live at the legacy `~/.tentaflow/addons/<addon_id>/` location; the
+/// boot-time migration `lifecycle::migrate_addon_dirs_to_org_default` moves
+/// those trees to the new layout, so by the time runtime sees `addon_data_dir`
+/// every existing addon has been re-homed under `org-default`.
+fn addons_root(org_id: &str) -> Result<PathBuf, AbiError> {
+    validate_addon_id(org_id)?;
     // `dirs::home_dir()` zwraca None na headless srodowiskach bez HOME — w
     // takiej sytuacji zwracamy Operation (nie panikujemy).
     let home = dirs::home_dir().ok_or(AbiError::Operation)?;
-    Ok(home.join(".tentaflow").join("addons"))
+    Ok(home
+        .join(".tentaflow")
+        .join("orgs")
+        .join(org_id)
+        .join("addons"))
 }
 
-/// Zwraca per-addon katalog danych `~/.tentaflow/addons/<addon_id>/`.
+/// Zwraca per-addon katalog danych `~/.tentaflow/orgs/<org_id>/addons/<addon_id>/`.
 /// Tworzy katalog (idempotent) wraz z hierarchia jesli nie istnieje.
 /// Na Unixach ustawia uprawnienia 0700 (tylko wlasciciel).
-pub fn addon_data_dir(addon_id: &str) -> Result<PathBuf, AbiError> {
+pub fn addon_data_dir(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {
     validate_addon_id(addon_id)?;
-    let root = addons_root()?;
+    let root = addons_root(org_id)?;
     let path = root.join(addon_id);
     std::fs::create_dir_all(&path).map_err(|_| AbiError::Operation)?;
 
@@ -97,8 +104,8 @@ pub fn addon_data_dir(addon_id: &str) -> Result<PathBuf, AbiError> {
 }
 
 /// Sciezka per-addon SQLite (data.db) — uzywana przez storage_sql i migrations.
-pub fn addon_db_path(addon_id: &str) -> Result<PathBuf, AbiError> {
-    Ok(addon_data_dir(addon_id)?.join("data.db"))
+pub fn addon_db_path(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {
+    Ok(addon_data_dir(org_id, addon_id)?.join("data.db"))
 }
 
 // =============================================================================
@@ -193,7 +200,7 @@ mod tests {
     #[test]
     fn test_addon_data_dir_creates_directory() {
         with_tmp_home(|| {
-            let path = addon_data_dir("test-addon").expect("addon_data_dir");
+            let path = addon_data_dir("org-default", "test-addon").expect("addon_data_dir");
             assert!(path.exists(), "katalog utworzony");
             assert!(path.is_dir());
             assert!(path.ends_with("test-addon"));
@@ -203,8 +210,8 @@ mod tests {
     #[test]
     fn test_addon_data_dir_idempotent() {
         with_tmp_home(|| {
-            let p1 = addon_data_dir("idem-addon").expect("first");
-            let p2 = addon_data_dir("idem-addon").expect("second");
+            let p1 = addon_data_dir("org-default", "idem-addon").expect("first");
+            let p2 = addon_data_dir("org-default", "idem-addon").expect("second");
             assert_eq!(p1, p2, "ta sama sciezka");
             assert!(p1.exists());
         });
@@ -213,7 +220,7 @@ mod tests {
     #[test]
     fn test_addon_db_path_in_data_dir() {
         with_tmp_home(|| {
-            let dbp = addon_db_path("db-addon").expect("db path");
+            let dbp = addon_db_path("org-default", "db-addon").expect("db path");
             assert!(dbp.ends_with("data.db"));
             assert!(dbp.parent().unwrap().exists());
         });
@@ -224,7 +231,7 @@ mod tests {
     fn test_addon_data_dir_permissions_0700() {
         use std::os::unix::fs::PermissionsExt;
         with_tmp_home(|| {
-            let p = addon_data_dir("perm-test").expect("created");
+            let p = addon_data_dir("org-default", "perm-test").expect("created");
             let meta = std::fs::metadata(&p).unwrap();
             // Niskie 9 bitow = mode (rwx rwx rwx). 0700 = rwx --- ---.
             let mode_low = meta.permissions().mode() & 0o777;

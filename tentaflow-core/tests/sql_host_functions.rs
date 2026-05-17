@@ -82,9 +82,9 @@ fn install_and_insert_select_end_to_end() {
         "001_init.sql",
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 0);",
     );
-    apply_migrations("sql-e2e", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("sql-e2e", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
-    let pool = open_addon_db("sql-e2e").unwrap();
+    let pool = open_addon_db("org-default", "sql-e2e").unwrap();
     // INSERT via bind params (symulacja sql_exec internals).
     {
         let conn = pool.get().unwrap();
@@ -114,7 +114,7 @@ fn install_and_insert_select_end_to_end() {
         assert_eq!(rows[1], ("beta".to_string(), 5));
     }
 
-    close_addon_db("sql-e2e");
+    close_addon_db("org-default", "sql-e2e");
 }
 
 #[test]
@@ -127,9 +127,9 @@ fn sql_injection_via_bind_param_is_safe() {
         "001_init.sql",
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
     );
-    apply_migrations("sql-inj", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("sql-inj", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
-    let pool = open_addon_db("sql-inj").unwrap();
+    let pool = open_addon_db("org-default", "sql-inj").unwrap();
     // Probuje "wstrzyknac" DROP TABLE jako wartosc parametru.
     let payload = "'; DROP TABLE items;--";
     {
@@ -156,7 +156,7 @@ fn sql_injection_via_bind_param_is_safe() {
             .unwrap();
         assert_eq!(stored, payload, "wartosc zapisana dokladnie");
     }
-    close_addon_db("sql-inj");
+    close_addon_db("org-default", "sql-inj");
 }
 
 #[test]
@@ -169,9 +169,9 @@ fn constraint_violation_returns_proper_error() {
         "001_init.sql",
         "CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE);",
     );
-    apply_migrations("sql-constraint", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("sql-constraint", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
-    let pool = open_addon_db("sql-constraint").unwrap();
+    let pool = open_addon_db("org-default", "sql-constraint").unwrap();
     let conn = pool.get().unwrap();
     conn.execute(
         "INSERT INTO items (code) VALUES (?)",
@@ -196,7 +196,7 @@ fn constraint_violation_returns_proper_error() {
         }
         _ => panic!("inne errore niz constraint: {err:?}"),
     }
-    close_addon_db("sql-constraint");
+    close_addon_db("org-default", "sql-constraint");
 }
 
 #[test]
@@ -210,9 +210,9 @@ fn migration_idempotent_reapply_skipped() {
         "CREATE TABLE x (id INTEGER PRIMARY KEY);",
     );
 
-    let n1 = apply_migrations("sql-idem", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    let n1 = apply_migrations("sql-idem", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
     assert_eq!(n1, 1);
-    let n2 = apply_migrations("sql-idem", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    let n2 = apply_migrations("sql-idem", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
     assert_eq!(n2, 0, "drugi run nie aplikuje");
 
     // Wpis w core DB widoczny ze status success.
@@ -227,7 +227,7 @@ fn migration_idempotent_reapply_skipped() {
     assert_eq!(status, "success");
     assert_eq!(hash.len(), 64);
     drop(conn);
-    close_addon_db("sql-idem");
+    close_addon_db("org-default", "sql-idem");
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn migration_hash_mismatch_blocks_install() {
         "001_init.sql",
         "CREATE TABLE x (id INTEGER);",
     );
-    apply_migrations("sql-tamper", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("sql-tamper", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
     // Podmieniamy tresc migracji po zaaplikowaniu — runner ma to wykryc.
     std::fs::write(
@@ -248,9 +248,9 @@ fn migration_hash_mismatch_blocks_install() {
         "CREATE TABLE x (id INTEGER, malicious INTEGER);",
     )
     .unwrap();
-    let res = apply_migrations("sql-tamper", "0.1.0", "migrations", bundle.path(), &core);
+    let res = apply_migrations("sql-tamper", "0.1.0", "migrations", bundle.path(), &core, "org-default");
     assert!(res.is_err(), "tampered migration powinno failowac");
-    close_addon_db("sql-tamper");
+    close_addon_db("org-default", "sql-tamper");
 }
 
 #[test]
@@ -263,9 +263,9 @@ fn transaction_rollback_on_constraint_fail() {
         "001_init.sql",
         "CREATE TABLE entries (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE);",
     );
-    apply_migrations("sql-tx", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("sql-tx", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
-    let pool = open_addon_db("sql-tx").unwrap();
+    let pool = open_addon_db("org-default", "sql-tx").unwrap();
     {
         let conn = pool.get().unwrap();
         conn.execute(
@@ -294,7 +294,7 @@ fn transaction_rollback_on_constraint_fail() {
             .unwrap();
         assert_eq!(count, 1, "tylko seed po rollback");
     }
-    close_addon_db("sql-tx");
+    close_addon_db("org-default", "sql-tx");
 }
 
 #[test]
@@ -311,9 +311,9 @@ fn statement_readonly_blocks_dml_in_query_path() {
         "001_init.sql",
         "CREATE TABLE x (id INTEGER PRIMARY KEY);",
     );
-    apply_migrations("ro-check", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("ro-check", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
-    let pool = open_addon_db("ro-check").unwrap();
+    let pool = open_addon_db("org-default", "ro-check").unwrap();
     let conn = pool.get().unwrap();
 
     let stmt_select = conn.prepare("SELECT * FROM x").unwrap();
@@ -330,7 +330,7 @@ fn statement_readonly_blocks_dml_in_query_path() {
         .unwrap();
     assert!(stmt_cte_select.readonly(), "WITH ... SELECT pozostaje readonly");
 
-    close_addon_db("ro-check");
+    close_addon_db("org-default", "ro-check");
 }
 
 #[test]
@@ -345,9 +345,9 @@ fn transaction_drop_without_commit_rolls_back() {
         "001_init.sql",
         "CREATE TABLE items (id INTEGER PRIMARY KEY, n INTEGER);",
     );
-    apply_migrations("tx-drop", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("tx-drop", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
-    let pool = open_addon_db("tx-drop").unwrap();
+    let pool = open_addon_db("org-default", "tx-drop").unwrap();
     {
         let mut conn = pool.get().unwrap();
         let mut tx = conn.transaction().unwrap();
@@ -366,7 +366,7 @@ fn transaction_drop_without_commit_rolls_back() {
             .unwrap();
         assert_eq!(count, 0, "drop transakcji bez commit -> rollback");
     }
-    close_addon_db("tx-drop");
+    close_addon_db("org-default", "tx-drop");
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn uninstall_clears_addon_migrations_applied() {
         "001_init.sql",
         "CREATE TABLE x (id INTEGER);",
     );
-    apply_migrations("re-install", "0.1.0", "migrations", bundle.path(), &core).unwrap();
+    apply_migrations("re-install", "0.1.0", "migrations", bundle.path(), &core, "org-default").unwrap();
 
     // Sanity: wpis istnieje.
     {
@@ -420,7 +420,7 @@ fn uninstall_clears_addon_migrations_applied() {
             .unwrap();
         assert_eq!(count, 0, "uninstall musi usunac wpisy migracji");
     }
-    close_addon_db("re-install");
+    close_addon_db("org-default", "re-install");
 }
 
 #[test]
@@ -432,11 +432,11 @@ fn two_addons_isolated_databases() {
     write_migration(bundle_a.path(), "001_a.sql", "CREATE TABLE a_only (x INTEGER);");
     write_migration(bundle_b.path(), "001_b.sql", "CREATE TABLE b_only (y INTEGER);");
 
-    apply_migrations("addon-a", "0.1.0", "migrations", bundle_a.path(), &core).unwrap();
-    apply_migrations("addon-b", "0.1.0", "migrations", bundle_b.path(), &core).unwrap();
+    apply_migrations("addon-a", "0.1.0", "migrations", bundle_a.path(), &core, "org-default").unwrap();
+    apply_migrations("addon-b", "0.1.0", "migrations", bundle_b.path(), &core, "org-default").unwrap();
 
-    let pa = open_addon_db("addon-a").unwrap();
-    let pb = open_addon_db("addon-b").unwrap();
+    let pa = open_addon_db("org-default", "addon-a").unwrap();
+    let pb = open_addon_db("org-default", "addon-b").unwrap();
     let ca = pa.get().unwrap();
     let cb = pb.get().unwrap();
     // a_only widoczne tylko w addon-a, b_only tylko w addon-b.
@@ -459,6 +459,6 @@ fn two_addons_isolated_databases() {
 
     drop(ca);
     drop(cb);
-    close_addon_db("addon-a");
-    close_addon_db("addon-b");
+    close_addon_db("org-default", "addon-a");
+    close_addon_db("org-default", "addon-b");
 }

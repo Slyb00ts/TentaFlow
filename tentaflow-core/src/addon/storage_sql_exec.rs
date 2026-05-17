@@ -195,8 +195,8 @@ fn map_sqlite_error(e: &rusqlite::Error) -> StorageSqlError {
     }
 }
 
-fn acquire_pool(addon_id: &str) -> Result<AddonDbPool, StorageSqlError> {
-    get_addon_pool(addon_id).ok_or(StorageSqlError::NotDeclared)
+fn acquire_pool(org_id: &str, addon_id: &str) -> Result<AddonDbPool, StorageSqlError> {
+    get_addon_pool(org_id, addon_id).ok_or(StorageSqlError::NotDeclared)
 }
 
 /// Guard, ktory uruchamia watchdog thread przerywajacy zapytanie SQL po
@@ -251,6 +251,7 @@ impl Drop for QueryTimeoutGuard {
 
 /// DML (INSERT/UPDATE/DELETE). Returns `(rows_affected, last_insert_id)`.
 pub fn exec_for_addon(
+    org_id: &str,
     addon_id: &str,
     query: &str,
     params: &[JsonValue],
@@ -258,7 +259,7 @@ pub fn exec_for_addon(
     if is_ddl(query) {
         return Err(StorageSqlError::DdlBlocked);
     }
-    let pool = acquire_pool(addon_id)?;
+    let pool = acquire_pool(org_id, addon_id)?;
     let params: Vec<SqliteValue> = params
         .iter()
         .map(json_to_sqlite_value)
@@ -279,6 +280,7 @@ pub fn exec_for_addon(
 
 /// SELECT — wszystkie wiersze. `limit` ogranicza w pamieci (None = bez limitu).
 pub fn query_for_addon(
+    org_id: &str,
     addon_id: &str,
     query: &str,
     params: &[JsonValue],
@@ -287,7 +289,7 @@ pub fn query_for_addon(
     if is_ddl(query) || !is_read_only(query) {
         return Err(StorageSqlError::NotReadOnly);
     }
-    let pool = acquire_pool(addon_id)?;
+    let pool = acquire_pool(org_id, addon_id)?;
     let params: Vec<SqliteValue> = params
         .iter()
         .map(json_to_sqlite_value)
@@ -327,11 +329,12 @@ pub fn query_for_addon(
 
 /// SELECT zwracajacy pierwszy wiersz lub `null`.
 pub fn query_one_for_addon(
+    org_id: &str,
     addon_id: &str,
     query: &str,
     params: &[JsonValue],
 ) -> Result<JsonValue, StorageSqlError> {
-    let full = query_for_addon(addon_id, query, params, Some(2))?;
+    let full = query_for_addon(org_id, addon_id, query, params, Some(2))?;
     let rows = full
         .get("rows")
         .and_then(|v| v.as_array())
@@ -346,6 +349,7 @@ pub fn query_one_for_addon(
 
 /// Atomic batch DML. Returns total `rows_affected`.
 pub fn transaction_for_addon(
+    org_id: &str,
     addon_id: &str,
     statements: &[(String, Vec<JsonValue>)],
 ) -> Result<i64, StorageSqlError> {
@@ -354,7 +358,7 @@ pub fn transaction_for_addon(
             return Err(StorageSqlError::DdlBlocked);
         }
     }
-    let pool = acquire_pool(addon_id)?;
+    let pool = acquire_pool(org_id, addon_id)?;
     let mut conn = pool.get().map_err(abi_to_storage)?;
     let _timeout = QueryTimeoutGuard::new(&conn, QUERY_TIMEOUT_MS);
     let mut tx = conn.transaction().map_err(|e| map_sqlite_error(&e))?;

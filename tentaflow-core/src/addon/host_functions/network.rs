@@ -929,6 +929,7 @@ mod tests {
             addon_id: "net-test-addon".to_string(),
             instance_id: "test-instance".to_string(),
             user_id: None,
+            org_id: None,
             db,
             permissions,
             event_bus,

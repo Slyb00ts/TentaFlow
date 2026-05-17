@@ -360,11 +360,37 @@ pub async fn handle_ws_connection<S>(
                     }
                 }
 
+                // F2 P1.b — resolve the per-request OrgContext once per
+                // message. Failure leaves `org_context = None` so handlers
+                // that opt into org-scoping can decline cleanly while
+                // legacy handlers (no org-aware code path) keep running.
+                // Resolution attaches the user's default org for binary
+                // WS in P1.b; X-Org-Id / subprotocol pinning lands with
+                // the org-switcher UI in P1.c. The session's 16-byte
+                // user_id carries the i64 user id in its trailing 8 bytes
+                // (see auth_login marker `0xFF`); we reuse that encoding
+                // as the stringified key into `org_memberships`.
+                let org_context = match &session {
+                    SessionAuth::UserSession { user_id, .. } => {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&user_id[8..]);
+                        let uid = u64::from_le_bytes(buf) as i64;
+                        let user_id_str = uid.to_string();
+                        crate::services::rbac::resolve_org_context(
+                            &app_state.db,
+                            &user_id_str,
+                            None,
+                        )
+                        .ok()
+                    }
+                    _ => None,
+                };
                 let ctx = HandlerContext {
                     session: session.clone(),
                     correlation_id: envelope.correlation_id,
                     resume_secret: Some(resume_secret.clone()),
                     state: app_state.clone(),
+                    org_context,
                 };
 
                 let variant_name = dispatch::variant_name_of(&body);

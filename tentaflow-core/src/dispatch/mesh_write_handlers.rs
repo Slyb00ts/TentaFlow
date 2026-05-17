@@ -1017,6 +1017,7 @@ mod profiling_tests {
             correlation_id: 1,
             resume_secret: None,
             state: AppState::for_test(),
+            org_context: None,
         }
     }
 

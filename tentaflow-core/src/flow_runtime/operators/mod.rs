@@ -76,6 +76,7 @@ impl OperatorContext {
             user_id: None,
             instance_id: None,
             is_system_call: true,
+            org_id: None,
         }
     }
 }

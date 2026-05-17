@@ -129,6 +129,7 @@ pub fn apply_migrations(
     manifest_migrations_dir: &str,
     bundle_root: &Path,
     core_db: &DbPool,
+    org_id: &str,
 ) -> Result<usize, AbiError> {
     // Sciezka migracji: bundle_root + manifest_migrations_dir. Sanitizujemy
     // manifest path zeby nie wyjsc poza bundle (path traversal w manifest).
@@ -151,7 +152,7 @@ pub fn apply_migrations(
     }
 
     // Otworz/utworz pool dla addona — bedzie potrzebny do apply.
-    let pool = open_addon_db(addon_id)?;
+    let pool = open_addon_db(org_id, addon_id)?;
 
     let mut applied_count = 0usize;
     for mig in &migrations {
@@ -345,12 +346,13 @@ mod tests {
                 "migrations",
                 bundle.path(),
                 &core_db,
+                "org-default",
             )
             .unwrap();
             assert_eq!(n, 1);
 
             // Sprawdz tabele w per-addon DB.
-            let pool = super::super::storage_sql::open_addon_db("mig-init-test").unwrap();
+            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-init-test").unwrap();
             let conn = pool.get().unwrap();
             let count: i64 = conn
                 .query_row(
@@ -360,7 +362,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1);
-            super::super::storage_sql::close_addon_db("mig-init-test");
+            super::super::storage_sql::close_addon_db("org-default", "mig-init-test");
         });
     }
 
@@ -378,9 +380,9 @@ mod tests {
                 ],
             );
             let core_db = setup_core_db();
-            let n = apply_migrations("mig-order-test", "0.1.0", "migrations", bundle.path(), &core_db).unwrap();
+            let n = apply_migrations("mig-order-test", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
             assert_eq!(n, 2);
-            let pool = super::super::storage_sql::open_addon_db("mig-order-test").unwrap();
+            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-order-test").unwrap();
             let conn = pool.get().unwrap();
             // ts kolumna istnieje (drugi migration zaaplikowany po pierwszym).
             let info_cols: Vec<String> = conn
@@ -391,7 +393,7 @@ mod tests {
                 .filter_map(|r| r.ok())
                 .collect();
             assert!(info_cols.contains(&"ts".to_string()));
-            super::super::storage_sql::close_addon_db("mig-order-test");
+            super::super::storage_sql::close_addon_db("org-default", "mig-order-test");
         });
     }
 
@@ -402,11 +404,11 @@ mod tests {
             let mig_dir = bundle.path().join("migrations");
             write_migrations(&mig_dir, &[("001_init.sql", "CREATE TABLE x (id INTEGER);")]);
             let core_db = setup_core_db();
-            let n1 = apply_migrations("mig-idem", "0.1.0", "migrations", bundle.path(), &core_db).unwrap();
+            let n1 = apply_migrations("mig-idem", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
             assert_eq!(n1, 1);
-            let n2 = apply_migrations("mig-idem", "0.1.0", "migrations", bundle.path(), &core_db).unwrap();
+            let n2 = apply_migrations("mig-idem", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
             assert_eq!(n2, 0, "drugi run skip");
-            super::super::storage_sql::close_addon_db("mig-idem");
+            super::super::storage_sql::close_addon_db("org-default", "mig-idem");
         });
     }
 
@@ -417,12 +419,12 @@ mod tests {
             let mig_dir = bundle.path().join("migrations");
             write_migrations(&mig_dir, &[("001_init.sql", "CREATE TABLE x (id INTEGER);")]);
             let core_db = setup_core_db();
-            apply_migrations("mig-hash", "0.1.0", "migrations", bundle.path(), &core_db).unwrap();
+            apply_migrations("mig-hash", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
             // Zmodyfikuj tresc migracji po apply.
             std::fs::write(mig_dir.join("001_init.sql"), "CREATE TABLE x (id INTEGER, extra TEXT);").unwrap();
-            let res = apply_migrations("mig-hash", "0.1.0", "migrations", bundle.path(), &core_db);
+            let res = apply_migrations("mig-hash", "0.1.0", "migrations", bundle.path(), &core_db, "org-default");
             assert!(res.is_err(), "hash mismatch powinien byc wykryty");
-            super::super::storage_sql::close_addon_db("mig-hash");
+            super::super::storage_sql::close_addon_db("org-default", "mig-hash");
         });
     }
 
@@ -440,9 +442,9 @@ mod tests {
                 )],
             );
             let core_db = setup_core_db();
-            let res = apply_migrations("mig-fail", "0.1.0", "migrations", bundle.path(), &core_db);
+            let res = apply_migrations("mig-fail", "0.1.0", "migrations", bundle.path(), &core_db, "org-default");
             assert!(res.is_err());
-            let pool = super::super::storage_sql::open_addon_db("mig-fail").unwrap();
+            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-fail").unwrap();
             let conn = pool.get().unwrap();
             let count: i64 = conn
                 .query_row(
@@ -452,7 +454,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 0, "tabela 'good' nie powinna istniec po rollback");
-            super::super::storage_sql::close_addon_db("mig-fail");
+            super::super::storage_sql::close_addon_db("org-default", "mig-fail");
         });
     }
 
@@ -471,9 +473,9 @@ mod tests {
                 ],
             );
             let core_db = setup_core_db();
-            let n = apply_migrations("mig-invalid", "0.1.0", "migrations", bundle.path(), &core_db).unwrap();
+            let n = apply_migrations("mig-invalid", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
             assert_eq!(n, 1, "tylko 001_init.sql zaakceptowane");
-            super::super::storage_sql::close_addon_db("mig-invalid");
+            super::super::storage_sql::close_addon_db("org-default", "mig-invalid");
         });
     }
 
@@ -484,7 +486,7 @@ mod tests {
             let mig_dir = bundle.path().join("migrations");
             write_migrations(&mig_dir, &[("001_bad.sql", "CREATE TABL x (;")]);
             let core_db = setup_core_db();
-            let _ = apply_migrations("mig-status", "0.1.0", "migrations", bundle.path(), &core_db);
+            let _ = apply_migrations("mig-status", "0.1.0", "migrations", bundle.path(), &core_db, "org-default");
             let conn = core_db.lock().unwrap();
             let status: String = conn
                 .query_row(
@@ -495,7 +497,7 @@ mod tests {
                 .unwrap();
             assert_eq!(status, "failed");
             drop(conn);
-            super::super::storage_sql::close_addon_db("mig-status");
+            super::super::storage_sql::close_addon_db("org-default", "mig-status");
         });
     }
 
@@ -504,8 +506,8 @@ mod tests {
         with_tmp_home(|| {
             let bundle = tempfile::tempdir().unwrap();
             let core_db = setup_core_db();
-            assert!(apply_migrations("mig-trav", "0.1.0", "../etc", bundle.path(), &core_db).is_err());
-            assert!(apply_migrations("mig-trav", "0.1.0", "/tmp", bundle.path(), &core_db).is_err());
+            assert!(apply_migrations("mig-trav", "0.1.0", "../etc", bundle.path(), &core_db, "org-default").is_err());
+            assert!(apply_migrations("mig-trav", "0.1.0", "/tmp", bundle.path(), &core_db, "org-default").is_err());
         });
     }
 
@@ -514,9 +516,9 @@ mod tests {
         with_tmp_home(|| {
             let bundle = tempfile::tempdir().unwrap();
             let core_db = setup_core_db();
-            let n = apply_migrations("mig-nodir", "0.1.0", "migrations", bundle.path(), &core_db).unwrap();
+            let n = apply_migrations("mig-nodir", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
             assert_eq!(n, 0);
-            super::super::storage_sql::close_addon_db("mig-nodir");
+            super::super::storage_sql::close_addon_db("org-default", "mig-nodir");
         });
     }
 }

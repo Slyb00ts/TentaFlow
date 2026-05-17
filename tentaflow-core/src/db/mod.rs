@@ -71,6 +71,27 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // Uruchom migracje
     migrations::run(&conn)?;
 
+    // F2 P1.b — migrate any pre-F2 `~/.tentaflow/addons/<addon_id>/`
+    // directories into the new per-org layout
+    // `~/.tentaflow/orgs/org-default/addons/<addon_id>/`. Runs once after
+    // migrations have populated the DB column; subsequent boots find the
+    // legacy root gone and return Ok(0). Failure is logged, not fatal —
+    // an addon whose dir refuses to move will surface a config error at
+    // first runtime access, which is easier to diagnose than a boot abort.
+    if let Some(home) = dirs::home_dir() {
+        match crate::addon::lifecycle::migrate_addon_dirs_to_org_default(&home) {
+            Ok(n) if n > 0 => info!(
+                "lifecycle: migrated {} legacy addon dir(s) to per-org layout",
+                n
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "lifecycle: legacy addon dir migration partial: {} — manual cleanup may be required",
+                e
+            ),
+        }
+    }
+
     // F1c P5 — flow_invocations rows left in `status='running'` after a
     // crash/restart can never be finalized by a live scheduler, so reconcile
     // them to `failed/core_restart` before the new process begins issuing

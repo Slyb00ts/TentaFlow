@@ -36,6 +36,9 @@ pub struct CallerContext {
     /// `true` skips the per-user permission resolve. Flow operators run
     /// system-side and inherit the addon's manifest permission set.
     pub is_system_call: bool,
+    /// F2 P1.b — owning organization of the call. `None` means "use the
+    /// default tenant" and is recorded as `org-default` in audit rows.
+    pub org_id: Option<String>,
 }
 
 /// Request shape for `dispatch`. `payload_json` is forwarded verbatim to the
@@ -614,15 +617,24 @@ fn emit_audit_inner(
             return;
         }
     };
+    // F2 P1.b — write `org_id` alongside the existing chained columns.
+    // The owning org rides on `CallerContext.org_id`; system calls / boot
+    // paths that do not pin a tenant fall back to `org-default` so the
+    // column stays populated for new rows.
+    let org_for_row = caller
+        .org_id
+        .as_deref()
+        .unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let _ = conn.execute(
-        "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             caller.user_id, &caller.addon_id, instance,
             action, resource_type, resource_id,
             result, error_message, action_hash,
             risk_db, None::<&str>, None::<&str>,
-            timestamp, prev_hash, hash
+            timestamp, prev_hash, hash,
+            org_for_row
         ],
     );
 }

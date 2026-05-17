@@ -349,6 +349,7 @@ fn make_state(db: &DbPool, addon_id: &str, permissions: Vec<String>) -> AddonSta
         addon_id: addon_id.to_string(),
         instance_id: format!("{addon_id}-inst"),
         user_id: None,
+        org_id: None,
         db: db.clone(),
         permissions,
         event_bus: Arc::new(EventBus::new()),

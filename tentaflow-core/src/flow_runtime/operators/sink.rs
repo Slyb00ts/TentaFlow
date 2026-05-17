@@ -133,6 +133,12 @@ pub async fn run(
                         let q = query.as_deref().unwrap();
                         let (sql, params_vec) = substitute_placeholders(q, &record);
                         let addon_id = ctx.addon_id.clone();
+                        // Flow operators run system-side; per-org pinning will
+                        // arrive in P1.c when the flow scheduler threads
+                        // OrgContext from the invoking handler. For now we
+                        // default to `org-default` so single-tenant nodes
+                        // keep working.
+                        let org_id = crate::services::org::DEFAULT_ORG_ID.to_string();
                         // `exec_for_addon` is sync and can block for up to the
                         // 30 s SQL watchdog; without `spawn_blocking` the
                         // current tokio worker is pinned and `cancel` cannot
@@ -140,7 +146,7 @@ pub async fn run(
                         // return on cancel while the SQL completes in the
                         // background (its own watchdog still applies).
                         let handle = tokio::task::spawn_blocking(move || {
-                            exec_for_addon(&addon_id, &sql, &params_vec)
+                            exec_for_addon(&org_id, &addon_id, &sql, &params_vec)
                         });
                         tokio::select! {
                             res = handle => match res {
