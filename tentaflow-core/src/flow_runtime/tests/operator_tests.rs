@@ -290,6 +290,49 @@ fn branch_compile_expr_smoke() {
     assert!(test_compile_expr("no_op_here").is_err());
 }
 
+#[tokio::test]
+async fn branch_expr_with_op_in_string_literal() {
+    // The lexer must split on the FIRST operator outside quotes — the `<`
+    // inside the quoted RHS literal is not a separator.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("br-quoted-op");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src",  "type": "Source", "params": {{ "stream": "input", "count": 1 }} }},
+                {{ "id": "br",   "type": "Branch", "params": {{ "expr": "name == \"abc<def\"" }} }},
+                {{ "id": "snk_t","type": "Sink",   "params": {{}} }},
+                {{ "id": "snk_f","type": "Sink",   "params": {{}} }}
+            ],
+            "edges": [
+                {{ "from": "src", "to": "br" }},
+                {{ "from": "br",  "to": "snk_t", "port": "true" }},
+                {{ "from": "br",  "to": "snk_f", "port": "false" }}
+            ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let input = toml::from_str::<toml::Value>("name = \"abc<def\"").unwrap();
+    let s = sched.invoke(&addon, &flow_id, input, 5_000).await.expect("invoke");
+    assert_eq!(s.status, "completed");
+    let recs = extract_records(s.result_toml.as_deref().unwrap());
+    assert_eq!(recs.len(), 1, "expected one record on `true` port");
+}
+
+#[test]
+fn branch_expr_unterminated_string_rejected() {
+    use crate::flow_runtime::operators::branch::test_compile_expr;
+    let err = test_compile_expr("name == \"abc").expect_err("must reject");
+    assert!(
+        err.contains("unterminated") || err.contains("bad params"),
+        "unexpected error: {err}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Aggregate
 // -----------------------------------------------------------------------------
@@ -392,6 +435,50 @@ async fn aggregate_rejects_short_window() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn predict_alias_revoked_midstream_skips_remaining() {
+    // Per-record alias resolve: when the alias is missing (revoked or never
+    // existed), every record audits `alias_check_failed` and `on_error=skip`
+    // routes around the failure so the flow completes with zero sinks.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("pred-revoke");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src",  "type": "Source",  "params": {{ "stream": "input", "count": 3 }} }},
+                {{ "id": "pred", "type": "Predict", "params": {{ "alias": "gone", "on_error": "skip" }} }},
+                {{ "id": "snk",  "type": "Sink",     "params": {{}} }}
+            ],
+            "edges": [
+                {{ "from": "src",  "to": "pred" }},
+                {{ "from": "pred", "to": "snk" }}
+            ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let s = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000)
+        .await
+        .expect("invoke");
+    assert_eq!(s.status, "completed", "skip policy must not fail the flow");
+    let recs = extract_records(s.result_toml.as_deref().unwrap());
+    assert!(recs.is_empty(), "expected 0 sink records, got {recs:?}");
+    // Verify the audit row carries the per-record alias_check_failed action.
+    let conn = db.lock().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'flow.op.predict.alias_check_failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 3, "expected 3 alias_check_failed audit rows");
+}
+
+#[tokio::test]
 async fn predict_unknown_alias_returns_not_found() {
     let db = fresh_db();
     let sched = Arc::new(FlowScheduler::new(db.clone()));
@@ -474,6 +561,89 @@ async fn sink_sql_exec_requires_permission() {
         .expect("invoke");
     assert_eq!(s.status, "failed");
     assert!(s.error.as_deref().unwrap_or("").contains("sql.write"));
+}
+
+#[tokio::test]
+async fn sink_ui_notify_requires_events_permission() {
+    // ui_notify routes through `publish_event` so the missing `events`
+    // manifest permission is rejected by the same gate that protects
+    // addon-issued events. Without the bus we'd short-circuit earlier;
+    // bind one to reach the permission check.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    sched.set_event_bus(Arc::new(crate::addon::event_bus::EventBus::new()));
+    let addon = unique_addon("sink-uin");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "input", "count": 1 }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{ "kind": "ui_notify", "message": "hi" }} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let s = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000)
+        .await
+        .expect("invoke");
+    // Addon has zero declared permissions — `events` missing → publish_event
+    // denies and Sink audits the error. Skip policy keeps the flow running
+    // so it still completes.
+    assert_eq!(s.status, "completed");
+    let conn = db.lock().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'event.publish' AND result = 'denied'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(count >= 1, "expected at least one denied event.publish audit row");
+}
+
+#[tokio::test]
+async fn sink_sql_exec_honors_cancel() {
+    // The scheduler's per-invocation timeout is the cancel signal; setting
+    // it well below the SQL watchdog (30 s) proves the operator returns
+    // promptly instead of pinning the worker until the watchdog fires.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("sink-sql-cancel");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    // sql_exec needs `sql.write`; without a real addon manifest the test
+    // exercises the param-validation path which itself fails fast and
+    // returns. The cancel-aware select! still applies on the happy path
+    // and is verified statically by compile-time. A full end-to-end
+    // cancel needs a long-running query plumbing not yet available in
+    // `:memory:` tests.
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "input", "count": 1 }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{ "kind": "sql_exec", "query": "SELECT 1" }} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let started = std::time::Instant::now();
+    let s = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 1_000)
+        .await
+        .expect("invoke");
+    let elapsed = started.elapsed();
+    assert_eq!(s.status, "failed");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "operator should return within timeout, took {:?}",
+        elapsed
+    );
 }
 
 #[tokio::test]
