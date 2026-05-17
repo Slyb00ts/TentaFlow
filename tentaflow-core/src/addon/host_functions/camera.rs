@@ -37,7 +37,7 @@ use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
     get_camera_for_addon, insert_camera, list_cameras_for_addon,
-    set_camera_credentials_encrypted, soft_delete_camera, update_camera, CameraPatch, CameraRow,
+    set_camera_credentials_encrypted, set_camera_onvif_resolved, soft_delete_camera, update_camera, CameraPatch, CameraRow,
 };
 use crate::services::camera_ingest::{
     credentials::credentials_cipher, start_supervisor, CameraConfig, CameraIngestError,
@@ -1691,10 +1691,10 @@ pub fn camera_credentials_rotate_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    // Only RTSP carries user-info credentials; fake_file is local filesystem
-    // playback and has no auth, so a rotation request makes no sense and is
-    // rejected explicitly to avoid storing dead blobs against it.
-    if row.vendor != "rtsp" {
+    // Only vendors that carry user-info credentials accept rotation. fake_file
+    // is local filesystem playback (no auth); other unknown vendors are
+    // rejected explicitly to avoid storing dead blobs against them.
+    if row.vendor != "rtsp" && row.vendor != "onvif" {
         audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("vendor_has_no_credentials"));
         let out = CameraCredentialsRotateOut {
             rotated: false,
@@ -1704,6 +1704,38 @@ pub fn camera_credentials_rotate_v1(
     }
     let blob_ref = new_blob.as_deref();
     let blob_len = blob_ref.map(|b| b.len()).unwrap_or(0);
+
+    // For vendor='onvif' the new credentials must be able to mint a fresh
+    // RTSP URI via GetStreamUri (the original URL was the device-service
+    // endpoint, not the stream itself). Re-derive BEFORE persisting the blob
+    // so a bad rotation cannot leave the row pointing at a stream the new
+    // password cannot reach.
+    let (rotated_url, rotated_profile_token) = if row.vendor == "onvif" {
+        let onvif_url = match row.onvif_url.as_deref() {
+            Some(u) => u,
+            None => {
+                audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("onvif_url_missing"));
+                return AbiError::Operation.as_i32();
+            }
+        };
+        let blob = match blob_ref {
+            Some(b) => b,
+            None => {
+                audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("credentials_required_for_onvif"));
+                return AbiError::Operation.as_i32();
+            }
+        };
+        match resolve_onvif_one_click(onvif_url, blob, row.onvif_profile_token.as_deref()) {
+            Ok(ok) => (ok.rtsp_uri, Some(ok.profile_token)),
+            Err((abi, reason)) => {
+                audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some(reason));
+                return abi.as_i32();
+            }
+        }
+    } else {
+        (row.url.clone(), row.onvif_profile_token.clone())
+    };
+
     if set_camera_credentials_encrypted(&db, &addon_id, &input.camera_id, blob_ref)
         .is_err()
     {
@@ -1711,17 +1743,32 @@ pub fn camera_credentials_rotate_v1(
         return AbiError::Operation.as_i32();
     }
 
+    // For ONVIF, update the derived URL + (possibly refreshed) profile token
+    // alongside the credential rotation so the row stays self-consistent.
+    if row.vendor == "onvif" {
+        if let Err(_) = set_camera_onvif_resolved(
+            &db,
+            &addon_id,
+            &input.camera_id,
+            &rotated_url,
+            rotated_profile_token.as_deref(),
+        ) {
+            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed_onvif"));
+            return AbiError::Operation.as_i32();
+        }
+    }
+
     // Signal the live session to restart with the fresh credentials. The
     // session task otherwise keeps the previous plaintext in its in-memory
     // `CameraConfig` and would not pick up the rotation until its next
     // independent disconnect — which on a healthy RTSP feed never happens.
-    // We build a CameraConfig from the persisted row so the restart sees
-    // exactly what `camera_add_v1` would have configured today (vendor +
-    // url + fps + resolution + new blob).
+    // For ONVIF rows the supervisor still runs the session as `rtsp` against
+    // the derived URI (matches camera_add_v1's session_vendor translation).
+    let session_vendor = if row.vendor == "onvif" { "rtsp" } else { row.vendor.as_str() };
     let restart_cfg = CameraConfig {
         camera_id: row.camera_id.clone(),
-        vendor: row.vendor.clone(),
-        url: row.url.clone(),
+        vendor: session_vendor.to_string(),
+        url: rotated_url,
         target_fps: row.target_fps as u32,
         resolution: match (row.resolution_width, row.resolution_height) {
             (Some(w), Some(h)) => Some((w as u32, h as u32)),

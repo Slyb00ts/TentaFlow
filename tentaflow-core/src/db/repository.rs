@@ -11043,6 +11043,29 @@ pub fn set_camera_credentials_encrypted(
     Ok(n > 0)
 }
 
+/// Updates the URL (RTSP) and onvif_profile_token of a camera owned by
+/// `addon_id`. Used by the ONVIF credential rotation path which re-derives
+/// the stream URI from GetStreamUri whenever the password changes — the
+/// device-service URL itself is preserved (it sits in `onvif_url` and is
+/// not touched here). Returns true when a row was updated.
+#[cfg(feature = "camera")]
+pub fn set_camera_onvif_resolved(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    new_rtsp_url: &str,
+    profile_token: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE cameras SET url = ?1, onvif_profile_token = ?2, updated_at = ?3 \
+         WHERE owner_addon_id = ?4 AND camera_id = ?5 AND removed_at IS NULL",
+        rusqlite::params![new_rtsp_url, profile_token, now, addon_id, camera_id],
+    )?;
+    Ok(n > 0)
+}
+
 /// Returns `(rowid, blob)` for every camera that currently has an encrypted
 /// credentials blob. Used by the rotate-key CLI to walk and re-encrypt every
 /// row under a single transaction. Includes soft-deleted rows so historical
