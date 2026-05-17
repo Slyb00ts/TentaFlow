@@ -265,6 +265,21 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Flow API (F1c P5) — invoke addon-declared flow templates, poll status,
+    /// request cooperative cancellation. Requires `flow.invoke` permission.
+    fn flow_invoke_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn flow_status_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn flow_cancel_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Alias API (F1a M1.W5) — readonly inspection of aliases.
     /// Requires `alias.read` permission. Lifecycle (create/deactivate) is
     /// driven implicitly by addon install/uninstall from the manifest.
@@ -1284,6 +1299,7 @@ pub mod prelude {
         SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
         vector_upsert, vector_search, vector_delete, encode_vector_b64, VectorHit,
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
+        flow_invoke, flow_status, flow_cancel, FlowInvocation,
         AbiError,
         log,
     };
@@ -2171,6 +2187,77 @@ pub fn gate_check_scoped(
     }
     let bytes = call_sql_with_one_input(gate_check_v1, s.as_bytes())?;
     parse_toml(&bytes)
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — Flow API (F1c P5)
+// =============================================================================
+
+/// Status row returned by `flow_invoke` / `flow_status`. Mirrors the
+/// `InvocationStatus` shape produced by the core scheduler.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FlowInvocation {
+    pub invocation_id: String,
+    pub status: String,
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub operators_completed: i64,
+    #[serde(default)]
+    pub operators_total: i64,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub result_toml: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FlowCancelRaw {
+    cancelled: bool,
+}
+
+/// Invoke a manifest-declared flow. `wait_ms == 0` returns immediately with
+/// `status = "running"`; `wait_ms > 0` awaits the DAG up to 30 s (silently
+/// clamped by the host). `input` is forwarded verbatim to every operator
+/// as `OperatorContext.input_toml`.
+pub fn flow_invoke(
+    flow_id: &str,
+    input_toml: &str,
+    wait_ms: u32,
+) -> Result<FlowInvocation, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "flow_id", flow_id);
+    s.push_str(&format!("wait_ms = {}\n", wait_ms));
+    // `input` is rendered as an inline TOML expression so callers can pass
+    // a nested table — push it last to avoid leaking the table header into
+    // subsequent scalar keys.
+    s.push_str("input = ");
+    s.push_str(input_toml.trim());
+    s.push('\n');
+    let bytes = call_sql_with_one_input(flow_invoke_v1, s.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Read the authoritative DB row for an invocation. The host filters by
+/// the calling addon id, so an invocation owned by a different addon is
+/// reported as `AbiError::NotFound`.
+pub fn flow_status(invocation_id: &str) -> Result<FlowInvocation, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "invocation_id", invocation_id);
+    let bytes = call_sql_with_one_input(flow_status_v1, s.as_bytes())?;
+    parse_toml(&bytes)
+}
+
+/// Request cooperative cancellation of a running invocation. Idempotent:
+/// cancelling a finished invocation returns `cancelled = true` as long as
+/// the invocation belongs to the calling addon.
+pub fn flow_cancel(invocation_id: &str) -> Result<bool, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "invocation_id", invocation_id);
+    let bytes = call_sql_with_one_input(flow_cancel_v1, s.as_bytes())?;
+    let raw: FlowCancelRaw = parse_toml(&bytes)?;
+    Ok(raw.cancelled)
 }
 
 // =============================================================================
