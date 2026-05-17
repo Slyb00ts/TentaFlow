@@ -525,6 +525,7 @@ mod tests {
             addon_id: "storage-test-addon".to_string(),
             instance_id: "t".to_string(),
             user_id: None,
+            org_id: None,
             db: db.clone(),
             permissions,
             event_bus: Arc::new(EventBus::new()),

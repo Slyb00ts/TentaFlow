@@ -263,6 +263,7 @@ impl InstancePool {
             addon_id: self.addon_id.clone(),
             instance_id: String::new(), // Bedzie ustawiony przy acquire()
             user_id,
+            org_id: None,
             db: self.db.clone(),
             permissions: self.declared_permissions.clone(),
             event_bus: self.event_bus.clone(),

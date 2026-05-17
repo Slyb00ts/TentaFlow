@@ -31,6 +31,7 @@ pub mod mesh_registry;
 pub mod org;
 pub mod pickup_tokens;
 pub mod policy;
+pub mod rbac;
 pub mod ports;
 pub mod recording;
 pub mod registry;

@@ -73,9 +73,9 @@ fn with_tmp_home<F: FnOnce()>(f: F) {
 #[test]
 fn distinct_addon_ids_resolve_to_distinct_paths() {
     with_tmp_home(|| {
-        let a = addon_data_dir("alpha").expect("alpha ok");
-        let b = addon_data_dir("alpha-extra").expect("alpha-extra ok");
-        let c = addon_data_dir("beta").expect("beta ok");
+        let a = addon_data_dir("org-default", "alpha").expect("alpha ok");
+        let b = addon_data_dir("org-default", "alpha-extra").expect("alpha-extra ok");
+        let c = addon_data_dir("org-default", "beta").expect("beta ok");
         assert_ne!(a, b, "addon_id prefix overlap must not collide on disk");
         assert_ne!(a, c);
         assert_ne!(b, c);
@@ -92,8 +92,8 @@ fn distinct_addon_ids_resolve_to_distinct_paths() {
 #[test]
 fn distinct_addon_pools_back_distinct_files() {
     with_tmp_home(|| {
-        let pool_a = storage_sql::open_addon_db("iso-a").expect("pool A");
-        let pool_b = storage_sql::open_addon_db("iso-b").expect("pool B");
+        let pool_a = storage_sql::open_addon_db("org-default", "iso-a").expect("pool A");
+        let pool_b = storage_sql::open_addon_db("org-default", "iso-b").expect("pool B");
 
         // Write a sentinel row through pool A.
         {
@@ -133,8 +133,8 @@ fn distinct_addon_pools_back_distinct_files() {
         };
         assert_eq!(a_has_table, 1);
 
-        storage_sql::close_addon_db("iso-a");
-        storage_sql::close_addon_db("iso-b");
+        storage_sql::close_addon_db("org-default", "iso-a");
+        storage_sql::close_addon_db("org-default", "iso-b");
     });
 }
 
@@ -145,17 +145,17 @@ fn distinct_addon_pools_back_distinct_files() {
 #[test]
 fn close_one_pool_leaves_other_pool_usable() {
     with_tmp_home(|| {
-        let pool_a = storage_sql::open_addon_db("close-a").expect("A");
-        let _pool_b = storage_sql::open_addon_db("close-b").expect("B");
+        let pool_a = storage_sql::open_addon_db("org-default", "close-a").expect("A");
+        let _pool_b = storage_sql::open_addon_db("org-default", "close-b").expect("B");
 
-        storage_sql::close_addon_db("close-b");
+        storage_sql::close_addon_db("org-default", "close-b");
 
         // A must still be usable.
         let conn = pool_a.get().expect("A still usable after B close");
         let one: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
         assert_eq!(one, 1);
 
-        storage_sql::close_addon_db("close-a");
+        storage_sql::close_addon_db("org-default", "close-a");
     });
 }
 
@@ -166,8 +166,8 @@ fn close_one_pool_leaves_other_pool_usable() {
 #[test]
 fn db_path_is_strict_subpath_of_data_dir() {
     with_tmp_home(|| {
-        let dir = addon_data_dir("strict-sub").expect("dir");
-        let dbp = addon_db_path("strict-sub").expect("db");
+        let dir = addon_data_dir("org-default", "strict-sub").expect("dir");
+        let dbp = addon_db_path("org-default", "strict-sub").expect("db");
         assert!(
             dbp.starts_with(&dir),
             "db path {:?} must live under data dir {:?}",
@@ -204,8 +204,8 @@ fn validate_addon_id_does_not_resolve_via_symlink() {
 #[test]
 fn symlink_between_addon_dirs_does_not_punch_through_pool_keying() {
     with_tmp_home(|| {
-        let dir_a = addon_data_dir("sym-a").expect("A");
-        let dir_b = addon_data_dir("sym-b").expect("B");
+        let dir_a = addon_data_dir("org-default", "sym-a").expect("A");
+        let dir_b = addon_data_dir("org-default", "sym-b").expect("B");
 
         // Place a symlink inside A pointing at B's data dir. Pool A opens
         // ~/.tentaflow/addons/sym-a/data.db (not the symlink), so the leak
@@ -214,11 +214,11 @@ fn symlink_between_addon_dirs_does_not_punch_through_pool_keying() {
         let _ = std::fs::remove_file(&leak);
         symlink(&dir_b, &leak).expect("symlink");
 
-        let pool_a = storage_sql::open_addon_db("sym-a").expect("A pool");
+        let pool_a = storage_sql::open_addon_db("org-default", "sym-a").expect("A pool");
         let conn = pool_a.get().expect("A conn");
         conn.execute("CREATE TABLE marker_a (id INTEGER)", []).unwrap();
 
-        let pool_b = storage_sql::open_addon_db("sym-b").expect("B pool");
+        let pool_b = storage_sql::open_addon_db("org-default", "sym-b").expect("B pool");
         let conn_b = pool_b.get().expect("B conn");
         let saw_a: i64 = conn_b
             .query_row(
@@ -229,8 +229,8 @@ fn symlink_between_addon_dirs_does_not_punch_through_pool_keying() {
             .unwrap();
         assert_eq!(saw_a, 0, "B must not see A's table via symlink");
 
-        storage_sql::close_addon_db("sym-a");
-        storage_sql::close_addon_db("sym-b");
+        storage_sql::close_addon_db("org-default", "sym-a");
+        storage_sql::close_addon_db("org-default", "sym-b");
         let _ = std::fs::remove_file(&leak);
         // Quiet `dir_a unused`.
         assert!(Path::new(&dir_a).is_dir());
@@ -248,8 +248,8 @@ fn symlink_between_addon_dirs_does_not_punch_through_pool_keying() {
 #[test]
 fn sql_bound_parameters_with_path_shape_stay_inside_addon_db() {
     with_tmp_home(|| {
-        let pool_a = storage_sql::open_addon_db("sql-iso-a").expect("A");
-        let pool_b = storage_sql::open_addon_db("sql-iso-b").expect("B");
+        let pool_a = storage_sql::open_addon_db("org-default", "sql-iso-a").expect("A");
+        let pool_b = storage_sql::open_addon_db("org-default", "sql-iso-b").expect("B");
 
         // Addon A creates a table and inserts a traversal-shaped string.
         // SQLite stores it verbatim — no path resolution happens because
@@ -303,7 +303,7 @@ fn sql_bound_parameters_with_path_shape_stay_inside_addon_db() {
         // /etc/passwd (or any host path) was not opened. We assert the
         // observable side: A's data dir still does NOT contain a file
         // literally named after the traversal payload.
-        let a_dir = tentaflow_core::addon::fs_sandbox::addon_data_dir("sql-iso-a").unwrap();
+        let a_dir = tentaflow_core::addon::fs_sandbox::addon_data_dir("org-default", "sql-iso-a").unwrap();
         let candidate = a_dir.join(traversal);
         assert!(
             !candidate.exists(),
@@ -311,7 +311,7 @@ fn sql_bound_parameters_with_path_shape_stay_inside_addon_db() {
             candidate
         );
 
-        storage_sql::close_addon_db("sql-iso-a");
-        storage_sql::close_addon_db("sql-iso-b");
+        storage_sql::close_addon_db("org-default", "sql-iso-a");
+        storage_sql::close_addon_db("org-default", "sql-iso-b");
     });
 }

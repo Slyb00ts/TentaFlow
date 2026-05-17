@@ -444,6 +444,7 @@ mod tests {
             addon_id: addon_id.to_string(),
             instance_id: "inst-1".to_string(),
             user_id,
+            org_id: None,
             db,
             permissions,
             event_bus: Arc::new(EventBus::new()),

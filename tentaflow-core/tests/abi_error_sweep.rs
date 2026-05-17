@@ -396,6 +396,7 @@ fn trigger_camera_vendor_unsupported_via_camera_add() {
         addon_id: "vendor-test-addon".to_string(),
         instance_id: "v-1".to_string(),
         user_id: None,
+        org_id: None,
         db: db.clone(),
         permissions: vec!["cameras.write".to_string()],
         event_bus: Arc::new(EventBus::new()),

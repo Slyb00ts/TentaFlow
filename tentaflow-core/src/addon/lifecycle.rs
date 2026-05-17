@@ -332,12 +332,18 @@ fn apply_addon_sql_migrations(
         );
     }
 
+    // F2 P1.b — install runs under `org-default` during P1.b. Per-tenant
+    // install (lifecycle::install_for_org) lands in P1.c together with the
+    // CLI surface; until then every install is owned by `org-default`,
+    // matching the v32 backfill for `addons.org_id`.
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
     match crate::addon::migrations::apply_migrations(
         &manifest.addon_id,
         &manifest.version,
         migrations_dir,
         addon_dir,
         db,
+        org_id,
     ) {
         Ok(n) => {
             info!(
@@ -354,7 +360,7 @@ fn apply_addon_sql_migrations(
                 manifest.addon_id,
                 e.as_i32()
             );
-            crate::addon::storage_sql::close_addon_db(&manifest.addon_id);
+            crate::addon::storage_sql::close_addon_db(org_id, &manifest.addon_id);
             // Usun z DB (best-effort, install i tak juz failuje).
             let _ = uninstall(&manifest.addon_id, db);
             bail!(
@@ -499,7 +505,12 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
 
     // F1a §6.5 M1.W4: zamknij per-addon SQLite pool. Plik data.db pozostaje
     // na dysku (user moze chciec backup) — czyszczenie tylko manualne.
-    crate::addon::storage_sql::close_addon_db(addon_id);
+    // F2 P1.b — uninstall is single-tenant in P1.b (org-default). Per-org
+    // uninstall lands with the CLI in P1.c.
+    crate::addon::storage_sql::close_addon_db(
+        crate::services::org::DEFAULT_ORG_ID,
+        addon_id,
+    );
 
     // F1c P5 — drop any compiled flows this addon registered so a later
     // invoke against a stale id reports "not found" instead of executing a
@@ -509,6 +520,89 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     info!("Addon '{}' odinstalowany", addon_id);
 
     Ok(())
+}
+
+// =============================================================================
+// F2 P1.b — boot-time migration of pre-F2 addon dirs to per-org layout
+// =============================================================================
+
+/// Move every legacy `<home>/.tentaflow/addons/<addon_id>/` directory into the
+/// new per-org layout `<home>/.tentaflow/orgs/org-default/addons/<addon_id>/`.
+/// Called from the boot path AFTER `db::migrations::run` so the DB v32
+/// backfill has already promoted every row to `org-default`.
+///
+/// Idempotent: a second invocation finds the legacy root already absent (or
+/// empty) and returns 0. Returns the number of addon dirs that were moved
+/// successfully. IO failures on individual entries are logged and skipped —
+/// the boot does not abort on a single stuck dir (e.g. open file handle on
+/// Windows). Missing legacy root → returns Ok(0).
+pub fn migrate_addon_dirs_to_org_default(home: &std::path::Path) -> std::io::Result<usize> {
+    let legacy_root = home.join(".tentaflow").join("addons");
+    if !legacy_root.exists() {
+        return Ok(0);
+    }
+    let target_root = home
+        .join(".tentaflow")
+        .join("orgs")
+        .join(crate::services::org::DEFAULT_ORG_ID)
+        .join("addons");
+    std::fs::create_dir_all(&target_root)?;
+
+    let mut moved = 0usize;
+    for entry in std::fs::read_dir(&legacy_root)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("migrate_addon_dirs: read_dir entry skipped: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Skip non-directory entries (stray files from manual operator
+        // intervention should not block the migration).
+        if !path.is_dir() {
+            continue;
+        }
+        let dest = target_root.join(&name);
+        if dest.exists() {
+            // Target already populated — either a previous partial migration
+            // or the operator re-installed under the new layout. Leave the
+            // legacy dir alone so a human can reconcile.
+            tracing::warn!(
+                "migrate_addon_dirs: '{}' exists at both legacy and per-org paths — skipping",
+                name
+            );
+            continue;
+        }
+        match std::fs::rename(&path, &dest) {
+            Ok(_) => {
+                moved += 1;
+                tracing::info!(
+                    "migrate_addon_dirs: '{}' moved to per-org layout",
+                    name
+                );
+            }
+            Err(e) => {
+                // `rename` across filesystem boundaries fails with EXDEV on
+                // Linux. The legacy root and target are siblings under the
+                // same `.tentaflow` tree so this should not happen, but log
+                // and continue rather than abort the entire boot.
+                tracing::warn!(
+                    "migrate_addon_dirs: rename '{}' failed: {} — manual move required",
+                    name,
+                    e
+                );
+            }
+        }
+    }
+
+    // Try to drop the now-empty legacy root. Failure is non-fatal.
+    let _ = std::fs::remove_dir(&legacy_root);
+    Ok(moved)
 }
 
 // =============================================================================
