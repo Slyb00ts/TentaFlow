@@ -170,6 +170,12 @@ pub async fn run(
                     service_name: alias.clone(),
                     payload_json,
                     timeout_ms,
+                    // Predict mints alias-gated calls; dispatch must reject
+                    // Ok(None) (treat as concrete service) so a same-named
+                    // live service cannot be reached if the alias was
+                    // revoked between Predict's preflight resolve and
+                    // dispatch's own resolve.
+                    alias_required: true,
                 };
                 let started = Instant::now();
                 let sm_ref = ctx.service_manager.as_ref();
