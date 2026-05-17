@@ -148,48 +148,38 @@ pub fn event_publish(
         serde_json::Value::Null
     };
 
-    // Sprawdz uprawnienie events (rw — publikacja wymaga write)
-    if !check_permission(caller.data(), "events", Some(&event_type)) {
-        audit_log(
-            caller.data(),
-            "event.publish",
-            Some("events"),
-            Some(&event_type),
-            "denied",
-            None,
-        );
-        return ABI_ERR_PERMISSION;
-    }
-
-    let addon_id = caller.data().addon_id.clone();
-    let user_id = caller.data().user_id;
+    let state = caller.data();
+    let req_caller = crate::services::service_call::CallerContext {
+        addon_id: state.addon_id.clone(),
+        user_id: state.user_id,
+        instance_id: Some(state.instance_id.clone()),
+        is_system_call: state.is_system_call,
+    };
+    let bus = state.event_bus.clone();
+    let db = state.db.clone();
+    let checker = state.permission_checker.clone();
+    let permissions = state.permissions.clone();
 
     info!(
         "event_publish: addon='{}', event_type='{}'",
-        addon_id, event_type
+        req_caller.addon_id, event_type
     );
 
-    // Opublikuj event
-    let event = crate::addon::event_bus::Event {
-        event_type: event_type.clone(),
-        source_addon: Some(addon_id.clone()),
-        source_user: user_id,
+    match crate::addon::event_publish::publish_event(
+        &bus,
+        &db,
+        &req_caller,
+        Some(&checker),
+        &permissions,
+        &event_type,
         payload,
-        timestamp: chrono::Utc::now(),
-    };
-
-    caller.data().event_bus.publish(event);
-
-    audit_log(
-        caller.data(),
-        "event.publish",
-        Some("events"),
-        Some(&event_type),
-        "ok",
-        None,
-    );
-
-    ABI_OK
+    ) {
+        Ok(()) => ABI_OK,
+        Err(crate::addon::event_publish::EventPublishError::Permission { .. }) => {
+            ABI_ERR_PERMISSION
+        }
+        Err(_) => ABI_ERR_OPERATION,
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 pub mod bundled;
 pub mod errors;
 pub mod event_bus;
+pub mod event_publish;
 pub mod flow_blocks;
 pub mod fs_sandbox;
 pub mod host_functions;
@@ -16,6 +17,7 @@ pub mod manifest;
 pub mod migrations;
 pub mod sdk_version;
 pub mod storage_sql;
+pub mod storage_sql_exec;
 pub mod oauth;
 pub mod oauth_cleanup;
 pub mod oauth_crypto;
