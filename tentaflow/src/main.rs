@@ -434,6 +434,16 @@ async fn run_server(args: Args) -> Result<()> {
         .service_manager()
         .set_event_bus(addon_manager.event_bus().clone());
 
+    // Late-bind flow_runtime's ServiceManager + EventBus handles so operators
+    // (Predict, Sink event_publish) reach the same QUIC routing surface and
+    // bus the WASM host functions use.
+    {
+        let sched = tentaflow_core::flow_runtime::scheduler::FlowScheduler::global();
+        sched.set_service_manager(router.service_manager().clone());
+        sched.set_event_bus(addon_manager.event_bus().clone());
+    }
+    tentaflow_core::addon::event_publish::init_global(addon_manager.event_bus().clone());
+
     addon_manager.clone().start_event_dispatcher();
 
     // Wpiecie addon block resolverem do flow_engine — od tego momentu flow
