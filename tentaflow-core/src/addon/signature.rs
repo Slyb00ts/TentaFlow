@@ -16,13 +16,22 @@ use sha2::{Digest, Sha256};
 
 use crate::db::DbPool;
 
+/// Upper bound on a single UI bundle file. HTML+JS bundles are typically well
+/// under 1 MiB; the cap exists to stop a malicious or buggy manifest from
+/// pointing `src` at a multi-gigabyte file and OOM-ing install. Increase if
+/// legitimate larger UI bundles appear.
+pub const MAX_UI_BUNDLE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SignatureError {
-    #[error("publisher key not in trust store: {0}")]
+    #[error("publisher key not in trust store (prefix: {0})")]
     UntrustedPublisher(String),
 
     #[error("invalid public key format (expected 32-byte Ed25519 base64): {0}")]
     InvalidPublicKey(String),
+
+    #[error("bundle too large: {size} bytes > {max} max")]
+    BundleTooLarge { size: u64, max: u64 },
 
     #[error("invalid signature format (expected Ed25519 base64): {0}")]
     InvalidSignatureFormat(String),
@@ -54,9 +63,9 @@ pub fn verify_ui_component_bundle(
     pool: &DbPool,
 ) -> Result<(), SignatureError> {
     if !is_publisher_trusted(pool, publisher_pk_b64)? {
-        return Err(SignatureError::UntrustedPublisher(
-            publisher_pk_b64.to_string(),
-        ));
+        return Err(SignatureError::UntrustedPublisher(truncate_pk_for_audit(
+            publisher_pk_b64,
+        )));
     }
 
     let pk_bytes = base64::engine::general_purpose::STANDARD
@@ -91,10 +100,19 @@ pub fn verify_ui_component_bundle(
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
 
-    let bundle_bytes = std::fs::read(bundle_path)?;
-    if bundle_bytes.is_empty() {
+    let metadata = std::fs::metadata(bundle_path)?;
+    let size = metadata.len();
+    if size == 0 {
         return Err(SignatureError::BundleEmpty);
     }
+    if size > MAX_UI_BUNDLE_BYTES {
+        return Err(SignatureError::BundleTooLarge {
+            size,
+            max: MAX_UI_BUNDLE_BYTES,
+        });
+    }
+
+    let bundle_bytes = std::fs::read(bundle_path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bundle_bytes);
     let digest = hasher.finalize();
@@ -247,8 +265,44 @@ mod tests {
         let sig = sign_bundle(&sk, bundle);
         let f = write_bundle(bundle);
         match verify_ui_component_bundle(f.path(), &pk, &sig, &pool) {
-            Err(SignatureError::UntrustedPublisher(k)) => assert_eq!(k, pk),
+            Err(SignatureError::UntrustedPublisher(prefix)) => {
+                assert_eq!(prefix.chars().count(), 8, "must be 8-char prefix only");
+                assert!(pk.starts_with(&prefix), "prefix must match pk start");
+                assert_ne!(prefix, pk, "full key must NOT be in error");
+            }
             other => panic!("expected UntrustedPublisher, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn untrusted_publisher_error_truncates_key_in_display() {
+        let pool = make_pool();
+        let sk = keypair(99);
+        let pk = pk_b64(&sk);
+        assert!(pk.len() > 8, "test precondition: full key longer than prefix");
+        let bundle = b"data";
+        let sig = sign_bundle(&sk, bundle);
+        let f = write_bundle(bundle);
+        let err = verify_ui_component_bundle(f.path(), &pk, &sig, &pool).unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains(&pk), "full key leaked into Display: {msg}");
+    }
+
+    #[test]
+    fn verify_rejects_bundle_over_size_cap() {
+        let pool = make_pool();
+        let sk = keypair(7);
+        let pk = pk_b64(&sk);
+        trust(&pool, &pk);
+        let oversize = vec![0xABu8; (MAX_UI_BUNDLE_BYTES + 1) as usize];
+        let sig = sign_bundle(&sk, &oversize);
+        let f = write_bundle(&oversize);
+        match verify_ui_component_bundle(f.path(), &pk, &sig, &pool) {
+            Err(SignatureError::BundleTooLarge { size, max }) => {
+                assert_eq!(max, MAX_UI_BUNDLE_BYTES);
+                assert!(size > max);
+            }
+            other => panic!("expected BundleTooLarge, got {other:?}"),
         }
     }
 

@@ -20,6 +20,7 @@ use tentaflow_core::addon::signature::verify_ui_component_bundle;
 use tentaflow_core::addon::AddonManifest;
 use tentaflow_core::db;
 use tentaflow_core::db::repository as repo;
+use tentaflow_core::util::path_safety::safe_resolve;
 
 #[derive(Subcommand, Debug)]
 pub enum AddonCommand {
@@ -406,69 +407,19 @@ fn resolve_paths(path: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     }
 }
 
-/// Bezpieczna walidacja sciezki referowanej z manifestu — odrzuca sciezki
-/// absolutne, komponenty `..` i (po canonicalize) sciezki wskazujace poza
-/// katalog addona. Zwraca pelna joined path gdy OK, albo czytelny komunikat
-/// bledu opisujacy ktora regula path traversal zostala naruszona.
-fn safe_resolve(addon_dir: &Path, rel_path: &str) -> Result<PathBuf, String> {
-    let rel = Path::new(rel_path);
-    if rel.is_absolute() {
-        return Err(format!(
-            "sciezka '{rel_path}' jest absolutna; manifest musi uzywac sciezek wzglednych"
-        ));
-    }
-    for component in rel.components() {
-        if let std::path::Component::ParentDir = component {
-            return Err(format!(
-                "sciezka '{rel_path}' zawiera '..' — niedozwolone path traversal"
-            ));
-        }
-    }
-    let joined = addon_dir.join(rel);
-    if let Ok(canonical) = joined.canonicalize() {
-        let addon_canonical = addon_dir
-            .canonicalize()
-            .map_err(|e| format!("nie mozna canonicalize katalogu addona: {e}"))?;
-        if !canonical.starts_with(&addon_canonical) {
-            return Err(format!(
-                "sciezka '{rel_path}' po canonicalize wskazuje poza katalog addona"
-            ));
-        }
-    }
-    Ok(joined)
-}
-
 fn check_file(dir: &Path, rel: &str, label: &str, report: &mut ValidationReport) {
-    let full = match safe_resolve(dir, rel) {
-        Ok(p) => p,
-        Err(e) => {
-            report.errors.push(format!("{label}: {e}"));
-            return;
-        }
-    };
-    if full.exists() {
-        report.infos.push(format!("{label}: '{rel}' istnieje"));
-    } else {
-        report
-            .errors
-            .push(format!("{label}: plik '{rel}' nie istnieje w {dir:?}"));
+    match safe_resolve(dir, rel) {
+        Ok(_) => report.infos.push(format!("{label}: '{rel}' istnieje")),
+        Err(e) => report.errors.push(format!("{label}: {e}")),
     }
 }
 
 fn check_file_soft(dir: &Path, rel: &str, label: &str, report: &mut ValidationReport) {
-    let full = match safe_resolve(dir, rel) {
-        Ok(p) => p,
-        Err(e) => {
-            report.errors.push(format!("{label}: {e}"));
-            return;
-        }
-    };
-    if full.exists() {
-        report.infos.push(format!("{label}: '{rel}' istnieje"));
-    } else {
-        report.warnings.push(format!(
-            "{label}: plik '{rel}' nie istnieje w {dir:?} (zbuduj addon przed pakowaniem)"
-        ));
+    match safe_resolve(dir, rel) {
+        Ok(_) => report.infos.push(format!("{label}: '{rel}' istnieje")),
+        Err(e) => report.warnings.push(format!(
+            "{label}: plik '{rel}' nie dostepny ({e}); zbuduj addon przed pakowaniem"
+        )),
     }
 }
 
