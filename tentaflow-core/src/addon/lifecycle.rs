@@ -661,17 +661,14 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
     sync_manifest_metadata(db, &new_manifest)?;
 
-    // F1c P5 — swap compiled flows: drop every previous-version entry for this
-    // addon and publish the new set atomically (from the perspective of new
-    // flow_invoke_v1 calls; in-flight invocations holding an Arc to the old
-    // CompiledFlow keep running against the old graph until they finish).
-    {
-        let registry = crate::flow_runtime::registry::global();
-        registry.unregister_addon(addon_id);
-        for flow in new_compiled_flows {
-            registry.register(addon_id, flow);
-        }
-    }
+    // F1c P5 — atomically swap compiled flows: drop every previous-version
+    // entry for this addon and publish the new set under a single write lock,
+    // so no concurrent flow_invoke_v1 ever observes a partial publish (no
+    // not-found-then-found window). In-flight invocations holding an Arc to
+    // the old CompiledFlow keep running against the old graph until they
+    // finish.
+    crate::flow_runtime::registry::global()
+        .replace_addon_flows(addon_id, new_compiled_flows);
 
     info!(
         "Addon '{}' zaktualizowany do v{}",
