@@ -42,10 +42,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::addon::event_bus::EventBus;
+use crate::addon::permissions::PermissionChecker;
 use crate::db::DbPool;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 use super::bounded_drop_oldest::BoundedDropOldest;
+use super::operators::{
+    self, OperatorContext, OperatorError, OutboundEdge,
+};
 use super::registry;
 use super::types::{CompiledFlow, OperatorType};
 
@@ -651,6 +655,12 @@ impl FlowScheduler {
         operators_total: i64,
         guard: CapGuard,
     ) -> InvocationStatus {
+        // Build the per-invocation PermissionChecker once and share by Arc.
+        // The operators that need it (Predict, Sink event/ui_notify) clone
+        // the Arc; the rest carry the handle without ever using it.
+        let permission_checker = Arc::new(PermissionChecker::new(self.db.clone()));
+        let permissions = load_declared_permissions(&self.db, &addon_id).await;
+
         let mut tasks: JoinSet<OperatorOutcome> = JoinSet::new();
         for op_id in &flow.topo_order {
             let op = flow
@@ -664,29 +674,31 @@ impl FlowScheduler {
                 .filter(|(k, _)| k.to == op.id)
                 .map(|(_, v)| v.clone())
                 .collect();
-            let outbound: Vec<Arc<BoundedDropOldest<FlowMessage>>> = edges
+            let outbound: Vec<OutboundEdge> = edges
                 .iter()
                 .filter(|(k, _)| k.from == op.id)
-                .map(|(_, v)| v.clone())
+                .map(|(k, v)| (k.port.clone(), v.clone()))
                 .collect();
 
-            let op_id = op.id.clone();
+            let ctx = OperatorContext {
+                addon_id: addon_id.clone(),
+                flow_id: flow.def.id.clone(),
+                invocation_id: invocation_id.clone(),
+                operator_id: op.id.clone(),
+                input_toml: input.clone(),
+                params: op.params.clone(),
+                db: self.db.clone(),
+                permissions: permissions.clone(),
+                permission_checker: permission_checker.clone(),
+                service_manager: self.service_manager(),
+                event_bus: self.event_bus(),
+                sink_outputs: sink_outputs.clone(),
+            };
             let op_type = op.op_type;
             let token = cancel.clone();
-            let sinks = sink_outputs.clone();
-            let input_for_source = input.clone();
             let completed = operators_completed.clone();
             tasks.spawn(async move {
-                let outcome = run_operator(
-                    &op_id,
-                    op_type,
-                    inbound,
-                    outbound,
-                    input_for_source,
-                    sinks,
-                    token,
-                )
-                .await;
+                let outcome = dispatch_operator(op_type, ctx, inbound, outbound, token).await;
                 if matches!(outcome, OperatorOutcome::Completed) {
                     completed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -700,6 +712,12 @@ impl FlowScheduler {
             match joined {
                 Ok(OperatorOutcome::Completed) => {}
                 Ok(OperatorOutcome::Cancelled) => cancelled = true,
+                Ok(OperatorOutcome::Failed(err)) => {
+                    if failure.is_none() {
+                        failure = Some(err);
+                    }
+                    cancel.cancel();
+                }
                 Err(join_err) => {
                     if failure.is_none() {
                         failure = Some(format!("operator task panic: {join_err}"));
@@ -824,12 +842,13 @@ impl FlowScheduler {
 }
 
 // -----------------------------------------------------------------------------
-// Operator runtime — chunk B passthrough body.
+// Operator runtime — dispatches to flow_runtime::operators::*.
 // -----------------------------------------------------------------------------
 
-enum OperatorOutcome {
+pub(crate) enum OperatorOutcome {
     Completed,
     Cancelled,
+    Failed(String),
 }
 
 enum FinalStatus {
@@ -838,95 +857,75 @@ enum FinalStatus {
     Cancelled,
 }
 
-/// Real chunk-B operator body. Every operator reads each inbound edge to
-/// completion and forwards every record to every outbound edge. Source
-/// operators have no inbound edge — they inject the caller's `input` once
-/// and then propagate `Eof`. Sink operators have no outbound edge — they
-/// append every record to `sink_outputs` and discard `Eof` on the floor.
-///
-/// Chunk C replaces this body with per-operator logic (Predict service_call,
-/// Threshold filter, Branch port selection, Aggregate window, Sink side
-/// effects). The orchestration scaffolding around it does not change.
-async fn run_operator(
-    _op_id: &str,
+/// Reads the declared permission identifiers for `addon_id` from
+/// `addon_declared_permissions`. Returns an empty vector when the addon has
+/// no row in the table (e.g. test fixtures that bypass `lifecycle::install`).
+async fn load_declared_permissions(db: &DbPool, addon_id: &str) -> Vec<String> {
+    let pool = db.clone();
+    let addon = addon_id.to_string();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+        let conn = pool
+            .lock()
+            .map_err(|e| anyhow!("db pool poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT permission_type FROM addon_declared_permissions WHERE addon_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![addon], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(s) = r {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            warn!("flow_runtime: declared_permissions lookup failed: {e}");
+            Vec::new()
+        }
+        Err(e) => {
+            warn!("flow_runtime: declared_permissions join error: {e}");
+            Vec::new()
+        }
+    }
+}
+
+async fn dispatch_operator(
     op_type: OperatorType,
+    ctx: OperatorContext,
     inbound: Vec<Arc<BoundedDropOldest<FlowMessage>>>,
-    outbound: Vec<Arc<BoundedDropOldest<FlowMessage>>>,
-    source_input: toml::Value,
-    sink_outputs: Arc<AsyncMutex<Vec<toml::Value>>>,
+    outbound: Vec<OutboundEdge>,
     cancel: CancellationToken,
 ) -> OperatorOutcome {
-    let is_source = matches!(op_type, OperatorType::Source) || inbound.is_empty();
-    let is_sink = matches!(op_type, OperatorType::Sink) || outbound.is_empty();
-
-    if is_source {
-        if cancel.is_cancelled() {
-            for edge in &outbound {
-                edge.close();
-            }
-            return OperatorOutcome::Cancelled;
+    let res: Result<(), OperatorError> = match op_type {
+        OperatorType::Source => operators::run_source(ctx, inbound, outbound, cancel.clone()).await,
+        OperatorType::Predict => {
+            operators::run_predict(ctx, inbound, outbound, cancel.clone()).await
         }
-        for edge in &outbound {
-            edge.send(FlowMessage::Record(source_input.clone()));
-            edge.send(FlowMessage::Eof);
-            edge.close();
+        OperatorType::Threshold => {
+            operators::run_threshold(ctx, inbound, outbound, cancel.clone()).await
         }
-        return OperatorOutcome::Completed;
-    }
-
-    // Per-edge EOF tracking. A global `received_eofs` counter would race when
-    // a previously-closed edge re-emits None on the next outer iteration: the
-    // operator would tally one EOF per inbound edge per loop pass and exit
-    // before the still-active edges drained. Track EOF status against the
-    // concrete edge index instead.
-    let inbound_total = inbound.len();
-    let mut eof_received: Vec<bool> = vec![false; inbound_total];
-    'outer: loop {
-        if eof_received.iter().all(|done| *done) {
-            break 'outer;
+        OperatorType::Branch => operators::run_branch(ctx, inbound, outbound, cancel.clone()).await,
+        OperatorType::Aggregate => {
+            operators::run_aggregate(ctx, inbound, outbound, cancel.clone()).await
         }
-        let mut made_progress = false;
-        for (idx, edge) in inbound.iter().enumerate() {
-            if eof_received[idx] {
-                continue;
-            }
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    for e in &outbound { e.close(); }
-                    return OperatorOutcome::Cancelled;
-                }
-                msg = edge.recv() => match msg {
-                    Some(FlowMessage::Record(v)) => {
-                        made_progress = true;
-                        if is_sink {
-                            let mut g = sink_outputs.lock().await;
-                            g.push(v);
-                        } else {
-                            for out in &outbound {
-                                out.send(FlowMessage::Record(v.clone()));
-                            }
-                        }
-                    }
-                    Some(FlowMessage::Eof) | None => {
-                        eof_received[idx] = true;
-                        made_progress = true;
-                    }
-                }
+        OperatorType::Sink => operators::run_sink(ctx, inbound, outbound, cancel.clone()).await,
+    };
+    match res {
+        Ok(()) => {
+            if cancel.is_cancelled() {
+                OperatorOutcome::Cancelled
+            } else {
+                OperatorOutcome::Completed
             }
         }
-        if !made_progress {
-            // Every remaining edge is already EOF-flagged — defensive break.
-            break 'outer;
-        }
+        Err(e) => OperatorOutcome::Failed(e.to_string()),
     }
-
-    for out in &outbound {
-        out.send(FlowMessage::Eof);
-        out.close();
-    }
-    OperatorOutcome::Completed
 }
+
 
 // -----------------------------------------------------------------------------
 // Edge construction
