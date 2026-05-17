@@ -1,0 +1,17 @@
+[addon]
+id = "test-flow-runner"
+display_name = "Test Flow Runner"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "flow.invoke"
+display_name = "Invoke flows"
+description = "Allows the addon to run its declared flows"
+risk = "medium"
+
+[[flow_template]]
+id = "tv-test-simple"
+display_name = "Simple test flow"
+path = "flows/simple.flow.json"
+description = "Source -> Threshold -> Sink"

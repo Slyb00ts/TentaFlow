@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "tv-test-simple",
+  "operators": [
+    { "id": "src", "type": "Source", "params": { "stream": "input", "count": 3 } },
+    { "id": "thr", "type": "Threshold", "params": { "field": "value", "min": 5.0 } },
+    { "id": "snk", "type": "Sink", "params": { "kind": "invocation_result" } }
+  ],
+  "edges": [
+    { "from": "src", "to": "thr" },
+    { "from": "thr", "to": "snk" }
+  ]
+}
