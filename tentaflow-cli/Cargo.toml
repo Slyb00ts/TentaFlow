@@ -19,3 +19,6 @@ rand = "0.10.1"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+base64 = "0.22.1"
+sha2 = "0.10.9"
+ed25519-dalek = { path = "../vendor/ed25519-dalek", features = ["rand_core"] }

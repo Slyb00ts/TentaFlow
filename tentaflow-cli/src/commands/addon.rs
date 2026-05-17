@@ -14,9 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tentaflow_core::addon::lifecycle::parse_manifest_toml;
-use tentaflow_core::addon::manifest::validate_manifest_extensions;
+use tentaflow_core::addon::manifest::{validate_manifest_extensions, validate_publisher_pk_b64};
 use tentaflow_core::addon::sdk_version::{check_compatibility, CORE_SDK_VERSION};
+use tentaflow_core::addon::signature::verify_ui_component_bundle;
 use tentaflow_core::addon::AddonManifest;
+use tentaflow_core::db;
+use tentaflow_core::db::repository as repo;
 
 #[derive(Subcommand, Debug)]
 pub enum AddonCommand {
@@ -25,6 +28,48 @@ pub enum AddonCommand {
         /// Sciezka do katalogu addonu (z manifest.toml) lub do samego pliku
         /// manifestu.
         path: PathBuf,
+    },
+    /// Dodaje klucz publiczny Ed25519 wydawcy do trust store (F1c P2).
+    TrustKey {
+        /// Klucz publiczny Ed25519, 32 bajty zakodowane base64 (44 znaki).
+        key_b64: String,
+        /// Czytelna nazwa wydawcy (np. "ACME Sp. z o.o.").
+        #[arg(long)]
+        label: String,
+        /// Opcjonalny kanal kontaktu (email lub URL).
+        #[arg(long)]
+        contact: Option<String>,
+        /// Sciezka do pliku DB tentaflow.db.
+        #[arg(long, default_value = "tentaflow.db")]
+        db: PathBuf,
+    },
+    /// Listuje wszystkich zaufanych wydawcow z trust store.
+    ListTrusted {
+        /// Sciezka do pliku DB tentaflow.db.
+        #[arg(long, default_value = "tentaflow.db")]
+        db: PathBuf,
+    },
+    /// Usuwa klucz wydawcy z trust store (nie wplywa na juz zainstalowane addony).
+    UntrustKey {
+        /// Klucz publiczny Ed25519 do usuniecia (base64).
+        key_b64: String,
+        /// Sciezka do pliku DB tentaflow.db.
+        #[arg(long, default_value = "tentaflow.db")]
+        db: PathBuf,
+    },
+    /// Weryfikuje bundle UI bez instalacji addona (dry-run signature check).
+    VerifyBundle {
+        /// Sciezka do pliku bundle (JS / archive).
+        bundle_path: PathBuf,
+        /// Klucz publiczny wydawcy (base64).
+        #[arg(long = "publisher-key")]
+        publisher_key: String,
+        /// Sygnatura `ed25519:<base64>` lub samo base64 (64 bajty).
+        #[arg(long)]
+        signature: String,
+        /// Sciezka do pliku DB tentaflow.db (trust store sprawdza, czy klucz jest zaufany).
+        #[arg(long, default_value = "tentaflow.db")]
+        db: PathBuf,
     },
 }
 
@@ -44,6 +89,138 @@ pub fn run(cmd: AddonCommand) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        AddonCommand::TrustKey {
+            key_b64,
+            label,
+            contact,
+            db,
+        } => run_trust_key(&key_b64, &label, contact.as_deref(), &db),
+        AddonCommand::ListTrusted { db } => run_list_trusted(&db),
+        AddonCommand::UntrustKey { key_b64, db } => run_untrust_key(&key_b64, &db),
+        AddonCommand::VerifyBundle {
+            bundle_path,
+            publisher_key,
+            signature,
+            db,
+        } => run_verify_bundle(&bundle_path, &publisher_key, &signature, &db),
+    }
+}
+
+fn run_trust_key(key_b64: &str, label: &str, contact: Option<&str>, db_path: &Path) -> ExitCode {
+    if label.trim().is_empty() {
+        eprintln!("Blad: --label nie moze byc pusty");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = validate_publisher_pk_b64(key_b64) {
+        eprintln!("Blad: {e}");
+        return ExitCode::from(1);
+    }
+    let pool = match db::init(db_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Nie mozna otworzyc DB {}: {e}", db_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    match repo::insert_trusted_publisher(&pool, key_b64, label, contact, None) {
+        Ok(1) => {
+            println!("OK: klucz dodany do trust store ({label})");
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            println!("UWAGA: klucz juz byl w trust store (bez zmian)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Blad insert: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_list_trusted(db_path: &Path) -> ExitCode {
+    let pool = match db::init(db_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Nie mozna otworzyc DB {}: {e}", db_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    match repo::list_trusted_publishers(&pool) {
+        Ok(rows) => {
+            if rows.is_empty() {
+                println!("(trust store pusty — zaden zewnetrzny addon z UI nie zainstaluje sie)");
+            } else {
+                println!("{:<46} {:<32} {:<25} {}", "key_b64", "label", "added_at", "contact");
+                for r in rows {
+                    println!(
+                        "{:<46} {:<32} {:<25} {}",
+                        r.key_b64,
+                        r.label,
+                        r.added_at,
+                        r.contact.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Blad zapytania: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_untrust_key(key_b64: &str, db_path: &Path) -> ExitCode {
+    let pool = match db::init(db_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Nie mozna otworzyc DB {}: {e}", db_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    match repo::remove_trusted_publisher(&pool, key_b64) {
+        Ok(true) => {
+            println!("OK: klucz usuniety z trust store");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("UWAGA: klucza nie bylo w trust store");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Blad delete: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_verify_bundle(
+    bundle_path: &Path,
+    publisher_key: &str,
+    signature: &str,
+    db_path: &Path,
+) -> ExitCode {
+    if !bundle_path.exists() {
+        eprintln!("Blad: bundle '{}' nie istnieje", bundle_path.display());
+        return ExitCode::from(1);
+    }
+    let pool = match db::init(db_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Nie mozna otworzyc DB {}: {e}", db_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    match verify_ui_component_bundle(bundle_path, publisher_key, signature, &pool) {
+        Ok(()) => {
+            println!("OK: signature zweryfikowana, wydawca zaufany");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("BLAD weryfikacji: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -139,6 +316,7 @@ pub fn validate(path: &Path) -> anyhow::Result<ValidationReport> {
         manifest.sdk_version.as_deref(),
         &manifest.uses_aliases,
         &manifest.uses_models,
+        manifest.publisher.as_ref(),
     ) {
         report
             .errors

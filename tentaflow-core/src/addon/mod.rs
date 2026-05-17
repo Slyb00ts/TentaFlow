@@ -22,6 +22,7 @@ pub mod oauth_crypto;
 pub mod oauth_master_key;
 pub mod oauth_refresh_guard;
 pub mod permissions;
+pub mod signature;
 pub mod rate_limiter;
 pub mod runtime;
 pub mod tool_dispatch;
@@ -155,6 +156,11 @@ pub struct AddonManifest {
     /// modeli (free-form `model_id`, bez FK).
     #[serde(default)]
     pub uses_models: Vec<manifest::UsesModelSpec>,
+    /// Sekcja `[publisher]` — Ed25519 public key + label wydawcy. Wymagana
+    /// gdy addon deklaruje `[[ui_component]]` (signatures verify). Klucz musi
+    /// byc obecny w `trusted_publishers` (DB v26) zeby install przeszedl.
+    #[serde(default)]
+    pub publisher: Option<manifest::PublisherInfo>,
 }
 
 /// Sekcja [application] manifestu — rejestracja addonu jako aplikacji
