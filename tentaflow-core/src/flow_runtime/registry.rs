@@ -58,6 +58,18 @@ impl FlowRegistry {
         before - guard.len()
     }
 
+    /// Atomically replaces every flow owned by `addon_id` with `flows`. Holds
+    /// the write lock across the drop + reinsert so no concurrent reader ever
+    /// sees a partial publish (used by the upgrade path).
+    pub fn replace_addon_flows(&self, addon_id: &str, flows: Vec<Arc<CompiledFlow>>) {
+        let mut guard = self.inner.write();
+        guard.retain(|(aid, _), _| aid != addon_id);
+        for flow in flows {
+            let flow_id = flow.def.id.clone();
+            guard.insert((addon_id.to_string(), flow_id), flow);
+        }
+    }
+
     /// Returns flow ids owned by `addon_id`, sorted lexicographically for
     /// stable diagnostics / test assertions.
     pub fn list_for_addon(&self, addon_id: &str) -> Vec<String> {
