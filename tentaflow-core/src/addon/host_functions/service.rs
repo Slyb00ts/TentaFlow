@@ -65,6 +65,10 @@ pub fn service_request(
         service_name: service_name.clone(),
         payload_json: request_json,
         timeout_ms: 0,
+        // WASM service_request keeps legacy semantics: service_name may be an
+        // alias OR a concrete service; both are accepted. Flow operators that
+        // mint alias-gated calls set this to true.
+        alias_required: false,
     };
     let db = state.db.clone();
     let permission_checker = state.permission_checker.clone();

@@ -48,6 +48,12 @@ pub struct ServiceCallRequest {
     /// 0 = use the default `DISPATCH_TIMEOUT`. The WASM ABI does not surface
     /// a timeout knob today; operators may dial it down in C1.
     pub timeout_ms: u32,
+    /// When `true`, dispatch requires `service_name` to resolve to a row in
+    /// `model_aliases`. The alias gate currently allows `Ok(None)` (treat as
+    /// concrete service name) — flow operators that mint calls explicitly
+    /// through an alias should set this so a revoked alias cannot fall
+    /// through to a same-named live service.
+    pub alias_required: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +177,20 @@ pub async fn dispatch(
             Some("service.request"),
             None,
         ) {
+            Ok(None) if req.alias_required => {
+                emit_audit(
+                    db,
+                    &req.caller,
+                    "service.request",
+                    Some("alias"),
+                    Some(&service_name),
+                    "denied",
+                    Some("alias_required_not_found"),
+                );
+                return Err(ServiceCallError::NotFound {
+                    service: service_name,
+                });
+            }
             Ok(_) => {}
             Err(e) => {
                 if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>()
