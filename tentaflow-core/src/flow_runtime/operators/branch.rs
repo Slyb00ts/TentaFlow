@@ -62,6 +62,13 @@ fn compile_expr(raw: &str) -> Result<CompiledExpr, OperatorError> {
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = in_string {
+            // Backslash escapes the next byte (typical for \" inside "..." or
+            // \' inside '...'). Without this, `name == "abc\"<def"` would
+            // close the string at the escaped quote and parse `<` as an op.
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
             if c == q {
                 in_string = None;
             }
@@ -133,7 +140,22 @@ fn parse_literal(s: &str) -> Result<Literal, OperatorError> {
         if s.len() < 2 {
             return Err(OperatorError::BadParams("branch: malformed quoted literal".to_string()));
         }
-        return Ok(Literal::Str(s[1..s.len() - 1].to_string()));
+        // Unescape: \" → ", \' → ', \\ → \. Lexer above treats `\<quote>` as
+        // a literal quote inside the string; this routine collapses the
+        // escape sequence into the actual character.
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        return Ok(Literal::Str(out));
     }
     if let Ok(i) = s.parse::<i64>() {
         return Ok(Literal::Num(i as f64));
