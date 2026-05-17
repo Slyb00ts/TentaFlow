@@ -27,7 +27,12 @@ static GLOBAL_BUS: OnceLock<Arc<EventBus>> = OnceLock::new();
 /// `AddonManager`. Unit tests that need bus-isolated setups leave the global
 /// unset and consume the bus explicitly.
 pub fn init_global(bus: Arc<EventBus>) {
-    let _ = GLOBAL_BUS.set(bus);
+    if GLOBAL_BUS.set(bus).is_err() {
+        tracing::warn!(
+            "event_publish::init_global called more than once; subsequent bus ignored. \
+             flow_runtime operators will publish to the first-installed bus."
+        );
+    }
 }
 
 /// Returns the global bus or `None` if `init_global` was never called.
