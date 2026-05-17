@@ -395,6 +395,7 @@ pub fn recording_save_snapshot_v1(
     };
 
     let file_path_str = saved.file_path.to_string_lossy().to_string();
+    let org_id = caller.data().org_id.clone();
     if let Err(e) = insert_recording(
         &db,
         saved.recording_ref.as_str(),
@@ -409,6 +410,7 @@ pub fn recording_save_snapshot_v1(
         saved.pixel_format.as_deref(),
         &saved.hash_sha256,
         &retention_class,
+        org_id.as_deref(),
     ) {
         warn!("recording.save_snapshot insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -517,6 +519,7 @@ pub fn recording_save_segment_v1(
     };
 
     let file_path_str = saved.file_path.to_string_lossy().to_string();
+    let org_id = caller.data().org_id.clone();
     if let Err(e) = insert_recording(
         &db,
         saved.recording_ref.as_str(),
@@ -531,6 +534,7 @@ pub fn recording_save_segment_v1(
         None,
         &saved.hash_sha256,
         &retention_class,
+        org_id.as_deref(),
     ) {
         warn!("recording.save_segment insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -595,7 +599,8 @@ pub fn recording_get_url_v1(
 
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    match get_recording_for_addon(&db, &addon_id, &input.recording_ref) {
+    let org_id = caller.data().org_id.clone();
+    match get_recording_for_addon(&db, &addon_id, &input.recording_ref, org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(caller.data(), "recording.get_url", Some(&input.recording_ref), RiskClass::B, "denied", Some("not_found_or_not_owned"));
@@ -664,7 +669,8 @@ pub fn recording_get_stream_v1(
 
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_recording_for_addon(&db, &addon_id, &input.recording_ref) {
+    let org_id = caller.data().org_id.clone();
+    let row = match get_recording_for_addon(&db, &addon_id, &input.recording_ref, org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "recording.get_stream", Some(&input.recording_ref), RiskClass::B, "denied", Some("not_found_or_not_owned"));
@@ -755,7 +761,8 @@ pub fn recording_purge_v1(
 
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_recording_for_addon(&db, &addon_id, &input.recording_ref) {
+    let org_id = caller.data().org_id.clone();
+    let row = match get_recording_for_addon(&db, &addon_id, &input.recording_ref, org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "recording.purge", Some(&input.recording_ref), RiskClass::A, "denied", Some("not_found_or_not_owned"));
@@ -777,7 +784,7 @@ pub fn recording_purge_v1(
         audit(caller.data(), "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("purge_io_error"));
         return AbiError::Operation.as_i32();
     }
-    if let Err(_e) = soft_delete_recording(&db, &addon_id, &input.recording_ref) {
+    if let Err(_e) = soft_delete_recording(&db, &addon_id, &input.recording_ref, org_id.as_deref()) {
         audit(caller.data(), "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("db_soft_delete_failed"));
         return AbiError::Operation.as_i32();
     }
@@ -840,8 +847,9 @@ pub fn recording_stats_v1(
 
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
+    let org_id = caller.data().org_id.clone();
     let agg: RecordingStatsAggregate =
-        match recording_stats_for_addon(&db, &addon_id, input.camera_id.as_deref()) {
+        match recording_stats_for_addon(&db, &addon_id, input.camera_id.as_deref(), org_id.as_deref()) {
             Ok(a) => a,
             Err(_) => {
                 audit(caller.data(), "recording.stats", None, RiskClass::B, "error", Some("db_error"));
@@ -1099,6 +1107,7 @@ fn save_snapshot_core(state: &AddonState, raw: &str) -> CoreResult {
         saved.pixel_format.as_deref(),
         &saved.hash_sha256,
         &retention_class,
+        state.org_id.as_deref(),
     ) {
         warn!("recording.save_snapshot insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -1187,6 +1196,7 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
         None,
         &saved.hash_sha256,
         &retention_class,
+        state.org_id.as_deref(),
     ) {
         warn!("recording.save_segment insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -1223,7 +1233,7 @@ fn get_url_core(state: &AddonState, raw: &str) -> CoreResult {
         audit(state, "recording.get_url", None, RiskClass::B, "denied", Some(reason));
         return CoreResult::Err(AbiError::Operation.as_i32());
     }
-    match get_recording_for_addon(&state.db, &state.addon_id, &input.recording_ref) {
+    match get_recording_for_addon(&state.db, &state.addon_id, &input.recording_ref, state.org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(state, "recording.get_url", Some(&input.recording_ref), RiskClass::B, "denied", Some("not_found_or_not_owned"));
@@ -1262,7 +1272,7 @@ fn get_stream_core(state: &AddonState, raw: &str) -> CoreResult {
         audit(state, "recording.get_stream", None, RiskClass::B, "denied", Some(reason));
         return CoreResult::Err(AbiError::Operation.as_i32());
     }
-    let row = match get_recording_for_addon(&state.db, &state.addon_id, &input.recording_ref) {
+    let row = match get_recording_for_addon(&state.db, &state.addon_id, &input.recording_ref, state.org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(state, "recording.get_stream", Some(&input.recording_ref), RiskClass::B, "denied", Some("not_found_or_not_owned"));
@@ -1317,7 +1327,7 @@ fn purge_core(state: &AddonState, raw: &str) -> CoreResult {
         audit(state, "recording.purge", None, RiskClass::A, "denied", Some(reason));
         return CoreResult::Err(AbiError::Operation.as_i32());
     }
-    let row = match get_recording_for_addon(&state.db, &state.addon_id, &input.recording_ref) {
+    let row = match get_recording_for_addon(&state.db, &state.addon_id, &input.recording_ref, state.org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(state, "recording.purge", Some(&input.recording_ref), RiskClass::A, "denied", Some("not_found_or_not_owned"));
@@ -1334,7 +1344,7 @@ fn purge_core(state: &AddonState, raw: &str) -> CoreResult {
         audit(state, "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("purge_io_error"));
         return CoreResult::Err(AbiError::Operation.as_i32());
     }
-    if soft_delete_recording(&state.db, &state.addon_id, &input.recording_ref).is_err() {
+    if soft_delete_recording(&state.db, &state.addon_id, &input.recording_ref, state.org_id.as_deref()).is_err() {
         audit(state, "recording.purge", Some(&input.recording_ref), RiskClass::A, "error", Some("db_soft_delete_failed"));
         return CoreResult::Err(AbiError::Operation.as_i32());
     }
@@ -1358,7 +1368,7 @@ fn stats_core(state: &AddonState, raw: &str) -> CoreResult {
             }
         }
     };
-    let agg = match recording_stats_for_addon(&state.db, &state.addon_id, input.camera_id.as_deref()) {
+    let agg = match recording_stats_for_addon(&state.db, &state.addon_id, input.camera_id.as_deref(), state.org_id.as_deref()) {
         Ok(a) => a,
         Err(_) => {
             audit(state, "recording.stats", None, RiskClass::B, "error", Some("db_error"));

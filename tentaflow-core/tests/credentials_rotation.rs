@@ -84,7 +84,7 @@ fn set_camera_credentials_round_trip_through_db() {
     let blob = cipher.encrypt("user:pw").unwrap();
 
     let updated =
-        set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, Some(&blob)).unwrap();
+        set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, Some(&blob), None).unwrap();
     assert!(updated, "row should be touched");
 
     let row = tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id, None)
@@ -97,7 +97,7 @@ fn set_camera_credentials_round_trip_through_db() {
 
     // Clearing also works.
     let cleared =
-        set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, None).unwrap();
+        set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, None, None).unwrap();
     assert!(cleared);
     let row =
         tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id, None)
@@ -119,7 +119,7 @@ fn cross_owner_set_credentials_returns_false() {
     let cipher = CredentialsCipher::load_or_generate_at(&fresh_key_path(&td, "k")).unwrap();
     let blob = cipher.encrypt("u:p").unwrap();
     let touched =
-        set_camera_credentials_encrypted(&db, "addon-stranger", &camera_id, Some(&blob)).unwrap();
+        set_camera_credentials_encrypted(&db, "addon-stranger", &camera_id, Some(&blob), None).unwrap();
     assert!(!touched, "ownership guard must reject foreign addon");
 }
 
