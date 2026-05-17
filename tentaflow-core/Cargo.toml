@@ -111,6 +111,7 @@ r2d2_sqlite = "0.34.0"
 # Crypto
 argon2 = "0.5.3"
 sha2 = "0.10.9"
+sha1 = "0.10.6"
 hmac = "0.12.1"
 aes-gcm = "0.10.3"
 hkdf = "0.12.4"

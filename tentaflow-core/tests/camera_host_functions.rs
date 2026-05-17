@@ -54,6 +54,8 @@ fn insert(
         "C",
         "default",
         None,
+        None,
+        None,
     )
     .expect("insert");
 }
@@ -176,6 +178,8 @@ fn db_re_insert_active_id_collides() {
         None,
         "C",
         "default",
+        None,
+        None,
         None,
     );
     assert!(res.is_err(), "active row must trigger unique index violation");
