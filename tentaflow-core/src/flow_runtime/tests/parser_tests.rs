@@ -145,6 +145,34 @@ fn reject_port_on_non_branch() {
 }
 
 #[test]
+fn reject_duplicate_edge_same_port() {
+    // Two edges with identical (from, to, port) — the scheduler would have
+    // silently coalesced them via HashMap insert. Compile must reject.
+    let json = r#"{
+        "schema_version": 1,
+        "id": "dup",
+        "operators": [
+            { "id": "src", "type": "Source", "params": {} },
+            { "id": "snk", "type": "Sink",   "params": {} }
+        ],
+        "edges": [
+            { "from": "src", "to": "snk" },
+            { "from": "src", "to": "snk" }
+        ]
+    }"#;
+    let def = parse_flow_definition(json).expect("parse");
+    match compile(def) {
+        Err(FlowCompileError::DuplicateEdge {
+            edge_idx: 1,
+            from,
+            to,
+            port,
+        }) if from == "src" && to == "snk" && port.is_none() => {}
+        other => panic!("expected DuplicateEdge, got {other:?}"),
+    }
+}
+
+#[test]
 fn reject_invalid_port_value() {
     let json = r#"{
         "schema_version": 1,

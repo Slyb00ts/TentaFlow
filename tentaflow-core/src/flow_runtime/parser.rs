@@ -87,6 +87,21 @@ fn validate_edges(
     edges: &[EdgeDef],
     op_types: &HashMap<String, OperatorType>,
 ) -> Result<(), FlowCompileError> {
+    // Reject duplicate edges keyed by (from, to, port). The scheduler builds a
+    // HashMap with the same key shape and would silently coalesce duplicates
+    // — surface the model error here instead.
+    let mut seen: HashSet<(String, String, Option<String>)> = HashSet::with_capacity(edges.len());
+    for (idx, edge) in edges.iter().enumerate() {
+        let key = (edge.from.clone(), edge.to.clone(), edge.port.clone());
+        if !seen.insert(key) {
+            return Err(FlowCompileError::DuplicateEdge {
+                edge_idx: idx,
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                port: edge.port.clone(),
+            });
+        }
+    }
     for (idx, edge) in edges.iter().enumerate() {
         let from_type = op_types.get(&edge.from).ok_or_else(|| {
             FlowCompileError::EdgeReferencesUnknownOperator {
