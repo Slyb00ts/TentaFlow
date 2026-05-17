@@ -526,15 +526,24 @@ pub fn audit_log_with_risk(
                 }
             };
 
+        // F2 P1.b — `org_id` is written to the row but NOT folded into the
+        // chain hash. Extending `AuditRowHashInput` would invalidate every
+        // pre-F2 chained row on disk; a column-only addition keeps the
+        // verifier compatible with historical rows. Fallback to
+        // `org-default` for system / boot starts that have no org context.
+        let org_for_row = state.org_id.as_deref().unwrap_or(
+            crate::services::org::DEFAULT_ORG_ID,
+        );
         let _ = conn.execute(
-            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash, org_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 state.user_id, &state.addon_id, &state.instance_id,
                 action, resource_type, resource_id,
                 result, error_message, action_hash,
                 risk_class_db, related_claim_id, request_id,
-                timestamp, prev_hash_blob, hash_blob
+                timestamp, prev_hash_blob, hash_blob,
+                org_for_row
             ],
         );
     }

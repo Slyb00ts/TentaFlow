@@ -122,6 +122,7 @@ fn make_state(db: DbPool, addon_id: &str, permissions: Vec<String>) -> AddonStat
         addon_id: addon_id.to_string(),
         instance_id: "flow-e2e-instance".to_string(),
         user_id: None,
+        org_id: None,
         db,
         permissions,
         event_bus,

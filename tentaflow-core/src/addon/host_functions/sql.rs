@@ -93,8 +93,13 @@ pub fn sql_exec_v1(
         Err(code) => return code,
     };
     let addon_id = caller.data().addon_id.clone();
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
 
-    let result = exec_for_addon(&addon_id, &query, &params);
+    let result = exec_for_addon(&org_id, &addon_id, &query, &params);
     match result {
         Ok((rows_affected, last_insert_id)) => {
             audit_log_with_risk(
@@ -264,10 +269,15 @@ fn sql_query_inner(
         Err(code) => return code,
     };
     let addon_id = caller.data().addon_id.clone();
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let result = if one {
-        query_one_for_addon(&addon_id, &query, &params)
+        query_one_for_addon(&org_id, &addon_id, &query, &params)
     } else {
-        query_for_addon(&addon_id, &query, &params, None)
+        query_for_addon(&org_id, &addon_id, &query, &params, None)
     };
     match result {
         Ok(response) => {
@@ -415,7 +425,12 @@ pub fn sql_transaction_v1(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    match transaction_for_addon(&addon_id, &prepared) {
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    match transaction_for_addon(&org_id, &addon_id, &prepared) {
         Ok(total) => {
             audit_log_with_risk(
                 caller.data(),

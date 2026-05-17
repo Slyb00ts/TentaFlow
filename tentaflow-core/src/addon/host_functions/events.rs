@@ -154,6 +154,7 @@ pub fn event_publish(
         user_id: state.user_id,
         instance_id: Some(state.instance_id.clone()),
         is_system_call: state.is_system_call,
+        org_id: state.org_id.clone(),
     };
     let bus = state.event_bus.clone();
     let db = state.db.clone();
@@ -200,6 +201,7 @@ mod tests {
             addon_id: "events-test-addon".to_string(),
             instance_id: "t".to_string(),
             user_id: None,
+            org_id: None,
             db: db.clone(),
             permissions,
             event_bus: Arc::new(EventBus::new()),

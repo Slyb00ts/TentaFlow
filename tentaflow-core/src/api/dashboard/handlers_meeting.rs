@@ -775,6 +775,7 @@ mod tests {
             correlation_id: 1,
             resume_secret: None,
             state,
+            org_context: None,
         }
     }
 

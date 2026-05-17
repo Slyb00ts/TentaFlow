@@ -4839,7 +4839,7 @@ fn ensure_application_addon_running(
     if manager.has_running_instance(addon_id) {
         return;
     }
-    match manager.start_addon(addon_id, None) {
+    match manager.start_addon(addon_id, None, None) {
         Ok(iid) => tracing::info!(
             "ensure_application_addon_running: '{}' lazy started, instance={}",
             addon_id,

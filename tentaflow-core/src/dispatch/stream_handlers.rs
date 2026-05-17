@@ -767,6 +767,7 @@ mod tests {
             correlation_id: 99,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 
@@ -807,6 +808,7 @@ mod tests {
             correlation_id: 1,
             resume_secret: Some(Arc::new(b"test-secret".to_vec())),
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 
@@ -851,6 +853,7 @@ mod tests {
             correlation_id: 2,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 
@@ -902,6 +905,7 @@ mod tests {
             correlation_id: 1,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 

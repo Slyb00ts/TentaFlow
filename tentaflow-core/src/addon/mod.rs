@@ -359,6 +359,11 @@ pub struct AddonState {
     pub addon_id: String,
     pub instance_id: String,
     pub user_id: Option<i64>,
+    /// F2 P1.b — owning organization for this addon instance. Threaded through
+    /// audit emits and per-org filesystem sandbox paths. `None` for system /
+    /// boot starts that pre-date a real org context (treated as `org-default`
+    /// by downstream consumers).
+    pub org_id: Option<String>,
     pub db: DbPool,
     pub permissions: Vec<String>,
     pub event_bus: Arc<EventBus>,
@@ -913,11 +918,20 @@ impl AddonManager {
         Ok(())
     }
 
-    /// Uruchamia addon — tworzy instancje WASM, zwraca instance_id
-    pub fn start_addon(&self, addon_id: &str, user_id: Option<i64>) -> Result<String> {
+    /// Uruchamia addon — tworzy instancje WASM, zwraca instance_id.
+    ///
+    /// F2 P1.b — `org_id` scopes the instance to its owning tenant. `None`
+    /// means "system / boot start" (legacy single-tenant nodes) and gets
+    /// recorded as `org-default` in downstream audit / sandbox paths.
+    pub fn start_addon(
+        &self,
+        addon_id: &str,
+        user_id: Option<i64>,
+        org_id: Option<String>,
+    ) -> Result<String> {
         info!(
-            "Uruchamianie addonu '{}' dla user_id={:?}",
-            addon_id, user_id
+            "Uruchamianie addonu '{}' dla user_id={:?} org_id={:?}",
+            addon_id, user_id, org_id
         );
 
         // Pobierz lub skompiluj modul WASM
@@ -936,6 +950,7 @@ impl AddonManager {
             addon_id: addon_id.to_string(),
             instance_id: instance_id.clone(),
             user_id,
+            org_id: org_id.clone(),
             db: self.db.clone(),
             permissions,
             event_bus: self.event_bus.clone(),
@@ -1099,7 +1114,7 @@ impl AddonManager {
             if !has_service {
                 continue;
             }
-            match self.start_addon(&a.addon_id, None) {
+            match self.start_addon(&a.addon_id, None, None) {
                 Ok(iid) => info!(
                     "auto_start_services: '{}' uruchomiony, instance_id={}",
                     a.addon_id, iid
@@ -1153,7 +1168,7 @@ impl AddonManager {
                 .map(|s| s.enabled && s.tick_interval_ms.map(|i| i > 0).unwrap_or(false))
                 .unwrap_or(false);
             if has_service {
-                self.start_addon(addon_id, None)?;
+                self.start_addon(addon_id, None, None)?;
             }
         }
 
@@ -1693,6 +1708,7 @@ impl AddonManager {
         block_type: &str,
         envelope_json: &[u8],
         user_id: Option<i64>,
+        org_id: Option<String>,
         fuel_budget: u64,
         deadline: Option<std::time::Instant>,
     ) -> Result<Vec<u8>> {
@@ -1727,6 +1743,7 @@ impl AddonManager {
             addon_id: addon_id.to_string(),
             instance_id: instance_id.clone(),
             user_id,
+            org_id: org_id.clone(),
             db: self.db.clone(),
             permissions,
             event_bus: self.event_bus.clone(),

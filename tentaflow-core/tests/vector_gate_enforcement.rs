@@ -81,6 +81,7 @@ fn make_state(
         addon_id: addon_id.to_string(),
         instance_id: "inst-test".to_string(),
         user_id: None,
+        org_id: None,
         db: pool.clone(),
         permissions: Vec::new(),
         event_bus: Arc::new(tentaflow_core::addon::event_bus::EventBus::new()),

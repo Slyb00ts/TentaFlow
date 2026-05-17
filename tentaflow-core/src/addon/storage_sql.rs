@@ -71,31 +71,36 @@ impl AddonDbPool {
 // Globalny rejestr pool per addon
 // =============================================================================
 
-/// Mapa addon_id -> pool. DashMap zapewnia per-shard lock — open i close
-/// dla roznych addonow nie konkuruja. Lifecycle: install_addon woła
+/// Mapa (org_id, addon_id) -> pool. DashMap zapewnia per-shard lock — open
+/// i close dla roznych addonow nie konkuruja. Lifecycle: install_addon woła
 /// `open_addon_db`, uninstall_addon → `close_addon_db`.
-fn registry() -> &'static DashMap<String, AddonDbPool> {
-    static REGISTRY: OnceLock<DashMap<String, AddonDbPool>> = OnceLock::new();
+///
+/// F2 P1.b — the key gained `org_id` so two tenants installing the same
+/// addon_id keep isolated SQLite files (each lives under
+/// `~/.tentaflow/orgs/<org_id>/addons/<addon_id>/data.db`).
+fn registry() -> &'static DashMap<(String, String), AddonDbPool> {
+    static REGISTRY: OnceLock<DashMap<(String, String), AddonDbPool>> = OnceLock::new();
     REGISTRY.get_or_init(DashMap::new)
 }
 
-/// Otwiera (lub zwraca istniejacy) pool dla danego addona.
+/// Otwiera (lub zwraca istniejacy) pool dla danego addona w danej organizacji.
 ///
 /// Pierwsze wywolanie:
-/// - Tworzy plik `data.db` w `addon_data_dir(addon_id)` (przez fs_sandbox).
+/// - Tworzy plik `data.db` w `addon_data_dir(org_id, addon_id)` (przez fs_sandbox).
 /// - Konfiguruje pragmas: journal=WAL, foreign_keys=ON, synchronous=NORMAL,
 ///   temp_store=MEMORY, busy_timeout=5000ms.
 /// - Buduje r2d2::Pool z max_size = POOL_MAX_SIZE.
 ///
 /// Kolejne wywolania zwracaja sklonowany handle do tego samego pool.
 ///
-/// Bezpieczenstwo: addon_id jest walidowany przez `addon_db_path` → `validate_addon_id`.
-pub fn open_addon_db(addon_id: &str) -> Result<AddonDbPool, AbiError> {
-    if let Some(existing) = registry().get(addon_id) {
+/// Bezpieczenstwo: oba identyfikatory walidowane przez `addon_db_path` → `validate_addon_id`.
+pub fn open_addon_db(org_id: &str, addon_id: &str) -> Result<AddonDbPool, AbiError> {
+    let key = (org_id.to_string(), addon_id.to_string());
+    if let Some(existing) = registry().get(&key) {
         return Ok(existing.clone());
     }
 
-    let db_path = addon_db_path(addon_id)?;
+    let db_path = addon_db_path(org_id, addon_id)?;
 
     let manager = SqliteConnectionManager::file(&db_path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
@@ -118,23 +123,25 @@ pub fn open_addon_db(addon_id: &str) -> Result<AddonDbPool, AbiError> {
         .map_err(|_| AbiError::Operation)?;
 
     let pool = AddonDbPool { inner };
-    registry().insert(addon_id.to_string(), pool.clone());
+    registry().insert(key, pool.clone());
     Ok(pool)
 }
 
-/// Usuwa pool z rejestru — wszystkie polaczenia zostana zamkniete gdy ich
-/// uchwyty zostana zwolnione (Arc drop). Plik `data.db` NIE jest usuwany
-/// (user moze chciec backup). Czyszczenie pliku w F1a wyłącznie manualne.
-pub fn close_addon_db(addon_id: &str) {
-    registry().remove(addon_id);
+/// Usuwa pool z rejestru dla pary (org, addon). Wszystkie polaczenia zostana
+/// zamkniete gdy ich uchwyty zostana zwolnione (Arc drop). Plik `data.db`
+/// NIE jest usuwany (user moze chciec backup). Czyszczenie pliku manualne.
+pub fn close_addon_db(org_id: &str, addon_id: &str) {
+    registry().remove(&(org_id.to_string(), addon_id.to_string()));
 }
 
 /// Pobiera pool dla addona jezeli istnieje w rejestrze. Uzywane przez
 /// host functions: SQL pool MUSI byc juz otwarty przez install_addon —
 /// brak pool → blad konfiguracji (addon nie zadeklarowal [storage] sql=true
 /// lub install fail).
-pub fn get_addon_pool(addon_id: &str) -> Option<AddonDbPool> {
-    registry().get(addon_id).map(|p| p.clone())
+pub fn get_addon_pool(org_id: &str, addon_id: &str) -> Option<AddonDbPool> {
+    registry()
+        .get(&(org_id.to_string(), addon_id.to_string()))
+        .map(|p| p.clone())
 }
 
 // =============================================================================
@@ -163,7 +170,7 @@ mod tests {
     #[test]
     fn test_open_addon_db_creates_file_with_wal_mode() {
         with_tmp_home(|| {
-            let pool = open_addon_db("wal-test").expect("open");
+            let pool = open_addon_db("org-default", "wal-test").expect("open");
             let conn = pool.get().expect("connection");
             let mode: String = conn
                 .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -173,28 +180,28 @@ mod tests {
                 .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
                 .expect("foreign_keys query");
             assert_eq!(fk, 1, "foreign_keys ON");
-            close_addon_db("wal-test");
+            close_addon_db("org-default", "wal-test");
         });
     }
 
     #[test]
     fn test_pool_returns_connection() {
         with_tmp_home(|| {
-            let pool = open_addon_db("conn-test").expect("open");
+            let pool = open_addon_db("org-default", "conn-test").expect("open");
             let conn = pool.get().expect("get connection");
             let val: i64 = conn
                 .query_row("SELECT 1", [], |row| row.get(0))
                 .expect("select 1");
             assert_eq!(val, 1);
-            close_addon_db("conn-test");
+            close_addon_db("org-default", "conn-test");
         });
     }
 
     #[test]
     fn test_two_addons_have_separate_pools_and_files() {
         with_tmp_home(|| {
-            let p1 = open_addon_db("alpha").expect("alpha");
-            let p2 = open_addon_db("beta").expect("beta");
+            let p1 = open_addon_db("org-default", "alpha").expect("alpha");
+            let p2 = open_addon_db("org-default", "beta").expect("beta");
 
             // Rozne pliki — utworz tabele w alpha, sprawdz ze brak jej w beta.
             {
@@ -213,19 +220,19 @@ mod tests {
                 assert_eq!(count, 0, "tabela foo widoczna tylko w alpha");
             }
 
-            close_addon_db("alpha");
-            close_addon_db("beta");
+            close_addon_db("org-default", "alpha");
+            close_addon_db("org-default", "beta");
         });
     }
 
     #[test]
     fn test_close_addon_db_purges_pool() {
         with_tmp_home(|| {
-            let _ = open_addon_db("purge-test").expect("open");
-            assert!(get_addon_pool("purge-test").is_some());
-            close_addon_db("purge-test");
+            let _ = open_addon_db("org-default", "purge-test").expect("open");
+            assert!(get_addon_pool("org-default", "purge-test").is_some());
+            close_addon_db("org-default", "purge-test");
             assert!(
-                get_addon_pool("purge-test").is_none(),
+                get_addon_pool("org-default", "purge-test").is_none(),
                 "pool wyczyszczony z rejestru"
             );
         });
@@ -234,7 +241,7 @@ mod tests {
     #[test]
     fn test_concurrent_connections_from_pool() {
         with_tmp_home(|| {
-            let pool = open_addon_db("concurrent-test").expect("open");
+            let pool = open_addon_db("org-default", "concurrent-test").expect("open");
             // Pobierz POOL_MAX_SIZE polaczen jednoczesnie — wszystkie OK.
             let conns: Vec<_> = (0..POOL_MAX_SIZE)
                 .map(|_| pool.get().expect("connection"))
@@ -242,16 +249,16 @@ mod tests {
             assert_eq!(conns.len() as u32, POOL_MAX_SIZE);
             assert_eq!(pool.state().connections, POOL_MAX_SIZE);
             drop(conns);
-            close_addon_db("concurrent-test");
+            close_addon_db("org-default", "concurrent-test");
         });
     }
 
     #[test]
     fn test_invalid_addon_id_rejected_by_open() {
         with_tmp_home(|| {
-            assert!(open_addon_db("../etc").is_err());
-            assert!(open_addon_db("with/slash").is_err());
-            assert!(open_addon_db("").is_err());
+            assert!(open_addon_db("org-default", "../etc").is_err());
+            assert!(open_addon_db("org-default", "with/slash").is_err());
+            assert!(open_addon_db("org-default", "").is_err());
         });
     }
 }

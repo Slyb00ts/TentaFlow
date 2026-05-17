@@ -279,6 +279,10 @@ pub fn add_membership(
             params![org_id, user_id, role_id, granted_at, granted_by],
         )
         .map_err(map_db)?;
+    drop(conn);
+    // Drop the DB guard before touching the RBAC cache so a future cache
+    // implementation that re-reads the DB cannot deadlock on the same pool.
+    crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
     Ok(n > 0)
 }
 
@@ -290,6 +294,8 @@ pub fn remove_membership(pool: &DbPool, org_id: &str, user_id: &str) -> Result<b
             params![org_id, user_id],
         )
         .map_err(map_db)?;
+    drop(conn);
+    crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
     Ok(n > 0)
 }
 

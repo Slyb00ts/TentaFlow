@@ -44,6 +44,7 @@ mod tests {
             correlation_id: 1,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
 
         let variants = [

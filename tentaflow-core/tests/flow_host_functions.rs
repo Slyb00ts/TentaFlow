@@ -67,6 +67,7 @@ fn make_state(
         addon_id: addon_id.to_string(),
         instance_id: "flow-host-test-instance".to_string(),
         user_id: None,
+        org_id: None,
         db,
         permissions,
         event_bus,

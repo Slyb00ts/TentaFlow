@@ -154,6 +154,7 @@ impl NodeAdapter for AddonNodeAdapter {
                 &block_type,
                 &envelope_json,
                 user_id,
+                None,
                 fuel,
                 deadline,
             )

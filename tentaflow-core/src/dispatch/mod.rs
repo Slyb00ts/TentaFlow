@@ -57,6 +57,12 @@ pub struct HandlerContext {
     pub resume_secret: Option<std::sync::Arc<Vec<u8>>>,
     /// Shared resources serwera (DB, Router, MeshPeerStore, ...).
     pub state: std::sync::Arc<state::AppState>,
+    /// F2 P1.b — per-request org snapshot. `None` for paths without a user
+    /// session (mesh handlers, anonymous endpoints, system-initiated calls);
+    /// handlers that need org scoping must check this is `Some` and reject
+    /// otherwise. Threaded in by the WS binary entrypoint after session
+    /// resolve; mesh / test handlers leave it `None`.
+    pub org_context: Option<crate::services::rbac::OrgContext>,
 }
 
 // =============================================================================
@@ -882,6 +888,7 @@ mod tests {
             correlation_id: 1,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let body = MessageBody::Error(ProtocolError {
             code: ProtocolErrorCode::Internal,
@@ -979,6 +986,7 @@ mod tests {
             correlation_id: 100,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
 
         // R-LIST — empty test DB → empty Vec, valid response.
@@ -1008,6 +1016,7 @@ mod tests {
                 correlation_id: 1,
                 resume_secret: None,
                 state: state::AppState::for_test(),
+                org_context: None,
             },
         )
         .await;
@@ -1049,6 +1058,7 @@ mod tests {
             correlation_id: 7,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
         assert!(!is_err);
@@ -1062,6 +1072,7 @@ mod tests {
             correlation_id: 8,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
         assert!(is_err);
@@ -1078,6 +1089,7 @@ mod tests {
             correlation_id: 9,
             resume_secret: None,
             state: state::AppState::for_test(),
+            org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx).await;
         assert!(!is_err);
@@ -1130,6 +1142,7 @@ mod visibility_enforcement_tests {
             correlation_id: 1,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
@@ -1165,6 +1178,7 @@ mod visibility_enforcement_tests {
             correlation_id: 2,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, _) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
@@ -1193,6 +1207,7 @@ mod visibility_enforcement_tests {
             correlation_id: 3,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, _) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
@@ -1218,6 +1233,7 @@ mod visibility_enforcement_tests {
             correlation_id: 4,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(
@@ -1248,6 +1264,7 @@ mod visibility_enforcement_tests {
             correlation_id: 5,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(
@@ -1282,6 +1299,7 @@ mod visibility_enforcement_tests {
             correlation_id: 6,
             resume_secret: None,
             state: state.clone(),
+            org_context: None,
         };
 
         let (resp, is_err) = dispatch(
