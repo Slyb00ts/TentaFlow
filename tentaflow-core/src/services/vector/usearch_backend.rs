@@ -5,8 +5,16 @@
 // locks for concurrent reads) but `add`/`remove`/`save` mutate the graph and
 // we want a single writer at a time, so we wrap the handle in a parking_lot
 // `RwLock`: reads (`search`, `count`) take the read guard, writers take the
-// write guard. usearch's `save(path)` writes the full mmap-backed index to
-// disk; we call it after every successful mutation for crash durability.
+// write guard.
+//
+// Persistence model:
+//   * Reopen path uses `Index::view(path)` — usearch mmaps the file lazily so
+//     a 3 GiB index does not balloon the RSS at open. Only the pages actually
+//     touched by inserts / searches are paged in.
+//   * Every successful upsert / delete calls `save(path)` before returning so
+//     that a successful return implies durability. On Unix we follow up with
+//     `chmod 0o600` to keep embeddings (PII for face vectors) from leaking to
+//     other local users via the default 0644 umask.
 
 use std::path::PathBuf;
 #[cfg(test)]
@@ -26,9 +34,9 @@ pub struct UsearchBackend {
 }
 
 impl UsearchBackend {
-    /// Open the on-disk index at `file_path` if it exists, otherwise create a
-    /// fresh empty one with the supplied geometry and persist a 0-vector file
-    /// so subsequent reopens follow the load path.
+    /// Open the on-disk index at `file_path` if it exists (mmap via
+    /// `Index::view`), otherwise create a fresh empty one and persist a
+    /// header file so subsequent reopens follow the view() path.
     pub fn open_or_create(file_path: PathBuf, dim: u32, metric: Metric) -> Result<Self> {
         if !(1..=4096).contains(&dim) {
             return Err(VectorError::InvalidDim(dim));
@@ -49,29 +57,30 @@ impl UsearchBackend {
         let index =
             Index::new(&options).map_err(|e| VectorError::Backend(format!("Index::new: {e}")))?;
 
-        // If a file exists, load its contents into the freshly built index.
-        // usearch's load() needs the geometry to already match — that is why
-        // we pass `dim`/`metric` from the manager (DB-resolved) and not from
-        // the file header.
         if file_path.exists() {
+            // view() = mmap the on-disk index, paging in only what is touched
+            // by searches and inserts. Avoids loading a multi-GB graph into
+            // RAM at reopen time.
             let path_str = file_path.to_string_lossy().to_string();
             index
-                .load(&path_str)
-                .map_err(|e| VectorError::Backend(format!("Index::load({path_str}): {e}")))?;
+                .view(&path_str)
+                .map_err(|e| VectorError::Backend(format!("Index::view({path_str}): {e}")))?;
         } else {
-            // Ensure the parent dir exists; the first save() below will then
-            // write the empty index header so future reopens hit the load
-            // path instead of repeatedly walking the create branch.
+            // Ensure parent dir exists with 0o700 (only owner can list the
+            // per-addon vector directory). The first save() below then writes
+            // the empty index header so future reopens hit the view() path.
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| VectorError::Io {
                     path: Some(parent.to_path_buf()),
                     source: e,
                 })?;
+                tighten_dir_mode(parent)?;
             }
             let path_str = file_path.to_string_lossy().to_string();
             index
                 .save(&path_str)
                 .map_err(|e| VectorError::Backend(format!("Index::save({path_str}): {e}")))?;
+            tighten_file_mode(&file_path)?;
         }
 
         Ok(Self {
@@ -80,6 +89,17 @@ impl UsearchBackend {
             dim,
             metric,
         })
+    }
+
+    /// Internal: save + chmod 0600. Called after every mutation so that a
+    /// successful upsert/delete return implies a durable, owner-only file.
+    fn persist(&self, index: &Index) -> Result<()> {
+        let path_str = self.file_path.to_string_lossy().to_string();
+        index
+            .save(&path_str)
+            .map_err(|e| VectorError::Backend(format!("save({path_str}): {e}")))?;
+        tighten_file_mode(&self.file_path)?;
+        Ok(())
     }
 
     /// Test-only helper — returns the on-disk file path of the backing index.
@@ -95,6 +115,48 @@ fn metric_to_usearch(m: Metric) -> MetricKind {
         Metric::Euclidean => MetricKind::L2sq,
         Metric::Dot => MetricKind::IP,
     }
+}
+
+/// Enforce mode 0600 on the index file. Embeddings of regulated data
+/// (face vectors, person attributes) qualify as PII; the default umask 0022
+/// would leave them at 0644 and readable by every local user.
+fn tighten_file_mode(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            VectorError::Io {
+                path: Some(path.to_path_buf()),
+                source: e,
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Enforce mode 0700 on the per-addon vectors directory so directory listing
+/// is restricted to the owning process user. Matches the pattern in
+/// `services::key_storage`.
+fn tighten_dir_mode(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            VectorError::Io {
+                path: Some(path.to_path_buf()),
+                source: e,
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 impl VectorBackend for UsearchBackend {
@@ -121,7 +183,7 @@ impl VectorBackend for UsearchBackend {
         let needed = size + 1;
         let current_capacity = guard.capacity();
         if needed > current_capacity {
-            let new_cap = ((needed + capacity_chunk - 1) / capacity_chunk) * capacity_chunk;
+            let new_cap = needed.div_ceil(capacity_chunk) * capacity_chunk;
             guard
                 .reserve(new_cap)
                 .map_err(|e| VectorError::Backend(format!("reserve({new_cap}): {e}")))?;
@@ -129,8 +191,7 @@ impl VectorBackend for UsearchBackend {
 
         // usearch with multi=false rejects a second add() under the same
         // key ("Duplicate keys not allowed"). To honour upsert semantics we
-        // remove the existing entry first when present. contains() is O(1)
-        // on the high-level wrapper.
+        // remove the existing entry first when present.
         if guard.contains(ref_id) {
             guard
                 .remove(ref_id)
@@ -139,6 +200,7 @@ impl VectorBackend for UsearchBackend {
         guard
             .add(ref_id, vector)
             .map_err(|e| VectorError::Backend(format!("add({ref_id}): {e}")))?;
+        self.persist(&guard)?;
         Ok(())
     }
 
@@ -176,7 +238,19 @@ impl VectorBackend for UsearchBackend {
         let removed = guard
             .remove(ref_id)
             .map_err(|e| VectorError::Backend(format!("remove({ref_id}): {e}")))?;
+        if removed > 0 {
+            // Only persist on a real removal — no point rewriting the file
+            // when the key was already absent.
+            self.persist(&guard)?;
+        }
         Ok(removed > 0)
+    }
+
+    fn has_ref(&self, ref_id: u64) -> bool {
+        if ref_id == 0 {
+            return false;
+        }
+        self.inner.read().contains(ref_id)
     }
 
     fn count(&self) -> u64 {
@@ -185,11 +259,7 @@ impl VectorBackend for UsearchBackend {
 
     fn save(&self) -> Result<()> {
         let guard = self.inner.read();
-        let path_str = self.file_path.to_string_lossy().to_string();
-        guard
-            .save(&path_str)
-            .map_err(|e| VectorError::Backend(format!("save({path_str}): {e}")))?;
-        Ok(())
+        self.persist(&guard)
     }
 
     fn dim(&self) -> u32 {
@@ -235,25 +305,29 @@ mod tests {
         be.upsert(30, &[0.0, 0.0, 1.0, 0.0]).unwrap();
         let hits = be.search(&[0.99, 0.01, 0.0, 0.0], 2).unwrap();
         assert_eq!(hits.len(), 2);
-        // Closest to [1,0,0,0] is key 10.
         assert_eq!(hits[0].ref_id, 10);
     }
 
     #[test]
-    fn test_delete_removes_vector() {
-        let (_dir, be) = tmp_backend(3, Metric::Cosine);
-        be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
-        be.upsert(2, &[0.0, 1.0, 0.0]).unwrap();
-        assert_eq!(be.count(), 2);
-        assert!(be.delete(1).unwrap());
-        assert_eq!(be.count(), 1);
-        // Second delete returns false (no key).
-        assert!(!be.delete(1).unwrap());
+    fn test_delete_removes_vector_and_persists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ns.usearch");
+        {
+            let be = UsearchBackend::open_or_create(path.clone(), 3, Metric::Cosine).unwrap();
+            be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
+            be.upsert(2, &[0.0, 1.0, 0.0]).unwrap();
+            assert!(be.delete(1).unwrap());
+            // Second delete returns false (no key).
+            assert!(!be.delete(1).unwrap());
+        }
+        // Reopen — the delete must have been persisted before delete()
+        // returned, so the count after reopen is 1, not 2.
+        let be2 = UsearchBackend::open_or_create(path, 3, Metric::Cosine).unwrap();
+        assert_eq!(be2.count(), 1);
     }
 
     #[test]
     fn test_cosine_metric_distance() {
-        // Identical vector has near-zero cosine distance.
         let (_dir, be) = tmp_backend(2, Metric::Cosine);
         be.upsert(1, &[1.0, 0.0]).unwrap();
         let hits = be.search(&[1.0, 0.0], 1).unwrap();
@@ -278,16 +352,17 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_and_reopen() {
+    fn test_persist_and_reopen_uses_view() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("persist.usearch");
         {
             let be = UsearchBackend::open_or_create(path.clone(), 3, Metric::Cosine).unwrap();
             be.upsert(7, &[1.0, 0.0, 0.0]).unwrap();
             be.upsert(8, &[0.0, 1.0, 0.0]).unwrap();
-            be.save().unwrap();
+            // No explicit save() — upsert persists internally.
         }
-        // Reopen — data must survive.
+        // Reopen — open_or_create takes the view() branch (file exists);
+        // data must be visible and search must still work.
         let be2 = UsearchBackend::open_or_create(path, 3, Metric::Cosine).unwrap();
         assert_eq!(be2.count(), 2);
         let hits = be2.search(&[1.0, 0.0, 0.0], 1).unwrap();
@@ -298,10 +373,45 @@ mod tests {
     fn test_upsert_replaces_existing() {
         let (_dir, be) = tmp_backend(3, Metric::Cosine);
         be.upsert(42, &[1.0, 0.0, 0.0]).unwrap();
-        // multi=false → second add with same key overwrites in place.
         be.upsert(42, &[0.0, 1.0, 0.0]).unwrap();
         assert_eq!(be.count(), 1);
         let hits = be.search(&[0.0, 1.0, 0.0], 1).unwrap();
         assert_eq!(hits[0].ref_id, 42);
+    }
+
+    #[test]
+    fn test_has_ref_reflects_membership() {
+        let (_dir, be) = tmp_backend(2, Metric::Cosine);
+        assert!(!be.has_ref(1));
+        be.upsert(1, &[1.0, 0.0]).unwrap();
+        assert!(be.has_ref(1));
+        assert!(!be.has_ref(2));
+        // ref_id 0 is invalid by contract, never present.
+        assert!(!be.has_ref(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_enforces_file_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, be) = tmp_backend(3, Metric::Cosine);
+        be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
+        let meta = std::fs::metadata(be.file_path()).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {:o}", mode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_vector_dir_mode_0700_after_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        // Nest one level deeper so open_or_create has to mkdir the parent.
+        let nested = dir.path().join("sub").join("ns.usearch");
+        let _be = UsearchBackend::open_or_create(nested.clone(), 3, Metric::Cosine).unwrap();
+        let parent = nested.parent().unwrap();
+        let meta = std::fs::metadata(parent).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected 0700, got {:o}", mode);
     }
 }

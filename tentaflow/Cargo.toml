@@ -13,7 +13,7 @@ gpu-rocm = ["tentaflow-core/gpu-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
 
 [dependencies]
-tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa"] }
+tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa", "vector"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"

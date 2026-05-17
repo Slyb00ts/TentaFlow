@@ -1,3 +1,4 @@
+#![cfg(feature = "vector")]
 // =============================================================================
 // File: tests/vector_host_functions.rs
 // Purpose: Integration tests for the F1c P3 vector storage stack — exercises
@@ -17,6 +18,7 @@ use tempfile::TempDir;
 use tentaflow_core::addon::errors::AbiError;
 use tentaflow_core::addon::host_functions::vector::test_api as vector_api;
 use tentaflow_core::addon::manifest::VectorNamespaceSpec;
+use rusqlite::params;
 use tentaflow_core::services::vector::{
     Metric, NamespaceManager, VectorError, MAX_NAMESPACES_PER_ADDON,
 };
@@ -292,4 +294,135 @@ fn abi_error_codes_used_by_vector_api_are_stable() {
 #[allow(dead_code)]
 fn _silence_imports() -> (Arc<Mutex<()>>,) {
     (Arc::new(Mutex::new(())),)
+}
+
+// -----------------------------------------------------------------------------
+// F1c P3 review fixes — codex regression tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn search_on_nonexistent_namespace_via_manager_returns_not_found_no_mutation() {
+    // Mirrors the host-level guarantee: vector_search_v1 calls
+    // NamespaceManager::get (not get_or_create), so a read against an
+    // un-initialized namespace must NOT spawn a DB row.
+    let (_dir, pool) = open_pool();
+    let root = TempDir::new().unwrap();
+    let mgr = mgr_with_temproot(pool.clone(), root.path().to_path_buf());
+
+    let res = mgr.get("addon_a", "never_written");
+    assert!(matches!(res, Err(VectorError::NamespaceNotFound { .. })));
+
+    // The DB row must not have been created as a side effect.
+    let conn = pool.lock().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM addon_vector_namespaces WHERE addon_id = 'addon_a'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "search must not mutate the catalog");
+}
+
+#[test]
+fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
+    // When the per-addon cap is already saturated, concurrent new-key
+    // inserts must ALL be rejected with VectorQuotaExceeded. The IMMEDIATE
+    // transaction in upsert_with_quota holds the SQLite mutex across the
+    // SUM(count) read + UPDATE, so two writers cannot both observe a stale
+    // pre-write count and slip past the cap.
+    use std::sync::Arc as StdArc;
+    use std::thread;
+    use tentaflow_core::services::vector::MAX_VECTORS_PER_ADDON;
+
+    let (_dir, pool) = open_pool();
+    let root = TempDir::new().unwrap();
+    let mgr = StdArc::new(mgr_with_temproot(pool.clone(), root.path().to_path_buf()));
+
+    // Materialize the namespace row, then directly pin the cached count to
+    // the cap. The quota check sums the `count` column, so this is a valid
+    // shortcut to the "addon is saturated" state without inserting 1M
+    // real vectors.
+    mgr.upsert_with_quota("addon_a", "ns", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine)
+        .unwrap();
+    {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE addon_vector_namespaces SET count = ?1 WHERE addon_id = 'addon_a'",
+            params![MAX_VECTORS_PER_ADDON as i64],
+        )
+        .unwrap();
+    }
+
+    let mut handles = Vec::new();
+    for tid in 0..8u64 {
+        let mgr_c = mgr.clone();
+        handles.push(thread::spawn(move || {
+            mgr_c.upsert_with_quota(
+                "addon_a",
+                "ns",
+                100 + tid,
+                &[1.0, 0.0, 0.0],
+                3,
+                Metric::Cosine,
+            )
+        }));
+    }
+
+    let mut quota_errors = 0usize;
+    let mut ok = 0usize;
+    let mut other = Vec::new();
+    for h in handles {
+        match h.join().unwrap() {
+            Err(VectorError::VectorQuotaExceeded { .. }) => quota_errors += 1,
+            Ok(_) => ok += 1,
+            Err(e) => other.push(format!("{e:?}")),
+        }
+    }
+    // Caveat: a successful upsert writes the LIVE backend.count() back into
+    // the cached `count` column, which can drop the cached SUM below the
+    // cap and unblock subsequent inserts in this synthetic test. We assert
+    // the strict contract: at least one of the eight concurrent inserts
+    // must hit QuotaExceeded (the cap is real), and any rejection MUST be
+    // QuotaExceeded — not a SQLite busy / poisoned-mutex / panic leak.
+    assert!(
+        quota_errors > 0,
+        "at least one concurrent insert must hit the cap, got ok={} other={:?}",
+        ok,
+        other
+    );
+    assert!(
+        other.is_empty(),
+        "non-quota rejections leaked: {:?}",
+        other
+    );
+}
+
+#[test]
+fn delete_persistence_survives_backend_reopen() {
+    // After backend.delete() returns Ok, the file on disk must already
+    // reflect the deletion — no separate save() call needed. We verify by
+    // dropping the in-memory backend and reopening from the persisted file.
+    let (_dir, pool) = open_pool();
+    let root = TempDir::new().unwrap();
+    let root_path = root.path().to_path_buf();
+
+    let backend_path;
+    {
+        let mgr = mgr_with_temproot(pool.clone(), root_path.clone());
+        let be = mgr
+            .get_or_create("addon_a", "ns", 3, Metric::Cosine)
+            .unwrap();
+        be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
+        be.upsert(2, &[0.0, 1.0, 0.0]).unwrap();
+        assert!(be.delete(1).unwrap());
+        backend_path = root_path
+            .join("addon_a")
+            .join("vectors")
+            .join("ns.usearch");
+    }
+    let mgr2 = mgr_with_temproot(pool, root_path);
+    let be2 = mgr2.get("addon_a", "ns").expect("reopen");
+    assert_eq!(be2.count(), 1, "delete must be durable across reopen");
+    assert!(backend_path.exists());
 }

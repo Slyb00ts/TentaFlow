@@ -24,7 +24,6 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
 use super::{
@@ -396,21 +395,19 @@ pub fn vector_upsert_v1(
     let addon_id = caller.data().addon_id.clone();
     let mgr = manager(caller.data()).clone();
 
-    if let Err(e) = mgr.check_vector_quota(&addon_id) {
-        let (abi, reason) = map_vector_error(e);
-        audit(
-            caller.data(),
-            "vector.upsert",
-            Some(&input.namespace),
-            RiskClass::B,
-            "denied",
-            Some(reason),
-        );
-        return abi.as_i32();
-    }
-
-    let backend = match mgr.get_or_create(&addon_id, &input.namespace, spec.dimensions, metric) {
-        Ok(b) => b,
+    // upsert_with_quota holds an IMMEDIATE SQLite transaction across the
+    // quota check + backend insert + count UPDATE, so two concurrent
+    // upserts cannot both pass the cap. The backend persists internally,
+    // so a successful return implies a durable write.
+    let count = match mgr.upsert_with_quota(
+        &addon_id,
+        &input.namespace,
+        input.ref_id,
+        &vector,
+        spec.dimensions,
+        metric,
+    ) {
+        Ok(c) => c,
         Err(e) => {
             let (abi, reason) = map_vector_error(e);
             audit(
@@ -424,39 +421,6 @@ pub fn vector_upsert_v1(
             return abi.as_i32();
         }
     };
-
-    if let Err(e) = backend.upsert(input.ref_id, &vector) {
-        let (abi, reason) = map_vector_error(e);
-        audit(
-            caller.data(),
-            "vector.upsert",
-            Some(&input.namespace),
-            RiskClass::B,
-            "denied",
-            Some(reason),
-        );
-        return abi.as_i32();
-    }
-
-    if let Err(e) = backend.save() {
-        warn!(
-            "vector.upsert: save failed for {}/{}: {:?}",
-            addon_id, input.namespace, e
-        );
-        let (abi, reason) = map_vector_error(e);
-        audit(
-            caller.data(),
-            "vector.upsert",
-            Some(&input.namespace),
-            RiskClass::B,
-            "error",
-            Some(reason),
-        );
-        return abi.as_i32();
-    }
-
-    let count = backend.count();
-    let _ = mgr.update_count(&addon_id, &input.namespace, count);
 
     audit(
         caller.data(),
@@ -608,12 +572,12 @@ pub fn vector_search_v1(
     let addon_id = caller.data().addon_id.clone();
     let mgr = manager(caller.data()).clone();
 
-    // F1c P3 search semantics: if the addon has never written to this
-    // namespace we treat the read as "namespace exists in manifest but no
-    // data" — return zero hits rather than NotFound. NotFound is reserved
-    // for namespaces that are not declared in the manifest at all (caught
-    // above).
-    let metric = match spec_metric(&spec) {
+    // Read path: validate spec metric matches the on-disk geometry but do
+    // NOT create the namespace. Searching a namespace the addon never wrote
+    // to returns an empty hit list (the manifest declares it, but no data
+    // landed yet) rather than spawning a DB row + on-disk file from a
+    // vector.read-permission call.
+    let _ = match spec_metric(&spec) {
         Ok(m) => m,
         Err(reason) => {
             audit(
@@ -627,8 +591,9 @@ pub fn vector_search_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    let backend = match mgr.get_or_create(&addon_id, &input.namespace, spec.dimensions, metric) {
-        Ok(b) => b,
+    let backend = match mgr.get(&addon_id, &input.namespace) {
+        Ok(b) => Some(b),
+        Err(VectorError::NamespaceNotFound { .. }) => None,
         Err(e) => {
             let (abi, reason) = map_vector_error(e);
             audit(
@@ -641,6 +606,22 @@ pub fn vector_search_v1(
             );
             return abi.as_i32();
         }
+    };
+
+    let Some(backend) = backend else {
+        audit(
+            caller.data(),
+            "vector.search",
+            Some(&input.namespace),
+            RiskClass::B,
+            "ok",
+            Some("namespace_empty"),
+        );
+        let out = SearchOutput {
+            namespace: input.namespace,
+            hits: Vec::new(),
+        };
+        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
     };
 
     let hits = match backend.search(&query, input.k as usize) {
@@ -771,8 +752,13 @@ pub fn vector_delete_v1(
     let addon_id = caller.data().addon_id.clone();
     let mgr = manager(caller.data()).clone();
 
+    // Delete is idempotent at the namespace level: a delete on a namespace
+    // that was never written to is reported as removed=false, count=0
+    // rather than NotFound — matches REST DELETE semantics and lets addons
+    // call this without first checking existence.
     let backend = match mgr.get(&addon_id, &input.namespace) {
-        Ok(b) => b,
+        Ok(b) => Some(b),
+        Err(VectorError::NamespaceNotFound { .. }) => None,
         Err(e) => {
             let (abi, reason) = map_vector_error(e);
             audit(
@@ -787,6 +773,27 @@ pub fn vector_delete_v1(
         }
     };
 
+    let Some(backend) = backend else {
+        audit(
+            caller.data(),
+            "vector.delete",
+            Some(&input.namespace),
+            RiskClass::B,
+            "ok",
+            Some("namespace_empty"),
+        );
+        let out = DeleteOutput {
+            namespace: input.namespace,
+            ref_id: input.ref_id,
+            removed: false,
+            count: 0,
+        };
+        return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+    };
+
+    // backend.delete() persists internally before returning Ok — a success
+    // implies durability. Failure here propagates upstream rather than
+    // returning success with a non-durable in-memory delete.
     let removed = match backend.delete(input.ref_id) {
         Ok(b) => b,
         Err(e) => {
@@ -796,21 +803,15 @@ pub fn vector_delete_v1(
                 "vector.delete",
                 Some(&input.namespace),
                 RiskClass::B,
-                "denied",
+                "error",
                 Some(reason),
             );
             return abi.as_i32();
         }
     };
 
+    let count = backend.count();
     if removed {
-        if let Err(e) = backend.save() {
-            warn!(
-                "vector.delete: save failed for {}/{}: {:?}",
-                addon_id, input.namespace, e
-            );
-        }
-        let count = backend.count();
         let _ = mgr.update_count(&addon_id, &input.namespace, count);
     }
 
@@ -827,7 +828,7 @@ pub fn vector_delete_v1(
         namespace: input.namespace,
         ref_id: input.ref_id,
         removed,
-        count: backend.count(),
+        count,
     };
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }

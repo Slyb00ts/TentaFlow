@@ -235,32 +235,76 @@ impl NamespaceManager {
         Ok(entry.value().clone())
     }
 
-    /// Wraps the per-call enforcement: verifies adding one more vector would
-    /// not break `MAX_VECTORS_PER_ADDON`. Called from the upsert host fn
-    /// before delegating to the backend. We sum `addon_vector_namespaces.count`
-    /// instead of polling every live backend to keep the check O(1) over
-    /// namespaces — the slight staleness vs the live `count()` is acceptable
-    /// for a soft quota.
-    pub fn check_vector_quota(&self, addon_id: &str) -> Result<()> {
+    /// Transactional upsert: checks the per-addon quota, runs the backend
+    /// upsert (which persists internally), and bumps the cached `count` row
+    /// — all under a single `IMMEDIATE` SQLite transaction so two concurrent
+    /// upserts at the cap cannot both succeed.
+    ///
+    /// `is_replace` is computed before the backend write via `has_ref`, so a
+    /// quota check only fires on a genuine insert. Replacing an existing key
+    /// is always allowed regardless of cap.
+    ///
+    /// Returns the new count for the namespace.
+    pub fn upsert_with_quota(
+        &self,
+        addon_id: &str,
+        namespace: &str,
+        ref_id: u64,
+        vector: &[f32],
+        dim: u32,
+        metric: Metric,
+    ) -> Result<u64> {
+        let backend = self.get_or_create(addon_id, namespace, dim, metric)?;
+        let is_replace = backend.has_ref(ref_id);
+
         let conn = self
             .pool
             .lock()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
+        // IMMEDIATE upgrades to a RESERVED lock right away so a second
+        // upsert from another thread blocks here instead of racing the
+        // SELECT+UPDATE pair below.
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| VectorError::Db(e.to_string()))?;
+
         let total: i64 = conn
             .query_row(
                 "SELECT COALESCE(SUM(count), 0) FROM addon_vector_namespaces WHERE addon_id = ?1",
                 rusqlite::params![addon_id],
                 |r| r.get(0),
             )
-            .map_err(|e| VectorError::Db(e.to_string()))?;
-        if total as u64 >= MAX_VECTORS_PER_ADDON {
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                VectorError::Db(e.to_string())
+            })?;
+
+        if !is_replace && (total as u64) >= MAX_VECTORS_PER_ADDON {
+            let _ = conn.execute("ROLLBACK", []);
             return Err(VectorError::VectorQuotaExceeded {
                 addon_id: addon_id.to_string(),
                 current: total as u64,
                 max: MAX_VECTORS_PER_ADDON,
             });
         }
-        Ok(())
+
+        if let Err(e) = backend.upsert(ref_id, vector) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e);
+        }
+
+        let new_count = backend.count();
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE addon_vector_namespaces SET count = ?1, updated_at = ?2 \
+             WHERE addon_id = ?3 AND namespace = ?4",
+            rusqlite::params![new_count as i64, now, addon_id, namespace],
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(VectorError::Db(e.to_string()));
+        }
+        conn.execute("COMMIT", [])
+            .map_err(|e| VectorError::Db(e.to_string()))?;
+        Ok(new_count)
     }
 
     fn check_namespace_quota(&self, addon_id: &str) -> Result<()> {
@@ -543,5 +587,43 @@ mod tests {
         let (_dir, mgr) = mgr();
         let res = mgr.get_or_create("addon_a", "bad/name", 3, Metric::Cosine);
         assert!(matches!(res, Err(VectorError::InvalidNamespaceName(_))));
+    }
+
+    #[test]
+    fn test_upsert_with_quota_replace_does_not_increment_count() {
+        let (_dir, mgr) = mgr();
+        let c1 = mgr
+            .upsert_with_quota("addon_a", "ns1", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine)
+            .unwrap();
+        assert_eq!(c1, 1);
+        // Replacing the same ref_id: count must stay at 1, not become 2.
+        let c2 = mgr
+            .upsert_with_quota("addon_a", "ns1", 1, &[0.0, 1.0, 0.0], 3, Metric::Cosine)
+            .unwrap();
+        assert_eq!(c2, 1);
+    }
+
+    #[test]
+    fn test_upsert_with_quota_blocks_new_insert_at_cap() {
+        // Pre-populate the DB row with `count = MAX` so the next genuine
+        // insert sits at the cap. We bypass the backend (which would
+        // otherwise have to load 1M vectors) by updating the cached count
+        // directly — the quota check sums the count column.
+        let (_dir, mgr) = mgr();
+        mgr.upsert_with_quota("addon_a", "ns1", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine)
+            .unwrap();
+        {
+            let conn = mgr.pool.lock().unwrap();
+            conn.execute(
+                "UPDATE addon_vector_namespaces SET count = ?1 WHERE addon_id = 'addon_a'",
+                rusqlite::params![MAX_VECTORS_PER_ADDON as i64],
+            )
+            .unwrap();
+        }
+        // A new key (genuine insert) must trip the cap immediately.
+        let err = mgr
+            .upsert_with_quota("addon_a", "ns1", 999, &[0.0, 0.0, 1.0], 3, Metric::Cosine)
+            .unwrap_err();
+        assert!(matches!(err, VectorError::VectorQuotaExceeded { .. }));
     }
 }
