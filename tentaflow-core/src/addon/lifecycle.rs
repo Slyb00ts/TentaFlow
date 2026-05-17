@@ -58,7 +58,30 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // implies every ui_component must verify.
     if let Some(publisher) = manifest.publisher.as_ref() {
         for component in &manifest.ui_components {
-            let bundle_path = addon_dir.join(&component.src);
+            let bundle_path = match crate::util::path_safety::safe_resolve(addon_dir, &component.src) {
+                Ok(p) => p,
+                Err(e) => {
+                    let pk_short = crate::addon::signature::truncate_pk_for_audit(
+                        &publisher.ed25519_public_key,
+                    );
+                    let _ = crate::db::repository::log_audit(
+                        db,
+                        None,
+                        Some(&manifest.addon_id),
+                        "addon.ui_signature_verify",
+                        Some(component.id.as_str()),
+                        Some(&format!("denied: unsafe bundle path; publisher_pk={pk_short}")),
+                        None,
+                        None,
+                    );
+                    bail!(
+                        "ui_component '{}' src '{}' rejected: {}",
+                        component.id,
+                        component.src,
+                        e
+                    );
+                }
+            };
             if let Err(e) = crate::addon::signature::verify_ui_component_bundle(
                 &bundle_path,
                 &publisher.ed25519_public_key,
@@ -1849,5 +1872,125 @@ runtime = "wasmtime"
         assert_eq!(row.runtime, "wasmtime");
         assert_eq!(row.category, "communication");
         assert_eq!(row.wasm_size_bytes, wasm.len() as i64);
+    }
+
+    fn write_trusted_publisher(db: &crate::db::DbPool, key_b64: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO trusted_publishers (key_b64, label, added_at) VALUES (?1, 'test', '2026-01-01T00:00:00Z')",
+            rusqlite::params![key_b64],
+        )
+        .unwrap();
+    }
+
+    fn pub_pk_b64() -> (ed25519_dalek::SigningKey, String) {
+        use base64::Engine;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        (sk, pk_b64)
+    }
+
+    fn install_with_bad_src(component_src: &str) -> anyhow::Error {
+        use base64::Engine;
+        let tmp = tempfile::tempdir().unwrap();
+        let addon_dir = tmp.path();
+        let (_sk, pk_b64) = pub_pk_b64();
+        let sig_b64 = format!(
+            "ed25519:{}",
+            base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+        );
+
+        let manifest = format!(
+            r#"
+[addon]
+id = "path-traversal-test"
+name = "PT Test"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[publisher]
+label = "Test Publisher"
+ed25519_public_key = "{pk_b64}"
+
+[[ui_component]]
+id = "evil"
+src = "{component_src}"
+signature = "{sig_b64}"
+slot = "sidebar"
+"#
+        );
+        std::fs::write(addon_dir.join("manifest.toml"), manifest).unwrap();
+        let mut f = std::fs::File::create(addon_dir.join("addon.wasm")).unwrap();
+        f.write_all(&minimal_wasm_bytes()).unwrap();
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        write_trusted_publisher(&db, &pk_b64);
+        install(addon_dir, &db).unwrap_err()
+    }
+
+    #[test]
+    fn install_rejects_dotdot_in_component_src() {
+        let err = install_with_bad_src("../../etc/passwd");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rejected") && msg.contains(".."),
+            "expected rejection mentioning '..', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_rejects_absolute_component_src() {
+        let err = install_with_bad_src("/etc/passwd");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rejected") && msg.contains("absolute"),
+            "expected absolute-path rejection, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlink_component_src() {
+        use base64::Engine;
+        let tmp = tempfile::tempdir().unwrap();
+        let addon_dir = tmp.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.html");
+        std::fs::write(&target, b"<html>secret</html>").unwrap();
+        std::os::unix::fs::symlink(&target, addon_dir.join("link.html")).unwrap();
+
+        let (_sk, pk_b64) = pub_pk_b64();
+        let manifest = format!(
+            r#"
+[addon]
+id = "symlink-test"
+name = "Sym Test"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[publisher]
+label = "Test Publisher"
+ed25519_public_key = "{pk_b64}"
+
+[[ui_component]]
+id = "linked"
+src = "link.html"
+signature = "ed25519:{}"
+slot = "sidebar"
+"#,
+            base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+        );
+        std::fs::write(addon_dir.join("manifest.toml"), manifest).unwrap();
+        let mut f = std::fs::File::create(addon_dir.join("addon.wasm")).unwrap();
+        f.write_all(&minimal_wasm_bytes()).unwrap();
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        write_trusted_publisher(&db, &pk_b64);
+        let err = install(addon_dir, &db).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rejected"),
+            "expected symlink rejection, got: {msg}"
+        );
     }
 }

@@ -6,4 +6,5 @@
 // schedulers, ...). Anything here MUST stay dependency-free except for `std`
 // — adding heavyweight imports forces every consumer to pull them.
 
+pub mod path_safety;
 pub mod token_bucket;
