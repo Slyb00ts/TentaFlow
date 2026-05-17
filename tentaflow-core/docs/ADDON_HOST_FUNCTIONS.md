@@ -1826,3 +1826,107 @@ let removed = vector_delete("faces", 17)?;
 | `PayloadTooLarge` | 21 | Input > 1 MiB or output > 1 MiB |
 | `GateNotSatisfied` | 22 | Namespace declares a gate; `gate_claim_id` missing or empty |
 
+
+## 17. Policy / Gate API (F1c P4 — TentaVision)
+
+Addon-facing API for verifying DPIA / FRIA / legal-grant / consent claims
+issued by an administrator. Used to gate D4 face re-identification and any
+vector namespace whose manifest declares `[[vector_namespace]].gate`.
+
+### 17.1 gate_check_v1
+
+```
+ABI: gate_check_v1(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
+Permission: policy.read
+Risk class: B (read-only inspection of regulated policy artifact)
+```
+
+Input TOML:
+```toml
+gate_id = "d4-historical"            # id of [[gate]] declared in manifest
+claim_id = "claim-dpia-faces-2026"   # the claim issued via `tentaflow-cli policy issue`
+resource_scope = "faces"             # optional — vector namespace / alias id
+```
+
+Output TOML:
+```toml
+valid = true
+claim_id = "claim-dpia-faces-2026"
+claim_type = "dpia"
+valid_until = "2030-01-01T00:00:00Z"
+[[signers]]
+role = "dpo"
+user = "alice"
+[[signers]]
+role = "supervisor"
+user = "bob"
+```
+
+When the claim fails validation:
+```toml
+valid = false
+claim_id = "claim-x"
+claim_type = ""
+valid_until = ""
+reason = "claim revoked: claim-x (reason: audit fail)"
+```
+
+Errors:
+- `AbiError::Permission` (1) — addon lacks `policy.read`.
+- `AbiError::NotFound` (2) — `gate_id` not declared in manifest.
+- `AbiError::Operation` (5) — malformed TOML input.
+
+### 17.2 Implicit enforcement in vector_search_v1
+
+When a `[[vector_namespace]]` declares a `gate`, `vector_search_v1`
+denies with `AbiError::GateNotSatisfied` (22) unless the addon passes
+`gate_claim_id = "<claim>"` AND the engine accepts it. Denial reason
+codes (in audit `details`):
+
+- `gate_claim_id_missing` — namespace gated but no claim passed.
+- `gate_not_declared_in_manifest` — manifest gate id missing (should
+  not happen post-install).
+- `claim_not_found` — claim id not in `policy_claims`.
+- `claim_revoked` — claim was revoked via `tentaflow-cli policy revoke`.
+- `claim_outside_validity` — `valid_from..valid_until` does not contain
+  current UTC time.
+- `claim_type_mismatch` — claim's `claim_type` does not match the gate's
+  required type.
+- `claim_scope_mismatch` — claim was narrowed to a different addon /
+  namespace.
+- `missing_required_signer` — no signer with a required role.
+
+### 17.3 SDK wrappers
+
+```rust
+let result = tentaflow_sdk::gate_check("d4-historical", "claim-dpia-faces-2026")?;
+if !result.valid {
+    return Err(format!("policy gate denied: {}",
+        result.reason.unwrap_or_default()));
+}
+// or with explicit scope:
+let result = tentaflow_sdk::gate_check_scoped(
+    "d4-historical", "claim-dpia-faces-2026", Some("faces"))?;
+```
+
+A `valid=false` return is NOT an `AbiError` — the addon explicitly
+asked for an inspection and may decide to surface the denial to the
+operator (e.g. as a UI toast) before retrying with a different claim.
+
+### 17.4 Audit
+
+Every call emits one audit row:
+- `action='policy.gate_check'`, risk class B, `related_claim_id=<claim_id>`.
+- `result='gate_ok'` on success, `result='gate_denied'` on policy
+  rejection. `details` carries the reason code listed in 17.2.
+- Pre-engine errors (missing permission, unknown gate id, payload
+  invalid) use `result='denied'` with reasons `missing_permission`,
+  `gate_not_declared_in_manifest`, `payload_invalid`, `toml_parse_error`.
+
+### 17.5 Issuance (admin only)
+
+Claims are issued via `tentaflow-cli policy issue` — there is no
+addon-side ABI for creating, revoking, or signing claims. See
+`docs/POLICY_CLAIMS.md` (forthcoming) or the F1c implementation note
+`notes/tentavision-f1c-implementation.md` Phase 4 for the full CLI
+surface.

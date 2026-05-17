@@ -10,6 +10,7 @@ pub mod aliases;
 #[cfg(feature = "camera")]
 pub mod camera;
 pub mod events;
+pub mod gate;
 pub mod http;
 pub mod llm;
 pub mod log;
@@ -200,6 +201,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "sql_transaction_v1", sql::sql_transaction_v1)
         .map_err(|e| anyhow::anyhow!("Rejestracja sql_transaction_v1: {e}"))?;
+
+    // --- Policy/Gate API (F1c P4 — DPIA/FRIA claim engine) ---
+    linker
+        .func_wrap("tentaflow", "gate_check_v1", gate::gate_check_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja gate_check_v1: {e}"))?;
 
     // --- Vector API (F1c P3 — embedded usearch HNSW + mmap) ---
     #[cfg(feature = "vector")]

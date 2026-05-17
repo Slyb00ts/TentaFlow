@@ -222,12 +222,12 @@ fn spec_metric(spec: &VectorNamespaceSpec) -> Result<Metric, &'static str> {
     Metric::parse(&spec.distance).ok_or("invalid_metric_in_manifest")
 }
 
-/// Gate evaluation placeholder. P3 enforces only the structural rule: if the
-/// namespace declares a gate, the caller MUST supply a non-empty
-/// `gate_claim_id` in the search request. The actual claim validation against
-/// `policy_claims` + `policy_claim_signatures` lands in P4. Returning
-/// `GateNotSatisfied` now means callers wire claim plumbing today rather than
-/// after a silent contract change at P4.
+/// Structural gate check — kept as the first defence so callers always
+/// supply `gate_claim_id` for a gated namespace before we even touch the
+/// policy DB. Full claim validation (DPIA / FRIA / signers / validity
+/// window) happens in `enforce_gate_with_policy` below, which delegates to
+/// `services::policy::verify_claim` against the addon manifest `[[gate]]`
+/// entry referenced by `spec.gate`.
 pub fn check_gate(
     spec: &VectorNamespaceSpec,
     claim_id: Option<&str>,
@@ -238,6 +238,38 @@ pub fn check_gate(
     match claim_id {
         Some(c) if !c.is_empty() => Ok(()),
         _ => Err(AbiError::GateNotSatisfied),
+    }
+}
+
+/// Full policy enforcement for a gated namespace. Returns Ok when the
+/// namespace has no `gate` field OR when the claim verifies against the
+/// gate's `[[gate]]` requirements. On rejection returns `(AbiError, reason)`
+/// where `reason` is a short audit code (`gate_not_satisfied`,
+/// `claim_revoked`, `claim_outside_validity`, ...). The caller is expected
+/// to emit an audit row with `result='gate_denied'` and `details=reason`.
+pub fn enforce_gate_with_policy(
+    state: &AddonState,
+    spec: &VectorNamespaceSpec,
+    claim_id: Option<&str>,
+) -> Result<(), (AbiError, &'static str)> {
+    let Some(gate_id) = spec.gate.as_deref() else {
+        return Ok(());
+    };
+    let claim_id = match claim_id {
+        Some(c) if !c.is_empty() => c,
+        _ => return Err((AbiError::GateNotSatisfied, "gate_claim_id_missing")),
+    };
+    let gate = match super::gate::lookup_gate(state, gate_id) {
+        Some(g) => g.clone(),
+        None => return Err((AbiError::NotFound, "gate_not_declared_in_manifest")),
+    };
+    let ctx = super::gate::build_context(&state.addon_id, &gate, Some(&spec.name));
+    match crate::services::policy::verify_claim(&state.db, claim_id, &ctx) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let (reason, _) = super::gate::policy_error_to_reason(&e);
+            Err((AbiError::GateNotSatisfied, reason))
+        }
     }
 }
 
@@ -542,16 +574,18 @@ pub fn vector_search_v1(
         }
     };
 
-    if let Err(e) = check_gate(&spec, input.gate_claim_id.as_deref()) {
+    if let Err((abi, reason)) =
+        enforce_gate_with_policy(caller.data(), &spec, input.gate_claim_id.as_deref())
+    {
         audit(
             caller.data(),
             "vector.search",
             Some(&input.namespace),
             RiskClass::B,
-            "denied",
-            Some("gate_not_satisfied"),
+            "gate_denied",
+            Some(reason),
         );
-        return e.as_i32();
+        return abi.as_i32();
     }
 
     let query = match decode_vector(&input.query_b64) {
@@ -842,5 +876,5 @@ pub fn vector_delete_v1(
 /// `#[doc(hidden)]` — not part of the addon-facing API.
 #[doc(hidden)]
 pub mod test_api {
-    pub use super::{check_gate, decode_vector, map_vector_error, MAX_SEARCH_K};
+    pub use super::{check_gate, decode_vector, enforce_gate_with_policy, map_vector_error, MAX_SEARCH_K};
 }

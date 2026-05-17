@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod mesh_keys;
 pub mod mesh_registry;
 pub mod pickup_tokens;
+pub mod policy;
 pub mod ports;
 pub mod recording;
 pub mod registry;

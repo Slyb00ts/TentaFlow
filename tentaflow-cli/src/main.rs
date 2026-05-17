@@ -41,6 +41,11 @@ enum TopCommand {
         #[command(subcommand)]
         sub: commands::audit::AuditCommand,
     },
+    /// Policy / claims engine (F1c P4 — DPIA / FRIA / legal grants)
+    Policy {
+        #[command(subcommand)]
+        sub: commands::policy::PolicyCommand,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -50,5 +55,6 @@ fn main() -> std::process::ExitCode {
         TopCommand::Camera { sub } => commands::camera::run(sub),
         TopCommand::Keys { sub } => commands::keys::run(sub),
         TopCommand::Audit { sub } => commands::audit::run(sub),
+        TopCommand::Policy { sub } => commands::policy::run(sub),
     }
 }
