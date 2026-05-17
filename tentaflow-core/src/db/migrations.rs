@@ -166,8 +166,56 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_vector_namespaces",
             MigrationStep::Sql(ADDON_VECTOR_NAMESPACES),
         ),
+        (
+            28,
+            "policy_claims",
+            MigrationStep::Sql(POLICY_CLAIMS),
+        ),
     ]
 }
+
+// F1c P4 — policy/claims engine tables. `policy_claims` records DPIA / FRIA
+// approvals or legal grants issued by an administrator (via CLI). Each claim
+// can be scoped globally (addon NULL) or narrowed to a specific addon and
+// optionally a single namespace / alias id. Claims expire automatically
+// (`valid_until`) and can be revoked at any time (`revoked_at` set non-NULL).
+// `policy_claim_signatures` carries the multi-signer requirement — at least
+// one signer per required role (typically DPO + supervisor) is enforced by
+// the engine when verifying. `signature_b64` is optional: NULL means manual
+// admin acknowledgment recorded via CLI; populated means a cryptographic
+// Ed25519 signature exists alongside the manual approval (verified
+// opportunistically — manual ack is the contract today, the signature is a
+// future-proofed audit anchor).
+const POLICY_CLAIMS: &str = r#"
+CREATE TABLE IF NOT EXISTS policy_claims (
+    claim_id TEXT PRIMARY KEY,
+    claim_type TEXT NOT NULL,
+    label TEXT NOT NULL,
+    subject TEXT NULL,
+    scope TEXT NULL,
+    document_uri TEXT NULL,
+    scope_addon_id TEXT NULL,
+    scope_namespace TEXT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    revoked_at TEXT NULL,
+    revoked_reason TEXT NULL,
+    issued_by_user TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_claims_type ON policy_claims(claim_type);
+CREATE INDEX IF NOT EXISTS idx_policy_claims_scope ON policy_claims(scope_addon_id, scope_namespace);
+
+CREATE TABLE IF NOT EXISTS policy_claim_signatures (
+    claim_id TEXT NOT NULL REFERENCES policy_claims(claim_id) ON DELETE CASCADE,
+    signer_role TEXT NOT NULL,
+    signer_user TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    signature_b64 TEXT NULL,
+    PRIMARY KEY (claim_id, signer_role, signer_user)
+);
+CREATE INDEX IF NOT EXISTS idx_policy_claim_sig_claim ON policy_claim_signatures(claim_id);
+"#;
 
 // F1c P3 — per-addon per-namespace HNSW vector index registry. The on-disk
 // HNSW file lives at `file_path` (`<HOME>/.tentaflow/addons/<addon_id>/vectors/
