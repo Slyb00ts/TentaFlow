@@ -10,7 +10,8 @@
     "test:ui": "playwright test --project=m16-aliases --project=m14-bindings --project=m15-wizard",
     "test:m14": "playwright test --project=m14-bindings",
     "test:m15": "playwright test --project=m15-wizard",
-    "test:m16": "playwright test --project=m16-aliases"
+    "test:m16": "playwright test --project=m16-aliases",
+    "test:f1c": "playwright test --project=f1c-addon-ui"
   },
   "keywords": [],
   "author": "",
