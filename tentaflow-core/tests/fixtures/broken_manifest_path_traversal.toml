@@ -4,6 +4,12 @@ name = "Broken Path Traversal"
 version = "0.1.0"
 wasm_file = "addon.wasm"
 
+# A valid publisher block so the cross-section validator does not reject
+# the manifest before path-traversal detection runs on `src`.
+[publisher]
+ed25519_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+label = "Test"
+
 [[ui_component]]
 id = "evil"
 display_name = "Evil"

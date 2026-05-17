@@ -51,6 +51,55 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
         bail!("Addon '{}': {}", manifest.addon_id, e);
     }
 
+    // 2b. F1c P2 — verify Ed25519 signatures of [[ui_component]] bundles
+    // against [publisher] key in the trust store. Failure aborts install
+    // before any DB row is written. The manifest validator already rejected
+    // "ui_components without publisher" combinations, so an Some(publisher)
+    // implies every ui_component must verify.
+    if let Some(publisher) = manifest.publisher.as_ref() {
+        for component in &manifest.ui_components {
+            let bundle_path = addon_dir.join(&component.src);
+            if let Err(e) = crate::addon::signature::verify_ui_component_bundle(
+                &bundle_path,
+                &publisher.ed25519_public_key,
+                &component.signature,
+                db,
+            ) {
+                let pk_short = crate::addon::signature::truncate_pk_for_audit(
+                    &publisher.ed25519_public_key,
+                );
+                let _ = crate::db::repository::log_audit(
+                    db,
+                    None,
+                    Some(&manifest.addon_id),
+                    "addon.ui_signature_verify",
+                    Some(component.id.as_str()),
+                    Some(&format!("denied: {e}; publisher_pk={pk_short}")),
+                    None,
+                    None,
+                );
+                bail!(
+                    "ui_component '{}': signature verify failed ({})",
+                    component.id,
+                    e
+                );
+            }
+            let pk_short = crate::addon::signature::truncate_pk_for_audit(
+                &publisher.ed25519_public_key,
+            );
+            let _ = crate::db::repository::log_audit(
+                db,
+                None,
+                Some(&manifest.addon_id),
+                "addon.ui_signature_verify",
+                Some(component.id.as_str()),
+                Some(&format!("ok: publisher_pk={pk_short}")),
+                None,
+                None,
+            );
+        }
+    }
+
     // 3. Odczytaj plik WASM
     let wasm_path = addon_dir.join(&manifest.wasm_file);
 
@@ -1063,6 +1112,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
     let gpu = parse_gpu_section(top.get("gpu"));
     let uses_aliases = parse_uses_aliases(top.get("uses_alias"))?;
     let uses_models = parse_uses_models(top.get("uses_model"))?;
+    let publisher = parse_publisher_section(top.get("publisher"))?;
 
     crate::addon::manifest::validate_manifest_extensions(
         storage.as_ref(),
@@ -1074,6 +1124,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         sdk_version.as_deref(),
         &uses_aliases,
         &uses_models,
+        publisher.as_ref(),
     )?;
 
     let resources = top.get("resources").map(|res| ResourceRequirements {
@@ -1143,7 +1194,40 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         sdk_version,
         uses_aliases,
         uses_models,
+        publisher,
     })
+}
+
+/// Parses optional `[publisher]` table. Strict on field types — `label` and
+/// `ed25519_public_key` must be strings when present.
+fn parse_publisher_section(
+    val: Option<&toml::Value>,
+) -> Result<Option<crate::addon::manifest::PublisherInfo>> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    let tbl = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[publisher] must be a table"))?;
+    let ed25519_public_key = tbl
+        .get("ed25519_public_key")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("[publisher] missing ed25519_public_key (string)"))?
+        .to_string();
+    let label = tbl
+        .get("label")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("[publisher] missing label (string)"))?
+        .to_string();
+    let contact = tbl
+        .get("contact")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    Ok(Some(crate::addon::manifest::PublisherInfo {
+        ed25519_public_key,
+        label,
+        contact,
+    }))
 }
 
 // Parsery sekcji rozszerzonych (F1a). Trzymamy je w lifecycle.rs zeby utrzymac
