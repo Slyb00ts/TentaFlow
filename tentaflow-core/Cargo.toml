@@ -140,6 +140,13 @@ flate2 = "1.1.9"
 tar = "0.4.45"
 tempfile = "3.27.0"
 
+# Vector storage (F1c P3 — embedded HNSW + mmap)
+# Cross-compile uwaga: usearch ma C++ core (cxx). Buduje sie na desktop
+# (linux/macos/windows) bez problemu — wymaga toolchainu cc/c++. Mobile
+# (ios/android) potrzebuje weryfikacji w F1c P3.1 (opcjonalnie fallback
+# `hnsw_rs` pure-Rust). Domyslne features wystarcza (HNSW + save/load).
+usearch = "2.25"
+
 # Synchronizacja
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
