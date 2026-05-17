@@ -215,6 +215,7 @@ impl FlowScheduler {
         flow_id: &str,
         input: toml::Value,
         wait_ms: u32,
+        actor_user_id: Option<i64>,
     ) -> Result<InvocationStatus, InvokeError> {
         let flow = registry::global()
             .get(addon_id, flow_id)
@@ -245,14 +246,15 @@ impl FlowScheduler {
                 .map_err(|e| anyhow!("db pool poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO flow_invocations \
-                    (id, addon_id, flow_id, started_at, status, operators_completed, operators_total) \
-                 VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5)",
+                    (id, addon_id, flow_id, started_at, status, operators_completed, operators_total, actor_user_id) \
+                 VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, ?6)",
                 rusqlite::params![
                     inv_id_owned,
                     addon_id_owned,
                     flow_id_owned,
                     started_at_owned,
-                    operators_total
+                    operators_total,
+                    actor_user_id
                 ],
             )?;
             Ok(())
