@@ -202,7 +202,7 @@ fn resolve_file_url_rejects_empty_input() {
 fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
     insert_camera(
         db, camera_id, owner, "display", "fake_file", url, 30, None, None, "C",
-        "default", None,
+        "default", None, None, None,
     )
     .expect("insert");
 }

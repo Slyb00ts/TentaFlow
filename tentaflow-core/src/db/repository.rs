@@ -10929,6 +10929,8 @@ pub struct CameraRow {
     pub created_at: i64,
     pub updated_at: i64,
     pub credentials_encrypted: Option<Vec<u8>>,
+    pub onvif_url: Option<String>,
+    pub onvif_profile_token: Option<String>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -10966,6 +10968,8 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
         credentials_encrypted: row.get(17)?,
+        onvif_url: row.get(18)?,
+        onvif_profile_token: row.get(19)?,
     })
 }
 
@@ -10973,7 +10977,8 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
 const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
-     fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted";
+     fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
+     onvif_url, onvif_profile_token";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -10996,6 +11001,8 @@ pub fn insert_camera(
     retention_class: &str,
     profile: &str,
     credentials_encrypted: Option<&[u8]>,
+    onvif_url: Option<&str>,
+    onvif_profile_token: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
@@ -11003,11 +11010,13 @@ pub fn insert_camera(
         "INSERT INTO cameras \
          (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
           resolution_width, resolution_height, retention_class, status, status_message, \
-          fps_actual, last_frame_at, credentials_encrypted, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?12)",
+          fps_actual, last_frame_at, credentials_encrypted, onvif_url, onvif_profile_token, \
+          created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?14)",
         rusqlite::params![
             camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
-            resolution_width, resolution_height, retention_class, credentials_encrypted, now,
+            resolution_width, resolution_height, retention_class, credentials_encrypted,
+            onvif_url, onvif_profile_token, now,
         ],
     )?;
     Ok(conn.last_insert_rowid())

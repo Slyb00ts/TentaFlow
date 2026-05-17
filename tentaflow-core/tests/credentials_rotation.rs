@@ -72,6 +72,8 @@ fn set_camera_credentials_round_trip_through_db() {
         "C",
         "default",
         None,
+        None,
+        None,
     )
     .unwrap();
 
@@ -109,7 +111,7 @@ fn cross_owner_set_credentials_returns_false() {
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     insert_camera(
         &db, &camera_id, "addon-owner", "front gate", "rtsp",
-        "rtsp://cam.local/stream", 30, None, None, "C", "default", None,
+        "rtsp://cam.local/stream", 30, None, None, "C", "default", None, None, None,
     )
     .unwrap();
     let td = tempfile::tempdir().unwrap();
@@ -145,6 +147,8 @@ fn rotate_key_re_encrypts_every_row() {
             "rtsp://x/y",
             30, None, None, "C", "default",
             Some(&blob),
+            None,
+            None,
         )
         .unwrap();
         ids.push((cid, *c));

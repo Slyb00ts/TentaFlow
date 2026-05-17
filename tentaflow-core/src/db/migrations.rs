@@ -176,7 +176,48 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flow_invocations",
             MigrationStep::Sql(FLOW_INVOCATIONS),
         ),
+        (
+            30,
+            "cameras_onvif_metadata",
+            MigrationStep::Rust(cameras_add_onvif_metadata_columns),
+        ),
     ]
+}
+
+// F1c P6 — persist the ONVIF device-service URL and the profile token chosen
+// at `camera_add_v1` time so the credentials-rotation path can re-derive the
+// RTSP URI without forcing the operator to re-run discovery. Both columns
+// are nullable: rows added under `vendor='rtsp'` (or pre-P6 ONVIF rows added
+// by hand) keep NULL.
+//
+// SQLite has no `ADD COLUMN IF NOT EXISTS`. We read PRAGMA table_info first
+// and skip the ALTER when the column already exists so the migration is
+// idempotent across partial-run reopens.
+fn cameras_add_onvif_metadata_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(cameras)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_url = false;
+    let mut has_token = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "onvif_url" {
+            has_url = true;
+        } else if name == "onvif_profile_token" {
+            has_token = true;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_url {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN onvif_url TEXT NULL;")?;
+    }
+    if !has_token {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN onvif_profile_token TEXT NULL;",
+        )?;
+    }
+    Ok(())
 }
 
 // F1c P5 — runtime tracking of in-flight and historical flow invocations
