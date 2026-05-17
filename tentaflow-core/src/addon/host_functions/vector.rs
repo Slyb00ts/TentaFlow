@@ -117,13 +117,29 @@ fn audit(
     result: &str,
     reason: Option<&str>,
 ) {
+    audit_with_claim(state, action, namespace, risk, result, reason, None);
+}
+
+/// Variant of `audit` that links the row to a `policy_claims.claim_id` via
+/// the audit chain `related_claim_id` column. Used by gate-denial paths so
+/// the compliance audit shows *which* claim was rejected, not just that a
+/// gate denied (data minimization rule for F1c P4).
+fn audit_with_claim(
+    state: &AddonState,
+    action: &str,
+    namespace: Option<&str>,
+    risk: RiskClass,
+    result: &str,
+    reason: Option<&str>,
+    related_claim_id: Option<&str>,
+) {
     audit_log_with_risk(
         state,
         action,
         Some("vector_namespace"),
         namespace,
         risk,
-        None,
+        related_claim_id,
         None,
         result,
         reason,
@@ -241,34 +257,61 @@ pub fn check_gate(
     }
 }
 
-/// Full policy enforcement for a gated namespace. Returns Ok when the
-/// namespace has no `gate` field OR when the claim verifies against the
-/// gate's `[[gate]]` requirements. On rejection returns `(AbiError, reason)`
-/// where `reason` is a short audit code (`gate_not_satisfied`,
-/// `claim_revoked`, `claim_outside_validity`, ...). The caller is expected
-/// to emit an audit row with `result='gate_denied'` and `details=reason`.
+/// Outcome of `enforce_gate_with_policy` on the deny path. Carries the
+/// short audit reason code plus the `claim_id` that was attempted (when
+/// the addon supplied one) so the caller can link the audit row to the
+/// rejected claim via `related_claim_id`. `claim_id` is `None` only when
+/// the gated namespace was called without any claim id at all.
+#[derive(Debug)]
+pub struct GateDenial {
+    pub abi: AbiError,
+    pub reason: &'static str,
+    pub attempted_claim_id: Option<String>,
+}
+
+/// Full policy enforcement for a gated namespace. Returns Ok with the
+/// `claim_id` that satisfied the gate (or `None` when the namespace has
+/// no `gate` field). On rejection returns `GateDenial` with the audit
+/// reason and the attempted claim id (if any) so the caller can emit a
+/// `gate_denied` audit row tied to the claim via `related_claim_id`.
 pub fn enforce_gate_with_policy(
     state: &AddonState,
     spec: &VectorNamespaceSpec,
     claim_id: Option<&str>,
-) -> Result<(), (AbiError, &'static str)> {
+) -> Result<Option<String>, GateDenial> {
     let Some(gate_id) = spec.gate.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     let claim_id = match claim_id {
         Some(c) if !c.is_empty() => c,
-        _ => return Err((AbiError::GateNotSatisfied, "gate_claim_id_missing")),
+        _ => {
+            return Err(GateDenial {
+                abi: AbiError::GateNotSatisfied,
+                reason: "gate_claim_id_missing",
+                attempted_claim_id: None,
+            });
+        }
     };
     let gate = match super::gate::lookup_gate(state, gate_id) {
         Some(g) => g.clone(),
-        None => return Err((AbiError::NotFound, "gate_not_declared_in_manifest")),
+        None => {
+            return Err(GateDenial {
+                abi: AbiError::NotFound,
+                reason: "gate_not_declared_in_manifest",
+                attempted_claim_id: Some(claim_id.to_string()),
+            });
+        }
     };
     let ctx = super::gate::build_context(&state.addon_id, &gate, Some(&spec.name));
     match crate::services::policy::verify_claim(&state.db, claim_id, &ctx) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Some(claim_id.to_string())),
         Err(e) => {
             let (reason, _) = super::gate::policy_error_to_reason(&e);
-            Err((AbiError::GateNotSatisfied, reason))
+            Err(GateDenial {
+                abi: AbiError::GateNotSatisfied,
+                reason,
+                attempted_claim_id: Some(claim_id.to_string()),
+            })
         }
     }
 }
@@ -574,18 +617,19 @@ pub fn vector_search_v1(
         }
     };
 
-    if let Err((abi, reason)) =
+    if let Err(denial) =
         enforce_gate_with_policy(caller.data(), &spec, input.gate_claim_id.as_deref())
     {
-        audit(
+        audit_with_claim(
             caller.data(),
             "vector.search",
             Some(&input.namespace),
             RiskClass::B,
             "gate_denied",
-            Some(reason),
+            Some(denial.reason),
+            denial.attempted_claim_id.as_deref(),
         );
-        return abi.as_i32();
+        return denial.abi.as_i32();
     }
 
     let query = match decode_vector(&input.query_b64) {
@@ -876,5 +920,5 @@ pub fn vector_delete_v1(
 /// `#[doc(hidden)]` — not part of the addon-facing API.
 #[doc(hidden)]
 pub mod test_api {
-    pub use super::{check_gate, decode_vector, enforce_gate_with_policy, map_vector_error, MAX_SEARCH_K};
+    pub use super::{check_gate, decode_vector, enforce_gate_with_policy, map_vector_error, GateDenial, MAX_SEARCH_K};
 }

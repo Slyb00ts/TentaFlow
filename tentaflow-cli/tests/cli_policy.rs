@@ -273,3 +273,85 @@ fn policy_verify_invalid_for_revoked_claim() {
         .failure()
         .stderr(contains("INVALID [revoked]"));
 }
+
+#[test]
+fn policy_verify_reads_manifest_gate_spec() {
+    // F1c P4: `policy verify` must be able to pull required signer roles +
+    // claim type directly from an addon manifest `[[gate]]` block, instead
+    // of trusting the admin to re-type --signer-role / --type. Otherwise a
+    // single missing --signer-role flag yields a false-positive OK while
+    // the runtime would reject the same claim.
+    let d = TempDir::new().unwrap();
+    let db = d.path().join("t.db");
+    let manifest_path = d.path().join("manifest.toml");
+    std::fs::write(
+        &manifest_path,
+        r#"
+[addon]
+id = "test-addon-manifest-verify"
+name = "Test Manifest Verify"
+version = "0.1.0"
+description = "T"
+wasm_file = "addon.wasm"
+
+[[gate]]
+id = "d4-historical"
+display_name = "D4 Historical Face Search"
+required_claims = [
+  { type = "approval", subject = "dpo" },
+  { type = "approval", subject = "supervisor" },
+  { type = "consent" },
+]
+"#,
+    )
+    .unwrap();
+
+    // Issue a claim signed ONLY by dpo — supervisor is missing.
+    cli()
+        .args([
+            "policy", "issue", "--claim-id", "c1", "--type", "consent", "--label", "x",
+            "--valid-until", "2030-01-01T00:00:00Z", "--signer", "dpo:alice", "--db",
+        ])
+        .arg(&db)
+        .assert()
+        .success();
+
+    // Without the manifest, the default fallback (--signer-role dpo) lets the
+    // claim through — false positive.
+    cli()
+        .args([
+            "policy", "verify", "--claim-id", "c1", "--type", "consent", "--db",
+        ])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(contains("OK: claim 'c1' valid"));
+
+    // With the manifest, the supervisor signer role is enforced and the same
+    // claim is correctly rejected.
+    cli()
+        .args(["policy", "verify", "--claim-id", "c1", "--addon-manifest"])
+        .arg(&manifest_path)
+        .args(["--gate-id", "d4-historical", "--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(contains("INVALID [missing_signer]"))
+        .stderr(contains("supervisor"));
+}
+
+#[test]
+fn policy_verify_rejects_manifest_without_gate_id() {
+    let d = TempDir::new().unwrap();
+    let db = d.path().join("t.db");
+    let manifest_path = d.path().join("m.toml");
+    std::fs::write(&manifest_path, "[addon]\nid = \"x\"\nversion = \"0.1\"\n").unwrap();
+    cli()
+        .args(["policy", "verify", "--claim-id", "c1", "--addon-manifest"])
+        .arg(&manifest_path)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(contains("must be supplied together"));
+}

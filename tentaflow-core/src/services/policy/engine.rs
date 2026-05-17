@@ -31,10 +31,24 @@ pub struct ClaimContext {
     /// Required signer roles. Engine asserts that every role here appears
     /// at least once in `policy_claim_signatures` for the claim.
     pub required_signer_roles: Vec<String>,
-    /// "Now" timestamp in UTC ISO-8601 used for the validity window check.
-    /// Caller-supplied so unit tests can pin time deterministically; host
-    /// fn callers use `chrono::Utc::now().to_rfc3339()`.
+    /// "Now" timestamp as an RFC 3339 string (any offset accepted — `Z`,
+    /// `+00:00`, `+02:00`...). Caller-supplied so unit tests can pin time
+    /// deterministically; host fn callers use `chrono::Utc::now().to_rfc3339()`.
+    /// The engine parses every timestamp into `DateTime<Utc>` before
+    /// comparing, so mixing zone offsets across `now_utc`, `valid_from` and
+    /// `valid_until` is safe — they are normalized to UTC instants.
     pub now_utc: String,
+}
+
+/// Parses an RFC 3339 timestamp into UTC. Accepts every offset form
+/// (`...Z`, `...+00:00`, `...+02:00`, etc.) and converts to UTC so callers
+/// can lex-free compare instants. Wrapped here so every validity-window
+/// check in `verify_claim` returns the same `PolicyError::DbError` shape
+/// when a stored claim has a malformed timestamp.
+fn parse_rfc3339_utc(s: &str, field: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| PolicyError::DbError(format!("invalid RFC3339 timestamp in {field} ('{s}'): {e}")))
 }
 
 /// Signer entry returned in the verified payload (role + user identity).
@@ -78,13 +92,14 @@ pub fn verify_claim(
         });
     }
 
-    // Validity window. Comparison is lexicographic — works for ISO-8601 UTC
-    // strings ("YYYY-MM-DDTHH:MM:SSZ") because the format is monotonic in
-    // string ordering. Mixing local-time / offset strings here would break
-    // ordering; the CLI + host fn callers both pass UTC.
-    if ctx.now_utc.as_str() < row.valid_from.as_str()
-        || ctx.now_utc.as_str() > row.valid_until.as_str()
-    {
+    // Validity window. Parse every timestamp through `DateTime<Utc>` so we
+    // compare instants, not strings — mixing `Z` and `+00:00` (or any other
+    // offset) across `now_utc`, `valid_from` and `valid_until` would break
+    // lexicographic ordering and could let an expired claim through.
+    let now_dt = parse_rfc3339_utc(&ctx.now_utc, "now_utc")?;
+    let valid_from_dt = parse_rfc3339_utc(&row.valid_from, "valid_from")?;
+    let valid_until_dt = parse_rfc3339_utc(&row.valid_until, "valid_until")?;
+    if now_dt < valid_from_dt || now_dt > valid_until_dt {
         return Err(PolicyError::ClaimNotInValidityPeriod {
             claim_id: row.claim_id,
             now: ctx.now_utc.clone(),
@@ -323,6 +338,60 @@ mod tests {
         repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
         verify_claim(&pool, "c1", &ctx("addon-1", "dpia", Some("ns1"))).unwrap();
         verify_claim(&pool, "c1", &ctx("addon-2", "dpia", Some("ns2"))).unwrap();
+    }
+
+    #[test]
+    fn test_verify_accepts_z_suffix() {
+        let (_d, pool) = open_pool();
+        repo::insert_claim(&pool, &base_claim("c1")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "a")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
+        let mut c = ctx("addon", "dpia", None);
+        c.now_utc = "2026-06-15T12:00:00Z".to_string();
+        verify_claim(&pool, "c1", &c).unwrap();
+    }
+
+    #[test]
+    fn test_verify_accepts_plus_offset() {
+        let (_d, pool) = open_pool();
+        let mut nc = base_claim("c1");
+        nc.valid_from = "2026-01-01T00:00:00+00:00".to_string();
+        nc.valid_until = "2027-01-01T00:00:00+00:00".to_string();
+        repo::insert_claim(&pool, &nc).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "a")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
+        let mut c = ctx("addon", "dpia", None);
+        c.now_utc = "2026-06-15T00:00:00Z".to_string();
+        verify_claim(&pool, "c1", &c).unwrap();
+    }
+
+    #[test]
+    fn test_verify_accepts_non_utc_offset() {
+        // valid_until = 2027-01-01T02:00:00+02:00 == 2027-01-01T00:00:00Z.
+        // now      = 2026-12-31T23:59:00Z is BEFORE valid_until in UTC even
+        // though lex-string `2026-12-31...Z` > `2027-01-01T02:...+02:00`.
+        let (_d, pool) = open_pool();
+        let mut nc = base_claim("c1");
+        nc.valid_from = "2026-01-01T02:00:00+02:00".to_string();
+        nc.valid_until = "2027-01-01T02:00:00+02:00".to_string();
+        repo::insert_claim(&pool, &nc).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "a")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
+        let mut c = ctx("addon", "dpia", None);
+        c.now_utc = "2026-12-31T23:59:00Z".to_string();
+        verify_claim(&pool, "c1", &c).unwrap();
+    }
+
+    #[test]
+    fn test_verify_rejects_malformed_timestamp() {
+        let (_d, pool) = open_pool();
+        let mut nc = base_claim("c1");
+        nc.valid_until = "not-a-date".to_string();
+        repo::insert_claim(&pool, &nc).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "a")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
+        let err = verify_claim(&pool, "c1", &ctx("addon", "dpia", None)).unwrap_err();
+        assert!(matches!(err, PolicyError::DbError(_)), "got {err:?}");
     }
 
     #[test]
