@@ -22,5 +22,6 @@ module.exports = defineConfig({
     { name: 'm16-aliases', testMatch: 'm16-services-aliases.spec.js' },
     { name: 'm14-bindings', testMatch: 'm14-bindings.spec.js' },
     { name: 'm15-wizard', testMatch: 'm15-install-wizard.spec.js' },
+    { name: 'f1c-addon-ui', testMatch: 'addon-ui-iframe.spec.js' },
   ],
 });
