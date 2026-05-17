@@ -160,9 +160,10 @@ fn gated_namespace_without_claim_is_denied() {
     let (_d, pool) = open_pool();
     let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
     let spec = vector_spec("faces", Some("d4-historical"));
-    let (abi, reason) = enforce_gate_with_policy(&state, &spec, None).unwrap_err();
-    assert_eq!(abi, AbiError::GateNotSatisfied);
-    assert_eq!(reason, "gate_claim_id_missing");
+    let denial = enforce_gate_with_policy(&state, &spec, None).unwrap_err();
+    assert_eq!(denial.abi, AbiError::GateNotSatisfied);
+    assert_eq!(denial.reason, "gate_claim_id_missing");
+    assert!(denial.attempted_claim_id.is_none());
 }
 
 #[test]
@@ -172,9 +173,10 @@ fn gated_namespace_with_unknown_gate_id_returns_not_found() {
     // rejected, but the runtime guards anyway.
     let state = make_state(pool, "addon-x", Vec::new());
     let spec = vector_spec("faces", Some("d4-historical"));
-    let (abi, reason) = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
-    assert_eq!(abi, AbiError::NotFound);
-    assert_eq!(reason, "gate_not_declared_in_manifest");
+    let denial = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
+    assert_eq!(denial.abi, AbiError::NotFound);
+    assert_eq!(denial.reason, "gate_not_declared_in_manifest");
+    assert_eq!(denial.attempted_claim_id.as_deref(), Some("c1"));
 }
 
 #[test]
@@ -193,9 +195,10 @@ fn gated_namespace_with_revoked_claim_denied() {
     policy::revoke_claim(&pool, "c1", "audit fail", "2026-02-01T00:00:00Z").unwrap();
     let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
     let spec = vector_spec("faces", Some("d4-historical"));
-    let (abi, reason) = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
-    assert_eq!(abi, AbiError::GateNotSatisfied);
-    assert_eq!(reason, "claim_revoked");
+    let denial = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
+    assert_eq!(denial.abi, AbiError::GateNotSatisfied);
+    assert_eq!(denial.reason, "claim_revoked");
+    assert_eq!(denial.attempted_claim_id.as_deref(), Some("c1"));
 }
 
 #[test]
@@ -213,9 +216,38 @@ fn gated_namespace_with_addon_scoped_claim_rejects_wrong_addon() {
     issue(&pool, "c1", "dpia", Some("addon-y"), None, &[("dpo", "alice")]);
     let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
     let spec = vector_spec("faces", Some("d4-historical"));
-    let (abi, reason) = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
-    assert_eq!(abi, AbiError::GateNotSatisfied);
-    assert_eq!(reason, "claim_scope_mismatch");
+    let denial = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
+    assert_eq!(denial.abi, AbiError::GateNotSatisfied);
+    assert_eq!(denial.reason, "claim_scope_mismatch");
+    assert_eq!(denial.attempted_claim_id.as_deref(), Some("c1"));
+}
+
+#[test]
+fn gate_denial_carries_attempted_claim_id_for_audit_chain() {
+    // F1c P4 audit chain rule: every gate denial against a supplied claim
+    // must surface the claim id so the host fn writes it into
+    // `audit_log.related_claim_id`. The previous version returned only
+    // (AbiError, reason) and the chain was incomplete on denials.
+    let (_d, pool) = open_pool();
+    issue(&pool, "c1", "dpia", Some("addon-y"), None, &[("dpo", "alice")]);
+    let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
+    let spec = vector_spec("faces", Some("d4-historical"));
+    let denial = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
+    assert_eq!(denial.abi, AbiError::GateNotSatisfied);
+    assert_eq!(denial.attempted_claim_id.as_deref(), Some("c1"));
+}
+
+#[test]
+fn gate_denial_without_claim_has_no_chain_reference() {
+    // When the addon never supplied a claim id, the audit row cannot link
+    // to a `policy_claims` row — `attempted_claim_id` stays None and the
+    // host fn writes `related_claim_id = NULL`.
+    let (_d, pool) = open_pool();
+    let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
+    let spec = vector_spec("faces", Some("d4-historical"));
+    let denial = enforce_gate_with_policy(&state, &spec, None).unwrap_err();
+    assert!(denial.attempted_claim_id.is_none());
+    assert_eq!(denial.reason, "gate_claim_id_missing");
 }
 
 #[test]

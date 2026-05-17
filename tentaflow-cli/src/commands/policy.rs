@@ -10,6 +10,10 @@ use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use tentaflow_core::addon::host_functions::gate::{
+    primary_claim_type_for_gate, required_signer_roles_for_gate,
+};
+use tentaflow_core::addon::lifecycle::parse_manifest_toml;
 use tentaflow_core::db;
 use tentaflow_core::services::policy::{
     self, ClaimContext, ListFilter, NewClaim, NewSignature, PolicyError,
@@ -84,11 +88,22 @@ pub enum PolicyCommand {
         db: PathBuf,
     },
     /// Verify a claim against a gate context (dry-run, no mutation).
+    ///
+    /// Two ways to declare what the gate requires:
+    ///   * `--addon-manifest <path> --gate-id <id>` — canonical: reads the
+    ///     `[[gate]]` block from the addon manifest. This is what the runtime
+    ///     enforces, so admins should prefer this when they want to mirror
+    ///     production behavior.
+    ///   * `--type` + `--signer-role` — manual override. Used when no manifest
+    ///     is available (rare) or to probe a hypothetical gate spec.
+    /// When both are given the manifest wins (canonical source) and `--type`
+    /// + `--signer-role` are ignored to avoid a silent false-positive OK.
     Verify {
         #[arg(long = "claim-id")]
         claim_id: String,
-        /// Expected claim type.
-        #[arg(long = "type")]
+        /// Expected claim type. Ignored when `--addon-manifest` + `--gate-id`
+        /// are supplied (manifest gate spec wins).
+        #[arg(long = "type", default_value = "")]
         claim_type: String,
         /// Addon identity used for scope matching.
         #[arg(long = "addon", default_value = "")]
@@ -97,8 +112,18 @@ pub enum PolicyCommand {
         #[arg(long = "namespace")]
         namespace: Option<String>,
         /// Required signer roles. Repeat for multi-role. Default: dpo.
+        /// Ignored when `--addon-manifest` + `--gate-id` are supplied.
         #[arg(long = "signer-role")]
         signer_role: Vec<String>,
+        /// Path to an addon manifest.toml. When combined with `--gate-id`,
+        /// the engine pulls the required signer roles and claim type from
+        /// the `[[gate]]` block instead of `--signer-role` / `--type`.
+        #[arg(long = "addon-manifest")]
+        addon_manifest: Option<PathBuf>,
+        /// Gate id from the addon manifest `[[gate]]` block. Required when
+        /// `--addon-manifest` is supplied.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
         #[arg(long, default_value = "tentaflow.db")]
         db: PathBuf,
     },
@@ -152,6 +177,8 @@ pub fn run(cmd: PolicyCommand) -> ExitCode {
             addon,
             namespace,
             signer_role,
+            addon_manifest,
+            gate_id,
             db,
         } => run_verify(
             &claim_id,
@@ -159,6 +186,8 @@ pub fn run(cmd: PolicyCommand) -> ExitCode {
             &addon,
             namespace.as_deref(),
             &signer_role,
+            addon_manifest.as_deref(),
+            gate_id.as_deref(),
             &db,
         ),
         PolicyCommand::Revoke {
@@ -379,27 +408,78 @@ fn run_show(claim_id: &str, db_path: &Path) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_verify(
     claim_id: &str,
     claim_type: &str,
     addon: &str,
     namespace: Option<&str>,
     signer_roles: &[String],
+    addon_manifest: Option<&Path>,
+    gate_id: Option<&str>,
     db_path: &Path,
 ) -> ExitCode {
     let pool = match open_db(db_path) {
         Ok(p) => p,
         Err(c) => return c,
     };
-    let mut roles: Vec<String> = signer_roles.to_vec();
-    if roles.is_empty() {
-        roles.push("dpo".to_string());
-    }
+
+    // Manifest path wins over manual --type / --signer-role to prevent a
+    // silent false-positive OK when an admin under-declares signer roles
+    // relative to what production gate enforcement actually requires.
+    let (resolved_claim_type, resolved_roles) = match (addon_manifest, gate_id) {
+        (Some(path), Some(g_id)) => {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: cannot read manifest {}: {e}", path.display());
+                    return ExitCode::from(1);
+                }
+            };
+            let manifest = match parse_manifest_toml(&content) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: cannot parse manifest {}: {e}", path.display());
+                    return ExitCode::from(1);
+                }
+            };
+            let gate = match manifest.gates.iter().find(|g| g.id == g_id) {
+                Some(g) => g,
+                None => {
+                    eprintln!(
+                        "Error: gate '{g_id}' not declared in manifest {}",
+                        path.display()
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            (
+                primary_claim_type_for_gate(gate),
+                required_signer_roles_for_gate(gate),
+            )
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("Error: --addon-manifest and --gate-id must be supplied together");
+            return ExitCode::from(1);
+        }
+        (None, None) => {
+            if claim_type.is_empty() {
+                eprintln!("Error: --type is required when --addon-manifest is not supplied");
+                return ExitCode::from(1);
+            }
+            let mut roles: Vec<String> = signer_roles.to_vec();
+            if roles.is_empty() {
+                roles.push("dpo".to_string());
+            }
+            (claim_type.to_string(), roles)
+        }
+    };
+
     let ctx = ClaimContext {
         addon_id: addon.to_string(),
-        claim_type_required: claim_type.to_string(),
+        claim_type_required: resolved_claim_type,
         resource_scope: namespace.map(String::from),
-        required_signer_roles: roles,
+        required_signer_roles: resolved_roles,
         now_utc: chrono::Utc::now().to_rfc3339(),
     };
     match policy::verify_claim(&pool, claim_id, &ctx) {
