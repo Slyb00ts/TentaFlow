@@ -25,7 +25,6 @@ use super::{
     close_outbound, emit_op_audit, next_record, read_param_string, toml_to_json,
     OperatorContext, OperatorError, OutboundEdge,
 };
-use crate::addon::event_bus::Event;
 use crate::addon::event_publish::publish_event;
 use crate::addon::storage_sql_exec::exec_for_addon;
 use crate::flow_runtime::bounded_drop_oldest::BoundedDropOldest;
@@ -132,10 +131,27 @@ pub async fn run(
                     }
                     SinkKind::SqlExec => {
                         let q = query.as_deref().unwrap();
-                        let substituted = substitute_placeholders(q, &record);
-                        match exec_for_addon(&ctx.addon_id, &substituted.0, &substituted.1) {
-                            Ok(_) => Ok(()),
-                            Err(e) => Err(e.to_string()),
+                        let (sql, params_vec) = substitute_placeholders(q, &record);
+                        let addon_id = ctx.addon_id.clone();
+                        // `exec_for_addon` is sync and can block for up to the
+                        // 30 s SQL watchdog; without `spawn_blocking` the
+                        // current tokio worker is pinned and `cancel` cannot
+                        // interrupt it. The `tokio::select!` lets the operator
+                        // return on cancel while the SQL completes in the
+                        // background (its own watchdog still applies).
+                        let handle = tokio::task::spawn_blocking(move || {
+                            exec_for_addon(&addon_id, &sql, &params_vec)
+                        });
+                        tokio::select! {
+                            res = handle => match res {
+                                Ok(Ok(_)) => Ok(()),
+                                Ok(Err(e)) => Err(e.to_string()),
+                                Err(join_err) => Err(format!("sql_exec join: {join_err}")),
+                            },
+                            _ = cancel.cancelled() => {
+                                close_outbound(&outbound);
+                                return Ok(());
+                            }
                         }
                     }
                     SinkKind::UiNotify => {
@@ -145,19 +161,21 @@ pub async fn run(
                             "message": ui_message.as_deref().unwrap_or(""),
                             "record": toml_to_json(&record),
                         });
-                        // ui_notify bypasses the per-event permission resolve
-                        // because `ui.notification` is a runtime-owned topic
-                        // (not a user-declared event). The audit row for the
-                        // sink is written by `emit_op_audit` below.
-                        let event = Event {
-                            event_type: "ui.notification".to_string(),
-                            source_addon: Some(ctx.addon_id.clone()),
-                            source_user: None,
+                        // Goes through `publish_event` so the `events`
+                        // permission gate (and its audit row) applies the
+                        // same way an addon-issued event would — without
+                        // this an addon could emit `ui.notification`
+                        // without declaring any event permission.
+                        publish_event(
+                            bus,
+                            &ctx.db,
+                            &ctx.caller(),
+                            Some(&ctx.permission_checker),
+                            &ctx.permissions,
+                            "ui.notification",
                             payload,
-                            timestamp: chrono::Utc::now(),
-                        };
-                        bus.publish(event);
-                        Ok(())
+                        )
+                        .map_err(|e| e.to_string())
                     }
                 };
                 match outcome {

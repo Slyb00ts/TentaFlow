@@ -49,9 +49,15 @@ impl AggOp {
     }
 }
 
-fn flush_window(op: AggOp, samples: &mut Vec<f64>, count: u64, start: &str, end: &str) -> Option<toml::Value> {
+fn flush_window(
+    op: AggOp,
+    samples: &mut Vec<f64>,
+    count: u64,
+    start: &str,
+    end: &str,
+) -> (Option<toml::Value>, bool) {
     if count == 0 {
-        return None;
+        return (None, false);
     }
     let value = match op {
         AggOp::Count => count as f64,
@@ -66,13 +72,19 @@ fn flush_window(op: AggOp, samples: &mut Vec<f64>, count: u64, start: &str, end:
             }
         }
     };
+    // `count` is a `u64` but the TOML `count` field is `i64`. A window with
+    // >i64::MAX records is not physically reachable in a single tumbling
+    // window today, but the cast is still unchecked — saturate so the
+    // field stays monotonic non-negative if the invariant ever breaks.
+    let saturated = count > i64::MAX as u64;
+    let count_i64 = if saturated { i64::MAX } else { count as i64 };
     let mut t = toml::value::Table::new();
     t.insert("window_start".to_string(), toml::Value::String(start.to_string()));
     t.insert("window_end".to_string(), toml::Value::String(end.to_string()));
-    t.insert("count".to_string(), toml::Value::Integer(count as i64));
+    t.insert("count".to_string(), toml::Value::Integer(count_i64));
     t.insert("value".to_string(), toml::Value::Float(value));
     samples.clear();
-    Some(toml::Value::Table(t))
+    (Some(toml::Value::Table(t)), saturated)
 }
 
 pub async fn run(
@@ -116,13 +128,26 @@ pub async fn run(
         if active == 0 {
             // Flush the final partial window before tearing down outbound.
             let window_end = Utc::now().to_rfc3339();
-            if let Some(rec) =
-                flush_window(op, &mut samples, count, &window_start, &window_end)
-            {
+            let (maybe_rec, saturated) =
+                flush_window(op, &mut samples, count, &window_start, &window_end);
+            if let Some(rec) = maybe_rec {
                 for (_, edge) in &outbound {
                     edge.send(FlowMessage::Record(rec.clone()));
                 }
                 windows_emitted += 1;
+            }
+            if saturated {
+                emit_op_audit(
+                    &ctx.db,
+                    &ctx.addon_id,
+                    &ctx.flow_id,
+                    &ctx.invocation_id,
+                    &ctx.operator_id,
+                    "aggregate",
+                    "count_saturated",
+                    "warn",
+                    Some(serde_json::json!({"raw_count_u64": count})),
+                );
             }
             break;
         }
@@ -135,13 +160,26 @@ pub async fn run(
             }
             _ = interval.tick() => {
                 let window_end = Utc::now().to_rfc3339();
-                if let Some(rec) =
-                    flush_window(op, &mut samples, count, &window_start, &window_end)
-                {
+                let (maybe_rec, saturated) =
+                    flush_window(op, &mut samples, count, &window_start, &window_end);
+                if let Some(rec) = maybe_rec {
                     for (_, edge) in &outbound {
                         edge.send(FlowMessage::Record(rec.clone()));
                     }
                     windows_emitted += 1;
+                }
+                if saturated {
+                    emit_op_audit(
+                        &ctx.db,
+                        &ctx.addon_id,
+                        &ctx.flow_id,
+                        &ctx.invocation_id,
+                        &ctx.operator_id,
+                        "aggregate",
+                        "count_saturated",
+                        "warn",
+                        Some(serde_json::json!({"raw_count_u64": count})),
+                    );
                 }
                 count = 0;
                 window_start = window_end;

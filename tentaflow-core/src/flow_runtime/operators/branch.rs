@@ -51,22 +51,57 @@ struct CompiledExpr {
 
 fn compile_expr(raw: &str) -> Result<CompiledExpr, OperatorError> {
     let s = raw.trim();
-    // Operator detection: 2-char operators first so `==` is not split as `=`.
-    let two_char = ["==", "!=", "<=", ">="];
-    let mut found: Option<(usize, &str)> = None;
-    for op in &two_char {
-        if let Some(idx) = s.find(op) {
-            found = Some((idx, op));
-            break;
+    // Operator detection scans char-by-char while tracking quote state so
+    // a literal like `name == "abc<def"` is not split on the inner `<`.
+    // Two-char ops (==,!=,<=,>=) take priority over single-char (<,>) at
+    // the same position; the first operator found outside a string wins.
+    let bytes = s.as_bytes();
+    let mut in_string: Option<u8> = None;
+    let mut found: Option<(usize, &'static str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_string {
+            if c == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
         }
-    }
-    if found.is_none() {
-        for op in &["<", ">"] {
-            if let Some(idx) = s.find(op) {
-                found = Some((idx, op));
+        if c == b'\'' || c == b'"' {
+            in_string = Some(c);
+            i += 1;
+            continue;
+        }
+        // Two-char first.
+        if i + 1 < bytes.len() {
+            let two = &bytes[i..i + 2];
+            let op2: Option<&'static str> = match two {
+                b"==" => Some("=="),
+                b"!=" => Some("!="),
+                b"<=" => Some("<="),
+                b">=" => Some(">="),
+                _ => None,
+            };
+            if let Some(op) = op2 {
+                found = Some((i, op));
                 break;
             }
         }
+        if c == b'<' {
+            found = Some((i, "<"));
+            break;
+        }
+        if c == b'>' {
+            found = Some((i, ">"));
+            break;
+        }
+        i += 1;
+    }
+    if in_string.is_some() {
+        return Err(OperatorError::BadParams(format!(
+            "branch: unterminated string literal in '{raw}'"
+        )));
     }
     let (idx, op_str) = found.ok_or_else(|| {
         OperatorError::BadParams(format!("branch: no comparison operator in '{raw}'"))
