@@ -15,6 +15,7 @@
 // after a roles preseed change in a migration).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -46,12 +47,20 @@ pub enum PermissionDecision {
 
 pub struct PermissionMatrix {
     inner: RwLock<HashMap<(String, String), HashSet<String>>>,
+    /// Monotonic counter bumped on every `invalidate*`. A reader that misses
+    /// the cache snapshots the counter before the DB load and only writes the
+    /// loaded set back when the counter is unchanged on completion. This
+    /// closes the read-DB-write race where an invalidate happens between the
+    /// miss and the write: without the guard the stale-cache reader would
+    /// resurrect the invalidated entry.
+    generation: AtomicU64,
 }
 
 impl PermissionMatrix {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -77,9 +86,18 @@ impl PermissionMatrix {
         if let Some(set) = self.inner.read().get(&key) {
             return Ok(set.contains(perm));
         }
+        let gen_before = self.generation.load(Ordering::Acquire);
         let set = Self::load_for_user_org(db, user_id, org_id)?;
         let granted = set.contains(perm);
-        self.inner.write().insert(key, set);
+        let mut w = self.inner.write();
+        // Only commit the freshly-loaded set if no `invalidate*` was observed
+        // between the cache miss and the DB load. A racing invalidate bumps
+        // `generation`; in that case we drop the stale set and let the next
+        // reader re-load. Decision (granted/not) for THIS call still uses
+        // the snapshot we just read — the new check is whether to cache it.
+        if self.generation.load(Ordering::Acquire) == gen_before {
+            w.insert(key, set);
+        }
         Ok(granted)
     }
 
@@ -109,6 +127,7 @@ impl PermissionMatrix {
     /// after `add_membership` / `remove_membership` mutates the underlying
     /// role assignment so the next read sees fresh state.
     pub fn invalidate(&self, user_id: &str, org_id: &str) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.inner
             .write()
             .remove(&(user_id.to_string(), org_id.to_string()));
@@ -118,6 +137,7 @@ impl PermissionMatrix {
     /// (a permission list change without a membership change would otherwise
     /// stay invisible until a process restart).
     pub fn invalidate_all(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.inner.write().clear();
     }
 
@@ -261,6 +281,51 @@ mod tests {
             m.require(&pool, "u-5", &org_id, "org.admin"),
             PermissionDecision::Deny(PermissionError::NotGranted(p, _, _)) if p == "org.admin"
         ));
+    }
+
+    #[test]
+    fn permission_matrix_invalidate_during_load_does_not_poison_cache() {
+        // Simulates the race: thread A misses, snapshots generation, loads
+        // permissions from DB. Before A writes, the role is mutated and
+        // `invalidate` is called (bumping generation). A's write must NOT
+        // resurrect the now-stale set; the next reader must re-load and
+        // observe the new role's permissions.
+        let (_d, pool) = open_pool();
+        let org_id = seed_admin_membership(&pool, "u-race");
+        let m = PermissionMatrix::new();
+
+        // Prime: cache is empty.
+        assert_eq!(m.cache_len(), 0);
+
+        // Step 1: simulate A's miss by capturing generation manually.
+        let gen_before = m.generation.load(Ordering::Acquire);
+        let stale_set: HashSet<String> =
+            PermissionMatrix::load_for_user_org(&pool, "u-race", &org_id).unwrap();
+        assert!(stale_set.contains("org.admin"));
+
+        // Step 2: external invalidation (e.g. role swap to viewer).
+        m.invalidate("u-race", &org_id);
+        assert!(m.generation.load(Ordering::Acquire) > gen_before);
+
+        // Step 3: A finalizes — generation moved, so the insert must be
+        // skipped. We reproduce the exact body of `has_permission` here.
+        {
+            let mut w = m.inner.write();
+            if m.generation.load(Ordering::Acquire) == gen_before {
+                w.insert(("u-race".to_string(), org_id.clone()), stale_set);
+            }
+        }
+        assert_eq!(
+            m.cache_len(),
+            0,
+            "stale write must not resurrect invalidated entry"
+        );
+
+        // Step 4: next reader re-loads from DB and caches the fresh set.
+        assert!(m
+            .has_permission(&pool, "u-race", &org_id, "org.admin")
+            .unwrap());
+        assert_eq!(m.cache_len(), 1);
     }
 
     #[test]

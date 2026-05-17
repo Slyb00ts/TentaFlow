@@ -55,6 +55,7 @@ pub async fn run(
                             "field_missing",
                             "drop",
                             Some(serde_json::json!({"field": field})),
+                            ctx.org_id.as_deref(),
                         );
                         continue;
                     }
@@ -80,6 +81,7 @@ pub async fn run(
                             "drop",
                             "drop",
                             Some(serde_json::json!({"reason": "not_numeric", "field": field})),
+                            ctx.org_id.as_deref(),
                         );
                         continue;
                     }
@@ -115,6 +117,7 @@ pub async fn run(
         "completed",
         "ok",
         Some(serde_json::json!({"passed": passed, "dropped": dropped})),
+        ctx.org_id.as_deref(),
     );
     Ok(())
 }

@@ -50,7 +50,7 @@ async fn invoke_unknown_flow_returns_not_found() {
     let sched = Arc::new(FlowScheduler::new(fresh_db()));
     let addon = unique_addon("notfound");
     let err = sched
-        .invoke(&addon, "ghost-flow", toml::Value::Table(Default::default()), 0, None)
+        .invoke(&addon, "ghost-flow", toml::Value::Table(Default::default()), 0, None, None)
         .await
         .expect_err("unknown flow");
     match err {
@@ -73,6 +73,7 @@ async fn invoke_writes_running_then_completed_to_db() {
             &flow_id,
             toml::Value::String("payload".into()),
             5_000,
+            None,
             None,
         )
         .await
@@ -117,7 +118,7 @@ async fn concurrency_cap_blocks_extra_invocations() {
         let a = addon.clone();
         let f = flow_id.clone();
         handles.push(tokio::spawn(async move {
-            s.invoke(&a, &f, toml::Value::Integer(i as i64), 10_000, None)
+            s.invoke(&a, &f, toml::Value::Integer(i as i64), 10_000, None, None)
                 .await
         }));
     }
@@ -147,7 +148,7 @@ async fn cancel_marks_invocation_cancelled() {
     registry::global().register(&addon, make_flow(&flow_id));
 
     let running = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(0), 0, None)
+        .invoke(&addon, &flow_id, toml::Value::Integer(0), 0, None, None)
         .await
         .expect("invoke started");
     // Issue cancel immediately. The passthrough flow may have already
@@ -186,7 +187,7 @@ async fn wait_ms_zero_returns_running_handle() {
     registry::global().register(&addon, make_flow(&flow_id));
 
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(0), 0, None)
+        .invoke(&addon, &flow_id, toml::Value::Integer(0), 0, None, None)
         .await
         .expect("invoke");
     assert_eq!(st.status, "running");
@@ -203,7 +204,7 @@ async fn wait_ms_long_enough_returns_completed() {
     registry::global().register(&addon, make_flow(&flow_id));
 
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(0), 10_000, None)
+        .invoke(&addon, &flow_id, toml::Value::Integer(0), 10_000, None, None)
         .await
         .expect("invoke");
     assert_eq!(st.status, "completed");
@@ -256,7 +257,7 @@ async fn backpressure_drop_emits_audit_on_finalize() {
     // backpressure expected — assert the audit row is NOT written so the
     // happy path stays quiet.
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(1), 5_000, None)
+        .invoke(&addon, &flow_id, toml::Value::Integer(1), 5_000, None, None)
         .await
         .expect("invoke");
     assert_eq!(st.status, "completed");
@@ -304,7 +305,7 @@ async fn multi_input_operator_waits_all_eofs() {
     registry::global().register(&addon, flow);
 
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::String("payload".into()), 5_000, None)
+        .invoke(&addon, &flow_id, toml::Value::String("payload".into()), 5_000, None, None)
         .await
         .expect("invoke");
     assert_eq!(st.status, "completed", "status: {:?}", st);
@@ -345,7 +346,7 @@ async fn cap_released_on_panic() {
         let a = addon.clone();
         let f = flow_id.clone();
         handles.push(tokio::spawn(async move {
-            s.invoke(&a, &f, toml::Value::Integer(0), 5_000, None).await
+            s.invoke(&a, &f, toml::Value::Integer(0), 5_000, None, None).await
         }));
     }
     for h in handles {
@@ -354,7 +355,7 @@ async fn cap_released_on_panic() {
 
     // All slots must be released — a fresh invocation must succeed.
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(1), 5_000, None)
+        .invoke(&addon, &flow_id, toml::Value::Integer(1), 5_000, None, None)
         .await
         .expect("post-drain invoke");
     assert_eq!(st.status, "completed");
@@ -377,7 +378,7 @@ async fn concurrency_cap_emits_denied_audit_row() {
         let a = addon.clone();
         let f = flow_id.clone();
         handles.push(tokio::spawn(async move {
-            s.invoke(&a, &f, toml::Value::Integer(i as i64), 10_000, None)
+            s.invoke(&a, &f, toml::Value::Integer(i as i64), 10_000, None, None)
                 .await
         }));
     }

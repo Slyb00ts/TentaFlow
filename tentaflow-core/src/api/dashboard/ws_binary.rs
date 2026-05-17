@@ -18,7 +18,7 @@ use tentaflow_protocol::{
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::dispatch::{
     self, addon_perm_broadcast, audit_broadcast, meeting_live_broadcast, resume_token,
@@ -376,12 +376,33 @@ pub async fn handle_ws_connection<S>(
                         buf.copy_from_slice(&user_id[8..]);
                         let uid = u64::from_le_bytes(buf) as i64;
                         let user_id_str = uid.to_string();
-                        crate::services::rbac::resolve_org_context(
+                        match crate::services::rbac::resolve_org_context(
                             &app_state.db,
                             &user_id_str,
                             None,
-                        )
-                        .ok()
+                        ) {
+                            Ok(ctx) => Some(ctx),
+                            // NoMembership is an expected steady-state for a
+                            // user who has not yet been added to any org — log
+                            // at warn (informative for the operator, not
+                            // alarming). Every other variant indicates either
+                            // a DB problem or a malformed header that the
+                            // operator does need to see at `error`.
+                            Err(crate::services::rbac::OrgContextError::NoMembership(uid)) => {
+                                warn!(
+                                    "binary-WS: user '{}' has no org membership — org_context=None",
+                                    uid
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                error!(
+                                    "binary-WS: org_context resolution failed (user_id={}): {}",
+                                    user_id_str, e
+                                );
+                                None
+                            }
+                        }
                     }
                     _ => None,
                 };

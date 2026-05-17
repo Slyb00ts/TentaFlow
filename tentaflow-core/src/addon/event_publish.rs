@@ -166,15 +166,19 @@ fn emit_audit(
             return;
         }
     };
+    let org_for_row = caller
+        .org_id
+        .as_deref()
+        .unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let _ = conn.execute(
-        "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             caller.user_id, &caller.addon_id, instance,
             action, resource_type, resource_id,
             result, error_message, action_hash,
             risk_db, None::<&str>, None::<&str>,
-            timestamp, prev_hash, hash
+            timestamp, prev_hash, hash, org_for_row
         ],
     );
 }

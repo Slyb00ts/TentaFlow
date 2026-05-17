@@ -562,21 +562,49 @@ pub fn migrate_addon_dirs_to_org_default(home: &std::path::Path) -> std::io::Res
             Some(n) => n.to_string(),
             None => continue,
         };
+        // `symlink_metadata` does NOT follow links — a symlinked addon dir
+        // (operator's manual customisation, e.g. linking into a dev tree)
+        // must not be silently moved or dereferenced. Warn and skip so the
+        // operator can reconcile by hand; following the link would corrupt
+        // both the legacy path and whatever it pointed at.
+        let lstat = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "migrate_addon_dirs: symlink_metadata('{}') failed: {} — skipping",
+                    name,
+                    e
+                );
+                continue;
+            }
+        };
+        if lstat.file_type().is_symlink() {
+            tracing::warn!(
+                "migrate_addon_dirs: '{}' is a symlink — skipping (manual move required)",
+                name
+            );
+            continue;
+        }
         // Skip non-directory entries (stray files from manual operator
         // intervention should not block the migration).
-        if !path.is_dir() {
+        if !lstat.is_dir() {
             continue;
         }
         let dest = target_root.join(&name);
         if dest.exists() {
-            // Target already populated — either a previous partial migration
-            // or the operator re-installed under the new layout. Leave the
-            // legacy dir alone so a human can reconcile.
-            tracing::warn!(
-                "migrate_addon_dirs: '{}' exists at both legacy and per-org paths — skipping",
-                name
-            );
-            continue;
+            // Target already populated — refuse to continue. A collision
+            // means the operator has a second copy of the same addon under
+            // the per-org root; silently leaving the legacy dir in place
+            // would hide the inconsistency until a later boot fails. Stop
+            // the migration so a human reconciles before the daemon comes
+            // up.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "migrate_addon_dirs: '{}' exists at both legacy and per-org paths",
+                    name
+                ),
+            ));
         }
         match std::fs::rename(&path, &dest) {
             Ok(_) => {
@@ -2156,5 +2184,65 @@ slot = "sidebar"
             msg.contains("rejected"),
             "expected symlink rejection, got: {msg}"
         );
+    }
+
+    #[test]
+    fn migrate_addon_dirs_skips_symlink_entry() {
+        // A symlink under the legacy root must NOT be moved (would leave the
+        // target dangling or corrupt the operator's manual customisation).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy_root = home.join(".tentaflow").join("addons");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+
+        // Real dir → migrates.
+        let real = legacy_root.join("real-addon");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("manifest.toml"), "id=\"real\"").unwrap();
+
+        // Symlink → skipped. Use `symlink_dir` on Windows, `symlink` on Unix.
+        let link_target = tmp.path().join("external-tree");
+        std::fs::create_dir(&link_target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&link_target, legacy_root.join("linked-addon")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&link_target, legacy_root.join("linked-addon")).unwrap();
+
+        let moved = migrate_addon_dirs_to_org_default(home).expect("migrate ok");
+        assert_eq!(moved, 1, "only the real dir should migrate");
+
+        let target_root = home
+            .join(".tentaflow")
+            .join("orgs")
+            .join(crate::services::org::DEFAULT_ORG_ID)
+            .join("addons");
+        assert!(target_root.join("real-addon").exists());
+        assert!(!target_root.join("linked-addon").exists());
+        // The symlink stays at the legacy path for the operator to reconcile.
+        assert!(legacy_root.join("linked-addon").exists());
+    }
+
+    #[test]
+    fn migrate_addon_dirs_errors_on_collision() {
+        // A pre-existing entry at the per-org target must abort migration so
+        // the operator sees the inconsistency at boot.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy_root = home.join(".tentaflow").join("addons");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        let target_root = home
+            .join(".tentaflow")
+            .join("orgs")
+            .join(crate::services::org::DEFAULT_ORG_ID)
+            .join("addons");
+        std::fs::create_dir_all(&target_root).unwrap();
+
+        // Same name on both sides → collision.
+        std::fs::create_dir(legacy_root.join("dup")).unwrap();
+        std::fs::create_dir(target_root.join("dup")).unwrap();
+
+        let err = migrate_addon_dirs_to_org_default(home).expect_err("must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(format!("{err}").contains("dup"));
     }
 }

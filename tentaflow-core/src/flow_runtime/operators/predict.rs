@@ -89,6 +89,7 @@ pub async fn run(
                                 "reason": "alias_not_found",
                                 "alias": alias,
                             })),
+                            ctx.org_id.as_deref(),
                         );
                         match on_error {
                             OnError::Skip => continue,
@@ -132,6 +133,7 @@ pub async fn run(
                                     "reason": "permission_denied",
                                     "alias": alias,
                                 })),
+                                ctx.org_id.as_deref(),
                             );
                             match on_error {
                                 OnError::Skip => continue,
@@ -226,6 +228,7 @@ pub async fn run(
                             "ok",
                             "ok",
                             Some(serde_json::json!({"alias": alias, "duration_ms": duration_ms})),
+                            ctx.org_id.as_deref(),
                         );
                     }
                     Ok(Err(err)) => {
@@ -252,6 +255,7 @@ pub async fn run(
                                 "alias": alias,
                                 "reason": err.to_string(),
                             })),
+                            ctx.org_id.as_deref(),
                         );
                         match on_error {
                             OnError::Skip => continue,
@@ -290,6 +294,7 @@ pub async fn run(
                             "error",
                             "error",
                             Some(serde_json::json!({"alias": alias, "reason": "timeout"})),
+                            ctx.org_id.as_deref(),
                         );
                         match on_error {
                             OnError::Skip => continue,
@@ -326,6 +331,7 @@ pub async fn run(
         "completed",
         "ok",
         Some(serde_json::json!({"ok_count": ok_count, "err_count": err_count})),
+        ctx.org_id.as_deref(),
     );
     Ok(())
 }
