@@ -1478,6 +1478,15 @@ fn parse_ui_components(
             .and_then(|v| v.as_str())
             .unwrap_or("low")
             .to_string();
+        let host_permissions = item
+            .get("host_permissions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         out.push(crate::addon::manifest::UiComponentSpec {
             id,
             display_name,
@@ -1485,6 +1494,7 @@ fn parse_ui_components(
             src,
             signature,
             risk,
+            host_permissions,
         });
     }
     Ok(out)
