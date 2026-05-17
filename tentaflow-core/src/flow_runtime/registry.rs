@@ -10,10 +10,14 @@
 // key; in-flight tasks keep the old Arc until they complete).
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 use super::types::CompiledFlow;
 
+// parking_lot RwLock avoids the std lock poisoning footgun — a panic in any
+// caller would otherwise turn every subsequent registry access into a panic.
 pub struct FlowRegistry {
     inner: RwLock<HashMap<(String, String), Arc<CompiledFlow>>>,
 }
@@ -34,12 +38,12 @@ impl FlowRegistry {
     /// Inserts (or replaces) the compiled flow for `(addon_id, flow.def.id)`.
     pub fn register(&self, addon_id: &str, flow: Arc<CompiledFlow>) {
         let flow_id = flow.def.id.clone();
-        let mut guard = self.inner.write().expect("flow registry write lock");
+        let mut guard = self.inner.write();
         guard.insert((addon_id.to_string(), flow_id), flow);
     }
 
     pub fn get(&self, addon_id: &str, flow_id: &str) -> Option<Arc<CompiledFlow>> {
-        let guard = self.inner.read().expect("flow registry read lock");
+        let guard = self.inner.read();
         guard
             .get(&(addon_id.to_string(), flow_id.to_string()))
             .cloned()
@@ -48,7 +52,7 @@ impl FlowRegistry {
     /// Drops every flow owned by `addon_id`. Called from addon uninstall.
     /// Returns the number of entries removed.
     pub fn unregister_addon(&self, addon_id: &str) -> usize {
-        let mut guard = self.inner.write().expect("flow registry write lock");
+        let mut guard = self.inner.write();
         let before = guard.len();
         guard.retain(|(aid, _), _| aid != addon_id);
         before - guard.len()
@@ -57,7 +61,7 @@ impl FlowRegistry {
     /// Returns flow ids owned by `addon_id`, sorted lexicographically for
     /// stable diagnostics / test assertions.
     pub fn list_for_addon(&self, addon_id: &str) -> Vec<String> {
-        let guard = self.inner.read().expect("flow registry read lock");
+        let guard = self.inner.read();
         let mut out: Vec<String> = guard
             .keys()
             .filter(|(aid, _)| aid == addon_id)

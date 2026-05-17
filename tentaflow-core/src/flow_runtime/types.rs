@@ -4,8 +4,8 @@
 //
 // Wire types deserialized from `*.flow.json` (`FlowDefinition`, `OperatorDef`,
 // `EdgeDef`) plus the post-validation `CompiledFlow` returned by `parser::
-// compile`. `OperatorType` is a closed enum: unknown values produce a typed
-// `FlowCompileError::UnknownOperator` instead of being silently accepted.
+// compile`. `OperatorType` is a closed enum: unknown values fail serde
+// deserialization and surface as `FlowCompileError::Parse`.
 
 use std::collections::HashMap;
 
@@ -103,9 +103,6 @@ pub enum FlowCompileError {
 
     #[error("flow has {count} operators, exceeds limit of {}", MAX_OPERATORS_PER_FLOW)]
     TooManyOperators { count: usize },
-
-    #[error("operator id '{0}' referenced but not declared")]
-    UnknownOperator(String),
 
     #[error("duplicate operator id '{0}'")]
     DuplicateOperator(String),
