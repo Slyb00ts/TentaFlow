@@ -11,6 +11,7 @@
 
 pub mod boot;
 pub mod bounded_drop_oldest;
+pub mod operators;
 pub mod parser;
 pub mod registry;
 pub mod scheduler;
