@@ -869,6 +869,7 @@ pub fn camera_add_v1(
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
+    let org_id_for_insert = caller.data().org_id.clone();
 
     let res_w = input.resolution_width.map(|v| v as i64);
     let res_h = input.resolution_height.map(|v| v as i64);
@@ -928,6 +929,7 @@ pub fn camera_add_v1(
         credentials_blob.as_deref(),
         onvif_url_to_persist.as_deref(),
         onvif_token_to_persist.as_deref(),
+        org_id_for_insert.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         // Compensate the started session so the registry stays consistent.
@@ -964,7 +966,8 @@ pub fn camera_list_v1(
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let rows = match list_cameras_for_addon(&db, &addon_id) {
+    let org_id_for_query = caller.data().org_id.clone();
+    let rows = match list_cameras_for_addon(&db, &addon_id, org_id_for_query.as_deref()) {
         Ok(v) => v,
         Err(_) => {
             audit(caller.data(), "camera.list", None, RiskClass::B, "error", Some("db_error"));
@@ -1034,7 +1037,7 @@ pub fn camera_get_v1(
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "camera.get", Some(&input.camera_id), RiskClass::B, "denied", Some("not_found_or_not_owned"));
@@ -1141,7 +1144,7 @@ pub fn camera_update_v1(
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
 
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
@@ -1186,7 +1189,7 @@ pub fn camera_update_v1(
         return AbiError::Operation.as_i32();
     }
 
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "error", Some("row_disappeared_after_update"));
@@ -1266,7 +1269,7 @@ pub fn camera_remove_v1(
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
 
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
@@ -1353,7 +1356,7 @@ pub fn camera_snapshot_v1(
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(caller.data(), "camera.snapshot", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
@@ -1440,7 +1443,7 @@ pub fn camera_health_v1(
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "camera.health", Some(&input.camera_id), RiskClass::B, "denied", Some("not_found_or_not_owned"));
@@ -1680,7 +1683,7 @@ pub fn camera_credentials_rotate_v1(
     };
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
@@ -1913,6 +1916,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let addon_id = state.addon_id.clone();
     let db = state.db.clone();
+    let org_id_for_insert = state.org_id.clone();
 
     let res_w = input.resolution_width.map(|v| v as i64);
     let res_h = input.resolution_height.map(|v| v as i64);
@@ -1962,6 +1966,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         credentials_blob.as_deref(),
         onvif_url_to_persist.as_deref(),
         onvif_token_to_persist.as_deref(),
+        org_id_for_insert.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         let _ = run_async(sup.remove_camera(&camera_id));

@@ -352,7 +352,7 @@ pub fn recording_save_snapshot_v1(
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
     // Ownership check + retention pull from cameras table.
-    let cam_row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    let cam_row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "recording.save_snapshot", Some(&input.camera_id), RiskClass::A, "denied", Some("camera_not_found_or_not_owned"));
@@ -479,7 +479,7 @@ pub fn recording_save_segment_v1(
 
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let cam_row = match get_camera_for_addon(&db, &addon_id, &input.camera_id) {
+    let cam_row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(caller.data(), "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("camera_not_found_or_not_owned"));
@@ -923,7 +923,7 @@ pub fn frame_url_v1(
     // frame_url doesn't expose camera metadata.
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    match get_camera_for_addon(&db, &addon_id, &stored.metadata.camera_id) {
+    match get_camera_for_addon(&db, &addon_id, &stored.metadata.camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(caller.data(), "recording.frame_url", Some(&input.frame_ref), RiskClass::B, "denied", Some("camera_not_owned"));
@@ -1048,7 +1048,7 @@ fn save_snapshot_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::Operation.as_i32());
         }
     }
-    let cam_row = match get_camera_for_addon(&state.db, &state.addon_id, &input.camera_id) {
+    let cam_row = match get_camera_for_addon(&state.db, &state.addon_id, &input.camera_id, state.org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(state, "recording.save_snapshot", Some(&input.camera_id), RiskClass::A, "denied", Some("camera_not_found_or_not_owned"));
@@ -1141,7 +1141,7 @@ fn save_segment_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::Operation.as_i32());
         }
     }
-    let cam_row = match get_camera_for_addon(&state.db, &state.addon_id, &input.camera_id) {
+    let cam_row = match get_camera_for_addon(&state.db, &state.addon_id, &input.camera_id, state.org_id.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(state, "recording.save_segment", Some(&input.camera_id), RiskClass::A, "denied", Some("camera_not_found_or_not_owned"));
@@ -1410,7 +1410,7 @@ fn frame_url_core(state: &AddonState, raw: &str) -> CoreResult {
             return CoreResult::Err(AbiError::NotFound.as_i32());
         }
     };
-    match get_camera_for_addon(&state.db, &state.addon_id, &stored.metadata.camera_id) {
+    match get_camera_for_addon(&state.db, &state.addon_id, &stored.metadata.camera_id, state.org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
             audit(state, "recording.frame_url", Some(&input.frame_ref), RiskClass::B, "denied", Some("camera_not_owned"));

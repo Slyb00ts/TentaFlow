@@ -202,7 +202,7 @@ fn resolve_file_url_rejects_empty_input() {
 fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
     insert_camera(
         db, camera_id, owner, "display", "fake_file", url, 30, None, None, "C",
-        "default", None, None, None,
+        "default", None, None, None, None,
     )
     .expect("insert");
 }
@@ -212,9 +212,9 @@ fn cross_addon_camera_get_returns_none_for_foreign_owner() {
     let db = make_db();
     let id = uniq("cam_iso_get");
     insert(&db, &id, "addon-a", "/tmp/a.mp4");
-    let foreign = get_camera_for_addon(&db, "addon-b", &id).unwrap();
+    let foreign = get_camera_for_addon(&db, "addon-b", &id, None).unwrap();
     assert!(foreign.is_none(), "addon-b must not see addon-a's camera");
-    let mine = get_camera_for_addon(&db, "addon-a", &id).unwrap();
+    let mine = get_camera_for_addon(&db, "addon-a", &id, None).unwrap();
     assert!(mine.is_some());
 }
 
@@ -225,7 +225,7 @@ fn cross_addon_soft_delete_no_op_for_foreign_owner() {
     insert(&db, &id, "addon-a", "/tmp/a.mp4");
     let removed = soft_delete_camera(&db, "addon-b", &id).unwrap();
     assert!(!removed, "foreign soft-delete must be no-op");
-    let mine = get_camera_for_addon(&db, "addon-a", &id).unwrap();
+    let mine = get_camera_for_addon(&db, "addon-a", &id, None).unwrap();
     assert!(mine.is_some(), "owner's camera survives foreign delete attempt");
 }
 
@@ -236,8 +236,8 @@ fn cross_addon_list_does_not_leak_other_owners() {
     let id_b = uniq("cam_b");
     insert(&db, &id_a, "addon-a", "/tmp/a.mp4");
     insert(&db, &id_b, "addon-b", "/tmp/b.mp4");
-    let listed_a = list_cameras_for_addon(&db, "addon-a").unwrap();
-    let listed_b = list_cameras_for_addon(&db, "addon-b").unwrap();
+    let listed_a = list_cameras_for_addon(&db, "addon-a", None).unwrap();
+    let listed_b = list_cameras_for_addon(&db, "addon-b", None).unwrap();
     assert!(listed_a.iter().all(|r| r.owner_addon_id == "addon-a"));
     assert!(listed_b.iter().all(|r| r.owner_addon_id == "addon-b"));
     assert!(listed_a.iter().any(|r| r.camera_id == id_a));

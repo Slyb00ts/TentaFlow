@@ -7,4 +7,6 @@ pub mod addon;
 pub mod audit;
 pub mod camera;
 pub mod keys;
+pub mod org;
 pub mod policy;
+pub mod user;
