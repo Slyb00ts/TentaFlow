@@ -87,6 +87,11 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     let pool = Arc::new(Mutex::new(conn));
     set_global_pool(pool.clone());
 
+    // F1c P5 chunk B — install the flow scheduler singleton with the same
+    // pool the rest of the runtime uses. Idempotent: a second `init` (test
+    // harnesses, integration suites) leaves the original instance in place.
+    crate::flow_runtime::scheduler::FlowScheduler::init(pool.clone());
+
     // Upgrade path for PR5: copy `trusted_nodes` rows + parse legacy
     // `settings.trusted_contact:*` JSON entries into peer_persisted /
     // peer_hints. Idempotent (INSERT OR IGNORE), so a second startup is a
