@@ -41,7 +41,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+use crate::addon::event_bus::EventBus;
 use crate::db::DbPool;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 use super::bounded_drop_oldest::BoundedDropOldest;
 use super::registry;
@@ -116,6 +118,13 @@ pub struct FlowScheduler {
     /// for in-memory state (DB still owns the authoritative status text).
     by_addon: PlMutex<HashMap<String, HashSet<String>>>,
     in_flight: PlMutex<HashMap<String, InFlight>>,
+    /// Late-bound by boot wiring after Router is constructed. Operators in
+    /// chunk C treat `None` as fatal-but-clean (Predict returns Internal).
+    /// `ArcSwap`-style: one writer, many readers, no blocking on the hot path.
+    service_manager: PlMutex<Option<Arc<ServiceManager>>>,
+    /// Late-bound after AddonManager owns the canonical EventBus. Sink
+    /// operators emitting events publish here; tests may leave this `None`.
+    event_bus: PlMutex<Option<Arc<EventBus>>>,
 }
 
 static GLOBAL: OnceLock<Arc<FlowScheduler>> = OnceLock::new();
@@ -147,7 +156,34 @@ impl FlowScheduler {
             db,
             by_addon: PlMutex::new(HashMap::new()),
             in_flight: PlMutex::new(HashMap::new()),
+            service_manager: PlMutex::new(None),
+            event_bus: PlMutex::new(None),
         }
+    }
+
+    /// Late-bind the service manager handle. Called once from core boot
+    /// after `Router::new`. Subsequent calls overwrite — production wiring
+    /// triggers this exactly once; rebinding is harmless because the handle
+    /// is read on every operator dispatch.
+    pub fn set_service_manager(&self, sm: Arc<ServiceManager>) {
+        *self.service_manager.lock() = Some(sm);
+    }
+
+    /// Late-bind the event bus handle (same lifecycle as `set_service_manager`).
+    pub fn set_event_bus(&self, bus: Arc<EventBus>) {
+        *self.event_bus.lock() = Some(bus);
+    }
+
+    /// Snapshot of the service manager handle. `None` until `set_service_manager`
+    /// is called — operators raising side effects against it must surface a
+    /// clean `Internal` error in that case.
+    pub fn service_manager(&self) -> Option<Arc<ServiceManager>> {
+        self.service_manager.lock().clone()
+    }
+
+    /// Snapshot of the event bus handle (same semantics as `service_manager`).
+    pub fn event_bus(&self) -> Option<Arc<EventBus>> {
+        self.event_bus.lock().clone()
     }
 
     /// Installs the process-wide singleton. First caller wins; subsequent
