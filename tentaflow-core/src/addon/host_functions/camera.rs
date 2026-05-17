@@ -57,12 +57,11 @@ const PERM_CAMERAS_SNAPSHOT: &str = "cameras.snapshot";
 // =============================================================================
 
 /// Vendors that `camera_add_v1` will persist as a managed session. ONVIF
-/// stays off this list because the device-service URL is not a streamable
-/// URL — operators must first run `camera_discover_v1`, pull the RTSP media
-/// URI off the discovered profile, and call `camera_add_v1` with
-/// `vendor='rtsp'`. Wiring GetStreamUri into the add path is a later
-/// milestone (it requires WS-Security UsernameToken auth on top of SOAP).
-const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp"];
+/// is accepted: the host calls `GetProfiles` + `GetStreamUri` to derive an
+/// RTSP URI from the device-service URL and persists the derivation
+/// (`onvif_url` + `onvif_profile_token`) so a later credentials rotation
+/// can re-resolve without re-running discovery.
+const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif"];
 
 /// Vendors `camera_test_connection_v1` knows how to probe. ONVIF is included
 /// — we probe its device-service HTTP endpoint as a reachability check.
@@ -209,10 +208,24 @@ struct CameraAddInput {
     /// Optional base64-encoded `user:pass` for the RTSP connector. When
     /// present, decoded, validated, encrypted with the cameras master key,
     /// and stored in `cameras.credentials_encrypted`. The plaintext never
-    /// touches the DB and is never logged.
+    /// touches the DB and is never logged. For `vendor='onvif'` the same
+    /// field carries the operator credentials used for the SOAP
+    /// UsernameToken digest; it is REQUIRED in that mode.
     #[serde(default)]
     credentials_b64: Option<String>,
+    /// `vendor='onvif'` only: optional profile token to pin a specific
+    /// media profile. When absent, the first profile returned by
+    /// `GetProfiles` is used. Validated against the same character set as
+    /// `profile` to keep XML-injection out of the SOAP envelope (the token
+    /// is XML-escaped on the way out as a second line of defense).
+    #[serde(default)]
+    onvif_profile_token: Option<String>,
 }
+
+/// Hard upper bound on the SOAP-resolve timeout (10 s default, 30 s ceiling
+/// — same as `onvif_media::MAX_TIMEOUT_MS`). Cameras that take longer than
+/// this on discovery are not usable in the wizard flow.
+const ONVIF_RESOLVE_TIMEOUT_MS: u32 = 10_000;
 
 fn default_target_fps() -> u32 {
     30
@@ -674,6 +687,69 @@ async fn onvif_test_connection(url: &str, timeout_secs: u64) -> Result<String, S
     Ok(format!("ONVIF endpoint responded HTTP {}", resp.status().as_u16()))
 }
 
+/// Result of an ONVIF SOAP resolve performed during `camera_add_v1` /
+/// `camera_add_core` for `vendor='onvif'`. Carries the derived RTSP URI
+/// that replaces the device-service URL in the supervisor session, plus
+/// the profile token actually chosen (for persistence).
+struct OnvifResolveOk {
+    rtsp_uri: String,
+    profile_token: String,
+}
+
+/// Reason tag for the audit log when an ONVIF resolve fails. Returned as a
+/// short stable string so operators can grep — never include user-supplied
+/// data here (host / credentials must not leak into audit rows).
+fn map_onvif_resolve_error(e: &crate::services::camera_ingest::onvif_media::OnvifError) -> (AbiError, &'static str) {
+    use crate::services::camera_ingest::onvif_media::OnvifError::*;
+    match e {
+        AuthFailed => (AbiError::Permission, "onvif_auth_failed"),
+        NoProfiles => (AbiError::CameraUnreachable, "onvif_no_profiles"),
+        ProfileNotFound(_) => (AbiError::NotFound, "onvif_profile_not_found"),
+        Timeout(_) => (AbiError::Timeout, "onvif_timeout"),
+        Transport(_) => (AbiError::CameraUnreachable, "onvif_transport_failure"),
+        SoapFault(_) | MalformedResponse(_) => (AbiError::Operation, "onvif_invalid_response"),
+    }
+}
+
+/// Resolve an ONVIF device-service URL into a streamable RTSP URI by
+/// running `GetProfiles` + `GetStreamUri`. Plaintext `user:pass` is taken
+/// from the already-decoded credentials blob (decrypted with the master
+/// key) so the SOAP digest can be built — the plaintext is dropped at the
+/// end of this function and never returned to the caller / logged.
+fn resolve_onvif_one_click(
+    device_service_url: &str,
+    credentials_blob: &[u8],
+    profile_token: Option<&str>,
+) -> Result<OnvifResolveOk, (AbiError, &'static str)> {
+    use crate::services::camera_ingest::credentials::credentials_cipher;
+    use crate::services::camera_ingest::onvif_media;
+
+    let plain = match credentials_cipher().decrypt(credentials_blob) {
+        Ok(p) => p,
+        Err(_) => return Err((AbiError::Operation, "credentials_decrypt_failed")),
+    };
+    let (username, password) = match plain.split_once(':') {
+        Some((u, p)) if !u.is_empty() && !p.is_empty() => (u.to_string(), p.to_string()),
+        _ => return Err((AbiError::Operation, "credentials_missing_user_pass_separator")),
+    };
+    let creds = onvif_media::OnvifCredentials { username, password };
+    let res = run_async(onvif_media::derive_rtsp_uri(
+        device_service_url,
+        &creds,
+        profile_token,
+        ONVIF_RESOLVE_TIMEOUT_MS,
+    ));
+    drop(creds); // best-effort scrub; AES-GCM decrypt buffer lives in `plain`
+    drop(plain);
+    match res {
+        Ok(stream) => Ok(OnvifResolveOk {
+            rtsp_uri: stream.rtsp_uri,
+            profile_token: stream.profile_token,
+        }),
+        Err(e) => Err(map_onvif_resolve_error(&e)),
+    }
+}
+
 // =============================================================================
 // Host function: camera_add_v1
 // =============================================================================
@@ -712,7 +788,7 @@ pub fn camera_add_v1(
         audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("missing_permission"));
         return AbiError::Permission.as_i32();
     }
-    let input: CameraAddInput = match toml::from_str(&raw) {
+    let mut input: CameraAddInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
             audit(caller.data(), "camera.add", None, RiskClass::A, "error", Some("invalid_toml"));
@@ -756,6 +832,40 @@ pub fn camera_add_v1(
         }
     };
 
+    // For `vendor='onvif'` the supplied URL is the device-service endpoint —
+    // not a streamable URI. Resolve it via SOAP (GetProfiles + GetStreamUri)
+    // to an `rtsp://` URI before the supervisor session starts. Credentials
+    // are mandatory in this mode; the same encrypted blob feeds both the
+    // SOAP UsernameToken digest and the RTSP connector at session start.
+    let onvif_url_to_persist;
+    let onvif_token_to_persist;
+    if input.vendor == "onvif" {
+        let Some(blob) = credentials_blob.as_deref() else {
+            audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("missing_credentials"));
+            return AbiError::Operation.as_i32();
+        };
+        if let Some(tok) = &input.onvif_profile_token {
+            if !profile_valid(tok) {
+                audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("onvif_profile_token_invalid"));
+                return AbiError::Operation.as_i32();
+            }
+        }
+        match resolve_onvif_one_click(&input.url, blob, input.onvif_profile_token.as_deref()) {
+            Ok(ok) => {
+                onvif_url_to_persist = Some(input.url.clone());
+                onvif_token_to_persist = Some(ok.profile_token);
+                input.url = ok.rtsp_uri;
+            }
+            Err((err, reason)) => {
+                audit(caller.data(), "camera.add", None, RiskClass::A, "error", Some(reason));
+                return err.as_i32();
+            }
+        }
+    } else {
+        onvif_url_to_persist = None;
+        onvif_token_to_persist = None;
+    }
+
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
@@ -767,9 +877,13 @@ pub fn camera_add_v1(
     // and so never need a compensating delete. If the host crashes between
     // supervisor start and DB insert the in-memory registry dies with the
     // process; reconciliation at lazy-init drives the steady-state.
+    // ONVIF cameras are streamed as RTSP (the derived URI), so the
+    // supervisor vendor is rewritten to `rtsp` while the DB row preserves
+    // `onvif` for UI and re-derivation lookups.
+    let session_vendor = if input.vendor == "onvif" { "rtsp" } else { input.vendor.as_str() };
     let cfg = CameraConfig {
         camera_id: camera_id.clone(),
-        vendor: input.vendor.clone(),
+        vendor: session_vendor.to_string(),
         url: input.url.clone(),
         target_fps: input.target_fps,
         resolution: match (input.resolution_width, input.resolution_height) {
@@ -812,6 +926,8 @@ pub fn camera_add_v1(
         &input.retention_class,
         &input.profile,
         credentials_blob.as_deref(),
+        onvif_url_to_persist.as_deref(),
+        onvif_token_to_persist.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         // Compensate the started session so the registry stays consistent.
@@ -1672,7 +1788,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         audit(state, "camera.add", None, RiskClass::A, "denied", Some("missing_permission"));
         return AbiError::Permission.as_i32();
     }
-    let input: CameraAddInput = match toml::from_str(raw) {
+    let mut input: CameraAddInput = match toml::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
             audit(state, "camera.add", None, RiskClass::A, "error", Some("invalid_toml"));
@@ -1716,6 +1832,37 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         }
     };
 
+    // Mirrors the ONVIF resolve in `camera_add_v1`: replace the device-service
+    // URL with the SOAP-derived RTSP URI before the supervisor session starts.
+    let onvif_url_to_persist;
+    let onvif_token_to_persist;
+    if input.vendor == "onvif" {
+        let Some(blob) = credentials_blob.as_deref() else {
+            audit(state, "camera.add", None, RiskClass::A, "denied", Some("missing_credentials"));
+            return AbiError::Operation.as_i32();
+        };
+        if let Some(tok) = &input.onvif_profile_token {
+            if !profile_valid(tok) {
+                audit(state, "camera.add", None, RiskClass::A, "denied", Some("onvif_profile_token_invalid"));
+                return AbiError::Operation.as_i32();
+            }
+        }
+        match resolve_onvif_one_click(&input.url, blob, input.onvif_profile_token.as_deref()) {
+            Ok(ok) => {
+                onvif_url_to_persist = Some(input.url.clone());
+                onvif_token_to_persist = Some(ok.profile_token);
+                input.url = ok.rtsp_uri;
+            }
+            Err((err, reason)) => {
+                audit(state, "camera.add", None, RiskClass::A, "error", Some(reason));
+                return err.as_i32();
+            }
+        }
+    } else {
+        onvif_url_to_persist = None;
+        onvif_token_to_persist = None;
+    }
+
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let addon_id = state.addon_id.clone();
     let db = state.db.clone();
@@ -1723,9 +1870,10 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     let res_w = input.resolution_width.map(|v| v as i64);
     let res_h = input.resolution_height.map(|v| v as i64);
 
+    let session_vendor = if input.vendor == "onvif" { "rtsp" } else { input.vendor.as_str() };
     let cfg = CameraConfig {
         camera_id: camera_id.clone(),
-        vendor: input.vendor.clone(),
+        vendor: session_vendor.to_string(),
         url: input.url.clone(),
         target_fps: input.target_fps,
         resolution: match (input.resolution_width, input.resolution_height) {
@@ -1765,6 +1913,8 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         &input.retention_class,
         &input.profile,
         credentials_blob.as_deref(),
+        onvif_url_to_persist.as_deref(),
+        onvif_token_to_persist.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         let _ = run_async(sup.remove_camera(&camera_id));
