@@ -75,13 +75,18 @@ export function bridgeError(code, message) {
 
 // ---------- action registry ---------------------------------------------------
 
+// Each action declares the COMPLETE set of allowed payload keys
+// (`allowedKeys`). Extra keys are rejected with EBADREQ to prevent silent
+// drift between addon code and host schema. Empty array = payload must be {}.
 export const ACTION_REGISTRY = Object.freeze({
   // List aliases owned by the calling addon. Backend wired to
   // modelAliasListRequest filtered by addon_id in the host dispatcher.
   'alias.list_owned': {
     backend: 'binary',
+    allowedKeys: [],
     validateInput(payload) {
       expectObject(payload, 'payload');
+      expectNoExtraKeys(payload, 'payload', this.allowedKeys);
     },
   },
 
@@ -89,16 +94,20 @@ export const ACTION_REGISTRY = Object.freeze({
   // P1 returns EUNIMPL until a camera admin endpoint lands.
   'camera.list': {
     backend: 'unimpl',
+    allowedKeys: [],
     validateInput(payload) {
       expectObject(payload, 'payload');
+      expectNoExtraKeys(payload, 'payload', this.allowedKeys);
     },
   },
 
   'camera.snapshot': {
     backend: 'unimpl',
+    allowedKeys: ['camera_id'],
     validateInput(payload) {
       expectObject(payload, 'payload');
       expectString(payload.camera_id, 'payload.camera_id');
+      expectNoExtraKeys(payload, 'payload', this.allowedKeys);
     },
   },
 
@@ -106,29 +115,46 @@ export const ACTION_REGISTRY = Object.freeze({
   // authors can code against the final action contract.
   'vector.search': {
     backend: 'unimpl',
+    allowedKeys: ['namespace', 'query', 'k'],
     validateInput(payload) {
       expectObject(payload, 'payload');
       expectString(payload.namespace, 'payload.namespace');
       expectArrayOfNumbers(payload.query, 'payload.query');
       expectIntInRange(payload.k, 'payload.k', 1, 1000);
+      expectNoExtraKeys(payload, 'payload', this.allowedKeys);
     },
   },
 
   // Local-only: parent triggers a toast. No backend round-trip.
   'ui.notify': {
     backend: 'local',
+    allowedKeys: ['level', 'message'],
     validateInput(payload) {
       expectObject(payload, 'payload');
       expectOneOf(payload.level, 'payload.level', ['info', 'warn', 'error']);
       expectString(payload.message, 'payload.message');
+      expectNoExtraKeys(payload, 'payload', this.allowedKeys);
     },
   },
 });
 
+function expectNoExtraKeys(obj, path, allowed) {
+  const extra = Object.keys(obj).filter((k) => !allowed.includes(k));
+  if (extra.length > 0) {
+    throw bridgeError('EBADREQ', `${path} has unexpected fields: ${JSON.stringify(extra)}`);
+  }
+}
+
 // ---------- envelope validator ------------------------------------------------
+
+const ENVELOPE_ALLOWED_KEYS = ['kind', 'id', 'action', 'payload'];
 
 export function validateRequestEnvelope(msg) {
   if (!isPlainObject(msg)) throw bridgeError('EBADREQ', 'message must be an object');
+  const extra = Object.keys(msg).filter((k) => !ENVELOPE_ALLOWED_KEYS.includes(k));
+  if (extra.length > 0) {
+    throw bridgeError('EBADREQ', `envelope has unexpected fields: ${JSON.stringify(extra)}`);
+  }
   if (msg.kind !== 'request') throw bridgeError('EBADREQ', 'kind must be "request"');
   if (typeof msg.id !== 'string' || msg.id.length === 0 || msg.id.length > 128) {
     throw bridgeError('EBADREQ', 'id must be a non-empty string ≤128 chars');
