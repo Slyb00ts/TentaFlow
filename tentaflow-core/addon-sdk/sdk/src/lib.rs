@@ -257,6 +257,14 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Policy / Gate API (F1c P4) — verify a DPIA / FRIA claim against a
+    /// `[[gate]]` declaration before running a gated operation. Requires
+    /// `policy.read` permission.
+    fn gate_check_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Alias API (F1a M1.W5) — readonly inspection of aliases.
     /// Requires `alias.read` permission. Lifecycle (create/deactivate) is
     /// driven implicitly by addon install/uninstall from the manifest.
@@ -1275,6 +1283,7 @@ pub mod prelude {
         recording_get_stream, recording_purge, recording_stats, frame_url,
         SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
         vector_upsert, vector_search, vector_delete, encode_vector_b64, VectorHit,
+        gate_check, gate_check_scoped, GateCheckResult, GateSigner,
         AbiError,
         log,
     };
@@ -2105,6 +2114,63 @@ pub fn vector_delete(namespace: &str, ref_id: u64) -> Result<bool, AbiError> {
     let bytes = call_sql_with_one_input(vector_delete_v1, s.as_bytes())?;
     let resp: VectorDeleteResponse = parse_toml(&bytes)?;
     Ok(resp.removed)
+}
+
+// =============================================================================
+// Policy / Gate API wrappers (F1c P4) — DPIA / FRIA claim verification
+// =============================================================================
+
+/// One signer entry on a verified claim. `role` matches the manifest gate
+/// requirement (`dpo`, `supervisor`, ...) and `user` is the admin identity
+/// recorded when the claim was issued.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateSigner {
+    pub role: String,
+    pub user: String,
+}
+
+/// Result of `gate_check`. `valid=true` means the claim satisfied every
+/// requirement of the named gate (validity window, type, scope, signer
+/// roles). When `valid=false`, `reason` carries a human-readable denial
+/// message from the policy engine.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateCheckResult {
+    pub valid: bool,
+    pub claim_id: String,
+    #[serde(default)]
+    pub claim_type: String,
+    #[serde(default)]
+    pub valid_until: String,
+    #[serde(default)]
+    pub signers: Vec<GateSigner>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Verify a policy claim against the gate id declared in the addon manifest.
+/// Requires `policy.read` permission. A `valid=false` result is NOT an
+/// AbiError — it is a soft decision the addon can react to. Hard errors
+/// (no permission, gate id unknown, malformed payload) return AbiError.
+pub fn gate_check(gate_id: &str, claim_id: &str) -> Result<GateCheckResult, AbiError> {
+    gate_check_scoped(gate_id, claim_id, None)
+}
+
+/// Like `gate_check` but with an optional resource scope hint — required
+/// when the claim was issued for a specific resource (vector namespace,
+/// alias id) and the gate enforces namespace-level narrowing.
+pub fn gate_check_scoped(
+    gate_id: &str,
+    claim_id: &str,
+    resource_scope: Option<&str>,
+) -> Result<GateCheckResult, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "gate_id", gate_id);
+    push_kv_str(&mut s, "claim_id", claim_id);
+    if let Some(rs) = resource_scope {
+        push_kv_str(&mut s, "resource_scope", rs);
+    }
+    let bytes = call_sql_with_one_input(gate_check_v1, s.as_bytes())?;
+    parse_toml(&bytes)
 }
 
 // =============================================================================
