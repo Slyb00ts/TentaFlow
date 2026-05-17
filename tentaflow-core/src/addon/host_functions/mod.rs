@@ -10,6 +10,7 @@ pub mod aliases;
 #[cfg(feature = "camera")]
 pub mod camera;
 pub mod events;
+pub mod flow;
 pub mod gate;
 pub mod http;
 pub mod llm;
@@ -206,6 +207,17 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "gate_check_v1", gate::gate_check_v1)
         .map_err(|e| anyhow::anyhow!("Rejestracja gate_check_v1: {e}"))?;
+
+    // --- Flow API (F1c P5 — DAG flow runtime: invoke/status/cancel) ---
+    linker
+        .func_wrap("tentaflow", "flow_invoke_v1", flow::flow_invoke_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja flow_invoke_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "flow_status_v1", flow::flow_status_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja flow_status_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "flow_cancel_v1", flow::flow_cancel_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja flow_cancel_v1: {e}"))?;
 
     // --- Vector API (F1c P3 — embedded usearch HNSW + mmap) ---
     #[cfg(feature = "vector")]
