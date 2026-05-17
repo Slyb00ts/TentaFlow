@@ -122,8 +122,79 @@ test.describe('F1c-P1 — addon UI iframe harness', () => {
 
   test('unmount removes iframe from registry (no leak)', async ({ page }) => {
     await gotoHarnessPage(page);
+    // Install URL.revokeObjectURL spy BEFORE we trigger unmount so we can
+    // assert the blob: URL is actually freed (not just orphaned).
+    await page.evaluate(() => {
+      window.__revokedUrls = [];
+      const orig = URL.revokeObjectURL.bind(URL);
+      URL.revokeObjectURL = (u) => {
+        window.__revokedUrls.push(u);
+        return orig(u);
+      };
+    });
+    const iframeSrcBefore = await page.evaluate(() => {
+      const f = document.querySelector('tf-addon-ui-frame');
+      return f && f.iframe ? f.iframe.src : null;
+    });
     await page.click('#btn-unmount');
+
     const present = await page.evaluate(() => !!document.querySelector('tf-addon-ui-frame'));
     expect(present).toBe(false);
+
+    // The blob: URL the demo handed to the frame must have been revoked.
+    if (iframeSrcBefore && iframeSrcBefore.startsWith('blob:')) {
+      const revoked = await page.evaluate(() => window.__revokedUrls);
+      expect(revoked).toContain(iframeSrcBefore);
+    }
+
+    // Registry must be empty — no orphaned record holding a contentWindow ref.
+    const registrySize = await page.evaluate(async () => {
+      const { addonUiHost } = await import('/js/addon-ui-host.js');
+      return addonUiHost._registrySize();
+    });
+    expect(registrySize).toBe(0);
+  });
+
+  test('envelope with extra fields is rejected (EBADREQ)', async ({ page }) => {
+    await gotoHarnessPage(page);
+    const frame = page.frameLocator('tf-addon-ui-frame iframe').first();
+    await frame.locator('body').evaluate(() => {
+      window.__lastExtra = null;
+      window.addEventListener('message', (e) => {
+        if (e.data && e.data.id === 'extra-1') window.__lastExtra = e.data;
+      });
+      window.parent.postMessage({
+        kind: 'request', id: 'extra-1', action: 'ui.notify',
+        payload: { level: 'info', message: 'x' },
+        addonId: 'spoof', // unexpected envelope field
+      }, '*');
+    });
+    await frame.locator('body').evaluate(async () => {
+      while (!window.__lastExtra) await new Promise((r) => setTimeout(r, 50));
+    });
+    const result = await frame.locator('body').evaluate(() => window.__lastExtra);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('EBADREQ');
+  });
+
+  test('payload with extra fields is rejected (EBADREQ)', async ({ page }) => {
+    await gotoHarnessPage(page);
+    const frame = page.frameLocator('tf-addon-ui-frame iframe').first();
+    await frame.locator('body').evaluate(() => {
+      window.__lastPayloadExtra = null;
+      window.addEventListener('message', (e) => {
+        if (e.data && e.data.id === 'pl-extra-1') window.__lastPayloadExtra = e.data;
+      });
+      window.parent.postMessage({
+        kind: 'request', id: 'pl-extra-1', action: 'ui.notify',
+        payload: { level: 'info', message: 'x', __extra: true },
+      }, '*');
+    });
+    await frame.locator('body').evaluate(async () => {
+      while (!window.__lastPayloadExtra) await new Promise((r) => setTimeout(r, 50));
+    });
+    const result = await frame.locator('body').evaluate(() => window.__lastPayloadExtra);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('EBADREQ');
   });
 });

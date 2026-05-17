@@ -706,6 +706,40 @@ risk = "low"
     assert_eq!(m.ui_components.len(), 1);
 }
 
+#[test]
+fn test_ui_component_host_permissions_parsed() {
+    let toml = r#"
+[addon]
+id = "with-perms"
+name = "x"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[[ui_component]]
+id = "u-with-perms"
+display_name = "U with perms"
+slot = "main"
+src = "u.js"
+signature = "ed25519:<base64-signature-placeholder>"
+risk = "low"
+host_permissions = ["alias.read", "camera.read"]
+
+[[ui_component]]
+id = "u-presentational"
+display_name = "U presentational"
+slot = "main"
+src = "u2.js"
+signature = "ed25519:<base64-signature-placeholder>"
+risk = "low"
+"#;
+    let m = parse_manifest_toml(toml).expect("host_permissions must parse");
+    assert_eq!(m.ui_components.len(), 2);
+    let with_perms = m.ui_components.iter().find(|c| c.id == "u-with-perms").unwrap();
+    assert_eq!(with_perms.host_permissions, vec!["alias.read".to_string(), "camera.read".to_string()]);
+    let presentational = m.ui_components.iter().find(|c| c.id == "u-presentational").unwrap();
+    assert!(presentational.host_permissions.is_empty(), "default empty when omitted");
+}
+
 // =============================================================================
 // sdk_version
 // =============================================================================

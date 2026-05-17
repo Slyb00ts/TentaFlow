@@ -22,6 +22,11 @@ class TfAddonUiFrame extends HTMLElement {
     this._shadow = this.attachShadow({ mode: 'open' });
     this._iframe = null;
     this._statusEl = null;
+    // Tracks the most recent blob: URL we loaded into the iframe so we can
+    // revoke it on attribute swap OR on disconnect — even when the element is
+    // removed directly via DOM (`element.remove()`) without going through the
+    // host harness `unmount()` path.
+    this._currentBlobUrl = null;
     this._onLoad = this._onLoad.bind(this);
     this._onError = this._onError.bind(this);
   }
@@ -36,11 +41,26 @@ class TfAddonUiFrame extends HTMLElement {
       this._iframe.removeEventListener('load', this._onLoad);
       this._iframe.removeEventListener('error', this._onError);
     }
+    this._revokeCurrentBlob();
   }
 
-  attributeChangedCallback(name) {
+  attributeChangedCallback(name, oldValue, newValue) {
     if (!this._iframe) return;
-    if (name === 'src-url') this._applySrc();
+    if (name === 'src-url') {
+      // If old value was a blob URL we own, revoke before swap to avoid leak.
+      if (oldValue && oldValue.startsWith('blob:') && oldValue !== newValue) {
+        try { URL.revokeObjectURL(oldValue); } catch (_) { /* noop */ }
+        if (this._currentBlobUrl === oldValue) this._currentBlobUrl = null;
+      }
+      this._applySrc();
+    }
+  }
+
+  _revokeCurrentBlob() {
+    if (this._currentBlobUrl) {
+      try { URL.revokeObjectURL(this._currentBlobUrl); } catch (_) { /* noop */ }
+      this._currentBlobUrl = null;
+    }
   }
 
   // Exposed for the host harness to register the inner iframe in its
@@ -109,6 +129,11 @@ class TfAddonUiFrame extends HTMLElement {
     if (this._iframe.src !== src) {
       this._showStatus('Ładowanie addona…', 'info');
       this._iframe.src = src;
+      if (src.startsWith('blob:')) {
+        this._currentBlobUrl = src;
+      } else {
+        this._currentBlobUrl = null;
+      }
     }
   }
 

@@ -334,6 +334,13 @@ pub struct UiComponentSpec {
     pub signature: String,
     /// Poziom ryzyka: zob. UI_COMPONENT_RISK_LEVELS.
     pub risk: String,
+    /// Permisje hosta wymagane przez komponent UI do wywolan host-functions
+    /// z iframe via postMessage bridge (F1c P1+). Musi byc podzbiorem permisji
+    /// zadeklarowanych w `[[permission]]` addona. Pusta lista = komponent
+    /// czysto prezentacyjny (zero wywolan hosta). Auto-derived check: kazda
+    /// akcja bridge jest zmapowana na wymagany scope; brak scope -> EPERM.
+    #[serde(default)]
+    pub host_permissions: Vec<String>,
 }
 
 // =============================================================================

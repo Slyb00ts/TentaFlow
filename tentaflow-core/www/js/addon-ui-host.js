@@ -38,6 +38,13 @@ async function getApiBinary() {
 // Maps each live iframe element to its registration record. We key on the
 // element itself (NOT addonId) because event.source equality identifies the
 // iframe; the addonId in any user-controlled payload would be impersonable.
+//
+// Record shape: { addonId, componentId, permissions: Set<string> }.
+// Dispatch model in P1 is REQUEST → AWAIT BACKEND → RESPOND synchronously per
+// request id; the parent does not track a `pendingRequests` map because every
+// request resolves (or rejects) inside one async function call. If P2/P3 adds
+// async fan-out (e.g. server-pushed events keyed to a prior request id), a
+// pending map will be added then — not preemptively.
 const _iframeRegistry = new Map();
 
 // ---------- global listener (installed once) ---------------------------------
@@ -136,9 +143,17 @@ async function dispatchBinary(record, action, payload) {
   switch (action) {
     case 'alias.list_owned': {
       const all = await api.list('modelAliasListRequest', { arrayKey: 'aliases' });
-      // Filter to aliases owned by this addon. The binary response includes
-      // owner_addon_id per row (see codec.modelAliasListRequest schema).
-      return all.filter((a) => a.owner_addon_id === record.addonId);
+      // Prefix heuristic — false-positive risk: addon 'teams' would match alias
+      // 'teams-spy' even if owned by another addon. Same workaround as M14
+      // bindings tab (modules/addons/bindings.js). Production requires
+      // ModelAliasEntry.owner_addon_id backend extension (tracked in
+      // tentavision-f1c-implementation.md). Until then, the iframe-side view is
+      // read-only — no destructive action possible on misattributed alias.
+      const prefix = String(record.addonId || '').toLowerCase();
+      return all.filter((a) => {
+        const name = String(a.alias || '').toLowerCase();
+        return prefix && (name === prefix || name.startsWith(prefix + '-') || name.startsWith(prefix + '_'));
+      });
     }
     default:
       throw bridgeError('EINTERNAL', `binary dispatch missing for "${action}"`);
@@ -202,11 +217,12 @@ export const addonUiHost = {
     frame.setAttribute('component-id', componentId);
     frame.setAttribute('permissions', permissions.join(','));
 
-    let ownedBlobUrl = null;
     if (bundleHtml) {
       const blob = new Blob([bundleHtml], { type: 'text/html' });
-      ownedBlobUrl = URL.createObjectURL(blob);
-      frame.setAttribute('src-url', ownedBlobUrl);
+      const blobUrl = URL.createObjectURL(blob);
+      frame.setAttribute('src-url', blobUrl);
+      // Ownership of blob URL transfers to <tf-addon-ui-frame>: the component
+      // revokes it in disconnectedCallback OR on src-url attribute swap.
     } else {
       frame.setAttribute('src-url', srcUrl);
     }
@@ -235,10 +251,8 @@ export const addonUiHost = {
       unmount() {
         const innerIframe = frame.iframe;
         if (innerIframe) _iframeRegistry.delete(innerIframe);
-        if (ownedBlobUrl) {
-          URL.revokeObjectURL(ownedBlobUrl);
-          ownedBlobUrl = null;
-        }
+        // Removing the element triggers disconnectedCallback on the component,
+        // which revokes the owned blob: URL.
         frame.remove();
       },
     };
