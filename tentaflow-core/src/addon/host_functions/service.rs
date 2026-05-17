@@ -10,7 +10,7 @@
 
 use tracing::warn;
 
-use super::{get_memory, read_guest_string, write_guest_output, AddonState, WasmCaller,
+use super::{audit_log, get_memory, read_guest_string, write_guest_output, AddonState, WasmCaller,
     ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_ERR_RATE_LIMIT,
 };
 
@@ -54,20 +54,6 @@ pub fn service_request(
             }
         };
 
-    // ResourceType::HttpRequests covers `service.request` for the legacy
-    // AddonRateLimiter (per-resource quota table). Service-call-specific
-    // rate-limit lives in `service_call::dispatch`.
-    if let Some(ref rate_limiter) = caller.data().rate_limiter {
-        let addon_id = caller.data().addon_id.clone();
-        if rate_limiter
-            .check(&addon_id, ResourceType::HttpRequests)
-            .is_err()
-        {
-            return ABI_ERR_RATE_LIMIT;
-        }
-        rate_limiter.record_usage(&addon_id, ResourceType::HttpRequests, 1);
-    }
-
     let state = caller.data();
     let req = ServiceCallRequest {
         caller: CallerContext {
@@ -100,6 +86,40 @@ pub fn service_request(
             .await
         })
     });
+
+    // Legacy AddonRateLimiter (per-resource HttpRequests quota) is charged
+    // ONLY when dispatch has cleared permission + alias gate + service-call
+    // limiter — i.e. only on success or on a transport-class failure. Denials
+    // do not consume HttpRequests quota (matches pre-C0 behavior where the
+    // legacy check ran after permission and alias gates).
+    let charge_legacy_quota = matches!(
+        outcome,
+        Ok(_)
+            | Err(ServiceCallError::Timeout { .. })
+            | Err(ServiceCallError::PickupTokenInjection(_))
+            | Err(ServiceCallError::Internal(_))
+            | Err(ServiceCallError::ServiceManagerNotInitialized)
+    );
+    if charge_legacy_quota {
+        if let Some(ref rate_limiter) = caller.data().rate_limiter {
+            let addon_id = caller.data().addon_id.clone();
+            if rate_limiter
+                .check(&addon_id, ResourceType::HttpRequests)
+                .is_err()
+            {
+                audit_log(
+                    caller.data(),
+                    "service.request",
+                    Some("service"),
+                    Some(&service_name),
+                    "error",
+                    Some("rate limit exceeded"),
+                );
+                return ABI_ERR_RATE_LIMIT;
+            }
+            rate_limiter.record_usage(&addon_id, ResourceType::HttpRequests, 1);
+        }
+    }
 
     match outcome {
         Ok(resp) => {
