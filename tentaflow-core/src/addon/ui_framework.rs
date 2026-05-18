@@ -544,8 +544,10 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
 }
 
 /// Camera id contract: UUID v4 textual form (length 36, lowercase hex + dashes
-/// in `8-4-4-4-12` layout). Strict — addons that pass non-UUID values fail
-/// fast before any signed URL is minted.
+/// in `8-4-4-4-12` layout, version nibble `4` at index 14, RFC 4122 variant
+/// nibble in `8..=b` at index 19). Strict — addons that pass non-UUID values
+/// fail fast before any signed URL is minted. Error messages never echo the
+/// input value to keep audit/install logs PII-free.
 fn validate_camera_id(id: &str) -> anyhow::Result<()> {
     if id.len() != 36 {
         anyhow::bail!(
@@ -553,25 +555,55 @@ fn validate_camera_id(id: &str) -> anyhow::Result<()> {
             id.len()
         );
     }
-    for (i, b) in id.bytes().enumerate() {
+    let bytes = id.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
         let dash_pos = matches!(i, 8 | 13 | 18 | 23);
         if dash_pos {
             if b != b'-' {
-                anyhow::bail!(
-                    "LiveCameraTile.camera_id '{}' missing '-' at position {}",
-                    id,
-                    i
-                );
+                anyhow::bail!("LiveCameraTile.camera_id invalid format");
             }
-        } else if !((b.is_ascii_digit()) || (b'a'..=b'f').contains(&b)) {
-            anyhow::bail!(
-                "LiveCameraTile.camera_id '{}' has non-hex char at position {}",
-                id,
-                i
-            );
+        } else if !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            anyhow::bail!("LiveCameraTile.camera_id invalid format");
         }
     }
+    if bytes[14] != b'4' {
+        anyhow::bail!("LiveCameraTile.camera_id invalid format");
+    }
+    if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
+        anyhow::bail!("LiveCameraTile.camera_id invalid format");
+    }
     Ok(())
+}
+
+/// Strict counterpart of `parse_components_from_json` used by `ui_render`:
+/// returns an error on any malformed component (instead of silently dropping
+/// it via `filter_map`) and runs `validate_and_normalize_component` on every
+/// node in the tree. On success the returned JSON value mirrors the input
+/// shape (single component, `{components: [...]}`, or full panel) with
+/// normalized fields (e.g. clamped `ttl_secs`) so the cached panel reflects
+/// what the host actually accepted.
+pub fn parse_and_validate_ui_json(
+    json: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(arr) = json.get("components").and_then(|v| v.as_array()) {
+        let mut normalized = Vec::with_capacity(arr.len());
+        for v in arr {
+            let mut c: UiComponent = serde_json::from_value(v.clone())
+                .map_err(|e| anyhow::anyhow!("invalid component: {}", e))?;
+            validate_and_normalize_component(&mut c)?;
+            normalized.push(serde_json::to_value(&c)?);
+        }
+        let mut out = json.clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("components".to_string(), serde_json::Value::Array(normalized));
+        }
+        Ok(out)
+    } else {
+        let mut c: UiComponent = serde_json::from_value(json.clone())
+            .map_err(|e| anyhow::anyhow!("invalid component: {}", e))?;
+        validate_and_normalize_component(&mut c)?;
+        Ok(serde_json::to_value(&c)?)
+    }
 }
 
 /// Escapuje znaki specjalne HTML
@@ -690,6 +722,28 @@ mod tests {
     }
 
     #[test]
+    fn live_camera_tile_rejects_non_v4_uuid() {
+        let mut c = UiComponent::LiveCameraTile {
+            camera_id: "550e8400-e29b-11d4-a716-446655440000".to_string(),
+            ttl_secs: 30,
+            label: None,
+            height_px: None,
+        };
+        assert!(validate_and_normalize_component(&mut c).is_err());
+    }
+
+    #[test]
+    fn live_camera_tile_rejects_invalid_variant() {
+        let mut c = UiComponent::LiveCameraTile {
+            camera_id: "550e8400-e29b-41d4-c716-446655440000".to_string(),
+            ttl_secs: 30,
+            label: None,
+            height_px: None,
+        };
+        assert!(validate_and_normalize_component(&mut c).is_err());
+    }
+
+    #[test]
     fn live_camera_tile_rejects_bad_uuid() {
         let mut c = UiComponent::LiveCameraTile {
             camera_id: "not-a-uuid".to_string(),
@@ -711,6 +765,47 @@ mod tests {
             UiComponent::LiveCameraTile { ttl_secs, .. } => assert_eq!(ttl_secs, 30),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn ui_render_rejects_invalid_live_camera_tile() {
+        // Simulates the WASM ABI path: addon ships a `live_camera_tile`
+        // with a path-traversal payload as `camera_id`. The strict
+        // parse+validate must refuse it so nothing reaches the UI cache.
+        let panel_json = serde_json::json!({
+            "components": [
+                {
+                    "type": "live_camera_tile",
+                    "camera_id": "../etc/passwd",
+                    "ttl_secs": 30
+                }
+            ]
+        });
+        let err = parse_and_validate_ui_json(&panel_json)
+            .expect_err("path traversal camera_id must be rejected");
+        let msg = format!("{}", err);
+        assert!(
+            !msg.contains("../etc/passwd"),
+            "error message must not echo addon input"
+        );
+    }
+
+    #[test]
+    fn ui_render_accepts_valid_live_camera_tile_and_normalizes_ttl() {
+        let panel_json = serde_json::json!({
+            "components": [
+                {
+                    "type": "live_camera_tile",
+                    "camera_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "ttl_secs": 9999
+                }
+            ]
+        });
+        let out = parse_and_validate_ui_json(&panel_json).expect("must accept valid tile");
+        assert_eq!(
+            out["components"][0]["ttl_secs"],
+            serde_json::json!(LIVE_CAMERA_TILE_TTL_MAX)
+        );
     }
 
     #[test]

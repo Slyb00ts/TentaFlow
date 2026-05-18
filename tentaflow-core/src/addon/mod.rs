@@ -216,10 +216,7 @@ impl AddonApplicationSection {
             );
         }
         if !panel_rx.is_match(&self.entry_panel) {
-            bail!(
-                "application.entry_panel '{}' must match [a-z0-9][a-z0-9_-]*",
-                self.entry_panel
-            );
+            bail!("application.entry_panel invalid format");
         }
         let title_len = self.title.chars().count();
         if !(1..=60).contains(&title_len) {
@@ -233,10 +230,7 @@ impl AddonApplicationSection {
             bail!("application.icon length {} out of range 1..=40", icon_len);
         }
         if !icon_rx.is_match(&self.icon) {
-            bail!(
-                "application.icon '{}' must match [a-z][a-z0-9-]*",
-                self.icon
-            );
+            bail!("application.icon invalid format");
         }
         if !(0..=10_000).contains(&self.sort_order) {
             bail!(
