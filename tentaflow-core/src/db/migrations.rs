@@ -191,7 +191,60 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "multi_tenant_rbac_org_isolation",
             MigrationStep::Rust(setup_multi_tenant),
         ),
+        (
+            33,
+            "model_aliases_strategy_round_robin",
+            MigrationStep::Rust(model_aliases_strategy_round_robin),
+        ),
     ]
+}
+
+// F2 P2.a — formalise the legal value set for `model_aliases.strategy`.
+// The initial schema declared the column without a CHECK constraint, so
+// `round_robin` was already accepted by the storage layer (and the runtime
+// `Strategy::from_db` parser maps the literal to `Strategy::RoundRobin`).
+// This migration pins the contract: only `first_available` and `round_robin`
+// are valid going forward. Any future strategy must edit both this CHECK
+// and `services::catalog::Strategy::from_db`.
+//
+// SQLite cannot ALTER a CHECK constraint in place; we rebuild the table
+// using the canonical pattern (CREATE new + INSERT SELECT + DROP old +
+// RENAME + recreate index). Idempotent at three levels:
+//   * If the live `model_aliases` already has a CHECK that accepts both
+//     values (re-run after success), the rebuild repeats but produces an
+//     equivalent schema — wasted work, never incorrect.
+//   * `model_aliases_new` is dropped at the start so a half-run from a
+//     previous attempt cannot collide on the staging table name.
+//   * `DROP TABLE IF EXISTS` on the post-rename leftover keeps a partial
+//     rerun (process killed between RENAME and index creation) recoverable.
+fn model_aliases_strategy_round_robin(conn: &Connection) -> Result<()> {
+    // Drop any leftover staging table from a previous interrupted run.
+    conn.execute_batch("DROP TABLE IF EXISTS model_aliases_new;")?;
+
+    // Create the rebuilt table with an explicit CHECK constraint. Column
+    // order, types and defaults mirror the v1 schema (line 1174) so the
+    // INSERT SELECT below is a straight column-for-column copy.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE model_aliases_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT UNIQUE NOT NULL,
+            target_model TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            fallback_targets TEXT DEFAULT NULL,
+            strategy TEXT DEFAULT 'first_available'
+                CHECK(strategy IN ('first_available','round_robin'))
+        );
+        INSERT INTO model_aliases_new (id, alias, target_model, is_active, fallback_targets, strategy)
+            SELECT id, alias, target_model, is_active, fallback_targets,
+                   COALESCE(strategy, 'first_available')
+              FROM model_aliases;
+        DROP TABLE model_aliases;
+        ALTER TABLE model_aliases_new RENAME TO model_aliases;
+        CREATE INDEX IF NOT EXISTS idx_model_aliases_alias ON model_aliases(alias);
+        "#,
+    )?;
+    Ok(())
 }
 
 // F2 P1.a — multi-tenant foundation. Creates the three control tables

@@ -280,6 +280,17 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Services catalog API (F2 P2.a) — read-only view of the mesh-wide
+    /// service registry. Requires `service.read` permission.
+    fn service_list_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn node_resources_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Alias API (F1a M1.W5) — readonly inspection of aliases.
     /// Requires `alias.read` permission. Lifecycle (create/deactivate) is
     /// driven implicitly by addon install/uninstall from the manifest.
@@ -1300,6 +1311,7 @@ pub mod prelude {
         vector_upsert, vector_search, vector_delete, encode_vector_b64, VectorHit,
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
         flow_invoke, flow_status, flow_cancel, FlowInvocation,
+        service_list, node_resources_get, ServiceInfo, NodeResources, NodeGpu,
         AbiError,
         log,
     };
@@ -2258,6 +2270,86 @@ pub fn flow_cancel(invocation_id: &str) -> Result<bool, AbiError> {
     let bytes = call_sql_with_one_input(flow_cancel_v1, s.as_bytes())?;
     let raw: FlowCancelRaw = parse_toml(&bytes)?;
     Ok(raw.cancelled)
+}
+
+// =============================================================================
+// Services catalog wrappers (F2 P2.a) — read-only mesh service inspection
+// =============================================================================
+
+/// One row from `service_list`. `service_id` is the cross-node stable id
+/// `<node>:<local_id>`; `service_local_id` carries the numeric id that the
+/// router APIs expect when addressing the service directly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceInfo {
+    pub service_id: String,
+    pub service_local_id: i64,
+    pub display_name: String,
+    pub kind: String,
+    pub status: String,
+    pub node_id: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceListResponse {
+    #[serde(default)]
+    services: Vec<ServiceInfo>,
+}
+
+/// Filtered view of every service visible in the mesh (local node + every
+/// reachable peer). Pass `None` for any filter to include everything.
+/// Requires the `service.read` permission.
+pub fn service_list(
+    kind: Option<&str>,
+    status: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<Vec<ServiceInfo>, AbiError> {
+    let mut s = String::new();
+    if let Some(k) = kind {
+        push_kv_str(&mut s, "kind", k);
+    }
+    if let Some(st) = status {
+        push_kv_str(&mut s, "status", st);
+    }
+    if let Some(n) = node_id {
+        push_kv_str(&mut s, "node_id", n);
+    }
+    let bytes = call_sql_with_one_input(service_list_v1, s.as_bytes())?;
+    let resp: ServiceListResponse = parse_toml(&bytes)?;
+    Ok(resp.services)
+}
+
+/// Live hardware snapshot for one node. Local node only today — passing an
+/// unknown / remote `node_id` returns `AbiError::NotFound`. Requires the
+/// `service.read` permission.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeResources {
+    pub node_id: String,
+    pub cpu_cores: u32,
+    pub cpu_load_pct: f64,
+    pub ram_total_mb: u64,
+    pub ram_used_mb: u64,
+    #[serde(default)]
+    pub gpu: Option<NodeGpu>,
+    pub gpu_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeGpu {
+    pub name: String,
+    pub vram_total_mb: u64,
+    pub vram_used_mb: u64,
+    pub utilization_pct: f64,
+}
+
+pub fn node_resources_get(node_id: &str) -> Result<NodeResources, AbiError> {
+    let mut s = String::new();
+    push_kv_str(&mut s, "node_id", node_id);
+    let bytes = call_sql_with_one_input(node_resources_get_v1, s.as_bytes())?;
+    parse_toml(&bytes)
 }
 
 // =============================================================================

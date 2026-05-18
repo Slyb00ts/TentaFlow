@@ -21,6 +21,7 @@ pub mod oauth;
 pub mod recording;
 pub mod secrets;
 pub mod service;
+pub mod services;
 pub mod sql;
 pub mod storage;
 #[cfg(feature = "camera")]
@@ -183,6 +184,18 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "service_request", service::service_request)
         .map_err(|e| anyhow::anyhow!("Rejestracja service_request: {e}"))?;
+
+    // --- Services catalog read-only (F2 P2.a — M16 v2 dropdown + node res) ---
+    linker
+        .func_wrap("tentaflow", "service_list_v1", services::service_list_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja service_list_v1: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "node_resources_get_v1",
+            services::node_resources_get_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja node_resources_get_v1: {e}"))?;
 
     // --- OAuth API ---
     linker
