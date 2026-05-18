@@ -42,6 +42,14 @@ impl MetadataStreamId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Reconstruct a stream id from the wire-form string. Used by host
+    /// functions that received the opaque id from the addon and need to
+    /// look it up in the bus. The bus never validates the inner shape; a
+    /// non-existent id yields a no-op on `unsubscribe`.
+    pub fn new_from_raw(raw: String) -> Self {
+        Self(raw)
+    }
 }
 
 impl Default for MetadataStreamId {
@@ -154,6 +162,28 @@ impl MetadataBus {
         if let Some(mut entries) = self.inner.get_mut(camera_id) {
             entries.retain(|e| &e.stream_id != stream_id);
         }
+    }
+
+    /// F2 P6.b — addon-facing unsubscribe path. The addon holds the opaque
+    /// `MetadataStreamId` (`meta_<uuid>`) but does not retain the camera_id.
+    /// Walks every per-camera entry list looking for the stream and, on hit,
+    /// returns the camera_id so the caller (the host fn) can release the
+    /// pull-supervisor refcount. `None` means the stream was already
+    /// unsubscribed or never existed.
+    pub fn unsubscribe_by_stream_id(
+        &self,
+        stream_id: &MetadataStreamId,
+    ) -> Option<String> {
+        for mut entry in self.inner.iter_mut() {
+            let camera_id = entry.key().clone();
+            let entries = entry.value_mut();
+            let before = entries.len();
+            entries.retain(|e| &e.stream_id != stream_id);
+            if entries.len() != before {
+                return Some(camera_id);
+            }
+        }
+        None
     }
 
     /// Fan out one `MetadataFrame` to every subscriber on `frame.camera_id`.

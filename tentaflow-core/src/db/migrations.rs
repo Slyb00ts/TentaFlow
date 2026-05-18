@@ -206,7 +206,63 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_metadata_supported",
             MigrationStep::Rust(cameras_add_metadata_supported_column),
         ),
+        (
+            36,
+            "roles_add_camera_metadata",
+            MigrationStep::Rust(roles_add_camera_metadata_permission),
+        ),
     ]
+}
+
+// F2 P6.b — grant `camera.metadata` to operators so they can subscribe to
+// ONVIF analytics streams. Admin already received this permission as part of
+// the v32 seed; operator did not. Viewer is intentionally left alone — the
+// subscription host fn mutates supervisor state (refcount + spawn pull task)
+// and is therefore not a pure read operation.
+//
+// Idempotent: re-reads the permissions JSON, only appends when the entry is
+// missing. Safe to run on a fresh DB (`org_operator` already exists from v32)
+// and on an old DB where an admin manually edited the row.
+fn roles_add_camera_metadata_permission(conn: &Connection) -> Result<()> {
+    const TARGET_ROLES: &[&str] = &["org_admin", "org_operator"];
+    const NEW_PERM: &str = "camera.metadata";
+
+    for role_name in TARGET_ROLES {
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT role_id, permissions_json FROM roles WHERE name = ?1",
+                rusqlite::params![role_name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        let Some((role_id, perms_json)) = row else {
+            // Role missing — possible on test DBs that skipped v32 seeding. A
+            // missing role is harmless here; the role will be created with the
+            // correct permission set when v32 runs.
+            continue;
+        };
+        let mut perms: Vec<String> = match serde_json::from_str(&perms_json) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupt JSON should not abort the whole migration — log and
+                // skip so a single bad row does not block startup.
+                tracing::warn!(
+                    "roles_add_camera_metadata: role '{role_name}' has non-JSON permissions; skipping"
+                );
+                continue;
+            }
+        };
+        if perms.iter().any(|p| p == NEW_PERM) {
+            continue;
+        }
+        perms.push(NEW_PERM.to_string());
+        let updated = serde_json::to_string(&perms).unwrap_or(perms_json);
+        conn.execute(
+            "UPDATE roles SET permissions_json = ?1 WHERE role_id = ?2",
+            rusqlite::params![updated, role_id],
+        )?;
+    }
+    Ok(())
 }
 
 // F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table
