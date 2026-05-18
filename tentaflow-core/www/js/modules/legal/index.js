@@ -2,13 +2,14 @@
 // Plik: legal/index.js — RODO legal documents admin UI
 // Opis: Ekran administracyjny F2-P8.d M10 — lista wygenerowanych dokumentow
 //       RODO (warianty short/standard/full), generacja nowego PDF i miekkie
-//       unieważnienie. Komunikacja przez binary protocol (LegalAdminBody).
-//       Permission gating opiera sie o role admin (analogicznie do users/audit).
+//       uniewaznienie. Komunikacja przez binary protocol (LegalAdminBody).
+//       Permission gating opiera sie o role admin/dpo (analogicznie do
+//       users/audit). Backend i tak gate'uje przez legal.write — to czysto
+//       UX matter zeby DPO widzial przyciski generowania.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
-import { TfWindow } from '/js/components/tf-window.js';
 
 // Cache podpisanych URL-i z odpowiedzi GenerateResponse. Lista RPC nie zwraca
 // signedUrl, wiec link "Pobierz" dziala tylko dla dokumentow wygenerowanych
@@ -33,18 +34,23 @@ const VARIANT_DESCRIPTIONS = {
   full: 'Wariant pelny — klauzula RODO + zalaczniki techniczne i polityka cookies.',
 };
 
-// Mapuje protokolowe kody bledow na komunikaty PL.
+// Mapuje protokolowe kody bledow na komunikaty PL. Nieznane kody przepuszczamy
+// verbatim (`${code}: ${reason}`) zeby nie maskowac nowych bledow z serwera
+// generycznym komunikatem.
 function mapErrorMessage(err) {
   const code = err?.code;
-  const reason = err?.reason ?? err?.message ?? '';
+  const reason = String(err?.reason ?? err?.message ?? '').trim();
   if (code === 11 || /quota/i.test(reason)) return 'Przekroczono limit generacji dokumentow.';
   if (code === 7 || /permission/i.test(reason)) return 'Brak uprawnien do tej operacji.';
   if (code === 9 || /conflict/i.test(reason)) {
     if (/already_revoked/i.test(reason)) return 'Dokument byl juz wczesniej uniewazniony.';
-    return 'Konflikt stanu dokumentu.';
+    return reason ? `Konflikt: ${reason}` : 'Konflikt stanu dokumentu.';
   }
-  if (code === 3 || /bad_request|invalid/i.test(reason)) return 'Nieprawidlowe zadanie.';
-  return err?.message || 'Nieznany blad serwera.';
+  if (code === 3 || /bad_request|invalid/i.test(reason)) {
+    return reason ? `Nieprawidlowe zadanie: ${reason}` : 'Nieprawidlowe zadanie.';
+  }
+  if (reason) return code != null ? `${code}: ${reason}` : reason;
+  return 'Nieznany blad serwera.';
 }
 
 const LegalScreen = {
@@ -69,7 +75,16 @@ const LegalScreen = {
       </div>
 
       <div class="card" style="padding: 0; overflow: hidden;">
-        <div id="legal-table-host"></div>
+        <tf-table id="legal-table">
+          <tf-column key="variant" label="${escapeAttr('Wariant')}" renderer="chip"></tf-column>
+          <tf-column key="generatedAt" label="${escapeAttr('Wygenerowano')}"></tf-column>
+          <tf-column key="hash" label="${escapeAttr('Hash')}" renderer="html"></tf-column>
+          <tf-column key="status" label="${escapeAttr('Status')}" renderer="chip"></tf-column>
+          <tf-column key="actions" label="${escapeAttr('Akcje')}" renderer="html"></tf-column>
+        </tf-table>
+        <div id="legal-empty" hidden style="padding: 36px; text-align: center; color: var(--text-3);">
+          Brak dokumentow do wyswietlenia.
+        </div>
       </div>
     `;
   },
@@ -78,6 +93,7 @@ const LegalScreen = {
     canWrite = await detectWritePermission();
     renderHeaderActions();
     attachFilterHandlers();
+    bindTableActions();
     await loadDocuments();
   },
 
@@ -90,13 +106,14 @@ const LegalScreen = {
   },
 };
 
-// Tylko admin moze generowac i uniewazniac. Brak osobnego permission API —
-// uzywamy authMeRequest.role analogicznie do modules/audit i modules/users.
+// Tylko admin / DPO moze generowac i uniewazniac. AuthMeResponse nie zwraca
+// listy permissions, wiec stosujemy role check. Backend dodatkowo wymusza
+// permission `legal.write` — tu chodzi wylacznie o UI gating.
 async function detectWritePermission() {
   try {
     const me = await ApiBinary.one('authMeRequest');
     const role = String(me?.role || '').toLowerCase();
-    return role === 'admin' || me?.isAdmin === true;
+    return role === 'admin' || role === 'dpo' || me?.isAdmin === true;
   } catch (_) {
     return false;
   }
@@ -123,6 +140,30 @@ function attachFilterHandlers() {
     await loadDocuments();
   });
   byId('legal-refresh')?.addEventListener('click', () => { loadDocuments(); });
+}
+
+// Delegujemy klik na przyciski wewnatrz <tf-table> przez composedPath (komorki
+// dla renderer="html" siedza w shadow DOM tabeli).
+function bindTableActions() {
+  const table = byId('legal-table');
+  if (!table) return;
+  table.addEventListener('click', (ev) => {
+    const path = ev.composedPath();
+    const btn = path.find((el) => el && el.tagName === 'TF-BUTTON' && el.dataset && el.dataset.act);
+    if (!btn) return;
+    const id = btn.dataset.docId;
+    if (!id) return;
+    if (btn.dataset.act === 'download') {
+      const url = signedUrlCache.get(id);
+      if (!url) {
+        toast('Brak aktywnego URL — wygeneruj ponownie.', 'warn');
+        return;
+      }
+      window.location.href = url;
+    } else if (btn.dataset.act === 'revoke') {
+      openRevokeConfirm(id);
+    }
+  });
 }
 
 async function loadDocuments() {
@@ -158,27 +199,8 @@ function filterDocuments() {
   });
 }
 
-function renderTable() {
-  const host = byId('legal-table-host');
-  if (!host) return;
-  const rows = filterDocuments();
-  if (rows.length === 0) {
-    host.innerHTML = `<div class="empty-state" style="padding: 36px; text-align: center; color: var(--text-3);">
-      Brak dokumentow do wyswietlenia.
-    </div>`;
-    return;
-  }
-
-  const headers = `
-    <tr>
-      <th>Wariant</th>
-      <th>Wygenerowano</th>
-      <th>Hash</th>
-      <th>Status</th>
-      <th style="text-align:right;">Akcje</th>
-    </tr>
-  `;
-  const body = rows.map((d, idx) => {
+function buildRows() {
+  return filterDocuments().map((d) => {
     const docId = String(d.docId ?? d.doc_id ?? '');
     const variant = String(d.variant ?? '');
     const variantLabel = VARIANT_LABELS[variant] || variant;
@@ -186,29 +208,32 @@ function renderTable() {
     const hashFull = String(d.contentHash ?? d.content_hash ?? '');
     const hashShort = hashFull.slice(0, 12);
     const active = isActive(d);
-    const statusChip = active
-      ? '<tf-chip variant="success">Aktywny</tf-chip>'
-      : '<tf-chip variant="muted">Uniewazniony</tf-chip>';
-    const variantChip = `<tf-chip variant="info">${escapeHtml(variantLabel)}</tf-chip>`;
-    return `
-      <tr data-doc-id="${escapeAttr(docId)}" data-idx="${idx}">
-        <td>${variantChip}</td>
-        <td>${escapeHtml(generatedAt)}</td>
-        <td><code title="${escapeAttr(hashFull)}" style="font-family: 'SF Mono', monospace; font-size: 12px;">${escapeHtml(hashShort)}</code></td>
-        <td>${statusChip}</td>
-        <td style="text-align:right;">${renderRowActions(docId, active)}</td>
-      </tr>
-    `;
-  }).join('');
+    return {
+      variant: { status: 'info', label: variantLabel },
+      generatedAt,
+      hash: `<code title="${escapeAttr(hashFull)}" style="font-family: 'SF Mono', monospace; font-size: 12px;">${escapeHtml(hashShort)}</code>`,
+      status: active
+        ? { status: 'ok', label: 'Aktywny' }
+        : { status: 'muted', label: 'Uniewazniony' },
+      actions: renderRowActions(docId, active),
+    };
+  });
+}
 
-  host.innerHTML = `
-    <table class="tf-table-plain" style="width:100%; border-collapse: collapse;">
-      <thead>${headers}</thead>
-      <tbody>${body}</tbody>
-    </table>
-  `;
-
-  bindRowActions();
+function renderTable() {
+  const table = byId('legal-table');
+  const empty = byId('legal-empty');
+  if (!table) return;
+  const rows = buildRows();
+  if (rows.length === 0) {
+    table.hidden = true;
+    if (empty) empty.hidden = false;
+    table.rows = [];
+    return;
+  }
+  if (empty) empty.hidden = true;
+  table.hidden = false;
+  table.rows = rows;
 }
 
 function renderRowActions(docId, active) {
@@ -226,26 +251,6 @@ function renderRowActions(docId, active) {
   `;
 }
 
-function bindRowActions() {
-  document.querySelectorAll('#legal-table-host [data-act="download"]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const id = btn.getAttribute('data-doc-id');
-      const url = signedUrlCache.get(id);
-      if (!url) {
-        toast('Brak aktywnego URL — wygeneruj ponownie.', 'warn');
-        return;
-      }
-      window.location.href = url;
-    });
-  });
-  document.querySelectorAll('#legal-table-host [data-act="revoke"]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const id = btn.getAttribute('data-doc-id');
-      if (id) openRevokeConfirm(id);
-    });
-  });
-}
-
 // Format ISO ms -> 'YYYY-MM-DD HH:mm' w lokalu pl-PL. Wartosci null/0 -> "—".
 function formatDate(ms) {
   const n = Number(ms);
@@ -260,96 +265,124 @@ function formatDate(ms) {
 
 // =============================================================================
 // Dialog generacji
+//
+// Budujemy <tf-window> recznie (nie przez TfWindow.open) zeby:
+//  - rejestrowac listener close-request PRZED appendChild (capture race-free),
+//  - footer buttons uzywaja data-role + bezposrednich handlerow zamiast
+//    polegania na auto-close po evencie 'action' (ktore moze zamknac okno
+//    zanim ustawimy submitInFlight).
 // =============================================================================
 
 function openGenerateDialog() {
   if (!canWrite) return;
   let submitInFlight = false;
 
+  const dlg = document.createElement('tf-window');
+  dlg.setAttribute('title', 'Generuj dokument RODO');
+  dlg.setAttribute('buttons', 'close');
+  dlg.setAttribute('width', '520');
+  dlg.setAttribute('min-height', '220');
+  dlg.setAttribute('initial-x', 'center');
+  dlg.setAttribute('initial-y', 'center');
+  dlg.setAttribute('role', 'dialog');
+  dlg.setAttribute('aria-modal', 'true');
+
   const variantOptions = ['short', 'standard', 'full'].map((v) => `
     <option value="${v}">${escapeHtml(VARIANT_LABELS[v])} — ${escapeHtml(VARIANT_DESCRIPTIONS[v])}</option>
   `).join('');
 
-  const bodyHtml = `
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.innerHTML = `
     <div style="display: grid; gap: 12px;">
       <div>
         <label style="display:block; font-size:12px; color:var(--text-3); margin-bottom:6px;">Wariant dokumentu</label>
-        <tf-select id="legal-gen-variant" value="standard" style="width:100%;">
+        <tf-select data-role="variant" value="standard" style="width:100%;">
           ${variantOptions}
         </tf-select>
       </div>
-      <div id="legal-gen-error" style="display:none;"></div>
+      <div data-role="error" style="display:none;"></div>
     </div>
   `;
-  const footerHtml = `
-    <tf-button variant="ghost" data-action="cancel">Anuluj</tf-button>
-    <tf-button variant="primary" data-action="generate" id="legal-gen-submit">Generuj</tf-button>
-  `;
+  dlg.appendChild(body);
 
-  TfWindow.open({
-    title: 'Generuj dokument RODO',
-    body: bodyHtml,
-    footer: footerHtml,
-    buttons: 'close',
-    modal: true,
-    width: 520,
-    minHeight: 220,
+  const footer = document.createElement('div');
+  footer.slot = 'footer';
+  footer.style.cssText = 'display:flex;gap:8px;width:100%;';
+  footer.innerHTML = `
+    <div style="flex:1"></div>
+    <tf-button variant="ghost" data-role="cancel">Anuluj</tf-button>
+    <tf-button variant="primary" data-role="submit">Generuj</tf-button>
+  `;
+  dlg.appendChild(footer);
+
+  // Modalne tlo + blokada zamkniecia podczas in-flight RPC.
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+
+  dlg.addEventListener('close-request', (e) => {
+    if (submitInFlight) { e.preventDefault(); return; }
   });
 
-  // Po otwarciu okno jest w DOM — bind handlerow po tick'u zeby slotted nodes
-  // i tf-select byly zainicjowane.
-  setTimeout(() => {
-    const win = document.querySelector('tf-window:last-of-type');
-    if (!win) return;
+  document.body.appendChild(dlg);
 
-    win.addEventListener('close-request', (e) => {
-      if (submitInFlight) e.preventDefault();
-    });
+  const cleanup = () => {
+    if (backdrop.isConnected) backdrop.remove();
+  };
+  // Sprzata backdrop gdy okno zostanie usuniete z DOM.
+  const mo = new MutationObserver(() => {
+    if (!dlg.isConnected) {
+      mo.disconnect();
+      cleanup();
+    }
+  });
+  mo.observe(document.body, { childList: true, subtree: true });
 
-    win.addEventListener('action', async (e) => {
-      const act = e.detail?.action;
-      if (act === 'generate') {
-        e.preventDefault();
-        if (submitInFlight) return;
-        const variantEl = document.getElementById('legal-gen-variant');
-        const variant = String(variantEl?.value ?? 'standard');
-        await executeGenerate(win, variant, (val) => { submitInFlight = val; });
+  const cancelBtn = footer.querySelector('[data-role="cancel"]');
+  const submitBtn = footer.querySelector('[data-role="submit"]');
+  const errorBox = body.querySelector('[data-role="error"]');
+
+  cancelBtn?.addEventListener('click', () => {
+    if (submitInFlight) return;
+    dlg.close(true);
+  });
+
+  submitBtn?.addEventListener('click', async () => {
+    if (submitInFlight) return;
+    submitInFlight = true;
+    submitBtn.setAttribute('disabled', '');
+    cancelBtn?.setAttribute('disabled', '');
+    if (errorBox) { errorBox.style.display = 'none'; errorBox.innerHTML = ''; }
+    const variantEl = body.querySelector('tf-select[data-role="variant"]');
+    const variant = String(variantEl?.value ?? 'standard');
+    try {
+      const resp = await ApiBinary.one('legalDocumentGenerateRequest', { variant });
+      const docId = String(resp.docId ?? resp.doc_id ?? '');
+      const signedUrl = String(resp.signedUrl ?? resp.signed_url ?? '');
+      if (docId && signedUrl) {
+        signedUrlCache.set(docId, signedUrl);
       }
-    });
-  }, 0);
-}
-
-async function executeGenerate(win, variant, setInFlight) {
-  const submitBtn = document.getElementById('legal-gen-submit');
-  const errorBox = document.getElementById('legal-gen-error');
-  if (errorBox) { errorBox.style.display = 'none'; errorBox.innerHTML = ''; }
-  if (submitBtn) submitBtn.setAttribute('disabled', '');
-  setInFlight(true);
-  try {
-    const resp = await ApiBinary.one('legalDocumentGenerateRequest', { variant });
-    const docId = String(resp.docId ?? resp.doc_id ?? '');
-    const signedUrl = String(resp.signedUrl ?? resp.signed_url ?? '');
-    if (docId && signedUrl) {
-      signedUrlCache.set(docId, signedUrl);
+      submitInFlight = false;
+      dlg.close(true);
+      toast('Dokument wygenerowany — rozpoczynam pobieranie.', 'success');
+      if (signedUrl) {
+        window.location.href = signedUrl;
+      }
+      await loadDocuments();
+    } catch (err) {
+      submitInFlight = false;
+      submitBtn.removeAttribute('disabled');
+      cancelBtn?.removeAttribute('disabled');
+      const msg = mapErrorMessage(err);
+      if (errorBox) {
+        errorBox.style.display = 'block';
+        errorBox.innerHTML = `<tf-chip variant="danger">${escapeHtml(msg)}</tf-chip>`;
+      } else {
+        toast(`Blad: ${msg}`, 'error');
+      }
     }
-    setInFlight(false);
-    win.close(true);
-    toast('Dokument wygenerowany — rozpoczynam pobieranie.', 'success');
-    if (signedUrl) {
-      window.location.href = signedUrl;
-    }
-    await loadDocuments();
-  } catch (err) {
-    setInFlight(false);
-    if (submitBtn) submitBtn.removeAttribute('disabled');
-    const msg = mapErrorMessage(err);
-    if (errorBox) {
-      errorBox.style.display = 'block';
-      errorBox.innerHTML = `<tf-chip variant="danger">${escapeHtml(msg)}</tf-chip>`;
-    } else {
-      toast(`Blad: ${msg}`, 'error');
-    }
-  }
+  });
 }
 
 // =============================================================================
@@ -360,7 +393,19 @@ function openRevokeConfirm(docId) {
   if (!canWrite) return;
   let submitInFlight = false;
 
-  const bodyHtml = `
+  const dlg = document.createElement('tf-window');
+  dlg.setAttribute('title', 'Uniewaznij dokument');
+  dlg.setAttribute('buttons', 'close');
+  dlg.setAttribute('width', '440');
+  dlg.setAttribute('min-height', '200');
+  dlg.setAttribute('initial-x', 'center');
+  dlg.setAttribute('initial-y', 'center');
+  dlg.setAttribute('role', 'dialog');
+  dlg.setAttribute('aria-modal', 'true');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.innerHTML = `
     <p style="color: var(--text-2); font-size: 13px;">
       Czy na pewno chcesz uniewaznic dokument <code style="font-family:'SF Mono',monospace;">${escapeHtml(docId.slice(0, 12))}</code>?
     </p>
@@ -368,75 +413,89 @@ function openRevokeConfirm(docId) {
       Operacja oznacza dokument jako uniewazniony. Plik PDF pozostaje na dysku
       do celow audytu, ale nie bedzie zwracany w domyslnej liscie.
     </p>
-    <div id="legal-rev-error" style="display:none; margin-top:10px;"></div>
+    <div data-role="error" style="display:none; margin-top:10px;"></div>
   `;
-  const footerHtml = `
-    <tf-button variant="ghost" data-action="cancel">Anuluj</tf-button>
-    <tf-button variant="danger-solid" icon="trash" data-action="revoke" id="legal-rev-submit">Uniewaznij</tf-button>
-  `;
+  dlg.appendChild(body);
 
-  TfWindow.open({
-    title: 'Uniewaznij dokument',
-    body: bodyHtml,
-    footer: footerHtml,
-    buttons: 'close',
-    modal: true,
-    width: 440,
-    minHeight: 200,
+  const footer = document.createElement('div');
+  footer.slot = 'footer';
+  footer.style.cssText = 'display:flex;gap:8px;width:100%;';
+  footer.innerHTML = `
+    <div style="flex:1"></div>
+    <tf-button variant="ghost" data-role="cancel">Anuluj</tf-button>
+    <tf-button variant="danger-solid" icon="trash" data-role="submit">Uniewaznij</tf-button>
+  `;
+  dlg.appendChild(footer);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+
+  dlg.addEventListener('close-request', (e) => {
+    if (submitInFlight) { e.preventDefault(); return; }
   });
 
-  setTimeout(() => {
-    const win = document.querySelector('tf-window:last-of-type');
-    if (!win) return;
+  document.body.appendChild(dlg);
 
-    win.addEventListener('close-request', (e) => {
-      if (submitInFlight) e.preventDefault();
-    });
+  const cleanup = () => {
+    if (backdrop.isConnected) backdrop.remove();
+  };
+  const mo = new MutationObserver(() => {
+    if (!dlg.isConnected) {
+      mo.disconnect();
+      cleanup();
+    }
+  });
+  mo.observe(document.body, { childList: true, subtree: true });
 
-    win.addEventListener('action', async (e) => {
-      const act = e.detail?.action;
-      if (act === 'revoke') {
-        e.preventDefault();
-        if (submitInFlight) return;
-        await executeRevoke(win, docId, (val) => { submitInFlight = val; });
-      }
-    });
-  }, 0);
-}
+  const cancelBtn = footer.querySelector('[data-role="cancel"]');
+  const submitBtn = footer.querySelector('[data-role="submit"]');
+  const errorBox = body.querySelector('[data-role="error"]');
 
-async function executeRevoke(win, docId, setInFlight) {
-  const submitBtn = document.getElementById('legal-rev-submit');
-  const errorBox = document.getElementById('legal-rev-error');
-  if (errorBox) { errorBox.style.display = 'none'; errorBox.innerHTML = ''; }
-  if (submitBtn) submitBtn.setAttribute('disabled', '');
-  setInFlight(true);
-  try {
-    await ApiBinary.one('legalDocumentRevokeRequest', { docId });
-    setInFlight(false);
-    win.close(true);
-    toast('Dokument uniewazniony.', 'success');
-    signedUrlCache.delete(docId);
-    await loadDocuments();
-  } catch (err) {
-    setInFlight(false);
-    if (submitBtn) submitBtn.removeAttribute('disabled');
-    const code = err?.code;
-    const reason = err?.reason ?? err?.message ?? '';
-    // Specjalny przypadek: already_revoked = idempotentny sukces dla UX.
-    if (code === 9 && /already_revoked/i.test(reason)) {
-      win.close(true);
-      toast('Dokument byl juz wczesniej uniewazniony.', 'info');
+  cancelBtn?.addEventListener('click', () => {
+    if (submitInFlight) return;
+    dlg.close(true);
+  });
+
+  submitBtn?.addEventListener('click', async () => {
+    if (submitInFlight) return;
+    submitInFlight = true;
+    submitBtn.setAttribute('disabled', '');
+    cancelBtn?.setAttribute('disabled', '');
+    if (errorBox) { errorBox.style.display = 'none'; errorBox.innerHTML = ''; }
+    try {
+      await ApiBinary.one('legalDocumentRevokeRequest', { docId });
+      signedUrlCache.delete(docId);
+      submitInFlight = false;
+      dlg.close(true);
+      toast('Dokument uniewazniony.', 'success');
       await loadDocuments();
-      return;
+    } catch (err) {
+      const code = err?.code;
+      const reason = String(err?.reason ?? err?.message ?? '');
+      // already_revoked = idempotentny sukces. signedUrl jest juz unieważniony
+      // po stronie serwera, wiec wyrzucamy z cache zeby przycisk Pobierz nie
+      // wprowadzal w blad.
+      if (code === 9 && /already_revoked/i.test(reason)) {
+        signedUrlCache.delete(docId);
+        submitInFlight = false;
+        dlg.close(true);
+        toast('Dokument byl juz wczesniej uniewazniony.', 'info');
+        await loadDocuments();
+        return;
+      }
+      submitInFlight = false;
+      submitBtn.removeAttribute('disabled');
+      cancelBtn?.removeAttribute('disabled');
+      const msg = mapErrorMessage(err);
+      if (errorBox) {
+        errorBox.style.display = 'block';
+        errorBox.innerHTML = `<tf-chip variant="danger">${escapeHtml(msg)}</tf-chip>`;
+      } else {
+        toast(`Blad: ${msg}`, 'error');
+      }
     }
-    const msg = mapErrorMessage(err);
-    if (errorBox) {
-      errorBox.style.display = 'block';
-      errorBox.innerHTML = `<tf-chip variant="danger">${escapeHtml(msg)}</tf-chip>`;
-    } else {
-      toast(`Blad: ${msg}`, 'error');
-    }
-  }
+  });
 }
 
 export default LegalScreen;
