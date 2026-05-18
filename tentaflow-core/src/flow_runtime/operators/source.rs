@@ -234,9 +234,12 @@ async fn run_camera_source(
         ctx.org_id.as_deref(),
     );
 
-    // Rate-limit window between emissions. `0` disables rate limiting.
+    // Rate-limit window between emissions. `0` disables rate limiting. We
+    // compute the interval in nanoseconds (sub-ms precision) so high fps
+    // targets do not round down to a coarser ms interval — `1000/120 = 8 ms`
+    // would otherwise permit ~125 fps on a 120-fps target.
     let min_emit_interval = if fps > 0 {
-        Some(Duration::from_millis((1000 / fps.max(1)) as u64))
+        Some(Duration::from_nanos(1_000_000_000u64 / u64::from(fps.max(1))))
     } else {
         None
     };
@@ -344,8 +347,12 @@ async fn run_camera_source(
         }
     }
 
-    // Final flush — emit any pending drops accumulated within the last partial
-    // window so they are not lost on cancellation / camera_offline.
+    // Final flush — pick up any drops still sitting in the subscriber's
+    // internal counter that never made it across as a `StreamMessage::Drop`
+    // (e.g. cancellation arrived first) and combine them with the locally
+    // accumulated window before the audit row is written.
+    dropped_in_window = dropped_in_window.saturating_add(subscriber.dropped_pending());
+
     if dropped_in_window > 0 || rate_limit_skipped > 0 {
         emit_op_audit(
             &ctx.db,
@@ -388,8 +395,11 @@ async fn run_camera_source(
         ctx.org_id.as_deref(),
     );
 
-    // Subscriber drops here; the bus prunes its entry on the next broadcast
-    // via the `try_send` → `Closed` path (see `services::streaming::bus`).
+    // Explicit unsubscribe — without this, a quiet camera with no further
+    // broadcast traffic would leave a stale entry in StreamingBus until the
+    // next publish triggers the Closed-prune path. Cancellation on a silent
+    // stream is a common case, so we eagerly clean up.
+    crate::services::streaming_bus().unsubscribe(&camera_id, &subscriber.stream_id);
     drop(subscriber);
     Ok(())
 }
