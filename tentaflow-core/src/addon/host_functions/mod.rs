@@ -9,6 +9,8 @@ pub mod abi_helpers;
 pub mod aliases;
 #[cfg(feature = "camera")]
 pub mod camera;
+#[cfg(feature = "camera")]
+pub mod camera_metadata;
 pub mod events;
 pub mod flow;
 pub mod gate;
@@ -357,6 +359,29 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "frame_url_v1", recording::frame_url_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja frame_url_v1: {e}"))?;
+
+        // --- ONVIF analytics metadata (F2 P6.b) ---
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_metadata_subscribe_v1",
+                camera_metadata::camera_metadata_subscribe_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_subscribe_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_metadata_unsubscribe_v1",
+                camera_metadata::camera_metadata_unsubscribe_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_unsubscribe_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_metadata_poll_v1",
+                camera_metadata::camera_metadata_poll_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_poll_v1: {e}"))?;
     }
 
     Ok(())
