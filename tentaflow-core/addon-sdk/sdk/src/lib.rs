@@ -387,6 +387,22 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+
+    /// ONVIF analytics metadata (F2 P6.b) — subscribe/poll/unsubscribe to
+    /// per-camera object detection events pulled from the camera's
+    /// PullPoint events service. All payloads are TOML.
+    fn camera_metadata_subscribe_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_metadata_unsubscribe_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_metadata_poll_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -1305,6 +1321,8 @@ pub mod prelude {
         CameraHealthInfo, SnapshotInfo, CameraTestResult,
         stream_subscribe, stream_next, stream_close,
         StreamNextMessage, StreamFrameMeta,
+        camera_metadata_subscribe, camera_metadata_poll, camera_metadata_unsubscribe,
+        MetadataItem, MetadataFrame, MetadataPollResult,
         recording_save_snapshot, recording_save_segment, recording_get_url,
         recording_get_stream, recording_purge, recording_stats, frame_url,
         SavedRecordingInfo, RecordingUrl, RecordingStream, RecordingStats, FrameUrl,
@@ -1841,6 +1859,149 @@ pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
     let bytes = call_sql_with_one_input_capped(stream_close_v1, payload.as_bytes(), MAX_OUT_CAP_STREAM)?;
     let _: StreamCloseOut = parse_toml(&bytes)?;
     Ok(())
+}
+
+// =============================================================================
+// Camera metadata API wrappers (F2 P6.b) — ONVIF analytics events.
+//
+// Subscribe to a camera that already has `metadata_supported = true` (set
+// when ONVIF discovery found a non-empty Media2 metadata configuration).
+// Each `camera_metadata_poll` returns up to `max_items` analytics frames
+// pulled from the camera's PullPoint stream, plus backpressure / offline
+// signals. The host fn enforces `camera.metadata` permission, org isolation
+// and the metadata_supported gate.
+//
+// Requires TentaFlow core built with `--features camera`.
+// =============================================================================
+
+/// One detected object inside a `MetadataFrame`. Fields mirror the ONVIF
+/// analytics schema: `class` (e.g. "Vehicle"), confidence in 0..1,
+/// optional `bbox` as `[left, top, right, bottom]` in normalised 0..1
+/// device coordinates, and an optional `track_id` for cross-frame
+/// correlation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetadataItem {
+    pub class: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub bbox: Option<[f64; 4]>,
+    #[serde(default)]
+    pub track_id: Option<String>,
+}
+
+/// One analytics frame — a single device tick that produced one or more
+/// detections.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetadataFrame {
+    pub camera_id: String,
+    /// Event timestamp in unix milliseconds (as supplied by the device,
+    /// times 1000). May be 0 if the camera omitted the `UtcTime` attribute.
+    pub ts_unix_ms: i64,
+    pub items: Vec<MetadataItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MetadataPollRaw {
+    #[serde(default)]
+    frames: Vec<MetadataFrame>,
+    #[serde(default)]
+    camera_offline: bool,
+    #[serde(default)]
+    dropped: u64,
+}
+
+/// Aggregate poll outcome — frames plus optional backpressure / offline
+/// signals.
+#[derive(Debug, Clone)]
+pub struct MetadataPollResult {
+    pub frames: Vec<MetadataFrame>,
+    /// True iff the camera went offline mid-poll (the supervisor task
+    /// exited or `CameraOffline` was raised on the bus). The addon should
+    /// stop polling this subscription.
+    pub camera_offline: bool,
+    /// Number of frames the host dropped due to bus backpressure since the
+    /// last successful poll.
+    pub dropped: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MetadataSubscribeOut {
+    subscription_id: String,
+    #[allow(dead_code)]
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MetadataUnsubscribeOut {
+    unsubscribed: bool,
+}
+
+/// Subscribe to a camera's ONVIF analytics-metadata stream. The host spawns
+/// (or refcounts) a per-camera PullPoint task; the first subscriber pays
+/// the cost of `CreatePullPointSubscription` against the camera. Errors:
+///
+///   * `Permission` — addon lacks `camera.metadata` or the camera lives in
+///                    another org.
+///   * `NotFound`   — camera does not exist (or is not owned by this addon).
+///   * `Operation`  — camera does not advertise metadata
+///                    (`metadata_supported = false`), or ONVIF credentials
+///                    are missing.
+///   * `CameraUnreachable` — transport error talking to the events service.
+pub fn camera_metadata_subscribe(camera_id: &str) -> Result<String, AbiError> {
+    let payload = format!(
+        "camera_id = {}\n",
+        toml::Value::String(camera_id.to_string()),
+    );
+    let bytes = call_sql_with_one_input_capped(
+        camera_metadata_subscribe_v1,
+        payload.as_bytes(),
+        MAX_OUT_CAP_STREAM,
+    )?;
+    let out: MetadataSubscribeOut = parse_toml(&bytes)?;
+    Ok(out.subscription_id)
+}
+
+/// Bounded-await poll for the next batch of analytics frames. `timeout_ms`
+/// is clamped to 30 000 ms host-side; `max_items` is clamped to 100.
+pub fn camera_metadata_poll(
+    subscription_id: &str,
+    max_items: u32,
+    timeout_ms: u32,
+) -> Result<MetadataPollResult, AbiError> {
+    let payload = format!(
+        "subscription_id = {}\nmax_items = {}\ntimeout_ms = {}\n",
+        toml::Value::String(subscription_id.to_string()),
+        max_items,
+        timeout_ms,
+    );
+    let bytes = call_sql_with_one_input_capped(
+        camera_metadata_poll_v1,
+        payload.as_bytes(),
+        MAX_OUT_CAP_STREAM,
+    )?;
+    let raw: MetadataPollRaw = parse_toml(&bytes)?;
+    Ok(MetadataPollResult {
+        frames: raw.frames,
+        camera_offline: raw.camera_offline,
+        dropped: raw.dropped,
+    })
+}
+
+/// Drop the subscription. Idempotent: a second call for the same id
+/// (or one for an unknown id) returns `Ok(false)`. The supervisor pull
+/// task is cancelled when the last addon unsubscribes from the camera.
+pub fn camera_metadata_unsubscribe(subscription_id: &str) -> Result<bool, AbiError> {
+    let payload = format!(
+        "subscription_id = {}\n",
+        toml::Value::String(subscription_id.to_string()),
+    );
+    let bytes = call_sql_with_one_input_capped(
+        camera_metadata_unsubscribe_v1,
+        payload.as_bytes(),
+        MAX_OUT_CAP_STREAM,
+    )?;
+    let out: MetadataUnsubscribeOut = parse_toml(&bytes)?;
+    Ok(out.unsubscribed)
 }
 
 // =============================================================================

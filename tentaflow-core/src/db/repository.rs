@@ -10931,6 +10931,11 @@ pub struct CameraRow {
     pub credentials_encrypted: Option<Vec<u8>>,
     pub onvif_url: Option<String>,
     pub onvif_profile_token: Option<String>,
+    /// F2 P6.a — true iff the ONVIF discovery step found a non-empty
+    /// metadata configuration on the device. False (the column default) for
+    /// any non-ONVIF camera and for ONVIF cameras whose
+    /// `GetMetadataConfigurations` returned an empty list.
+    pub metadata_supported: bool,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -10970,6 +10975,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         credentials_encrypted: row.get(17)?,
         onvif_url: row.get(18)?,
         onvif_profile_token: row.get(19)?,
+        metadata_supported: row.get::<_, i64>(20).map(|v| v != 0).unwrap_or(false),
     })
 }
 
@@ -10978,7 +10984,7 @@ const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
-     onvif_url, onvif_profile_token";
+     onvif_url, onvif_profile_token, metadata_supported";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -11070,6 +11076,31 @@ pub fn set_camera_onvif_resolved(
         "UPDATE cameras SET url = ?1, onvif_profile_token = ?2, updated_at = ?3 \
          WHERE owner_addon_id = ?4 AND camera_id = ?5 AND org_id = ?6 AND removed_at IS NULL",
         rusqlite::params![new_rtsp_url, profile_token, now, addon_id, camera_id, resolved_org],
+    )?;
+    Ok(n > 0)
+}
+
+/// F2 P6.a — flip the `metadata_supported` flag on a camera row. Returns
+/// `Ok(true)` if a row was updated, `Ok(false)` if no matching row existed
+/// (foreign owner / soft-deleted / wrong org). Used by the ONVIF discovery
+/// step (and tests) to mark cameras whose `GetMetadataConfigurations` call
+/// returned at least one configuration.
+#[cfg(feature = "camera")]
+pub fn set_camera_metadata_supported(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    supported: bool,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let now = chrono::Utc::now().timestamp();
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let flag = if supported { 1_i64 } else { 0_i64 };
+    let n = conn.execute(
+        "UPDATE cameras SET metadata_supported = ?1, updated_at = ?2 \
+         WHERE owner_addon_id = ?3 AND camera_id = ?4 AND org_id = ?5 AND removed_at IS NULL",
+        rusqlite::params![flag, now, addon_id, camera_id, resolved_org],
     )?;
     Ok(n > 0)
 }
