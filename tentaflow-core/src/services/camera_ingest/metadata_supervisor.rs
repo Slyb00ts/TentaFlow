@@ -25,9 +25,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -76,26 +75,80 @@ pub enum SupervisorError {
     Transport(String),
 }
 
+/// Generation counter used to disambiguate handles across rapid
+/// release/ensure cycles. A late `release` for an old generation must not
+/// cancel a newly-spawned task that reused the same `camera_id`.
+type Generation = u64;
+
 struct PullTaskHandle {
     cancel: CancellationToken,
     /// Number of active addon subscriptions on this camera. The task lives
     /// as long as `subscribers > 0`.
     subscribers: usize,
-    /// Detached join handle. We never `.await` it from `release` — the task
-    /// observes `cancel` and exits on its own.
-    _join: JoinHandle<()>,
+    /// Join handle taken by `release_and_wait` so callers can deterministically
+    /// wait for the pull task (and its best-effort Unsubscribe SOAP call) to
+    /// finish before a follow-up `ensure_pull_task` creates a fresh
+    /// subscription on the device.
+    join: Option<JoinHandle<()>>,
+    /// Monotonic generation id stamped at task spawn. A task self-terminating
+    /// (auth failure) checks this on cleanup so it only removes its OWN
+    /// registry entry — a fresh task spawned after a credential rotation
+    /// is not collateral damage.
+    generation: Generation,
 }
 
 #[derive(Default)]
 pub struct MetadataPullSupervisor {
     handles: Mutex<HashMap<String, PullTaskHandle>>,
+    /// Per-camera mutex used as a serialisation point for
+    /// `ensure_pull_task`. Two concurrent first-subscribers serialise on the
+    /// same `Arc<tokio::Mutex>` so only one network round-trip
+    /// (`CreatePullPointSubscription`) is performed; the loser observes the
+    /// winner's handle and refcount-bumps. Held only across the create-and-
+    /// publish window — never across a long-poll.
+    ensure_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Monotonic generation counter (see `PullTaskHandle::generation`).
+    next_generation: Mutex<Generation>,
 }
 
 impl MetadataPullSupervisor {
     pub fn new() -> Self {
         Self {
             handles: Mutex::new(HashMap::new()),
+            ensure_locks: Mutex::new(HashMap::new()),
+            next_generation: Mutex::new(1),
         }
+    }
+
+    /// Acquire (or create) the per-camera ensure lock. The returned `Arc`
+    /// keeps the lock alive for the duration of the caller's critical
+    /// section; the registry entry is dropped when the last `Arc` falls.
+    fn ensure_lock_for(&self, camera_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut g = self.ensure_locks.lock();
+        g.entry(camera_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Drop the per-camera ensure-lock entry once nobody is holding it.
+    /// Called after the create-subscription window closes to keep the map
+    /// from growing unbounded over the lifetime of the process.
+    fn maybe_drop_ensure_lock(&self, camera_id: &str, current: &Arc<tokio::sync::Mutex<()>>) {
+        let mut g = self.ensure_locks.lock();
+        if let Some(existing) = g.get(camera_id) {
+            // Strong count == 2 means only the map and our local Arc still
+            // reference the lock; no other ensure_pull_task is waiting.
+            if Arc::ptr_eq(existing, current) && Arc::strong_count(current) == 2 {
+                g.remove(camera_id);
+            }
+        }
+    }
+
+    fn next_gen(&self) -> Generation {
+        let mut g = self.next_generation.lock();
+        let v = *g;
+        *g = g.wrapping_add(1);
+        v
     }
 
     /// Process-wide singleton. Matches the `metadata_bus()` accessor.
@@ -117,7 +170,9 @@ impl MetadataPullSupervisor {
         creds: OnvifCredentials,
         events_service_url: String,
     ) -> Result<(), SupervisorError> {
-        // Refcount bump path — task already running.
+        // Fast path — task already running. Take the bump without acquiring
+        // the per-camera ensure lock so a steady-state stream of subscribes
+        // never blocks on the slow path.
         {
             let mut guard = self.handles.lock();
             if let Some(h) = guard.get_mut(camera_id) {
@@ -130,16 +185,45 @@ impl MetadataPullSupervisor {
             }
         }
 
-        // Initial subscribe — do this BEFORE spawning so the caller learns
-        // immediately about AuthFailed / Transport errors.
-        let initial = create_pull_point_subscription(
+        // Slow path — serialise concurrent first-subscribers so only one
+        // CreatePullPointSubscription is issued per camera. The lock is
+        // released before the long-poll loop starts.
+        let lock = self.ensure_lock_for(camera_id);
+        let _permit = lock.lock().await;
+
+        // Re-check: another first-subscriber may have won the lock and
+        // already installed a handle. Refcount-bump and return.
+        {
+            let mut guard = self.handles.lock();
+            if let Some(h) = guard.get_mut(camera_id) {
+                h.subscribers += 1;
+                debug!(
+                    "metadata_supervisor: refcount={} for camera_id='{}' (post-lock)",
+                    h.subscribers, camera_id
+                );
+                drop(guard);
+                drop(_permit);
+                self.maybe_drop_ensure_lock(camera_id, &lock);
+                return Ok(());
+            }
+        }
+
+        // No competing winner — perform the network round-trip.
+        let initial = match create_pull_point_subscription(
             &events_service_url,
             &creds,
             SUBSCRIPTION_INITIAL_TERMINATION_SECS,
             PULL_TIMEOUT_MS,
         )
         .await
-        .map_err(map_initial_error)?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                drop(_permit);
+                self.maybe_drop_ensure_lock(camera_id, &lock);
+                return Err(map_initial_error(e));
+            }
+        };
 
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -147,6 +231,7 @@ impl MetadataPullSupervisor {
         let task_url = events_service_url.clone();
         let task_creds = creds.clone();
         let supervisor = Arc::clone(self);
+        let generation = self.next_gen();
 
         let join = tokio::spawn(async move {
             run_pull_loop(
@@ -156,36 +241,35 @@ impl MetadataPullSupervisor {
                 task_creds,
                 initial,
                 task_cancel,
+                generation,
             )
             .await;
         });
 
-        let mut guard = self.handles.lock();
-        // Race: a concurrent ensure may have inserted; if so cancel ours and
-        // bump the existing refcount instead.
-        if let Some(h) = guard.get_mut(camera_id) {
-            h.subscribers += 1;
-            drop(guard);
-            cancel.cancel();
-            return Ok(());
-        }
-        guard.insert(
+        self.handles.lock().insert(
             camera_id.to_string(),
             PullTaskHandle {
                 cancel,
                 subscribers: 1,
-                _join: join,
+                join: Some(join),
+                generation,
             },
         );
         info!(
-            "metadata_supervisor: spawned pull task for camera_id='{}'",
+            "metadata_supervisor: spawned pull task for camera_id='{}' gen={generation}",
             camera_id
         );
+        drop(_permit);
+        self.maybe_drop_ensure_lock(camera_id, &lock);
         Ok(())
     }
 
     /// Decrements the refcount; cancels the pull task when it reaches zero.
     /// Calling `release` for an unknown camera_id is a no-op (idempotent).
+    /// The pull task observes the cancel token and exits asynchronously —
+    /// callers that need to wait for the device-side Unsubscribe SOAP call
+    /// to complete (typical when an addon resubscribes immediately) should
+    /// use `release_and_wait` instead.
     pub fn release(&self, camera_id: &str) {
         let mut guard = self.handles.lock();
         let drop_now = match guard.get_mut(camera_id) {
@@ -204,7 +288,44 @@ impl MetadataPullSupervisor {
                     "metadata_supervisor: refcount=0, cancelled pull task for '{}'",
                     camera_id
                 );
+                // Drop the JoinHandle — the task observes cancel and exits.
+                drop(h.join);
             }
+        }
+    }
+
+    /// Async sibling of `release`. When the refcount drops to zero the
+    /// caller awaits the pull task's exit (bounded by `JOIN_TIMEOUT`) so
+    /// the device-side Unsubscribe SOAP call has a chance to complete
+    /// before a follow-up `ensure_pull_task` creates a fresh subscription.
+    /// Returns `Ok(())` whether or not the wait timed out — the timeout
+    /// path simply detaches the task and lets it finish in the background.
+    pub async fn release_and_wait(&self, camera_id: &str) {
+        const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+        let join_opt = {
+            let mut guard = self.handles.lock();
+            let drop_now = match guard.get_mut(camera_id) {
+                Some(h) => {
+                    if h.subscribers > 0 {
+                        h.subscribers -= 1;
+                    }
+                    h.subscribers == 0
+                }
+                None => return,
+            };
+            if !drop_now {
+                return;
+            }
+            let h = guard.remove(camera_id).expect("just confirmed present");
+            h.cancel.cancel();
+            info!(
+                "metadata_supervisor: refcount=0, awaiting pull task exit for '{}'",
+                camera_id
+            );
+            h.join
+        };
+        if let Some(j) = join_opt {
+            let _ = tokio::time::timeout(JOIN_TIMEOUT, j).await;
         }
     }
 
@@ -241,6 +362,40 @@ fn map_initial_error(e: OnvifError) -> SupervisorError {
     }
 }
 
+/// Detect SOAP faults that imply the device-side subscription is gone
+/// (expired or unknown reference). These trigger an immediate recreate
+/// instead of waiting for the renewal timer.
+fn fault_indicates_dead_subscription(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("resourceunknown")
+        || lower.contains("unabletogetmessages")
+        || lower.contains("expired")
+        || lower.contains("notfound")
+}
+
+/// Compute the local `Instant` at which the next renewal must complete.
+/// `requested_secs` is what we asked the device for; `device_termination_unix`
+/// is what the device echoed back. We do NOT trust the device's absolute
+/// clock — clock skew between the host and the camera would otherwise push
+/// the renewal arbitrarily late. Instead we anchor on the local receipt
+/// `Instant` and use the SHORTER of (a) the device's reported lifetime
+/// converted to a delta, (b) the lifetime we originally requested.
+fn renewal_deadline(
+    received_at: Instant,
+    requested_secs: u32,
+    device_termination_unix: i64,
+    receipt_unix: i64,
+) -> Instant {
+    let device_delta_secs = (device_termination_unix - receipt_unix).max(0) as u64;
+    let requested = requested_secs as u64;
+    // Pick the shorter lifetime so a buggy device that echoes a far-future
+    // timestamp cannot keep us from renewing.
+    let chosen = device_delta_secs.min(requested).max(1);
+    let lead = RENEW_LEAD_SECS as u64;
+    let until_renew = chosen.saturating_sub(lead);
+    received_at + Duration::from_secs(until_renew)
+}
+
 async fn run_pull_loop(
     supervisor: Arc<MetadataPullSupervisor>,
     camera_id: String,
@@ -248,24 +403,31 @@ async fn run_pull_loop(
     creds: OnvifCredentials,
     initial: crate::services::camera_ingest::onvif_events::PullPointSubscription,
     cancel: CancellationToken,
+    generation: Generation,
 ) {
     audit_pull(&camera_id, "pull_started", None);
 
     let mut subscription = initial;
+    // Local clock anchor for the initial subscription's renewal.
+    let mut sub_received_at = Instant::now();
+    let mut sub_receipt_unix = chrono::Utc::now().timestamp();
     let mut backoff_ms: u64 = MIN_BACKOFF_MS;
 
-    loop {
+    'outer: loop {
         // Cancel-aware short-circuit before each long-poll iteration.
         if cancel.is_cancelled() {
             break;
         }
 
-        // Renew (re-create) the subscription proactively. ONVIF cameras drop
-        // pulls past `TerminationTime` and return either `ResourceUnknown`
-        // SOAP faults or HTTP 404 — recreating before the deadline keeps the
-        // loop steady-state.
-        let now = Utc::now().timestamp();
-        if subscription.termination_time_unix - now <= RENEW_LEAD_SECS {
+        // Renew (re-create) the subscription proactively. We compare on
+        // local `Instant`s to immunise against clock skew with the camera.
+        let deadline = renewal_deadline(
+            sub_received_at,
+            SUBSCRIPTION_INITIAL_TERMINATION_SECS,
+            subscription.termination_time_unix,
+            sub_receipt_unix,
+        );
+        if Instant::now() >= deadline {
             match create_pull_point_subscription(
                 &events_service_url,
                 &creds,
@@ -275,9 +437,6 @@ async fn run_pull_loop(
             .await
             {
                 Ok(fresh) => {
-                    // Best-effort teardown of the previous subscription so we
-                    // do not leave orphans on the camera. Idempotent — silently
-                    // swallows SOAP faults from already-expired subscriptions.
                     let _ = unsubscribe_pull_point(
                         &subscription.reference_uri,
                         &creds,
@@ -285,20 +444,15 @@ async fn run_pull_loop(
                     )
                     .await;
                     subscription = fresh;
+                    sub_received_at = Instant::now();
+                    sub_receipt_unix = chrono::Utc::now().timestamp();
                     debug!(
                         "metadata_supervisor: renewed subscription for '{}'",
                         camera_id
                     );
                 }
                 Err(OnvifError::AuthFailed) => {
-                    warn!(
-                        "metadata_supervisor: auth failed on renew for '{}', exiting",
-                        camera_id
-                    );
-                    audit_pull(&camera_id, "pull_stopped", Some("auth_failed"));
-                    // Drop the registry entry so a later `ensure_pull_task`
-                    // can spawn a fresh task once creds are rotated.
-                    supervisor.handles.lock().remove(&camera_id);
+                    handle_auth_failure(&supervisor, &camera_id, generation).await;
                     return;
                 }
                 Err(e) => {
@@ -335,9 +489,6 @@ async fn run_pull_loop(
                 backoff_ms = MIN_BACKOFF_MS;
                 for ev in events {
                     if ev.items.is_empty() {
-                        // Filter out events without a parsable metadata
-                        // payload — they are typically motion / tamper alerts
-                        // we surface via a separate path in F3.
                         continue;
                     }
                     let frame = MetadataFrame {
@@ -349,13 +500,48 @@ async fn run_pull_loop(
                 }
             }
             Err(OnvifError::AuthFailed) => {
+                handle_auth_failure(&supervisor, &camera_id, generation).await;
+                return;
+            }
+            Err(OnvifError::SoapFault(ref fault))
+                if fault_indicates_dead_subscription(fault) =>
+            {
+                // Device dropped the subscription out from under us — recreate
+                // immediately instead of waiting for the renewal timer.
                 warn!(
-                    "metadata_supervisor: auth failed mid-loop for '{}', exiting",
+                    "metadata_supervisor: subscription dead for '{}' ({fault}); recreating",
                     camera_id
                 );
-                audit_pull(&camera_id, "pull_stopped", Some("auth_failed"));
-                supervisor.handles.lock().remove(&camera_id);
-                return;
+                match create_pull_point_subscription(
+                    &events_service_url,
+                    &creds,
+                    SUBSCRIPTION_INITIAL_TERMINATION_SECS,
+                    PULL_TIMEOUT_MS,
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        subscription = fresh;
+                        sub_received_at = Instant::now();
+                        sub_receipt_unix = chrono::Utc::now().timestamp();
+                        backoff_ms = MIN_BACKOFF_MS;
+                    }
+                    Err(OnvifError::AuthFailed) => {
+                        handle_auth_failure(&supervisor, &camera_id, generation).await;
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "metadata_supervisor: recreate after dead-sub failed for '{}': {e}",
+                            camera_id
+                        );
+                        if sleep_or_cancel(&cancel, backoff_ms).await {
+                            break 'outer;
+                        }
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                    }
+                }
+                continue;
             }
             Err(e) => {
                 warn!(
@@ -380,6 +566,34 @@ async fn run_pull_loop(
     )
     .await;
     audit_pull(&camera_id, "pull_stopped", Some("cancelled"));
+}
+
+/// Auth failure path: emit CameraOffline to every active bus subscriber so
+/// addons learn the subscription is dead, then remove the supervisor handle
+/// — but only when the entry's generation still matches. A late auth-fail
+/// for a previous generation must not yank a freshly-spawned task that was
+/// installed after credentials were rotated.
+async fn handle_auth_failure(
+    supervisor: &Arc<MetadataPullSupervisor>,
+    camera_id: &str,
+    generation: Generation,
+) {
+    warn!(
+        "metadata_supervisor: auth failed for '{}' gen={generation}, closing bus",
+        camera_id
+    );
+    metadata_bus()
+        .close_camera(camera_id, "auth_failed")
+        .await;
+    {
+        let mut g = supervisor.handles.lock();
+        if let Some(h) = g.get(camera_id) {
+            if h.generation == generation {
+                g.remove(camera_id);
+            }
+        }
+    }
+    audit_pull(camera_id, "pull_stopped", Some("auth_failed"));
 }
 
 /// Sleeps `ms` milliseconds or returns `true` if cancelled mid-sleep.
@@ -436,7 +650,8 @@ mod tests {
             PullTaskHandle {
                 cancel,
                 subscribers: 1,
-                _join: join,
+                join: Some(join),
+                generation: 0,
             },
         );
         sup.handles
@@ -534,5 +749,126 @@ mod tests {
             reference_uri: "http://x".into(),
             termination_time_unix: 0,
         };
+    }
+
+    // ---------------------------------------------------------------------
+    // Codex review fixes — issue-specific regression tests
+    // ---------------------------------------------------------------------
+
+    /// Issue #1: two `ensure_lock_for` callers must obtain the SAME lock so a
+    /// concurrent first-subscribe is serialised at the create-subscription
+    /// boundary. We probe the registry directly rather than driving real
+    /// network I/O.
+    #[tokio::test]
+    async fn ensure_lock_for_returns_same_lock_per_camera() {
+        let sup = Arc::new(MetadataPullSupervisor::new());
+        let a = sup.ensure_lock_for("cam_lock");
+        let b = sup.ensure_lock_for("cam_lock");
+        assert!(Arc::ptr_eq(&a, &b), "same camera_id must hand back same Arc");
+        // Different camera_id must yield a distinct Arc.
+        let c = sup.ensure_lock_for("cam_other");
+        assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    /// Issue #1: after a serialised first-subscribe completes and both Arcs
+    /// drop, `maybe_drop_ensure_lock` evicts the entry so the per-camera
+    /// lock map does not grow unbounded.
+    #[tokio::test]
+    async fn maybe_drop_ensure_lock_evicts_when_last_ref() {
+        let sup = Arc::new(MetadataPullSupervisor::new());
+        let l = sup.ensure_lock_for("cam_evict");
+        sup.maybe_drop_ensure_lock("cam_evict", &l);
+        // Lock entry removed; a fresh acquire creates a NEW Arc.
+        drop(l);
+        let fresh = sup.ensure_lock_for("cam_evict");
+        let _ = fresh;
+    }
+
+    /// Issue #3: `release_and_wait` cancels the task AND awaits its exit so a
+    /// subscribe-after-unsubscribe sees the previous task finished.
+    #[tokio::test]
+    async fn release_and_wait_blocks_until_task_exits() {
+        let sup = Arc::new(MetadataPullSupervisor::new());
+        let tok = install_synthetic_task(&sup, "cam_join");
+        // The synthetic task exits as soon as it observes cancel.
+        sup.release_and_wait("cam_join").await;
+        // Task must be cancelled (its idle loop terminates) and entry gone.
+        assert!(tok.is_cancelled());
+        assert_eq!(sup.active_count(), 0);
+    }
+
+    /// Issue #3: `release_and_wait` for an unknown camera is a no-op (same
+    /// idempotent semantics as `release`).
+    #[tokio::test]
+    async fn release_and_wait_unknown_camera_is_noop() {
+        let sup = Arc::new(MetadataPullSupervisor::new());
+        sup.release_and_wait("never-seen").await;
+        assert_eq!(sup.active_count(), 0);
+    }
+
+    /// Issue #6: renewal anchors on the LOCAL `Instant` of receipt and on
+    /// the shorter of (device-reported lifetime, requested lifetime). A
+    /// camera whose clock is far in the future cannot trick the supervisor
+    /// into postponing renewal indefinitely.
+    #[test]
+    fn renewal_deadline_caps_at_requested_lifetime() {
+        let received_at = Instant::now();
+        // Device claims a 10-hour subscription but we asked for 600 s.
+        let receipt_unix = 1_700_000_000;
+        let device_term = receipt_unix + 36_000;
+        let dl = renewal_deadline(received_at, 600, device_term, receipt_unix);
+        // Must be `received_at + (600 - 60) = +540 s`, NOT 36000 - 60 s.
+        let expected = received_at + Duration::from_secs(540);
+        assert!(dl <= expected + Duration::from_millis(1));
+        assert!(dl >= expected - Duration::from_millis(1));
+    }
+
+    /// Issue #6: SOAP faults that name a dead subscription must trigger an
+    /// immediate recreate in the pull loop. `fault_indicates_dead_subscription`
+    /// is the predicate that gates that branch.
+    #[test]
+    fn dead_subscription_fault_detector_matches_known_strings() {
+        assert!(fault_indicates_dead_subscription(
+            "wsnt:ResourceUnknownFault: subscription expired"
+        ));
+        assert!(fault_indicates_dead_subscription("UnableToGetMessages"));
+        assert!(fault_indicates_dead_subscription("ter:Expired"));
+        assert!(fault_indicates_dead_subscription("NotFound"));
+        assert!(!fault_indicates_dead_subscription(
+            "ter:ActionNotSupported"
+        ));
+        assert!(!fault_indicates_dead_subscription(""));
+    }
+
+    /// Issue #4: when the auth-failure path runs, it must remove the handle
+    /// ONLY when the generation still matches. A late auth-fail from an old
+    /// task must not cancel a freshly-spawned task that replaced it.
+    #[tokio::test]
+    async fn handle_auth_failure_respects_generation() {
+        let sup = Arc::new(MetadataPullSupervisor::new());
+        // Install a synthetic "new generation" handle by hand.
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let join = tokio::spawn(async move { task_cancel.cancelled().await });
+        sup.handles.lock().insert(
+            "cam_gen".to_string(),
+            PullTaskHandle {
+                cancel,
+                subscribers: 1,
+                join: Some(join),
+                generation: 42,
+            },
+        );
+        // Call handle_auth_failure with a STALE generation (1) — must NOT
+        // remove the live handle.
+        handle_auth_failure(&sup, "cam_gen", 1).await;
+        assert_eq!(
+            sup.active_count(),
+            1,
+            "stale-generation auth failure must not yank live handle"
+        );
+        // Now the matching generation — handle is removed.
+        handle_auth_failure(&sup, "cam_gen", 42).await;
+        assert_eq!(sup.active_count(), 0);
     }
 }
