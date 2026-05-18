@@ -92,6 +92,45 @@ pub fn streaming_bus() -> &'static Arc<streaming::StreamingBus> {
 /// the cost (one `stat()` per key per 5 s) is invisible.
 const KEY_WATCHER_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Fire a best-effort mesh broadcast after an on-disk key rotation.
+///
+/// Called from the key-storage watcher callback once the new bytes have been
+/// loaded into the in-memory issuer. If the mesh pipeline never registered
+/// a `BroadcastHook` (single-node deployment) this is a no-op. Any error —
+/// rate-limit, encoding, no trusted peers — is emitted to `audit_log` and
+/// otherwise swallowed: the rotation itself has already succeeded.
+fn trigger_mesh_broadcast_on_rotate(rotated_name: &'static str) {
+    let Some(hook) = mesh_keys::broadcast_hook() else {
+        // No mesh in this process — nothing to broadcast to. Silent.
+        return;
+    };
+    let iroh = hook.iroh.clone();
+    let node_id = hook.local_node_id.clone();
+    tokio::spawn(async move {
+        let pool = mesh_keys::mesh_key_pool();
+        let outcome = pool
+            .broadcast_on_rotate(&node_id, rotated_name, &iroh)
+            .await;
+        match &outcome {
+            Ok(br) => tracing::info!(
+                target: "tentaflow::mesh_keys::broadcast",
+                name = rotated_name,
+                peer_count = br.peer_count,
+                ok_count = br.ok_count,
+                err_count = br.err_count,
+                "broadcast_on_rotate completed"
+            ),
+            Err(e) => tracing::warn!(
+                target: "tentaflow::mesh_keys::broadcast",
+                name = rotated_name,
+                error = %e,
+                "broadcast_on_rotate failed (rotation itself succeeded)"
+            ),
+        }
+        mesh_keys::emit_broadcast_audit(rotated_name, outcome.as_ref());
+    });
+}
+
 pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
     PICKUP_TOKEN_ISSUER.get_or_init(|| {
         let issuer = Arc::new(pickup_tokens::PickupTokenIssuer::new());
@@ -105,6 +144,7 @@ pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
+                    trigger_mesh_broadcast_on_rotate(pickup_tokens::KEY_NAME);
                 },
             );
         }
@@ -126,6 +166,9 @@ pub fn frame_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::FrameUrl.key_name(),
+                    );
                 },
             );
         }
@@ -148,6 +191,9 @@ pub fn recording_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::Recording.key_name(),
+                    );
                 },
             );
         }
