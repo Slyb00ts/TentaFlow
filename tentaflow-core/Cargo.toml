@@ -5,7 +5,7 @@ edition = "2021"
 description = "TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobile"
 
 [features]
-default = ["inference-whisper"]
+default = ["inference-whisper", "camera"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # whisper-rs i llama-cpp-2 obie linkuja wlasna kopie ggml. Duplicate symbols
