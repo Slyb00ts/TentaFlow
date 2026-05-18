@@ -653,6 +653,24 @@ impl AddonManager {
             self.install_manifest_aliases(&manifest)?;
         }
 
+        // F2-P3 — push [runtime] overrides into the scheduler and the
+        // service_call rate limiter so the cap/rate-limit per addon actually
+        // takes effect from the next invocation (instead of waiting for a
+        // process restart or a manual API call). 0 sentinel = no override
+        // (clear back to default), Some(n>0) = apply.
+        if let Some(rt) = manifest.runtime_overrides.as_ref() {
+            let sched = crate::flow_runtime::scheduler::FlowScheduler::global();
+            match rt.max_concurrency {
+                Some(n) if n > 0 => sched.set_addon_concurrency_cap(&manifest.addon_id, n),
+                _ => sched.clear_addon_concurrency_cap(&manifest.addon_id),
+            }
+            let rl = crate::services::service_call_rate_limit::service_call_rate_limiter();
+            match rt.rate_limit_per_min {
+                Some(n) if n > 0 => rl.set_addon_rate_limit_per_min(&manifest.addon_id, n),
+                _ => rl.clear_addon_rate_limit(&manifest.addon_id),
+            }
+        }
+
         info!(
             "Addon '{}' v{} zainstalowany pomyslnie",
             manifest.addon_id, manifest.version
