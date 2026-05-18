@@ -72,17 +72,19 @@ async fn source_emits_count_records_then_eof() {
 }
 
 #[tokio::test]
-async fn source_rejects_camera_stream() {
+async fn source_rejects_unknown_camera_id() {
+    // No row in `cameras` for this addon/org → operator must fail fast with a
+    // tenant-scoped denial rather than silently producing zero records.
     let db = fresh_db();
     let sched = Arc::new(FlowScheduler::new(db.clone()));
-    let addon = unique_addon("src-cam");
+    let addon = unique_addon("src-cam-missing");
     let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
     let json = format!(
         r#"{{
             "schema_version": 1,
             "id": "{flow_id}",
             "operators": [
-                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.main", "fps": 5 }} }},
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.does-not-exist", "fps": 5 }} }},
                 {{ "id": "snk", "type": "Sink",   "params": {{}} }}
             ],
             "edges": [ {{ "from": "src", "to": "snk" }} ]
@@ -94,11 +96,65 @@ async fn source_rejects_camera_stream() {
         .await
         .expect("invoke");
     assert_eq!(status.status, "failed");
+    let err = status.error.as_deref().unwrap_or("");
     assert!(
-        status.error.as_deref().unwrap_or("").contains("camera.*"),
-        "error: {:?}",
-        status.error
+        err.contains("camera_not_found_or_not_in_org"),
+        "error: {err:?}",
     );
+}
+
+#[tokio::test]
+async fn source_rejects_empty_camera_id() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("src-cam-empty");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera." }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{}} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let status = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .await
+        .expect("invoke");
+    assert_eq!(status.status, "failed");
+    let err = status.error.as_deref().unwrap_or("");
+    assert!(err.contains("empty camera id"), "error: {err:?}");
+}
+
+#[tokio::test]
+async fn source_rejects_fps_over_max() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("src-fps-bad");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "input", "fps": 9999 }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{}} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let status = sched
+        .invoke(&addon, &flow_id, toml::Value::Integer(0), 5_000, None, None)
+        .await
+        .expect("invoke");
+    assert_eq!(status.status, "failed");
+    let err = status.error.as_deref().unwrap_or("");
+    assert!(err.contains("exceeds max"), "error: {err:?}");
 }
 
 #[tokio::test]
@@ -644,6 +700,300 @@ async fn sink_sql_exec_honors_cancel() {
         "operator should return within timeout, took {:?}",
         elapsed
     );
+}
+
+// -----------------------------------------------------------------------------
+// Source — camera.<id> (real streaming_bus subscription)
+// -----------------------------------------------------------------------------
+//
+// These tests use the process-wide `services::streaming_bus()` singleton.
+// Camera ids are uuid-tagged per test to avoid cross-test interference; each
+// test inserts its own `cameras` row owned by its addon so org/ownership
+// guards exercise the real query path.
+
+#[cfg(feature = "camera")]
+async fn wait_terminal(
+    sched: &Arc<FlowScheduler>,
+    invocation_id: &str,
+    addon_id: &str,
+) -> crate::flow_runtime::scheduler::InvocationStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let st = sched.status(invocation_id, addon_id).await.expect("status");
+        if st.status != "running" {
+            return st;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("invocation {invocation_id} did not terminate within 5s");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(feature = "camera")]
+fn insert_test_camera(db: &DbPool, addon_id: &str, camera_id: &str) {
+    crate::db::repository::insert_camera(
+        db,
+        camera_id,
+        addon_id,
+        "test cam",
+        "fake_file",
+        "fake://test",
+        5,
+        Some(4),
+        Some(2),
+        "B",
+        "default",
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("insert_camera");
+}
+
+#[cfg(feature = "camera")]
+fn mk_meta(camera_id: &str) -> crate::services::frame_storage::FrameMetadata {
+    crate::services::frame_storage::FrameMetadata {
+        camera_id: camera_id.to_string(),
+        width: 4,
+        height: 2,
+        pixel_format: crate::services::frame_storage::FramePixelFormat::Rgb24,
+        timestamp_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+        pts: None,
+        frame_size_bytes: 8,
+    }
+}
+
+#[cfg(feature = "camera")]
+fn count_audit_rows(db: &DbPool, addon_id: &str, action_like: &str) -> i64 {
+    let conn = db.lock().expect("db lock");
+    conn.query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE addon_id = ?1 AND action LIKE ?2",
+        rusqlite::params![addon_id, action_like],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
+#[cfg(feature = "camera")]
+#[tokio::test]
+async fn camera_source_emits_frames_from_bus() {
+    use crate::services::frame_storage::RawFrameRef;
+
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("src-cam-frames");
+    let camera_id = format!("cam-frames-{}", uuid::Uuid::new_v4());
+    insert_test_camera(&db, &addon, &camera_id);
+
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.{camera_id}" }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{ "kind": "invocation_result" }} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+
+    // Launch detached; push frames; close camera to drive natural completion
+    // (result_toml is only written on the `completed` terminal status).
+    let initial = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 0, None, None)
+        .await
+        .expect("invoke");
+    let invocation_id = initial.invocation_id.clone();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let bus = crate::services::streaming_bus();
+    for _ in 0..5 {
+        bus.broadcast(&camera_id, RawFrameRef::new(), mk_meta(&camera_id));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    bus.close_camera(&camera_id, "test_drain").await;
+    let status = wait_terminal(&sched, &invocation_id, &addon).await;
+    assert_eq!(status.status, "completed", "error: {:?}", status.error);
+    let records = extract_records(status.result_toml.as_deref().unwrap_or("records = []"));
+    assert!(
+        records.len() >= 3,
+        "expected ≥3 frame records, got {}: {:?}",
+        records.len(),
+        records
+    );
+    let first = &records[0];
+    assert_eq!(first.get("camera_id").and_then(|v| v.as_str()), Some(camera_id.as_str()));
+    assert!(first.get("raw_ref").and_then(|v| v.as_str()).is_some());
+    assert!(first.get("ts").and_then(|v| v.as_integer()).is_some());
+}
+
+#[cfg(feature = "camera")]
+#[tokio::test]
+async fn camera_source_respects_fps_rate_limit() {
+    use crate::services::frame_storage::RawFrameRef;
+
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("src-cam-fps");
+    let camera_id = format!("cam-fps-{}", uuid::Uuid::new_v4());
+    insert_test_camera(&db, &addon, &camera_id);
+
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    // fps=5 → emit window 200 ms. Over 1.5 s we accept at most ~10 records
+    // including the very first frame which passes without a prev anchor.
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.{camera_id}", "fps": 5 }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{ "kind": "invocation_result" }} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+
+    let initial = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 0, None, None)
+        .await
+        .expect("invoke");
+    let invocation_id = initial.invocation_id.clone();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let bus = crate::services::streaming_bus();
+    // Fire 30 frames at ~30 fps over ~1 s.
+    for _ in 0..30 {
+        bus.broadcast(&camera_id, RawFrameRef::new(), mk_meta(&camera_id));
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    bus.close_camera(&camera_id, "test_drain").await;
+    let status = wait_terminal(&sched, &invocation_id, &addon).await;
+    assert_eq!(status.status, "completed", "error: {:?}", status.error);
+    let records = extract_records(status.result_toml.as_deref().unwrap_or("records = []"));
+    assert!(
+        records.len() <= 12,
+        "fps=5 over ≤1.5s should yield ≤12 records, got {}",
+        records.len()
+    );
+    assert!(
+        records.len() >= 2,
+        "fps=5 should still let at least 2 records through, got {}",
+        records.len()
+    );
+}
+
+#[cfg(feature = "camera")]
+#[tokio::test]
+async fn camera_source_unknown_camera_id_fails_fast() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("src-cam-404");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.nonexistent-{}" }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{}} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#,
+        uuid::Uuid::new_v4()
+    );
+    registry::global().register(&addon, compile_flow(&json));
+    let status = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .await
+        .expect("invoke");
+    assert_eq!(status.status, "failed");
+    assert!(status
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("camera_not_found_or_not_in_org"));
+    // Audit row must record the denial.
+    let denied = count_audit_rows(&db, &addon, "flow.op.source.error");
+    assert!(denied >= 1, "expected at least one source.error audit row");
+}
+
+#[cfg(feature = "camera")]
+#[tokio::test]
+async fn camera_source_rejects_cross_addon_owner() {
+    // Camera installed by addon_a; addon_b in the same org_default tries to
+    // subscribe — ownership guard refuses without leaking existence.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon_a = unique_addon("src-owner-a");
+    let addon_b = unique_addon("src-owner-b");
+    let camera_id = format!("cam-owner-{}", uuid::Uuid::new_v4());
+    insert_test_camera(&db, &addon_a, &camera_id);
+
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.{camera_id}" }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{}} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon_b, compile_flow(&json));
+    let status = sched
+        .invoke(&addon_b, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .await
+        .expect("invoke");
+    assert_eq!(status.status, "failed");
+    assert!(status
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("camera_not_found_or_not_in_org"));
+}
+
+#[cfg(feature = "camera")]
+#[tokio::test]
+async fn camera_source_camera_offline_completes_cleanly() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("src-cam-off");
+    let camera_id = format!("cam-off-{}", uuid::Uuid::new_v4());
+    insert_test_camera(&db, &addon, &camera_id);
+
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "id": "{flow_id}",
+            "operators": [
+                {{ "id": "src", "type": "Source", "params": {{ "stream": "camera.{camera_id}" }} }},
+                {{ "id": "snk", "type": "Sink",   "params": {{ "kind": "invocation_result" }} }}
+            ],
+            "edges": [ {{ "from": "src", "to": "snk" }} ]
+        }}"#
+    );
+    registry::global().register(&addon, compile_flow(&json));
+
+    let initial = sched
+        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 0, None, None)
+        .await
+        .expect("invoke");
+    let invocation_id = initial.invocation_id.clone();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    crate::services::streaming_bus()
+        .close_camera(&camera_id, "test_close")
+        .await;
+    let status = wait_terminal(&sched, &invocation_id, &addon).await;
+    assert_eq!(status.status, "completed", "error: {:?}", status.error);
+    let off_audits = count_audit_rows(&db, &addon, "flow.op.source.camera_offline");
+    assert!(off_audits >= 1, "expected camera_offline audit row");
 }
 
 #[tokio::test]
