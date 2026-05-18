@@ -44,6 +44,13 @@ export function openInstallWizard(opts = {}) {
     },
     // Step 3 — aliases: alias_name -> {enabled: bool, target: string}
     aliases: new Map(),
+    // Step 4 — discovered ONVIF cameras
+    cameras: {
+      discovered: [],
+      added: new Map(),
+      loading: false,
+      error: null,
+    },
   };
 
   initFromManifest();
@@ -245,7 +252,7 @@ function renderStepBody() {
     case 1: return renderPermissionsStep();
     case 2: return renderStorageStep();
     case 3: return renderAliasesStep();
-    case 4:
+    case 4: return renderCamerasStep();
     case 5:
     case 6:
       return renderPlaceholderStep(state.currentStep);
@@ -472,6 +479,294 @@ function renderAliasesStep() {
   `;
 }
 
+// --- Step 4: Discovered cameras (ONVIF) ------------------------------------
+
+function renderCamerasStep() {
+  const c = state.cameras;
+  const tableId = 'wizard-cameras-table';
+  const headerLine = `
+    <div class="wizard-cameras-header">
+      <div>
+        <h2 class="wizard-section-title">${escapeHtml(I18n.t('install_wizard.step4_title'))}</h2>
+        <p class="wizard-section-sub">${escapeHtml(I18n.t('install_wizard.step4_sub'))}</p>
+      </div>
+      <div class="wizard-cameras-actions">
+        <tf-button variant="ghost" icon="refresh" data-role="cameras-refresh" ${c.loading ? 'disabled' : ''}>${escapeHtml(I18n.t('install_wizard.cameras_refresh'))}</tf-button>
+        <tf-button variant="ghost" icon="chevron-right" data-role="cameras-skip">${escapeHtml(I18n.t('install_wizard.cameras_skip'))}</tf-button>
+      </div>
+    </div>
+  `;
+
+  if (c.loading) {
+    return `
+      ${headerLine}
+      <div class="wizard-cameras-state">
+        <svg class="icon spin"><use href="#i-refresh"/></svg>
+        <span>${escapeHtml(I18n.t('install_wizard.cameras_loading'))}</span>
+      </div>
+    `;
+  }
+
+  if (c.error) {
+    return `
+      ${headerLine}
+      <div class="wizard-warning">
+        <svg class="icon"><use href="#i-alert"/></svg>
+        ${escapeHtml(c.error)}
+      </div>
+    `;
+  }
+
+  if (!Array.isArray(c.discovered) || c.discovered.length === 0) {
+    return `
+      ${headerLine}
+      <div class="addons-empty">${escapeHtml(I18n.t('install_wizard.cameras_empty'))}</div>
+    `;
+  }
+
+  return `
+    ${headerLine}
+    <div class="section-card wizard-cameras-table-wrap">
+      <tf-table id="${tableId}">
+        <tf-column key="vendor" label="${escapeAttr(I18n.t('install_wizard.cameras_col_vendor'))}"></tf-column>
+        <tf-column key="model" label="${escapeAttr(I18n.t('install_wizard.cameras_col_model'))}"></tf-column>
+        <tf-column key="ip" label="${escapeAttr(I18n.t('install_wizard.cameras_col_ip'))}"></tf-column>
+        <tf-column key="statusChip" label="${escapeAttr(I18n.t('install_wizard.cameras_col_status'))}" renderer="chip"></tf-column>
+        <tf-column key="actions" label="${escapeAttr(I18n.t('install_wizard.cameras_col_actions'))}" renderer="html"></tf-column>
+      </tf-table>
+    </div>
+  `;
+}
+
+function cameraRowKey(cam) {
+  const xa = Array.isArray(cam?.xaddrs) ? cam.xaddrs[0] : null;
+  return xa || `${cam?.vendor || ''}|${cam?.model || ''}|${cam?.ip || ''}`;
+}
+
+function buildCameraRows() {
+  const c = state.cameras;
+  return c.discovered.map((cam, idx) => {
+    const key = cameraRowKey(cam);
+    const isAdded = c.added.has(key);
+    const statusChip = isAdded
+      ? { status: 'ok', label: I18n.t('install_wizard.cameras_status_added') }
+      : { status: 'info', label: I18n.t('install_wizard.cameras_status_not_added') };
+    const actionLabel = isAdded
+      ? I18n.t('install_wizard.cameras_action_added')
+      : I18n.t('install_wizard.cameras_action_add');
+    const actionsHtml = isAdded
+      ? `<tf-chip status="ok" icon="check">${escapeHtml(actionLabel)}</tf-chip>`
+      : `<tf-button size="sm" variant="primary" data-role="cam-add" data-idx="${idx}" aria-label="${escapeAttr(I18n.t('install_wizard.cameras_action_add'))}">${escapeHtml(actionLabel)}</tf-button>`;
+    return {
+      vendor: cam.vendor || '—',
+      model: cam.model || '—',
+      ip: cam.ip || '—',
+      statusChip,
+      actions: actionsHtml,
+    };
+  });
+}
+
+async function loadDiscoveredCameras() {
+  state.cameras.loading = true;
+  state.cameras.error = null;
+  renderStep();
+  try {
+    const resp = await ApiBinary.one('cameraDiscoverRequest');
+    const list = Array.isArray(resp?.discovered) ? resp.discovered : [];
+    state.cameras.discovered = list;
+  } catch (err) {
+    state.cameras.discovered = [];
+    state.cameras.error = `${I18n.t('install_wizard.cameras_err_discover')}: ${err?.message || err}`;
+  } finally {
+    state.cameras.loading = false;
+    renderStep();
+  }
+}
+
+function mapCameraErrorCode(code) {
+  const m = {
+    auth_failed: 'install_wizard.cameras_err_auth_failed',
+    no_profiles: 'install_wizard.cameras_err_no_profiles',
+    profile_not_found: 'install_wizard.cameras_err_profile_not_found',
+    timeout: 'install_wizard.cameras_err_timeout',
+    transport: 'install_wizard.cameras_err_transport',
+    url_userinfo_not_allowed: 'install_wizard.cameras_err_url_userinfo_not_allowed',
+  };
+  const key = m[code] || 'install_wizard.cameras_err_generic';
+  return I18n.t(key);
+}
+
+function openAddCameraDialog(idx) {
+  const cam = state.cameras.discovered[idx];
+  if (!cam) return;
+  const defaultName = `${cam.vendor || ''} ${cam.model || ''}`.trim() || (cam.ip || 'camera');
+  const xa = Array.isArray(cam.xaddrs) ? cam.xaddrs[0] : '';
+  const dlg = document.createElement('tf-window');
+  dlg.setAttribute('title', I18n.t('install_wizard.cameras_add_title'));
+  dlg.setAttribute('icon', 'video');
+  dlg.setAttribute('buttons', 'close');
+  dlg.setAttribute('width', '520');
+  dlg.setAttribute('min-width', '420');
+  dlg.setAttribute('initial-x', 'center');
+  dlg.setAttribute('initial-y', 'center');
+  dlg.setAttribute('role', 'dialog');
+  dlg.setAttribute('aria-modal', 'true');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.className = 'wizard-cameras-dialog';
+  body.innerHTML = `
+    <div class="wizard-cameras-dialog-info">
+      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_vendor'))}:</span> ${escapeHtml(cam.vendor || '—')}</div>
+      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_model'))}:</span> ${escapeHtml(cam.model || '—')}</div>
+      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_ip'))}:</span> ${escapeHtml(cam.ip || '—')}</div>
+      <div class="muted small mono">${escapeHtml(xa || '')}</div>
+    </div>
+    <div class="wizard-cameras-dialog-fields">
+      <label>
+        <span>${escapeHtml(I18n.t('install_wizard.cameras_field_display_name'))} *</span>
+        <tf-input data-field="display_name" value="${escapeAttr(defaultName)}" required></tf-input>
+      </label>
+      <label>
+        <span>${escapeHtml(I18n.t('install_wizard.cameras_field_username'))} *</span>
+        <tf-input data-field="username" value="" required autocomplete="off"></tf-input>
+      </label>
+      <label>
+        <span>${escapeHtml(I18n.t('install_wizard.cameras_field_password'))} *</span>
+        <tf-input data-field="password" type="password" value="" required autocomplete="new-password"></tf-input>
+      </label>
+      <label>
+        <span>${escapeHtml(I18n.t('install_wizard.cameras_field_profile_token'))}</span>
+        <tf-input data-field="profile_token" value="" placeholder="${escapeAttr(I18n.t('install_wizard.cameras_field_profile_token_ph'))}"></tf-input>
+      </label>
+      <label>
+        <span>${escapeHtml(I18n.t('install_wizard.cameras_field_target_fps'))}</span>
+        <tf-input data-field="target_fps" type="number" value="15" min="1" max="120"></tf-input>
+      </label>
+    </div>
+    <div class="wizard-cameras-dialog-error" data-role="dialog-error" hidden></div>
+  `;
+  dlg.appendChild(body);
+
+  const footer = document.createElement('div');
+  footer.slot = 'footer';
+  footer.style.cssText = 'display:flex;gap:8px;width:100%;';
+  footer.innerHTML = `
+    <div style="flex:1"></div>
+    <tf-button variant="ghost" data-role="dialog-cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+    <tf-button variant="primary" icon="check" data-role="dialog-save">${escapeHtml(I18n.t('install_wizard.cameras_dialog_save'))}</tf-button>
+  `;
+  dlg.appendChild(footer);
+
+  document.body.appendChild(dlg);
+
+  const readField = (name) => {
+    const el = body.querySelector(`tf-input[data-field="${name}"]`);
+    if (!el) return '';
+    return (el.value ?? el.getAttribute('value') ?? '').toString().trim();
+  };
+
+  const showError = (msg) => {
+    const box = body.querySelector('[data-role="dialog-error"]');
+    if (!box) return;
+    box.hidden = !msg;
+    box.textContent = msg || '';
+  };
+
+  footer.querySelector('[data-role="dialog-cancel"]')?.addEventListener('click', () => {
+    dlg.close(true);
+  });
+
+  // Esc handling delegated to tf-window default behavior.
+
+  footer.querySelector('[data-role="dialog-save"]')?.addEventListener('click', async () => {
+    const displayName = readField('display_name');
+    const username = readField('username');
+    const password = readField('password');
+    const profileToken = readField('profile_token');
+    const targetFpsRaw = readField('target_fps');
+    if (!displayName || !username || !password) {
+      showError(I18n.t('install_wizard.cameras_err_required'));
+      return;
+    }
+    let targetFps = null;
+    if (targetFpsRaw !== '') {
+      const n = Number(targetFpsRaw);
+      if (!Number.isFinite(n) || n < 1 || n > 120) {
+        showError(I18n.t('install_wizard.cameras_err_fps_range'));
+        return;
+      }
+      targetFps = n;
+    }
+    showError('');
+    const saveBtn = footer.querySelector('[data-role="dialog-save"]');
+    saveBtn?.setAttribute('disabled', '');
+    try {
+      const payload = {
+        displayName,
+        deviceServiceUrl: xa,
+        username,
+        password,
+        profileToken: profileToken || null,
+        targetFps,
+      };
+      const resp = await ApiBinary.action('cameraAddOnvifRequest', payload);
+      const key = cameraRowKey(cam);
+      const cameraId = resp?.cameraId ?? resp?.camera_id ?? null;
+      const rtspUrl = resp?.rtspUrl ?? resp?.rtsp_url ?? '';
+      state.cameras.added.set(key, { cameraId, rtspUrl });
+      toast(I18n.t('install_wizard.cameras_add_success'), 'success');
+      dlg.close(true);
+      renderStep();
+    } catch (err) {
+      const friendly = mapCameraErrorCode(err?.code);
+      showError(`${friendly}${err?.message ? ` — ${err.message}` : ''}`);
+      saveBtn?.removeAttribute('disabled');
+    }
+  });
+
+  // Focus first field for keyboard users.
+  requestAnimationFrame(() => {
+    const first = body.querySelector('tf-input[data-field="display_name"]');
+    first?.focus?.();
+  });
+}
+
+function attachCamerasStepHandlers(root) {
+  root.querySelector('[data-role="cameras-refresh"]')?.addEventListener('click', () => {
+    loadDiscoveredCameras();
+  });
+  root.querySelector('[data-role="cameras-skip"]')?.addEventListener('click', () => {
+    if (state.currentStep < 6) {
+      state.currentStep += 1;
+      renderStep();
+    }
+  });
+  const table = root.querySelector('#wizard-cameras-table');
+  if (table) {
+    table.rows = buildCameraRows();
+    table.addEventListener('click', (ev) => {
+      const path = ev.composedPath();
+      const btn = path.find((el) => el && el.tagName === 'TF-BUTTON' && el.dataset && el.dataset.role === 'cam-add');
+      if (!btn) return;
+      const idx = Number(btn.dataset.idx);
+      if (Number.isInteger(idx)) openAddCameraDialog(idx);
+    });
+  }
+
+  // Auto-load on first visit.
+  if (
+    !state.cameras.loading
+    && !state.cameras.error
+    && state.cameras.discovered.length === 0
+    && !state.cameras._autoLoaded
+  ) {
+    state.cameras._autoLoaded = true;
+    loadDiscoveredCameras();
+  }
+}
+
 // --- Steps 4-6 placeholders ------------------------------------------------
 
 function renderPlaceholderStep(n) {
@@ -569,6 +864,8 @@ function attachStepHandlers(root) {
         updateFooter();
       });
     });
+  } else if (state.currentStep === 4) {
+    attachCamerasStepHandlers(root);
   }
 }
 
