@@ -169,22 +169,83 @@ pub struct AddonManifest {
     pub runtime_overrides: Option<manifest::RuntimeSection>,
 }
 
-/// Sekcja [application] manifestu — rejestracja addonu jako aplikacji
-/// widocznej w glownym menu GUI (Apps launcher). Wymaga zeby addon
-/// eksportowal `on_request` i renderowal UI panel przez `ui_render`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `[application]` manifest section — registers the addon as a user-facing
+/// application in the "My applications" launcher. The addon must render
+/// `entry_panel` via `ui_render` so the host can serve it when the user
+/// clicks the tile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AddonApplicationSection {
-    /// ID panelu UI startowego — frontend po kliknieciu w menu woła
-    /// `AddonUiPanelGetRequest { addon_id, panel_id }`.
+    /// Panel id served on tile click. Must be rendered by the addon through
+    /// `ui_render` with this exact `panel_id`.
     pub entry_panel: String,
-    /// Tytul widoczny pod ikona w launchu.
+    /// Application title shown in sidebar / tile (e.g. "TentaVision").
     pub title: String,
-    /// Identyfikator ikony sprite (np. "i-camera"). Domyslnie `addon.icon`.
+    /// Icon name from the TentaFlow icon library (e.g. "video", "camera").
+    pub icon: String,
+    /// Short description shown under the tile in "All applications".
     #[serde(default)]
-    pub icon: Option<String>,
-    /// Opcjonalna kolejnosc w menu (mniejsza wartosc = wyzej). Default 100.
-    #[serde(default)]
-    pub sort_order: Option<i32>,
+    pub description: String,
+    /// Sort order in "My applications" (lower = higher). Default 100.
+    #[serde(default = "default_app_sort_order")]
+    pub sort_order: i32,
+}
+
+fn default_app_sort_order() -> i32 {
+    100
+}
+
+impl AddonApplicationSection {
+    /// Structural validation. Rejects malformed `entry_panel`, oversize titles,
+    /// invalid icon names and out-of-range sort orders. Reason strings are
+    /// static so audit and install logs can correlate on them.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use regex::Regex;
+        use std::sync::OnceLock;
+        static PANEL_RX: OnceLock<Regex> = OnceLock::new();
+        static ICON_RX: OnceLock<Regex> = OnceLock::new();
+        let panel_rx = PANEL_RX.get_or_init(|| {
+            Regex::new(r"^[a-z0-9][a-z0-9_-]*$").expect("static regex")
+        });
+        let icon_rx = ICON_RX
+            .get_or_init(|| Regex::new(r"^[a-z][a-z0-9-]*$").expect("static regex"));
+
+        if self.entry_panel.is_empty() || self.entry_panel.len() > 64 {
+            bail!(
+                "application.entry_panel length {} out of range 1..=64",
+                self.entry_panel.len()
+            );
+        }
+        if !panel_rx.is_match(&self.entry_panel) {
+            bail!(
+                "application.entry_panel '{}' must match [a-z0-9][a-z0-9_-]*",
+                self.entry_panel
+            );
+        }
+        let title_len = self.title.chars().count();
+        if !(1..=60).contains(&title_len) {
+            bail!(
+                "application.title length {} out of range 1..=60",
+                title_len
+            );
+        }
+        let icon_len = self.icon.chars().count();
+        if !(1..=40).contains(&icon_len) {
+            bail!("application.icon length {} out of range 1..=40", icon_len);
+        }
+        if !icon_rx.is_match(&self.icon) {
+            bail!(
+                "application.icon '{}' must match [a-z][a-z0-9-]*",
+                self.icon
+            );
+        }
+        if !(0..=10_000).contains(&self.sort_order) {
+            bail!(
+                "application.sort_order {} out of range 0..=10000",
+                self.sort_order
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Sekcja [service] manifestu — deklaracja trybu ciaglego addonu.

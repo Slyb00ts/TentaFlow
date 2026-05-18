@@ -4895,9 +4895,6 @@ pub fn addon_ui_dispatch(
             let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> =
                 Vec::new();
             for a in rows {
-                if !a.is_enabled {
-                    continue;
-                }
                 if !visible_to_user(&a.addon_id)? {
                     continue;
                 }
@@ -4910,19 +4907,14 @@ pub fn addon_ui_dispatch(
                         Err(_) => continue,
                     };
                 if let Some(app) = manifest.application {
-                    let icon = app.icon.or_else(|| {
-                        if a.icon.is_empty() {
-                            None
-                        } else {
-                            Some(a.icon.clone())
-                        }
-                    });
                     applications.push(tentaflow_protocol::AddonApplicationInfo {
                         addon_id: a.addon_id.clone(),
                         title: app.title,
                         entry_panel: app.entry_panel,
-                        icon,
-                        sort_order: app.sort_order.unwrap_or(100),
+                        icon: app.icon,
+                        description: app.description,
+                        sort_order: app.sort_order,
+                        enabled: a.is_enabled,
                     });
                 }
             }
