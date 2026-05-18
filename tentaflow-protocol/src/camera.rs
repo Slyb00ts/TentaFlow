@@ -148,4 +148,89 @@ mod tests {
         });
         assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
     }
+
+    // F2 P7.a-bis: ensure the CameraAdminPayload survives a round trip when
+    // wrapped in `MessageBody::CameraAdminBody`. The browser-side WASM glue
+    // (tentaflow-protocol-wasm) emits frames at this outer layer, so wire
+    // compatibility must hold for the full envelope body.
+    #[test]
+    fn camera_admin_body_discover_request_round_trip() {
+        use crate::message_body::MessageBody;
+        let body =
+            MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverRequest(
+                CameraDiscoverRequest {},
+            ));
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded =
+            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_add_onvif_request_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(
+            CameraAddOnvifRequest {
+                display_name: "Lobby".into(),
+                device_service_url: "http://10.0.0.7/onvif/device_service".into(),
+                username: "viewer".into(),
+                password: "s3cret".into(),
+                profile_token: None,
+                target_fps: Some(10),
+            },
+        ));
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded =
+            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_discover_response_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverResponse(
+            CameraDiscoverResponse {
+                discovered: vec![
+                    DiscoveredCameraInfo {
+                        address: "10.0.0.21".into(),
+                        xaddrs: vec!["http://10.0.0.21/onvif/device_service".into()],
+                        types: vec!["dn:NetworkVideoTransmitter".into()],
+                        manufacturer: "Hikvision".into(),
+                        model: "DS-2CD".into(),
+                    },
+                    DiscoveredCameraInfo {
+                        address: "10.0.0.22".into(),
+                        xaddrs: vec![],
+                        types: vec![],
+                        manufacturer: String::new(),
+                        model: String::new(),
+                    },
+                ],
+            },
+        ));
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded =
+            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_add_onvif_response_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifResponse(
+            CameraAddOnvifResponse {
+                camera_id: "cam_xyz".into(),
+                rtsp_url: "rtsp://10.0.0.21:554/Streaming/Channels/101".into(),
+                profile_token: "Profile_1".into(),
+            },
+        ));
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded =
+            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
 }

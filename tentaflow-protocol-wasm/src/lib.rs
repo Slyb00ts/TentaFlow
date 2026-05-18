@@ -4846,6 +4846,72 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 .unwrap_or_else(|_| "{}".to_string());
             set(&obj, "json", json.into());
         }
+        MessageBody::CameraAdminBody(payload) => match payload {
+            tentaflow_protocol::CameraAdminPayload::DiscoverRequest(_) => {
+                set(&obj, "variant", "CameraDiscoverRequest".into());
+            }
+            tentaflow_protocol::CameraAdminPayload::DiscoverResponse(resp) => {
+                set(&obj, "variant", "CameraDiscoverResponse".into());
+                let arr = js_sys::Array::new();
+                for cam in resp.discovered {
+                    let item = js_sys::Object::new();
+                    // Map wire field names to the dashboard wizard schema:
+                    // `vendor` (manufacturer), `model`, `ip` (address), plus
+                    // raw `xaddrs` + `types` for advanced flows.
+                    set(&item, "vendor", cam.manufacturer.clone().into());
+                    set(&item, "manufacturer", cam.manufacturer.into());
+                    set(&item, "model", cam.model.into());
+                    set(&item, "ip", cam.address.clone().into());
+                    set(&item, "address", cam.address.into());
+                    let xaddrs = js_sys::Array::new();
+                    for x in cam.xaddrs {
+                        xaddrs.push(&JsValue::from_str(&x));
+                    }
+                    set(&item, "xaddrs", xaddrs.into());
+                    let types = js_sys::Array::new();
+                    for t in cam.types {
+                        types.push(&JsValue::from_str(&t));
+                    }
+                    set(&item, "types", types.into());
+                    arr.push(&item.into());
+                }
+                set(&obj, "discovered", arr.into());
+            }
+            tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(req) => {
+                // Requests do not normally round-trip back to the GUI, but
+                // surface the full payload so debug tooling (binary inspector)
+                // can render it.
+                set(&obj, "variant", "CameraAddOnvifRequest".into());
+                set(&obj, "displayName", req.display_name.clone().into());
+                set(&obj, "display_name", req.display_name.into());
+                set(
+                    &obj,
+                    "deviceServiceUrl",
+                    req.device_service_url.clone().into(),
+                );
+                set(&obj, "device_service_url", req.device_service_url.into());
+                set(&obj, "username", req.username.into());
+                // Password is never echoed back to the GUI; tag presence only.
+                set(&obj, "hasPassword", (!req.password.is_empty()).into());
+                if let Some(pt) = req.profile_token {
+                    set(&obj, "profileToken", pt.clone().into());
+                    set(&obj, "profile_token", pt.into());
+                }
+                if let Some(fps) = req.target_fps {
+                    set(&obj, "targetFps", fps.into());
+                    set(&obj, "target_fps", fps.into());
+                }
+            }
+            tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(resp) => {
+                set(&obj, "variant", "CameraAddOnvifResponse".into());
+                set(&obj, "cameraId", resp.camera_id.clone().into());
+                set(&obj, "camera_id", resp.camera_id.into());
+                set(&obj, "rtspUrl", resp.rtsp_url.clone().into());
+                set(&obj, "rtsp_url", resp.rtsp_url.into());
+                set(&obj, "profileToken", resp.profile_token.clone().into());
+                set(&obj, "profile_token", resp.profile_token.into());
+            }
+        },
     }
     Ok(obj.into())
 }
@@ -7666,5 +7732,49 @@ pub fn encode_profiling_collectors_status_request(node_id: String) -> Result<Vec
             tentaflow_protocol::ProfilingCollectorsStatusRequest { node_id },
         ),
     )
+}
+
+// =============================================================================
+// Camera admin (F2 P7.a-bis) — wizard dashboard RPCs packed into
+// `MessageBody::CameraAdminBody(CameraAdminPayload)`.
+// =============================================================================
+
+/// MessageBody::CameraAdminBody(DiscoverRequest) — kick off ONVIF WS-Discovery
+/// against the local network; the response carries the discovered devices.
+#[wasm_bindgen(js_name = encodeCameraDiscoverRequest)]
+pub fn encode_camera_discover_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CameraAdminBody(
+        tentaflow_protocol::CameraAdminPayload::DiscoverRequest(
+            tentaflow_protocol::CameraDiscoverRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CameraAdminBody(AddOnvifRequest) — bind a discovered ONVIF
+/// device as a managed camera session. Credentials travel over the TLS
+/// admin transport and are AES-GCM-sealed server-side before persistence.
+#[wasm_bindgen(js_name = encodeCameraAddOnvifRequest)]
+pub fn encode_camera_add_onvif_request(
+    display_name: String,
+    device_service_url: String,
+    username: String,
+    password: String,
+    profile_token: Option<String>,
+    target_fps: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CameraAdminBody(
+        tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(
+            tentaflow_protocol::CameraAddOnvifRequest {
+                display_name,
+                device_service_url,
+                username,
+                password,
+                profile_token,
+                target_fps,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
 }
 
