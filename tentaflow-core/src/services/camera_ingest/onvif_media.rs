@@ -40,6 +40,12 @@ const ACTION_GET_PROFILES: &str =
     "http://www.onvif.org/ver10/media/wsdl/GetProfiles";
 const ACTION_GET_STREAM_URI: &str =
     "http://www.onvif.org/ver10/media/wsdl/GetStreamUri";
+/// Media2 service uses the ver20 namespace. `GetMetadataConfigurations`
+/// enumerates metadata configs the device advertises; if the list is empty
+/// the camera does not expose analytics events (no PullPoint subscription
+/// can be made for object detections).
+const ACTION_GET_METADATA_CONFIGURATIONS: &str =
+    "http://www.onvif.org/ver20/media/wsdl/GetMetadataConfigurations";
 
 /// Hard upper bound on per-call timeouts so a misconfigured caller cannot
 /// hold a tokio worker for minutes.
@@ -67,6 +73,20 @@ pub struct OnvifProfile {
     pub encoding: Option<String>,
     /// `(width, height)` if the encoder publishes a Resolution element.
     pub resolution: Option<(u32, u32)>,
+}
+
+/// One ONVIF Media2 metadata configuration as returned by
+/// `GetMetadataConfigurations`. The presence of at least one configuration
+/// indicates the device produces analytics metadata (object detections,
+/// events) that can be retrieved over a PullPoint subscription. The
+/// `analytics_engine_token` (when present) lets a future caller bind the
+/// configuration to a specific analytics module on the camera; the wizard
+/// only inspects emptiness of the list, not the contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataConfiguration {
+    pub token: String,
+    pub name: String,
+    pub analytics_engine_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,9 +230,68 @@ pub async fn derive_rtsp_uri(
     .await
 }
 
+/// Calls Media2 `GetMetadataConfigurations` and returns the device-advertised
+/// metadata configurations. An empty `Ok(vec![])` is a successful answer that
+/// means "the device exposes no analytics" — the wizard treats this as a
+/// signal to store `metadata_supported = 0` on the camera row.
+///
+/// `media2_service_url` is the URL the device returned for the Media2
+/// capability (via `GetServices`). On many cameras this is identical to the
+/// Media v1 service URL, but the SOAP body uses the `tr2:` namespace either
+/// way — the device dispatches by SOAP body element name, not URL path.
+pub async fn get_metadata_configurations(
+    media2_service_url: &str,
+    creds: &OnvifCredentials,
+    timeout_ms: u32,
+) -> Result<Vec<MetadataConfiguration>, OnvifError> {
+    let body = r#"<tr2:GetMetadataConfigurations/>"#;
+    let envelope = build_envelope(creds, body);
+    let resp = send_soap(
+        media2_service_url,
+        ACTION_GET_METADATA_CONFIGURATIONS,
+        envelope,
+        timeout_ms,
+    )
+    .await?;
+    parse_get_metadata_configurations_response(&resp)
+}
+
 // =============================================================================
 // SOAP transport
 // =============================================================================
+
+pub(super) async fn send_soap_pub(
+    endpoint: &str,
+    action: &str,
+    envelope: String,
+    timeout_ms: u32,
+) -> Result<String, OnvifError> {
+    send_soap(endpoint, action, envelope, timeout_ms).await
+}
+
+pub(super) fn build_envelope_pub(creds: &OnvifCredentials, body_inner: &str) -> String {
+    build_envelope(creds, body_inner)
+}
+
+pub(super) fn xml_escape_pub(s: &str) -> String {
+    xml_escape(s)
+}
+
+pub(super) fn extract_xml_text_pub(xml: &str, tag: &str) -> Option<String> {
+    extract_xml_text(xml, tag)
+}
+
+pub(super) fn contains_tag_pub(xml: &str, tag: &str) -> bool {
+    contains_tag(xml, tag)
+}
+
+pub(super) fn find_close_tag_pub(haystack: &str, tag: &str) -> Option<usize> {
+    find_close_tag(haystack, tag)
+}
+
+pub(super) fn extract_open_tag_attr_pub(open_body: &str, key: &str) -> Option<String> {
+    extract_open_tag_attr(open_body, key)
+}
 
 async fn send_soap(
     endpoint: &str,
@@ -309,7 +388,10 @@ fn build_envelope(creds: &OnvifCredentials, body_inner: &str) -> String {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tt="http://www.onvif.org/ver10/schema"
-            xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+            xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+            xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+            xmlns:wsa="http://www.w3.org/2005/08/addressing">
   <s:Header>
     <Security s:mustUnderstand="1"
               xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -434,6 +516,120 @@ fn parse_get_stream_uri_response(xml: &str) -> Result<String, OnvifError> {
         )));
     }
     Ok(uri)
+}
+
+/// Parse a `GetMetadataConfigurationsResponse`. The body lists zero or more
+/// `<tr2:Configurations token="...">` blocks, each carrying a `tt:Name` and
+/// optionally a `tt:AnalyticsEngineConfiguration` (or `tt:AnalyticsModule`)
+/// that we treat as the analytics-engine binding. Unknown children are
+/// ignored.
+///
+/// An empty `<GetMetadataConfigurationsResponse/>` envelope (device honours
+/// the call but has nothing to advertise) returns `Ok(vec![])`. A body with
+/// no `GetMetadataConfigurationsResponse` element at all returns
+/// `MalformedResponse` — same discrimination as `parse_get_profiles_response`.
+fn parse_get_metadata_configurations_response(
+    xml: &str,
+) -> Result<Vec<MetadataConfiguration>, OnvifError> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((token, block_start, block_end)) =
+        find_configurations_block(xml, cursor)
+    {
+        let block = &xml[block_start..block_end];
+        let name = extract_xml_text(block, "Name").unwrap_or_default();
+        // The analytics engine binding may surface either as a direct
+        // `AnalyticsEngineConfigurationToken` element or as an attribute on
+        // `AnalyticsEngineConfiguration` — match the text form first and
+        // fall back to the open-tag `token` attribute on the engine config.
+        let analytics_engine_token =
+            extract_xml_text(block, "AnalyticsEngineConfigurationToken")
+                .or_else(|| extract_analytics_engine_token(block));
+        out.push(MetadataConfiguration {
+            token,
+            name,
+            analytics_engine_token,
+        });
+        cursor = block_end;
+    }
+    if out.is_empty() {
+        if contains_tag(xml, "GetMetadataConfigurationsResponse") {
+            return Ok(out);
+        }
+        return Err(OnvifError::MalformedResponse(
+            "no <GetMetadataConfigurationsResponse> in body".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Walk the XML looking for `<...:Configurations token="...">` blocks
+/// returned inside a `GetMetadataConfigurationsResponse`. Mirrors
+/// `find_profiles_block` with a different local name.
+fn find_configurations_block(xml: &str, start: usize) -> Option<(String, usize, usize)> {
+    let mut cursor = start;
+    while cursor < xml.len() {
+        let rest = &xml[cursor..];
+        let lt = rest.find('<')?;
+        let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with('/')
+            || after_lt.starts_with('!')
+            || after_lt.starts_with('?')
+        {
+            cursor += lt + 1;
+            continue;
+        }
+        let open_end = after_lt.find('>')?;
+        let open_body = &after_lt[..open_end];
+        let name_end = open_body
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(open_body.len());
+        let qname = &open_body[..name_end];
+        let local = qname.rsplit(':').next().unwrap_or(qname);
+        if local == "Configurations" && !open_body.ends_with('/') {
+            if let Some(token) = extract_open_tag_attr(open_body, "token") {
+                let content_start = cursor + lt + 1 + open_end + 1;
+                let after_open = &xml[content_start..];
+                if let Some(close_idx) = find_close_tag(after_open, "Configurations") {
+                    return Some((token, content_start, content_start + close_idx));
+                }
+            }
+        }
+        cursor += lt + 1 + open_end + 1;
+    }
+    None
+}
+
+/// Extract a `token="..."` attribute from the first
+/// `<...:AnalyticsEngineConfiguration token="...">` open tag in `block`.
+fn extract_analytics_engine_token(block: &str) -> Option<String> {
+    let mut cursor = 0usize;
+    while cursor < block.len() {
+        let rest = &block[cursor..];
+        let lt = rest.find('<')?;
+        let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with('/')
+            || after_lt.starts_with('!')
+            || after_lt.starts_with('?')
+        {
+            cursor += lt + 1;
+            continue;
+        }
+        let open_end = after_lt.find('>')?;
+        let open_body = &after_lt[..open_end];
+        let name_end = open_body
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(open_body.len());
+        let qname = &open_body[..name_end];
+        let local = qname.rsplit(':').next().unwrap_or(qname);
+        if local == "AnalyticsEngineConfiguration" {
+            if let Some(t) = extract_open_tag_attr(open_body, "token") {
+                return Some(t);
+            }
+        }
+        cursor += lt + 1 + open_end + 1;
+    }
+    None
 }
 
 /// Locate the next `<...:Profiles token="...">` opening tag from `start`
@@ -884,6 +1080,65 @@ mod tests {
             Some("xyz")
         );
         assert_eq!(extract_open_tag_attr("Profiles", "token"), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // GetMetadataConfigurations parsing (F2 P6.a)
+    // -------------------------------------------------------------------------
+
+    const SAMPLE_GET_METADATA_CONFIGS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:tt="http://www.onvif.org/ver10/schema"
+              xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+  <env:Body>
+    <tr2:GetMetadataConfigurationsResponse>
+      <tr2:Configurations token="MetaCfg_1">
+        <tt:Name>MetadataConfig 1</tt:Name>
+        <tt:UseCount>1</tt:UseCount>
+        <tt:AnalyticsEngineConfiguration token="AEC_1">
+          <tt:AnalyticsModule Name="MotionRegionDetector" Type="tt:MotionRegionDetector"/>
+        </tt:AnalyticsEngineConfiguration>
+      </tr2:Configurations>
+      <tr2:Configurations token="MetaCfg_2">
+        <tt:Name>MetadataConfig 2</tt:Name>
+      </tr2:Configurations>
+    </tr2:GetMetadataConfigurationsResponse>
+  </env:Body>
+</env:Envelope>"#;
+
+    #[test]
+    fn get_metadata_configurations_parses_real_response_xml() {
+        let cfgs = parse_get_metadata_configurations_response(SAMPLE_GET_METADATA_CONFIGS)
+            .expect("parse");
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(cfgs[0].token, "MetaCfg_1");
+        assert_eq!(cfgs[0].name, "MetadataConfig 1");
+        assert_eq!(cfgs[0].analytics_engine_token.as_deref(), Some("AEC_1"));
+        assert_eq!(cfgs[1].token, "MetaCfg_2");
+        assert_eq!(cfgs[1].name, "MetadataConfig 2");
+        assert!(cfgs[1].analytics_engine_token.is_none());
+    }
+
+    #[test]
+    fn get_metadata_configurations_empty_list_means_no_profile_m() {
+        // Device acknowledges the call but exposes zero metadata configs.
+        // Caller treats this as "no analytics" — must not return an error.
+        let xml = r#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+            <env:Body><tr2:GetMetadataConfigurationsResponse/></env:Body></env:Envelope>"#;
+        let cfgs = parse_get_metadata_configurations_response(xml).expect("parse");
+        assert!(cfgs.is_empty());
+    }
+
+    #[test]
+    fn get_metadata_configurations_auth_fault_surface() {
+        // Fault detection lives in send_soap (mapped to AuthFailed by the
+        // transport layer); the parser itself rejects non-response bodies.
+        let body = "<garbage>nope</garbage>";
+        assert!(matches!(
+            parse_get_metadata_configurations_response(body),
+            Err(OnvifError::MalformedResponse(_))
+        ));
     }
 
     #[test]
