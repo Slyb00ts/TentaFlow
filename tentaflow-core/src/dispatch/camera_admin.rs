@@ -44,6 +44,14 @@ const DEFAULT_DISCOVER_TIMEOUT_MS: u64 = 3_000;
 static DISCOVER_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DEFAULT_DISCOVER_TIMEOUT_MS);
 
+/// Test-only seam: tightens the WS-Discovery wait so integration tests
+/// (which live in a separate crate and therefore cannot use `#[cfg(test)]`
+/// symbols) can drive the rate-limit window without burning 18 seconds.
+/// Production callers must not touch this — the `_for_test` suffix and
+/// `#[doc(hidden)]` keep it out of normal usage. A `feature = "test-seams"`
+/// gate is intentionally NOT used because integration tests run with the
+/// default feature set and a separate flag would require coordinated
+/// dev-dependencies across consumers.
 #[doc(hidden)]
 pub fn set_discover_timeout_ms_for_test(ms: u64) {
     DISCOVER_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -162,9 +170,21 @@ fn validate_http_url(url: &str) -> Result<(), &'static str> {
     if url.len() > 2048 {
         return Err("url_too_long");
     }
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    // Parse via url::Url so userinfo / authority smuggling is rejected.
+    // `http://camera.local@evil.host/onvif/...` would otherwise pass a
+    // starts_with check yet target `evil.host`. We require http/https scheme,
+    // a present host, and no embedded userinfo — credentials travel in the
+    // SOAP envelope only, never inline in the device URL.
+    let parsed = url::Url::parse(url).map_err(|_| "url_malformed")?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
         return Err("url_scheme_unsupported");
+    }
+    if parsed.host_str().map(str::is_empty).unwrap_or(true) {
+        return Err("url_host_missing");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url_userinfo_not_allowed");
     }
     Ok(())
 }
