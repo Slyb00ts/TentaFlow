@@ -22,6 +22,7 @@
 
 pub mod camera;
 pub mod envelope;
+pub mod legal;
 pub mod mesh;
 pub mod message_body;
 pub mod pii;
@@ -394,6 +395,11 @@ pub use message_body::{
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDiscoverRequest,
     CameraDiscoverResponse, DiscoveredCameraInfo,
+};
+pub use legal::{
+    LegalAdminPayload, LegalDocumentGenerateRequest, LegalDocumentGenerateResponse,
+    LegalDocumentRevokeRequest, LegalDocumentRevokeResponse, LegalDocumentSummary,
+    LegalDocumentsListRequest, LegalDocumentsListResponse,
 };
 pub use pii::PiiRulePayload;
 pub use profiling::{

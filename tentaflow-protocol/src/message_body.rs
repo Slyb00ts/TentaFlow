@@ -3951,6 +3951,12 @@ pub enum MessageBody {
     // limit + dashboard wizard need (P7.b).
     CameraAdminBody(crate::camera::CameraAdminPayload),
 
+    // ---- Legal admin RPCs (F2 P8.c) ----
+    // 3 par request/response (List, Generate, Revoke) spakowane w jeden slot,
+    // analogicznie do CameraAdminBody / ProfilingBody. Powod: rkyv 0.8
+    // 256-variant limit + dashboard RODO surface (P8.d).
+    LegalAdminBody(crate::legal::LegalAdminPayload),
+
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
     Error(ProtocolError),

@@ -29,6 +29,8 @@ pub enum UrlScope {
     FrameUrl,
     /// Snapshots / segments out of the `recordings` table.
     Recording,
+    /// RODO/GDPR legal documents (F2 P8.c) — PDF artifacts in `legal_documents`.
+    LegalUrl,
 }
 
 impl UrlScope {
@@ -36,6 +38,7 @@ impl UrlScope {
         match self {
             Self::FrameUrl => "frame",
             Self::Recording => "recording",
+            Self::LegalUrl => "legal",
         }
     }
 
@@ -43,6 +46,7 @@ impl UrlScope {
         match self {
             Self::FrameUrl => 60,
             Self::Recording => 60,
+            Self::LegalUrl => 60,
         }
     }
 
@@ -50,6 +54,7 @@ impl UrlScope {
         match self {
             Self::FrameUrl => 600,
             Self::Recording => 3600,
+            Self::LegalUrl => 3600,
         }
     }
 
@@ -60,6 +65,7 @@ impl UrlScope {
         match self {
             Self::FrameUrl => "frame_url",
             Self::Recording => "recording_url",
+            Self::LegalUrl => "legal_url",
         }
     }
 }
@@ -253,6 +259,7 @@ impl SignedUrlIssuer {
         let scope = match self.scope {
             UrlScope::FrameUrl => crate::services::mesh_keys::KeyScope::FrameUrl,
             UrlScope::Recording => crate::services::mesh_keys::KeyScope::RecordingUrl,
+            UrlScope::LegalUrl => crate::services::mesh_keys::KeyScope::LegalUrl,
         };
         for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {
             let expected = hmac_sign(&peer_key, payload.as_bytes());

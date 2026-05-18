@@ -54,6 +54,7 @@ pub enum KeyScope {
     PickupToken,
     FrameUrl,
     RecordingUrl,
+    LegalUrl,
 }
 
 impl KeyScope {
@@ -64,6 +65,7 @@ impl KeyScope {
             Self::PickupToken => PICKUP_TOKEN_KEY_NAME,
             Self::FrameUrl => UrlScope::FrameUrl.key_name(),
             Self::RecordingUrl => UrlScope::Recording.key_name(),
+            Self::LegalUrl => UrlScope::LegalUrl.key_name(),
         }
     }
 
@@ -74,15 +76,18 @@ impl KeyScope {
             Some(Self::FrameUrl)
         } else if s == UrlScope::Recording.key_name() {
             Some(Self::RecordingUrl)
+        } else if s == UrlScope::LegalUrl.key_name() {
+            Some(Self::LegalUrl)
         } else {
             None
         }
     }
 
-    pub const ALL: [KeyScope; 3] = [
+    pub const ALL: [KeyScope; 4] = [
         KeyScope::PickupToken,
         KeyScope::FrameUrl,
         KeyScope::RecordingUrl,
+        KeyScope::LegalUrl,
     ];
 }
 
@@ -117,6 +122,7 @@ struct PerPeerKeys {
     pickup_token: Option<PeerKeyState>,
     frame_url: Option<PeerKeyState>,
     recording_url: Option<PeerKeyState>,
+    legal_url: Option<PeerKeyState>,
 }
 
 impl PerPeerKeys {
@@ -125,6 +131,7 @@ impl PerPeerKeys {
             KeyScope::PickupToken => &mut self.pickup_token,
             KeyScope::FrameUrl => &mut self.frame_url,
             KeyScope::RecordingUrl => &mut self.recording_url,
+            KeyScope::LegalUrl => &mut self.legal_url,
         }
     }
 
@@ -133,6 +140,7 @@ impl PerPeerKeys {
             KeyScope::PickupToken => &self.pickup_token,
             KeyScope::FrameUrl => &self.frame_url,
             KeyScope::RecordingUrl => &self.recording_url,
+            KeyScope::LegalUrl => &self.legal_url,
         }
     }
 }

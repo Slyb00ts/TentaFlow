@@ -132,6 +132,14 @@ pub fn database_path() -> PathBuf {
     data_dir().join("router.db")
 }
 
+/// Root directory for RODO/GDPR legal-document PDFs (F2 P8). Layout:
+/// `<tentaflow_home>/data/legal/<org_id>/<timestamp>-<uuid>.pdf`. Kept
+/// under `data/` so a single backup of the data dir captures every legal
+/// artifact alongside the SQLite database.
+pub fn legal_root_dir() -> PathBuf {
+    data_dir().join("legal")
+}
+
 /// Cache root for Python bundle templates and instances. Honors
 /// `TENTAFLOW_CACHE_DIR` so tests / power users can redirect heavy venvs
 /// onto a non-default disk.

@@ -14,6 +14,8 @@ pub mod frames;
 #[cfg(feature = "camera")]
 pub mod recording;
 
+pub mod legal;
+
 #[cfg(feature = "dashboard-api")]
 pub mod dashboard;
 

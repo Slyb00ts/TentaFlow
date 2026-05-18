@@ -64,6 +64,7 @@ static STREAMING_BUS: OnceLock<Arc<streaming::StreamingBus>> = OnceLock::new();
 static PICKUP_TOKEN_ISSUER: OnceLock<Arc<pickup_tokens::PickupTokenIssuer>> = OnceLock::new();
 static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 #[cfg(feature = "vector")]
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 
@@ -194,6 +195,36 @@ pub fn recording_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     }
                     trigger_mesh_broadcast_on_rotate(
                         signed_urls::UrlScope::Recording.key_name(),
+                    );
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// F2 P8.c — process-wide signing key for `/legal/<doc_id>` URLs. Same
+/// disk-backed rotation contract as the recording / frame issuers: the new
+/// bytes land via `tentaflow-cli keys rotate legal_url` and the watcher
+/// promotes them into the issuer's in-memory KeyState, leaving the previous
+/// key valid as a verify-only secondary for `max_ttl + 5 s`.
+pub fn legal_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    LEGAL_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::LegalUrl,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::LegalUrl.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::LegalUrl.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::LegalUrl.key_name(),
                     );
                 },
             );
