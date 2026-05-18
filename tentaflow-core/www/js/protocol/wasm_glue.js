@@ -1084,6 +1084,53 @@ export function encodeBrowserCaptureRequest(session_id, kind, full_page) {
 }
 
 /**
+ * MessageBody::CameraAdminBody(AddOnvifRequest) — bind a discovered ONVIF
+ * device as a managed camera session. Credentials travel over the TLS
+ * admin transport and are AES-GCM-sealed server-side before persistence.
+ * @param {string} display_name
+ * @param {string} device_service_url
+ * @param {string} username
+ * @param {string} password
+ * @param {string | null} [profile_token]
+ * @param {number | null} [target_fps]
+ * @returns {Uint8Array}
+ */
+export function encodeCameraAddOnvifRequest(display_name, device_service_url, username, password, profile_token, target_fps) {
+    const ptr0 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(device_service_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(profile_token) ? 0 : passStringToWasm0(profile_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCameraAddOnvifRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, isLikeNone(target_fps) ? Number.MAX_SAFE_INTEGER : (target_fps) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * MessageBody::CameraAdminBody(DiscoverRequest) — kick off ONVIF WS-Discovery
+ * against the local network; the response carries the discovered devices.
+ * @returns {Uint8Array}
+ */
+export function encodeCameraDiscoverRequest() {
+    const ret = wasm.encodeCameraDiscoverRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * @param {string | null | undefined} surface_filter
  * @param {boolean} include_blocking_diagnostics
  * @returns {Uint8Array}

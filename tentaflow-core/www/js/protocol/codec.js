@@ -695,6 +695,46 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Camera admin (F2 P7.a-bis) — ONVIF wizard
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::CameraAdminBody(DiscoverRequest) — start ONVIF WS-Discovery. */
+  cameraDiscoverRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraDiscoverRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::CameraAdminBody(AddOnvifRequest) — bind a discovered ONVIF
+   * device as a managed camera session.
+   * payload: { displayName, deviceServiceUrl, username, password,
+   *            profileToken?, targetFps? }
+   */
+  cameraAddOnvifRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraAddOnvifRequest(
+      payload.displayName,
+      payload.deviceServiceUrl,
+      payload.username,
+      payload.password,
+      payload.profileToken ?? null,
+      payload.targetFps != null ? Number(payload.targetFps) : null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------
 
