@@ -1992,6 +1992,60 @@ export function encodeIamUpdateUserRequest(user_id, display_name, email, is_acti
 }
 
 /**
+ * MessageBody::LegalAdminBody(GenerateRequest) — render and persist a new
+ * RODO/GDPR PDF. `variant` must be one of `short` | `standard` | `full`
+ * (server-side validation via `RodoVariant::from_str`).
+ * @param {string} variant
+ * @returns {Uint8Array}
+ */
+export function encodeLegalDocumentGenerateRequest(variant) {
+    const ptr0 = passStringToWasm0(variant, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeLegalDocumentGenerateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::LegalAdminBody(RevokeRequest) — soft-delete a previously
+ * generated legal document. The PDF stays on disk; the row gets a
+ * `revoked_at` stamp and is excluded from default list views.
+ * @param {string} doc_id
+ * @returns {Uint8Array}
+ */
+export function encodeLegalDocumentRevokeRequest(doc_id) {
+    const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeLegalDocumentRevokeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::LegalAdminBody(ListRequest) — fetch the legal documents
+ * catalogue. `include_revoked = false` matches the default dashboard view.
+ * @param {boolean} include_revoked
+ * @returns {Uint8Array}
+ */
+export function encodeLegalDocumentsListRequest(include_revoked) {
+    const ret = wasm.encodeLegalDocumentsListRequest(include_revoked);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * MessageBody::MePreferencesGetRequest (unit variant).
  * @returns {Uint8Array}
  */
