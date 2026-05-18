@@ -153,7 +153,9 @@ fn count_cameras_for_org(state: &AppState, org_id: &str) -> i64 {
 fn last_audit_for_action(state: &AppState, action: &str) -> Option<(Option<String>, String)> {
     let conn = state.db.lock().expect("db mutex");
     conn.query_row(
-        "SELECT resource, COALESCE(details, '') FROM audit_log \
+        "SELECT COALESCE(resource, resource_id), \
+                COALESCE(result, '') || ' ' || COALESCE(details, '') \
+         FROM audit_log \
          WHERE action = ?1 ORDER BY id DESC LIMIT 1",
         rusqlite::params![action],
         |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
@@ -486,8 +488,8 @@ async fn camera_add_onvif_rejects_invalid_inputs_without_calling_device() {
 // camera.frame_url
 // =============================================================================
 
-const VALID_UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
-const VALID_UUID_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+const VALID_UUID_A: &str = "cam_550e8400-e29b-41d4-a716-446655440000";
+const VALID_UUID_B: &str = "cam_550e8400-e29b-41d4-a716-446655440001";
 
 fn insert_camera_row(state: &AppState, camera_id: &str, org_id: &str) {
     tentaflow_core::db::repository::insert_camera(
@@ -649,4 +651,48 @@ async fn frame_url_rate_limit_per_user() {
 
     let audit = last_audit_for_action(&state, "camera.frame_url").expect("audit row");
     assert!(audit.1.contains("rate_limited"), "details={}", audit.1);
+}
+
+#[tokio::test]
+async fn frame_url_rejects_unknown_prefix() {
+    ensure_cameras_key_env();
+    reset_frame_url_rate_limiter_for_test();
+    let state = AppState::for_test();
+    let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
+
+    // Same length as `cam_<uuid v4>` (40 chars) but the wrong 4-byte prefix.
+    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
+        CameraFrameUrlRequest {
+            camera_id: "foo_550e8400-e29b-41d4-a716-446655440000".to_string(),
+            ttl_secs: 30,
+        },
+    ));
+    let err = expect_error(camera_admin_dispatch(&req, &ctx).await);
+    assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    assert_eq!(err.message, "camera_id_invalid_format");
+}
+
+#[tokio::test]
+async fn frame_url_accepts_cam_prefix_uuid() {
+    ensure_cameras_key_env();
+    reset_frame_url_rate_limiter_for_test();
+    let state = AppState::for_test();
+    insert_camera_row(&state, VALID_UUID_B, "org-test");
+    push_frame(VALID_UUID_B);
+    let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
+
+    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
+        CameraFrameUrlRequest {
+            camera_id: VALID_UUID_B.to_string(),
+            ttl_secs: 30,
+        },
+    ));
+    let out = camera_admin_dispatch(&req, &ctx).await.expect("ok");
+    match out {
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlResponse(r)) => {
+            assert!(r.signed_url.starts_with("/frames/"));
+            assert!(r.signed_url.contains("token="));
+        }
+        other => panic!("expected FrameUrlResponse, got {other:?}"),
+    }
 }

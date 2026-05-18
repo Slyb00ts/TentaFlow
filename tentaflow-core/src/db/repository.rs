@@ -6436,8 +6436,12 @@ pub fn get_permission_catalog_risk(
     Ok(v)
 }
 
-/// Zapisuje wpis audytowy z wszystkimi polami (severity, resource_type, resource_id).
-/// Zamiast `log_audit`, ta funkcja wypelnia tez kolumny dodane przez migracje 20 i 39.
+/// Zapisuje wpis audytowy z wszystkimi polami (severity, resource_type, resource_id,
+/// risk_class, org_id, result). Zamiast `log_audit`, ta funkcja wypelnia tez kolumny
+/// dodane przez migracje 20, 39 oraz Merkle-chain (P4). Risk class follows the
+/// F1b convention (`A` = high / sensitive admin, `B` = medium, `C` = low / read,
+/// `unclassified` as fallback for legacy callers).
+#[allow(clippy::too_many_arguments)]
 pub fn log_audit_full(
     pool: &DbPool,
     user_id: Option<i64>,
@@ -6447,6 +6451,9 @@ pub fn log_audit_full(
     resource_id: Option<&str>,
     details: Option<&str>,
     severity: &str,
+    risk_class: &str,
+    result: Option<&str>,
+    org_id: Option<&str>,
     ip_address: Option<&str>,
     node_id: Option<&str>,
 ) -> Result<()> {
@@ -6460,13 +6467,13 @@ pub fn log_audit_full(
         resource: None,
         resource_type,
         resource_id,
-        result: None,
+        result,
         error_message: None,
         details,
         ip_address,
         node_id,
         severity: Some(severity),
-        risk_class: "unclassified",
+        risk_class,
         related_claim_id: None,
         request_id: None,
         timestamp: &timestamp,
@@ -6474,10 +6481,10 @@ pub fn log_audit_full(
     let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log \
-           (timestamp, user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id, prev_hash, hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+           (timestamp, user_id, addon_id, action, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
-            timestamp, user_id, addon_id, action, resource_type, resource_id, details, severity, ip_address, node_id, prev_hash, hash,
+            timestamp, user_id, addon_id, action, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash,
         ],
     )?;
     Ok(())
@@ -9436,6 +9443,9 @@ mod permission_and_oauth_tests {
             Some("audit-toggle"),
             Some(&details),
             "info",
+            "unclassified",
+            None,
+            None,
             None,
             Some("node-test"),
         )

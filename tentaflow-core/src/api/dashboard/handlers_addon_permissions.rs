@@ -76,6 +76,9 @@ fn audit(
         Some(resource_id),
         Some(&details),
         severity,
+        "unclassified",
+        None,
+        None,
         None,
         Some(node_id),
     ) {
