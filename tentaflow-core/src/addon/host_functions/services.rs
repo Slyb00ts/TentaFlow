@@ -169,7 +169,7 @@ pub fn service_list_v1(
                 kind: s.category.clone(),
                 status: s.status.clone(),
                 node_id: s.node_id.clone(),
-                endpoint: s.endpoint_url.clone(),
+                endpoint: s.endpoint_url.as_deref().map(sanitize_endpoint_url),
                 capabilities: caps,
             }
         })
@@ -178,6 +178,25 @@ pub fn service_list_v1(
     let out = ServiceListOutput { services: filtered };
     audit_service(caller.data(), "service.list", "ok", None);
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
+}
+
+/// Strips userinfo (`user:pass@`) and query-string from a service endpoint
+/// URL before exposing it to addons via `service_list_v1`. If an admin
+/// inadvertently stored credentials inline (e.g. `http://user:pass@host:8000`)
+/// or token-bearing query params, this prevents any addon holding
+/// `service.read` from harvesting them. Falls back to the original on parse
+/// failure since the URL was already in storage and stripping is best-effort.
+fn sanitize_endpoint_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.into()
+        }
+        Err(_) => raw.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +452,7 @@ pub mod test_api {
                     kind: s.category.clone(),
                     status: s.status.clone(),
                     node_id: s.node_id.clone(),
-                    endpoint: s.endpoint_url.clone(),
+                    endpoint: s.endpoint_url.as_deref().map(super::sanitize_endpoint_url),
                     capabilities: caps,
                 }
             })
