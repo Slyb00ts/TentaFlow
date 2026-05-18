@@ -155,17 +155,17 @@ pub fn reset_frame_url_rate_limiter_for_test() {
     frame_url_rate_limiter().buckets.clear();
 }
 
-/// Strict UUID v4 textual-form validator. Mirrors `validate_camera_id` in
-/// `addon::ui_framework` (Chunk A). The contract is 36 chars, lowercase hex
-/// plus dashes in the standard layout, version nibble `4` at index 14, and
-/// the RFC 4122 variant nibble in the `8..=b` band at index 19. Kept local
-/// rather than reaching across the `addon` module so the dispatch crate
-/// doesn't drag in addon-only types.
+/// Camera id validator matching the on-the-wire format minted everywhere in
+/// the codebase: `cam_<uuid v4>` (40 chars total — 4-byte `cam_` prefix plus
+/// the canonical 8-4-4-4-12 UUID v4 layout). Mirrors `validate_camera_id` in
+/// `addon::ui_framework` (Chunk A). Kept local rather than reaching across
+/// the `addon` module so the dispatch crate doesn't drag in addon-only types.
 fn validate_camera_id(id: &str) -> Result<(), &'static str> {
-    if id.len() != 36 {
+    if id.len() != 40 || !id.starts_with("cam_") {
         return Err("camera_id_invalid_format");
     }
-    let bytes = id.as_bytes();
+    let uuid = &id[4..];
+    let bytes = uuid.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         let dash_pos = matches!(i, 8 | 13 | 18 | 23);
         if dash_pos {
@@ -230,6 +230,49 @@ fn audit_row(ctx: &HandlerContext, action: &str, resource: Option<&str>, details
         action,
         resource,
         Some(details),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+}
+
+/// Per-call audit for `camera.frame_url` (risk class `C` — low-risk read of a
+/// signed URL). Drops a hash-chained row through `log_audit_full` carrying
+/// `org_id`, `result`, and structured JSON `details`. Denied paths pass
+/// `resource_id=None` and a reason-only `details` blob — never echo the raw
+/// `camera_id` for cross-tenant probe defense; success paths carry the
+/// camera_id in `resource_id` plus `{"ttl_secs": N, "camera_id": "..."}`.
+fn audit_frame_url(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    result: &str,
+    resource_id: Option<&str>,
+    details: &serde_json::Value,
+) {
+    let user_i64 = match &ctx.session {
+        SessionAuth::UserSession { user_id, .. } => {
+            if user_id[0] == 0xFF {
+                let mut le = [0u8; 8];
+                le.copy_from_slice(&user_id[8..]);
+                Some(i64::from_le_bytes(le))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let details_str = details.to_string();
+    let _ = repository::log_audit_full(
+        &ctx.state.db,
+        user_i64,
+        None,
+        "camera.frame_url",
+        Some("camera"),
+        resource_id,
+        Some(&details_str),
+        "info",
+        "C",
+        Some(result),
+        Some(org.org_id.as_str()),
         None,
         Some(&ctx.state.local_node_id),
     );
@@ -642,22 +685,38 @@ async fn camera_frame_url(
 ) -> Result<CameraFrameUrlResponse, ProtocolError> {
     let org = require_org(ctx)?;
     if !org.has(PERM_READ) {
-        audit_row(ctx, "camera.frame_url", None, "denied: missing_permission");
+        audit_frame_url(
+            ctx,
+            org,
+            "denied",
+            None,
+            &serde_json::json!({"reason": "missing_permission"}),
+        );
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "camera.read permission required",
         ));
     }
     if let Err(reason) = validate_camera_id(&req.camera_id) {
-        audit_row(ctx, "camera.frame_url", None, &format!("denied: {reason}"));
+        audit_frame_url(
+            ctx,
+            org,
+            "denied",
+            None,
+            &serde_json::json!({"reason": reason}),
+        );
         return Err(ProtocolError::bad_request(reason));
     }
     if req.ttl_secs < FRAME_URL_TTL_MIN_SECS || req.ttl_secs > FRAME_URL_TTL_MAX_SECS {
-        audit_row(
+        audit_frame_url(
             ctx,
-            "camera.frame_url",
+            org,
+            "denied",
             None,
-            "denied: ttl_secs_out_of_range",
+            &serde_json::json!({
+                "reason": "ttl_secs_out_of_range",
+                "ttl_secs": req.ttl_secs,
+            }),
         );
         return Err(ProtocolError::bad_request("ttl_secs_out_of_range"));
     }
@@ -669,7 +728,13 @@ async fn camera_frame_url(
         .map(|s| format!("{}:{}", org.org_id, s))
         .unwrap_or_else(|| format!("{}:_", org.org_id));
     if frame_url_rate_limiter().check(&user_key).is_err() {
-        audit_row(ctx, "camera.frame_url", None, "denied: rate_limited");
+        audit_frame_url(
+            ctx,
+            org,
+            "denied",
+            None,
+            &serde_json::json!({"reason": "rate_limited"}),
+        );
         return Err(ProtocolError::new(
             ProtocolErrorCode::RateLimited,
             "camera.frame_url rate limit exceeded",
@@ -684,13 +749,25 @@ async fn camera_frame_url(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("camera.frame_url db lookup failed: {e}");
-            audit_row(ctx, "camera.frame_url", None, "error: db_query_failed");
+            audit_frame_url(
+                ctx,
+                org,
+                "error",
+                None,
+                &serde_json::json!({"reason": "db_query_failed"}),
+            );
             return Err(ProtocolError::internal("db_query_failed"));
         }
     };
     if !exists {
         // Static reason — never echo camera_id (cross-tenant probe defense).
-        audit_row(ctx, "camera.frame_url", None, "denied: camera_not_found");
+        audit_frame_url(
+            ctx,
+            org,
+            "denied",
+            None,
+            &serde_json::json!({"reason": "camera_not_found"}),
+        );
         return Err(ProtocolError::not_found("camera_not_found"));
     }
 
@@ -699,7 +776,13 @@ async fn camera_frame_url(
     {
         Some(p) => p,
         None => {
-            audit_row(ctx, "camera.frame_url", None, "denied: no_frame_available");
+            audit_frame_url(
+                ctx,
+                org,
+                "denied",
+                None,
+                &serde_json::json!({"reason": "no_frame_available"}),
+            );
             return Err(ProtocolError::not_found("no_frame_available"));
         }
     };
@@ -710,20 +793,26 @@ async fn camera_frame_url(
         Ok(u) => u,
         Err(e) => {
             tracing::warn!("camera.frame_url issue failed: {e}");
-            audit_row(ctx, "camera.frame_url", None, "error: issue_failed");
+            audit_frame_url(
+                ctx,
+                org,
+                "error",
+                None,
+                &serde_json::json!({"reason": "issue_failed"}),
+            );
             return Err(ProtocolError::internal("issue_failed"));
         }
     };
     let signed_url = format!("/frames/{}?{}", frame_ref.as_str(), issued.query_string());
-    audit_row(
+    audit_frame_url(
         ctx,
-        "camera.frame_url",
-        Some(frame_ref.as_str()),
-        &format!(
-            "ok: user_id={} ttl={}",
-            user_id_str(ctx).unwrap_or("?"),
-            req.ttl_secs
-        ),
+        org,
+        "success",
+        Some(req.camera_id.as_str()),
+        &serde_json::json!({
+            "ttl_secs": req.ttl_secs,
+            "camera_id": req.camera_id,
+        }),
     );
 
     Ok(CameraFrameUrlResponse {

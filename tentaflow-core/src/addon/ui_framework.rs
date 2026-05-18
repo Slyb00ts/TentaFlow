@@ -543,19 +543,19 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
     }
 }
 
-/// Camera id contract: UUID v4 textual form (length 36, lowercase hex + dashes
-/// in `8-4-4-4-12` layout, version nibble `4` at index 14, RFC 4122 variant
-/// nibble in `8..=b` at index 19). Strict — addons that pass non-UUID values
-/// fail fast before any signed URL is minted. Error messages never echo the
-/// input value to keep audit/install logs PII-free.
+/// Camera id contract: `cam_<uuid v4>` (length 40, `cam_` prefix + canonical
+/// 8-4-4-4-12 UUID v4 layout, lowercase hex, version nibble `4` at index 14
+/// of the uuid suffix, RFC 4122 variant nibble in `8..=b` at index 19).
+/// Matches the mint format used by `camera_add_onvif` and the addon `camera_add`
+/// host fn. Strict — addons that pass non-conformant values fail fast before
+/// any signed URL is minted. Error messages never echo the input value to
+/// keep audit/install logs PII-free.
 fn validate_camera_id(id: &str) -> anyhow::Result<()> {
-    if id.len() != 36 {
-        anyhow::bail!(
-            "LiveCameraTile.camera_id length {} (expected 36 chars UUID v4)",
-            id.len()
-        );
+    if id.len() != 40 || !id.starts_with("cam_") {
+        anyhow::bail!("LiveCameraTile.camera_id invalid format");
     }
-    let bytes = id.as_bytes();
+    let uuid = &id[4..];
+    let bytes = uuid.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         let dash_pos = matches!(i, 8 | 13 | 18 | 23);
         if dash_pos {

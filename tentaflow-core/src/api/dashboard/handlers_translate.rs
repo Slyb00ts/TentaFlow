@@ -127,6 +127,9 @@ fn audit_translate(
         None,
         Some(&details),
         "info",
+        "unclassified",
+        None,
+        None,
         None,
         Some(node_id),
     ) {

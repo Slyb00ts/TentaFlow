@@ -300,6 +300,16 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
     ) {
         return true;
     }
+    // CameraAdminBody:FrameUrlResponse carries a signed `/frames/<ref>?token=...`
+    // URL whose query string includes a live HMAC token. With
+    // `TENTAFLOW_TRACE_WSS=1` an attacker reading trace logs could lift the
+    // token wire and replay the download within the (up to 300 s) TTL.
+    if matches!(
+        body,
+        MessageBody::CameraAdminBody(tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(_))
+    ) {
+        return true;
+    }
     // LegalAdminBody:GenerateResponse carries a fully-formed signed download
     // URL whose query string includes a live HMAC token. With
     // `TENTAFLOW_TRACE_WSS=1` an attacker reading trace logs could lift the
