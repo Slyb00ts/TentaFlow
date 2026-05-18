@@ -57,18 +57,35 @@ pub fn ui_render(
         return ABI_ERR_PERMISSION;
     }
 
-    // Waliduj JSON UI
-    let ui_value: serde_json::Value = match serde_json::from_str(&ui_json_str) {
+    // Waliduj JSON UI — najpierw parse, potem strict semantic validation
+    // (camera_id UUID v4, ttl_secs zakres, itd.). Bez tego addon moglby
+    // wstrzyknac dowolny camera_id do panelu, co wycieklo by do frontu.
+    let ui_value_raw: serde_json::Value = match serde_json::from_str(&ui_json_str) {
         Ok(v) => v,
-        Err(e) => {
-            let msg = format!("Niepoprawny UI JSON: {}", e);
+        Err(_) => {
             audit_log(
                 caller.data(),
                 "ui.render",
                 Some("ui"),
                 Some(&panel_id),
                 "error",
-                Some(&msg),
+                Some("invalid ui json"),
+            );
+            return ABI_ERR_OPERATION;
+        }
+    };
+
+    let ui_value = match crate::addon::ui_framework::parse_and_validate_ui_json(&ui_value_raw)
+    {
+        Ok(v) => v,
+        Err(_) => {
+            audit_log(
+                caller.data(),
+                "ui.render",
+                Some("ui"),
+                Some(&panel_id),
+                "denied",
+                Some("ui component validation failed"),
             );
             return ABI_ERR_OPERATION;
         }
