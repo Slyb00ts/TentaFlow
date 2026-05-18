@@ -44,7 +44,10 @@ impl UrlScope {
 
     pub fn min_ttl_secs(&self) -> u64 {
         match self {
-            Self::FrameUrl => 60,
+            // Live preview tiles refresh every (ttl/2) seconds — short TTLs
+            // are required so a leaked URL becomes useless quickly. The
+            // dashboard tile contract is 5..=300 secs; the floor matches.
+            Self::FrameUrl => 5,
             Self::Recording => 60,
             Self::LegalUrl => 60,
         }
@@ -365,12 +368,12 @@ mod tests {
     fn test_ttl_out_of_range_frame_url() {
         let i = frame_issuer();
         assert!(matches!(
-            i.issue("f".into(), 10).unwrap_err(),
-            SignedUrlError::TtlOutOfRange(10, 60, 600)
+            i.issue("f".into(), 1).unwrap_err(),
+            SignedUrlError::TtlOutOfRange(1, 5, 600)
         ));
         assert!(matches!(
             i.issue("f".into(), 700).unwrap_err(),
-            SignedUrlError::TtlOutOfRange(700, 60, 600)
+            SignedUrlError::TtlOutOfRange(700, 5, 600)
         ));
     }
 

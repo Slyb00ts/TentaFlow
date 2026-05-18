@@ -1,24 +1,19 @@
 // =============================================================================
 // Plik: tf-live-camera-tile.js
-// Opis: Komponent <tf-live-camera-tile camera-id ttl-secs [label] [height-px]
-//       addon-id panel-id> — kafelek live podgladu z kamery. Co (ttl_secs / 2)
-//       sekund odswieza atrybut `src` w wewnetrznym <img> przez nowy signed URL
-//       (frame_url) pobierany akcja `__tentaflow.frame_url__` w panelu addonu.
-//       Cleanup timera w disconnectedCallback gwarantuje brak wyciekow gdy
-//       addon-app re-renderuje panel.
-// Przyklad: <tf-live-camera-tile camera-id="550e..." ttl-secs="30"
-//             addon-id="tentavision" panel-id="home"></tf-live-camera-tile>
+// Opis: Komponent <tf-live-camera-tile camera-id ttl-secs [label] [height-px]>
+//       — kafelek live podgladu z kamery. Co (ttl_secs / 2) sekund odswieza
+//       atrybut `src` w wewnetrznym <img> przez nowy signed URL (frame_url)
+//       pobierany binarnym dispatchem `cameraFrameUrlRequest` bezposrednio
+//       z core (zero round-tripa do WASM addona). Cleanup timera w
+//       disconnectedCallback gwarantuje brak wyciekow gdy panel jest
+//       re-renderowany.
+// Przyklad: <tf-live-camera-tile camera-id="550e8400-e29b-41d4-a716-446655440000"
+//             ttl-secs="30"></tf-live-camera-tile>
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 
-// Zarezerwowany action ID w panelach addonu zwracajacy {frameUrl: "..."}.
-// Addon-side: deklaruje action o tym ID + on_action zwraca signed URL z
-// frame_url(camera_id, ttl_secs). Jezeli action nie istnieje — pokazujemy
-// "Brak podglądu" zamiast pustego src.
-const FRAME_URL_ACTION = '__tentaflow.frame_url__';
-
-// Bezpieczne granice (zgodne z LIVE_CAMERA_TILE_TTL_MIN/MAX w hoscie).
+// Bezpieczne granice (zgodne z FRAME_URL_TTL_MIN/MAX w hoscie).
 const TTL_MIN = 5;
 const TTL_MAX = 300;
 const TTL_DEFAULT = 30;
@@ -29,7 +24,7 @@ const ERROR_BACKOFF_MULT = 2;
 
 class TfLiveCameraTile extends HTMLElement {
   static get observedAttributes() {
-    return ['camera-id', 'ttl-secs', 'label', 'height-px', 'addon-id', 'panel-id'];
+    return ['camera-id', 'ttl-secs', 'label', 'height-px'];
   }
 
   constructor() {
@@ -126,30 +121,26 @@ class TfLiveCameraTile extends HTMLElement {
   async _refresh() {
     if (this._disposed || this._fetching) return;
     const cameraId = this.getAttribute('camera-id') ?? '';
-    const addonId = this.getAttribute('addon-id') ?? '';
-    const panelId = this.getAttribute('panel-id') ?? '';
     const ttl = this._ttlSecs();
-    if (!cameraId || !addonId || !panelId) {
+    if (!cameraId) {
       this._showError();
       return;
     }
     this._fetching = true;
     try {
-      const res = await ApiBinary.one('addonUiActionRequest', {
-        addonId,
-        panelId,
-        actionId: FRAME_URL_ACTION,
-        params: { cameraId, ttlSecs: ttl },
+      const res = await ApiBinary.one('cameraFrameUrlRequest', {
+        cameraId,
+        ttlSecs: ttl,
       });
-      const url = String(res?.frameUrl ?? res?.frame_url ?? '').trim();
-      if (!url) throw new Error('empty frameUrl');
+      const url = String(res?.signedUrl ?? res?.signed_url ?? '').trim();
+      if (!url) throw new Error('empty signedUrl');
       this._applyUrl(url);
       this._scheduleRefresh((ttl * 1000) / 2);
     } catch (e) {
       console.warn('[tf-live-camera-tile] frame_url fetch failed:', e?.message ?? e);
       this._showError();
-      // Slower backoff po bledzie — zeby addon w stanie awarii nie generowal
-      // bezsensownego ruchu na binary WS.
+      // Wolniejszy backoff po bledzie — zeby kamera w stanie awarii nie
+      // generowala bezsensownego ruchu na binary WS.
       this._scheduleRefresh((ttl * 1000) * ERROR_BACKOFF_MULT);
     } finally {
       this._fetching = false;

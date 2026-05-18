@@ -82,6 +82,38 @@ pub struct CameraAddOnvifResponse {
     pub profile_token: String,
 }
 
+/// Live-preview frame URL request — the dashboard `<tf-live-camera-tile>`
+/// custom element calls this directly so the panel does not round-trip
+/// through the addon WASM `__tentaflow.frame_url__` action. The handler
+/// authenticates as the user session, gates on `camera.read`, validates the
+/// camera id (UUID v4), enforces a per-user rate limit, and mints a signed
+/// `/frames/<ref>?token=...` URL against the latest frame stored for that
+/// camera in the in-memory LRU.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraFrameUrlRequest {
+    /// Camera id (UUID v4 textual form, 36 chars). Strict validation in the
+    /// handler — non-UUID values fail with BadRequest before any DB hit.
+    pub camera_id: String,
+    /// Requested TTL in seconds. Dispatch contract: 5..=300. Out-of-range
+    /// values yield BadRequest; the response `expires_at_ms` echoes the
+    /// actually-minted expiry.
+    pub ttl_secs: u32,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraFrameUrlResponse {
+    /// Same-origin signed URL (`/frames/<ref>?token=&exp=&ref=`).
+    pub signed_url: String,
+    /// Absolute expiry as Unix milliseconds. Mirrors the host-fn
+    /// `UrlOut.expires_unix_ms` shape so dashboard + addon paths stay
+    /// schema-compatible.
+    pub expires_at_ms: i64,
+}
+
 /// Inner-enum pack — keeps every admin camera RPC in a single
 /// `MessageBody::CameraAdminBody` slot (rkyv 256-variant budget). Matches the
 /// `ProfilingPayload` / `VisionInferPayload` pattern.
@@ -93,6 +125,8 @@ pub enum CameraAdminPayload {
     DiscoverResponse(CameraDiscoverResponse),
     AddOnvifRequest(CameraAddOnvifRequest),
     AddOnvifResponse(CameraAddOnvifResponse),
+    FrameUrlRequest(CameraFrameUrlRequest),
+    FrameUrlResponse(CameraFrameUrlResponse),
 }
 
 #[cfg(test)]
@@ -212,6 +246,55 @@ mod tests {
         ));
         let bytes =
             rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded =
+            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn frame_url_request_round_trip() {
+        let v = CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
+            camera_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            ttl_secs: 30,
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn frame_url_response_round_trip() {
+        let v = CameraAdminPayload::FrameUrlResponse(CameraFrameUrlResponse {
+            signed_url: "/frames/frame_550e8400-e29b-41d4-a716-446655440000?token=ABCD&exp=1700000000000&ref=frame_xyz"
+                .into(),
+            expires_at_ms: 1_700_000_000_000,
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn camera_admin_body_frame_url_request_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
+            CameraFrameUrlRequest {
+                camera_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                ttl_secs: 30,
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
+        let decoded =
+            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn camera_admin_body_frame_url_response_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlResponse(
+            CameraFrameUrlResponse {
+                signed_url: "/frames/frame_x?token=A&exp=1&ref=frame_x".into(),
+                expires_at_ms: 1,
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
         let decoded =
             rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);

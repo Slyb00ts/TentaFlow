@@ -16,7 +16,8 @@ use parking_lot::Mutex;
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDiscoverResponse,
-    DiscoveredCameraInfo, MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
+    CameraFrameUrlRequest, CameraFrameUrlResponse, DiscoveredCameraInfo, MessageBody,
+    ProtocolError, ProtocolErrorCode, SessionAuth,
 };
 
 use super::HandlerContext;
@@ -32,6 +33,20 @@ use crate::services::rbac::OrgContext;
 
 const PERM_DISCOVER: &str = "camera.discover";
 const PERM_WRITE: &str = "camera.write";
+const PERM_READ: &str = "camera.read";
+
+// Frame URL dispatch contract — the dashboard `<tf-live-camera-tile>` may
+// request TTLs as short as 5 s (preview refreshes every ttl/2 s). Values
+// outside this band yield BadRequest before the issuer is touched.
+const FRAME_URL_TTL_MIN_SECS: u32 = 5;
+const FRAME_URL_TTL_MAX_SECS: u32 = 300;
+
+// Per-user frame-url rate limit. Burst 30, sustain 30 / min — matches the
+// browse-friendly tier (tile refresh is ttl/2 s; at the 5 s floor that
+// produces 24 req/min for a single tile, leaving budget for ~1 extra tile
+// before the bucket drains).
+const FRAME_URL_BURST: u32 = 30;
+const FRAME_URL_REFILL_PER_SEC: f64 = 30.0 / 60.0;
 
 /// SOAP resolve budget — matches the host-fn one-click path.
 const ONVIF_RESOLVE_TIMEOUT_MS: u32 = 10_000;
@@ -101,6 +116,73 @@ impl DiscoverRateLimiter {
 fn discover_rate_limiter() -> &'static Arc<DiscoverRateLimiter> {
     static LIMITER: std::sync::OnceLock<Arc<DiscoverRateLimiter>> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| Arc::new(DiscoverRateLimiter::default()))
+}
+
+// =============================================================================
+// Per-user rate limiter for camera.frame_url
+// =============================================================================
+
+#[derive(Default)]
+struct FrameUrlRateLimiter {
+    buckets: dashmap::DashMap<String, Mutex<crate::util::token_bucket::TokenBucket>>,
+}
+
+impl FrameUrlRateLimiter {
+    fn check(&self, user_key: &str) -> Result<(), f64> {
+        let entry = self
+            .buckets
+            .entry(user_key.to_string())
+            .or_insert_with(|| {
+                Mutex::new(crate::util::token_bucket::TokenBucket::new(FRAME_URL_BURST))
+            });
+        let mut bucket = entry.lock();
+        let now = Instant::now();
+        bucket
+            .refill_and_peek(FRAME_URL_BURST, FRAME_URL_REFILL_PER_SEC, now)
+            .map(|()| bucket.commit_one())
+    }
+}
+
+fn frame_url_rate_limiter() -> &'static Arc<FrameUrlRateLimiter> {
+    static LIMITER: std::sync::OnceLock<Arc<FrameUrlRateLimiter>> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| Arc::new(FrameUrlRateLimiter::default()))
+}
+
+/// Test-only reset of the per-user bucket so integration tests can replay
+/// the burst scenario without cross-test contamination.
+#[doc(hidden)]
+pub fn reset_frame_url_rate_limiter_for_test() {
+    frame_url_rate_limiter().buckets.clear();
+}
+
+/// Strict UUID v4 textual-form validator. Mirrors `validate_camera_id` in
+/// `addon::ui_framework` (Chunk A). The contract is 36 chars, lowercase hex
+/// plus dashes in the standard layout, version nibble `4` at index 14, and
+/// the RFC 4122 variant nibble in the `8..=b` band at index 19. Kept local
+/// rather than reaching across the `addon` module so the dispatch crate
+/// doesn't drag in addon-only types.
+fn validate_camera_id(id: &str) -> Result<(), &'static str> {
+    if id.len() != 36 {
+        return Err("camera_id_invalid_format");
+    }
+    let bytes = id.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let dash_pos = matches!(i, 8 | 13 | 18 | 23);
+        if dash_pos {
+            if b != b'-' {
+                return Err("camera_id_invalid_format");
+            }
+        } else if !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err("camera_id_invalid_format");
+        }
+    }
+    if bytes[14] != b'4' {
+        return Err("camera_id_invalid_format");
+    }
+    if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
+        return Err("camera_id_invalid_format");
+    }
+    Ok(())
 }
 
 /// Test-only reset of the per-org bucket so tests can replay the burst scenario
@@ -307,11 +389,17 @@ pub async fn camera_admin_dispatch(
                 CameraAdminPayload::AddOnvifResponse(resp),
             ))
         }
-        CameraAdminPayload::DiscoverResponse(_) | CameraAdminPayload::AddOnvifResponse(_) => {
-            Err(ProtocolError::bad_request(
-                "response variant cannot be sent as a request",
+        CameraAdminPayload::FrameUrlRequest(r) => {
+            let resp = camera_frame_url(ctx, r.clone()).await?;
+            Ok(MessageBody::CameraAdminBody(
+                CameraAdminPayload::FrameUrlResponse(resp),
             ))
         }
+        CameraAdminPayload::DiscoverResponse(_)
+        | CameraAdminPayload::AddOnvifResponse(_)
+        | CameraAdminPayload::FrameUrlResponse(_) => Err(ProtocolError::bad_request(
+            "response variant cannot be sent as a request",
+        )),
     }
 }
 
@@ -337,6 +425,10 @@ register_camera_admin_variant!(
 register_camera_admin_variant!(
     "CameraAddOnvifRequest",
     "tentaflow_ws_handler_camera_add_onvif"
+);
+register_camera_admin_variant!(
+    "CameraFrameUrlRequest",
+    "tentaflow_ws_handler_camera_frame_url"
 );
 
 // =============================================================================
@@ -521,5 +613,121 @@ async fn camera_add_onvif(
         camera_id,
         rtsp_url: resolved.rtsp_uri,
         profile_token: resolved.profile_token,
+    })
+}
+
+// =============================================================================
+// Frame URL (live tile)
+// =============================================================================
+//
+// User-session counterpart to the addon-scoped `recording::frame_url_v1` host
+// fn. Mints a same-origin signed `/frames/<ref>?token=...` URL for the latest
+// frame stored for `camera_id` in the in-memory LRU. The browser tile
+// (`<tf-live-camera-tile>`) calls this directly so panel rendering does not
+// burn a round-trip through the addon WASM instance pool just to grab a URL.
+//
+// Security boundary:
+//   - permission `camera.read` (gated against `OrgContext`),
+//   - strict UUID v4 validation of `camera_id` (no echo of the raw value into
+//     audit details — only `denied: <reason>` static tags),
+//   - org_id isolation enforced at the DB query (`camera_exists_in_org`),
+//   - per-user rate limit (burst 30, sustain 30/min),
+//   - dispatch TTL band 5..=300 secs (BadRequest on out-of-range),
+//   - HMAC mint goes through the global `frame_url_issuer()` — same key as
+//     the addon-side path so URLs verify against the shared `/frames/` route.
+
+async fn camera_frame_url(
+    ctx: &HandlerContext,
+    req: CameraFrameUrlRequest,
+) -> Result<CameraFrameUrlResponse, ProtocolError> {
+    let org = require_org(ctx)?;
+    if !org.has(PERM_READ) {
+        audit_row(ctx, "camera.frame_url", None, "denied: missing_permission");
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "camera.read permission required",
+        ));
+    }
+    if let Err(reason) = validate_camera_id(&req.camera_id) {
+        audit_row(ctx, "camera.frame_url", None, &format!("denied: {reason}"));
+        return Err(ProtocolError::bad_request(reason));
+    }
+    if req.ttl_secs < FRAME_URL_TTL_MIN_SECS || req.ttl_secs > FRAME_URL_TTL_MAX_SECS {
+        audit_row(
+            ctx,
+            "camera.frame_url",
+            None,
+            "denied: ttl_secs_out_of_range",
+        );
+        return Err(ProtocolError::bad_request("ttl_secs_out_of_range"));
+    }
+
+    // Per-user bucket. Keyed by the org-scoped user id when available; fall
+    // back to org_id alone (anonymous-but-org-bound paths must still throttle
+    // even if user attribution is missing).
+    let user_key = user_id_str(ctx)
+        .map(|s| format!("{}:{}", org.org_id, s))
+        .unwrap_or_else(|| format!("{}:_", org.org_id));
+    if frame_url_rate_limiter().check(&user_key).is_err() {
+        audit_row(ctx, "camera.frame_url", None, "denied: rate_limited");
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::RateLimited,
+            "camera.frame_url rate limit exceeded",
+        ));
+    }
+
+    let exists = match crate::db::repository::camera_exists_in_org(
+        &ctx.state.db,
+        &req.camera_id,
+        &org.org_id,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("camera.frame_url db lookup failed: {e}");
+            audit_row(ctx, "camera.frame_url", None, "error: db_query_failed");
+            return Err(ProtocolError::internal("db_query_failed"));
+        }
+    };
+    if !exists {
+        // Static reason — never echo camera_id (cross-tenant probe defense).
+        audit_row(ctx, "camera.frame_url", None, "denied: camera_not_found");
+        return Err(ProtocolError::not_found("camera_not_found"));
+    }
+
+    let (frame_ref, _stored) = match crate::services::frame_storage()
+        .latest_for_camera(&req.camera_id)
+    {
+        Some(p) => p,
+        None => {
+            audit_row(ctx, "camera.frame_url", None, "denied: no_frame_available");
+            return Err(ProtocolError::not_found("no_frame_available"));
+        }
+    };
+
+    let issued = match crate::services::frame_url_issuer()
+        .issue(frame_ref.as_str().to_string(), req.ttl_secs as u64)
+    {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("camera.frame_url issue failed: {e}");
+            audit_row(ctx, "camera.frame_url", None, "error: issue_failed");
+            return Err(ProtocolError::internal("issue_failed"));
+        }
+    };
+    let signed_url = format!("/frames/{}?{}", frame_ref.as_str(), issued.query_string());
+    audit_row(
+        ctx,
+        "camera.frame_url",
+        Some(frame_ref.as_str()),
+        &format!(
+            "ok: user_id={} ttl={}",
+            user_id_str(ctx).unwrap_or("?"),
+            req.ttl_secs
+        ),
+    );
+
+    Ok(CameraFrameUrlResponse {
+        signed_url,
+        expires_at_ms: issued.expiry_unix_ms as i64,
     })
 }

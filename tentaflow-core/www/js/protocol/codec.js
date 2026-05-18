@@ -734,6 +734,24 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::CameraAdminBody(FrameUrlRequest) — live-preview tile URL.
+   * payload: { cameraId, ttlSecs }
+   */
+  cameraFrameUrlRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraFrameUrlRequest(
+      payload.cameraId,
+      Number(payload.ttlSecs),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------
