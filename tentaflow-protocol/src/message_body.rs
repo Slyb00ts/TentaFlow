@@ -2039,19 +2039,23 @@ pub struct AddonsListResponse {
 // SCHEMA v14: Apps menu + UI v2 endpointy
 // =============================================================================
 
-/// Aplikacja addonu widoczna w głównym menu launcher. Źródło:
-/// manifest `[application]` sekcja po install.
+/// Application tile shown in the launcher / "My applications". Sourced from
+/// the addon manifest `[application]` section at install time.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AddonApplicationInfo {
     pub addon_id: String,
     pub title: String,
-    /// ID panelu UI startowego (frontend ładuje przez
-    /// `AddonUiPayload::ReqPanelGet`).
+    /// Entry panel id — frontend loads it via `AddonUiPayload::ReqPanelGet`.
     pub entry_panel: String,
-    /// Identyfikator ikony sprite. None = fallback na `addon.icon`.
-    pub icon: Option<String>,
-    /// Kolejność w menu (mniejsze = wyżej). Default 100 jeżeli manifest pominie.
+    /// Icon name from the TentaFlow icon library (mandatory in manifest).
+    pub icon: String,
+    /// Short description shown under the tile in "All applications".
+    pub description: String,
+    /// Sort order (lower = higher). Default 100 when manifest omits it.
     pub sort_order: i32,
+    /// Whether the addon is currently enabled in `addons.is_enabled`. The
+    /// client uses this to gray out tiles for disabled addons.
+    pub enabled: bool,
 }
 
 /// Multiplex 6 endpointów Apps menu + UI v2 w jednym slocie `MessageBody`,

@@ -1262,26 +1262,58 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                 .map(|v| v as u64),
         });
 
-    let application = top
-        .get("application")
-        .and_then(|v| v.as_table())
-        .and_then(|app| {
-            let entry_panel = app.get("entry_panel").and_then(|v| v.as_str())?.to_string();
-            let title = app
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&entry_panel)
+    let application = match top.get("application") {
+        None => None,
+        Some(v) => {
+            let tbl = v
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("[application] must be a TOML table"))?;
+            let entry_panel = tbl
+                .get("entry_panel")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("[application] missing entry_panel (string)")
+                })?
                 .to_string();
-            Some(crate::addon::AddonApplicationSection {
+            let title = tbl
+                .get("title")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow::anyhow!("[application] missing title (string)"))?
+                .to_string();
+            let icon = tbl
+                .get("icon")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow::anyhow!("[application] missing icon (string)"))?
+                .to_string();
+            let description = tbl
+                .get("description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let sort_order = match tbl.get("sort_order") {
+                None => 100,
+                Some(toml::Value::Integer(n)) => {
+                    if !(i32::MIN as i64..=i32::MAX as i64).contains(n) {
+                        bail!("application.sort_order {n} outside i32 range");
+                    }
+                    *n as i32
+                }
+                Some(other) => bail!(
+                    "application.sort_order must be integer (got {})",
+                    other.type_str()
+                ),
+            };
+            let section = crate::addon::AddonApplicationSection {
                 entry_panel,
                 title,
-                icon: app.get("icon").and_then(|v| v.as_str()).map(String::from),
-                sort_order: app
-                    .get("sort_order")
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as i32),
-            })
-        });
+                icon,
+                description,
+                sort_order,
+            };
+            section.validate()?;
+            Some(section)
+        }
+    };
 
     let sdk_version = addon
         .get("sdk_version")
@@ -2050,6 +2082,143 @@ tick_fuel_budget = 20000000
         assert!(svc.enabled);
         assert_eq!(svc.tick_interval_ms, Some(500));
         assert_eq!(svc.tick_fuel_budget, Some(20_000_000));
+    }
+
+    #[test]
+    fn application_section_parses_with_all_fields() {
+        let toml = r#"
+[addon]
+id = "tentavision"
+name = "TentaVision"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = "TentaVision"
+icon = "video"
+description = "Live camera surveillance"
+sort_order = 10
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let app = m.application.expect("[application] parsed");
+        assert_eq!(app.entry_panel, "main");
+        assert_eq!(app.title, "TentaVision");
+        assert_eq!(app.icon, "video");
+        assert_eq!(app.description, "Live camera surveillance");
+        assert_eq!(app.sort_order, 10);
+    }
+
+    #[test]
+    fn application_section_uses_defaults_when_optional_fields_omitted() {
+        let toml = r#"
+[addon]
+id = "addon-x"
+name = "X"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "panel_a"
+title = "X"
+icon = "camera"
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        let app = m.application.expect("parsed");
+        assert_eq!(app.description, "");
+        assert_eq!(app.sort_order, 100);
+    }
+
+    #[test]
+    fn application_section_absent_yields_none() {
+        let toml = r#"
+[addon]
+id = "no-app"
+name = "No App"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+"#;
+        let m = parse_manifest_toml(toml).expect("parse");
+        assert!(m.application.is_none());
+    }
+
+    #[test]
+    fn application_rejects_invalid_entry_panel() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "Main Panel!"
+title = "Bad"
+icon = "video"
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(
+            err.to_string().contains("entry_panel"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn application_rejects_empty_title() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = ""
+icon = "video"
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(err.to_string().contains("title"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn application_rejects_invalid_icon() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = "OK"
+icon = "Video Cam!"
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(err.to_string().contains("icon"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn application_rejects_sort_order_out_of_range() {
+        let toml = r#"
+[addon]
+id = "bad"
+name = "Bad"
+version = "0.1.0"
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "main"
+title = "OK"
+icon = "video"
+sort_order = 999999
+"#;
+        let err = parse_manifest_toml(toml).expect_err("must reject");
+        assert!(
+            err.to_string().contains("sort_order"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
