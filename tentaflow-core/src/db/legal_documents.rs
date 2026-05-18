@@ -169,23 +169,35 @@ pub fn set_signed_url_ref(
 /// Soft-delete by stamping `revoked_at`. Idempotent at the SQL level (a row
 /// already revoked is overwritten with the new timestamp); the caller decides
 /// whether to re-revoke or short-circuit.
+/// Soft-delete the row. Idempotent at the SQL level: the `revoked_at IS NULL`
+/// guard ensures a second revoke of the same `(doc_id, org_id)` updates zero
+/// rows and returns `Ok(RevokeOutcome::AlreadyRevoked)` — the original
+/// timestamp and audit trail stay untouched. Callers distinguish a genuinely
+/// missing row via the pre-check (`get_by_id`).
 pub fn revoke(
     conn: &Connection,
     doc_id: &str,
     org_id: &str,
     now_ms: i64,
-) -> Result<()> {
+) -> Result<RevokeOutcome> {
     let affected = conn.execute(
         "UPDATE legal_documents SET revoked_at = ?1 \
-         WHERE id = ?2 AND org_id = ?3",
+         WHERE id = ?2 AND org_id = ?3 AND revoked_at IS NULL",
         params![now_ms, doc_id, org_id],
     )?;
-    if affected != 1 {
-        return Err(anyhow!(
-            "legal_documents revoke: no row for id={doc_id} org_id={org_id}"
-        ));
+    match affected {
+        0 => Ok(RevokeOutcome::AlreadyRevoked),
+        1 => Ok(RevokeOutcome::FreshlyRevoked),
+        n => Err(anyhow!(
+            "legal_documents revoke: unexpected affected row count {n} for id={doc_id} org_id={org_id}"
+        )),
     }
-    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    FreshlyRevoked,
+    AlreadyRevoked,
 }
 
 #[cfg(test)]
@@ -364,10 +376,36 @@ mod tests {
         seed_membership(&conn, "org-default", "u-1");
         seed_org(&conn, "org-b", "b");
         let id = insert(&conn, &make_doc("org-default", RodoVariant::Standard, 10)).unwrap();
-        revoke(&conn, &id, "org-default", 42).unwrap();
+        assert_eq!(
+            revoke(&conn, &id, "org-default", 42).unwrap(),
+            RevokeOutcome::FreshlyRevoked
+        );
         let got = get_by_id(&conn, &id, "org-default").unwrap().unwrap();
         assert_eq!(got.revoked_at, Some(42));
-        // Cross-tenant revoke must not succeed.
-        assert!(revoke(&conn, &id, "org-b", 99).is_err());
+        // Cross-tenant revoke matches zero rows — surfaced as AlreadyRevoked at
+        // this layer; the service layer's `get_by_id` pre-check turns the
+        // cross-tenant case into NotFound before we ever reach here.
+        assert_eq!(
+            revoke(&conn, &id, "org-b", 99).unwrap(),
+            RevokeOutcome::AlreadyRevoked
+        );
+    }
+
+    #[test]
+    fn revoke_is_idempotent_second_call_preserves_timestamp() {
+        let conn = open_test_conn();
+        seed_membership(&conn, "org-default", "u-1");
+        let id = insert(&conn, &make_doc("org-default", RodoVariant::Standard, 10)).unwrap();
+        assert_eq!(
+            revoke(&conn, &id, "org-default", 42).unwrap(),
+            RevokeOutcome::FreshlyRevoked
+        );
+        assert_eq!(
+            revoke(&conn, &id, "org-default", 99).unwrap(),
+            RevokeOutcome::AlreadyRevoked
+        );
+        // Original timestamp preserved — the second revoke did not overwrite.
+        let got = get_by_id(&conn, &id, "org-default").unwrap().unwrap();
+        assert_eq!(got.revoked_at, Some(42));
     }
 }

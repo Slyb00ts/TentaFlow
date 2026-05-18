@@ -336,6 +336,10 @@ async fn legal_document_revoke_v1(
             ProtocolErrorCode::PolicyDenied,
             "user_not_member",
         )),
+        Err(crate::services::legal::RevokeError::AlreadyRevoked) => Err(ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            "already_revoked",
+        )),
         Err(crate::services::legal::RevokeError::Db(e)) => {
             tracing::warn!("legal revoke db error: {e}");
             Err(ProtocolError::internal("db_error"))

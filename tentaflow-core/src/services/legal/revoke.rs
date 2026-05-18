@@ -13,7 +13,7 @@
 use rusqlite::{params, Connection};
 
 use crate::audit::chain::{compute_chain_for_insert, AuditRowHashInput};
-use crate::db::legal_documents::{get_by_id, revoke as repo_revoke};
+use crate::db::legal_documents::{get_by_id, revoke as repo_revoke, RevokeOutcome};
 use crate::db::DbPool;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +28,12 @@ pub enum RevokeError {
     /// code so probing cannot tell them apart.
     #[error("user not a member of organization")]
     UserNotMember,
+    /// The row already carries a `revoked_at` timestamp. Surfaced as a typed
+    /// error so the caller can pick its HTTP/RPC mapping (409 vs 200), but no
+    /// audit row is emitted at this layer — the original revoke already has
+    /// its `legal.revoke` row in the chain.
+    #[error("document already revoked")]
+    AlreadyRevoked,
     #[error("database error")]
     Db(#[from] rusqlite::Error),
 }
@@ -64,10 +70,18 @@ pub fn revoke(
         return Err(RevokeError::NotFound);
     }
 
-    repo_revoke(conn, doc_id, org_id, now_ms).map_err(anyhow_to_db)?;
-
-    let _ = audit_emit_revoke(conn, org_id, actor_user_id, doc_id, now_ms);
-    Ok(())
+    // Idempotent UPDATE: the SQL guard `revoked_at IS NULL` ensures a second
+    // revoke of the same row touches zero rows. We emit the audit chain entry
+    // only on the freshly-revoked transition so a duplicate caller cannot
+    // pollute the audit log with redundant rows (or overwrite the original
+    // `revoked_at` timestamp).
+    match repo_revoke(conn, doc_id, org_id, now_ms).map_err(anyhow_to_db)? {
+        RevokeOutcome::FreshlyRevoked => {
+            let _ = audit_emit_revoke(conn, org_id, actor_user_id, doc_id, now_ms);
+            Ok(())
+        }
+        RevokeOutcome::AlreadyRevoked => Err(RevokeError::AlreadyRevoked),
+    }
 }
 
 /// Async wrapper for use from Tokio handlers. Mirrors
@@ -268,5 +282,42 @@ mod tests {
         let id = seed_doc(&conn);
         let err = revoke(&conn, ORG, &id, "u-ghost", 1).unwrap_err();
         assert!(matches!(err, RevokeError::UserNotMember));
+    }
+
+    #[test]
+    fn revoke_already_revoked_returns_error_no_double_audit() {
+        let conn = open_db();
+        let id = seed_doc(&conn);
+        revoke(&conn, ORG, &id, USER, 42).expect("first revoke");
+
+        // Second revoke surfaces AlreadyRevoked and must NOT emit an audit row.
+        let audit_count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'legal.revoke' AND resource_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count_before, 1, "first revoke emits exactly one row");
+
+        let err = revoke(&conn, ORG, &id, USER, 999).unwrap_err();
+        assert!(matches!(err, RevokeError::AlreadyRevoked));
+
+        let audit_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'legal.revoke' AND resource_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_count_after, 1,
+            "second revoke must not emit a duplicate audit row"
+        );
+
+        // Original revoked_at timestamp preserved — the second call did not
+        // overwrite the row.
+        let row = get_by_id(&conn, &id, ORG).unwrap().unwrap();
+        assert_eq!(row.revoked_at, Some(42));
     }
 }
