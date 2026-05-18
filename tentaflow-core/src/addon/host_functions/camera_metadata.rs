@@ -17,8 +17,8 @@
 //                                       so the addon drives delivery by
 //                                       polling.
 //
-// Permission: `camera.metadata` (risk class B — mutates supervisor state on
-// subscribe/unsubscribe; poll is read-only but the bus capacity is shared).
+// Permission: `camera.metadata`. Risk class B for subscribe/unsubscribe
+// (mutate supervisor state) and risk class C for poll (read-only drain).
 // Org isolation: enforced via `get_camera_for_addon`, which restricts the
 // query by `(owner_addon_id, org_id, removed_at IS NULL)`.
 
@@ -413,47 +413,81 @@ pub fn camera_metadata_unsubscribe_v1(
         }
     };
 
-    // Resolve the active entry first to enforce addon ownership before we
-    // touch the bus or supervisor. Cross-addon unsubscribe = NotFound.
-    let active = match active_registry().get(&input.subscription_id) {
-        Some(e) => e.value().clone(),
+    // Peek the active entry to enforce addon ownership BEFORE we atomically
+    // remove it. The ownership check must precede the remove so a foreign
+    // caller cannot use this host fn to delete a sibling's registration.
+    let caller_addon = caller.data().addon_id.clone();
+    {
+        let snapshot = active_registry().get(&input.subscription_id);
+        match snapshot {
+            Some(e) => {
+                if e.value().addon_id != caller_addon {
+                    drop(e);
+                    audit_with_risk(
+                        caller.data(),
+                        "camera.metadata.unsubscribe",
+                        Some(&input.subscription_id),
+                        RiskClass::B,
+                        "denied",
+                        Some("cross_addon_unsubscribe"),
+                    );
+                    return AbiError::NotFound.as_i32();
+                }
+            }
+            None => {
+                audit_with_risk(
+                    caller.data(),
+                    "camera.metadata.unsubscribe",
+                    Some(&input.subscription_id),
+                    RiskClass::B,
+                    "denied",
+                    Some("subscription_not_found"),
+                );
+                let out = UnsubscribeOutput { unsubscribed: false };
+                return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+            }
+        }
+    }
+
+    // Atomic remove — whichever thread wins the `remove` call is the one
+    // that drops the bus row and releases the supervisor refcount. Other
+    // concurrent unsubscribes for the same id observe `None` and return
+    // idempotent `unsubscribed=false` without double-decrementing.
+    let active = match active_registry().remove(&input.subscription_id) {
+        Some((_k, v)) => v,
         None => {
-            audit(
+            // Lost the race to a concurrent unsubscribe. Idempotent return.
+            audit_with_risk(
                 caller.data(),
                 "camera.metadata.unsubscribe",
                 Some(&input.subscription_id),
-                "denied",
-                Some("subscription_not_found"),
+                RiskClass::B,
+                "ok",
+                Some("already_unsubscribed"),
             );
-            // Idempotent on the addon side: an unsubscribe for an unknown
-            // (or already-released) id returns ok=false rather than
-            // NotFound so the addon can call it from a Drop-style cleanup.
             let out = UnsubscribeOutput { unsubscribed: false };
             return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
         }
     };
-    let caller_addon = caller.data().addon_id.clone();
-    if active.addon_id != caller_addon {
-        audit(
-            caller.data(),
-            "camera.metadata.unsubscribe",
-            Some(&input.subscription_id),
-            "denied",
-            Some("cross_addon_unsubscribe"),
-        );
-        return AbiError::NotFound.as_i32();
-    }
 
-    // Drop the bus subscriber row and decrement the supervisor refcount.
+    // Drop the bus subscriber row and await the supervisor refcount drain.
+    // We use `release_and_wait` (not the sync `release`) so a subscribe
+    // immediately following an unsubscribe sees the previous device-side
+    // PullPoint torn down before a fresh CreatePullPointSubscription fires.
     let stream_id = MetadataStreamId::from_str_unchecked(&input.subscription_id);
     let _ = metadata_bus().unsubscribe_by_stream_id(&stream_id);
-    active_registry().remove(&input.subscription_id);
-    MetadataPullSupervisor::global().release(&active.camera_id);
+    let camera_id_for_release = active.camera_id.clone();
+    block_in_place_on(async move {
+        MetadataPullSupervisor::global()
+            .release_and_wait(&camera_id_for_release)
+            .await;
+    });
 
-    audit(
+    audit_with_risk(
         caller.data(),
         "camera.metadata.unsubscribe",
         Some(&active.camera_id),
+        RiskClass::B,
         "ok",
         None,
     );
@@ -477,18 +511,18 @@ pub fn camera_metadata_poll_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.metadata.poll", None, "error", Some("input_read_failed"));
+            audit_with_risk(caller.data(), "camera.metadata.poll", None, RiskClass::C, "error", Some("input_read_failed"));
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERA_METADATA, None) {
-        audit(caller.data(), "camera.metadata.poll", None, "denied", Some("missing_permission"));
+        audit_with_risk(caller.data(), "camera.metadata.poll", None, RiskClass::C, "denied", Some("missing_permission"));
         return AbiError::Permission.as_i32();
     }
     let input: PollInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.metadata.poll", None, "error", Some("invalid_toml"));
+            audit_with_risk(caller.data(), "camera.metadata.poll", None, RiskClass::C, "error", Some("invalid_toml"));
             return AbiError::Operation.as_i32();
         }
     };
@@ -499,10 +533,11 @@ pub fn camera_metadata_poll_v1(
     let active = match active_registry().get(&input.subscription_id) {
         Some(e) => e.value().clone(),
         None => {
-            audit(
+            audit_with_risk(
                 caller.data(),
                 "camera.metadata.poll",
                 Some(&input.subscription_id),
+                RiskClass::C,
                 "denied",
                 Some("subscription_not_found"),
             );
@@ -511,10 +546,11 @@ pub fn camera_metadata_poll_v1(
     };
     let caller_addon = caller.data().addon_id.clone();
     if active.addon_id != caller_addon {
-        audit(
+        audit_with_risk(
             caller.data(),
             "camera.metadata.poll",
             Some(&input.subscription_id),
+            RiskClass::C,
             "denied",
             Some("cross_addon_poll"),
         );
@@ -561,10 +597,11 @@ pub fn camera_metadata_poll_v1(
         }
     }
 
-    audit(
+    audit_with_risk(
         caller.data(),
         "camera.metadata.poll",
         Some(&active.camera_id),
+        RiskClass::C,
         "ok",
         None,
     );
@@ -687,12 +724,26 @@ fn write_toml_capped<T: Serialize>(
 }
 
 fn audit(state: &AddonState, action: &str, resource_id: Option<&str>, result: &str, reason: Option<&str>) {
+    // Default risk class for subscribe/unsubscribe: B (mutates supervisor
+    // state). Poll callers use `audit_with_risk` with `RiskClass::C` since
+    // a poll is a read-only drain of an existing subscriber's mpsc queue.
+    audit_with_risk(state, action, resource_id, RiskClass::B, result, reason);
+}
+
+fn audit_with_risk(
+    state: &AddonState,
+    action: &str,
+    resource_id: Option<&str>,
+    risk: RiskClass,
+    result: &str,
+    reason: Option<&str>,
+) {
     audit_log_with_risk(
         state,
         action,
         Some("camera"),
         resource_id,
-        RiskClass::B,
+        risk,
         None,
         None,
         result,
