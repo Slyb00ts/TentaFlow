@@ -4877,30 +4877,15 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 }
                 set(&obj, "discovered", arr.into());
             }
-            tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(req) => {
-                // Requests do not normally round-trip back to the GUI, but
-                // surface the full payload so debug tooling (binary inspector)
-                // can render it.
+            tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_) => {
+                // Request variants never legitimately decode in a response
+                // path. The server emits *Response variants; this branch only
+                // exists for exhaustiveness. Surface the variant name only —
+                // no credentials, username, or device URL — so a stray
+                // request body in a debug buffer cannot leak admin secrets
+                // to the JS layer.
                 set(&obj, "variant", "CameraAddOnvifRequest".into());
-                set(&obj, "displayName", req.display_name.clone().into());
-                set(&obj, "display_name", req.display_name.into());
-                set(
-                    &obj,
-                    "deviceServiceUrl",
-                    req.device_service_url.clone().into(),
-                );
-                set(&obj, "device_service_url", req.device_service_url.into());
-                set(&obj, "username", req.username.into());
-                // Password is never echoed back to the GUI; tag presence only.
-                set(&obj, "hasPassword", (!req.password.is_empty()).into());
-                if let Some(pt) = req.profile_token {
-                    set(&obj, "profileToken", pt.clone().into());
-                    set(&obj, "profile_token", pt.into());
-                }
-                if let Some(fps) = req.target_fps {
-                    set(&obj, "targetFps", fps.into());
-                    set(&obj, "target_fps", fps.into());
-                }
+                set(&obj, "warning", "unexpected_request_variant_in_response".into());
             }
             tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(resp) => {
                 set(&obj, "variant", "CameraAddOnvifResponse".into());
