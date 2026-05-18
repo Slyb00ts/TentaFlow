@@ -15,13 +15,14 @@
 // request from org A cannot leak the existence (or non-existence) of resources
 // belonging to org B through the error surface.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use blake3::Hasher;
 use handlebars::Handlebars;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use crate::audit::chain::{compute_chain_for_insert, AuditRowHashInput};
 use crate::db::legal_documents::{insert as insert_legal_document, NewLegalDocument};
 use crate::services::legal::types::RodoVariant;
 
@@ -90,8 +91,10 @@ pub struct RodoGenerationOutput {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RodoGenerationError {
-    #[error("organization not found")]
-    OrgNotFound,
+    /// Returned both when the org row does not exist and when the caller is
+    /// not a member of the org. The two cases are collapsed on purpose so a
+    /// remote caller cannot enumerate org existence via error-shape probing.
+    /// The server-side distinction is preserved in a `tracing::warn` line.
     #[error("user not a member of organization")]
     UserNotMember,
     #[error("template render failed")]
@@ -160,13 +163,29 @@ pub fn generate(
     input: &RodoGenerationInput,
     now_ms: i64,
 ) -> Result<RodoGenerationOutput, RodoGenerationError> {
-    // a) Load org row. RESTRICT lookup by org_id only — the caller's identity
-    // is checked separately via the membership step below.
-    let org = load_org(conn, &input.org_id)?;
-
-    // c) Verify membership before we render anything. A non-member must never
-    // see content or even the existence of an org through timing differences.
+    // a) + c) Load org row AND verify caller membership. Both failures collapse
+    // to the same external error (UserNotMember) so a probe cannot tell apart
+    // "org does not exist" from "org exists but you are not in it". The
+    // server-side `tracing::warn` keeps the operator-visible distinction.
+    let org = match load_org(conn, &input.org_id)? {
+        Some(row) => row,
+        None => {
+            tracing::warn!(
+                target: "tentaflow::legal::rodo",
+                org_id = %input.org_id,
+                user_id = %input.generated_by_user_id,
+                "rodo generate denied: org not found"
+            );
+            return Err(RodoGenerationError::UserNotMember);
+        }
+    };
     if !is_member(conn, &input.org_id, &input.generated_by_user_id)? {
+        tracing::warn!(
+            target: "tentaflow::legal::rodo",
+            org_id = %input.org_id,
+            user_id = %input.generated_by_user_id,
+            "rodo generate denied: user not member of org"
+        );
         return Err(RodoGenerationError::UserNotMember);
     }
 
@@ -212,14 +231,19 @@ pub fn generate(
     };
     let mut hb = Handlebars::new();
     hb.set_strict_mode(true);
+    // PDF output is a binary document, not HTML. The default HTML escape
+    // would turn legitimate punctuation in org names (e.g. `ACME <Co> & Sons`)
+    // into entity references like `&lt;Co&gt; &amp; Sons` baked into the PDF.
+    hb.register_escape_fn(handlebars::no_escape);
     let rendered = hb.render_template(template, &ctx)?;
 
     // g) Lay out the rendered text into an A4 PDF in memory.
     let pdf_bytes = render_pdf(&rendered, input.variant)?;
 
-    // h) Containment-check the output directory before writing. canonicalize()
-    // resolves any `..` segments the org_id might smuggle (defence in depth —
-    // UUIDv4 ids never carry `..`, but the generator must not rely on that).
+    // h) Containment-check the output directory BEFORE creating any
+    // intermediate dir. `build_pdf_path` validates that `org_id` is a
+    // UUIDv4 and that the resolved path is contained under the canonicalized
+    // `legal_root`. Only after that check do we materialize the org subdir.
     let pdf_path = build_pdf_path(legal_root, &input.org_id, now_ms)?;
     if let Some(parent) = pdf_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -281,24 +305,57 @@ pub fn generate(
     })
 }
 
+/// Async wrapper around [`generate`] for use from Tokio handlers.
+///
+/// The sync version blocks on Handlebars rendering, PDF layout (genpdf), and
+/// blocking file I/O — all of which would stall a Tokio worker thread if
+/// awaited from `async` code. This wrapper offloads the whole pipeline to a
+/// blocking pool via `tokio::task::spawn_blocking`.
+///
+/// Use [`generate`] directly from CLI / sync entry points where the calling
+/// thread is already a blocking-friendly context.
+pub async fn generate_async(
+    db: crate::db::DbPool,
+    legal_root: PathBuf,
+    input: RodoGenerationInput,
+    now_ms: i64,
+) -> Result<RodoGenerationOutput, RodoGenerationError> {
+    tokio::task::spawn_blocking(move || {
+        let conn = db
+            .lock()
+            .map_err(|_| {
+                RodoGenerationError::Db(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some("db pool mutex poisoned".to_string()),
+                ))
+            })?;
+        generate(&conn, &legal_root, &input, now_ms)
+    })
+    .await
+    .map_err(|join_err| {
+        RodoGenerationError::PdfGeneration(format!("blocking task join: {join_err}"))
+    })?
+}
+
 // --- helpers -----------------------------------------------------------------
 
-fn load_org(conn: &Connection, org_id: &str) -> Result<OrgRow, RodoGenerationError> {
-    conn.query_row(
-        "SELECT name, contact_email, dpo_contact, retention_policy_json \
-         FROM organizations WHERE org_id = ?1 AND status != 'deleted'",
-        params![org_id],
-        |row| {
-            Ok(OrgRow {
-                name: row.get(0)?,
-                contact_email: row.get(1)?,
-                dpo_contact: row.get(2)?,
-                retention_policy_json: row.get(3)?,
-            })
-        },
-    )
-    .optional()?
-    .ok_or(RodoGenerationError::OrgNotFound)
+fn load_org(conn: &Connection, org_id: &str) -> Result<Option<OrgRow>, RodoGenerationError> {
+    let row = conn
+        .query_row(
+            "SELECT name, contact_email, dpo_contact, retention_policy_json \
+             FROM organizations WHERE org_id = ?1 AND status != 'deleted'",
+            params![org_id],
+            |row| {
+                Ok(OrgRow {
+                    name: row.get(0)?,
+                    contact_email: row.get(1)?,
+                    dpo_contact: row.get(2)?,
+                    retention_policy_json: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
 }
 
 fn is_member(
@@ -315,18 +372,27 @@ fn is_member(
 }
 
 fn parse_retention(json_blob: Option<&str>) -> (u32, u32) {
+    fn pick(v: &serde_json::Value, key: &str, default: u32) -> u32 {
+        let Some(raw) = v.get(key).and_then(|x| x.as_u64()) else {
+            return default;
+        };
+        match u32::try_from(raw) {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    target: "tentaflow::legal::rodo",
+                    key = key,
+                    value = raw,
+                    "retention value exceeds u32::MAX, falling back to default"
+                );
+                default
+            }
+        }
+    }
     if let Some(raw) = json_blob {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-            let frames = v
-                .get("frames_days")
-                .and_then(|x| x.as_u64())
-                .map(|x| x as u32)
-                .unwrap_or(DEFAULT_RETENTION_FRAMES_DAYS);
-            let recordings = v
-                .get("recordings_days")
-                .and_then(|x| x.as_u64())
-                .map(|x| x as u32)
-                .unwrap_or(DEFAULT_RETENTION_RECORDINGS_DAYS);
+            let frames = pick(&v, "frames_days", DEFAULT_RETENTION_FRAMES_DAYS);
+            let recordings = pick(&v, "recordings_days", DEFAULT_RETENTION_RECORDINGS_DAYS);
             return (frames, recordings);
         }
     }
@@ -346,34 +412,48 @@ fn build_pdf_path(
     org_id: &str,
     now_ms: i64,
 ) -> Result<PathBuf, RodoGenerationError> {
+    // Defence-in-depth: reject any `org_id` that is not a valid UUIDv4. The
+    // `organizations` table already enforces a CHECK on this format, but a
+    // misconfigured / future migration must not be the only line of defence
+    // — we never want a malicious `org_id` to escape `legal_root`.
+    if !is_uuid_v4(org_id) {
+        return Err(RodoGenerationError::PathTraversal);
+    }
+
     // Ensure the root exists before canonicalize() — canonicalize() errors on
-    // a missing path. The org-scoped subdir is created later (after we know
-    // the path is contained).
+    // a missing path. The org-scoped subdir is intentionally NOT created here:
+    // if the containment proof below were to fail (it cannot once `org_id` is
+    // UUIDv4, but the check is still made), no stray directory must remain
+    // outside the root.
     std::fs::create_dir_all(legal_root)?;
     let root_canon = legal_root.canonicalize()?;
 
-    // The filename uses the timestamp + a random nonce so two concurrent
-    // generators in the same millisecond do not race on the same path. The
-    // DB row id is minted by the repo and is not known yet at this point,
-    // so we use a UUIDv4 just for the filename — the DB row will reference
-    // this same path.
+    // Build the candidate path manually and verify it stays under `root_canon`
+    // WITHOUT touching the filesystem. We walk every component of the joined
+    // path and reject any non-Normal segment (Component::ParentDir / RootDir /
+    // Prefix). This proves containment without needing canonicalize() on a
+    // path that has not been created yet.
     let nonce = uuid::Uuid::new_v4();
-    let candidate = root_canon
-        .join(org_id)
-        .join(format!("{}-{}.pdf", now_ms, nonce));
-
-    // Containment check: parent of the candidate must canonicalize back under
-    // root_canon. We canonicalize the parent only because the file itself does
-    // not exist yet.
-    let parent = candidate
-        .parent()
-        .ok_or(RodoGenerationError::PathTraversal)?;
-    std::fs::create_dir_all(parent)?;
-    let parent_canon = parent.canonicalize()?;
-    if !parent_canon.starts_with(&root_canon) {
+    let relative = PathBuf::from(org_id).join(format!("{}-{}.pdf", now_ms, nonce));
+    for c in relative.components() {
+        match c {
+            Component::Normal(_) => {}
+            _ => return Err(RodoGenerationError::PathTraversal),
+        }
+    }
+    let candidate = root_canon.join(&relative);
+    if !candidate.starts_with(&root_canon) {
         return Err(RodoGenerationError::PathTraversal);
     }
-    Ok(parent_canon.join(format!("{}-{}.pdf", now_ms, nonce)))
+    Ok(candidate)
+}
+
+/// Strict UUIDv4 check: 36-char canonical form with v4 + RFC4122 variant.
+fn is_uuid_v4(s: &str) -> bool {
+    match uuid::Uuid::parse_str(s) {
+        Ok(u) => u.get_version_num() == 4 && s.len() == 36,
+        Err(_) => false,
+    }
 }
 
 #[cfg(unix)]
@@ -465,23 +545,70 @@ fn audit_emit_generate(
     frames_days: u32,
     recordings_days: u32,
 ) -> Result<(), rusqlite::Error> {
+    // `audit_log.user_id` is INTEGER but the RODO subsystem identifies callers
+    // by TEXT user_id (`org_memberships.user_id`). Same pattern as
+    // `dispatch::camera_admin::audit_row`: the INTEGER column stays NULL for
+    // TEXT-keyed actors, and the actor string is preserved inside the
+    // `details` JSON so audit consumers can still query by user.
     let details = serde_json::json!({
         "variant": variant.as_str(),
         "doc_id": doc_id,
         "content_hash": content_hash,
         "retention_frames_days": frames_days,
         "retention_recordings_days": recordings_days,
+        "user_id": user_id,
     })
     .to_string();
+
+    // Compute the Merkle chain pair the same way `audit_log_with_risk` and
+    // `repository::log_audit_full` do — every audit row in the system must
+    // participate in the F1b P4 hash chain.
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let action = "legal.generate";
+    let resource_type = Some("legal_document");
+    let resource_id = Some(doc_id);
+    let result = Some("ok");
+    let severity = Some("info");
+    let risk_class = "B";
+    let hash_input = AuditRowHashInput {
+        user_id: None,
+        addon_id: None,
+        instance_id: None,
+        action,
+        resource: None,
+        resource_type,
+        resource_id,
+        result,
+        error_message: None,
+        details: Some(details.as_str()),
+        ip_address: None,
+        node_id: None,
+        severity,
+        risk_class,
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = compute_chain_for_insert(conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log \
             (timestamp, action, resource_type, resource_id, result, \
-             severity, risk_class, details, org_id) \
-         VALUES (datetime('now'), 'legal.generate', 'legal_document', ?1, 'ok', \
-                 'info', 'B', ?2, ?3)",
-        params![doc_id, details, org_id],
+             severity, risk_class, details, org_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            timestamp,
+            action,
+            resource_type,
+            resource_id,
+            result,
+            severity,
+            risk_class,
+            details,
+            org_id,
+            prev_hash,
+            hash,
+        ],
     )?;
-    let _ = user_id; // user_id column is INTEGER; we record the actor via details if needed.
     Ok(())
 }
 
@@ -492,11 +619,25 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    // Stable UUIDv4 used across tests in place of the legacy `org-default`
+    // string. The `organizations` row seeded by migrations is patched to this
+    // id so the on-disk path layout (which now requires UUIDv4) stays valid.
+    const TEST_ORG_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const TEST_USER_ID: &str = "u-test";
+
     fn open_db() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).expect("run migrations");
-        seed_membership(&conn, "org-default", "u-test");
+        // Migrations seed a default org under a non-UUID slug; rename it to a
+        // valid UUIDv4 so path containment (which requires UUIDv4) is exercised
+        // by the happy-path tests as well.
+        conn.execute(
+            "UPDATE organizations SET org_id = ?1 WHERE org_id = 'org-default'",
+            params![TEST_ORG_ID],
+        )
+        .unwrap();
+        seed_membership(&conn, TEST_ORG_ID, TEST_USER_ID);
         conn
     }
 
@@ -531,9 +672,9 @@ mod tests {
             &conn,
             root.path(),
             &RodoGenerationInput {
-                org_id: "org-default".into(),
+                org_id: TEST_ORG_ID.into(),
                 variant: RodoVariant::Short,
-                generated_by_user_id: "u-test".into(),
+                generated_by_user_id: TEST_USER_ID.into(),
             },
             1_700_000_000_000,
         )
@@ -554,15 +695,16 @@ mod tests {
     #[test]
     fn generate_rejects_non_member() {
         let conn = open_db();
-        seed_org(&conn, "org-other", "other");
+        let other_org = "22222222-2222-4222-8222-222222222222";
+        seed_org(&conn, other_org, "other");
         let root = tmp_root();
         let err = generate(
             &conn,
             root.path(),
             &RodoGenerationInput {
-                org_id: "org-other".into(),
+                org_id: other_org.into(),
                 variant: RodoVariant::Short,
-                generated_by_user_id: "u-test".into(),
+                generated_by_user_id: TEST_USER_ID.into(),
             },
             1_700_000_000_000,
         )
@@ -571,64 +713,83 @@ mod tests {
     }
 
     #[test]
-    fn generate_rejects_missing_org() {
+    fn generate_rejects_missing_org_as_non_member() {
+        // Missing org + non-member collapse to the same external error so a
+        // remote caller cannot enumerate org existence.
         let conn = open_db();
         let root = tmp_root();
         let err = generate(
             &conn,
             root.path(),
             &RodoGenerationInput {
-                org_id: "org-ghost".into(),
+                org_id: "33333333-3333-4333-8333-333333333333".into(),
                 variant: RodoVariant::Standard,
-                generated_by_user_id: "u-test".into(),
+                generated_by_user_id: TEST_USER_ID.into(),
             },
             1_700_000_000_000,
         )
         .expect_err("must reject missing org");
-        assert!(matches!(err, RodoGenerationError::OrgNotFound));
+        assert!(matches!(err, RodoGenerationError::UserNotMember));
     }
 
     #[test]
     fn path_traversal_org_id_cannot_escape() {
-        let conn = open_db();
-        // Seed an org row with a malicious-looking id. The org loader returns
-        // its row, the membership check passes, but build_pdf_path must
-        // refuse to write outside the root.
-        conn.execute(
-            "INSERT INTO organizations (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status, created_at) \
-             VALUES ('../escape', '../escape', 'escape', NULL, NULL, NULL, 'active', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-        seed_membership(&conn, "../escape", "u-test");
-        let root = tmp_root();
-        let res = generate(
-            &conn,
-            root.path(),
-            &RodoGenerationInput {
-                org_id: "../escape".into(),
-                variant: RodoVariant::Short,
-                generated_by_user_id: "u-test".into(),
-            },
+        // A non-UUIDv4 `org_id` must be refused by the path builder before
+        // the row is even consulted — defence in depth in case a future
+        // schema migration drops the org_id format constraint.
+        let res = build_pdf_path(
+            std::env::temp_dir().as_path(),
+            "../escape",
             1_700_000_000_000,
         );
-        // Either the path containment check refuses the write, or the FS
-        // canonicalize() collapses the `..` and the result still lives under
-        // the root. In both cases, the produced path must start with the
-        // canonicalized root.
-        match res {
-            Ok(out) => {
-                let root_canon = root.path().canonicalize().unwrap();
-                assert!(
-                    out.pdf_path.starts_with(&root_canon),
-                    "pdf_path {:?} escaped root {:?}",
-                    out.pdf_path,
-                    root_canon
-                );
-            }
-            Err(RodoGenerationError::PathTraversal) => {}
-            Err(other) => panic!("unexpected error: {other:?}"),
-        }
+        assert!(matches!(res, Err(RodoGenerationError::PathTraversal)));
+    }
+
+    #[test]
+    fn path_traversal_creates_no_dirs_outside_root() {
+        // After MED2 the org subdir must NOT be created when the org_id fails
+        // the containment / UUIDv4 check. We run inside a sandbox so the
+        // sibling that a traversal would target sits next to a brand-new
+        // root and is observable to belong to this test only.
+        let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+        let root_path = sandbox.path().join("legal-root");
+        std::fs::create_dir_all(&root_path).unwrap();
+
+        // Bad org_id with traversal segments — must be rejected up-front.
+        let res = build_pdf_path(&root_path, "../escape", 1_700_000_000_000);
+        assert!(matches!(res, Err(RodoGenerationError::PathTraversal)));
+        // The would-be traversal target `<sandbox>/escape` must not exist —
+        // nothing in this test touched it.
+        let leaked = sandbox.path().join("escape");
+        assert!(
+            !leaked.exists(),
+            "traversal target was created outside root: {:?}",
+            leaked
+        );
+
+        // Bad org_id that is just non-UUID — also rejected, also no dir made
+        // inside the root itself.
+        let res2 = build_pdf_path(&root_path, "not-a-uuid", 1_700_000_000_000);
+        assert!(matches!(res2, Err(RodoGenerationError::PathTraversal)));
+        let inside = root_path.join("not-a-uuid");
+        assert!(
+            !inside.exists(),
+            "rejected org subdir was still created: {:?}",
+            inside
+        );
+
+        // The root itself stays empty — no canonicalize side-effect created
+        // any org subdir.
+        let entries: Vec<_> = std::fs::read_dir(&root_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "legal_root should still be empty after rejected paths, got {:?}",
+            entries
+        );
     }
 
     #[test]
@@ -639,9 +800,9 @@ mod tests {
             &conn,
             root.path(),
             &RodoGenerationInput {
-                org_id: "org-default".into(),
+                org_id: TEST_ORG_ID.into(),
                 variant: RodoVariant::Standard,
-                generated_by_user_id: "u-test".into(),
+                generated_by_user_id: TEST_USER_ID.into(),
             },
             1_700_000_000_000,
         )
@@ -679,9 +840,9 @@ mod tests {
             &conn,
             root.path(),
             &RodoGenerationInput {
-                org_id: "org-default".into(),
+                org_id: TEST_ORG_ID.into(),
                 variant: RodoVariant::Full,
-                generated_by_user_id: "u-test".into(),
+                generated_by_user_id: TEST_USER_ID.into(),
             },
             1_700_000_000_000,
         )
