@@ -3,6 +3,7 @@
 // Opis: Modul bazy danych SQLite - inicjalizacja, pool, migracje.
 // =============================================================================
 
+pub mod legal_documents;
 pub mod migrations;
 pub mod models;
 pub mod repository;
