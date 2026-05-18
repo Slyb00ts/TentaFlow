@@ -8,8 +8,23 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use uuid::Uuid;
 
 use crate::services::legal::RodoVariant;
+
+/// Fields needed to create a new legal_documents row. The `id` is minted by
+/// the repository (UUIDv4) so callers cannot accidentally collide or smuggle
+/// a non-UUID value past the CHECK constraint.
+#[derive(Debug, Clone)]
+pub struct NewLegalDocument {
+    pub org_id: String,
+    pub variant: RodoVariant,
+    pub generated_at: i64,
+    pub generated_by_user_id: String,
+    pub content_hash: String,
+    pub pdf_path: String,
+    pub signed_url_ref: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegalDocument {
@@ -52,14 +67,19 @@ fn row_to_doc(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegalDocument> {
 const COLS: &str = "id, org_id, variant, generated_at, generated_by_user_id, \
                     content_hash, pdf_path, signed_url_ref, revoked_at";
 
-pub fn insert(conn: &Connection, doc: &LegalDocument) -> Result<()> {
+/// Insert a new legal document. The row id is minted here (UUIDv4) and
+/// returned to the caller; `revoked_at` is always NULL on insert. The CHECK
+/// constraints on `id` and `content_hash` are enforced by SQLite — a malformed
+/// hash surfaces as a constraint violation, not as silent corruption.
+pub fn insert(conn: &Connection, doc: &NewLegalDocument) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
     let affected = conn.execute(
         "INSERT INTO legal_documents \
             (id, org_id, variant, generated_at, generated_by_user_id, \
              content_hash, pdf_path, signed_url_ref, revoked_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
         params![
-            doc.id,
+            id,
             doc.org_id,
             doc.variant.as_str(),
             doc.generated_at,
@@ -67,7 +87,6 @@ pub fn insert(conn: &Connection, doc: &LegalDocument) -> Result<()> {
             doc.content_hash,
             doc.pdf_path,
             doc.signed_url_ref,
-            doc.revoked_at,
         ],
     )?;
     if affected != 1 {
@@ -76,7 +95,7 @@ pub fn insert(conn: &Connection, doc: &LegalDocument) -> Result<()> {
             affected
         ));
     }
-    Ok(())
+    Ok(id)
 }
 
 /// List documents for an org, ordered newest first. `include_revoked = false`
@@ -192,17 +211,19 @@ mod tests {
         conn
     }
 
-    fn make_doc(id: &str, org: &str, variant: RodoVariant, ts: i64) -> LegalDocument {
-        LegalDocument {
-            id: id.into(),
+    fn full_hash() -> String {
+        blake3::hash(b"test").to_hex().to_string()
+    }
+
+    fn make_doc(org: &str, variant: RodoVariant, ts: i64) -> NewLegalDocument {
+        NewLegalDocument {
             org_id: org.into(),
             variant,
             generated_at: ts,
             generated_by_user_id: "u-1".into(),
-            content_hash: "deadbeef".into(),
-            pdf_path: format!("/tmp/{id}.pdf"),
+            content_hash: full_hash(),
+            pdf_path: format!("/tmp/{org}-{ts}.pdf"),
             signed_url_ref: None,
-            revoked_at: None,
         }
     }
 
@@ -213,83 +234,140 @@ mod tests {
             params![id, id, slug],
         )
         .unwrap();
+        // Seed the `u-1` membership the composite FK on legal_documents
+        // requires for every (org_id, generated_by_user_id) pair the tests use.
+        seed_membership(conn, id, "u-1");
+    }
+
+    fn seed_membership(conn: &Connection, org_id: &str, user_id: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO org_memberships \
+                (org_id, user_id, role_id, granted_at, granted_by) \
+             VALUES (?1, ?2, 'role-org-admin', '2026-01-01T00:00:00Z', 'system')",
+            params![org_id, user_id],
+        )
+        .unwrap();
     }
 
     #[test]
     fn insert_and_get_round_trip() {
         let conn = open_test_conn();
-        let doc = make_doc("doc-1", "org-default", RodoVariant::Standard, 1000);
-        insert(&conn, &doc).unwrap();
-        let got = get_by_id(&conn, "doc-1", "org-default").unwrap().unwrap();
-        assert_eq!(got, doc);
+        seed_membership(&conn, "org-default", "u-1");
+        let new = make_doc("org-default", RodoVariant::Standard, 1000);
+        let id = insert(&conn, &new).unwrap();
+        let got = get_by_id(&conn, &id, "org-default").unwrap().unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.org_id, new.org_id);
+        assert_eq!(got.variant, new.variant);
+        assert_eq!(got.generated_at, new.generated_at);
+        assert_eq!(got.generated_by_user_id, new.generated_by_user_id);
+        assert_eq!(got.content_hash, new.content_hash);
+        assert_eq!(got.pdf_path, new.pdf_path);
+        assert_eq!(got.signed_url_ref, None);
+        assert_eq!(got.revoked_at, None);
+        // UUIDv4 shape — 36 chars, dashes at the canonical offsets.
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.as_bytes()[8], b'-');
+        assert_eq!(id.as_bytes()[13], b'-');
+        assert_eq!(id.as_bytes()[18], b'-');
+        assert_eq!(id.as_bytes()[23], b'-');
+    }
+
+    #[test]
+    fn insert_rejects_short_content_hash() {
+        let conn = open_test_conn();
+        seed_membership(&conn, "org-default", "u-1");
+        let mut new = make_doc("org-default", RodoVariant::Short, 1);
+        new.content_hash = "deadbeef".into();
+        let err = insert(&conn, &new).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("check"),
+            "expected CHECK violation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn insert_rejects_unknown_membership() {
+        let conn = open_test_conn();
+        // No membership seeded for u-ghost — composite FK must reject.
+        let mut new = make_doc("org-default", RodoVariant::Short, 1);
+        new.generated_by_user_id = "u-ghost".into();
+        let err = insert(&conn, &new).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "expected FK violation, got: {err}"
+        );
     }
 
     #[test]
     fn get_by_id_is_tenant_scoped() {
         let conn = open_test_conn();
         seed_org(&conn, "org-other", "other");
-        let doc = make_doc("doc-x", "org-other", RodoVariant::Short, 1);
-        insert(&conn, &doc).unwrap();
+        let id = insert(&conn, &make_doc("org-other", RodoVariant::Short, 1)).unwrap();
         // Cross-tenant read must observe a miss, not the row.
-        assert!(get_by_id(&conn, "doc-x", "org-default").unwrap().is_none());
-        assert!(get_by_id(&conn, "doc-x", "org-other").unwrap().is_some());
+        assert!(get_by_id(&conn, &id, "org-default").unwrap().is_none());
+        assert!(get_by_id(&conn, &id, "org-other").unwrap().is_some());
     }
 
     #[test]
     fn list_by_org_filters_and_orders_desc() {
         let conn = open_test_conn();
+        seed_membership(&conn, "org-default", "u-1");
         seed_org(&conn, "org-b", "b");
-        insert(&conn, &make_doc("a", "org-default", RodoVariant::Short, 100)).unwrap();
-        insert(&conn, &make_doc("b", "org-default", RodoVariant::Full, 300)).unwrap();
-        insert(&conn, &make_doc("c", "org-default", RodoVariant::Standard, 200)).unwrap();
-        insert(&conn, &make_doc("z", "org-b", RodoVariant::Short, 999)).unwrap();
+        let id_a = insert(&conn, &make_doc("org-default", RodoVariant::Short, 100)).unwrap();
+        let id_b = insert(&conn, &make_doc("org-default", RodoVariant::Full, 300)).unwrap();
+        let id_c = insert(&conn, &make_doc("org-default", RodoVariant::Standard, 200)).unwrap();
+        let _ = insert(&conn, &make_doc("org-b", RodoVariant::Short, 999)).unwrap();
 
         let rows = list_by_org(&conn, "org-default", false).unwrap();
-        let ids: Vec<_> = rows.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, vec!["b", "c", "a"]);
+        let ids: Vec<_> = rows.iter().map(|d| d.id.clone()).collect();
+        assert_eq!(ids, vec![id_b, id_c, id_a]);
     }
 
     #[test]
     fn list_by_org_hides_revoked_by_default() {
         let conn = open_test_conn();
-        insert(&conn, &make_doc("a", "org-default", RodoVariant::Short, 100)).unwrap();
-        insert(&conn, &make_doc("b", "org-default", RodoVariant::Full, 200)).unwrap();
-        revoke(&conn, "a", "org-default", 500).unwrap();
+        seed_membership(&conn, "org-default", "u-1");
+        let id_a = insert(&conn, &make_doc("org-default", RodoVariant::Short, 100)).unwrap();
+        let id_b = insert(&conn, &make_doc("org-default", RodoVariant::Full, 200)).unwrap();
+        revoke(&conn, &id_a, "org-default", 500).unwrap();
         let active: Vec<_> = list_by_org(&conn, "org-default", false)
             .unwrap()
             .into_iter()
             .map(|d| d.id)
             .collect();
-        assert_eq!(active, vec!["b"]);
+        assert_eq!(active, vec![id_b.clone()]);
         let all: Vec<_> = list_by_org(&conn, "org-default", true)
             .unwrap()
             .into_iter()
             .map(|d| d.id)
             .collect();
-        assert_eq!(all, vec!["b", "a"]);
+        assert_eq!(all, vec![id_b, id_a]);
     }
 
     #[test]
     fn set_signed_url_ref_persists_and_is_tenant_scoped() {
         let conn = open_test_conn();
+        seed_membership(&conn, "org-default", "u-1");
         seed_org(&conn, "org-b", "b");
-        insert(&conn, &make_doc("a", "org-default", RodoVariant::Short, 1)).unwrap();
-        set_signed_url_ref(&conn, "a", "org-default", "ref-xyz").unwrap();
-        let got = get_by_id(&conn, "a", "org-default").unwrap().unwrap();
+        let id = insert(&conn, &make_doc("org-default", RodoVariant::Short, 1)).unwrap();
+        set_signed_url_ref(&conn, &id, "org-default", "ref-xyz").unwrap();
+        let got = get_by_id(&conn, &id, "org-default").unwrap().unwrap();
         assert_eq!(got.signed_url_ref.as_deref(), Some("ref-xyz"));
         // Cross-tenant update must fail with no row affected.
-        assert!(set_signed_url_ref(&conn, "a", "org-b", "ref-leak").is_err());
+        assert!(set_signed_url_ref(&conn, &id, "org-b", "ref-leak").is_err());
     }
 
     #[test]
     fn revoke_marks_row_and_is_tenant_scoped() {
         let conn = open_test_conn();
+        seed_membership(&conn, "org-default", "u-1");
         seed_org(&conn, "org-b", "b");
-        insert(&conn, &make_doc("a", "org-default", RodoVariant::Standard, 10)).unwrap();
-        revoke(&conn, "a", "org-default", 42).unwrap();
-        let got = get_by_id(&conn, "a", "org-default").unwrap().unwrap();
+        let id = insert(&conn, &make_doc("org-default", RodoVariant::Standard, 10)).unwrap();
+        revoke(&conn, &id, "org-default", 42).unwrap();
+        let got = get_by_id(&conn, &id, "org-default").unwrap().unwrap();
         assert_eq!(got.revoked_at, Some(42));
         // Cross-tenant revoke must not succeed.
-        assert!(revoke(&conn, "a", "org-b", 99).is_err());
+        assert!(revoke(&conn, &id, "org-b", 99).is_err());
     }
 }
