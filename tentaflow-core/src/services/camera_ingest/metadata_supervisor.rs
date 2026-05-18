@@ -301,7 +301,11 @@ impl MetadataPullSupervisor {
     /// Returns `Ok(())` whether or not the wait timed out — the timeout
     /// path simply detaches the task and lets it finish in the background.
     pub async fn release_and_wait(&self, camera_id: &str) {
-        const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+        // Strictly greater than UNSUBSCRIBE_TIMEOUT_MS (5s) so the in-task
+        // unsubscribe SOAP call + tokio scheduling latency can complete
+        // before we detach. An immediate resubscribe after this returns
+        // therefore observes a torn-down device-side PullPoint.
+        const JOIN_TIMEOUT: Duration = Duration::from_secs(8);
         let join_opt = {
             let mut guard = self.handles.lock();
             let drop_now = match guard.get_mut(camera_id) {
@@ -578,6 +582,25 @@ async fn handle_auth_failure(
     camera_id: &str,
     generation: Generation,
 ) {
+    // Guard with the generation check FIRST. A late auth-fail from a previous
+    // task generation must not close the bus for a freshly-installed task
+    // (post-credential-rotation respawn). We atomically remove the matching
+    // generation entry under the handles lock; only if we owned it do we
+    // proceed to close_camera. Stale auth-fails become a silent no-op.
+    let owned = {
+        let mut g = supervisor.handles.lock();
+        match g.get(camera_id) {
+            Some(h) if h.generation == generation => {
+                g.remove(camera_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if !owned {
+        // Different generation owns the handle now — leave the new task alone.
+        return;
+    }
     warn!(
         "metadata_supervisor: auth failed for '{}' gen={generation}, closing bus",
         camera_id
@@ -585,14 +608,6 @@ async fn handle_auth_failure(
     metadata_bus()
         .close_camera(camera_id, "auth_failed")
         .await;
-    {
-        let mut g = supervisor.handles.lock();
-        if let Some(h) = g.get(camera_id) {
-            if h.generation == generation {
-                g.remove(camera_id);
-            }
-        }
-    }
     audit_pull(camera_id, "pull_stopped", Some("auth_failed"));
 }
 
