@@ -37,12 +37,33 @@ function renderTile(t) {
     </div>`;
 }
 
-// Whitelista ikon — patrz app.js. Trzymamy lokalny fallback bez importu zeby
-// nie tworzyc cyklu, ale zachowujemy spojnosc semantyki: nieznana ikona => 'apps'.
+// Whitelista ikon — synchronizowana z ADDON_ICON_WHITELIST w app.js.
+// Nieznana lub nieprawidlowa ikona => 'apps'. Walidacja chroni przed XSS:
+// raw input z manifestu addona NIE moze trafic do sprite() niesprawdzona.
+const ICON_WHITELIST = new Set([
+  'alert', 'apps', 'arrow', 'arrow-out', 'audit', 'ban', 'bar-chart', 'bolt',
+  'brain', 'branch', 'catalog', 'chart-line', 'chat', 'check', 'chevron-down',
+  'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
+  'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',
+  'dashboard', 'database', 'desktop', 'docker', 'download', 'edit',
+  'external-link', 'eye', 'file-text', 'filter', 'flow', 'folder', 'globe',
+  'globe-grid', 'gpu', 'grid-rows', 'grip', 'home', 'home-simple', 'host',
+  'iface-lan', 'iface-loop', 'iface-tb', 'iface-virt', 'iface-vpn',
+  'iface-wifi', 'image', 'info', 'key', 'line-chart', 'list', 'lock', 'logout',
+  'management', 'max', 'meeting', 'message', 'mic', 'min', 'model', 'models',
+  'network', 'network-svg', 'os', 'paperclip', 'pause', 'pi', 'pin', 'play',
+  'plus', 'prompt', 'puzzle', 'question', 'rag-db', 'ram', 'record',
+  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'search', 'send',
+  'services', 'settings', 'share', 'shield', 'sparkle', 'speaker',
+  'speaker-alt', 'star', 'stop', 'transform', 'trash', 'trend', 'unlock',
+  'user', 'users', 'volume', 'workflow-app', 'x', 'zap',
+]);
+
 function resolveIcon(raw) {
   const t = String(raw ?? '').trim();
   const id = t.startsWith('i-') ? t.slice(2) : t;
-  return id || 'apps';
+  if (id && ICON_WHITELIST.has(id)) return id;
+  return 'apps';
 }
 
 // Dynamic tile dla zainstalowanego addonu z `[application]` w manifescie.
