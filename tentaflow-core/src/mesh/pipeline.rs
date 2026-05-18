@@ -198,6 +198,17 @@ pub async fn start_mesh_pipeline(
     match IrohMeshManager::new(iroh_cfg, security_for_mesh).await {
         Ok(quic_mesh) => {
             let local_node_id = quic_mesh.node_id();
+
+            // F2 P5 — register the mesh broadcast-on-rotate hook so the
+            // on-disk key watcher in `services::mod` can push the rotated
+            // HMAC keys to every trust-paired peer without waiting for the
+            // next `PeerConnected`. Idempotent: a second mesh boot in the
+            // same process keeps the first handle.
+            crate::services::mesh_keys::register_broadcast_hook(
+                local_node_id.clone(),
+                quic_mesh.clone(),
+            );
+
             let local_node_info = node_info_collector::collect_node_info(&local_node_id);
             upsert_local_peer(
                 mesh_peer_store,
