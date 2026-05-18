@@ -9,6 +9,10 @@
 // roles preseed by migration v32 (admin / dpo: read+write; operator / viewer:
 // read only) and gate every host-fn touching this module.
 
+pub mod rodo_generator;
 pub mod types;
 
+pub use rodo_generator::{
+    generate as generate_rodo, RodoGenerationError, RodoGenerationInput, RodoGenerationOutput,
+};
 pub use types::RodoVariant;

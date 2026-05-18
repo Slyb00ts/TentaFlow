@@ -176,6 +176,14 @@ semver = "1.0"
 # Multipart form data parsing
 multer = "3.1"
 
+# Legal document rendering — Handlebars for template rendering + genpdf for
+# PDF output (F2 P8.b RODO generator). genpdf bundles a PDF layout engine on
+# top of printpdf so we get paragraphs / pagination without writing low-level
+# text positioning code. DejaVu fonts are vendored under assets/fonts/dejavu/
+# for full Polish-diacritic coverage on every platform.
+handlebars = "5"
+genpdf = "0.2"
+
 # Docker (optional)
 bollard = { version = "0.21.0", optional = true }
 
