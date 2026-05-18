@@ -48,6 +48,10 @@ export function openInstallWizard(opts = {}) {
     cameras: {
       discovered: [],
       added: new Map(),
+      // Set of cameraRowKey strings currently mid-flight in
+      // cameraAddOnvifRequest. Guards against rapid double-click that would
+      // open two dialogs and submit two AddOnvif calls for the same camera.
+      pending: new Set(),
       loading: false,
       error: null,
     },
@@ -548,15 +552,18 @@ function buildCameraRows() {
   return c.discovered.map((cam, idx) => {
     const key = cameraRowKey(cam);
     const isAdded = c.added.has(key);
+    const isPending = c.pending.has(key);
     const statusChip = isAdded
       ? { status: 'ok', label: I18n.t('install_wizard.cameras_status_added') }
       : { status: 'info', label: I18n.t('install_wizard.cameras_status_not_added') };
     const actionLabel = isAdded
       ? I18n.t('install_wizard.cameras_action_added')
       : I18n.t('install_wizard.cameras_action_add');
+    // Disable the action button while an AddOnvif call is in flight for this
+    // row so a second click cannot open a second dialog / submit a duplicate.
     const actionsHtml = isAdded
       ? `<tf-chip status="ok" icon="check">${escapeHtml(actionLabel)}</tf-chip>`
-      : `<tf-button size="sm" variant="primary" data-role="cam-add" data-idx="${idx}" aria-label="${escapeAttr(I18n.t('install_wizard.cameras_action_add'))}">${escapeHtml(actionLabel)}</tf-button>`;
+      : `<tf-button size="sm" variant="primary" data-role="cam-add" data-idx="${idx}" ${isPending ? 'disabled' : ''} aria-label="${escapeAttr(I18n.t('install_wizard.cameras_action_add'))}">${escapeHtml(actionLabel)}</tf-button>`;
     return {
       vendor: cam.vendor || '—',
       model: cam.model || '—',
@@ -600,6 +607,13 @@ function mapCameraErrorCode(code) {
 function openAddCameraDialog(idx) {
   const cam = state.cameras.discovered[idx];
   if (!cam) return;
+  const key = cameraRowKey(cam);
+  // Guard against rapid double-click: if a dialog/submit is already in flight
+  // for this row, refuse the second open. The button is also disabled while
+  // pending, but click events can still queue from keyboard activation.
+  if (state.cameras.pending.has(key) || state.cameras.added.has(key)) return;
+  state.cameras.pending.add(key);
+  renderStep();
   const defaultName = `${cam.vendor || ''} ${cam.model || ''}`.trim() || (cam.ip || 'camera');
   const xa = Array.isArray(cam.xaddrs) ? cam.xaddrs[0] : '';
   const dlg = document.createElement('tf-window');
@@ -673,6 +687,13 @@ function openAddCameraDialog(idx) {
     box.hidden = !msg;
     box.textContent = msg || '';
   };
+
+  // Clear the pending guard on any close path (Cancel, Esc, X, post-Save
+   // re-render). tf-window emits `close` once when the dialog disappears.
+  const clearPending = () => {
+    state.cameras.pending.delete(key);
+  };
+  dlg.addEventListener('close', clearPending);
 
   footer.querySelector('[data-role="dialog-cancel"]')?.addEventListener('click', () => {
     dlg.close(true);
