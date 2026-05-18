@@ -2973,11 +2973,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "title", a.title.into());
                         set(&item, "entryPanel", a.entry_panel.clone().into());
                         set(&item, "entry_panel", a.entry_panel.into());
-                        if let Some(icon) = a.icon {
-                            set(&item, "icon", icon.into());
-                        }
+                        set(&item, "icon", a.icon.into());
+                        set(&item, "description", a.description.into());
                         set(&item, "sortOrder", (a.sort_order as f64).into());
                         set(&item, "sort_order", (a.sort_order as f64).into());
+                        set(&item, "enabled", a.enabled.into());
                         arr.push(&item.into());
                     }
                     set(&obj, "applications", arr.into());

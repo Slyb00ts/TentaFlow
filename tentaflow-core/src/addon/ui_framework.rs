@@ -108,7 +108,35 @@ pub enum UiComponent {
         #[serde(default = "default_badge_color")]
         color: String,
     },
+
+    /// Live preview of a single camera. The host renders an `<img>` element
+    /// pointed at a signed `frame_url(camera_id, ttl_secs)` and refreshes the
+    /// `src` attribute every `ttl_secs / 2` seconds — there is zero round
+    /// trip back into the addon WASM module.
+    LiveCameraTile {
+        /// Camera id (UUID v4, matches `camera_add`).
+        camera_id: String,
+        /// Validity of each signed URL in seconds. Refresh cadence is
+        /// `ttl_secs / 2`. Allowed range: 5..=300; out-of-range values are
+        /// clamped on validation.
+        #[serde(default = "default_live_tile_ttl")]
+        ttl_secs: u32,
+        /// Optional label rendered above the preview (e.g. camera name).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// Optional fixed height in pixels (default: auto, square aspect).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height_px: Option<u32>,
+    },
 }
+
+fn default_live_tile_ttl() -> u32 {
+    30
+}
+
+/// Validation constants for `UiComponent::LiveCameraTile`.
+pub const LIVE_CAMERA_TILE_TTL_MIN: u32 = 5;
+pub const LIVE_CAMERA_TILE_TTL_MAX: u32 = 300;
 
 fn default_badge_color() -> String {
     "blue".to_string()
@@ -403,6 +431,38 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
                 escape_html(text)
             ));
         }
+
+        UiComponent::LiveCameraTile {
+            camera_id,
+            ttl_secs,
+            label,
+            height_px,
+        } => {
+            let height_attr = height_px
+                .map(|h| format!(" data-height-px=\"{}\"", h))
+                .unwrap_or_default();
+            let label_block = label
+                .as_ref()
+                .map(|l| {
+                    format!(
+                        "  <div class=\"tf-live-camera-label\">{}</div>\n",
+                        escape_html(l)
+                    )
+                })
+                .unwrap_or_default();
+            html.push_str(&format!(
+                "{}<div class=\"tf-live-camera-tile\" data-camera-id=\"{}\" data-ttl-secs=\"{}\"{}>\n\
+                 {}{}  <img class=\"tf-live-camera-img\" alt=\"Live preview\" />\n\
+                 {}</div>\n",
+                pad,
+                escape_html(camera_id),
+                ttl_secs,
+                height_attr,
+                pad,
+                label_block,
+                pad
+            ));
+        }
     }
 }
 
@@ -427,6 +487,92 @@ pub fn parse_components_from_json(json: &serde_json::Value) -> Vec<UiComponent> 
 // =============================================================================
 // Helpers
 // =============================================================================
+
+// =============================================================================
+// Validation
+// =============================================================================
+
+/// Validates a `UiComponent` tree in place. Today only `LiveCameraTile`
+/// carries host-enforced invariants; other variants are structurally validated
+/// at deserialization time. `ttl_secs` outside `5..=300` is clamped (the host
+/// accepts the tile but warns via the returned `Result::Ok` so the frontend
+/// sees the clamped value). Hard errors (empty/invalid `camera_id`, wrong
+/// length) bubble up as `Err`.
+pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::Result<()> {
+    match component {
+        UiComponent::LiveCameraTile {
+            camera_id,
+            ttl_secs,
+            ..
+        } => {
+            validate_camera_id(camera_id)?;
+            if *ttl_secs < LIVE_CAMERA_TILE_TTL_MIN {
+                *ttl_secs = LIVE_CAMERA_TILE_TTL_MIN;
+            } else if *ttl_secs > LIVE_CAMERA_TILE_TTL_MAX {
+                *ttl_secs = LIVE_CAMERA_TILE_TTL_MAX;
+            }
+            Ok(())
+        }
+        UiComponent::Card { children, .. } => {
+            for c in children {
+                validate_and_normalize_component(c)?;
+            }
+            Ok(())
+        }
+        UiComponent::Tabs { tabs } => {
+            for (_, children) in tabs {
+                for c in children {
+                    validate_and_normalize_component(c)?;
+                }
+            }
+            Ok(())
+        }
+        UiComponent::List { items } => {
+            for c in items {
+                validate_and_normalize_component(c)?;
+            }
+            Ok(())
+        }
+        UiComponent::Form { children, .. } => {
+            for c in children {
+                validate_and_normalize_component(c)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Camera id contract: UUID v4 textual form (length 36, lowercase hex + dashes
+/// in `8-4-4-4-12` layout). Strict — addons that pass non-UUID values fail
+/// fast before any signed URL is minted.
+fn validate_camera_id(id: &str) -> anyhow::Result<()> {
+    if id.len() != 36 {
+        anyhow::bail!(
+            "LiveCameraTile.camera_id length {} (expected 36 chars UUID v4)",
+            id.len()
+        );
+    }
+    for (i, b) in id.bytes().enumerate() {
+        let dash_pos = matches!(i, 8 | 13 | 18 | 23);
+        if dash_pos {
+            if b != b'-' {
+                anyhow::bail!(
+                    "LiveCameraTile.camera_id '{}' missing '-' at position {}",
+                    id,
+                    i
+                );
+            }
+        } else if !((b.is_ascii_digit()) || (b'a'..=b'f').contains(&b)) {
+            anyhow::bail!(
+                "LiveCameraTile.camera_id '{}' has non-hex char at position {}",
+                id,
+                i
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Escapuje znaki specjalne HTML
 fn escape_html(s: &str) -> String {
@@ -477,6 +623,94 @@ mod tests {
 
         let components = parse_components_from_json(&json);
         assert_eq!(components.len(), 2);
+    }
+
+    #[test]
+    fn live_camera_tile_serde_round_trip() {
+        let cam = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let original = UiComponent::LiveCameraTile {
+            camera_id: cam.clone(),
+            ttl_secs: 45,
+            label: Some("Front Door".to_string()),
+            height_px: Some(240),
+        };
+        let json = serde_json::to_value(&original).expect("serialize");
+        assert_eq!(json["type"], "live_camera_tile");
+        assert_eq!(json["camera_id"], cam.as_str());
+        assert_eq!(json["ttl_secs"], 45);
+        let back: UiComponent = serde_json::from_value(json).expect("deserialize");
+        match back {
+            UiComponent::LiveCameraTile {
+                camera_id,
+                ttl_secs,
+                label,
+                height_px,
+            } => {
+                assert_eq!(camera_id, cam);
+                assert_eq!(ttl_secs, 45);
+                assert_eq!(label.as_deref(), Some("Front Door"));
+                assert_eq!(height_px, Some(240));
+            }
+            _ => panic!("variant changed during round-trip"),
+        }
+    }
+
+    #[test]
+    fn live_camera_tile_clamps_ttl_below_min() {
+        let mut c = UiComponent::LiveCameraTile {
+            camera_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            ttl_secs: 1,
+            label: None,
+            height_px: None,
+        };
+        validate_and_normalize_component(&mut c).expect("ok");
+        match c {
+            UiComponent::LiveCameraTile { ttl_secs, .. } => {
+                assert_eq!(ttl_secs, LIVE_CAMERA_TILE_TTL_MIN);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn live_camera_tile_clamps_ttl_above_max() {
+        let mut c = UiComponent::LiveCameraTile {
+            camera_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            ttl_secs: 10_000,
+            label: None,
+            height_px: None,
+        };
+        validate_and_normalize_component(&mut c).expect("ok");
+        match c {
+            UiComponent::LiveCameraTile { ttl_secs, .. } => {
+                assert_eq!(ttl_secs, LIVE_CAMERA_TILE_TTL_MAX);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn live_camera_tile_rejects_bad_uuid() {
+        let mut c = UiComponent::LiveCameraTile {
+            camera_id: "not-a-uuid".to_string(),
+            ttl_secs: 30,
+            label: None,
+            height_px: None,
+        };
+        assert!(validate_and_normalize_component(&mut c).is_err());
+    }
+
+    #[test]
+    fn live_camera_tile_default_ttl_via_serde() {
+        let json = serde_json::json!({
+            "type": "live_camera_tile",
+            "camera_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let c: UiComponent = serde_json::from_value(json).expect("deserialize");
+        match c {
+            UiComponent::LiveCameraTile { ttl_secs, .. } => assert_eq!(ttl_secs, 30),
+            _ => panic!(),
+        }
     }
 
     #[test]
