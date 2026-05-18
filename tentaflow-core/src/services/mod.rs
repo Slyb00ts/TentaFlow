@@ -25,6 +25,7 @@ pub mod frame_proxy;
 pub mod frame_storage;
 pub mod handles_cache;
 pub mod key_storage;
+pub mod legal;
 pub mod lifecycle;
 pub mod mesh_keys;
 pub mod mesh_registry;
