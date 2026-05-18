@@ -4906,7 +4906,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "warning", "unexpected_request_variant_in_response".into());
             }
             tentaflow_protocol::LegalAdminPayload::ListResponse(resp) => {
-                set(&obj, "variant", "list_response".into());
+                set(&obj, "variant", "LegalDocumentsListResponse".into());
                 let arr = js_sys::Array::new();
                 for doc in resp.documents {
                     let item = js_sys::Object::new();
@@ -4942,7 +4942,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "warning", "unexpected_request_variant_in_response".into());
             }
             tentaflow_protocol::LegalAdminPayload::GenerateResponse(resp) => {
-                set(&obj, "variant", "generate_response".into());
+                set(&obj, "variant", "LegalDocumentGenerateResponse".into());
                 set(&obj, "doc_id", resp.doc_id.clone().into());
                 set(&obj, "docId", resp.doc_id.into());
                 set(&obj, "content_hash", resp.content_hash.clone().into());
@@ -4955,7 +4955,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "warning", "unexpected_request_variant_in_response".into());
             }
             tentaflow_protocol::LegalAdminPayload::RevokeResponse(resp) => {
-                set(&obj, "variant", "revoke_response".into());
+                set(&obj, "variant", "LegalDocumentRevokeResponse".into());
                 set(&obj, "doc_id", resp.doc_id.clone().into());
                 set(&obj, "docId", resp.doc_id.into());
                 set(&obj, "revoked_at_ms", (resp.revoked_at_ms as f64).into());
