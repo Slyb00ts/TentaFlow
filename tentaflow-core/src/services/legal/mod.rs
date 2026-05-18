@@ -9,10 +9,16 @@
 // roles preseed by migration v32 (admin / dpo: read+write; operator / viewer:
 // read only) and gate every host-fn touching this module.
 
+pub mod revoke;
 pub mod rodo_generator;
+pub mod signed_url;
 pub mod types;
 
+pub use revoke::{revoke as revoke_document, revoke_async as revoke_document_async, RevokeError};
 pub use rodo_generator::{
     generate as generate_rodo, RodoGenerationError, RodoGenerationInput, RodoGenerationOutput,
+};
+pub use signed_url::{
+    mint_legal_url, verify_legal_token, LegalSignedUrl, DEFAULT_LEGAL_URL_TTL_SECS,
 };
 pub use types::RodoVariant;

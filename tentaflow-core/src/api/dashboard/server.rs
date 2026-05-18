@@ -1358,6 +1358,95 @@ pub async fn handle_request(
         }
     }
 
+    // GET /legal/<doc_id>?token=&exp=&org=&nonce= — HMAC-signed download of a
+    // RODO/GDPR PDF artifact. HMAC-only auth, same shape as `/recordings`
+    // plus `org` + `nonce` extra fields (the legal binding is per-tenant +
+    // unguessable). F2 P8.c.
+    if method == Method::GET && path.starts_with("/legal/") && path.len() > "/legal/".len() {
+        use crate::api::legal::{
+            handle_legal_url, parse_query, read_legal_file, LegalFileOutcome, LegalOutcome,
+            RequestContext,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/legal")
+        {
+            return Ok(resp);
+        }
+        drop(req);
+        let path_doc_id = path.strip_prefix("/legal/").unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::legal_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_legal_url(path_doc_id, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            LegalOutcome::Ok {
+                org_id,
+                pdf_path,
+                content_hash,
+                generated_at,
+            } => {
+                let file_outcome =
+                    read_legal_file(&db, path_doc_id, &org_id, &pdf_path, ctx).await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    LegalFileOutcome::Ok { bytes } => Ok(apply_signed_url_security_headers(
+                        Response::builder()
+                            .status(status)
+                            .header("Content-Type", "application/pdf")
+                            .header("X-Legal-Hash", content_hash)
+                            .header("X-Legal-Generated-At", generated_at.to_string()),
+                    )
+                    .body(Either::Left(Full::new(Bytes::from(bytes))))
+                    .unwrap()),
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"legal_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            LegalOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(400)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            LegalOutcome::Denied(_)
+            | LegalOutcome::Revoked
+            | LegalOutcome::NotFound
+            | LegalOutcome::InternalError(_) => {
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"legal_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {
         let (status, content_type, body) = static_files::serve(&path);
