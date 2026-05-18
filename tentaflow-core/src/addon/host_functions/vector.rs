@@ -302,7 +302,12 @@ pub fn enforce_gate_with_policy(
             });
         }
     };
-    let ctx = super::gate::build_context(&state.addon_id, &gate, Some(&spec.name));
+    let ctx = super::gate::build_context(
+        &state.addon_id,
+        state.org_id.as_deref(),
+        &gate,
+        Some(&spec.name),
+    );
     match crate::services::policy::verify_claim(&state.db, claim_id, &ctx) {
         Ok(_) => Ok(Some(claim_id.to_string())),
         Err(e) => {

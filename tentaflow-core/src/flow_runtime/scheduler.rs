@@ -53,8 +53,10 @@ use super::operators::{
 use super::registry;
 use super::types::{CompiledFlow, OperatorType};
 
-/// Hard ceiling on concurrent invocations per addon. PM decision Q1.
-pub const PER_ADDON_CONCURRENCY_CAP: usize = 10;
+/// Default ceiling on concurrent invocations per addon. PM decision Q1.
+/// Per-addon override is loaded from manifest `[runtime] max_concurrency`
+/// via `FlowScheduler::set_addon_concurrency_cap`.
+pub const DEFAULT_CONCURRENCY_CAP: usize = 10;
 
 /// Per-edge buffer capacity. Larger than the steady-state working set so
 /// transient bursts (e.g. a yolo backend stall) are absorbed; once exceeded
@@ -121,6 +123,12 @@ pub struct FlowScheduler {
     /// check and for `cancel()` / `status()` lookups without touching DB
     /// for in-memory state (DB still owns the authoritative status text).
     by_addon: PlMutex<HashMap<String, HashSet<String>>>,
+    /// Per-addon concurrency cap overrides loaded from manifest
+    /// `[runtime] max_concurrency`. Addons absent from this map fall back
+    /// to `DEFAULT_CONCURRENCY_CAP`. Populated by `set_addon_concurrency_cap`
+    /// at addon install/start; cleared by `clear_addon_concurrency_cap` on
+    /// uninstall.
+    concurrency_overrides: PlMutex<HashMap<String, usize>>,
     in_flight: PlMutex<HashMap<String, InFlight>>,
     /// Late-bound by boot wiring after Router is constructed. Operators in
     /// chunk C treat `None` as fatal-but-clean (Predict returns Internal).
@@ -159,10 +167,41 @@ impl FlowScheduler {
         Self {
             db,
             by_addon: PlMutex::new(HashMap::new()),
+            concurrency_overrides: PlMutex::new(HashMap::new()),
             in_flight: PlMutex::new(HashMap::new()),
             service_manager: PlMutex::new(None),
             event_bus: PlMutex::new(None),
         }
+    }
+
+    /// Records the manifest-declared concurrency cap for an addon. Called
+    /// from `addon::lifecycle::install_addon` (and on every start so a
+    /// `[runtime]` rewrite picked up by a reload becomes immediately
+    /// effective). `cap == 0` is treated as "remove override" so a manifest
+    /// edit that drops the section re-anchors the addon to the default.
+    pub fn set_addon_concurrency_cap(&self, addon_id: &str, cap: u32) {
+        let mut g = self.concurrency_overrides.lock();
+        if cap == 0 {
+            g.remove(addon_id);
+        } else {
+            g.insert(addon_id.to_string(), cap as usize);
+        }
+    }
+
+    /// Drops the per-addon cap entry. Called from `uninstall_addon` so a
+    /// reinstall starts from a clean slate.
+    pub fn clear_addon_concurrency_cap(&self, addon_id: &str) {
+        self.concurrency_overrides.lock().remove(addon_id);
+    }
+
+    /// Looks up the effective cap for an addon — manifest override when
+    /// present, `DEFAULT_CONCURRENCY_CAP` otherwise.
+    pub fn effective_concurrency_cap(&self, addon_id: &str) -> usize {
+        self.concurrency_overrides
+            .lock()
+            .get(addon_id)
+            .copied()
+            .unwrap_or(DEFAULT_CONCURRENCY_CAP)
     }
 
     /// Late-bind the service manager handle. Called once from core boot
@@ -429,10 +468,11 @@ impl FlowScheduler {
         invocation_id: &str,
         org_id: Option<&str>,
     ) -> Result<CapGuard, InvokeError> {
+        let effective_cap = self.effective_concurrency_cap(addon_id);
         let denied = {
             let mut g = self.by_addon.lock();
             let entry = g.entry(addon_id.to_string()).or_default();
-            if entry.len() >= PER_ADDON_CONCURRENCY_CAP {
+            if entry.len() >= effective_cap {
                 true
             } else {
                 entry.insert(invocation_id.to_string());
@@ -440,10 +480,11 @@ impl FlowScheduler {
             }
         };
         if denied {
-            self.emit_concurrency_cap_audit(addon_id, org_id).await;
+            self.emit_concurrency_cap_audit(addon_id, org_id, effective_cap)
+                .await;
             return Err(InvokeError::ConcurrencyCapExceeded {
                 addon_id: addon_id.to_string(),
-                cap: PER_ADDON_CONCURRENCY_CAP,
+                cap: effective_cap,
             });
         }
         Ok(CapGuard {
@@ -463,7 +504,12 @@ impl FlowScheduler {
         }
     }
 
-    async fn emit_concurrency_cap_audit(&self, addon_id: &str, org_id: Option<&str>) {
+    async fn emit_concurrency_cap_audit(
+        &self,
+        addon_id: &str,
+        org_id: Option<&str>,
+        cap: usize,
+    ) {
         let db = self.db.clone();
         let addon = addon_id.to_string();
         let org = org_id
@@ -477,7 +523,7 @@ impl FlowScheduler {
             let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let details = serde_json::json!({
                 "reason": "max_concurrent_invocations",
-                "cap": PER_ADDON_CONCURRENCY_CAP,
+                "cap": cap,
             })
             .to_string();
             let hash_input = crate::audit::chain::AuditRowHashInput {

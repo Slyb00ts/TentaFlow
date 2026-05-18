@@ -910,3 +910,113 @@ path = "f1b.json"
         "unexpected error: {err}"
     );
 }
+
+// =============================================================================
+// F2 P3 — [runtime] section (per-addon concurrency / rate-limit overrides)
+// =============================================================================
+
+#[test]
+fn manifest_runtime_section_accepts_max_concurrency() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[runtime]
+max_concurrency = 3
+"#;
+    let m = parse_manifest_toml(toml).expect("parse");
+    let r = m.runtime_overrides.expect("[runtime] populated");
+    assert_eq!(r.max_concurrency, Some(3));
+    assert!(r.rate_limit_per_min.is_none());
+}
+
+#[test]
+fn manifest_runtime_section_accepts_rate_limit_per_min() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[runtime]
+rate_limit_per_min = 500
+"#;
+    let m = parse_manifest_toml(toml).expect("parse");
+    let r = m.runtime_overrides.expect("[runtime] populated");
+    assert_eq!(r.rate_limit_per_min, Some(500));
+    assert!(r.max_concurrency.is_none());
+}
+
+#[test]
+fn manifest_runtime_section_absent_defaults_to_none() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+"#;
+    let m = parse_manifest_toml(toml).expect("parse");
+    assert!(m.runtime_overrides.is_none());
+}
+
+#[test]
+fn manifest_runtime_section_zero_means_no_override() {
+    // `0` is the documented "remove the override" sentinel — addons that
+    // want the system default re-anchor by writing `0`, not by deleting
+    // the section.
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[runtime]
+max_concurrency = 0
+rate_limit_per_min = 0
+"#;
+    let m = parse_manifest_toml(toml).expect("parse");
+    let r = m.runtime_overrides.expect("[runtime] populated");
+    assert!(r.max_concurrency.is_none());
+    assert!(r.rate_limit_per_min.is_none());
+}
+
+#[test]
+fn manifest_runtime_section_rejects_non_integer() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[runtime]
+max_concurrency = "lots"
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(
+        err.contains("max_concurrency"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn manifest_runtime_section_rejects_negative() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[runtime]
+rate_limit_per_min = -1
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("rate_limit_per_min"), "unexpected error: {err}");
+}

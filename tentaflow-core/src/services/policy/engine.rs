@@ -10,6 +10,7 @@
 
 use crate::db::DbPool;
 
+use super::cache::{self, CachedDecision, GateCheckCache};
 use super::error::{PolicyError, Result};
 use super::repo;
 
@@ -19,6 +20,16 @@ use super::repo;
 #[derive(Debug, Clone)]
 pub struct ClaimContext {
     pub addon_id: String,
+    /// Owning organization for the caller. Threaded through `compute_ctx_hash`
+    /// so the gate-check cache enforces cross-org isolation: a hit produced
+    /// for org A can never satisfy a request from org B even when the claim
+    /// id and addon id coincide. `None` collapses to `"org-default"` for
+    /// boot-time / system calls predating multi-tenant onboarding.
+    pub org_id: Option<String>,
+    /// Identifier of the manifest `[[gate]]` block this verification is for.
+    /// Same claim referenced by two different gates can require different
+    /// signer roles — the cache key must distinguish them.
+    pub gate_id: String,
     /// Expected claim type — must match `policy_claims.claim_type`.
     /// Allowed values are mirrored from `manifest::CLAIM_TYPES`
     /// ("approval" | "grant" | "deployment_profile" | "consent" | "dpia" | "fria"
@@ -78,6 +89,22 @@ pub fn verify_claim(
     claim_id: &str,
     ctx: &ClaimContext,
 ) -> Result<ClaimVerified> {
+    // Hot-path cache short-circuit. The cache stores decisions per
+    // (claim_id, blake3(org_id | addon_id | gate_id | resource_scope)) so
+    // an allow for org A cannot be replayed for org B. Cache hits skip the
+    // DB roundtrip entirely; the wall-clock guard inside `cache::get`
+    // re-checks claim expiry before serving so default-deny is preserved.
+    let org_for_hash = ctx.org_id.as_deref().unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let ctx_hash = cache::compute_ctx_hash(
+        org_for_hash,
+        &ctx.addon_id,
+        &ctx.gate_id,
+        ctx.resource_scope.as_deref(),
+    );
+    if let Some(cached) = GateCheckCache::global().get(claim_id, &ctx_hash) {
+        return cached_to_result(claim_id, cached);
+    }
+
     let row = repo::get_claim(pool, claim_id)?
         .ok_or_else(|| PolicyError::ClaimNotFound(claim_id.to_string()))?;
 
@@ -161,7 +188,7 @@ pub fn verify_claim(
         }
     }
 
-    Ok(ClaimVerified {
+    let verified = ClaimVerified {
         claim_id: row.claim_id,
         claim_type: row.claim_type,
         valid_until: row.valid_until,
@@ -172,7 +199,55 @@ pub fn verify_claim(
                 user: s.signer_user,
             })
             .collect(),
-    })
+    };
+    // Cache the allow with the full attribution chain. `valid_until_unix`
+    // caps the cache lifetime to the claim's declared expiry so a 60 s TTL
+    // never serves a stale claim.
+    let valid_until_unix = parse_rfc3339_utc(&verified.valid_until, "valid_until")
+        .map(|dt| dt.timestamp())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp() + 60);
+    let signers_pairs: Vec<(String, String)> = verified
+        .signers
+        .iter()
+        .map(|s| (s.role.clone(), s.user.clone()))
+        .collect();
+    GateCheckCache::global().insert(
+        &verified.claim_id,
+        &ctx_hash,
+        CachedDecision {
+            allowed: true,
+            reason: None,
+            valid_until_unix,
+            claim_type: verified.claim_type.clone(),
+            valid_until: verified.valid_until.clone(),
+            signers: signers_pairs,
+        },
+    );
+    Ok(verified)
+}
+
+/// Rebuilds a `Result<ClaimVerified>` from a cached decision. Allow hits
+/// replay the stored attribution chain verbatim; deny hits surface a
+/// generic `ClaimScopeMismatch` carrying the stored reason text (the
+/// downstream `policy_error_to_reason` mapper collapses every deny variant
+/// to a short audit code anyway).
+fn cached_to_result(claim_id: &str, cached: CachedDecision) -> Result<ClaimVerified> {
+    if cached.allowed {
+        let signers = cached
+            .signers
+            .into_iter()
+            .map(|(role, user)| SignerEntry { role, user })
+            .collect();
+        Ok(ClaimVerified {
+            claim_id: claim_id.to_string(),
+            claim_type: cached.claim_type,
+            valid_until: cached.valid_until,
+            signers,
+        })
+    } else {
+        let reason = cached.reason.unwrap_or_else(|| "cached deny".to_string());
+        Err(PolicyError::ClaimScopeMismatch { detail: reason })
+    }
 }
 
 #[cfg(test)]
@@ -215,8 +290,14 @@ mod tests {
     }
 
     fn ctx(addon_id: &str, claim_type: &str, scope: Option<&str>) -> ClaimContext {
+        // Each test gets a fresh global cache to keep allow/deny replay
+        // semantics deterministic. `invalidate_all` is cheap (single Vec
+        // clear) so calling it from every constructor adds < 1 µs.
+        GateCheckCache::global().invalidate_all();
         ClaimContext {
             addon_id: addon_id.to_string(),
+            org_id: Some("org-test".to_string()),
+            gate_id: "gate-test".to_string(),
             claim_type_required: claim_type.to_string(),
             resource_scope: scope.map(String::from),
             required_signer_roles: vec!["dpo".to_string(), "supervisor".to_string()],
@@ -392,6 +473,80 @@ mod tests {
         repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
         let err = verify_claim(&pool, "c1", &ctx("addon", "dpia", None)).unwrap_err();
         assert!(matches!(err, PolicyError::DbError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_verify_claim_uses_cache_on_second_call() {
+        let (_d, pool) = open_pool();
+        repo::insert_claim(&pool, &base_claim("c1")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "alice")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "bob")).unwrap();
+        let ctx = ctx("addon-x", "dpia", None);
+        let first = verify_claim(&pool, "c1", &ctx).unwrap();
+        // Mutate the underlying DB row out-of-band: change claim_type so a
+        // fresh DB read would now reject. The cache hit on the second call
+        // must replay the original allow.
+        {
+            let conn = pool.lock().unwrap();
+            conn.execute(
+                "UPDATE policy_claims SET claim_type = ?1 WHERE claim_id = 'c1'",
+                rusqlite::params!["consent"],
+            )
+            .unwrap();
+        }
+        let second = verify_claim(&pool, "c1", &ctx).unwrap();
+        assert_eq!(first.signers.len(), second.signers.len());
+        assert_eq!(second.signers.len(), 2);
+    }
+
+    #[test]
+    fn test_verify_claim_bypasses_cache_after_revoke() {
+        let (_d, pool) = open_pool();
+        repo::insert_claim(&pool, &base_claim("c1")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "alice")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "bob")).unwrap();
+        let ctx = ctx("addon-x", "dpia", None);
+        verify_claim(&pool, "c1", &ctx).unwrap();
+        // Revoke through the repo path so the cache invalidation hook fires.
+        repo::revoke_claim(&pool, "c1", "audit fail", "2026-02-01T00:00:00Z").unwrap();
+        let err = verify_claim(&pool, "c1", &ctx).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::ClaimRevoked { .. }),
+            "expected revoked deny after invalidation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_cache_cross_org_isolation() {
+        // Same claim_id, same addon_id, different org_id — the cached allow
+        // for org-a must NOT satisfy a request from org-b. Achieved by
+        // including org_id in the ctx_hash.
+        let (_d, pool) = open_pool();
+        repo::insert_claim(&pool, &base_claim("c1")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "dpo", "alice")).unwrap();
+        repo::insert_signature(&pool, &sig("c1", "supervisor", "bob")).unwrap();
+        let mut ctx_a = ctx("addon-x", "dpia", None);
+        ctx_a.org_id = Some("org-a".to_string());
+        let mut ctx_b = ctx("addon-x", "dpia", None);
+        ctx_b.org_id = Some("org-b".to_string());
+        verify_claim(&pool, "c1", &ctx_a).unwrap();
+        // Now revoke at the DB layer without touching the cache (raw SQL).
+        // org-a's cached allow stays; org-b must still go to the DB and see
+        // the revocation.
+        {
+            let conn = pool.lock().unwrap();
+            conn.execute(
+                "UPDATE policy_claims SET revoked_at = '2026-02-01T00:00:00Z', \
+                  revoked_reason = 'oob' WHERE claim_id = 'c1'",
+                [],
+            )
+            .unwrap();
+        }
+        // org-a still served from cache.
+        verify_claim(&pool, "c1", &ctx_a).unwrap();
+        // org-b had no entry — DB roundtrip surfaces the revocation.
+        let err = verify_claim(&pool, "c1", &ctx_b).unwrap_err();
+        assert!(matches!(err, PolicyError::ClaimRevoked { .. }), "{err:?}");
     }
 
     #[test]

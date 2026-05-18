@@ -235,6 +235,14 @@ pub fn delete_organization(pool: &DbPool, org_id: &str) -> Result<bool> {
             params![org_id],
         )
         .map_err(map_db)?;
+    drop(conn);
+    if n > 0 {
+        // Org deletion implicitly revokes every per-org gate decision; the
+        // permission matrix is invalidated wholesale by callers/the next
+        // membership write, but the gate-check cache is keyed on org_id in
+        // the ctx hash so a wholesale flush is required here.
+        crate::services::policy::GateCheckCache::global().invalidate_all();
+    }
     Ok(n > 0)
 }
 
@@ -283,6 +291,10 @@ pub fn add_membership(
     // Drop the DB guard before touching the RBAC cache so a future cache
     // implementation that re-reads the DB cannot deadlock on the same pool.
     crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
+    // Membership rebinds can flip gate decisions (a role's permission set
+    // implicitly affects gate eligibility). Flush the gate-check cache
+    // wholesale — keyed by ctx_hash, no reverse index by user/org exists.
+    crate::services::policy::GateCheckCache::global().invalidate_all();
     Ok(n > 0)
 }
 
@@ -296,6 +308,10 @@ pub fn remove_membership(pool: &DbPool, org_id: &str, user_id: &str) -> Result<b
         .map_err(map_db)?;
     drop(conn);
     crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
+    // Membership rebinds can flip gate decisions (a role's permission set
+    // implicitly affects gate eligibility). Flush the gate-check cache
+    // wholesale — keyed by ctx_hash, no reverse index by user/org exists.
+    crate::services::policy::GateCheckCache::global().invalidate_all();
     Ok(n > 0)
 }
 

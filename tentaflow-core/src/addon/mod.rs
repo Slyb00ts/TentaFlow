@@ -163,6 +163,10 @@ pub struct AddonManifest {
     /// byc obecny w `trusted_publishers` (DB v26) zeby install przeszedl.
     #[serde(default)]
     pub publisher: Option<manifest::PublisherInfo>,
+    /// Sekcja `[runtime]` — per-addon override dla flow_runtime concurrency
+    /// cap i service_call rate-limit. Pusta sekcja / brak sekcji = defaults.
+    #[serde(default)]
+    pub runtime_overrides: Option<manifest::RuntimeSection>,
 }
 
 /// Sekcja [application] manifestu — rejestracja addonu jako aplikacji

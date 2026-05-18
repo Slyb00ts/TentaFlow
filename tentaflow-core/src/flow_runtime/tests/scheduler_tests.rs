@@ -17,7 +17,7 @@ use crate::db::DbPool;
 use crate::flow_runtime::parser::{compile, parse_flow_definition};
 use crate::flow_runtime::registry;
 use crate::flow_runtime::scheduler::{
-    FlowScheduler, InvokeError, PER_ADDON_CONCURRENCY_CAP,
+    FlowScheduler, InvokeError, DEFAULT_CONCURRENCY_CAP,
 };
 use crate::flow_runtime::types::CompiledFlow;
 
@@ -106,12 +106,12 @@ async fn concurrency_cap_blocks_extra_invocations() {
     let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
     registry::global().register(&addon, make_flow(&flow_id));
 
-    // Fire many concurrent invocations. At least PER_ADDON_CONCURRENCY_CAP+1
+    // Fire many concurrent invocations. At least DEFAULT_CONCURRENCY_CAP+1
     // must be in flight at the same instant for the cap check to trip,
     // which is racy under current_thread; the multi-threaded runtime makes
     // the race tight enough that the cap reliably fires. We oversubscribe
     // by 3x so the assertion is robust against scheduling jitter.
-    let attempts = (PER_ADDON_CONCURRENCY_CAP * 3) as u32;
+    let attempts = (DEFAULT_CONCURRENCY_CAP * 3) as u32;
     let mut handles = Vec::new();
     for i in 0..attempts {
         let s = sched.clone();
@@ -129,7 +129,7 @@ async fn concurrency_cap_blocks_extra_invocations() {
         match h.await.expect("join") {
             Ok(_) => ok += 1,
             Err(InvokeError::ConcurrencyCapExceeded { cap, .. }) => {
-                assert_eq!(cap, PER_ADDON_CONCURRENCY_CAP);
+                assert_eq!(cap, DEFAULT_CONCURRENCY_CAP);
                 denied += 1;
             }
             Err(other) => panic!("unexpected error: {:?}", other),
@@ -341,7 +341,7 @@ async fn cap_released_on_panic() {
 
     // Fill the addon's slots and drain them.
     let mut handles = Vec::new();
-    for _ in 0..PER_ADDON_CONCURRENCY_CAP {
+    for _ in 0..DEFAULT_CONCURRENCY_CAP {
         let s = sched.clone();
         let a = addon.clone();
         let f = flow_id.clone();
@@ -371,7 +371,7 @@ async fn concurrency_cap_emits_denied_audit_row() {
 
     // Same saturation pattern as the cap test; we only assert the audit
     // side-effect here so the flake budget is narrower.
-    let attempts = (PER_ADDON_CONCURRENCY_CAP * 3) as u32;
+    let attempts = (DEFAULT_CONCURRENCY_CAP * 3) as u32;
     let mut handles = Vec::new();
     for i in 0..attempts {
         let s = sched.clone();
@@ -396,4 +396,54 @@ async fn concurrency_cap_emits_denied_audit_row() {
         )
         .expect("count");
     assert!(count >= 1, "at least one denied row expected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flow_invoke_concurrency_cap_respects_manifest_override() {
+    // Addon declares `max_concurrency = 3` in `[runtime]`. The fourth
+    // concurrent invocation must trip the cap with `cap=3` (not the
+    // default 10) and surface a `ConcurrencyCapExceeded` error.
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("override");
+    let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
+    registry::global().register(&addon, make_flow(&flow_id));
+    sched.set_addon_concurrency_cap(&addon, 3);
+    assert_eq!(sched.effective_concurrency_cap(&addon), 3);
+
+    let attempts = 12;
+    let mut handles = Vec::new();
+    for i in 0..attempts {
+        let s = sched.clone();
+        let a = addon.clone();
+        let f = flow_id.clone();
+        handles.push(tokio::spawn(async move {
+            s.invoke(&a, &f, toml::Value::Integer(i as i64), 10_000, None, None)
+                .await
+        }));
+    }
+
+    let mut saw_three_cap = false;
+    for h in handles {
+        match h.await.expect("join") {
+            Ok(_) => {}
+            Err(InvokeError::ConcurrencyCapExceeded { cap, .. }) => {
+                assert_eq!(cap, 3, "manifest override must be reflected in error");
+                saw_three_cap = true;
+            }
+            Err(other) => panic!("unexpected error: {:?}", other),
+        }
+    }
+    assert!(saw_three_cap, "expected at least one cap=3 denial");
+}
+
+#[tokio::test]
+async fn concurrency_cap_zero_reverts_to_default() {
+    let db = fresh_db();
+    let sched = Arc::new(FlowScheduler::new(db.clone()));
+    let addon = unique_addon("clearcap");
+    sched.set_addon_concurrency_cap(&addon, 5);
+    assert_eq!(sched.effective_concurrency_cap(&addon), 5);
+    sched.set_addon_concurrency_cap(&addon, 0);
+    assert_eq!(sched.effective_concurrency_cap(&addon), DEFAULT_CONCURRENCY_CAP);
 }
