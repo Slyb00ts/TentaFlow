@@ -211,7 +211,53 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "roles_add_camera_metadata",
             MigrationStep::Rust(roles_add_camera_metadata_permission),
         ),
+        (
+            37,
+            "legal_documents",
+            MigrationStep::Rust(create_legal_documents_table),
+        ),
     ]
+}
+
+// F2 P8.a — RODO/GDPR document registry. Stores PDF artifacts generated per
+// organization (short / standard / full variant). The `legal.read` and
+// `legal.write` permission keys are already part of the v32 roles preseed
+// (`org_admin`, `dpo`: read+write; `org_operator`, `org_viewer`: read only),
+// so this migration adds storage only and does not touch `roles.permissions_json`.
+//
+// Row identity:
+//   * `id`                       UUIDv4 minted by the issuer
+//   * `org_id`                   tenant scope; cascades on org delete
+//   * `variant`                  one of short|standard|full (CHECK)
+//   * `generated_at`             unix epoch milliseconds
+//   * `generated_by_user_id`     TEXT user id (matches `org_memberships.user_id`)
+//   * `content_hash`             blake3 hex of the PDF bytes
+//   * `pdf_path`                 absolute path on disk
+//   * `signed_url_ref`           HMAC ref published to the recording_url tier
+//                                (NULL until the URL is minted)
+//   * `revoked_at`               soft-delete timestamp; NULL = active
+//
+// The composite index supports the dominant query: list-by-org with newest
+// rows first.
+fn create_legal_documents_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS legal_documents (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+            variant TEXT NOT NULL CHECK (variant IN ('short','standard','full')),
+            generated_at INTEGER NOT NULL,
+            generated_by_user_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            pdf_path TEXT NOT NULL,
+            signed_url_ref TEXT NULL,
+            revoked_at INTEGER NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_legal_documents_org_id_generated_at
+            ON legal_documents(org_id, generated_at DESC);
+        "#,
+    )?;
+    Ok(())
 }
 
 // F2 P6.b — grant `camera.metadata` to operators so they can subscribe to
