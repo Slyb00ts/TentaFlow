@@ -139,6 +139,10 @@ impl PermissionMatrix {
     pub fn invalidate_all(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.inner.write().clear();
+        // Role preseed rewrites change which permissions a given (user, org)
+        // pair holds, which can flip a gate decision. The gate-check cache
+        // has no reverse index by role — flush everything.
+        crate::services::policy::GateCheckCache::global().invalidate_all();
     }
 
     /// Number of cached entries — only useful for assertions in tests.

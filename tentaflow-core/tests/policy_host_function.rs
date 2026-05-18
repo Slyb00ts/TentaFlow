@@ -94,7 +94,7 @@ fn gate_check_v1_engine_path_ok_with_required_signers() {
         req("approval", Some("supervisor")),
         req("dpia", None),
     ]);
-    let ctx = build_context("addon-x", &g, Some("faces"));
+    let ctx = build_context("addon-x", Some("org-test"), &g, Some("faces"));
     let v = policy::verify_claim(&pool, "c1", &ctx).unwrap();
     assert_eq!(v.claim_id, "c1");
     assert_eq!(v.signers.len(), 2);
@@ -106,7 +106,7 @@ fn gate_check_v1_engine_path_denied_when_revoked() {
     issue_claim(&pool, "c1", "dpia", &[("dpo", "alice")]);
     policy::revoke_claim(&pool, "c1", "audit fail", "2026-02-01T00:00:00Z").unwrap();
     let g = gate(vec![req("dpia", None)]);
-    let ctx = build_context("addon-x", &g, None);
+    let ctx = build_context("addon-x", Some("org-test"), &g, None);
     let err = policy::verify_claim(&pool, "c1", &ctx).unwrap_err();
     let (code, msg) = policy_error_to_reason(&err);
     assert_eq!(code, "claim_revoked");
@@ -117,7 +117,7 @@ fn gate_check_v1_engine_path_denied_when_revoked() {
 fn gate_check_v1_engine_path_denied_when_unknown_claim() {
     let (_d, pool) = open_pool();
     let g = gate(vec![req("dpia", None)]);
-    let ctx = build_context("addon-x", &g, None);
+    let ctx = build_context("addon-x", Some("org-test"), &g, None);
     let err = policy::verify_claim(&pool, "missing", &ctx).unwrap_err();
     let (code, _) = policy_error_to_reason(&err);
     assert_eq!(code, "claim_not_found");
@@ -145,7 +145,7 @@ fn helper_required_signer_roles_aggregates_unique_sorted() {
 #[test]
 fn ctx_builder_uses_default_dpo_when_gate_has_no_approval_subject() {
     let g = gate(vec![req("dpia", None)]);
-    let ctx: ClaimContext = build_context("addon-x", &g, None);
+    let ctx: ClaimContext = build_context("addon-x", Some("org-test"), &g, None);
     assert_eq!(ctx.required_signer_roles, vec!["dpo".to_string()]);
     assert_eq!(ctx.claim_type_required, "dpia");
 }

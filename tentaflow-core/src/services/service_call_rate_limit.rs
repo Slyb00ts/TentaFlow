@@ -70,6 +70,12 @@ const MAX_ADDON_ENTRIES: usize = 10_000;
 
 pub struct ServiceCallRateLimiter {
     per_addon: DashMap<String, AddonEntry>,
+    /// Per-addon sustained rate overrides (requests per minute). Populated
+    /// from manifest `[runtime] rate_limit_per_min` at install/start. Burst
+    /// capacity is not configurable — addons that need a larger burst
+    /// re-architect to spread work across time rather than blow the
+    /// shared-backend allowance.
+    overrides_rpm: DashMap<String, u32>,
     config: ServiceCallRateLimitConfig,
 }
 
@@ -77,7 +83,39 @@ impl ServiceCallRateLimiter {
     pub fn new(config: ServiceCallRateLimitConfig) -> Self {
         Self {
             per_addon: DashMap::new(),
+            overrides_rpm: DashMap::new(),
             config,
+        }
+    }
+
+    /// Records a manifest-declared sustained rate limit (requests per
+    /// minute) for an addon. `rpm == 0` removes the override so the addon
+    /// reverts to the process default (1000 req/min). Override takes effect
+    /// on the next `check` call — existing in-flight tokens are not
+    /// rebalanced.
+    pub fn set_addon_rate_limit_per_min(&self, addon_id: &str, rpm: u32) {
+        if rpm == 0 {
+            self.overrides_rpm.remove(addon_id);
+            // Drop the cached bucket so the next check rebuilds with the
+            // default capacity. Without this, an override -> default flip
+            // would silently keep the override's refill rate.
+            self.per_addon.remove(addon_id);
+        } else {
+            self.overrides_rpm.insert(addon_id.to_string(), rpm);
+            self.per_addon.remove(addon_id);
+        }
+    }
+
+    /// Drops the per-addon entry on uninstall.
+    pub fn clear_addon_rate_limit(&self, addon_id: &str) {
+        self.overrides_rpm.remove(addon_id);
+        self.per_addon.remove(addon_id);
+    }
+
+    fn refill_per_sec_for(&self, addon_id: &str) -> f64 {
+        match self.overrides_rpm.get(addon_id) {
+            Some(rpm) => (*rpm.value() as f64) / 60.0,
+            None => self.config.per_addon_refill_per_sec,
         }
     }
 
@@ -88,6 +126,7 @@ impl ServiceCallRateLimiter {
         let now = Instant::now();
         self.sweep_if_needed(now);
 
+        let refill_per_sec = self.refill_per_sec_for(addon_id);
         let mut entry = self
             .per_addon
             .entry(addon_id.to_string())
@@ -98,7 +137,7 @@ impl ServiceCallRateLimiter {
         entry.last_seen = now;
         match entry.bucket.refill_and_peek(
             self.config.per_addon_capacity,
-            self.config.per_addon_refill_per_sec,
+            refill_per_sec,
             now,
         ) {
             Ok(()) => {
@@ -310,6 +349,40 @@ mod tests {
         assert!(matches!(rl.check("addon-a"), RateLimitResult::AddonLimit { .. }));
         std::thread::sleep(Duration::from_millis(1_100));
         assert_eq!(rl.check("addon-a"), RateLimitResult::Allow);
+    }
+
+    #[test]
+    fn rate_limit_uses_manifest_override_when_present() {
+        // Default config burst 3, sustain 1.0 req/s. Override the sustain
+        // rate to 600 req/min = 10 req/s for `addon-fast`. The bucket
+        // depletes after 3 immediate calls, then refills 10x faster than
+        // the default — wait 200 ms and another token must be available
+        // (default would still be empty: 0.2 s × 1.0 req/s = 0.2 tokens).
+        let rl = ServiceCallRateLimiter::new(cfg());
+        rl.set_addon_rate_limit_per_min("addon-fast", 600);
+        for _ in 0..3 {
+            assert_eq!(rl.check("addon-fast"), RateLimitResult::Allow);
+        }
+        assert!(matches!(
+            rl.check("addon-fast"),
+            RateLimitResult::AddonLimit { .. }
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            rl.check("addon-fast"),
+            RateLimitResult::Allow,
+            "override sustain should refill within 200 ms"
+        );
+    }
+
+    #[test]
+    fn rate_limit_zero_override_clears_per_addon_state() {
+        let rl = ServiceCallRateLimiter::new(cfg());
+        rl.set_addon_rate_limit_per_min("addon-x", 6000);
+        assert_eq!(rl.check("addon-x"), RateLimitResult::Allow);
+        rl.set_addon_rate_limit_per_min("addon-x", 0);
+        // Bucket reset; default applies on next call.
+        assert_eq!(rl.check("addon-x"), RateLimitResult::Allow);
     }
 
     #[test]
