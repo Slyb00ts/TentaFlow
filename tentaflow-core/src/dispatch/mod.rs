@@ -28,6 +28,7 @@ pub mod audit_broadcast;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
 pub mod handlers;
+pub mod legal_admin;
 pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
@@ -397,6 +398,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::CameraAdminPayload::DiscoverResponse(_) => "CameraDiscoverResponse",
             tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_) => "CameraAddOnvifRequest",
             tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(_) => "CameraAddOnvifResponse",
+        },
+        MessageBody::LegalAdminBody(p) => match p {
+            tentaflow_protocol::LegalAdminPayload::ListRequest(_) => "LegalDocumentsListRequest",
+            tentaflow_protocol::LegalAdminPayload::ListResponse(_) => "LegalDocumentsListResponse",
+            tentaflow_protocol::LegalAdminPayload::GenerateRequest(_) => {
+                "LegalDocumentGenerateRequest"
+            }
+            tentaflow_protocol::LegalAdminPayload::GenerateResponse(_) => {
+                "LegalDocumentGenerateResponse"
+            }
+            tentaflow_protocol::LegalAdminPayload::RevokeRequest(_) => "LegalDocumentRevokeRequest",
+            tentaflow_protocol::LegalAdminPayload::RevokeResponse(_) => "LegalDocumentRevokeResponse",
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",
