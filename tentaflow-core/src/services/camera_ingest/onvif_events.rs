@@ -136,17 +136,16 @@ pub async fn pull_messages(
     parse_pull_messages_response(&resp)
 }
 
-/// Best-effort teardown. A 200 from the device is preferred, but a 4xx /
-/// SOAP fault here is non-fatal — the device will drop the subscription
-/// at `TerminationTime` either way. The function returns the underlying
-/// error so the caller can log it; callers do not need to retry.
+/// Best-effort teardown. The device will drop the subscription at
+/// `TerminationTime` regardless, so a SOAP fault here is non-fatal.
 ///
 /// Idempotent: a second unsubscribe (or one against an already-expired
-/// subscription) returns Ok(()) instead of propagating SoapFault.
-/// Real cameras commonly fault on stale subscription_uri with
+/// subscription) returns Ok(()) instead of propagating SoapFault. Real
+/// cameras commonly fault on stale subscription_uri with
 /// `wsnt:ResourceUnknownFault` or generic auth/soap faults — treating
 /// these as success keeps `Drop` cleanup paths quiet. Transport errors
-/// still surface so callers can log connectivity issues.
+/// (timeout, connection refused) still surface so callers can log
+/// connectivity issues.
 pub async fn unsubscribe_pull_point(
     subscription_uri: &str,
     creds: &OnvifCredentials,
