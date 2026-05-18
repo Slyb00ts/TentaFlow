@@ -53,6 +53,7 @@ import ProfileReportView from '/js/modules/profile-report.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
+import LegalScreen from '/js/modules/legal/index.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -132,6 +133,7 @@ const ADMIN_NAV = [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
+      { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
   },
@@ -471,6 +473,7 @@ async function renderApp() {
   Router.register('rules', RulesScreen);
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
+  Router.register('legal', LegalScreen);
   Router.register('addons', AddonsScreen);
   // Drill-down: Router.navigate('addon-app', { addonId, panelId }) z apps-home.
   Router.register('addon-app', AddonAppScreen);
