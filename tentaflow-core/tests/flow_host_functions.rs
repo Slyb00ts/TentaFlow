@@ -335,16 +335,16 @@ async fn flow_cancel_marks_invocation_cancelled() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flow_invoke_concurrency_cap_quota_exceeded() {
-    use tentaflow_core::flow_runtime::scheduler::PER_ADDON_CONCURRENCY_CAP;
+    use tentaflow_core::flow_runtime::scheduler::DEFAULT_CONCURRENCY_CAP;
     let sched = Arc::new(FlowScheduler::new(fresh_db()));
     let addon = unique_addon("cap");
     let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
     registry::global().register(&addon, make_flow(&flow_id));
 
     // Oversubscribe 3x — the scheduler caps concurrent invocations at
-    // PER_ADDON_CONCURRENCY_CAP per addon. The blocking call must surface
+    // DEFAULT_CONCURRENCY_CAP per addon. The blocking call must surface
     // QuotaExceeded for at least one of the racers.
-    let attempts = (PER_ADDON_CONCURRENCY_CAP * 3) as u32;
+    let attempts = (DEFAULT_CONCURRENCY_CAP * 3) as u32;
     let mut handles = Vec::new();
     for i in 0..attempts {
         let sched = sched.clone();

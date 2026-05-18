@@ -110,14 +110,20 @@ pub fn primary_claim_type_for_gate(gate: &GateSpec) -> String {
 }
 
 /// Builds a `ClaimContext` from a manifest gate + caller identity. Pulled
-/// out for reuse by `vector_search_v1` enforcement (P4 §B.5).
+/// out for reuse by `vector_search_v1` enforcement (P4 §B.5). `org_id`
+/// threads the caller's organization through so the gate-check cache key
+/// enforces cross-org isolation; `None` collapses to `org-default` inside
+/// the cache hash.
 pub fn build_context(
     addon_id: &str,
+    org_id: Option<&str>,
     gate: &GateSpec,
     resource_scope: Option<&str>,
 ) -> ClaimContext {
     ClaimContext {
         addon_id: addon_id.to_string(),
+        org_id: org_id.map(String::from),
+        gate_id: gate.id.clone(),
         claim_type_required: primary_claim_type_for_gate(gate),
         resource_scope: resource_scope.map(String::from),
         required_signer_roles: required_signer_roles_for_gate(gate),
@@ -262,8 +268,9 @@ pub fn gate_check_v1(
     };
 
     let addon_id = caller.data().addon_id.clone();
+    let org_id = caller.data().org_id.clone();
     let pool = caller.data().db.clone();
-    let ctx = build_context(&addon_id, &gate, resource_scope.as_deref());
+    let ctx = build_context(&addon_id, org_id.as_deref(), &gate, resource_scope.as_deref());
 
     let result = verify_claim(&pool, &claim_id, &ctx);
     match result {

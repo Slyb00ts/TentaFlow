@@ -410,6 +410,31 @@ pub struct GpuInfo {
 }
 
 // =============================================================================
+// Sekcja [runtime] (F2 P3 — per-addon concurrency / rate-limit overrides)
+// =============================================================================
+
+/// Per-addon overrides for the flow_runtime concurrency cap and
+/// `service_call_v1` rate limit. Both fields are optional — addons that
+/// omit the section inherit the process-wide defaults
+/// (`flow_runtime::scheduler::DEFAULT_CONCURRENCY_CAP = 10`,
+/// `services::service_call_rate_limit::ServiceCallRateLimitConfig::default()`
+/// burst 100 / 1000 req/min). Values of 0 mean "no override" and are
+/// treated identically to `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimeSection {
+    /// Maximum concurrent in-flight `flow.invoke` invocations for this
+    /// addon. Hard ceiling — denials surface as `AbiError::QuotaExceeded`
+    /// with audit `risk_class='C'`.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// Sustained `service_call_v1` budget in requests per minute. Burst
+    /// stays at the default (100); only the sustain rate is configurable
+    /// because oversized burst windows defeat the limiter's purpose.
+    #[serde(default)]
+    pub rate_limit_per_min: Option<u32>,
+}
+
+// =============================================================================
 // Walidacja rozszerzen manifestu
 // =============================================================================
 

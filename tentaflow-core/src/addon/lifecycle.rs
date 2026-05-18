@@ -1298,6 +1298,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
     let uses_aliases = parse_uses_aliases(top.get("uses_alias"))?;
     let uses_models = parse_uses_models(top.get("uses_model"))?;
     let publisher = parse_publisher_section(top.get("publisher"))?;
+    let runtime_overrides = parse_runtime_section(top.get("runtime"))?;
 
     crate::addon::manifest::validate_manifest_extensions(
         storage.as_ref(),
@@ -1380,7 +1381,64 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         uses_aliases,
         uses_models,
         publisher,
+        runtime_overrides,
     })
+}
+
+/// Parses the optional top-level `[runtime]` TOML table into a
+/// `RuntimeSection`. Distinct from the `addon.runtime` scalar (which names
+/// the wasm engine — `"wasmtime"` / `"wasmi"`). Strict on field types: a
+/// non-integer `max_concurrency` or `rate_limit_per_min` is a hard parse
+/// error rather than a silent default, so a manifest typo cannot mask a
+/// regression in addon tuning.
+fn parse_runtime_section(
+    val: Option<&toml::Value>,
+) -> Result<Option<crate::addon::manifest::RuntimeSection>> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    let t = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[runtime] must be a TOML table"))?;
+    let max_concurrency = match t.get("max_concurrency") {
+        Some(toml::Value::Integer(n)) => {
+            if *n < 0 {
+                bail!("runtime.max_concurrency must be >= 0 (got {n})");
+            }
+            // Treat 0 as "no override" — the default cap stays in force.
+            if *n == 0 {
+                None
+            } else {
+                Some(*n as u32)
+            }
+        }
+        Some(other) => bail!(
+            "runtime.max_concurrency must be an integer (got {})",
+            other.type_str()
+        ),
+        None => None,
+    };
+    let rate_limit_per_min = match t.get("rate_limit_per_min") {
+        Some(toml::Value::Integer(n)) => {
+            if *n < 0 {
+                bail!("runtime.rate_limit_per_min must be >= 0 (got {n})");
+            }
+            if *n == 0 {
+                None
+            } else {
+                Some(*n as u32)
+            }
+        }
+        Some(other) => bail!(
+            "runtime.rate_limit_per_min must be an integer (got {})",
+            other.type_str()
+        ),
+        None => None,
+    };
+    Ok(Some(crate::addon::manifest::RuntimeSection {
+        max_concurrency,
+        rate_limit_per_min,
+    }))
 }
 
 /// Parses optional `[publisher]` table. Strict on field types — `label` and

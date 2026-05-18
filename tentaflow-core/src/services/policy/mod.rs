@@ -7,10 +7,12 @@
 // Admin-facing API: `repo::{issue, revoke, list, get}` (called by CLI
 // `tentaflow-cli policy ...`).
 
+pub mod cache;
 pub mod engine;
 pub mod error;
 pub mod repo;
 
+pub use cache::{compute_ctx_hash, CachedDecision, GateCheckCache};
 pub use engine::{verify_claim, ClaimContext, ClaimVerified, SignerEntry};
 pub use error::PolicyError;
 pub use repo::{

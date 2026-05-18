@@ -196,8 +196,30 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_aliases_strategy_round_robin",
             MigrationStep::Rust(model_aliases_strategy_round_robin),
         ),
+        (
+            34,
+            "gate_check_cache",
+            MigrationStep::Sql(GATE_CHECK_CACHE),
+        ),
     ]
 }
+
+// F2 P3 — reserved persistence table for gate_check decisions. The F2
+// runtime keeps the cache purely in-memory (`services::policy::cache`); F3
+// will gate-flip a feature flag that wires reads/writes through this table
+// so cache state survives restarts. Shipping the schema now means the F3
+// switch is a code change, not a migration.
+const GATE_CHECK_CACHE: &str = r#"
+CREATE TABLE IF NOT EXISTS gate_check_cache (
+    claim_id TEXT NOT NULL,
+    ctx_hash TEXT NOT NULL,
+    result TEXT NOT NULL,
+    cached_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (claim_id, ctx_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_gate_cache_expires ON gate_check_cache(expires_at);
+"#;
 
 // F2 P2.a — formalise the legal value set for `model_aliases.strategy`.
 // The initial schema declared the column without a CHECK constraint, so

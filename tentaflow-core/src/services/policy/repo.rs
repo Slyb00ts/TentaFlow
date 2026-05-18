@@ -269,5 +269,21 @@ pub fn revoke_claim(
             params![revoked_at, reason, claim_id],
         )
         .map_err(map_db)?;
+    drop(conn);
+    if n > 0 {
+        // Cache invalidation must run after the DB lock drops — a future
+        // cache impl reading back through the same pool would otherwise
+        // deadlock on the connection mutex.
+        super::cache::GateCheckCache::global().invalidate_claim(claim_id);
+    }
     Ok(n > 0)
+}
+
+/// Adds a signature row. Cache invalidation: a newly added signature can
+/// flip a deny (missing required signer) into an allow, so every gate
+/// decision keyed on this claim is dropped.
+pub fn add_signature_with_invalidation(pool: &DbPool, sig: &NewSignature) -> Result<()> {
+    insert_signature(pool, sig)?;
+    super::cache::GateCheckCache::global().invalidate_claim(&sig.claim_id);
+    Ok(())
 }
