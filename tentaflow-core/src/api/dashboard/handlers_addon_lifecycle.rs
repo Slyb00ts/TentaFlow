@@ -82,6 +82,9 @@ fn audit(
         Some(addon_id),
         Some(&details),
         severity,
+        "unclassified",
+        None,
+        None,
         None,
         Some(node_id),
     ) {

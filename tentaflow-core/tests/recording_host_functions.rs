@@ -540,8 +540,9 @@ async fn test_frame_url_basic_and_validation() {
     assert!(url.starts_with("/frames/"));
     assert!(url.contains("token="));
 
-    // TTL too small
-    let payload = format!("frame_ref = {}\nttl_secs = 30\n", toml::Value::String(frame_ref.clone()));
+    // TTL too small — FrameUrl scope min is 5 s (dashboard live tile needs short
+    // TTLs so a leaked URL becomes useless quickly). 4 s falls below the floor.
+    let payload = format!("frame_ref = {}\nttl_secs = 4\n", toml::Value::String(frame_ref.clone()));
     let (rc, _) = rec::frame_url_with_raw_input(&state, payload.as_bytes());
     assert_eq!(rc, AbiError::Operation.as_i32());
     // TTL too large
