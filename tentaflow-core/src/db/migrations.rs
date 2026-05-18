@@ -226,12 +226,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 // so this migration adds storage only and does not touch `roles.permissions_json`.
 //
 // Row identity:
-//   * `id`                       UUIDv4 minted by the issuer
-//   * `org_id`                   tenant scope; cascades on org delete
+//   * `id`                       UUIDv4 minted by the repo (CHECK on shape)
+//   * `org_id`                   tenant scope; ON DELETE RESTRICT — compliance
+//                                retention forbids cascading on org delete
+//                                (orgs are soft-deleted at the application layer)
 //   * `variant`                  one of short|standard|full (CHECK)
 //   * `generated_at`             unix epoch milliseconds
-//   * `generated_by_user_id`     TEXT user id (matches `org_memberships.user_id`)
-//   * `content_hash`             blake3 hex of the PDF bytes
+//   * `generated_by_user_id`     composite FK to org_memberships(org_id,user_id),
+//                                ON DELETE RESTRICT — losing a membership must
+//                                not erase the audit trail of generated documents
+//   * `content_hash`             blake3 hex of the PDF bytes (64 lowercase hex, CHECK)
 //   * `pdf_path`                 absolute path on disk
 //   * `signed_url_ref`           HMAC ref published to the recording_url tier
 //                                (NULL until the URL is minted)
@@ -243,15 +247,19 @@ fn create_legal_documents_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS legal_documents (
-            id TEXT PRIMARY KEY,
-            org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+            id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(id) = 36 AND id LIKE '________-____-____-____-____________'),
+            org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE RESTRICT,
             variant TEXT NOT NULL CHECK (variant IN ('short','standard','full')),
             generated_at INTEGER NOT NULL,
             generated_by_user_id TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
+            content_hash TEXT NOT NULL
+                CHECK (length(content_hash) = 64 AND content_hash GLOB '[0-9a-f]*'),
             pdf_path TEXT NOT NULL,
             signed_url_ref TEXT NULL,
-            revoked_at INTEGER NULL
+            revoked_at INTEGER NULL,
+            FOREIGN KEY (org_id, generated_by_user_id)
+                REFERENCES org_memberships(org_id, user_id) ON DELETE RESTRICT
         );
         CREATE INDEX IF NOT EXISTS idx_legal_documents_org_id_generated_at
             ON legal_documents(org_id, generated_at DESC);
