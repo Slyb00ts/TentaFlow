@@ -689,11 +689,15 @@ function openAddCameraDialog(idx) {
   };
 
   // Clear the pending guard on any close path (Cancel, Esc, X, post-Save
-   // re-render). tf-window emits `close` once when the dialog disappears.
+  // dispose). tf-window emits `close-request` (not `close`) when the user
+  // dismisses it. re-render is needed so the row button re-enables when
+  // the user backs out of the dialog without saving.
   const clearPending = () => {
-    state.cameras.pending.delete(key);
+    if (state.cameras.pending.delete(key)) {
+      renderStep();
+    }
   };
-  dlg.addEventListener('close', clearPending);
+  dlg.addEventListener('close-request', clearPending);
 
   footer.querySelector('[data-role="dialog-cancel"]')?.addEventListener('click', () => {
     dlg.close(true);
@@ -737,6 +741,11 @@ function openAddCameraDialog(idx) {
       const cameraId = resp?.cameraId ?? resp?.camera_id ?? null;
       const rtspUrl = resp?.rtspUrl ?? resp?.rtsp_url ?? '';
       state.cameras.added.set(key, { cameraId, rtspUrl });
+      // Clear the pending guard explicitly — programmatic close(true) may not
+      // dispatch close-request. After this, re-render shows the "Added" chip
+      // and the Add button is gone, so pending leak would be invisible to the
+      // user, but keep state tidy.
+      state.cameras.pending.delete(key);
       toast(I18n.t('install_wizard.cameras_add_success'), 'success');
       dlg.close(true);
       renderStep();
