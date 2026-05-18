@@ -2569,6 +2569,53 @@ export const encode = {
     );
   },
 
+  // ---- Legal documents (RODO/GDPR admin, F2-P8.d M10) -------------------
+
+  /**
+   * MessageBody::LegalAdminBody(ListRequest) — admin list of generated RODO
+   * documents. `includeRevoked=false` hides soft-deleted rows.
+   */
+  legalDocumentsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeLegalDocumentsListRequest(Boolean(payload.includeRevoked));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::LegalAdminBody(GenerateRequest) — render and persist a new
+   * RODO PDF. `variant` must be one of `short` | `standard` | `full`.
+   */
+  legalDocumentGenerateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeLegalDocumentGenerateRequest(String(payload.variant ?? 'standard'));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::LegalAdminBody(RevokeRequest) — soft-delete a legal document
+   * by its UUID.
+   */
+  legalDocumentRevokeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeLegalDocumentRevokeRequest(String(payload.docId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 };
 
 // =============================================================================
