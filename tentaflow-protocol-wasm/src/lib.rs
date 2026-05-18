@@ -4897,6 +4897,71 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "profile_token", resp.profile_token.into());
             }
         },
+        MessageBody::LegalAdminBody(payload) => match payload {
+            tentaflow_protocol::LegalAdminPayload::ListRequest(_) => {
+                // Request variants never legitimately arrive in a response
+                // path. Surface variant tag only — defense-in-depth mirror of
+                // CameraAdminPayload request-in-response handling.
+                set(&obj, "variant", "LegalDocumentsListRequest".into());
+                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+            }
+            tentaflow_protocol::LegalAdminPayload::ListResponse(resp) => {
+                set(&obj, "variant", "list_response".into());
+                let arr = js_sys::Array::new();
+                for doc in resp.documents {
+                    let item = js_sys::Object::new();
+                    set(&item, "doc_id", doc.doc_id.clone().into());
+                    set(&item, "docId", doc.doc_id.into());
+                    set(&item, "org_id", doc.org_id.clone().into());
+                    set(&item, "orgId", doc.org_id.into());
+                    set(&item, "variant", doc.variant.into());
+                    // `generated_at` on the wire is unix-ms — expose under the
+                    // dashboard's preferred `generated_at_ms` key plus camelCase.
+                    set(&item, "generated_at_ms", (doc.generated_at as f64).into());
+                    set(&item, "generatedAtMs", (doc.generated_at as f64).into());
+                    set(
+                        &item,
+                        "generated_by_user_id",
+                        doc.generated_by_user_id.clone().into(),
+                    );
+                    set(
+                        &item,
+                        "generatedByUserId",
+                        doc.generated_by_user_id.into(),
+                    );
+                    set(&item, "content_hash", doc.content_hash.clone().into());
+                    set(&item, "contentHash", doc.content_hash.into());
+                    set(&item, "revoked_at_ms", (doc.revoked_at_ms as f64).into());
+                    set(&item, "revokedAtMs", (doc.revoked_at_ms as f64).into());
+                    arr.push(&item.into());
+                }
+                set(&obj, "documents", arr.into());
+            }
+            tentaflow_protocol::LegalAdminPayload::GenerateRequest(_) => {
+                set(&obj, "variant", "LegalDocumentGenerateRequest".into());
+                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+            }
+            tentaflow_protocol::LegalAdminPayload::GenerateResponse(resp) => {
+                set(&obj, "variant", "generate_response".into());
+                set(&obj, "doc_id", resp.doc_id.clone().into());
+                set(&obj, "docId", resp.doc_id.into());
+                set(&obj, "content_hash", resp.content_hash.clone().into());
+                set(&obj, "contentHash", resp.content_hash.into());
+                set(&obj, "signed_url", resp.signed_url.clone().into());
+                set(&obj, "signedUrl", resp.signed_url.into());
+            }
+            tentaflow_protocol::LegalAdminPayload::RevokeRequest(_) => {
+                set(&obj, "variant", "LegalDocumentRevokeRequest".into());
+                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+            }
+            tentaflow_protocol::LegalAdminPayload::RevokeResponse(resp) => {
+                set(&obj, "variant", "revoke_response".into());
+                set(&obj, "doc_id", resp.doc_id.clone().into());
+                set(&obj, "docId", resp.doc_id.into());
+                set(&obj, "revoked_at_ms", (resp.revoked_at_ms as f64).into());
+                set(&obj, "revokedAtMs", (resp.revoked_at_ms as f64).into());
+            }
+        },
     }
     Ok(obj.into())
 }
@@ -7758,6 +7823,49 @@ pub fn encode_camera_add_onvif_request(
                 profile_token,
                 target_fps,
             },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
+// Legal admin (F2 P8.d-bis) — RODO/GDPR document RPCs packed into
+// `MessageBody::LegalAdminBody(LegalAdminPayload)`.
+// =============================================================================
+
+/// MessageBody::LegalAdminBody(ListRequest) — fetch the legal documents
+/// catalogue. `include_revoked = false` matches the default dashboard view.
+#[wasm_bindgen(js_name = encodeLegalDocumentsListRequest)]
+pub fn encode_legal_documents_list_request(include_revoked: bool) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::LegalAdminBody(
+        tentaflow_protocol::LegalAdminPayload::ListRequest(
+            tentaflow_protocol::LegalDocumentsListRequest { include_revoked },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::LegalAdminBody(GenerateRequest) — render and persist a new
+/// RODO/GDPR PDF. `variant` must be one of `short` | `standard` | `full`
+/// (server-side validation via `RodoVariant::from_str`).
+#[wasm_bindgen(js_name = encodeLegalDocumentGenerateRequest)]
+pub fn encode_legal_document_generate_request(variant: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::LegalAdminBody(
+        tentaflow_protocol::LegalAdminPayload::GenerateRequest(
+            tentaflow_protocol::LegalDocumentGenerateRequest { variant },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::LegalAdminBody(RevokeRequest) — soft-delete a previously
+/// generated legal document. The PDF stays on disk; the row gets a
+/// `revoked_at` stamp and is excluded from default list views.
+#[wasm_bindgen(js_name = encodeLegalDocumentRevokeRequest)]
+pub fn encode_legal_document_revoke_request(doc_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::LegalAdminBody(
+        tentaflow_protocol::LegalAdminPayload::RevokeRequest(
+            tentaflow_protocol::LegalDocumentRevokeRequest { doc_id },
         ),
     ))
     .map_err(|e| JsError::new(&e))
