@@ -200,3 +200,56 @@
   font-size: 12px;
   border-radius: 4px;
 }
+
+/* ---- Live camera tile (tf-live-camera-tile custom element) ---- */
+.tf-live-camera-tile {
+  display: block;
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--surface-3, #1c1f24);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.tf-live-camera-tile .tf-live-camera-label {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.tf-live-camera-tile .tf-live-camera-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.tf-live-camera-tile .tf-live-camera-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3, #9aa0a6);
+  font-size: 13px;
+  font-style: italic;
+  text-align: center;
+  padding: 12px;
+}
+
+/* ---- Addon-app nav item w sidebarze ---- */
+.sidebar .nav-item.addon-app-nav-item.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

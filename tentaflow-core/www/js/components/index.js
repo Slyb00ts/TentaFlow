@@ -21,6 +21,7 @@ import './tf-window.js';
 import './tf-segmented.js';
 import './tf-screen.js';
 import './tf-addon-ui-frame/tf-addon-ui-frame.js';
+import './tf-live-camera-tile.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
@@ -37,3 +38,4 @@ export { TfWindow, openTfWindow, tfConfirm } from './tf-window.js';
 export { TfSegmented } from './tf-segmented.js';
 export { TfScreen } from './tf-screen.js';
 export { TfAddonUiFrame } from './tf-addon-ui-frame/tf-addon-ui-frame.js';
+export { TfLiveCameraTile } from './tf-live-camera-tile.js';
