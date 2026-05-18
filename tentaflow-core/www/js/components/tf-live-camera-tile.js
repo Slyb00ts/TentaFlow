@@ -43,6 +43,10 @@ class TfLiveCameraTile extends HTMLElement {
   }
 
   connectedCallback() {
+    // Reset disposed flag — element moze byc detached+reattached (np. przy
+    // przelaczaniu tabow, layout reuse). Bez tego _scheduleRefresh() nigdy
+    // nie ruszy po powrocie do DOM.
+    this._disposed = false;
     if (!this._img) this._build();
     this._update();
     this._scheduleRefresh(0);
