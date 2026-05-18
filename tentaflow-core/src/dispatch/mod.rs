@@ -294,9 +294,19 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
         return true;
     }
     // CameraAdminBody:AddOnvifRequest carries plaintext ONVIF user+password.
-    matches!(
+    if matches!(
         body,
         MessageBody::CameraAdminBody(tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_))
+    ) {
+        return true;
+    }
+    // LegalAdminBody:GenerateResponse carries a fully-formed signed download
+    // URL whose query string includes a live HMAC token. With
+    // `TENTAFLOW_TRACE_WSS=1` an attacker reading trace logs could lift the
+    // token wire and replay the download within the 1 h TTL.
+    matches!(
+        body,
+        MessageBody::LegalAdminBody(tentaflow_protocol::LegalAdminPayload::GenerateResponse(_))
     )
 }
 

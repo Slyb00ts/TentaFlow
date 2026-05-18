@@ -333,12 +333,48 @@ pub async fn read_legal_file(
 }
 
 async fn read_legal_file_inner(file_path: &str) -> LegalFileOutcome {
+    // Reject symlinks BEFORE we open anything. `symlink_metadata` does not
+    // follow the final component, so a symlink at the leaf is caught here.
     match tokio::fs::symlink_metadata(file_path).await {
         Ok(m) if m.file_type().is_symlink() => return LegalFileOutcome::PathTraversal,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LegalFileOutcome::FileMissing,
         Err(_) => return LegalFileOutcome::IoError,
         Ok(_) => {}
     }
+
+    // Open the file FIRST and hold the descriptor for the rest of the routine.
+    // Reads below come from this held fd, not from a fresh `read(path)` — so
+    // an attacker who swaps the path for a symlink after our containment check
+    // would mutate a different inode than the one we are about to serve.
+    // `OpenOptions::open` with default flags follows symlinks, but the prior
+    // `symlink_metadata` rejected that case; any swap that lands between these
+    // two syscalls would still have to win the race AND survive `metadata()`
+    // on the held fd returning a non-regular file type below.
+    let file = match tokio::fs::File::open(file_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LegalFileOutcome::FileMissing,
+        Err(_) => return LegalFileOutcome::IoError,
+    };
+
+    // fd-anchored metadata: the kind/size we use comes from the inode the open
+    // file descriptor points at, not from a re-resolved path. A regular file
+    // is required — a swap to a directory, FIFO, or device is rejected.
+    let fd_meta = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return LegalFileOutcome::IoError,
+    };
+    if !fd_meta.is_file() {
+        return LegalFileOutcome::PathTraversal;
+    }
+    let len = fd_meta.len();
+    if len > MAX_LEGAL_RESPONSE_BYTES {
+        return LegalFileOutcome::FileTooLarge;
+    }
+
+    // Containment check via the canonical path. Run AFTER we already have the
+    // fd so the bytes we will return come from the inode validated above; a
+    // racing symlink swap between this canonicalize and the upcoming read
+    // cannot redirect us because `read_to_end` operates on `file` (held fd).
     let canonical = match tokio::fs::canonicalize(file_path).await {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LegalFileOutcome::FileMissing,
@@ -347,21 +383,12 @@ async fn read_legal_file_inner(file_path: &str) -> LegalFileOutcome {
     if !path_within_legal_root(&canonical).await {
         return LegalFileOutcome::PathTraversal;
     }
-    match tokio::fs::metadata(&canonical).await {
-        Ok(m) => {
-            let len = m.len();
-            if len > MAX_LEGAL_RESPONSE_BYTES {
-                LegalFileOutcome::FileTooLarge
-            } else {
-                match tokio::fs::read(&canonical).await {
-                    Ok(b) => LegalFileOutcome::Ok { bytes: b },
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        LegalFileOutcome::FileMissing
-                    }
-                    Err(_) => LegalFileOutcome::IoError,
-                }
-            }
-        }
+
+    use tokio::io::AsyncReadExt;
+    let mut file = file;
+    let mut bytes = Vec::with_capacity(len as usize);
+    match file.read_to_end(&mut bytes).await {
+        Ok(_) => LegalFileOutcome::Ok { bytes },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => LegalFileOutcome::FileMissing,
         Err(_) => LegalFileOutcome::IoError,
     }
