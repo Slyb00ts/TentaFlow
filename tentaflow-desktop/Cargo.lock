@@ -3761,6 +3761,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -4573,7 +4575,7 @@ dependencies = [
  "iroh-base",
  "iroh-dns",
  "iroh-metrics",
- "lru",
+ "lru 0.16.4",
  "n0-error",
  "n0-future",
  "noq",
@@ -5143,6 +5145,15 @@ dependencies = [
 
 [[package]]
 name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "lru"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
@@ -5193,7 +5204,7 @@ dependencies = [
  "flume",
  "futures-lite",
  "getrandom 0.3.4",
- "lru",
+ "lru 0.16.4",
  "serde",
  "serde_bencode",
  "serde_bytes",
@@ -7337,6 +7348,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r2d2"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
+dependencies = [
+ "log",
+ "parking_lot",
+ "scheduled-thread-pool",
+]
+
+[[package]]
+name = "r2d2_sqlite"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9a289c0a3bf56505c470efa2366e76010f1d892e2492a2f96b223386d63b7e2"
+dependencies = [
+ "r2d2",
+ "rusqlite",
+ "uuid",
+]
+
+[[package]]
 name = "rancor"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8080,6 +8113,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "scheduled-thread-pool"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
@@ -8995,6 +9037,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64",
+ "blake3",
  "bollard",
  "chrono",
  "core-foundation 0.10.1",
@@ -9021,12 +9064,15 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "llama-cpp-2",
+ "lru 0.12.5",
  "multer",
  "netdev 0.43.0",
  "num_cpus",
  "parking_lot",
  "pin-project-lite",
  "plist",
+ "r2d2",
+ "r2d2_sqlite",
  "rand 0.10.1",
  "rand_core 0.10.1",
  "rand_core 0.6.4",
@@ -9038,8 +9084,10 @@ dependencies = [
  "rustc-hash 2.1.2",
  "rustls",
  "rustls-pemfile",
+ "semver",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "shlex",
  "smallvec",
@@ -10089,6 +10137,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "rand 0.10.1",
  "wasm-bindgen",
 ]
 
