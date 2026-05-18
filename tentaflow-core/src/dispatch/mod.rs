@@ -25,6 +25,8 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+#[cfg(feature = "camera")]
+pub mod camera_admin;
 pub mod handlers;
 pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
@@ -279,7 +281,7 @@ pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody,
 ///   - ApiKeyCreateResponse: plaintext "shown only once" token
 ///   - SettingsUpdateRequest: potencjalnie is_secret=true entries
 fn is_sensitive_variant(body: &MessageBody) -> bool {
-    matches!(
+    if matches!(
         body,
         MessageBody::AuthLoginRequestBody(_)
             | MessageBody::AuthLoginResponseBody(_)
@@ -287,6 +289,13 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
             | MessageBody::SettingsUpdateRequestBody(_)
             | MessageBody::AddonConfigSetRequestBody(_)
             | MessageBody::AddonInstallRequestBody(_)
+    ) {
+        return true;
+    }
+    // CameraAdminBody:AddOnvifRequest carries plaintext ONVIF user+password.
+    matches!(
+        body,
+        MessageBody::CameraAdminBody(tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_))
     )
 }
 
@@ -382,6 +391,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ProfilingPayload::CollectorsStatusResponse(_) => {
                 "ProfilingCollectorsStatusResponse"
             }
+        },
+        MessageBody::CameraAdminBody(p) => match p {
+            tentaflow_protocol::CameraAdminPayload::DiscoverRequest(_) => "CameraDiscoverRequest",
+            tentaflow_protocol::CameraAdminPayload::DiscoverResponse(_) => "CameraDiscoverResponse",
+            tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_) => "CameraAddOnvifRequest",
+            tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(_) => "CameraAddOnvifResponse",
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",

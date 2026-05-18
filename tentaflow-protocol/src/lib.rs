@@ -20,6 +20,7 @@
 //
 // ============================================================================
 
+pub mod camera;
 pub mod envelope;
 pub mod mesh;
 pub mod message_body;
@@ -389,6 +390,10 @@ pub use message_body::{
     VNC_TUNNEL_OPEN_NO_PORT,
     VNC_TUNNEL_OPEN_OK,
     VNC_TUNNEL_OPEN_REMOTE_NODE,
+};
+pub use camera::{
+    CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDiscoverRequest,
+    CameraDiscoverResponse, DiscoveredCameraInfo,
 };
 pub use pii::PiiRulePayload;
 pub use profiling::{

@@ -3945,6 +3945,12 @@ pub enum MessageBody {
     // PiiRuleBody. Patrz ProfilingBody jako wzor inner-enum pack.
     VisionBody(crate::vision::VisionInferPayload),
 
+    // ---- Camera admin RPCs (F2 P7.a) ----
+    // 2 par request/response (Discover, AddOnvif) spakowane w jeden slot,
+    // analogicznie do ProfilingBody / VisionBody. Powod: rkyv 0.8 256-variant
+    // limit + dashboard wizard need (P7.b).
+    CameraAdminBody(crate::camera::CameraAdminPayload),
+
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
     Error(ProtocolError),
