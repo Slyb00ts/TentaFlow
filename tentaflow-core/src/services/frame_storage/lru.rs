@@ -148,6 +148,22 @@ impl FrameStorage {
         }
     }
 
+    /// Find the most recently inserted frame for a given `camera_id`. Used by
+    /// the dispatch-side `camera_frame_url_v1` handler so the browser tile can
+    /// mint a signed URL without knowing the opaque LRU `frame_<uuid>` ref.
+    /// Scans the LRU in MRU order and returns the first match; missing camera
+    /// (no frame yet, or the most recent one was evicted) yields `None`. Does
+    /// NOT bump LRU position — purely a lookup.
+    pub fn latest_for_camera(&self, camera_id: &str) -> Option<(RawFrameRef, StoredFrame)> {
+        let g = self.inner.lock();
+        for (key, frame) in g.iter() {
+            if frame.metadata.camera_id == camera_id {
+                return Some((key.clone(), frame.clone()));
+            }
+        }
+        None
+    }
+
     /// One-shot consume — Chunk C's PickupToken flow uses this to make a frame
     /// unavailable after the first fetch.
     pub fn remove(&self, frame_ref: &RawFrameRef) -> Option<StoredFrame> {

@@ -11188,6 +11188,28 @@ pub fn list_cameras_for_addon(
     Ok(rows)
 }
 
+/// Org-scoped existence check used by the user-session frame_url dispatch
+/// (`camera_frame_url_v1`). Returns `Ok(true)` when an active (not removed)
+/// camera row matches BOTH `camera_id` AND `org_id`. A cross-org camera is
+/// reported as missing — the dispatch handler maps `Ok(false)` to
+/// `NotFound` so existence in another tenant is not leaked through error
+/// codes.
+#[cfg(feature = "camera")]
+pub fn camera_exists_in_org(
+    pool: &DbPool,
+    camera_id: &str,
+    org_id: &str,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cameras \
+         WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL",
+        rusqlite::params![camera_id, org_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Returns the active row identified by `camera_id` if owned by `addon_id`
 /// in the supplied org. Cross-org or cross-addon lookups return `Ok(None)`
 /// so the caller surfaces `NotFound` rather than `PermissionDenied` —

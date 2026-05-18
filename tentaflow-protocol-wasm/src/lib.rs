@@ -4896,6 +4896,20 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "profileToken", resp.profile_token.clone().into());
                 set(&obj, "profile_token", resp.profile_token.into());
             }
+            tentaflow_protocol::CameraAdminPayload::FrameUrlRequest(_) => {
+                // Defense-in-depth: a stray request body must never echo the
+                // camera_id or ttl back to the JS layer. Surface the variant
+                // tag only — same pattern as AddOnvifRequest above.
+                set(&obj, "variant", "CameraFrameUrlRequest".into());
+                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+            }
+            tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(resp) => {
+                set(&obj, "variant", "CameraFrameUrlResponse".into());
+                set(&obj, "signedUrl", resp.signed_url.clone().into());
+                set(&obj, "signed_url", resp.signed_url.into());
+                set(&obj, "expiresAtMs", (resp.expires_at_ms as f64).into());
+                set(&obj, "expires_at_ms", (resp.expires_at_ms as f64).into());
+            }
         },
         MessageBody::LegalAdminBody(payload) => match payload {
             tentaflow_protocol::LegalAdminPayload::ListRequest(_) => {
@@ -7823,6 +7837,24 @@ pub fn encode_camera_add_onvif_request(
                 profile_token,
                 target_fps,
             },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CameraAdminBody(FrameUrlRequest) — live-preview tile URL
+/// for `<tf-live-camera-tile>`. The handler gates on `camera.read`,
+/// enforces UUID v4 camera_id validation, a per-user rate limit, and a
+/// 5..=300 s dispatch TTL band before minting against the global frame
+/// signed-URL issuer.
+#[wasm_bindgen(js_name = encodeCameraFrameUrlRequest)]
+pub fn encode_camera_frame_url_request(
+    camera_id: String,
+    ttl_secs: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CameraAdminBody(
+        tentaflow_protocol::CameraAdminPayload::FrameUrlRequest(
+            tentaflow_protocol::CameraFrameUrlRequest { camera_id, ttl_secs },
         ),
     ))
     .map_err(|e| JsError::new(&e))

@@ -408,6 +408,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::CameraAdminPayload::DiscoverResponse(_) => "CameraDiscoverResponse",
             tentaflow_protocol::CameraAdminPayload::AddOnvifRequest(_) => "CameraAddOnvifRequest",
             tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(_) => "CameraAddOnvifResponse",
+            tentaflow_protocol::CameraAdminPayload::FrameUrlRequest(_) => "CameraFrameUrlRequest",
+            tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(_) => "CameraFrameUrlResponse",
         },
         MessageBody::LegalAdminBody(p) => match p {
             tentaflow_protocol::LegalAdminPayload::ListRequest(_) => "LegalDocumentsListRequest",

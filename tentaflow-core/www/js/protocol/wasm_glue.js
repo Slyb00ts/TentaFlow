@@ -1131,6 +1131,28 @@ export function encodeCameraDiscoverRequest() {
 }
 
 /**
+ * MessageBody::CameraAdminBody(FrameUrlRequest) — live-preview tile URL
+ * for `<tf-live-camera-tile>`. The handler gates on `camera.read`,
+ * enforces UUID v4 camera_id validation, a per-user rate limit, and a
+ * 5..=300 s dispatch TTL band before minting against the global frame
+ * signed-URL issuer.
+ * @param {string} camera_id
+ * @param {number} ttl_secs
+ * @returns {Uint8Array}
+ */
+export function encodeCameraFrameUrlRequest(camera_id, ttl_secs) {
+    const ptr0 = passStringToWasm0(camera_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCameraFrameUrlRequest(ptr0, len0, ttl_secs);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @param {string | null | undefined} surface_filter
  * @param {boolean} include_blocking_diagnostics
  * @returns {Uint8Array}
