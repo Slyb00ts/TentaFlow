@@ -201,7 +201,39 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "gate_check_cache",
             MigrationStep::Sql(GATE_CHECK_CACHE),
         ),
+        (
+            35,
+            "cameras_metadata_supported",
+            MigrationStep::Rust(cameras_add_metadata_supported_column),
+        ),
     ]
+}
+
+// F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table
+// gains a boolean flag indicating whether the device exposes a metadata
+// configuration that produces analytics events. Filled by the wizard when
+// `GetMetadataConfigurations` returns a non-empty list; consumed by the
+// upcoming event-pull supervisor to decide whether to subscribe.
+fn cameras_add_metadata_supported_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(cameras)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "metadata_supported" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN metadata_supported INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 // F2 P3 — reserved persistence table for gate_check decisions. The F2
