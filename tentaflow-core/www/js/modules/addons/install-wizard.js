@@ -692,14 +692,23 @@ function openAddCameraDialog(idx) {
   // dispose). tf-window emits `close-request` (not `close`) when the user
   // dismisses it. re-render is needed so the row button re-enables when
   // the user backs out of the dialog without saving.
+  // Flips to true while a Save click is awaiting the response. Cancel and
+  // close-request must NOT clear the row's pending guard while a submit is
+  // in flight, otherwise the user could Save → Cancel → re-Add and stack
+  // two cameraAddOnvifRequest calls for the same camera.
+  let submitInFlight = false;
+
   const clearPending = () => {
+    if (submitInFlight) return;
     if (state.cameras.pending.delete(key)) {
       renderStep();
     }
   };
   dlg.addEventListener('close-request', clearPending);
 
-  footer.querySelector('[data-role="dialog-cancel"]')?.addEventListener('click', () => {
+  const cancelBtn = footer.querySelector('[data-role="dialog-cancel"]');
+  cancelBtn?.addEventListener('click', () => {
+    if (submitInFlight) return;
     // tf-window.close(true) skips the close-request event, so clear the
     // pending guard explicitly here too.
     state.cameras.pending.delete(key);
@@ -731,6 +740,8 @@ function openAddCameraDialog(idx) {
     showError('');
     const saveBtn = footer.querySelector('[data-role="dialog-save"]');
     saveBtn?.setAttribute('disabled', '');
+    cancelBtn?.setAttribute('disabled', '');
+    submitInFlight = true;
     try {
       const payload = {
         displayName,
@@ -757,6 +768,8 @@ function openAddCameraDialog(idx) {
       const friendly = mapCameraErrorCode(err?.code);
       showError(`${friendly}${err?.message ? ` — ${err.message}` : ''}`);
       saveBtn?.removeAttribute('disabled');
+      cancelBtn?.removeAttribute('disabled');
+      submitInFlight = false;
     }
   });
 
