@@ -695,7 +695,6 @@ async fn run_server(args: Args) -> Result<()> {
     // Stop every active camera session (drains the F1a CameraIngestSupervisor
     // singleton). GStreamer pipelines must terminate before the runtime
     // shuts down, otherwise EOS messages race the tokio worker teardown.
-    #[cfg(feature = "camera")]
     tentaflow_core::addon::host_functions::camera::shutdown_camera_supervisor_global().await;
 
     // Graceful shutdown mesh — zamyka QUIC endpoint (zwalnia port UDP) i wyrejestruje mDNS
