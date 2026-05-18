@@ -700,7 +700,11 @@ function openAddCameraDialog(idx) {
   dlg.addEventListener('close-request', clearPending);
 
   footer.querySelector('[data-role="dialog-cancel"]')?.addEventListener('click', () => {
+    // tf-window.close(true) skips the close-request event, so clear the
+    // pending guard explicitly here too.
+    state.cameras.pending.delete(key);
     dlg.close(true);
+    renderStep();
   });
 
   // Esc handling delegated to tf-window default behavior.
