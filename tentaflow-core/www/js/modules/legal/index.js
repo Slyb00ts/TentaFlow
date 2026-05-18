@@ -40,16 +40,19 @@ const VARIANT_DESCRIPTIONS = {
 function mapErrorMessage(err) {
   const code = err?.code;
   const reason = String(err?.reason ?? err?.message ?? '').trim();
-  if (code === 11 || /quota/i.test(reason)) return 'Przekroczono limit generacji dokumentow.';
-  if (code === 7 || /permission/i.test(reason)) return 'Brak uprawnien do tej operacji.';
-  if (code === 9 || /conflict/i.test(reason)) {
+  // Map only known protocol codes; unknown numeric codes pass through verbatim
+  // so the user sees what the server actually sent.
+  if (code === 11) return 'Przekroczono limit generacji dokumentow.';
+  if (code === 7) return 'Brak uprawnien do tej operacji.';
+  if (code === 9) {
     if (/already_revoked/i.test(reason)) return 'Dokument byl juz wczesniej uniewazniony.';
     return reason ? `Konflikt: ${reason}` : 'Konflikt stanu dokumentu.';
   }
-  if (code === 3 || /bad_request|invalid/i.test(reason)) {
+  if (code === 3) {
     return reason ? `Nieprawidlowe zadanie: ${reason}` : 'Nieprawidlowe zadanie.';
   }
-  if (reason) return code != null ? `${code}: ${reason}` : reason;
+  if (code != null) return reason ? `${code}: ${reason}` : `Blad serwera (kod ${code}).`;
+  if (reason) return reason;
   return 'Nieznany blad serwera.';
 }
 
