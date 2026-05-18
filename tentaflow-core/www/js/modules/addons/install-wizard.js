@@ -698,8 +698,15 @@ function openAddCameraDialog(idx) {
   // two cameraAddOnvifRequest calls for the same camera.
   let submitInFlight = false;
 
-  const clearPending = () => {
-    if (submitInFlight) return;
+  const clearPending = (event) => {
+    if (submitInFlight) {
+      // Header X / Esc still try to close the dialog by default. While a
+      // cameraAddOnvifRequest is in flight, prevent the dispose — otherwise
+      // the response handler writes error text into a removed DOM node and
+      // the row's pending guard is never cleared, leaving the row stuck.
+      event?.preventDefault?.();
+      return;
+    }
     if (state.cameras.pending.delete(key)) {
       renderStep();
     }
