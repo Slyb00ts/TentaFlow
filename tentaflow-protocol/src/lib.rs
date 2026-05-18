@@ -394,7 +394,7 @@ pub use message_body::{
 };
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDiscoverRequest,
-    CameraDiscoverResponse, DiscoveredCameraInfo,
+    CameraDiscoverResponse, CameraFrameUrlRequest, CameraFrameUrlResponse, DiscoveredCameraInfo,
 };
 pub use legal::{
     LegalAdminPayload, LegalDocumentGenerateRequest, LegalDocumentGenerateResponse,
