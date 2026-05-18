@@ -153,12 +153,13 @@ HMAC token wire in plain text via Hyper's request line.
 ### Default development command
 
 ```bash
-cargo build --features camera,dashboard-api
+cargo build --features dashboard-api
 ```
 
-This is the canonical surface for F1b feature work. `--features dashboard-api`
-alone compiles the HTTP/dashboard stack but skips camera ingest; add `camera`
-whenever touching `/frames`, `/recordings`, or the pickup tier.
+`camera` lives in `tentaflow-core`'s default features (GStreamer is mandatory
+for the video-surveillance pipeline), so it no longer needs an explicit flag.
+`dashboard-api` is still opt-in because some headless deployments skip the
+HTTP/dashboard stack.
 
 ### Production deploy checklist
 
