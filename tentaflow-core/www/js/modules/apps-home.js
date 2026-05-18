@@ -37,21 +37,48 @@ function renderTile(t) {
     </div>`;
 }
 
+// Whitelista ikon — patrz app.js. Trzymamy lokalny fallback bez importu zeby
+// nie tworzyc cyklu, ale zachowujemy spojnosc semantyki: nieznana ikona => 'apps'.
+function resolveIcon(raw) {
+  const t = String(raw ?? '').trim();
+  const id = t.startsWith('i-') ? t.slice(2) : t;
+  return id || 'apps';
+}
+
 // Dynamic tile dla zainstalowanego addonu z `[application]` w manifescie.
 // Click -> Router.navigate('addon-app', { addonId, panelId }).
 function renderAddonTile(app) {
-  const title = escapeHtml(app.title ?? app.addonId ?? '');
-  const desc = escapeHtml(app.addonId ?? '');
-  const iconRaw = (app.icon ?? '').toString();
-  const iconId = (iconRaw.startsWith('i-') ? iconRaw.slice(2) : iconRaw) || 'chip';
+  const addonId = app.addonId ?? app.addon_id ?? '';
+  const panelId = app.entryPanel ?? app.entry_panel ?? '';
+  const title = escapeHtml(app.title ?? addonId);
+  const desc = escapeHtml(app.description ?? addonId);
+  const iconId = resolveIcon(app.icon);
+  const enabled = app.enabled !== false;
+  const disabledBadge = enabled
+    ? ''
+    : `<span class="badge-soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
+  const cls = `app-tile addon-app-tile${enabled ? '' : ' coming-soon'}`;
   return `
-    <div class="app-tile addon-app-tile"
-         data-addon-id="${escapeHtml(app.addonId ?? '')}"
-         data-panel-id="${escapeHtml(app.entryPanel ?? '')}">
+    <div class="${cls}"
+         data-addon-id="${escapeHtml(addonId)}"
+         data-panel-id="${escapeHtml(panelId)}"
+         data-enabled="${enabled ? '1' : '0'}">
+      ${disabledBadge}
       <div class="app-icon">${sprite(iconId)}</div>
       <div class="app-name">${title}</div>
       <div class="app-desc">${desc}</div>
     </div>`;
+}
+
+function sortAddonApps(apps) {
+  return apps.slice().sort((a, b) => {
+    const sa = Number(a.sortOrder ?? a.sort_order ?? 0);
+    const sb = Number(b.sortOrder ?? b.sort_order ?? 0);
+    if (sa !== sb) return sa - sb;
+    const ta = String(a.title ?? a.addonId ?? a.addon_id ?? '').toLowerCase();
+    const tb = String(b.title ?? b.addonId ?? b.addon_id ?? '').toLowerCase();
+    return ta.localeCompare(tb);
+  });
 }
 
 const AppsHomeScreen = {
@@ -85,7 +112,7 @@ const AppsHomeScreen = {
         arrayKey: 'applications',
       });
       if (Array.isArray(apps) && apps.length > 0) {
-        const html = apps.map(renderAddonTile).join('');
+        const html = sortAddonApps(apps).map(renderAddonTile).join('');
         grid.insertAdjacentHTML('beforeend', html);
       }
     } catch (e) {
@@ -96,6 +123,7 @@ const AppsHomeScreen = {
       el.addEventListener('click', () => {
         // Addon app tile — drill-down do renderera UI v2.
         if (el.classList.contains('addon-app-tile')) {
+          if (el.dataset.enabled === '0') return;
           const addonId = el.dataset.addonId;
           const panelId = el.dataset.panelId;
           if (addonId && panelId) {

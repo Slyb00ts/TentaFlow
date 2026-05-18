@@ -123,6 +123,7 @@ function renderComponent(c, ctx) {
     case 'progress': return renderProgress(c);
     case 'code':     return renderCode(c);
     case 'badge':    return renderBadge(c);
+    case 'live_camera_tile': return renderLiveCameraTile(c, ctx);
     default:         return renderUnknown(c.type);
   }
 }
@@ -452,6 +453,24 @@ function renderCode(c) {
   code.textContent = c.content ?? '';
   pre.appendChild(code);
   return pre;
+}
+
+function renderLiveCameraTile(c, ctx) {
+  // Wlasciwy timer + signed-URL refresh trzyma custom element
+  // <tf-live-camera-tile> — tutaj tylko mapujemy pola JSON na atrybuty.
+  const el = document.createElement('tf-live-camera-tile');
+  const cameraId = String(c.camera_id ?? c.cameraId ?? '');
+  if (cameraId) el.setAttribute('camera-id', cameraId);
+  const ttl = Number(c.ttl_secs ?? c.ttlSecs);
+  if (Number.isFinite(ttl) && ttl > 0) el.setAttribute('ttl-secs', String(ttl));
+  const label = c.label;
+  if (typeof label === 'string' && label.length > 0) el.setAttribute('label', label);
+  const heightPx = Number(c.height_px ?? c.heightPx);
+  if (Number.isFinite(heightPx) && heightPx > 0) el.setAttribute('height-px', String(heightPx));
+  // Kontekst panelu — niezbedny dla addonUiActionRequest wewnatrz CE.
+  if (ctx?.addonId) el.setAttribute('addon-id', ctx.addonId);
+  if (ctx?.panelId) el.setAttribute('panel-id', ctx.panelId);
+  return el;
 }
 
 function renderUnknown(typeName) {
