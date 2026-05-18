@@ -81,10 +81,14 @@ pub async fn create_pull_point_subscription(
     timeout_ms: u32,
 ) -> Result<PullPointSubscription, OnvifError> {
     let secs = initial_termination_secs.clamp(60, 3600);
+    // CreatePullPointSubscription is an ONVIF events action (`tev`), not a
+    // WS-Notification action (`wsnt`). Real cameras reject the wsnt-namespaced
+    // body with a wsa:DestinationUnreachable / soap:Sender fault; we emit the
+    // tev-namespaced action so it actually negotiates a subscription.
     let body = format!(
-        r#"<wsnt:CreatePullPointSubscription xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+        r#"<tev:CreatePullPointSubscription xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
   <wsnt:InitialTerminationTime>PT{secs}S</wsnt:InitialTerminationTime>
-</wsnt:CreatePullPointSubscription>"#,
+</tev:CreatePullPointSubscription>"#,
         secs = secs,
     );
     let envelope = build_envelope_pub(creds, &body);
@@ -136,6 +140,13 @@ pub async fn pull_messages(
 /// SOAP fault here is non-fatal — the device will drop the subscription
 /// at `TerminationTime` either way. The function returns the underlying
 /// error so the caller can log it; callers do not need to retry.
+///
+/// Idempotent: a second unsubscribe (or one against an already-expired
+/// subscription) returns Ok(()) instead of propagating SoapFault.
+/// Real cameras commonly fault on stale subscription_uri with
+/// `wsnt:ResourceUnknownFault` or generic auth/soap faults — treating
+/// these as success keeps `Drop` cleanup paths quiet. Transport errors
+/// still surface so callers can log connectivity issues.
 pub async fn unsubscribe_pull_point(
     subscription_uri: &str,
     creds: &OnvifCredentials,
@@ -144,14 +155,11 @@ pub async fn unsubscribe_pull_point(
     let body =
         r#"<wsnt:Unsubscribe xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"/>"#;
     let envelope = build_envelope_pub(creds, body);
-    let _resp = send_soap_pub(
-        subscription_uri,
-        ACTION_UNSUBSCRIBE,
-        envelope,
-        timeout_ms,
-    )
-    .await?;
-    Ok(())
+    match send_soap_pub(subscription_uri, ACTION_UNSUBSCRIBE, envelope, timeout_ms).await {
+        Ok(_) => Ok(()),
+        Err(OnvifError::SoapFault(_)) | Err(OnvifError::AuthFailed) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // Suppress dead-code warnings on `xml_escape_pub` import — it is re-exported
