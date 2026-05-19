@@ -150,13 +150,17 @@ pub fn build_rtsp_pipeline(
 ) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
 
-    // GstRTSPLowerTrans bitmask: 0x1=udp, 0x2=udp-mcast, 0x4=tcp, 0x8=http,
-    // 0x10=tls. Default rtspsrc value is 0x7 (udp+udp-mcast+tcp) which
-    // EXCLUDES TLS — rtsps:// URLs would silently fail to connect. We pick:
-    //   - rtsp://  -> 0x7 (default behavior, UDP preferred, TCP fallback)
-    //   - rtsps:// -> 0x14 (tcp+tls, TLS over TCP; udp-over-tls is rare)
+    // `protocols` is GstRTSPLowerTrans (GFlags) — can't be set as raw u32.
+    // We pass through stringified flags which gst-rs parses via GFlags::from_str:
+    //   - rtsp://  -> "udp+udp-mcast+tcp" (default behavior, UDP preferred)
+    //   - rtsps:// -> "tcp+tls" (TLS over TCP; udp-over-tls is rare)
+    // Without `tls` in the mask, rtspsrc would silently fail on rtsps:// URLs.
     let is_tls = url.starts_with("rtsps://");
-    let protocols_mask: u32 = if is_tls { 0x14 } else { 0x7 };
+    let protocols_str = if is_tls {
+        "tcp+tls"
+    } else {
+        "udp+udp-mcast+tcp"
+    };
 
     let rtspsrc = gst::ElementFactory::make("rtspsrc")
         .property("location", url)
@@ -165,19 +169,20 @@ pub fn build_rtsp_pipeline(
         .property("timeout", (timeout_secs as u64).saturating_mul(1_000_000))
         // Disable rtspsrc's internal retry — we manage reconnect at session level.
         .property("retry", 0u32)
-        .property("protocols", protocols_mask)
+        .property_from_str("protocols", protocols_str)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("rtspsrc: {e}")))?;
 
     // Self-signed certs are common in surveillance NVRs (UniFi Protect,
-    // Hikvision, Dahua). GIO TlsCertificateFlags::empty() (0) disables all
-    // validation — operator-installed cameras live on trusted LAN segments
-    // and `[[network_rule]]` ACL (when wired) gates which hosts can be
-    // reached anyway. Documented trade-off: an attacker on-path between
-    // tentaflow and the NVR could MITM the RTSPS session. Acceptable for
-    // typical surveillance deployments where the camera link is L2.
+    // Hikvision, Dahua). `tls-validation-flags` is GTlsCertificateFlags
+    // (GFlags); empty string parses to 0 = no validation. Operator-installed
+    // cameras live on trusted LAN segments and `[[network_rule]]` ACL (when
+    // wired) gates which hosts can be reached anyway. Documented trade-off:
+    // an on-path attacker between tentaflow and the NVR could MITM the
+    // RTSPS session. Acceptable for typical surveillance deployments where
+    // the camera link is L2.
     if is_tls {
-        rtspsrc.set_property("tls-validation-flags", 0u32);
+        rtspsrc.set_property_from_str("tls-validation-flags", "");
     }
 
     let depay = gst::ElementFactory::make("rtph264depay")
