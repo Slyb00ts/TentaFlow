@@ -20,6 +20,7 @@
     "prompts": "Indicaciones",
     "models": "Modelos",
     "flows": "Constructor de flujos",
+    "scheduler": "Programador",
     "playground": "Sandbox",
     "chat": "Chat",
     "rules": "Reglas",

@@ -136,10 +136,8 @@ mod tests {
 
     fn input(from_node_id: &str, payload: FlowValue) -> NodeInput {
         let mut env = FlowEnvelope::with_payload(payload);
-        env.meta.insert(
-            "session_id".into(),
-            serde_json::json!("test-session-42"),
-        );
+        env.meta
+            .insert("session_id".into(), serde_json::json!("test-session-42"));
         NodeInput {
             from_node_id: from_node_id.into(),
             from_port: "full".into(),

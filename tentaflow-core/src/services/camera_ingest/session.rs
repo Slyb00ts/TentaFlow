@@ -215,7 +215,14 @@ async fn run_session(
     counters: Arc<FrameCounters>,
 ) {
     let cam_id = config.camera_id.clone();
-    publish(&health_tx, &cam_id, CameraStatus::Starting, None, &counters, None);
+    publish(
+        &health_tx,
+        &cam_id,
+        CameraStatus::Starting,
+        None,
+        &counters,
+        None,
+    );
 
     let pipeline = match build_pipeline(&path, cam_id.clone(), mailbox.clone(), counters.clone()) {
         Ok(p) => p,
@@ -229,7 +236,9 @@ async fn run_session(
                 &counters,
                 None,
             );
-            crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
+            crate::services::streaming_bus()
+                .close_camera(&cam_id, &reason)
+                .await;
             // Drain commands until Stop so the supervisor's join completes
             // cleanly even on early failure.
             drain_until_stop(&mut cmd_rx, &health_tx).await;
@@ -248,7 +257,9 @@ async fn run_session(
             None,
         );
         let _ = pipeline.pipeline.set_state(gst::State::Null);
-        crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
+        crate::services::streaming_bus()
+            .close_camera(&cam_id, &reason)
+            .await;
         drain_until_stop(&mut cmd_rx, &health_tx).await;
         return;
     }
@@ -257,7 +268,8 @@ async fn run_session(
 
     // FPS moving-average state. Sampled every second from the counters.
     let mut last_total: u64 = 0;
-    let mut fps_window: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(30);
+    let mut fps_window: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(30);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -568,8 +580,8 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_subdir, &link_dir).unwrap();
         let path_via_link = link_dir.join("file.mp4");
-        let err = super::super::fakefile::resolve_file_url(path_via_link.to_str().unwrap())
-            .unwrap_err();
+        let err =
+            super::super::fakefile::resolve_file_url(path_via_link.to_str().unwrap()).unwrap_err();
         assert!(
             matches!(err, CameraIngestError::SymlinkNotAllowed(_)),
             "expected SymlinkNotAllowed, got: {err:?}"

@@ -47,7 +47,8 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // Sprawdzenie kompatybilnosci SDK addona z rdzeniem (F1a §6.2.Y).
     // None → kompatybilny (addon nie deklaruje wymagan); Some(req) → musi
     // matchowac CORE_SDK_VERSION.
-    if let Err(e) = crate::addon::sdk_version::check_compatibility(manifest.sdk_version.as_deref()) {
+    if let Err(e) = crate::addon::sdk_version::check_compatibility(manifest.sdk_version.as_deref())
+    {
         bail!("Addon '{}': {}", manifest.addon_id, e);
     }
 
@@ -58,39 +59,41 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // implies every ui_component must verify.
     if let Some(publisher) = manifest.publisher.as_ref() {
         for component in &manifest.ui_components {
-            let bundle_path = match crate::util::path_safety::safe_resolve(addon_dir, &component.src) {
-                Ok(p) => p,
-                Err(e) => {
-                    let pk_short = crate::addon::signature::truncate_pk_for_audit(
-                        &publisher.ed25519_public_key,
-                    );
-                    let _ = crate::db::repository::log_audit(
-                        db,
-                        None,
-                        Some(&manifest.addon_id),
-                        "addon.ui_signature_verify",
-                        Some(component.id.as_str()),
-                        Some(&format!("denied: unsafe bundle path; publisher_pk={pk_short}")),
-                        None,
-                        None,
-                    );
-                    bail!(
-                        "ui_component '{}' src '{}' rejected: {}",
-                        component.id,
-                        component.src,
-                        e
-                    );
-                }
-            };
+            let bundle_path =
+                match crate::util::path_safety::safe_resolve(addon_dir, &component.src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let pk_short = crate::addon::signature::truncate_pk_for_audit(
+                            &publisher.ed25519_public_key,
+                        );
+                        let _ = crate::db::repository::log_audit(
+                            db,
+                            None,
+                            Some(&manifest.addon_id),
+                            "addon.ui_signature_verify",
+                            Some(component.id.as_str()),
+                            Some(&format!(
+                                "denied: unsafe bundle path; publisher_pk={pk_short}"
+                            )),
+                            None,
+                            None,
+                        );
+                        bail!(
+                            "ui_component '{}' src '{}' rejected: {}",
+                            component.id,
+                            component.src,
+                            e
+                        );
+                    }
+                };
             if let Err(e) = crate::addon::signature::verify_ui_component_bundle(
                 &bundle_path,
                 &publisher.ed25519_public_key,
                 &component.signature,
                 db,
             ) {
-                let pk_short = crate::addon::signature::truncate_pk_for_audit(
-                    &publisher.ed25519_public_key,
-                );
+                let pk_short =
+                    crate::addon::signature::truncate_pk_for_audit(&publisher.ed25519_public_key);
                 let _ = crate::db::repository::log_audit(
                     db,
                     None,
@@ -107,9 +110,8 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
                     e
                 );
             }
-            let pk_short = crate::addon::signature::truncate_pk_for_audit(
-                &publisher.ed25519_public_key,
-            );
+            let pk_short =
+                crate::addon::signature::truncate_pk_for_audit(&publisher.ed25519_public_key);
             let _ = crate::db::repository::log_audit(
                 db,
                 None,
@@ -252,8 +254,8 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
         .ok();
     }
 
-    // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains)
-    // Reguly required=true sa domyslnie approved (addon jawnie ich potrzebuje)
+    // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains).
+    // Deklaracja nie jest zgoda admina; kazda nowa regula startuje jako blocked.
     for rule in &manifest.network_rules {
         conn.execute(
             "INSERT OR IGNORE INTO addon_network_rules \
@@ -267,7 +269,7 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
                 rule.port,
                 rule.description.as_deref().unwrap_or(""),
                 rule.required as i32,
-                if rule.required { 1 } else { 0 }
+                0
             ],
         )
         .ok();
@@ -507,10 +509,7 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     // na dysku (user moze chciec backup) — czyszczenie tylko manualne.
     // F2 P1.b — uninstall is single-tenant in P1.b (org-default). Per-org
     // uninstall lands with the CLI in P1.c.
-    crate::addon::storage_sql::close_addon_db(
-        crate::services::org::DEFAULT_ORG_ID,
-        addon_id,
-    );
+    crate::addon::storage_sql::close_addon_db(crate::services::org::DEFAULT_ORG_ID, addon_id);
 
     // F1c P5 — drop any compiled flows this addon registered so a later
     // invoke against a stale id reports "not found" instead of executing a
@@ -609,10 +608,7 @@ pub fn migrate_addon_dirs_to_org_default(home: &std::path::Path) -> std::io::Res
         match std::fs::rename(&path, &dest) {
             Ok(_) => {
                 moved += 1;
-                tracing::info!(
-                    "migrate_addon_dirs: '{}' moved to per-org layout",
-                    name
-                );
+                tracing::info!("migrate_addon_dirs: '{}' moved to per-org layout", name);
             }
             Err(e) => {
                 // `rename` across filesystem boundaries fails with EXDEV on
@@ -789,8 +785,7 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     // not-found-then-found window). In-flight invocations holding an Arc to
     // the old CompiledFlow keep running against the old graph until they
     // finish.
-    crate::flow_runtime::registry::global()
-        .replace_addon_flows(addon_id, new_compiled_flows);
+    crate::flow_runtime::registry::global().replace_addon_flows(addon_id, new_compiled_flows);
 
     info!(
         "Addon '{}' zaktualizowany do v{}",
@@ -1243,10 +1238,8 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         })
         .unwrap_or_default();
 
-    let service = top
-        .get("service")
-        .and_then(|v| v.as_table())
-        .map(|svc| crate::addon::AddonServiceSection {
+    let service = top.get("service").and_then(|v| v.as_table()).map(|svc| {
+        crate::addon::AddonServiceSection {
             enabled: svc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
             tick_interval_ms: svc
                 .get("tick_interval_ms")
@@ -1260,7 +1253,8 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                 .get("tick_timeout_ms")
                 .and_then(|v| v.as_integer())
                 .map(|v| v as u64),
-        });
+        }
+    });
 
     let application = match top.get("application") {
         None => None,
@@ -1271,9 +1265,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
             let entry_panel = tbl
                 .get("entry_panel")
                 .and_then(|x| x.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("[application] missing entry_panel (string)")
-                })?
+                .ok_or_else(|| anyhow::anyhow!("[application] missing entry_panel (string)"))?
                 .to_string();
             let title = tbl
                 .get("title")
@@ -1579,10 +1571,7 @@ fn parse_aliases(val: Option<&toml::Value>) -> Result<Vec<crate::addon::manifest
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let gate = item
-            .get("gate")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let gate = item.get("gate").and_then(|v| v.as_str()).map(String::from);
         let visibility = match item.get("visibility").and_then(|v| v.as_str()) {
             Some(s) => crate::addon::manifest::AliasVisibility::parse(s)?,
             None => crate::addon::manifest::AliasVisibility::Private,
@@ -1622,13 +1611,20 @@ fn parse_uses_aliases(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("[[uses_alias]][{idx}] missing 'id'"))?
             .to_string();
-        let required = item.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+        let required = item
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let reason = item
             .get("reason")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        out.push(crate::addon::manifest::UsesAliasSpec { id, required, reason });
+        out.push(crate::addon::manifest::UsesAliasSpec {
+            id,
+            required,
+            reason,
+        });
     }
     Ok(out)
 }
@@ -1646,13 +1642,20 @@ fn parse_uses_models(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("[[uses_model]][{idx}] missing 'id'"))?
             .to_string();
-        let required = item.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+        let required = item
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let reason = item
             .get("reason")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        out.push(crate::addon::manifest::UsesModelSpec { id, required, reason });
+        out.push(crate::addon::manifest::UsesModelSpec {
+            id,
+            required,
+            reason,
+        });
     }
     Ok(out)
 }
@@ -1692,9 +1695,7 @@ fn parse_gates(val: Option<&toml::Value>) -> Result<Vec<crate::addon::manifest::
     Ok(out)
 }
 
-fn parse_claim_requirement(
-    val: &toml::Value,
-) -> Result<crate::addon::manifest::ClaimRequirement> {
+fn parse_claim_requirement(val: &toml::Value) -> Result<crate::addon::manifest::ClaimRequirement> {
     let claim_type = val
         .get("type")
         .and_then(|v| v.as_str())
@@ -1702,7 +1703,10 @@ fn parse_claim_requirement(
         .to_string();
     Ok(crate::addon::manifest::ClaimRequirement {
         claim_type,
-        subject: val.get("subject").and_then(|v| v.as_str()).map(String::from),
+        subject: val
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         scope: val.get("scope").and_then(|v| v.as_str()).map(String::from),
         status: val.get("status").and_then(|v| v.as_str()).map(String::from),
         value: val.get("value").and_then(|v| v.as_str()).map(String::from),
@@ -1736,9 +1740,8 @@ fn parse_vector_namespaces(
         let dimensions = item
             .get("dimensions")
             .and_then(|v| v.as_integer())
-            .ok_or_else(|| {
-                anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'dimensions'")
-            })? as u32;
+            .ok_or_else(|| anyhow::anyhow!("[[vector_namespace]][{idx}] missing 'dimensions'"))?
+            as u32;
         let distance = item
             .get("distance")
             .and_then(|v| v.as_str())
@@ -2305,7 +2308,8 @@ runtime = "wasmtime"
     fn pub_pk_b64() -> (ed25519_dalek::SigningKey, String) {
         use base64::Engine;
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        let pk_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
         (sk, pk_b64)
     }
 

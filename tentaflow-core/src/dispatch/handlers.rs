@@ -126,7 +126,7 @@ fn validate_flow_json_str(ctx: &HandlerContext, flow_json: &str) -> Result<(), P
         dispatcher.registry(),
         crate::flow_engine::validation::ValidationSource::UserDefined,
     )
-        .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
+    .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
 }
 
 // =============================================================================
@@ -193,7 +193,10 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
     // Per-username rate limit (10/min). Per-IP wymaga remote_addr w HandlerContext —
     // follow-up. Tutaj blokujemy brute-force na konkretnego usera.
     if !crate::auth::rate_limit::LOGIN_RATE_LIMITER.check_and_record(&payload.username, 10) {
-        tracing::warn!("Rate limit logowania (binary): username={}", payload.username);
+        tracing::warn!(
+            "Rate limit logowania (binary): username={}",
+            payload.username
+        );
         return Err(ProtocolError::new(
             ProtocolErrorCode::RateLimited,
             "too many login attempts, retry in a minute",
@@ -295,7 +298,8 @@ pub fn me_preferences_get(
     let user_id_bytes = require_user_id(ctx)?;
     let user_id = user_id_to_i64(&user_id_bytes)
         .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
-    let language = repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+    let language =
+        repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
     Ok(MessageBody::MePreferencesGetResponseBody(
         tentaflow_protocol::MePreferencesGetResponse { language },
     ))
@@ -310,21 +314,22 @@ pub fn me_preferences_update(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MePreferencesUpdateRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected MePreferencesUpdateRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MePreferencesUpdateRequest",
+            ))
+        }
     };
     let user_id_bytes = require_user_id(ctx)?;
     let user_id = user_id_to_i64(&user_id_bytes)
         .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
-    if repository::set_user_preferred_language(
-        &ctx.state.db,
-        user_id,
-        payload.language.as_deref(),
-    )
-    .is_err()
+    if repository::set_user_preferred_language(&ctx.state.db, user_id, payload.language.as_deref())
+        .is_err()
     {
         return Err(ProtocolError::bad_request("unsupported language code"));
     }
-    let language = repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+    let language =
+        repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
     Ok(MessageBody::MePreferencesUpdateResponseBody(
         tentaflow_protocol::MePreferencesUpdateResponse { language },
     ))
@@ -778,12 +783,8 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     // published flows before writing — guards/D.19 collision detection
     // only happens here, not at the SQL layer.
     if let Some(name) = payload.published_model_name.as_deref() {
-        crate::services::catalog::guards::check_flow_publish_collision(
-            &ctx.state.db,
-            name,
-            None,
-        )
-        .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
+        crate::services::catalog::guards::check_flow_publish_collision(&ctx.state.db, name, None)
+            .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
     }
 
     let params = db::models::FlowParams {
@@ -1012,27 +1013,26 @@ pub fn flow_node_templates_list(
     let mut templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
         .map(|t| {
-            let (input_ports, output_ports, input_port_types, output_port_types) =
-                match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
-                    Some(adapter) => {
-                        let in_specs = adapter.input_ports();
-                        let out_specs = adapter.output_ports();
-                        let in_ports: Vec<String> =
-                            in_specs.iter().map(|p| p.name.clone()).collect();
-                        let out_ports: Vec<String> =
-                            out_specs.iter().map(|p| p.name.clone()).collect();
-                        let in_types: Vec<String> = in_specs
-                            .iter()
-                            .map(|p| p.data_type.as_wire_str().to_string())
-                            .collect();
-                        let out_types: Vec<String> = out_specs
-                            .iter()
-                            .map(|p| p.data_type.as_wire_str().to_string())
-                            .collect();
-                        (in_ports, out_ports, in_types, out_types)
-                    }
-                    None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                };
+            let (input_ports, output_ports, input_port_types, output_port_types) = match dispatcher
+                .and_then(|d| d.registry().get(&t.node_type))
+            {
+                Some(adapter) => {
+                    let in_specs = adapter.input_ports();
+                    let out_specs = adapter.output_ports();
+                    let in_ports: Vec<String> = in_specs.iter().map(|p| p.name.clone()).collect();
+                    let out_ports: Vec<String> = out_specs.iter().map(|p| p.name.clone()).collect();
+                    let in_types: Vec<String> = in_specs
+                        .iter()
+                        .map(|p| p.data_type.as_wire_str().to_string())
+                        .collect();
+                    let out_types: Vec<String> = out_specs
+                        .iter()
+                        .map(|p| p.data_type.as_wire_str().to_string())
+                        .collect();
+                    (in_ports, out_ports, in_types, out_types)
+                }
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
             tentaflow_protocol::FlowNodeTemplate {
                 id: t.id,
                 node_type: t.node_type,
@@ -1056,10 +1056,8 @@ pub fn flow_node_templates_list(
     // żyją w tabeli flow_node_templates.
     if let Some(blocks) = dispatcher.and_then(|d| d.addon_flow_blocks()) {
         for b in blocks.list_all_blocks() {
-            let input_ports: Vec<String> =
-                b.inputs.iter().map(|p| p.name.clone()).collect();
-            let output_ports: Vec<String> =
-                b.outputs.iter().map(|p| p.name.clone()).collect();
+            let input_ports: Vec<String> = b.inputs.iter().map(|p| p.name.clone()).collect();
+            let output_ports: Vec<String> = b.outputs.iter().map(|p| p.name.clone()).collect();
             let input_port_types: Vec<String> =
                 b.inputs.iter().map(|p| p.port_type.clone()).collect();
             let output_port_types: Vec<String> =
@@ -3053,10 +3051,7 @@ fn db_alias_to_proto(a: crate::db::models::DbModelAlias) -> tentaflow_protocol::
 #[handler(variant = "CatalogListRequestBody", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn catalog_list(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn catalog_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let request = match req {
         MessageBody::CatalogListRequestBody(r) => r,
         // Defensive — the proc-macro only routes the right variant here, but
@@ -3329,8 +3324,7 @@ pub fn model_alias_delete(
         }
     };
 
-    let deleted =
-        crate::services::models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
+    let deleted = crate::services::models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
 
     if !deleted {
         return Err(ProtocolError::not_found(format!(
@@ -3370,10 +3364,9 @@ pub async fn nim_catalog_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let result =
-        crate::services::nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
-            .await
-            .map_err(|e| ProtocolError::internal(format!("nim catalog: {}", e)))?;
+    let result = crate::services::nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
+        .await
+        .map_err(|e| ProtocolError::internal(format!("nim catalog: {}", e)))?;
 
     let containers = result
         .containers
@@ -3615,16 +3608,11 @@ pub async fn service_manifest_deploy(
                         // Peers' `MeshServicesRegistry` pick the row up here
                         // instead of waiting for the 5-min anti-drift announce.
                         if let Some(qm) = quic_mesh_task {
-                            let payload =
-                                tentaflow_protocol::mesh::MeshServicesUpdatePayload {
-                                    from_node_id: local_node_id_task.clone(),
-                                    change: tentaflow_protocol::ServiceChange::Added(
-                                        info,
-                                    ),
-                                };
-                            if let Ok(bytes) =
-                                rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                            {
+                            let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                from_node_id: local_node_id_task.clone(),
+                                change: tentaflow_protocol::ServiceChange::Added(info),
+                            };
+                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                                 let _ = qm
                                     .broadcast_to_trusted(
                                         tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
@@ -3640,8 +3628,8 @@ pub async fn service_manifest_deploy(
                         // Supervisor reconcile would also do this on its
                         // next tick, but desktop has no supervisor and we
                         // don't want a 1-second window of staleness.
-                        if let Err(e) = catalog_provider_task
-                            .rebuild(&mesh_services_registry_task, &db_clone)
+                        if let Err(e) =
+                            catalog_provider_task.rebuild(&mesh_services_registry_task, &db_clone)
                         {
                             tracing::warn!(error = %e, "post-deploy catalog rebuild failed");
                         }
@@ -3747,9 +3735,7 @@ pub async fn deploy_vllm_recommend(
         return Err(ProtocolError::bad_request("model wymagany"));
     }
     if payload.gpus.is_empty() {
-        return Err(ProtocolError::bad_request(
-            "co najmniej jeden GPU wymagany",
-        ));
+        return Err(ProtocolError::bad_request("co najmniej jeden GPU wymagany"));
     }
 
     let client = reqwest::Client::builder()
@@ -3941,14 +3927,13 @@ pub async fn engine_recommend(
 
     let mut parameters: Vec<tentaflow_protocol::KeyValue> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    let push = |params: &mut Vec<tentaflow_protocol::KeyValue>,
-                key: &str,
-                value: serde_json::Value| {
-        params.push(tentaflow_protocol::KeyValue {
-            key: key.to_string(),
-            value_json: value.to_string(),
-        });
-    };
+    let push =
+        |params: &mut Vec<tentaflow_protocol::KeyValue>, key: &str, value: serde_json::Value| {
+            params.push(tentaflow_protocol::KeyValue {
+                key: key.to_string(),
+                value_json: value.to_string(),
+            });
+        };
 
     match engine_id {
         "vllm" | "vllm-metal" | "sglang" | "tensorrt-llm" => {
@@ -3979,9 +3964,8 @@ pub async fn engine_recommend(
                             "Nie udalo sie pobrac config.json z HF: {e}"
                         ))
                     })?;
-            let spec =
-                parse_hf_config_with_override(&config_json, &payload.model_repo, None)
-                    .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+            let spec = parse_hf_config_with_override(&config_json, &payload.model_repo, None)
+                .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
 
             let gpu_count = payload.gpus.len() as u32;
             let gpu_memory_gb = payload
@@ -4013,39 +3997,96 @@ pub async fn engine_recommend(
             // manifestu dorzucaja te klucze do env / API options przy deploy.
             match engine_id {
                 "vllm" | "vllm-metal" => {
-                    push(&mut parameters, "gpu_memory_utilization",
-                        serde_json::json!(cfg.gpu_memory_utilization));
-                    push(&mut parameters, "max_model_len", serde_json::json!(cfg.max_model_len));
-                    push(&mut parameters, "max_num_seqs", serde_json::json!(cfg.max_num_seqs));
-                    push(&mut parameters, "max_num_batched_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)));
-                    push(&mut parameters, "tensor_parallel_size",
-                        serde_json::json!(cfg.tensor_parallel));
-                    push(&mut parameters, "pipeline_parallel_size",
-                        serde_json::json!(cfg.pipeline_parallel));
-                    push(&mut parameters, "kv_cache_dtype",
-                        serde_json::json!(cfg.kv_cache_dtype));
+                    push(
+                        &mut parameters,
+                        "gpu_memory_utilization",
+                        serde_json::json!(cfg.gpu_memory_utilization),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_model_len",
+                        serde_json::json!(cfg.max_model_len),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_num_seqs",
+                        serde_json::json!(cfg.max_num_seqs),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_num_batched_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)),
+                    );
+                    push(
+                        &mut parameters,
+                        "tensor_parallel_size",
+                        serde_json::json!(cfg.tensor_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "pipeline_parallel_size",
+                        serde_json::json!(cfg.pipeline_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "kv_cache_dtype",
+                        serde_json::json!(cfg.kv_cache_dtype),
+                    );
                     push(&mut parameters, "dtype", serde_json::json!("auto"));
-                    push(&mut parameters, "enable_chunked_prefill", serde_json::json!(true));
+                    push(
+                        &mut parameters,
+                        "enable_chunked_prefill",
+                        serde_json::json!(true),
+                    );
                 }
                 "sglang" => {
-                    push(&mut parameters, "tp", serde_json::json!(cfg.tensor_parallel));
-                    push(&mut parameters, "mem_fraction",
-                        serde_json::json!(cfg.gpu_memory_utilization));
-                    push(&mut parameters, "max_total_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)));
-                    push(&mut parameters, "max_batch_size",
-                        serde_json::json!(cfg.max_num_seqs));
+                    push(
+                        &mut parameters,
+                        "tp",
+                        serde_json::json!(cfg.tensor_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "mem_fraction",
+                        serde_json::json!(cfg.gpu_memory_utilization),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_total_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_batch_size",
+                        serde_json::json!(cfg.max_num_seqs),
+                    );
                 }
                 "tensorrt-llm" => {
-                    push(&mut parameters, "tp", serde_json::json!(cfg.tensor_parallel));
-                    push(&mut parameters, "max_batch_size",
-                        serde_json::json!(cfg.max_num_seqs));
-                    push(&mut parameters, "max_seq_len", serde_json::json!(cfg.max_model_len));
-                    push(&mut parameters, "free_gpu_memory_fraction",
-                        serde_json::json!(cfg.gpu_memory_utilization));
-                    push(&mut parameters, "max_num_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)));
+                    push(
+                        &mut parameters,
+                        "tp",
+                        serde_json::json!(cfg.tensor_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_batch_size",
+                        serde_json::json!(cfg.max_num_seqs),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_seq_len",
+                        serde_json::json!(cfg.max_model_len),
+                    );
+                    push(
+                        &mut parameters,
+                        "free_gpu_memory_fraction",
+                        serde_json::json!(cfg.gpu_memory_utilization),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_num_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)),
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -4058,8 +4099,11 @@ pub async fn engine_recommend(
                 .unwrap_or(8);
             push(&mut parameters, "ctx_size", serde_json::json!(8192));
             push(&mut parameters, "n_gpu_layers", serde_json::json!(999));
-            push(&mut parameters, "threads",
-                serde_json::json!((cpus / 2).max(2)));
+            push(
+                &mut parameters,
+                "threads",
+                serde_json::json!((cpus / 2).max(2)),
+            );
             push(&mut parameters, "batch_size", serde_json::json!(512));
         }
         "ollama" => {
@@ -4068,8 +4112,11 @@ pub async fn engine_recommend(
                 .unwrap_or(8);
             push(&mut parameters, "context_size", serde_json::json!(8192));
             push(&mut parameters, "num_gpu", serde_json::json!(999));
-            push(&mut parameters, "num_thread",
-                serde_json::json!((cpus / 2).max(2)));
+            push(
+                &mut parameters,
+                "num_thread",
+                serde_json::json!((cpus / 2).max(2)),
+            );
             push(&mut parameters, "num_batch", serde_json::json!(512));
         }
         "whisper" | "mlx-whisper" => {
@@ -4077,12 +4124,23 @@ pub async fn engine_recommend(
                 .map(|n| n.get())
                 .unwrap_or(8);
             push(&mut parameters, "default_beam_size", serde_json::json!(5));
-            push(&mut parameters, "n_threads",
-                serde_json::json!((cpus / 2).max(2)));
+            push(
+                &mut parameters,
+                "n_threads",
+                serde_json::json!((cpus / 2).max(2)),
+            );
         }
         "mlx" => {
-            push(&mut parameters, "default_max_tokens", serde_json::json!(2048));
-            push(&mut parameters, "default_temperature", serde_json::json!(0.7));
+            push(
+                &mut parameters,
+                "default_max_tokens",
+                serde_json::json!(2048),
+            );
+            push(
+                &mut parameters,
+                "default_temperature",
+                serde_json::json!(0.7),
+            );
             push(&mut parameters, "default_top_p", serde_json::json!(0.95));
         }
         _ => {
@@ -4321,6 +4379,173 @@ fn escape_csv(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+#[handler(variant = "SchedulerJobsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_jobs_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobsListRequest(_)) => {}
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobsListRequestBody",
+            ))
+        }
+    }
+    let jobs = crate::scheduler::list_jobs(&ctx.state.db).map_err(db_err)?;
+    let jobs_json = serde_json::to_string(&jobs)
+        .map_err(|e| ProtocolError::internal(format!("scheduler jobs encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobsListResponse(
+            tentaflow_protocol::SchedulerJobsListResponse { jobs_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerActionsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_actions_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::ActionsListRequest(_)) => {
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerActionsListRequestBody",
+            ))
+        }
+    }
+    let actions = crate::scheduler::list_addon_actions(&ctx.state.db).map_err(db_err)?;
+    let actions_json = serde_json::to_string(&actions)
+        .map_err(|e| ProtocolError::internal(format!("scheduler actions encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::ActionsListResponse(
+            tentaflow_protocol::SchedulerActionsListResponse { actions_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerRunsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_runs_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::RunsListRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerRunsListRequestBody",
+            ))
+        }
+    };
+    let runs = crate::scheduler::list_runs(&ctx.state.db, &payload.job_id, payload.limit as i64)
+        .map_err(db_err)?;
+    let runs_json = serde_json::to_string(&runs)
+        .map_err(|e| ProtocolError::internal(format!("scheduler runs encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::RunsListResponse(
+            tentaflow_protocol::SchedulerRunsListResponse { runs_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerJobUpsertRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_job_upsert(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobUpsertRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobUpsertRequestBody",
+            ))
+        }
+    };
+    let user_id = require_user_id(ctx)
+        .ok()
+        .and_then(|b| user_id_to_i64(&b))
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let input: crate::scheduler::UpsertJobRequest = serde_json::from_str(&payload.job_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid scheduler job json: {}", e)))?;
+    let job = crate::scheduler::upsert_job(&ctx.state.db, input, user_id).map_err(db_err)?;
+    let job_json = serde_json::to_string(&job)
+        .map_err(|e| ProtocolError::internal(format!("scheduler job encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobUpsertResponse(
+            tentaflow_protocol::SchedulerJobUpsertResponse { job_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerJobDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_job_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobDeleteRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobDeleteRequestBody",
+            ))
+        }
+    };
+    crate::scheduler::delete_job(&ctx.state.db, &payload.job_id).map_err(db_err)?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobDeleteResponse(
+            tentaflow_protocol::SchedulerJobDeleteResponse { ok: true },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerJobRunNowRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn scheduler_job_run_now(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobRunNowRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobRunNowRequestBody",
+            ))
+        }
+    };
+    let addon_manager = ctx
+        .state
+        .addon_manager
+        .clone()
+        .ok_or_else(|| ProtocolError::internal("AddonManager unavailable"))?;
+    let user_id = require_user_id(ctx)
+        .ok()
+        .and_then(|b| user_id_to_i64(&b))
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let run = crate::scheduler::run_now(&ctx.state.db, addon_manager, &payload.job_id, user_id)
+        .await
+        .map_err(db_err)?;
+    let run_json = serde_json::to_string(&run)
+        .map_err(|e| ProtocolError::internal(format!("scheduler run encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobRunNowResponse(
+            tentaflow_protocol::SchedulerJobRunNowResponse { run_json },
+        ),
+    ))
 }
 
 #[handler(variant = "AuditLogListRequest", since = (1, 0))]
@@ -4890,10 +5115,8 @@ pub fn addon_ui_dispatch(
             // Zrodlo prawdy: zainstalowane addony, ktore deklaruja
             // [application] w manifescie. Czytamy manifest_json z DB,
             // deserializujemy, filtrujemy po widocznosci dla usera.
-            let rows =
-                crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
-            let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> =
-                Vec::new();
+            let rows = crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
+            let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> = Vec::new();
             for a in rows {
                 if !visible_to_user(&a.addon_id)? {
                     continue;
@@ -4927,18 +5150,17 @@ pub fn addon_ui_dispatch(
         }
 
         // ---- UI panel get ----
-        P::ReqPanelGet {
-            addon_id,
-            panel_id,
-        } => {
+        P::ReqPanelGet { addon_id, panel_id } => {
             // Visibility check — addon admin_only lub group-restricted nie
             // moze byc otwierany przez non-admin (codex P1).
             if !visible_to_user(addon_id)? {
                 return Err(ProtocolError::not_found("addon"));
             }
-            let manager = ctx.state.addon_manager.as_ref().ok_or_else(|| {
-                ProtocolError::internal("addon manager not configured")
-            })?;
+            let manager = ctx
+                .state
+                .addon_manager
+                .as_ref()
+                .ok_or_else(|| ProtocolError::internal("addon manager not configured"))?;
             // Lazy-start dla [application] addonow bez [service] — przed
             // serwowaniem pierwszego panelu uruchamiamy addon, zeby on_start
             // miał szansę zawołać `ui_render` (codex P1: tile widoczny w
@@ -4977,14 +5199,14 @@ pub fn addon_ui_dispatch(
             if !visible_to_user(addon_id)? {
                 return Err(ProtocolError::not_found("addon"));
             }
-            let manager = ctx.state.addon_manager.as_ref().ok_or_else(|| {
-                ProtocolError::internal("addon manager not configured")
-            })?;
+            let manager = ctx
+                .state
+                .addon_manager
+                .as_ref()
+                .ok_or_else(|| ProtocolError::internal("addon manager not configured"))?;
             ensure_application_addon_running(manager, addon_id);
-            let params: serde_json::Value =
-                serde_json::from_str(params_json).map_err(|e| {
-                    ProtocolError::bad_request(format!("params_json invalid: {}", e))
-                })?;
+            let params: serde_json::Value = serde_json::from_str(params_json)
+                .map_err(|e| ProtocolError::bad_request(format!("params_json invalid: {}", e)))?;
             let result_value = manager
                 .invoke_ui_action(addon_id, panel_id, action_id, params, Some(user_id))
                 .map_err(addon_ui_err)?;
@@ -4993,9 +5215,7 @@ pub fn addon_ui_dispatch(
         }
 
         // Response variants nie powinny przychodzic jako request.
-        P::ResApplicationsList { .. }
-        | P::ResPanelGet { .. }
-        | P::ResAction { .. } => {
+        P::ResApplicationsList { .. } | P::ResPanelGet { .. } | P::ResAction { .. } => {
             return Err(ProtocolError::bad_request("response variant in request"));
         }
     };
@@ -5961,8 +6181,8 @@ pub async fn service_update(
 
     // Zaktualizuj config_json: parsujemy istniejący JSON, mergujemy podane
     // pola, serializujemy. Pozostałe pola (np. ścieżki bundle) zostają.
-    let mut cfg: serde_json::Value = serde_json::from_str(&svc.config_json)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&svc.config_json).unwrap_or_else(|_| serde_json::json!({}));
     let cfg_obj = cfg
         .as_object_mut()
         .ok_or_else(|| ProtocolError::bad_request("service config_json is not an object"))?;
@@ -5980,7 +6200,10 @@ pub async fn service_update(
     }
     if let Some(util) = payload.gpu_memory_utilization {
         if let Some(num) = serde_json::Number::from_f64(util as f64) {
-            cfg_obj.insert("gpu_memory_utilization".into(), serde_json::Value::Number(num));
+            cfg_obj.insert(
+                "gpu_memory_utilization".into(),
+                serde_json::Value::Number(num),
+            );
         }
     }
     if let Some(v) = payload.max_model_len {
@@ -5996,7 +6219,10 @@ pub async fn service_update(
         );
     }
     if let Some(dt) = payload.kv_cache_dtype.as_ref() {
-        cfg_obj.insert("kv_cache_dtype".into(), serde_json::Value::String(dt.clone()));
+        cfg_obj.insert(
+            "kv_cache_dtype".into(),
+            serde_json::Value::String(dt.clone()),
+        );
     }
     if let Some(b) = payload.chunked_prefill {
         cfg_obj.insert("chunked_prefill".into(), serde_json::Value::Bool(b));
@@ -6051,9 +6277,11 @@ pub async fn service_update(
             }
             // Mark Starting + spawn detached respawn (jak supervisor).
             {
-                let conn = ctx.state.db.lock().map_err(|_| {
-                    ProtocolError::internal("db pool poisoned")
-                })?;
+                let conn = ctx
+                    .state
+                    .db
+                    .lock()
+                    .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
                 let _ = crate::services_repo::services::update_status(
                     &conn,
                     payload.service_id,
@@ -6169,9 +6397,9 @@ pub async fn service_vram_hint(
     // Mesh forward NIE jest zaimplementowany dla VramHint — wymagałby
     // proxy nvidia-smi przez QUIC. Local only na razie. `node_id` ignored.
     let exclude_pids: Vec<u32> = Vec::new(); // exclude_service_id mapping na PID
-                                              // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
-                                              // własny serwis zwykle nie liczy się jako zaskakujący duży
-                                              // konsument GPU bo jest dopiero startowany lub stopped.
+                                             // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
+                                             // własny serwis zwykle nie liczy się jako zaskakujący duży
+                                             // konsument GPU bo jest dopiero startowany lub stopped.
     let snapshot =
         crate::services::gpu_snapshot::collect_vram_snapshot(payload.gpu_index, &exclude_pids)
             .await;
@@ -6181,10 +6409,12 @@ pub async fn service_vram_hint(
         .map(crate::services::gpu_snapshot::recommended_utilization);
 
     Ok(MessageBody::ServiceBody(
-        tentaflow_protocol::ServicePayload::ResVramHint(tentaflow_protocol::ServiceVramHintResponse {
-            gpus: snapshot,
-            recommended_utilization: recommended,
-        }),
+        tentaflow_protocol::ServicePayload::ResVramHint(
+            tentaflow_protocol::ServiceVramHintResponse {
+                gpus: snapshot,
+                recommended_utilization: recommended,
+            },
+        ),
     ))
 }
 
@@ -6244,9 +6474,7 @@ mod catalog_list_tests {
         ModelInstance, OutputModality, ServiceSurface, Strategy,
     };
     use std::sync::Arc;
-    use tentaflow_protocol::{
-        CatalogDiagnosticWire, CatalogEntryKindWire, CatalogListRequest,
-    };
+    use tentaflow_protocol::{CatalogDiagnosticWire, CatalogEntryKindWire, CatalogListRequest};
 
     fn snapshot_with(entries: Vec<CatalogEntry>) -> CatalogSnapshot {
         CatalogSnapshot {
@@ -6343,7 +6571,10 @@ mod catalog_list_tests {
 
         let flow = by_id.get("chat-pl").unwrap();
         assert_eq!(flow.owned_by, "tentaflow-flow");
-        assert!(matches!(flow.kind, CatalogEntryKindWire::Flow { flow_id: 17, .. }));
+        assert!(matches!(
+            flow.kind,
+            CatalogEntryKindWire::Flow { flow_id: 17, .. }
+        ));
 
         let alias = by_id.get("rag-llm").unwrap();
         assert_eq!(alias.owned_by, "tentaflow-alias");
@@ -6401,7 +6632,10 @@ mod catalog_list_tests {
         shadowed.diagnostic = Some(CatalogDiagnostic::RemoteShadowed {
             local_owner: "node-z".into(),
         });
-        let snap = snapshot_with(vec![shadowed.clone(), service_entry("ok", ServiceSurface::Chat)]);
+        let snap = snapshot_with(vec![
+            shadowed.clone(),
+            service_entry("ok", ServiceSurface::Chat),
+        ]);
 
         let hidden = catalog_snapshot_to_wire(
             &snap,

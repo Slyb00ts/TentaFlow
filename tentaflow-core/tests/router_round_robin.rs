@@ -79,9 +79,11 @@ fn round_robin_resumes_when_target_returns() {
     let state = StrategyState::new();
     let mut phase1 = Vec::new();
     for _ in 0..4 {
-        phase1.push(rank(&candidates_phase1, Strategy::RoundRobin, &state)[0]
-            .requested_model()
-            .to_string());
+        phase1.push(
+            rank(&candidates_phase1, Strategy::RoundRobin, &state)[0]
+                .requested_model()
+                .to_string(),
+        );
     }
     assert_eq!(phase1, vec!["a", "c", "a", "c"]);
 
@@ -90,9 +92,11 @@ fn round_robin_resumes_when_target_returns() {
     let candidates_phase2 = vec![target("a"), target("b"), target("c")];
     let mut phase2 = Vec::new();
     for _ in 0..6 {
-        phase2.push(rank(&candidates_phase2, Strategy::RoundRobin, &state)[0]
-            .requested_model()
-            .to_string());
+        phase2.push(
+            rank(&candidates_phase2, Strategy::RoundRobin, &state)[0]
+                .requested_model()
+                .to_string(),
+        );
     }
     // Distribution must touch every member at least once.
     assert!(phase2.contains(&"a".to_string()));

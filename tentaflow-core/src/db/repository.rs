@@ -837,7 +837,14 @@ fn record_alias_resolve_denied_within_tx(
              result, error_message, severity, risk_class, details, prev_hash, hash) \
          VALUES (?1, NULL, ?2, 'alias_resolve_denied', \
                  'model_alias', ?3, 'denied', NULL, 'warn', 'A', ?4, ?5, ?6)",
-        rusqlite::params![timestamp, caller_addon_id, alias_name, details, prev_hash, hash],
+        rusqlite::params![
+            timestamp,
+            caller_addon_id,
+            alias_name,
+            details,
+            prev_hash,
+            hash
+        ],
     )?;
     Ok(())
 }
@@ -1186,8 +1193,11 @@ pub fn reconcile_uses_alias_for_alias_within_tx(
     for (consumer, before) in rows {
         let after = compute_uses_alias_status_within_tx(tx, alias_name, &consumer)?;
         if after != before.as_str() {
-            let decided_at: Option<i64> =
-                if after == "pending" { None } else { Some(now_unix()) };
+            let decided_at: Option<i64> = if after == "pending" {
+                None
+            } else {
+                Some(now_unix())
+            };
             tx.execute(
                 "UPDATE addon_uses_alias \
                     SET grant_status = ?1, grant_decided_at = ?2 \
@@ -1245,7 +1255,14 @@ pub fn audit_reconcile_uses_alias_within_tx(
              result, error_message, severity, risk_class, details, prev_hash, hash) \
          VALUES (?1, NULL, ?2, 'uses_alias.reconcile', \
                  'model_alias', ?3, 'reconciled', NULL, 'info', 'A', ?4, ?5, ?6)",
-        rusqlite::params![timestamp, consumer_addon_id, alias_name, details, prev_hash, hash],
+        rusqlite::params![
+            timestamp,
+            consumer_addon_id,
+            alias_name,
+            details,
+            prev_hash,
+            hash
+        ],
     )?;
     Ok(())
 }
@@ -1295,7 +1312,14 @@ pub fn audit_consumer_revoked_by_manifest_within_tx(
              result, error_message, severity, risk_class, details, prev_hash, hash) \
          VALUES (?1, NULL, ?2, 'consumer_revoked_by_manifest_change', \
                  'model_alias', ?3, 'revoked', NULL, 'info', 'A', ?4, ?5, ?6)",
-        rusqlite::params![timestamp, owner_addon_id, alias_name, details, prev_hash, hash],
+        rusqlite::params![
+            timestamp,
+            owner_addon_id,
+            alias_name,
+            details,
+            prev_hash,
+            hash
+        ],
     )?;
     Ok(())
 }
@@ -1629,7 +1653,11 @@ pub fn create_or_reactivate_model_alias_with_active(
     if !is_active {
         // Caller wants the alias parked (gated). Reuse the audited setter so
         // the deactivate event is recorded with proper attribution.
-        let changed_by = if owner_type == "addon" { owner_id } else { None };
+        let changed_by = if owner_type == "addon" {
+            owner_id
+        } else {
+            None
+        };
         set_model_alias_active_audited_within_tx(&tx, alias, false, changed_by)?;
     }
     tx.commit()?;
@@ -1705,10 +1733,7 @@ pub fn create_or_reactivate_model_alias_within_tx(
             )
             .optional()?;
         if let Some((ex_type, ex_owner_id)) = existing_owner {
-            if ex_type == "addon"
-                && owner_type == "addon"
-                && ex_owner_id.as_deref() != owner_id
-            {
+            if ex_type == "addon" && owner_type == "addon" && ex_owner_id.as_deref() != owner_id {
                 anyhow::bail!(
                     "alias '{}' is already owned by addon '{}'; cannot reassign to '{}'",
                     alias.escape_debug(),
@@ -7507,10 +7532,12 @@ pub fn get_addon_network_config(pool: &DbPool, addon_id: &str) -> Result<AddonNe
 /// Manifest-declared network rule row from `addon_network_rules`.
 #[derive(Debug, Clone)]
 pub struct AddonDeclaredNetworkRule {
+    pub rule_id: String,
     pub host: String,
     pub port: i32,
     pub protocol: String,
     pub required: bool,
+    pub approved: bool,
 }
 
 /// Loads manifest-declared network rules for an addon. Returns rows from
@@ -7522,20 +7549,51 @@ pub fn get_addon_declared_network_rules(
 ) -> Result<Vec<AddonDeclaredNetworkRule>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT host, port, protocol, required FROM addon_network_rules \
-         WHERE addon_id = ?1 ORDER BY host, port",
+        "SELECT rule_id, host, port, protocol, required, approved FROM addon_network_rules \
+         WHERE addon_id = ?1 ORDER BY host, port, rule_id",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![addon_id], |row| {
             Ok(AddonDeclaredNetworkRule {
-                host: row.get(0)?,
-                port: row.get(1)?,
-                protocol: row.get(2)?,
-                required: row.get::<_, i64>(3)? != 0,
+                rule_id: row.get(0)?,
+                host: row.get(1)?,
+                port: row.get(2)?,
+                protocol: row.get(3)?,
+                required: row.get::<_, i64>(4)? != 0,
+                approved: row.get::<_, i64>(5)? != 0,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Aktualizuje realne approvale regul manifestu na podstawie polityki admina.
+pub fn set_addon_network_rule_approvals(
+    pool: &DbPool,
+    addon_id: &str,
+    allowed_hosts: &[String],
+    blocked_hosts: &[String],
+    updated_by: Option<i64>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE addon_network_rules \
+         SET approved = 0, approved_by = NULL, approved_at = NULL \
+         WHERE addon_id = ?1",
+        rusqlite::params![addon_id],
+    )?;
+    for host in allowed_hosts {
+        if blocked_hosts.iter().any(|blocked| blocked == host) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE addon_network_rules \
+             SET approved = 1, approved_by = ?1, approved_at = datetime('now') \
+             WHERE addon_id = ?2 AND lower(host) = lower(?3)",
+            rusqlite::params![updated_by, addon_id, host],
+        )?;
+    }
+    Ok(())
 }
 
 /// Upsert konfiguracji regul sieciowych addona.
@@ -7794,12 +7852,33 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Act 1 — tworzenie aliasow (symulacja instalacji teams-bot)
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
-            .expect("Utworzenie aliasu teams-stt powinno sie udac");
-        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available", "addon", Some("teams-bot"))
-            .expect("Utworzenie aliasu teams-tts powinno sie udac");
-        create_or_reactivate_model_alias(&db, "teams-summary", "", "first_available", "addon", Some("teams-bot"))
-            .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu teams-stt powinno sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-tts",
+            "tts-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu teams-tts powinno sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-summary",
+            "",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
 
         // Assert 1 — aliasy istnieja i sa aktywne
         let stt = resolve_model_alias(&db, "teams-stt", None).unwrap();
@@ -7831,19 +7910,37 @@ mod alias_resolve_tests {
 
         // Assert 2 — resolve nie znajduje nieaktywnych aliasow
         assert!(
-            resolve_model_alias(&db, "teams-stt", None).unwrap().is_none(),
+            resolve_model_alias(&db, "teams-stt", None)
+                .unwrap()
+                .is_none(),
             "Nieaktywny alias teams-stt nie powinien byc rozwiazywany"
         );
         assert!(
-            resolve_model_alias(&db, "teams-tts", None).unwrap().is_none(),
+            resolve_model_alias(&db, "teams-tts", None)
+                .unwrap()
+                .is_none(),
             "Nieaktywny alias teams-tts nie powinien byc rozwiazywany"
         );
 
         // Act 3 — reaktywacja (symulacja ponownego uruchomienia)
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
-            .expect("Reaktywacja teams-stt powinna sie udac");
-        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available", "addon", Some("teams-bot"))
-            .expect("Reaktywacja teams-tts powinna sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Reaktywacja teams-stt powinna sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-tts",
+            "tts-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Reaktywacja teams-tts powinna sie udac");
 
         // Assert 3 — aliasy ponownie aktywne
         let stt = resolve_model_alias(&db, "teams-stt", None)
@@ -7866,11 +7963,20 @@ mod alias_resolve_tests {
         let db = create_test_db();
 
         // Tworzenie z domyslnym target_model
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
-            .expect("Utworzenie aliasu powinno sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Utworzenie aliasu powinno sie udac");
 
         // Uzytkownik zmienia target_model na inny
-        let alias = resolve_model_alias(&db, "teams-stt", None).unwrap().unwrap();
+        let alias = resolve_model_alias(&db, "teams-stt", None)
+            .unwrap()
+            .unwrap();
         update_model_alias_unchecked(
             &db,
             alias.id,
@@ -7886,8 +7992,15 @@ mod alias_resolve_tests {
         set_model_alias_active(&db, "teams-stt", false).unwrap();
 
         // Act — reaktywacja z domyslnym target_model
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot"))
-            .expect("Reaktywacja powinna sie udac");
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .expect("Reaktywacja powinna sie udac");
 
         // Assert — target_model ustawiony przez uzytkownika jest zachowany
         let alias = resolve_model_alias(&db, "teams-stt", None)
@@ -7906,7 +8019,15 @@ mod alias_resolve_tests {
 
         // Arrange
         let db = create_test_db();
-        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available", "addon", Some("teams-bot")).unwrap();
+        create_or_reactivate_model_alias(
+            &db,
+            "teams-stt",
+            "whisper-1",
+            "first_available",
+            "addon",
+            Some("teams-bot"),
+        )
+        .unwrap();
         set_model_alias_active(&db, "teams-stt", false).unwrap();
 
         // Act — ponowna dezaktywacja
@@ -7998,16 +8119,16 @@ mod alias_resolve_tests {
     #[test]
     fn test_alias_id_validation_rejects_bad_input() {
         let db = create_test_db();
-        for bad in &["", "1starts-with-digit", "UPPER", "has space", "has_underscore"] {
-            let err = create_or_reactivate_model_alias(
-                &db,
-                bad,
-                "",
-                "first_available",
-                "manual",
-                None,
-            )
-            .expect_err("validation must reject");
+        for bad in &[
+            "",
+            "1starts-with-digit",
+            "UPPER",
+            "has space",
+            "has_underscore",
+        ] {
+            let err =
+                create_or_reactivate_model_alias(&db, bad, "", "first_available", "manual", None)
+                    .expect_err("validation must reject");
             assert!(format!("{err}").contains("invalid alias id"));
         }
     }
@@ -8089,8 +8210,7 @@ mod alias_resolve_tests {
             Some("persist-addon"),
         )
         .unwrap();
-        set_model_alias_active_audited(&db, "persist-alias", false, Some("persist-addon"))
-            .unwrap();
+        set_model_alias_active_audited(&db, "persist-alias", false, Some("persist-addon")).unwrap();
 
         let conn = db.lock().unwrap();
         let (active, owner): (i64, String) = conn
@@ -8263,15 +8383,8 @@ mod alias_resolve_tests {
         // log aggregators. `escape_debug` renders them as `\0`, `\n`, etc.
         let db = create_test_db();
         let bad = "bad\0name";
-        let err = create_or_reactivate_model_alias(
-            &db,
-            bad,
-            "",
-            "first_available",
-            "manual",
-            None,
-        )
-        .expect_err("validation must reject control byte");
+        let err = create_or_reactivate_model_alias(&db, bad, "", "first_available", "manual", None)
+            .expect_err("validation must reject control byte");
         let msg = format!("{err}");
         assert!(
             msg.contains("\\u{0}") || msg.contains("\\0"),
@@ -8288,15 +8401,8 @@ mod alias_resolve_tests {
         let db = create_test_db();
         let name = format!("a{}", "b".repeat(63)); // 64 chars total, all valid
         assert_eq!(name.len(), 64);
-        create_or_reactivate_model_alias(
-            &db,
-            &name,
-            "model-x",
-            "first_available",
-            "manual",
-            None,
-        )
-        .expect("64-char alias must be accepted");
+        create_or_reactivate_model_alias(&db, &name, "model-x", "first_available", "manual", None)
+            .expect("64-char alias must be accepted");
     }
 
     #[test]
@@ -10813,7 +10919,6 @@ mod meeting_summary_action_items_tests {
     }
 }
 
-
 // =============================================================================
 // Tests: settings → peer_persisted/peer_hints upgrade migration (PR5)
 // =============================================================================
@@ -11085,7 +11190,14 @@ pub fn set_camera_onvif_resolved(
     let n = conn.execute(
         "UPDATE cameras SET url = ?1, onvif_profile_token = ?2, updated_at = ?3 \
          WHERE owner_addon_id = ?4 AND camera_id = ?5 AND org_id = ?6 AND removed_at IS NULL",
-        rusqlite::params![new_rtsp_url, profile_token, now, addon_id, camera_id, resolved_org],
+        rusqlite::params![
+            new_rtsp_url,
+            profile_token,
+            now,
+            addon_id,
+            camera_id,
+            resolved_org
+        ],
     )?;
     Ok(n > 0)
 }
@@ -11225,11 +11337,7 @@ pub fn list_cameras_for_addon(
 /// `NotFound` so existence in another tenant is not leaked through error
 /// codes.
 #[cfg(feature = "camera")]
-pub fn camera_exists_in_org(
-    pool: &DbPool,
-    camera_id: &str,
-    org_id: &str,
-) -> Result<bool> {
+pub fn camera_exists_in_org(pool: &DbPool, camera_id: &str, org_id: &str) -> Result<bool> {
     let conn = acquire(pool)?;
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM cameras \
@@ -11453,9 +11561,20 @@ pub fn insert_recording(
           retention_class, created_at, purged_at, org_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
         rusqlite::params![
-            recording_ref, kind, owner_addon_id, camera_id, file_path,
-            file_size_bytes, duration_ms, width, height, pixel_format,
-            hash_sha256, retention_class, now, resolved_org,
+            recording_ref,
+            kind,
+            owner_addon_id,
+            camera_id,
+            file_path,
+            file_size_bytes,
+            duration_ms,
+            width,
+            height,
+            pixel_format,
+            hash_sha256,
+            retention_class,
+            now,
+            resolved_org,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -11794,7 +11913,13 @@ mod chunk_c_visibility_consumer_tests {
         // Issue #1: addon_uses_alias granted alone is not enough — restricted
         // still needs the consumer whitelist.
         let db = make_db();
-        seed_owned_alias(&db, "shared-only", "addon-owner", "restricted", &["other-addon"]);
+        seed_owned_alias(
+            &db,
+            "shared-only",
+            "addon-owner",
+            "restricted",
+            &["other-addon"],
+        );
         seed_uses_alias(&db, "addon-stranger", "shared-only", "granted");
         let err = resolve_model_alias(&db, "shared-only", Some("addon-stranger"))
             .expect_err("uses_alias alone is not enough");
@@ -11876,8 +12001,7 @@ mod chunk_c_visibility_consumer_tests {
         // remove manifest-granted rows that vanished from `keep`, while
         // preserving admin-granted (granted_by_user_id IS NOT NULL) rows.
         let db = make_db();
-        let alias_id =
-            seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["b", "c"]);
+        let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["b", "c"]);
         {
             // Admin grant for "d" — must survive.
             let conn = db.lock().expect("lock");
@@ -11892,12 +12016,9 @@ mod chunk_c_visibility_consumer_tests {
         let revoked = {
             let mut conn = db.lock().expect("lock");
             let tx = conn.transaction().expect("tx");
-            let revoked = revoke_obsolete_manifest_consumers_within_tx(
-                &tx,
-                alias_id,
-                &["b".to_string()],
-            )
-            .expect("revoke");
+            let revoked =
+                revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, &["b".to_string()])
+                    .expect("revoke");
             tx.commit().expect("commit");
             revoked
         };
@@ -12011,7 +12132,13 @@ mod chunk_c_visibility_consumer_tests {
             upsert_uses_alias_within_tx(&tx, "addon-stranger", "shared", false, "ok").expect("b");
             tx.commit().expect("commit");
         }
-        seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["addon-friend"]);
+        seed_owned_alias(
+            &db,
+            "shared",
+            "addon-owner",
+            "restricted",
+            &["addon-friend"],
+        );
         let mut conn = db.lock().expect("lock");
         let tx = conn.transaction().expect("tx");
         let transitions =
@@ -12122,8 +12249,7 @@ mod chunk_c_visibility_consumer_tests {
             let mut conn = db.lock().expect("lock");
             let tx = conn.transaction().expect("tx");
             // Simulate admin grant via the same helper, with explicit user id.
-            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", Some(42))
-                .expect("admin grant");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", Some(42)).expect("admin grant");
             tx.commit().expect("commit");
         }
         let (initial_user, initial_at, _) = consumer_row(&db, alias_id, "addon-b");
@@ -12222,8 +12348,7 @@ mod chunk_c_visibility_consumer_tests {
         {
             let mut conn = db.lock().expect("lock");
             let tx = conn.transaction().expect("tx");
-            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
-                .expect("manifest grant");
+            add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None).expect("manifest grant");
             tx.commit().expect("commit");
         }
         // Mark it revoked (simulates an out-of-band revoke path; the manifest

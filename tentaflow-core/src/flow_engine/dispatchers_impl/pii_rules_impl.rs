@@ -25,8 +25,8 @@ impl PiiRulesStoreImpl {
 impl PiiRulesStore for PiiRulesStoreImpl {
     async fn active_rules(&self) -> Result<Vec<PiiRule>> {
         let db = self.db.clone();
-        let rows = tokio::task::spawn_blocking(move || repository::list_pii_rules_active(&db))
-            .await??;
+        let rows =
+            tokio::task::spawn_blocking(move || repository::list_pii_rules_active(&db)).await??;
         Ok(rows
             .into_iter()
             .map(|r| PiiRule {

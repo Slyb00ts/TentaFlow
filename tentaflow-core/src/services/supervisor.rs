@@ -411,12 +411,8 @@ impl Supervisor {
                 // tokio::select! z deploy::respawn() future i interval
                 // tick — pierwszy deploy result wins, interval jest
                 // anulowany.
-                update_progress_detached(
-                    &db_for_task,
-                    svc_id,
-                    Some("starting — bootstrap+spawn"),
-                )
-                .await;
+                update_progress_detached(&db_for_task, svc_id, Some("starting — bootstrap+spawn"))
+                    .await;
                 let respawn_fut = deploy::respawn(
                     &engine_id,
                     deploy_method,
@@ -445,8 +441,7 @@ impl Supervisor {
                 };
                 match outcome {
                     Ok(handle) => {
-                        if let Err(e) =
-                            update_runtime_detached(&db_for_task, svc_id, &handle).await
+                        if let Err(e) = update_runtime_detached(&db_for_task, svc_id, &handle).await
                         {
                             tracing::warn!(
                                 "supervisor: write_runtime failed for pinned {} ({}): {}",
@@ -455,13 +450,8 @@ impl Supervisor {
                                 e
                             );
                         }
-                        update_status_detached(
-                            &db_for_task,
-                            svc_id,
-                            ServiceStatus::Running,
-                            None,
-                        )
-                        .await;
+                        update_status_detached(&db_for_task, svc_id, ServiceStatus::Running, None)
+                            .await;
                         update_progress_detached(&db_for_task, svc_id, None).await;
                         tracing::info!(
                             "supervisor: pinned service {} ({}) up after detached deploy ({}s)",
@@ -1115,7 +1105,10 @@ async fn clear_runtime_detached(db: &DbPool, id: i64) {
             rusqlite::params![id],
         )?;
         if n == 0 {
-            return Err(anyhow::anyhow!("clear_runtime_detached: id={} not found", id));
+            return Err(anyhow::anyhow!(
+                "clear_runtime_detached: id={} not found",
+                id
+            ));
         }
         Ok(())
     })
@@ -1135,12 +1128,7 @@ async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
     .await;
 }
 
-async fn update_status_detached(
-    db: &DbPool,
-    id: i64,
-    status: ServiceStatus,
-    err: Option<&str>,
-) {
+async fn update_status_detached(db: &DbPool, id: i64, status: ServiceStatus, err: Option<&str>) {
     let db = db.clone();
     let err_owned = err.map(|s| s.to_string());
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {

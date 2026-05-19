@@ -24,7 +24,10 @@ pub enum VectorError {
     InvalidDim(u32),
 
     #[error("metric mismatch: namespace uses {expected}, request asked for {actual}")]
-    MetricMismatch { expected: &'static str, actual: String },
+    MetricMismatch {
+        expected: &'static str,
+        actual: String,
+    },
 
     #[error("invalid namespace name '{0}' (must match ^[a-z0-9_-]{{1,64}}$)")]
     InvalidNamespaceName(String),

@@ -14,11 +14,11 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use rusqlite::params;
 use tempfile::TempDir;
 use tentaflow_core::addon::errors::AbiError;
 use tentaflow_core::addon::host_functions::vector::test_api as vector_api;
 use tentaflow_core::addon::manifest::VectorNamespaceSpec;
-use rusqlite::params;
 use tentaflow_core::services::vector::{
     Metric, NamespaceManager, VectorError, MAX_NAMESPACES_PER_ADDON,
 };
@@ -391,11 +391,7 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
         ok,
         other
     );
-    assert!(
-        other.is_empty(),
-        "non-quota rejections leaked: {:?}",
-        other
-    );
+    assert!(other.is_empty(), "non-quota rejections leaked: {:?}", other);
 }
 
 #[test]
@@ -416,10 +412,7 @@ fn delete_persistence_survives_backend_reopen() {
         be.upsert(1, &[1.0, 0.0, 0.0]).unwrap();
         be.upsert(2, &[0.0, 1.0, 0.0]).unwrap();
         assert!(be.delete(1).unwrap());
-        backend_path = root_path
-            .join("addon_a")
-            .join("vectors")
-            .join("ns.usearch");
+        backend_path = root_path.join("addon_a").join("vectors").join("ns.usearch");
     }
     let mgr2 = mgr_with_temproot(pool, root_path);
     let be2 = mgr2.get("addon_a", "ns").expect("reopen");

@@ -22,7 +22,9 @@ use crate::flow_engine::envelope::{
     ArtifactProvenance, AudioStreamChunk, EnvelopeDelta, EnvelopeDeltaKind, FinishReason,
     FlowEnvelope, FlowValue, NodeInput,
 };
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter,
+};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "tts_stream_bridge";
@@ -518,7 +520,9 @@ mod tests {
             _req: TtsRequest,
         ) -> Result<BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>>
         {
-            Err(anyhow!("FakeTts: stream_synthesize not used in bridge tests"))
+            Err(anyhow!(
+                "FakeTts: stream_synthesize not used in bridge tests"
+            ))
         }
     }
 

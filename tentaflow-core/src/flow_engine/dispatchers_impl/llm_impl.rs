@@ -15,6 +15,7 @@ use std::time::Instant;
 use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 
+use super::{build_user_context, ModelRuntimeSlot};
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent,
 };
@@ -24,7 +25,6 @@ use crate::flow_engine::envelope::{
     ChatMessage, ChatMessageContent, ChatRole, FinishReason, LlmStreamChunk, MessagePart,
     TokenUsage,
 };
-use super::{build_user_context, ModelRuntimeSlot};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use base64::Engine;
 use std::sync::Arc;
@@ -41,7 +41,9 @@ impl LlmDispatcherImpl {
         Self { runtime, blobs }
     }
 
-    fn runtime(&self) -> Result<std::sync::Arc<crate::services::runtime::executor::ModelRuntimeExecutor>> {
+    fn runtime(
+        &self,
+    ) -> Result<std::sync::Arc<crate::services::runtime::executor::ModelRuntimeExecutor>> {
         self.runtime
             .read()
             .as_ref()
@@ -363,7 +365,10 @@ mod tests {
     #[test]
     fn finish_reason_mapping_covers_canonical_values() {
         assert_eq!(openai_finish_to_envelope(Some("stop")), FinishReason::Stop);
-        assert_eq!(openai_finish_to_envelope(Some("length")), FinishReason::Length);
+        assert_eq!(
+            openai_finish_to_envelope(Some("length")),
+            FinishReason::Length
+        );
         assert_eq!(
             openai_finish_to_envelope(Some("tool_calls")),
             FinishReason::ToolCalls
@@ -401,7 +406,9 @@ mod tests {
             .await
             .unwrap();
         let m = ChatMessage::user_multimodal(vec![
-            MessagePart::Text { text: "what?".into() },
+            MessagePart::Text {
+                text: "what?".into(),
+            },
             MessagePart::Image {
                 blob_ref: blob_ref.clone(),
                 detail: "auto".into(),

@@ -32,10 +32,9 @@ use tentaflow_protocol::{
         AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
         ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
-        ClusterUpdateRequest, DeployVllmRecommendRequest,
-        FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
-        FlowVersionListRequest, FlowVersionRestoreRequest, MePreferencesGetRequest,
-        MePreferencesUpdateRequest, MeshConnectRequest,
+        ClusterUpdateRequest, DeployVllmRecommendRequest, FlowCreateRequest, FlowUpdateRequest,
+        FlowVersionGetRequest, FlowVersionListRequest, FlowVersionRestoreRequest,
+        MePreferencesGetRequest, MePreferencesUpdateRequest, MeshConnectRequest,
         MeshNodeCommandRequest, MeshNodeNetworkConfigRequest, MeshPairInitRequest,
         MeshPairingConfirmRequest, MeshPairingRejectRequest, MeshPairingStartRequest,
         MeshTrustRetrustRequest, MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest,
@@ -310,9 +309,7 @@ pub fn encode_me_preferences_get_request() -> Result<Vec<u8>, JsError> {
 
 /// MessageBody::MePreferencesUpdateRequest { language }.
 #[wasm_bindgen(js_name = encodeMePreferencesUpdateRequest)]
-pub fn encode_me_preferences_update_request(
-    language: Option<String>,
-) -> Result<Vec<u8>, JsError> {
+pub fn encode_me_preferences_update_request(language: Option<String>) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MePreferencesUpdateRequestBody(
         MePreferencesUpdateRequest { language },
     ))
@@ -1258,6 +1255,69 @@ pub fn encode_audit_log_list_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeSchedulerJobsListRequest)]
+pub fn encode_scheduler_jobs_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobsListRequest(
+            tentaflow_protocol::SchedulerJobsListRequest,
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSchedulerActionsListRequest)]
+pub fn encode_scheduler_actions_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::ActionsListRequest(
+            tentaflow_protocol::SchedulerActionsListRequest,
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSchedulerRunsListRequest)]
+pub fn encode_scheduler_runs_list_request(job_id: String, limit: u32) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::RunsListRequest(
+            tentaflow_protocol::SchedulerRunsListRequest {
+                job_id,
+                limit: limit.min(200),
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSchedulerJobUpsertRequest)]
+pub fn encode_scheduler_job_upsert_request(job_json: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobUpsertRequest(
+            tentaflow_protocol::SchedulerJobUpsertRequest { job_json },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSchedulerJobDeleteRequest)]
+pub fn encode_scheduler_job_delete_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobDeleteRequest(
+            tentaflow_protocol::SchedulerJobDeleteRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSchedulerJobRunNowRequest)]
+pub fn encode_scheduler_job_run_now_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobRunNowRequest(
+            tentaflow_protocol::SchedulerJobRunNowRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::AuditLogExportRequest — eksport CSV z filtrami.
 #[wasm_bindgen(js_name = encodeAuditLogExportRequest)]
 pub fn encode_audit_log_export_request(
@@ -1556,8 +1616,10 @@ pub fn encode_service_config_update_request(payload_json: String) -> Result<Vec<
     use tentaflow_protocol::{ServicePayload, ServiceUpdateRequest};
     let payload: ServiceUpdateRequest = serde_json::from_str(&payload_json)
         .map_err(|e| JsError::new(&format!("ServiceUpdateRequest JSON: {e}")))?;
-    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqUpdate(payload)))
-        .map_err(|e| JsError::new(&e))
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqUpdate(
+        payload,
+    )))
+    .map_err(|e| JsError::new(&e))
 }
 
 /// MessageBody::ServiceBody(ServicePayload::ReqVramHint) — snapshot VRAM
@@ -3064,6 +3126,64 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "AuditLogCleanupResponse".into());
             set(&obj, "deletedCount", (resp.deleted_count as f64).into());
         }
+        MessageBody::SchedulerBody(payload) => match payload {
+            tentaflow_protocol::SchedulerPayload::JobsListRequest(_) => {
+                set(&obj, "variant", "SchedulerJobsListRequest".into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobsListResponse(resp) => {
+                set(&obj, "variant", "SchedulerJobsListResponse".into());
+                set(&obj, "jobsJson", resp.jobs_json.clone().into());
+                set(&obj, "jobs_json", resp.jobs_json.into());
+            }
+            tentaflow_protocol::SchedulerPayload::ActionsListRequest(_) => {
+                set(&obj, "variant", "SchedulerActionsListRequest".into());
+            }
+            tentaflow_protocol::SchedulerPayload::ActionsListResponse(resp) => {
+                set(&obj, "variant", "SchedulerActionsListResponse".into());
+                set(&obj, "actionsJson", resp.actions_json.clone().into());
+                set(&obj, "actions_json", resp.actions_json.into());
+            }
+            tentaflow_protocol::SchedulerPayload::RunsListRequest(req) => {
+                set(&obj, "variant", "SchedulerRunsListRequest".into());
+                set(&obj, "jobId", req.job_id.clone().into());
+                set(&obj, "job_id", req.job_id.into());
+                set(&obj, "limit", (req.limit as f64).into());
+            }
+            tentaflow_protocol::SchedulerPayload::RunsListResponse(resp) => {
+                set(&obj, "variant", "SchedulerRunsListResponse".into());
+                set(&obj, "runsJson", resp.runs_json.clone().into());
+                set(&obj, "runs_json", resp.runs_json.into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobUpsertRequest(req) => {
+                set(&obj, "variant", "SchedulerJobUpsertRequest".into());
+                set(&obj, "jobJson", req.job_json.clone().into());
+                set(&obj, "job_json", req.job_json.into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobUpsertResponse(resp) => {
+                set(&obj, "variant", "SchedulerJobUpsertResponse".into());
+                set(&obj, "jobJson", resp.job_json.clone().into());
+                set(&obj, "job_json", resp.job_json.into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobDeleteRequest(req) => {
+                set(&obj, "variant", "SchedulerJobDeleteRequest".into());
+                set(&obj, "jobId", req.job_id.clone().into());
+                set(&obj, "job_id", req.job_id.into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobDeleteResponse(resp) => {
+                set(&obj, "variant", "SchedulerJobDeleteResponse".into());
+                set(&obj, "ok", resp.ok.into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobRunNowRequest(req) => {
+                set(&obj, "variant", "SchedulerJobRunNowRequest".into());
+                set(&obj, "jobId", req.job_id.clone().into());
+                set(&obj, "job_id", req.job_id.into());
+            }
+            tentaflow_protocol::SchedulerPayload::JobRunNowResponse(resp) => {
+                set(&obj, "variant", "SchedulerJobRunNowResponse".into());
+                set(&obj, "runJson", resp.run_json.clone().into());
+                set(&obj, "run_json", resp.run_json.into());
+            }
+        },
         MessageBody::ServiceBody(payload) => decode_service_payload(&obj, payload),
         MessageBody::PromptListRequest => {
             set(&obj, "variant", "PromptListRequest".into());
@@ -4695,13 +4815,18 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let declared = js_sys::Array::new();
             for d in r.declared_rules {
                 let item = js_sys::Object::new();
+                set(&item, "ruleId", d.rule_id.clone().into());
+                set(&item, "rule_id", d.rule_id.into());
                 set(&item, "host", d.host.into());
                 match d.port {
                     Some(p) => set(&item, "port", (p as f64).into()),
                     None => set(&item, "port", JsValue::NULL),
                 }
+                set(&item, "protocol", d.protocol.into());
                 set(&item, "mode", d.mode.into());
                 set(&item, "status", d.status.into());
+                set(&item, "required", d.required.into());
+                set(&item, "approved", d.approved.into());
                 declared.push(&item.into());
             }
             set(&obj, "declaredRules", declared.clone().into());
@@ -4833,8 +4958,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             // Cala odpowiedz ma 60+ pol w 4 zagniezdzonych structach — zamiast
             // recznie kopiowac kazdy field, serializujemy do JSON i zwracamy
             // jako pojedynczy string. GUI robi JSON.parse() na polu `json`.
-            let json = serde_json::to_string(&payload)
-                .unwrap_or_else(|_| "{}".to_string());
+            let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
             set(&obj, "json", json.into());
         }
         MessageBody::EngineRecommendRequestBody(_) => {
@@ -4842,8 +4966,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::EngineRecommendResponseBody(payload) => {
             set(&obj, "variant", "EngineRecommendResponse".into());
-            let json = serde_json::to_string(&payload)
-                .unwrap_or_else(|_| "{}".to_string());
+            let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
             set(&obj, "json", json.into());
         }
         MessageBody::CameraAdminBody(payload) => match payload {
@@ -4885,7 +5008,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 // request body in a debug buffer cannot leak admin secrets
                 // to the JS layer.
                 set(&obj, "variant", "CameraAddOnvifRequest".into());
-                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
             }
             tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(resp) => {
                 set(&obj, "variant", "CameraAddOnvifResponse".into());
@@ -4901,7 +5028,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 // camera_id or ttl back to the JS layer. Surface the variant
                 // tag only — same pattern as AddOnvifRequest above.
                 set(&obj, "variant", "CameraFrameUrlRequest".into());
-                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
             }
             tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(resp) => {
                 set(&obj, "variant", "CameraFrameUrlResponse".into());
@@ -4917,7 +5048,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 // path. Surface variant tag only — defense-in-depth mirror of
                 // CameraAdminPayload request-in-response handling.
                 set(&obj, "variant", "LegalDocumentsListRequest".into());
-                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
             }
             tentaflow_protocol::LegalAdminPayload::ListResponse(resp) => {
                 set(&obj, "variant", "LegalDocumentsListResponse".into());
@@ -4938,11 +5073,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         "generated_by_user_id",
                         doc.generated_by_user_id.clone().into(),
                     );
-                    set(
-                        &item,
-                        "generatedByUserId",
-                        doc.generated_by_user_id.into(),
-                    );
+                    set(&item, "generatedByUserId", doc.generated_by_user_id.into());
                     set(&item, "content_hash", doc.content_hash.clone().into());
                     set(&item, "contentHash", doc.content_hash.into());
                     set(&item, "revoked_at_ms", (doc.revoked_at_ms as f64).into());
@@ -4953,7 +5084,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             tentaflow_protocol::LegalAdminPayload::GenerateRequest(_) => {
                 set(&obj, "variant", "LegalDocumentGenerateRequest".into());
-                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
             }
             tentaflow_protocol::LegalAdminPayload::GenerateResponse(resp) => {
                 set(&obj, "variant", "LegalDocumentGenerateResponse".into());
@@ -4966,7 +5101,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             tentaflow_protocol::LegalAdminPayload::RevokeRequest(_) => {
                 set(&obj, "variant", "LegalDocumentRevokeRequest".into());
-                set(&obj, "warning", "unexpected_request_variant_in_response".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
             }
             tentaflow_protocol::LegalAdminPayload::RevokeResponse(resp) => {
                 set(&obj, "variant", "LegalDocumentRevokeResponse".into());
@@ -5786,8 +5925,16 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             tentaflow_protocol::MeshConnState::Offline => "offline",
         };
         set(&connection_obj, "state", state_str.into());
-        set(&connection_obj, "sinceMs", (connection.since_ms as f64).into());
-        set(&connection_obj, "since_ms", (connection.since_ms as f64).into());
+        set(
+            &connection_obj,
+            "sinceMs",
+            (connection.since_ms as f64).into(),
+        );
+        set(
+            &connection_obj,
+            "since_ms",
+            (connection.since_ms as f64).into(),
+        );
         set(
             &connection_obj,
             "lastAppHeartbeatMs",
@@ -5823,7 +5970,11 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             .find(|p| p.selected)
             .or_else(|| connection.paths.first());
         if let Some(p) = chosen {
-            let kind = if p.transport == "relay" { "relay" } else { "direct" };
+            let kind = if p.transport == "relay" {
+                "relay"
+            } else {
+                "direct"
+            };
             set(&path_view, "kind", kind.into());
             if kind == "relay" {
                 if let Some(url) = &connection.relay_url {
@@ -5837,7 +5988,11 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&connection_obj, "path", path_view.into());
         } else if connection.transport == "p2p" || connection.transport == "relay" {
             // No paths list — synth from top-level transport/address.
-            let kind = if connection.transport == "relay" { "relay" } else { "direct" };
+            let kind = if connection.transport == "relay" {
+                "relay"
+            } else {
+                "direct"
+            };
             set(&path_view, "kind", kind.into());
             if kind == "relay" {
                 if let Some(url) = &connection.relay_url {
@@ -6710,10 +6865,7 @@ pub fn encode_addon_ui_panel_get_request(
     addon_id: String,
     panel_id: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_addon_ui(AddonUiPayload::ReqPanelGet {
-        addon_id,
-        panel_id,
-    })
+    encode_addon_ui(AddonUiPayload::ReqPanelGet { addon_id, panel_id })
 }
 
 /// MessageBody::AddonUiBody(ReqAction) — button click / form submit z UI
@@ -7474,9 +7626,7 @@ fn profile_report_v2_to_js(r: &tentaflow_protocol::ProfileReportV2) -> JsValue {
     o.into()
 }
 
-fn profiling_skipped_collector_to_js(
-    s: &tentaflow_protocol::ProfilingSkippedCollector,
-) -> JsValue {
+fn profiling_skipped_collector_to_js(s: &tentaflow_protocol::ProfilingSkippedCollector) -> JsValue {
     let o = js_sys::Object::new();
     set(&o, "id", s.id.clone().into());
     set(&o, "reason", s.reason.clone().into());
@@ -7666,7 +7816,10 @@ fn profiling_collector_status_to_js(c: &tentaflow_protocol::ProfilingCollectorSt
     set(
         &o,
         "version",
-        c.version.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+        c.version
+            .clone()
+            .map(JsValue::from)
+            .unwrap_or(JsValue::NULL),
     );
     set(
         &o,
@@ -7854,7 +8007,10 @@ pub fn encode_camera_frame_url_request(
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::CameraAdminBody(
         tentaflow_protocol::CameraAdminPayload::FrameUrlRequest(
-            tentaflow_protocol::CameraFrameUrlRequest { camera_id, ttl_secs },
+            tentaflow_protocol::CameraFrameUrlRequest {
+                camera_id,
+                ttl_secs,
+            },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -7902,4 +8058,3 @@ pub fn encode_legal_document_revoke_request(doc_id: String) -> Result<Vec<u8>, J
     ))
     .map_err(|e| JsError::new(&e))
 }
-

@@ -49,9 +49,9 @@ impl MemoryNodeAdapter {
         {
             return Ok(s.to_string());
         }
-        ctx.session_id
-            .clone()
-            .ok_or_else(|| anyhow!("memory adapter: no session_id (node config nor ctx.session_id)"))
+        ctx.session_id.clone().ok_or_else(|| {
+            anyhow!("memory adapter: no session_id (node config nor ctx.session_id)")
+        })
     }
 
     fn payload_text(envelope: &FlowEnvelope) -> Result<String> {

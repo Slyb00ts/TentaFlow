@@ -116,11 +116,10 @@ pub async fn fetch_from_peer(
         raw_ref: raw_ref.to_string(),
         request_id: request_id.clone(),
     };
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
-        .map_err(|e| {
-            client.cancel(&request_id);
-            FrameProxyError::Encode(e.to_string())
-        })?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).map_err(|e| {
+        client.cancel(&request_id);
+        FrameProxyError::Encode(e.to_string())
+    })?;
 
     if let Err(e) = iroh.send_frame_proxy_request(peer_id, &bytes).await {
         client.cancel(&request_id);
@@ -173,7 +172,10 @@ mod tests {
 
         let got = rx.await.expect("oneshot resolved");
         match got {
-            FrameProxyResponsePayload::NotFound { raw_ref, request_id } => {
+            FrameProxyResponsePayload::NotFound {
+                raw_ref,
+                request_id,
+            } => {
                 assert_eq!(raw_ref, "ref-a");
                 assert_eq!(request_id, "rid-1");
             }

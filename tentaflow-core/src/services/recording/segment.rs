@@ -17,8 +17,7 @@ use gstreamer::prelude::*;
 
 use super::error::{RecordingError, Result};
 use super::storage::{
-    camera_subdir, recording_base_dir, sha256_hex, validate_camera_id, RecordingKind,
-    RecordingRef,
+    camera_subdir, recording_base_dir, sha256_hex, validate_camera_id, RecordingKind, RecordingRef,
 };
 use super::SavedRecording;
 
@@ -31,7 +30,9 @@ pub async fn save_segment_mp4(
 ) -> Result<SavedRecording> {
     validate_camera_id(camera_id)?;
     if duration_secs == 0 {
-        return Err(RecordingError::GstPipeline("duration_secs must be > 0".into()));
+        return Err(RecordingError::GstPipeline(
+            "duration_secs must be > 0".into(),
+        ));
     }
 
     gst::init().map_err(|e| RecordingError::GstPipeline(format!("gst init: {e}")))?;
@@ -161,9 +162,7 @@ pub async fn save_segment_mp4(
     }
 
     let meta = tokio::fs::metadata(&file_path).await.map_err(|e| {
-        RecordingError::GstPipeline(format!(
-            "output file missing after pipeline drain: {e}"
-        ))
+        RecordingError::GstPipeline(format!("output file missing after pipeline drain: {e}"))
     })?;
     let file_size_bytes = meta.len();
     let bytes = tokio::fs::read(&file_path).await?;
@@ -203,16 +202,13 @@ fn parse_file_url(source_url: &str) -> Result<PathBuf> {
 /// Build the segment recording pipeline programmatically. Using typed
 /// ElementFactory calls (instead of parse_launch) means caller-controlled
 /// strings — paths, URLs — can never be interpreted as pipeline syntax.
-fn build_segment_pipeline(
-    source_path: &Path,
-    output_path: &Path,
-) -> Result<gst::Pipeline> {
-    let source_str = source_path.to_str().ok_or_else(|| {
-        RecordingError::GstPipeline("source path is not valid UTF-8".into())
-    })?;
-    let output_str = output_path.to_str().ok_or_else(|| {
-        RecordingError::GstPipeline("output path is not valid UTF-8".into())
-    })?;
+fn build_segment_pipeline(source_path: &Path, output_path: &Path) -> Result<gst::Pipeline> {
+    let source_str = source_path
+        .to_str()
+        .ok_or_else(|| RecordingError::GstPipeline("source path is not valid UTF-8".into()))?;
+    let output_str = output_path
+        .to_str()
+        .ok_or_else(|| RecordingError::GstPipeline("output path is not valid UTF-8".into()))?;
 
     let pipeline = gst::Pipeline::with_name("tentaflow-segment");
 
@@ -239,7 +235,14 @@ fn build_segment_pipeline(
         .map_err(|e| RecordingError::GstPipeline(format!("filesink: {e}")))?;
 
     pipeline
-        .add_many([&filesrc, &decodebin, &videoconvert, &x264enc, &mp4mux, &filesink])
+        .add_many([
+            &filesrc,
+            &decodebin,
+            &videoconvert,
+            &x264enc,
+            &mp4mux,
+            &filesink,
+        ])
         .map_err(|e| RecordingError::GstPipeline(format!("add_many: {e}")))?;
 
     filesrc
@@ -297,10 +300,7 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::*;
 
-    fn temp_home_guard() -> (
-        std::sync::MutexGuard<'static, ()>,
-        tempfile::TempDir,
-    ) {
+    fn temp_home_guard() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
         let guard = super::super::storage::home_sandbox_lock();
         let d = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", d.path());
@@ -341,15 +341,18 @@ mod tests {
         // surface it as GstPipeline. The check has to drain at least one bus
         // message which can take longer than the 1 s duration on slow CI,
         // hence the explicit 3 s ceiling — still well under the test timeout.
-        let err =
-            save_segment_mp4("cam_seg", "file:///no/such/path/xyz.mp4", 3).await.unwrap_err();
+        let err = save_segment_mp4("cam_seg", "file:///no/such/path/xyz.mp4", 3)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RecordingError::GstPipeline(_)));
     }
 
     #[tokio::test]
     async fn test_save_segment_rejects_zero_duration() {
         let _home = temp_home_guard();
-        let err = save_segment_mp4("cam_seg", "file:///dev/null", 0).await.unwrap_err();
+        let err = save_segment_mp4("cam_seg", "file:///dev/null", 0)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RecordingError::GstPipeline(_)));
     }
 
@@ -386,7 +389,9 @@ mod tests {
             return;
         }
         let url = format!("file://{}", sample.canonicalize().unwrap().display());
-        let saved = save_segment_mp4("cam_seg", &url, 2).await.expect("record ok");
+        let saved = save_segment_mp4("cam_seg", &url, 2)
+            .await
+            .expect("record ok");
         assert!(saved.file_path.exists());
         assert!(saved.file_size_bytes > 0);
         assert_eq!(saved.hash_sha256.len(), 64);

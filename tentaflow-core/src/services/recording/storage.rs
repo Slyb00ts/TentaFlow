@@ -53,8 +53,8 @@ impl From<RecordingRef> for String {
 
 /// Resolve `~/.tentaflow/recordings`. Fails if `HOME` cannot be located.
 pub fn recording_base_dir() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| RecordingError::BaseDirUnavailable("HOME not set".into()))?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| RecordingError::BaseDirUnavailable("HOME not set".into()))?;
     Ok(home.join(".tentaflow").join("recordings"))
 }
 

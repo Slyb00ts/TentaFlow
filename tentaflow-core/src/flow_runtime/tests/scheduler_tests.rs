@@ -16,9 +16,7 @@ use std::time::Duration;
 use crate::db::DbPool;
 use crate::flow_runtime::parser::{compile, parse_flow_definition};
 use crate::flow_runtime::registry;
-use crate::flow_runtime::scheduler::{
-    FlowScheduler, InvokeError, DEFAULT_CONCURRENCY_CAP,
-};
+use crate::flow_runtime::scheduler::{FlowScheduler, InvokeError, DEFAULT_CONCURRENCY_CAP};
 use crate::flow_runtime::types::CompiledFlow;
 
 fn fresh_db() -> DbPool {
@@ -50,7 +48,14 @@ async fn invoke_unknown_flow_returns_not_found() {
     let sched = Arc::new(FlowScheduler::new(fresh_db()));
     let addon = unique_addon("notfound");
     let err = sched
-        .invoke(&addon, "ghost-flow", toml::Value::Table(Default::default()), 0, None, None)
+        .invoke(
+            &addon,
+            "ghost-flow",
+            toml::Value::Table(Default::default()),
+            0,
+            None,
+            None,
+        )
         .await
         .expect_err("unknown flow");
     match err {
@@ -204,7 +209,14 @@ async fn wait_ms_long_enough_returns_completed() {
     registry::global().register(&addon, make_flow(&flow_id));
 
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(0), 10_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Integer(0),
+            10_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(st.status, "completed");
@@ -305,7 +317,14 @@ async fn multi_input_operator_waits_all_eofs() {
     registry::global().register(&addon, flow);
 
     let st = sched
-        .invoke(&addon, &flow_id, toml::Value::String("payload".into()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::String("payload".into()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(st.status, "completed", "status: {:?}", st);
@@ -346,7 +365,8 @@ async fn cap_released_on_panic() {
         let a = addon.clone();
         let f = flow_id.clone();
         handles.push(tokio::spawn(async move {
-            s.invoke(&a, &f, toml::Value::Integer(0), 5_000, None, None).await
+            s.invoke(&a, &f, toml::Value::Integer(0), 5_000, None, None)
+                .await
         }));
     }
     for h in handles {
@@ -445,5 +465,8 @@ async fn concurrency_cap_zero_reverts_to_default() {
     sched.set_addon_concurrency_cap(&addon, 5);
     assert_eq!(sched.effective_concurrency_cap(&addon), 5);
     sched.set_addon_concurrency_cap(&addon, 0);
-    assert_eq!(sched.effective_concurrency_cap(&addon), DEFAULT_CONCURRENCY_CAP);
+    assert_eq!(
+        sched.effective_concurrency_cap(&addon),
+        DEFAULT_CONCURRENCY_CAP
+    );
 }

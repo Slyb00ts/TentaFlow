@@ -37,7 +37,10 @@ pub(crate) fn dispatch_error_to_core(
             message: format!("flow {flow_id} compile failed: {msg}"),
             source: None,
         },
-        DispatchError::Unsupported { service_type, model } => crate::error::CoreError::InternalError {
+        DispatchError::Unsupported {
+            service_type,
+            model,
+        } => crate::error::CoreError::InternalError {
             message: format!(
                 "synthetic dispatch unsupported for service_type='{service_type}', model='{model}'"
             ),
@@ -83,8 +86,10 @@ async fn build_initial_envelope_inner(
     blobs: &dyn crate::flow_engine::blob_store::BlobStore,
 ) -> Result<(FlowEnvelope, FlowRequestMeta)> {
     let mut env = FlowEnvelope::empty();
-    env.meta
-        .insert("model".into(), serde_json::Value::String(request.model.clone()));
+    env.meta.insert(
+        "model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
 
     // Etap 2: request seed params trafiają do envelope.meta. LlmNodeAdapter
     // czyta je przez fallback `node.config -> envelope.meta`, więc operator
@@ -92,15 +97,18 @@ async fn build_initial_envelope_inner(
     // = użyj wartości z requestu.
     if let Some(t) = request.temperature {
         if let Some(num) = serde_json::Number::from_f64(t as f64) {
-            env.meta.insert("temperature".into(), serde_json::Value::Number(num));
+            env.meta
+                .insert("temperature".into(), serde_json::Value::Number(num));
         }
     }
     if let Some(mt) = request.max_tokens {
-        env.meta.insert("max_tokens".into(), serde_json::Value::Number(mt.into()));
+        env.meta
+            .insert("max_tokens".into(), serde_json::Value::Number(mt.into()));
     }
     if let Some(tp) = request.top_p {
         if let Some(num) = serde_json::Number::from_f64(tp as f64) {
-            env.meta.insert("top_p".into(), serde_json::Value::Number(num));
+            env.meta
+                .insert("top_p".into(), serde_json::Value::Number(num));
         }
     }
     if let Some(fp) = request.frequency_penalty {
@@ -121,12 +129,7 @@ async fn build_initial_envelope_inner(
     // image fallback do payload Text per pre-3b zachowanie. HTTP/HTTPS
     // image URLs odrzucone z InvalidRequest (3b nie robi fetch).
     let mut found_image: Option<(crate::flow_engine::blob_store::BlobRef, String)> = None;
-    if let Some(last_user) = request
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-    {
+    if let Some(last_user) = request.messages.iter().rev().find(|m| m.role == "user") {
         if let Some(MessageContent::Parts(parts)) = &last_user.content {
             for p in parts {
                 if let ContentPart::ImageUrl { image_url } = p {
@@ -171,7 +174,8 @@ async fn build_initial_envelope_inner(
     if request.audio_input.is_some() {
         // R4.B: audio chat path. Stage 1d zapisuje sygnał w meta — pełny
         // multimodal trigger (Audio payload via BlobStore) wraca w stage 2.
-        env.meta.insert("has_audio_input".into(), serde_json::Value::Bool(true));
+        env.meta
+            .insert("has_audio_input".into(), serde_json::Value::Bool(true));
     }
 
     let mut meta = FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
@@ -228,12 +232,12 @@ fn decode_data_url(url: &str) -> Result<(Vec<u8>, String)> {
     }
     // data:image/jpeg;base64,<...>
     let body = &url[5..]; // skip "data:"
-    let (header, b64) = body.split_once(',').ok_or_else(|| {
-        crate::error::CoreError::InvalidRequest {
-            message: "data URL missing comma separator".to_string(),
-            details: None,
-        }
-    })?;
+    let (header, b64) =
+        body.split_once(',')
+            .ok_or_else(|| crate::error::CoreError::InvalidRequest {
+                message: "data URL missing comma separator".to_string(),
+                details: None,
+            })?;
     let mime = match header.split(';').next() {
         Some(m) if !m.is_empty() => m.to_string(),
         _ => {

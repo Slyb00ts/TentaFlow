@@ -507,9 +507,7 @@ async fn run_pull_loop(
                 handle_auth_failure(&supervisor, &camera_id, generation).await;
                 return;
             }
-            Err(OnvifError::SoapFault(ref fault))
-                if fault_indicates_dead_subscription(fault) =>
-            {
+            Err(OnvifError::SoapFault(ref fault)) if fault_indicates_dead_subscription(fault) => {
                 // Device dropped the subscription out from under us — recreate
                 // immediately instead of waiting for the renewal timer.
                 warn!(
@@ -563,12 +561,8 @@ async fn run_pull_loop(
 
     // Cancellation path — best-effort teardown so the camera releases its
     // subscription slot.
-    let _ = unsubscribe_pull_point(
-        &subscription.reference_uri,
-        &creds,
-        UNSUBSCRIBE_TIMEOUT_MS,
-    )
-    .await;
+    let _ =
+        unsubscribe_pull_point(&subscription.reference_uri, &creds, UNSUBSCRIBE_TIMEOUT_MS).await;
     audit_pull(&camera_id, "pull_stopped", Some("cancelled"));
 }
 
@@ -605,9 +599,7 @@ async fn handle_auth_failure(
         "metadata_supervisor: auth failed for '{}' gen={generation}, closing bus",
         camera_id
     );
-    metadata_bus()
-        .close_camera(camera_id, "auth_failed")
-        .await;
+    metadata_bus().close_camera(camera_id, "auth_failed").await;
     audit_pull(camera_id, "pull_stopped", Some("auth_failed"));
 }
 
@@ -650,10 +642,7 @@ mod tests {
     /// Inject a synthetic running task into the supervisor map without going
     /// through `create_pull_point_subscription` (which would need a real
     /// camera). Used to exercise refcount semantics in isolation.
-    fn install_synthetic_task(
-        sup: &MetadataPullSupervisor,
-        camera_id: &str,
-    ) -> CancellationToken {
+    fn install_synthetic_task(sup: &MetadataPullSupervisor, camera_id: &str) -> CancellationToken {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let join = tokio::spawn(async move {
@@ -779,7 +768,10 @@ mod tests {
         let sup = Arc::new(MetadataPullSupervisor::new());
         let a = sup.ensure_lock_for("cam_lock");
         let b = sup.ensure_lock_for("cam_lock");
-        assert!(Arc::ptr_eq(&a, &b), "same camera_id must hand back same Arc");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same camera_id must hand back same Arc"
+        );
         // Different camera_id must yield a distinct Arc.
         let c = sup.ensure_lock_for("cam_other");
         assert!(!Arc::ptr_eq(&a, &c));
@@ -849,9 +841,7 @@ mod tests {
         assert!(fault_indicates_dead_subscription("UnableToGetMessages"));
         assert!(fault_indicates_dead_subscription("ter:Expired"));
         assert!(fault_indicates_dead_subscription("NotFound"));
-        assert!(!fault_indicates_dead_subscription(
-            "ter:ActionNotSupported"
-        ));
+        assert!(!fault_indicates_dead_subscription("ter:ActionNotSupported"));
         assert!(!fault_indicates_dead_subscription(""));
     }
 

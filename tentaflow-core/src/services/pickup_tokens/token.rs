@@ -112,9 +112,7 @@ pub(crate) fn parse_and_verify_multi<'a, I>(
 where
     I: IntoIterator<Item = &'a [u8]>,
 {
-    let (payload_b64, sig_b64) = wire
-        .split_once('.')
-        .ok_or(PickupVerifyError::Malformed)?;
+    let (payload_b64, sig_b64) = wire.split_once('.').ok_or(PickupVerifyError::Malformed)?;
     if payload_b64.is_empty() || sig_b64.is_empty() {
         return Err(PickupVerifyError::Malformed);
     }
@@ -126,9 +124,7 @@ where
     for key in keys {
         any_key_seen = true;
         let expected = hmac_sign(key, payload_b64);
-        if provided.len() == expected.len()
-            && bool::from(provided.ct_eq(&expected))
-        {
+        if provided.len() == expected.len() && bool::from(provided.ct_eq(&expected)) {
             matched = true;
         }
     }
@@ -168,7 +164,8 @@ mod tests {
     fn sign_then_verify_roundtrip() {
         let t = sign_payload(&key(), &payload());
         let wire = t.wire();
-        let (decoded, _) = parse_and_verify_multi(std::iter::once(key().as_slice()), &wire).expect("verify ok");
+        let (decoded, _) =
+            parse_and_verify_multi(std::iter::once(key().as_slice()), &wire).expect("verify ok");
         assert_eq!(decoded, payload());
     }
 

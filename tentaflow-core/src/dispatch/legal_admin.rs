@@ -25,8 +25,8 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::db::legal_documents::list_by_org;
 use crate::services::legal::{
-    generate_rodo, mint_legal_url, revoke_document_async, RodoGenerationError,
-    RodoGenerationInput, RodoVariant,
+    generate_rodo, mint_legal_url, revoke_document_async, RodoGenerationError, RodoGenerationInput,
+    RodoVariant,
 };
 use crate::services::rbac::OrgContext;
 
@@ -48,10 +48,9 @@ struct GenerateRateLimiter {
 
 impl GenerateRateLimiter {
     fn check(&self, org_id: &str) -> Result<(), f64> {
-        let entry = self
-            .buckets
-            .entry(org_id.to_string())
-            .or_insert_with(|| Mutex::new(crate::util::token_bucket::TokenBucket::new(GENERATE_BURST)));
+        let entry = self.buckets.entry(org_id.to_string()).or_insert_with(|| {
+            Mutex::new(crate::util::token_bucket::TokenBucket::new(GENERATE_BURST))
+        });
         let mut bucket = entry.lock();
         let now = Instant::now();
         bucket
@@ -97,15 +96,21 @@ pub async fn legal_admin_dispatch(
     match payload {
         LegalAdminPayload::ListRequest(r) => {
             let resp = legal_documents_list_v1(ctx, r.clone()).await?;
-            Ok(MessageBody::LegalAdminBody(LegalAdminPayload::ListResponse(resp)))
+            Ok(MessageBody::LegalAdminBody(
+                LegalAdminPayload::ListResponse(resp),
+            ))
         }
         LegalAdminPayload::GenerateRequest(r) => {
             let resp = legal_document_generate_v1(ctx, r.clone()).await?;
-            Ok(MessageBody::LegalAdminBody(LegalAdminPayload::GenerateResponse(resp)))
+            Ok(MessageBody::LegalAdminBody(
+                LegalAdminPayload::GenerateResponse(resp),
+            ))
         }
         LegalAdminPayload::RevokeRequest(r) => {
             let resp = legal_document_revoke_v1(ctx, r.clone()).await?;
-            Ok(MessageBody::LegalAdminBody(LegalAdminPayload::RevokeResponse(resp)))
+            Ok(MessageBody::LegalAdminBody(
+                LegalAdminPayload::RevokeResponse(resp),
+            ))
         }
         LegalAdminPayload::ListResponse(_)
         | LegalAdminPayload::GenerateResponse(_)
@@ -166,16 +171,13 @@ async fn legal_documents_list_v1(
         let conn = db
             .lock()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-        list_by_org(&conn, &org_id, include_revoked)
-            .map_err(|e| {
-                tracing::warn!("legal_documents_list_v1 db error: {e}");
-                ProtocolError::internal("db_error")
-            })
+        list_by_org(&conn, &org_id, include_revoked).map_err(|e| {
+            tracing::warn!("legal_documents_list_v1 db error: {e}");
+            ProtocolError::internal("db_error")
+        })
     })
     .await
-    .map_err(|join_err| {
-        ProtocolError::internal(format!("blocking task join: {join_err}"))
-    })??;
+    .map_err(|join_err| ProtocolError::internal(format!("blocking task join: {join_err}")))??;
 
     let documents = rows
         .into_iter()
@@ -229,14 +231,12 @@ async fn legal_document_generate_v1(
     };
 
     let output = tokio::task::spawn_blocking(move || {
-        let conn = db
-            .lock()
-            .map_err(|_| {
-                RodoGenerationError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "db pool poisoned",
-                ))
-            })?;
+        let conn = db.lock().map_err(|_| {
+            RodoGenerationError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "db pool poisoned",
+            ))
+        })?;
         generate_rodo(&conn, &legal_root, &input, now_ms)
     })
     .await

@@ -59,9 +59,11 @@ fn svc_with_caps(
     s
 }
 
-fn registry_with(local_node: &str, local: Vec<ServiceInfo>, remote: Vec<(&str, Vec<ServiceInfo>)>)
-    -> MeshServicesRegistry
-{
+fn registry_with(
+    local_node: &str,
+    local: Vec<ServiceInfo>,
+    remote: Vec<(&str, Vec<ServiceInfo>)>,
+) -> MeshServicesRegistry {
     let reg = MeshServicesRegistry::new();
     reg.replace_local(local_node.to_string(), local);
     for (n, services) in remote {
@@ -147,12 +149,7 @@ fn service_list_combines_filters() {
         ],
         vec![("peerA", vec![svc(4, "peerA", "d", "llm", "running")])],
     );
-    let out = test_api::list_from_registry(
-        &reg,
-        Some("llm"),
-        Some("running"),
-        Some("local"),
-    );
+    let out = test_api::list_from_registry(&reg, Some("llm"), Some("running"), Some("local"));
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].display_name, "a");
 }
@@ -162,7 +159,14 @@ fn service_list_projects_capabilities_unique_sorted() {
     let reg = registry_with(
         "local",
         vec![{
-            let mut s = svc_with_caps(1, "local", "vision-a", "vision", "running", &["detect", "track"]);
+            let mut s = svc_with_caps(
+                1,
+                "local",
+                "vision-a",
+                "vision",
+                "running",
+                &["detect", "track"],
+            );
             s.models.push(ServiceModelEntry {
                 model_name: "extra".into(),
                 display_name: None,

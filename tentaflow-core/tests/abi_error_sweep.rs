@@ -262,9 +262,11 @@ async fn trigger_conflict_via_double_alias_owner() {
     if res.is_ok() {
         let conn = db.lock().unwrap();
         let owners: Vec<String> = conn
-            .prepare("SELECT owner_id FROM model_alias_owners mo \
+            .prepare(
+                "SELECT owner_id FROM model_alias_owners mo \
                       JOIN model_aliases ma ON ma.id = mo.alias_id \
-                      WHERE ma.alias = 'shared-conflict' AND mo.owner_id IS NOT NULL")
+                      WHERE ma.alias = 'shared-conflict' AND mo.owner_id IS NOT NULL",
+            )
             .unwrap()
             .query_map([], |r| r.get::<_, String>(0))
             .unwrap()

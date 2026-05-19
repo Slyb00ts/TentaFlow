@@ -49,7 +49,13 @@ fn fetch_alias_row(db: &DbPool, alias: &str) -> Option<(i64, String, i64)> {
     conn.query_row(
         "SELECT id, target_model, is_active FROM model_aliases WHERE alias = ?1",
         rusqlite::params![alias],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     )
     .ok()
 }
@@ -123,8 +129,15 @@ fn alias_get_nonexistent_returns_not_found() {
 #[test]
 fn alias_get_returns_owner_manual_for_manual_owned() {
     let db = make_core_db();
-    create_or_reactivate_model_alias(&db, "admin-alias", "model-a", "first_available", "manual", None)
-        .unwrap();
+    create_or_reactivate_model_alias(
+        &db,
+        "admin-alias",
+        "model-a",
+        "first_available",
+        "manual",
+        None,
+    )
+    .unwrap();
 
     let out = test_api::alias_get_internal(&db, "admin-alias", "any-addon").unwrap();
     assert_eq!(out["owner"], json!("manual"));
@@ -138,7 +151,14 @@ fn alias_get_excludes_old_calls_from_24h_window() {
 
     let now = chrono::Utc::now().timestamp();
     insert_alias_call(&db, alias_db_id, "old-calls", "model-w", false, now - 60);
-    insert_alias_call(&db, alias_db_id, "old-calls", "model-w", false, now - 90_000);
+    insert_alias_call(
+        &db,
+        alias_db_id,
+        "old-calls",
+        "model-w",
+        false,
+        now - 90_000,
+    );
     insert_alias_call(&db, alias_db_id, "old-calls", "model-w", true, now - 90_000);
 
     let out = test_api::alias_get_internal(&db, "old-calls", "w-addon").unwrap();
@@ -160,10 +180,7 @@ fn alias_list_owned_returns_only_caller_aliases() {
     let out_a = test_api::alias_list_owned_internal(&db, "addon-a").unwrap();
     let arr_a = out_a["aliases"].as_array().expect("array");
     assert_eq!(arr_a.len(), 2);
-    let ids_a: Vec<&str> = arr_a
-        .iter()
-        .map(|v| v["id"].as_str().unwrap())
-        .collect();
+    let ids_a: Vec<&str> = arr_a.iter().map(|v| v["id"].as_str().unwrap()).collect();
     assert!(ids_a.contains(&"a-one"));
     assert!(ids_a.contains(&"a-two"));
     assert!(!ids_a.contains(&"b-one"));
@@ -182,8 +199,15 @@ fn alias_list_owned_empty_when_no_aliases() {
 #[test]
 fn alias_list_owned_excludes_manual_aliases() {
     let db = make_core_db();
-    create_or_reactivate_model_alias(&db, "manual-x", "model-m", "first_available", "manual", None)
-        .unwrap();
+    create_or_reactivate_model_alias(
+        &db,
+        "manual-x",
+        "model-m",
+        "first_available",
+        "manual",
+        None,
+    )
+    .unwrap();
     install_addon_alias(&db, "addon-m", "addon-y", "model-y");
 
     let out = test_api::alias_list_owned_internal(&db, "addon-m").unwrap();
@@ -203,11 +227,17 @@ fn alias_get_strips_stats_for_cross_addon_caller() {
 
     let alias_db_id = fetch_alias_row(&db, "private-stats").unwrap().0;
     let now = chrono::Utc::now().timestamp();
-    insert_alias_call(&db, alias_db_id, "private-stats", "model-p", false, now - 10);
+    insert_alias_call(
+        &db,
+        alias_db_id,
+        "private-stats",
+        "model-p",
+        false,
+        now - 10,
+    );
     insert_alias_call(&db, alias_db_id, "private-stats", "model-p", true, now - 20);
 
-    let owner_view =
-        test_api::alias_get_internal(&db, "private-stats", "owner-addon").unwrap();
+    let owner_view = test_api::alias_get_internal(&db, "private-stats", "owner-addon").unwrap();
     assert_eq!(owner_view["calls_24h"], json!(2));
     assert_eq!(owner_view["fallback_calls_24h"], json!(1));
     assert_eq!(owner_view["last_used_target"], json!("model-p"));

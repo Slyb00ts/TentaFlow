@@ -135,8 +135,8 @@ pub async fn start_mesh_pipeline(
     // + iroh relay wystarczaja do discovery peerow. Na desktop respektujemy
     // `mesh.dht_enabled` z config.toml (default true) — uzytkownicy z ISP
     // blokujacym BitTorrent UDP moga wylaczyc i nie zalewac logow timeout-ami.
-    let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")))
-        && mesh_config.dht_enabled;
+    let enable_dht =
+        cfg!(not(any(target_os = "ios", target_os = "android"))) && mesh_config.dht_enabled;
     let relay_url = load_relay_url(db_pool.as_ref(), Some(mesh_config));
 
     // Wyczysc stare wpisy `trusted_contact:*` z martwym relay URL zanim
@@ -597,10 +597,8 @@ async fn handle_peer_connected(
             // F1b P3.B — push our HMAC issuer keys (pickup_token, frame_url,
             // recording_url) so the peer can verify tokens we mint. Only sent
             // to already-trusted peers; the receiver enforces the same gate.
-            let advertise =
-                crate::services::mesh_keys::sync::build_local_advertise(&local_node_id);
-            if let Some(bytes) = crate::services::mesh_keys::sync::encode_advertise(&advertise)
-            {
+            let advertise = crate::services::mesh_keys::sync::build_local_advertise(&local_node_id);
+            if let Some(bytes) = crate::services::mesh_keys::sync::encode_advertise(&advertise) {
                 if let Err(e) = qm_events.send_hmac_keys_sync(&node_id, &bytes).await {
                     warn!("Blad wysylania HmacKeysSync do {}: {}", node_id, e);
                 }
@@ -2049,8 +2047,7 @@ fn spawn_quic_event_handler(
                         );
                         continue;
                     }
-                    crate::services::frame_proxy::frame_proxy_client()
-                        .handle_response(payload);
+                    crate::services::frame_proxy::frame_proxy_client().handle_response(payload);
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

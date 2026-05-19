@@ -886,11 +886,21 @@ pub fn addon_network_rules_get(
     {
         return Err(ProtocolError::not_found("addon nie istnieje"));
     }
-    let cfg =
+    let mut cfg =
         repository::get_addon_network_config(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
     let declared_rows =
         repository::get_addon_declared_network_rules(&ctx.state.db, &payload.addon_id)
             .map_err(db_err)?;
+    let approved_hosts: std::collections::BTreeSet<String> = declared_rows
+        .iter()
+        .filter(|r| r.approved)
+        .map(|r| r.host.clone())
+        .collect();
+    for host in approved_hosts {
+        if !cfg.allowed_hosts.iter().any(|h| h == &host) {
+            cfg.allowed_hosts.push(host);
+        }
+    }
     let declared_rules =
         compute_declared_status(&declared_rows, &cfg.allowed_hosts, &cfg.blocked_hosts);
     Ok(MessageBody::AddonNetworkRulesGetResponseBody(
@@ -903,16 +913,8 @@ pub fn addon_network_rules_get(
     ))
 }
 
-/// Merges manifest-declared rules with admin allow/block lists and computes a
-/// per-rule status:
-/// - declared "allow" + host in allowed_hosts         -> "covered"
-/// - declared "allow" + host in blocked_hosts         -> "conflicting"
-/// - declared "allow" + host in neither               -> "missing"
-/// - declared "block" + host in allowed_hosts         -> "conflicting"
-/// - declared "block" + host elsewhere                -> "covered"
-///
-/// Current manifest schema has no explicit mode field, so every declared rule
-/// is treated as "allow" (the addon declares hosts it needs to reach).
+/// Merges manifest-declared rules with admin policy and the real `approved`
+/// flag used by host functions.
 fn compute_declared_status(
     declared: &[repository::AddonDeclaredNetworkRule],
     allowed: &[String],
@@ -924,19 +926,24 @@ fn compute_declared_status(
             let mode = "allow";
             let host_allowed = allowed.iter().any(|h| h == &r.host);
             let host_blocked = blocked.iter().any(|h| h == &r.host);
-            let status = match (mode, host_allowed, host_blocked) {
-                ("allow", true, _) => "covered",
-                ("allow", false, true) => "conflicting",
-                ("allow", false, false) => "missing",
-                ("block", true, _) => "conflicting",
-                ("block", _, _) => "covered",
-                _ => "missing",
+            let status = if host_blocked && (r.approved || host_allowed) {
+                "conflicting"
+            } else if host_blocked {
+                "missing"
+            } else if r.approved {
+                "covered"
+            } else {
+                "missing"
             };
             AddonNetworkRuleDecl {
+                rule_id: r.rule_id.clone(),
                 host: r.host.clone(),
                 port: Some(r.port),
+                protocol: r.protocol.clone(),
                 mode: mode.to_string(),
                 status: status.to_string(),
+                required: r.required,
+                approved: r.approved,
             }
         })
         .collect()
@@ -998,6 +1005,14 @@ pub fn addon_network_rules_set(
     };
     repository::set_addon_network_config(&ctx.state.db, &payload.addon_id, &new, updated_by)
         .map_err(db_err)?;
+    repository::set_addon_network_rule_approvals(
+        &ctx.state.db,
+        &payload.addon_id,
+        &payload.allowed_hosts,
+        &payload.blocked_hosts,
+        updated_by,
+    )
+    .map_err(db_err)?;
 
     // Policz diff hostow — GUI/audyt atwiej ogladaja delty niz pelne listy.
     let diff_hosts = |old_list: &[String], new_list: &[String]| -> (Vec<String>, Vec<String>) {
@@ -1092,18 +1107,20 @@ mod declared_status_tests {
     use super::*;
     use crate::db::repository::AddonDeclaredNetworkRule;
 
-    fn rule(host: &str) -> AddonDeclaredNetworkRule {
+    fn rule(host: &str, approved: bool) -> AddonDeclaredNetworkRule {
         AddonDeclaredNetworkRule {
+            rule_id: host.to_string(),
             host: host.to_string(),
             port: 443,
             protocol: "tcp".to_string(),
             required: true,
+            approved,
         }
     }
 
     #[test]
-    fn allow_covered_when_host_in_allowed() {
-        let declared = vec![rule("graph.microsoft.com")];
+    fn allow_covered_when_rule_approved() {
+        let declared = vec![rule("graph.microsoft.com", true)];
         let allowed = vec!["graph.microsoft.com".to_string()];
         let blocked: Vec<String> = vec![];
         let out = compute_declared_status(&declared, &allowed, &blocked);
@@ -1115,14 +1132,14 @@ mod declared_status_tests {
 
     #[test]
     fn allow_missing_when_host_absent() {
-        let declared = vec![rule("api.example.com")];
+        let declared = vec![rule("api.example.com", false)];
         let out = compute_declared_status(&declared, &[], &[]);
         assert_eq!(out[0].status, "missing");
     }
 
     #[test]
-    fn allow_conflicting_when_host_in_blocked() {
-        let declared = vec![rule("api.example.com")];
+    fn allow_conflicting_when_approved_host_in_blocked() {
+        let declared = vec![rule("api.example.com", true)];
         let blocked = vec!["api.example.com".to_string()];
         let out = compute_declared_status(&declared, &[], &blocked);
         assert_eq!(out[0].status, "conflicting");
@@ -1131,9 +1148,9 @@ mod declared_status_tests {
     #[test]
     fn multiple_rules_independent_status() {
         let declared = vec![
-            rule("a.example.com"),
-            rule("b.example.com"),
-            rule("c.example.com"),
+            rule("a.example.com", true),
+            rule("b.example.com", true),
+            rule("c.example.com", false),
         ];
         let allowed = vec!["a.example.com".to_string()];
         let blocked = vec!["b.example.com".to_string()];

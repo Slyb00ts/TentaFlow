@@ -23,11 +23,8 @@ use std::sync::Arc;
 /// Slot na `ModelRuntimeExecutor` — Router::new tworzy slot pusty, później
 /// (po skonstruowaniu executora) wpina przez `slot.write() = Some(...)`. LLM,
 /// embeddings i TTS dispatcher impls czytają slot leniwie przy każdym calls.
-pub type ModelRuntimeSlot = Arc<
-    parking_lot::RwLock<
-        Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
-    >,
->;
+pub type ModelRuntimeSlot =
+    Arc<parking_lot::RwLock<Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>>>;
 
 /// Buduje `UserContext` z opcjonalnych pól request DTO. Brak `user_id` =
 /// `None` (wewnętrzny / addon / mesh-reverse caller — ACL fail-open).

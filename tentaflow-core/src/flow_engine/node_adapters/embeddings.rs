@@ -304,7 +304,11 @@ mod tests {
         let recorded = fake.last_inputs.lock().unwrap().clone();
         assert_eq!(
             recorded,
-            vec!["first".to_string(), "second".to_string(), "third".to_string()]
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
         );
 
         match out.payload {

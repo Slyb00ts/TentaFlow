@@ -10,9 +10,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::LlmRequest;
-use crate::flow_engine::envelope::{
-    ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput,
-};
+use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, LlmAdapter, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -313,13 +311,9 @@ mod tests {
     #[test]
     fn pick_model_prefers_node_config_then_meta() {
         let mut env = FlowEnvelope::empty();
-        env.meta
-            .insert("model".into(), json!("envelope-model"));
+        env.meta.insert("model".into(), json!("envelope-model"));
         let n = node(json!({"model": "node-model"}));
-        assert_eq!(
-            LlmNodeAdapter::pick_model(&n, &env).unwrap(),
-            "node-model"
-        );
+        assert_eq!(LlmNodeAdapter::pick_model(&n, &env).unwrap(), "node-model");
         let n = node(json!({}));
         assert_eq!(
             LlmNodeAdapter::pick_model(&n, &env).unwrap(),

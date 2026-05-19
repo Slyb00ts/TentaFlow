@@ -94,11 +94,15 @@ impl Router {
         // aktywuje się gdy admin nie skonfigurował user-defined flow.
         // Direct executor.execute_tts fallback wycięty w 3d-0b-final.
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let (initial, meta) = crate::services::runtime::executor::tts_request_to_initial_envelope(
-                &cleaned_request,
-                user.clone(),
-            );
-            match dispatcher.try_dispatch(&cleaned_request.model, "tts", initial, meta).await {
+            let (initial, meta) =
+                crate::services::runtime::executor::tts_request_to_initial_envelope(
+                    &cleaned_request,
+                    user.clone(),
+                );
+            match dispatcher
+                .try_dispatch(&cleaned_request.model, "tts", initial, meta)
+                .await
+            {
                 Ok(outcome) => {
                     let result = crate::services::runtime::executor::flow_outcome_to_tts_result(
                         outcome,
@@ -202,7 +206,4 @@ impl Router {
             }
         }
     }
-
 }
-
-

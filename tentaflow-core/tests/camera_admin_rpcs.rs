@@ -435,47 +435,44 @@ async fn camera_add_onvif_rejects_invalid_inputs_without_calling_device() {
     let ctx = ctx_with_perms(state.clone(), &["camera.write"]);
 
     // Empty display_name.
-    let bad = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(
-        CameraAddOnvifRequest {
+    let bad =
+        MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(CameraAddOnvifRequest {
             display_name: "".into(),
             device_service_url: "http://192.0.2.10/onvif/device_service".into(),
             username: "admin".into(),
             password: "hunter2".into(),
             profile_token: None,
             target_fps: Some(15),
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&bad, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "display_name_empty");
 
     // FPS out of range.
-    let bad_fps = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(
-        CameraAddOnvifRequest {
+    let bad_fps =
+        MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(CameraAddOnvifRequest {
             display_name: "X".into(),
             device_service_url: "http://192.0.2.10/onvif/device_service".into(),
             username: "admin".into(),
             password: "hunter2".into(),
             profile_token: None,
             target_fps: Some(120),
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&bad_fps, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "target_fps_out_of_range");
 
     // Username with unsafe chars (would let an attacker smuggle a `@` into
     // the rtsp:// userinfo).
-    let bad_user = MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(
-        CameraAddOnvifRequest {
+    let bad_user =
+        MessageBody::CameraAdminBody(CameraAdminPayload::AddOnvifRequest(CameraAddOnvifRequest {
             display_name: "X".into(),
             device_service_url: "http://192.0.2.10/onvif/device_service".into(),
             username: "admin@evil".into(),
             password: "hunter2".into(),
             profile_token: None,
             target_fps: Some(15),
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&bad_user, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "username_invalid_chars");
@@ -513,9 +510,7 @@ fn insert_camera_row(state: &AppState, camera_id: &str, org_id: &str) {
 }
 
 fn push_frame(camera_id: &str) {
-    use tentaflow_core::services::frame_storage::{
-        FrameMetadata, FramePixelFormat, StoredFrame,
-    };
+    use tentaflow_core::services::frame_storage::{FrameMetadata, FramePixelFormat, StoredFrame};
     let frame = StoredFrame {
         metadata: FrameMetadata {
             camera_id: camera_id.to_string(),
@@ -539,12 +534,11 @@ async fn frame_url_rejects_invalid_uuid() {
     let state = AppState::for_test();
     let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
 
-    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let req =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: "not-a-uuid".to_string(),
             ttl_secs: 30,
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&req, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "camera_id_invalid_format");
@@ -567,12 +561,11 @@ async fn frame_url_rejects_cross_org_camera() {
 
     let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
 
-    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let req =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: VALID_UUID_A.to_string(),
             ttl_secs: 30,
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&req, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::NotFound);
     assert_eq!(err.message, "camera_not_found");
@@ -594,23 +587,21 @@ async fn frame_url_rejects_ttl_out_of_range() {
     let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
 
     // Below the dispatch floor (5 secs).
-    let too_low = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let too_low =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: VALID_UUID_B.to_string(),
             ttl_secs: 4,
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&too_low, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "ttl_secs_out_of_range");
 
     // Above the dispatch ceiling (300 secs).
-    let too_high = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let too_high =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: VALID_UUID_B.to_string(),
             ttl_secs: 301,
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&too_high, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "ttl_secs_out_of_range");
@@ -630,12 +621,11 @@ async fn frame_url_rate_limit_per_user() {
     if let Some(oc) = ctx.org_context.as_mut() {
         oc.org_id = unique_org.to_string();
     }
-    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let req =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: VALID_UUID_A.to_string(),
             ttl_secs: 30,
-        },
-    ));
+        }));
 
     // Burst capacity = 30. The first 30 calls drain the bucket; refill at
     // 0.5 tok/s is too slow to replenish during a tight test loop.
@@ -661,12 +651,11 @@ async fn frame_url_rejects_unknown_prefix() {
     let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
 
     // Same length as `cam_<uuid v4>` (40 chars) but the wrong 4-byte prefix.
-    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let req =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: "foo_550e8400-e29b-41d4-a716-446655440000".to_string(),
             ttl_secs: 30,
-        },
-    ));
+        }));
     let err = expect_error(camera_admin_dispatch(&req, &ctx).await);
     assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     assert_eq!(err.message, "camera_id_invalid_format");
@@ -681,12 +670,11 @@ async fn frame_url_accepts_cam_prefix_uuid() {
     push_frame(VALID_UUID_B);
     let ctx = ctx_with_perms(state.clone(), &["camera.read"]);
 
-    let req = MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(
-        CameraFrameUrlRequest {
+    let req =
+        MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlRequest(CameraFrameUrlRequest {
             camera_id: VALID_UUID_B.to_string(),
             ttl_secs: 30,
-        },
-    ));
+        }));
     let out = camera_admin_dispatch(&req, &ctx).await.expect("ok");
     match out {
         MessageBody::CameraAdminBody(CameraAdminPayload::FrameUrlResponse(r)) => {

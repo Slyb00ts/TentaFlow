@@ -22,8 +22,8 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    close_outbound, emit_op_audit, next_record, read_param_string, toml_to_json,
-    OperatorContext, OperatorError, OutboundEdge,
+    close_outbound, emit_op_audit, next_record, read_param_string, toml_to_json, OperatorContext,
+    OperatorError, OutboundEdge,
 };
 use crate::addon::event_publish::publish_event;
 use crate::addon::storage_sql_exec::exec_for_addon;
@@ -54,19 +54,20 @@ pub async fn run(
     outbound: Vec<OutboundEdge>,
     cancel: CancellationToken,
 ) -> Result<(), OperatorError> {
-    let kind_str = read_param_string(&ctx.params, "kind")
-        .unwrap_or_else(|| "invocation_result".to_string());
+    let kind_str =
+        read_param_string(&ctx.params, "kind").unwrap_or_else(|| "invocation_result".to_string());
     let kind = parse_kind(&kind_str)
         .ok_or_else(|| OperatorError::BadParams(format!("sink: unknown kind '{kind_str}'")))?;
 
     // Kind-specific param validation up front so a missing topic / query
     // fails the flow before pulling any record.
-    let topic = match kind {
-        SinkKind::Event => Some(read_param_string(&ctx.params, "topic").ok_or_else(|| {
-            OperatorError::BadParams("sink event: 'topic' required".to_string())
-        })?),
-        _ => None,
-    };
+    let topic =
+        match kind {
+            SinkKind::Event => Some(read_param_string(&ctx.params, "topic").ok_or_else(|| {
+                OperatorError::BadParams("sink event: 'topic' required".to_string())
+            })?),
+            _ => None,
+        };
     let query = match kind {
         SinkKind::SqlExec => {
             if !ctx.permissions.iter().any(|p| p == "sql.write") {
@@ -81,9 +82,9 @@ pub async fn run(
         _ => None,
     };
     let ui_level = match kind {
-        SinkKind::UiNotify => Some(
-            read_param_string(&ctx.params, "level").unwrap_or_else(|| "info".to_string()),
-        ),
+        SinkKind::UiNotify => {
+            Some(read_param_string(&ctx.params, "level").unwrap_or_else(|| "info".to_string()))
+        }
         _ => None,
     };
     let ui_message = match kind {

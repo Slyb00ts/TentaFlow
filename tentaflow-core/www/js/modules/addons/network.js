@@ -50,12 +50,16 @@ function normalizeDeclared(v) {
   if (!Array.isArray(v)) return [];
   return v
     .map((r) => ({
+      ruleId: String(r?.ruleId ?? r?.rule_id ?? '').trim(),
       host: String(r?.host ?? '').trim(),
       port: Number.isFinite(Number(r?.port)) ? Number(r.port) : null,
+      protocol: String(r?.protocol ?? 'tcp').toLowerCase(),
       mode: String(r?.mode ?? 'allow').toLowerCase() === 'block' ? 'block' : 'allow',
       status: ['covered', 'missing', 'conflicting'].includes(String(r?.status))
         ? String(r.status)
         : 'missing',
+      required: !!r?.required,
+      approved: !!r?.approved,
     }))
     .filter((r) => r.host.length > 0);
 }
@@ -118,12 +122,19 @@ function renderDeclaredSection() {
 
 function renderDeclaredRow(rule) {
   const statusChip = renderStatusChip(rule.status);
+  const approvalChip = rule.approved
+    ? `<tf-chip status="ok">${escapeHtml(I18n.t('addon_network.approved'))}</tf-chip>`
+    : `<tf-chip status="warn">${escapeHtml(I18n.t('addon_network.not_approved'))}</tf-chip>`;
+  const requiredChip = rule.required
+    ? `<tf-chip status="warn">${escapeHtml(I18n.t('addon_network.required'))}</tf-chip>`
+    : '';
   const modeChip = rule.mode === 'block'
     ? `<tf-chip status="warn">${escapeHtml(I18n.t('addon_network.col_mode'))}: block</tf-chip>`
     : `<tf-chip status="info">${escapeHtml(I18n.t('addon_network.col_mode'))}: allow</tf-chip>`;
   const port = rule.port != null
     ? `<span class="port">:${escapeHtml(String(rule.port))}</span>`
     : '';
+  const protocol = `<span class="protocol">${escapeHtml(rule.protocol)}</span>`;
   const quickAction = rule.status === 'missing'
     ? `<tf-button variant="ghost" size="small" icon="plus"
           class="quick-action" data-quick-allow="${escapeAttr(rule.host)}">
@@ -132,9 +143,12 @@ function renderDeclaredRow(rule) {
     : '';
   return `
     <div class="network-declared-row">
+      ${protocol}
       <span class="host">${escapeHtml(rule.host)}</span>
       ${port}
       ${modeChip}
+      ${requiredChip}
+      ${approvalChip}
       ${statusChip}
       ${quickAction}
     </div>

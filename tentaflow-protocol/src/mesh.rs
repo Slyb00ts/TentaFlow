@@ -211,7 +211,6 @@ pub enum MeshMessage {
         node_ids: Vec<String>,
         strategy: String,
     },
-
 }
 
 // =============================================================================

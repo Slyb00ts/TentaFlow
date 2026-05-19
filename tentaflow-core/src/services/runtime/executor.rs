@@ -36,8 +36,7 @@ use crate::services::runtime::target::ResolvedExecutionTarget;
 /// Strumien chunkow zwracany przez `stream_chat`. Boxed `Pin<Box<dyn Stream>>`
 /// zeby caller mog go zapakowac w SSE bez wiedzy o konkretnym typie strumienia
 /// (kazdy backend transport produkuje inny typ wewnetrznie).
-pub type ExecutorChunkStream =
-    Pin<Box<dyn Stream<Item = CoreResult<ChatCompletionChunk>> + Send>>;
+pub type ExecutorChunkStream = Pin<Box<dyn Stream<Item = CoreResult<ChatCompletionChunk>> + Send>>;
 
 /// Errors visible to the caller. Every variant maps onto a user-facing
 /// outcome — `model_capability_unsupported` from the resolver, transport
@@ -94,9 +93,7 @@ impl ExecutorError {
     fn aborts_fallback_chain(&self) -> bool {
         matches!(
             self,
-            Self::FlowDispatcherUnavailable
-                | Self::SttRuntimeUnavailable
-                | Self::SttBackend(_)
+            Self::FlowDispatcherUnavailable | Self::SttRuntimeUnavailable | Self::SttBackend(_)
         )
     }
 }
@@ -124,9 +121,7 @@ pub struct ModelRuntimeExecutor {
     /// `None` for DB-less / no-mesh routers; the dispatcher returns
     /// `TransportPendingCutover` so the caller can pick the next
     /// candidate or take the legacy fallback.
-    mesh_manager: Arc<
-        parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>,
-    >,
+    mesh_manager: Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
     /// Per-alias round-robin state keyed by alias name. `DashMap` so we
     /// can mutate per-key without serialising the whole map.
     strategy_state: Arc<dashmap::DashMap<String, Arc<StrategyState>>>,
@@ -187,7 +182,10 @@ impl ModelRuntimeExecutor {
         for target in ranked {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self.dispatch_chat_blocking(&target, request.clone(), ctx).await {
+            match self
+                .dispatch_chat_blocking(&target, request.clone(), ctx)
+                .await
+            {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
@@ -268,7 +266,10 @@ impl ModelRuntimeExecutor {
         for target in ranked {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self.dispatch_chat_stream(&target, request.clone(), ctx).await {
+            match self
+                .dispatch_chat_stream(&target, request.clone(), ctx)
+                .await
+            {
                 Ok(stream) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
@@ -391,31 +392,33 @@ impl ModelRuntimeExecutor {
                         async move {
                             match chunk_result {
                                 Ok(stream_chunk) => match stream_chunk.chunk {
-                                    StreamChunkType::TextDelta(text) => Some(Ok(ChatCompletionChunk {
-                                        id: chat_id,
-                                        object: "chat.completion.chunk".to_string(),
-                                        created,
-                                        model,
-                                        choices: vec![ChunkChoice {
-                                            index: 0,
-                                            delta: Delta {
-                                                role: None,
-                                                content: Some(text),
-                                                reasoning_content: None,
-                                                tool_calls: None,
-                                            },
-                                            finish_reason: None,
-                                            logprobs: None,
-                                        }],
-                                        system_fingerprint: None,
-                                        audio: None,
-                                        detected_intent: None,
-                                        detected_tools: None,
-                                        transcribed_text: None,
-                                        speaker_id: None,
-                                        speaker_name: None,
-                                        usage: None,
-                                    })),
+                                    StreamChunkType::TextDelta(text) => {
+                                        Some(Ok(ChatCompletionChunk {
+                                            id: chat_id,
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model,
+                                            choices: vec![ChunkChoice {
+                                                index: 0,
+                                                delta: Delta {
+                                                    role: None,
+                                                    content: Some(text),
+                                                    reasoning_content: None,
+                                                    tool_calls: None,
+                                                },
+                                                finish_reason: None,
+                                                logprobs: None,
+                                            }],
+                                            system_fingerprint: None,
+                                            audio: None,
+                                            detected_intent: None,
+                                            detected_tools: None,
+                                            transcribed_text: None,
+                                            speaker_id: None,
+                                            speaker_name: None,
+                                            usage: None,
+                                        }))
+                                    }
                                     StreamChunkType::ReasoningDelta(reasoning) => {
                                         Some(Ok(ChatCompletionChunk {
                                             id: chat_id,
@@ -451,7 +454,8 @@ impl ModelRuntimeExecutor {
                                         // przepuścić to pole na wire (gdy klient
                                         // poprosił `stream_options.include_usage=true`)
                                         // czy stripować je back-compat default.
-                                        let usage = extract_completion_usage(final_metrics.as_ref());
+                                        let usage =
+                                            extract_completion_usage(final_metrics.as_ref());
                                         Some(Ok(ChatCompletionChunk {
                                             id: chat_id,
                                             object: "chat.completion.chunk".to_string(),
@@ -497,9 +501,10 @@ impl ModelRuntimeExecutor {
                 ctx.enter_hop().map_err(|e| {
                     ExecutorError::Internal(format!("mesh forward stream hop limit: {}", e))
                 })?;
-                let mesh = self.mesh_manager.read().clone().ok_or_else(|| {
-                    ExecutorError::TransportPendingCutover("mesh_forward_stream")
-                })?;
+                let mesh =
+                    self.mesh_manager.read().clone().ok_or_else(|| {
+                        ExecutorError::TransportPendingCutover("mesh_forward_stream")
+                    })?;
                 let protocol_messages =
                     crate::routing::openai_messages_to_protocol(&request.messages);
                 let request_id = uuid::Uuid::new_v4().to_string();
@@ -538,42 +543,36 @@ impl ModelRuntimeExecutor {
                     .forward_stream_request(node_id, &request_id, payload)
                     .await
                     .map_err(|e| {
-                        ExecutorError::Internal(format!(
-                            "mesh forward stream request: {}",
-                            e
-                        ))
+                        ExecutorError::Internal(format!("mesh forward stream request: {}", e))
                     })?;
                 let backend_url = format!("mesh://{}", node_id);
                 let protocol_stream = frame_stream.map(move |frame_result| {
-                    let frame = frame_result.map_err(|e| {
-                        crate::error::CoreError::NetworkError {
+                    let frame =
+                        frame_result.map_err(|e| crate::error::CoreError::NetworkError {
                             message: format!("mesh stream read: {}", e),
                             source: e,
-                        }
-                    })?;
-                    let archived = rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(
-                        &frame,
-                    )
-                    .map_err(|e| crate::error::CoreError::BackendError {
-                        backend_url: backend_url.clone(),
-                        message: format!("mesh stream access ModelStreamChunk: {}", e),
-                        source: None,
-                    })?;
+                        })?;
+                    let archived =
+                        rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&frame)
+                            .map_err(|e| crate::error::CoreError::BackendError {
+                                backend_url: backend_url.clone(),
+                                message: format!("mesh stream access ModelStreamChunk: {}", e),
+                                source: None,
+                            })?;
                     rkyv::deserialize::<ModelStreamChunk, rkyv::rancor::Error>(archived).map_err(
                         |e| crate::error::CoreError::BackendError {
                             backend_url: backend_url.clone(),
-                            message: format!(
-                                "mesh stream deserialize ModelStreamChunk: {}",
-                                e
-                            ),
+                            message: format!("mesh stream deserialize ModelStreamChunk: {}", e),
                             source: None,
                         },
                     )
                 });
-                Ok(crate::routing::stream_helpers::quic_stream_to_openai_chunks(
-                    protocol_stream,
-                    target_model,
-                ))
+                Ok(
+                    crate::routing::stream_helpers::quic_stream_to_openai_chunks(
+                        protocol_stream,
+                        target_model,
+                    ),
+                )
             }
             ResolvedExecutionTarget::Flow { .. } => {
                 Err(ExecutorError::TransportPendingCutover("flow_stream"))
@@ -609,7 +608,11 @@ impl ModelRuntimeExecutor {
         // Required modality slice — slot-allocate to keep the lifetime
         // bound to the request. Empty when only text in / text out.
         let inputs: &'a [InputModality] = match (needs_audio, needs_image) {
-            (true, true) => &[InputModality::Audio, InputModality::Image, InputModality::Text],
+            (true, true) => &[
+                InputModality::Audio,
+                InputModality::Image,
+                InputModality::Text,
+            ],
             (true, false) => &[InputModality::Audio, InputModality::Text],
             (false, true) => &[InputModality::Image, InputModality::Text],
             (false, false) => &[],
@@ -674,9 +677,7 @@ impl ModelRuntimeExecutor {
                     .chat_completion(request)
                     .await
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
-                BackendHandle::Quic(handle) => {
-                    Self::dispatch_chat_quic(handle, request).await
-                }
+                BackendHandle::Quic(handle) => Self::dispatch_chat_quic(handle, request).await,
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,
@@ -708,9 +709,7 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let response = self
-                    .forward_via_mesh(node_id, model_request, ctx)
-                    .await?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
                 match response.result {
                     ModelResult::Completion(completion) => Ok(ChatCompletionResponse {
                         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -771,9 +770,8 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id).map_err(|e| {
-                    ExecutorError::Internal(format!("flow recursion limit: {}", e))
-                })?;
+                ctx.enter_flow(*flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
 
                 // Pair `enter_flow` with `leave_flow` on every exit path
                 // — a dispatcher failure must not leave the recursion
@@ -790,19 +788,18 @@ impl ModelRuntimeExecutor {
                 let dispatch_result = {
                     let user = ctx.user.clone();
                     let blobs = dispatcher.blobs();
-                    let (initial, meta) = crate::routing::build_initial_envelope_for_user(
-                        &request, user, &blobs,
-                    )
-                    .await
-                    .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
+                    let (initial, meta) =
+                        crate::routing::build_initial_envelope_for_user(&request, user, &blobs)
+                            .await
+                            .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
                     dispatcher
                         .dispatch_by_flow_id(*flow_id, initial, meta)
                         .await
                 };
                 ctx.leave_flow();
 
-                let outcome = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
                 Ok(crate::routing::chat::flow_outcome_to_chat_response(
                     outcome,
@@ -827,13 +824,14 @@ impl ModelRuntimeExecutor {
     ) -> Result<tentaflow_protocol::ModelResponse, ExecutorError> {
         use tentaflow_protocol::*;
 
-        ctx.enter_hop().map_err(|e| {
-            ExecutorError::Internal(format!("mesh forward hop limit: {}", e))
-        })?;
+        ctx.enter_hop()
+            .map_err(|e| ExecutorError::Internal(format!("mesh forward hop limit: {}", e)))?;
 
-        let mesh = self.mesh_manager.read().clone().ok_or_else(|| {
-            ExecutorError::TransportPendingCutover("mesh_forward")
-        })?;
+        let mesh = self
+            .mesh_manager
+            .read()
+            .clone()
+            .ok_or_else(|| ExecutorError::TransportPendingCutover("mesh_forward"))?;
 
         // Codex R3b.7 H1 (defense in depth): re-verify trust on the
         // executor side too. Underlying transport already checks but a
@@ -861,20 +859,16 @@ impl ModelRuntimeExecutor {
 
         let request_id = model_request.request_id.clone();
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&model_request)
-            .map_err(|e| {
-                ExecutorError::Internal(format!("mesh forward serialize: {}", e))
-            })?
+            .map_err(|e| ExecutorError::Internal(format!("mesh forward serialize: {}", e)))?
             .into_vec();
         let response_bytes = mesh
             .forward_request(target_node_id, &request_id, payload)
             .await
             .map_err(|e| ExecutorError::Internal(format!("mesh forward request: {}", e)))?;
-        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(
-            &response_bytes,
-        )
-        .map_err(|e| {
-            ExecutorError::Internal(format!("mesh forward access ModelResponse: {}", e))
-        })?;
+        let archived = rkyv::access::<ArchivedModelResponse, rkyv::rancor::Error>(&response_bytes)
+            .map_err(|e| {
+                ExecutorError::Internal(format!("mesh forward access ModelResponse: {}", e))
+            })?;
         rkyv::deserialize::<ModelResponse, rkyv::rancor::Error>(archived).map_err(|e| {
             ExecutorError::Internal(format!("mesh forward deserialize ModelResponse: {}", e))
         })
@@ -900,8 +894,7 @@ impl ModelRuntimeExecutor {
             ))
         })?;
 
-        let protocol_messages =
-            crate::routing::openai_messages_to_protocol(&request.messages);
+        let protocol_messages = crate::routing::openai_messages_to_protocol(&request.messages);
         let request_id = uuid::Uuid::new_v4().to_string();
         let model_request = ModelRequest {
             request_id: request_id.clone(),
@@ -1186,9 +1179,7 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let response = self
-                    .forward_via_mesh(node_id, model_request, ctx)
-                    .await?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
                 match response.result {
                     ModelResult::Embeddings(result) => {
                         // Codex R3b.7 M2: cardinality guard. Peer that
@@ -1248,21 +1239,19 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id).map_err(|e| {
-                    ExecutorError::Internal(format!("flow recursion limit: {}", e))
-                })?;
+                ctx.enter_flow(*flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
                 // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
                 // Without this `dispatch_by_flow_id` sees `user_id = None`
                 // and skips the per-flow ACL check.
-                let (initial, meta) = embeddings_request_to_initial_envelope(
-                    &request, ctx.user.clone(),
-                );
+                let (initial, meta) =
+                    embeddings_request_to_initial_envelope(&request, ctx.user.clone());
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(*flow_id, initial, meta)
                     .await;
                 ctx.leave_flow();
-                let outcome = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
                 let expected_count = match &request.input {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
@@ -1400,8 +1389,8 @@ impl ModelRuntimeExecutor {
                     let model_name_owned = model_name.clone();
                     let text = request.input.clone();
                     let speed = request.speed.unwrap_or(1.0);
-                    let res = tokio::task::spawn_blocking(
-                        move || -> anyhow::Result<(Vec<f32>, u32)> {
+                    let res =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, u32)> {
                             let mgr = crate::tts::shared_tts_manager();
                             let guard = mgr.blocking_read();
                             // Some embedded engines (apple-tts) honour
@@ -1419,11 +1408,10 @@ impl ModelRuntimeExecutor {
                                 },
                             )?;
                             Ok((out.samples, out.sample_rate))
-                        },
-                    )
-                    .await
-                    .map_err(|e| ExecutorError::Internal(format!("embedded TTS join: {e}")))?
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        })
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("embedded TTS join: {e}")))?
+                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                     let (samples, sr) = res;
                     Ok(TtsExecutionResult {
                         bytes: samples_to_wav_pcm16(&samples, sr),
@@ -1448,7 +1436,10 @@ impl ModelRuntimeExecutor {
                             handle.config.name
                         ))
                     })?;
-                    let format = request.response_format.clone().unwrap_or_else(|| "wav".into());
+                    let format = request
+                        .response_format
+                        .clone()
+                        .unwrap_or_else(|| "wav".into());
                     let speed = request.speed.unwrap_or(1.0);
                     let model_request = ModelRequest {
                         request_id: uuid::Uuid::new_v4().to_string(),
@@ -1494,7 +1485,10 @@ impl ModelRuntimeExecutor {
                 model_name,
                 ..
             } => {
-                let format = request.response_format.clone().unwrap_or_else(|| "wav".into());
+                let format = request
+                    .response_format
+                    .clone()
+                    .unwrap_or_else(|| "wav".into());
                 let model_request = ModelRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
                     payload: ModelPayload::Audio(AudioPayload {
@@ -1511,14 +1505,10 @@ impl ModelRuntimeExecutor {
                     metadata: None,
                     session_id: None,
                 };
-                let response = self
-                    .forward_via_mesh(node_id, model_request, ctx)
-                    .await?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
                 match response.result {
                     ModelResult::Audio(audio_result) => match audio_result.data {
-                        AudioResultData::Audio(bytes) => {
-                            Ok(TtsExecutionResult { bytes, format })
-                        }
+                        AudioResultData::Audio(bytes) => Ok(TtsExecutionResult { bytes, format }),
                         _ => Err(ExecutorError::Internal(
                             "mesh TTS returned non-audio result".into(),
                         )),
@@ -1537,16 +1527,15 @@ impl ModelRuntimeExecutor {
                     .flow_dispatcher
                     .as_ref()
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
-                ctx.enter_flow(*flow_id).map_err(|e| {
-                    ExecutorError::Internal(format!("flow recursion limit: {e}"))
-                })?;
-                let (initial, meta) =
-                    tts_request_to_initial_envelope(&request, ctx.user.clone());
-                let dispatch_result =
-                    dispatcher.dispatch_by_flow_id(*flow_id, initial, meta).await;
+                ctx.enter_flow(*flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {e}")))?;
+                let (initial, meta) = tts_request_to_initial_envelope(&request, ctx.user.clone());
+                let dispatch_result = dispatcher
+                    .dispatch_by_flow_id(*flow_id, initial, meta)
+                    .await;
                 ctx.leave_flow();
-                let outcome = dispatch_result
-                    .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
                 flow_outcome_to_tts_result(outcome, dispatcher.blobs()).await
             }
         }
@@ -1576,9 +1565,11 @@ impl ModelRuntimeExecutor {
         request: TranscriptionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<TranscriptionResponse, ExecutorError> {
-        let runtime = self.stt_runtime.read().clone().ok_or_else(|| {
-            ExecutorError::SttRuntimeUnavailable
-        })?;
+        let runtime = self
+            .stt_runtime
+            .read()
+            .clone()
+            .ok_or_else(|| ExecutorError::SttRuntimeUnavailable)?;
 
         // Pusty model = bezposredni fallback do default local whisper
         // (handler `/v1/audio/transcriptions` bez `model` field — legacy
@@ -1595,7 +1586,9 @@ impl ModelRuntimeExecutor {
         let outcome = match self.resolver.resolve(&req, &snapshot, ctx) {
             Ok(o) => o,
             Err(crate::services::runtime::resolver::ResolveError::UnknownModel(_))
-            | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported { .. }) => {
+            | Err(crate::services::runtime::resolver::ResolveError::CapabilityUnsupported {
+                ..
+            }) => {
                 // Legacy single-node bez catalog STT entries: client wysyla
                 // `model="whisper-1"` (default), katalog nie ma takiego
                 // wpisu — fallback do default local whisper zamiast hard
@@ -1814,9 +1807,10 @@ pub(crate) async fn flow_outcome_to_tts_result(
     use crate::flow_engine::envelope::FlowValue;
     match outcome.final_envelope.payload {
         FlowValue::Audio { blob_ref, mime, .. } => {
-            let bytes = blobs.get(&blob_ref).await.map_err(|e| {
-                ExecutorError::Internal(format!("tts flow blob read: {e}"))
-            })?;
+            let bytes = blobs
+                .get(&blob_ref)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("tts flow blob read: {e}")))?;
             let format = tts_mime_to_format(&mime)?;
             Ok(TtsExecutionResult { bytes, format })
         }
@@ -1926,7 +1920,11 @@ pub(crate) async fn stt_request_to_initial_envelope(
 }
 
 fn mime_for_filename(filename: &str) -> String {
-    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "wav" => "audio/wav".to_string(),
         "mp3" => "audio/mpeg".to_string(),
@@ -2042,21 +2040,14 @@ mod tests {
         // Codex R3b.5+6 M2: SttRuntimeUnavailable is the **only** STT
         // failure where the caller may try the legacy path.
         assert!(ExecutorError::SttRuntimeUnavailable.aborts_fallback_chain());
-        assert!(
-            !ExecutorError::AllCandidatesFailed {
-                target_kind: "x",
-                attempts: 1,
-                last_error: "y".into(),
-            }
-            .aborts_fallback_chain()
-        );
-        assert!(
-            !ExecutorError::Internal("z".into()).aborts_fallback_chain()
-        );
-        assert!(
-            !ExecutorError::FlowEmptyResult { model: "m".into() }
-                .aborts_fallback_chain()
-        );
+        assert!(!ExecutorError::AllCandidatesFailed {
+            target_kind: "x",
+            attempts: 1,
+            last_error: "y".into(),
+        }
+        .aborts_fallback_chain());
+        assert!(!ExecutorError::Internal("z".into()).aborts_fallback_chain());
+        assert!(!ExecutorError::FlowEmptyResult { model: "m".into() }.aborts_fallback_chain());
     }
 
     // R3b.1: `dispatch_embeddings_blocking` per-target tests. Branches without
@@ -2082,11 +2073,9 @@ mod tests {
             handles,
             "local-node".to_string(),
         ));
-        let local_inference = Arc::new(
-            crate::inference::local::LocalInferenceHandler::new(
-                crate::inference::shared_inference_manager(),
-            ),
-        );
+        let local_inference = Arc::new(crate::inference::local::LocalInferenceHandler::new(
+            crate::inference::shared_inference_manager(),
+        ));
         let stt_slot = Arc::new(parking_lot::RwLock::new(None));
         let mesh_slot = Arc::new(parking_lot::RwLock::new(None));
         ModelRuntimeExecutor::new(
@@ -2107,7 +2096,8 @@ mod tests {
     #[tokio::test]
     async fn embeddings_embedded_routes_through_local_inference() {
         let exec = dummy_executor();
-        let target = ResolvedExecutionTarget::Local { service_id: 1,
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
             model_name: "qwen-emb".into(),
             handle: BackendHandle::Embedded {
                 model_name: "qwen-emb".into(),
@@ -2178,9 +2168,7 @@ mod tests {
     fn batch_request(model: &str, count: usize) -> EmbeddingRequest {
         EmbeddingRequest {
             model: model.to_string(),
-            input: EmbeddingInput::Multiple(
-                (0..count).map(|i| format!("text-{i}")).collect(),
-            ),
+            input: EmbeddingInput::Multiple((0..count).map(|i| format!("text-{i}")).collect()),
             encoding_format: None,
             dimensions: None,
             user: None,
@@ -2191,9 +2179,10 @@ mod tests {
     #[test]
     fn flow_outcome_extracts_single_embedding_for_single_input() {
         let request = make_request("any");
-        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Embedding(
-            vec![0.1, 0.2, 0.3],
-        ));
+        let outcome =
+            outcome_with_payload(crate::flow_engine::envelope::FlowValue::Embedding(vec![
+                0.1, 0.2, 0.3,
+            ]));
         let resp = flow_outcome_to_embedding_response(outcome, &request, 1).expect("single ok");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].embedding.len(), 3);
@@ -2331,4 +2320,3 @@ mod tests {
         assert!(matches!(err, ExecutorError::Internal(_)));
     }
 }
-

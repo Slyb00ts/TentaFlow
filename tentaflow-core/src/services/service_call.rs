@@ -252,7 +252,12 @@ pub async fn dispatch(
     let started = Instant::now();
     let dispatch_outcome = tokio::time::timeout(
         timeout,
-        dispatch_to_service(&service_manager, &service_name, &effective_payload, &addon_id),
+        dispatch_to_service(
+            &service_manager,
+            &service_name,
+            &effective_payload,
+            &addon_id,
+        ),
     )
     .await;
     let duration_ms = started.elapsed().as_millis() as i64;
@@ -354,7 +359,10 @@ pub async fn dispatch(
             if let Some(ref wire) = minted_token_wire {
                 crate::services::pickup_token_issuer().revoke(wire);
             }
-            error!("service_call: dispatch error for '{}': {}", service_name, msg);
+            error!(
+                "service_call: dispatch error for '{}': {}",
+                service_name, msg
+            );
             log_alias_call(
                 db,
                 &req.caller,
@@ -572,8 +580,19 @@ fn emit_audit_full(
     result: &str,
     error_message: Option<&str>,
 ) {
-    let Ok(conn) = db.lock() else { return; };
-    emit_audit_inner(&conn, caller, action, resource_type, resource_id, risk_class, result, error_message);
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+    emit_audit_inner(
+        &conn,
+        caller,
+        action,
+        resource_type,
+        resource_id,
+        risk_class,
+        result,
+        error_message,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

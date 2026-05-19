@@ -52,13 +52,9 @@ pub enum StreamMessage {
         metadata: FrameMetadata,
     },
     /// Backpressure signal — N frames dropped since the previous delivery.
-    Drop {
-        count: u64,
-    },
+    Drop { count: u64 },
     /// Camera is going away (removed/error). Subscribers should stop polling.
-    CameraOffline {
-        reason: String,
-    },
+    CameraOffline { reason: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -415,7 +411,10 @@ mod tests {
                 NextOutcome::Timeout => continue,
             }
         }
-        assert!(saw_none, "subscriber must observe channel close after timeout");
+        assert!(
+            saw_none,
+            "subscriber must observe channel close after timeout"
+        );
     }
 
     #[tokio::test]

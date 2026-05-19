@@ -84,7 +84,10 @@ fn bench_recording_url_issue(c: &mut Criterion) {
     c.bench_function("recording_url_issue", |b| {
         b.iter(|| {
             counter = counter.wrapping_add(1);
-            let r = format!("snap_{:032x}-0000-0000-0000-000000000000", counter & 0xffff_ffff);
+            let r = format!(
+                "snap_{:032x}-0000-0000-0000-000000000000",
+                counter & 0xffff_ffff
+            );
             let _ = black_box(issuer.issue(black_box(r), black_box(120)).expect("issue"));
         });
     });

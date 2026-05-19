@@ -139,7 +139,8 @@ mod tests {
 
     #[test]
     fn telemetry_tags_cover_every_variant() {
-        let local = ResolvedExecutionTarget::Local { service_id: 1,
+        let local = ResolvedExecutionTarget::Local {
+            service_id: 1,
             model_name: "m".into(),
             handle: embedded("m"),
         };
@@ -170,7 +171,8 @@ mod tests {
 
     #[test]
     fn embedded_local_is_always_alive() {
-        let t = ResolvedExecutionTarget::Local { service_id: 1,
+        let t = ResolvedExecutionTarget::Local {
+            service_id: 1,
             model_name: "m".into(),
             handle: embedded("m"),
         };

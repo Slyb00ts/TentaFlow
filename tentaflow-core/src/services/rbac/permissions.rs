@@ -188,7 +188,16 @@ mod tests {
     }
 
     fn seed_admin_membership(pool: &DbPool, user_id: &str) -> String {
-        let org = org_repo::create_organization(pool, "Acme", &format!("acme-{user_id}"), None, None, None, None).unwrap();
+        let org = org_repo::create_organization(
+            pool,
+            "Acme",
+            &format!("acme-{user_id}"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let admin = org_repo::list_roles(pool)
             .unwrap()
             .into_iter()
@@ -199,7 +208,16 @@ mod tests {
     }
 
     fn seed_viewer_membership(pool: &DbPool, user_id: &str) -> String {
-        let org = org_repo::create_organization(pool, "Beta", &format!("beta-{user_id}"), None, None, None, None).unwrap();
+        let org = org_repo::create_organization(
+            pool,
+            "Beta",
+            &format!("beta-{user_id}"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let viewer = org_repo::list_roles(pool)
             .unwrap()
             .into_iter()
@@ -214,8 +232,12 @@ mod tests {
         let (_d, pool) = open_pool();
         let org_id = seed_admin_membership(&pool, "u-1");
         let m = PermissionMatrix::new();
-        assert!(m.has_permission(&pool, "u-1", &org_id, "org.admin").unwrap());
-        assert!(m.has_permission(&pool, "u-1", &org_id, "camera.write").unwrap());
+        assert!(m
+            .has_permission(&pool, "u-1", &org_id, "org.admin")
+            .unwrap());
+        assert!(m
+            .has_permission(&pool, "u-1", &org_id, "camera.write")
+            .unwrap());
     }
 
     #[test]
@@ -225,8 +247,12 @@ mod tests {
         let m = PermissionMatrix::new();
         // org_viewer has org.read but not org.write.
         assert!(m.has_permission(&pool, "u-2", &org_id, "org.read").unwrap());
-        assert!(!m.has_permission(&pool, "u-2", &org_id, "org.write").unwrap());
-        assert!(!m.has_permission(&pool, "u-2", &org_id, "camera.write").unwrap());
+        assert!(!m
+            .has_permission(&pool, "u-2", &org_id, "org.write")
+            .unwrap());
+        assert!(!m
+            .has_permission(&pool, "u-2", &org_id, "camera.write")
+            .unwrap());
     }
 
     #[test]
@@ -235,10 +261,14 @@ mod tests {
         let org_id = seed_admin_membership(&pool, "u-3");
         let m = PermissionMatrix::new();
         assert_eq!(m.cache_len(), 0);
-        assert!(m.has_permission(&pool, "u-3", &org_id, "org.admin").unwrap());
+        assert!(m
+            .has_permission(&pool, "u-3", &org_id, "org.admin")
+            .unwrap());
         assert_eq!(m.cache_len(), 1);
         // Second read does not insert a second entry — same key.
-        assert!(m.has_permission(&pool, "u-3", &org_id, "camera.read").unwrap());
+        assert!(m
+            .has_permission(&pool, "u-3", &org_id, "camera.read")
+            .unwrap());
         assert_eq!(m.cache_len(), 1);
     }
 
@@ -247,12 +277,16 @@ mod tests {
         let (_d, pool) = open_pool();
         let org_id = seed_admin_membership(&pool, "u-4");
         let m = PermissionMatrix::new();
-        assert!(m.has_permission(&pool, "u-4", &org_id, "org.admin").unwrap());
+        assert!(m
+            .has_permission(&pool, "u-4", &org_id, "org.admin")
+            .unwrap());
         assert_eq!(m.cache_len(), 1);
         m.invalidate("u-4", &org_id);
         assert_eq!(m.cache_len(), 0);
         // Re-read repopulates.
-        assert!(m.has_permission(&pool, "u-4", &org_id, "org.admin").unwrap());
+        assert!(m
+            .has_permission(&pool, "u-4", &org_id, "org.admin")
+            .unwrap());
         assert_eq!(m.cache_len(), 1);
     }
 

@@ -16,9 +16,9 @@ use tokio::task::JoinHandle;
 
 use crate::config::ConnectionType;
 use crate::services::backend::client::BackendClient;
-use crate::services::runtime::CircuitBreakerConfig;
-use crate::services::runtime::quic_handle::{QuicServiceHandle, QuicServiceState};
 use crate::services::mesh_registry::MeshServicesRegistry;
+use crate::services::runtime::quic_handle::{QuicServiceHandle, QuicServiceState};
+use crate::services::runtime::CircuitBreakerConfig;
 use crate::services::transport::Transport;
 
 /// Live runtime handle dla pojedynczej (node_id, service_id) pary. Jednolity
@@ -82,7 +82,11 @@ impl BackendHandle {
         match self {
             BackendHandle::Http(client) => format!("http:{}", client.url()),
             BackendHandle::Quic(h) => format!("quic:{}", h.config.url),
-            BackendHandle::Embedded { engine_id, model_name, .. } => {
+            BackendHandle::Embedded {
+                engine_id,
+                model_name,
+                ..
+            } => {
                 format!("embedded:{engine_id}:{model_name}")
             }
         }
@@ -385,7 +389,8 @@ mod tests {
 
         let h = BackendHandle::Embedded {
             model_name: "qwen3-0.8b".into(),
-            node_id: "nodeA".into(), engine_id: "test-engine".into(),
+            node_id: "nodeA".into(),
+            engine_id: "test-engine".into(),
         };
         cache.insert("nodeA".into(), 42, h);
         assert_eq!(cache.len(), 1);
@@ -406,7 +411,8 @@ mod tests {
             1,
             BackendHandle::Embedded {
                 model_name: "m1".into(),
-                node_id: "nodeA".into(), engine_id: "test-engine".into(),
+                node_id: "nodeA".into(),
+                engine_id: "test-engine".into(),
             },
         );
         cache.insert(
@@ -414,7 +420,8 @@ mod tests {
             2,
             BackendHandle::Embedded {
                 model_name: "m2".into(),
-                node_id: "nodeB".into(), engine_id: "test-engine".into(),
+                node_id: "nodeB".into(),
+                engine_id: "test-engine".into(),
             },
         );
         let mut keys = cache.keys();
@@ -437,7 +444,8 @@ mod tests {
             7,
             BackendHandle::Embedded {
                 model_name: "qwen-0.8b".into(),
-                node_id: "local".into(), engine_id: "test-engine".into(),
+                node_id: "local".into(),
+                engine_id: "test-engine".into(),
             },
         );
         cache.insert(
@@ -445,7 +453,8 @@ mod tests {
             11,
             BackendHandle::Embedded {
                 model_name: "phi-3-mini".into(),
-                node_id: "remote".into(), engine_id: "test-engine".into(),
+                node_id: "remote".into(),
+                engine_id: "test-engine".into(),
             },
         );
 

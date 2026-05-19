@@ -36,10 +36,8 @@ use thiserror::Error;
 
 /// SOAP action URIs for the calls we make. ONVIF requires the SOAP `Action`
 /// header to match these strings exactly.
-const ACTION_GET_PROFILES: &str =
-    "http://www.onvif.org/ver10/media/wsdl/GetProfiles";
-const ACTION_GET_STREAM_URI: &str =
-    "http://www.onvif.org/ver10/media/wsdl/GetStreamUri";
+const ACTION_GET_PROFILES: &str = "http://www.onvif.org/ver10/media/wsdl/GetProfiles";
+const ACTION_GET_STREAM_URI: &str = "http://www.onvif.org/ver10/media/wsdl/GetStreamUri";
 /// Media2 service uses the ver20 namespace. `GetMetadataConfigurations`
 /// enumerates metadata configs the device advertises; if the list is empty
 /// the camera does not expose analytics events (no PullPoint subscription
@@ -308,10 +306,7 @@ async fn send_soap(
     // SOAP 1.2 carries the action inside the `Content-Type` parameter; many
     // ONVIF cameras also honor the legacy `SOAPAction` header so we send
     // both to maximize interoperability.
-    let content_type = format!(
-        "application/soap+xml; charset=utf-8; action=\"{}\"",
-        action
-    );
+    let content_type = format!("application/soap+xml; charset=utf-8; action=\"{}\"", action);
     let req = client
         .post(endpoint)
         .header("Content-Type", content_type)
@@ -434,11 +429,7 @@ fn build_password_digest(password: &str) -> (String, String, String) {
 
 /// Pure compute step factored out so tests can pin a fixed nonce + timestamp
 /// and verify the digest matches the WS-Security spec vector.
-pub(crate) fn compute_password_digest(
-    nonce: &[u8],
-    created: &[u8],
-    password: &[u8],
-) -> [u8; 20] {
+pub(crate) fn compute_password_digest(nonce: &[u8], created: &[u8], password: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(nonce);
     hasher.update(created);
@@ -533,18 +524,15 @@ fn parse_get_metadata_configurations_response(
 ) -> Result<Vec<MetadataConfiguration>, OnvifError> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
-    while let Some((token, block_start, block_end)) =
-        find_configurations_block(xml, cursor)
-    {
+    while let Some((token, block_start, block_end)) = find_configurations_block(xml, cursor) {
         let block = &xml[block_start..block_end];
         let name = extract_xml_text(block, "Name").unwrap_or_default();
         // The analytics engine binding may surface either as a direct
         // `AnalyticsEngineConfigurationToken` element or as an attribute on
         // `AnalyticsEngineConfiguration` — match the text form first and
         // fall back to the open-tag `token` attribute on the engine config.
-        let analytics_engine_token =
-            extract_xml_text(block, "AnalyticsEngineConfigurationToken")
-                .or_else(|| extract_analytics_engine_token(block));
+        let analytics_engine_token = extract_xml_text(block, "AnalyticsEngineConfigurationToken")
+            .or_else(|| extract_analytics_engine_token(block));
         out.push(MetadataConfiguration {
             token,
             name,
@@ -572,10 +560,7 @@ fn find_configurations_block(xml: &str, start: usize) -> Option<(String, usize, 
         let rest = &xml[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -608,10 +593,7 @@ fn extract_analytics_engine_token(block: &str) -> Option<String> {
         let rest = &block[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -641,10 +623,7 @@ fn find_profiles_block(xml: &str, start: usize) -> Option<(String, usize, usize)
         let rest = &xml[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -678,8 +657,14 @@ fn extract_resolution(block: &str) -> Option<(u32, u32)> {
     // `Height` it finds — in practice this is always the encoder
     // resolution because no other element with those local names appears
     // in a profile.
-    let w = extract_xml_text(block, "Width")?.trim().parse::<u32>().ok()?;
-    let h = extract_xml_text(block, "Height")?.trim().parse::<u32>().ok()?;
+    let w = extract_xml_text(block, "Width")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    let h = extract_xml_text(block, "Height")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
     if w == 0 || h == 0 {
         return None;
     }
@@ -753,10 +738,7 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
         let rest = &xml[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -1071,8 +1053,7 @@ mod tests {
     #[test]
     fn extract_open_tag_attr_handles_single_and_double_quotes() {
         assert_eq!(
-            extract_open_tag_attr(r#"trt:Profiles token="abc" fixed="true""#, "token")
-                .as_deref(),
+            extract_open_tag_attr(r#"trt:Profiles token="abc" fixed="true""#, "token").as_deref(),
             Some("abc")
         );
         assert_eq!(
@@ -1108,8 +1089,8 @@ mod tests {
 
     #[test]
     fn get_metadata_configurations_parses_real_response_xml() {
-        let cfgs = parse_get_metadata_configurations_response(SAMPLE_GET_METADATA_CONFIGS)
-            .expect("parse");
+        let cfgs =
+            parse_get_metadata_configurations_response(SAMPLE_GET_METADATA_CONFIGS).expect("parse");
         assert_eq!(cfgs.len(), 2);
         assert_eq!(cfgs[0].token, "MetaCfg_1");
         assert_eq!(cfgs[0].name, "MetadataConfig 1");

@@ -278,7 +278,10 @@ mod tests {
         let c = GateCheckCache::new();
         let h = compute_ctx_hash("org-a", "addon-x", "g1", None);
         c.insert("c1", &h, allow(past_unix()));
-        assert!(c.get("c1", &h).is_none(), "expired claim must not be served");
+        assert!(
+            c.get("c1", &h).is_none(),
+            "expired claim must not be served"
+        );
     }
 
     #[test]

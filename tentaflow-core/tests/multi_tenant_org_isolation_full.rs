@@ -18,8 +18,8 @@
 //      falls back to `org-default` (None) — production stays compatible
 //      with backfilled rows that pre-date P1.b.
 
-use tentaflow_core::db::DbPool;
 use tentaflow_core::db::repository as repo;
+use tentaflow_core::db::DbPool;
 use tentaflow_core::services::org::DEFAULT_ORG_ID;
 #[cfg(feature = "vector")]
 use tentaflow_core::services::vector::backend::Metric;
@@ -33,12 +33,7 @@ fn open_pool() -> (tempfile::TempDir, DbPool) {
     (dir, pool)
 }
 
-fn insert_camera_in_org(
-    pool: &DbPool,
-    addon_id: &str,
-    camera_id: &str,
-    org_id: &str,
-) -> i64 {
+fn insert_camera_in_org(pool: &DbPool, addon_id: &str, camera_id: &str, org_id: &str) -> i64 {
     repo::insert_camera(
         pool,
         camera_id,
@@ -68,8 +63,8 @@ fn camera_list_returns_only_org_a_cameras_for_addon_in_org_a() {
     insert_camera_in_org(&pool, "vision-adr", "cam-a-2", "org-a");
     insert_camera_in_org(&pool, "vision-adr", "cam-b-1", "org-b");
 
-    let rows_a = repo::list_cameras_for_addon(&pool, "vision-adr", Some("org-a"))
-        .expect("list rows org A");
+    let rows_a =
+        repo::list_cameras_for_addon(&pool, "vision-adr", Some("org-a")).expect("list rows org A");
     let ids_a: Vec<_> = rows_a.iter().map(|r| r.camera_id.as_str()).collect();
     assert!(ids_a.contains(&"cam-a-1"));
     assert!(ids_a.contains(&"cam-a-2"));
@@ -78,8 +73,8 @@ fn camera_list_returns_only_org_a_cameras_for_addon_in_org_a() {
         "org A list leaked org B row: {ids_a:?}"
     );
 
-    let rows_b = repo::list_cameras_for_addon(&pool, "vision-adr", Some("org-b"))
-        .expect("list rows org B");
+    let rows_b =
+        repo::list_cameras_for_addon(&pool, "vision-adr", Some("org-b")).expect("list rows org B");
     let ids_b: Vec<_> = rows_b.iter().map(|r| r.camera_id.as_str()).collect();
     assert_eq!(ids_b, vec!["cam-b-1"]);
 }
@@ -92,8 +87,8 @@ fn camera_get_returns_none_for_cross_org_lookup() {
     // Caller in org B asking for the same (addon_id, camera_id) must get
     // None — the host fn maps None to AbiError::NotFound, NEVER to a leaked
     // CameraRow.
-    let row_b = repo::get_camera_for_addon(&pool, "vision-adr", "cam-1", Some("org-b"))
-        .expect("get ok");
+    let row_b =
+        repo::get_camera_for_addon(&pool, "vision-adr", "cam-1", Some("org-b")).expect("get ok");
     assert!(row_b.is_none(), "cross-org get leaked the org A row");
 
     // Sanity: same call under org A returns the row.
@@ -216,7 +211,10 @@ fn recording_purge_does_not_affect_other_org() {
     // The org-A row is still live.
     let still = repo::get_recording_for_addon(&pool, "vision-adr", "snap_a", Some("org-a"))
         .expect("get ok");
-    assert!(still.is_some(), "org-A row must survive the cross-org purge");
+    assert!(
+        still.is_some(),
+        "org-A row must survive the cross-org purge"
+    );
 
     // The org-B row is also untouched (sanity for the test setup).
     let other = repo::get_recording_for_addon(&pool, "vision-adr", "snap_b", Some("org-b"))
@@ -275,11 +273,17 @@ fn camera_soft_delete_under_wrong_org_is_no_op() {
 
     let removed_b = repo::soft_delete_camera(&pool, "vision-adr", "cam-only-a-del", Some("org-b"))
         .expect("delete ok");
-    assert!(!removed_b, "org-B must NOT be able to soft-delete an org-A row");
+    assert!(
+        !removed_b,
+        "org-B must NOT be able to soft-delete an org-A row"
+    );
 
     let row_a = repo::get_camera_for_addon(&pool, "vision-adr", "cam-only-a-del", Some("org-a"))
         .expect("get ok");
-    assert!(row_a.is_some(), "org-A row survives the cross-org delete attempt");
+    assert!(
+        row_a.is_some(),
+        "org-A row survives the cross-org delete attempt"
+    );
 }
 
 #[test]
@@ -288,8 +292,8 @@ fn audit_log_for_addon_in_org_a_carries_org_id_a() {
     // re-assert the simpler shape here so a regression in the audit insert
     // is caught alongside the camera / vector regressions — a P1.c sweep
     // failure should not require running two test binaries to triage.
-    use std::sync::Arc;
     use parking_lot::Mutex as PlMutex;
+    use std::sync::Arc;
     use tentaflow_core::addon::event_bus::EventBus;
     use tentaflow_core::addon::host_functions::audit_log_with_risk;
     use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;

@@ -44,9 +44,7 @@ pub const CLAIM_TYPES: &[&str] = &["approval", "grant", "deployment_profile", "c
 /// 88 znakow (86 base64 + 2 padding). Strict — nie akceptujemy innej dlugosci.
 fn signature_regex() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
-    RX.get_or_init(|| {
-        Regex::new(r"^ed25519:[A-Za-z0-9+/]{86}==$").expect("regex stale poprawny")
-    })
+    RX.get_or_init(|| Regex::new(r"^ed25519:[A-Za-z0-9+/]{86}==$").expect("regex stale poprawny"))
 }
 
 /// Placeholder z draft manifestu (sekcja 5 planu TentaVision). Pozwalamy na niego
@@ -154,7 +152,10 @@ impl AliasVisibility {
             "private" => Ok(AliasVisibility::Private),
             "restricted" => Ok(AliasVisibility::Restricted),
             "public" => Ok(AliasVisibility::Public),
-            _ => bail!("invalid alias visibility '{}' (allowed: private/restricted/public)", s),
+            _ => bail!(
+                "invalid alias visibility '{}' (allowed: private/restricted/public)",
+                s
+            ),
         }
     }
 }
@@ -531,13 +532,19 @@ pub fn validate_manifest_extensions(
     for u in uses_aliases {
         validate_uses_target_id("[[uses_alias]]", &u.id)?;
         if u.required && u.reason.trim().is_empty() {
-            bail!("[[uses_alias]] id='{}' is required=true but reason is empty", u.id);
+            bail!(
+                "[[uses_alias]] id='{}' is required=true but reason is empty",
+                u.id
+            );
         }
     }
     for u in uses_models {
         validate_uses_target_id("[[uses_model]]", &u.id)?;
         if u.required && u.reason.trim().is_empty() {
-            bail!("[[uses_model]] id='{}' is required=true but reason is empty", u.id);
+            bail!(
+                "[[uses_model]] id='{}' is required=true but reason is empty",
+                u.id
+            );
         }
     }
     check_unique_ids("gate", gates.iter().map(|g| g.id.as_str()))?;
@@ -549,10 +556,7 @@ pub fn validate_manifest_extensions(
         "flow_template",
         flow_templates.iter().map(|f| f.id.as_str()),
     )?;
-    check_unique_ids(
-        "ui_component",
-        ui_components.iter().map(|u| u.id.as_str()),
-    )?;
+    check_unique_ids("ui_component", ui_components.iter().map(|u| u.id.as_str()))?;
 
     for vns in vector_namespaces {
         if !VECTOR_DISTANCES.contains(&vns.distance.as_str()) {
@@ -631,7 +635,11 @@ pub fn validate_manifest_extensions(
         // Akceptujemy zarowno czyste `Version` ("0.2.0"), jak i `VersionReq`
         // (">=0.2.0", "^0.3"). semver::VersionReq parsuje oba.
         semver::VersionReq::parse(req).map_err(|e| {
-            anyhow::anyhow!("addon.sdk_version '{}' is not a valid semver req: {}", req, e)
+            anyhow::anyhow!(
+                "addon.sdk_version '{}' is not a valid semver req: {}",
+                req,
+                e
+            )
         })?;
     }
 
@@ -690,10 +698,9 @@ fn validate_uses_target_id(kind: &str, raw: &str) -> Result<()> {
     if raw.len() > 128 {
         bail!("{} id '{}' exceeds 128 chars", kind, raw);
     }
-    if !raw
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.')
-    {
+    if !raw.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+    }) {
         bail!(
             "{} id '{}' contains invalid characters (allowed: [a-z0-9_.-])",
             kind,
@@ -762,10 +769,9 @@ mod chunk_c_validation_tests {
             risk: "low".into(),
             host_permissions: vec![],
         };
-        let err = validate_manifest_extensions(
-            None, &[], &[], &[], &[], &[uic], None, &[], &[], None,
-        )
-        .expect_err("missing publisher must reject");
+        let err =
+            validate_manifest_extensions(None, &[], &[], &[], &[], &[uic], None, &[], &[], None)
+                .expect_err("missing publisher must reject");
         assert!(err.to_string().contains("no [publisher] block"));
     }
 
@@ -777,7 +783,16 @@ mod chunk_c_validation_tests {
             contact: None,
         };
         let err = validate_manifest_extensions(
-            None, &[], &[], &[], &[], &[], None, &[], &[], Some(&pub_info),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            Some(&pub_info),
         )
         .expect_err("bad pk must reject");
         assert!(err.to_string().contains("invalid length"));
@@ -791,7 +806,16 @@ mod chunk_c_validation_tests {
             contact: None,
         };
         let err = validate_manifest_extensions(
-            None, &[], &[], &[], &[], &[], None, &[], &[], Some(&pub_info),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            Some(&pub_info),
         )
         .expect_err("empty label must reject");
         assert!(err.to_string().contains("publisher.label"));

@@ -26,8 +26,8 @@ use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::security::MeshSecurity;
 use crate::metrics::RouterMetrics;
-use crate::services::runtime::quic_handle::ServiceManager;
 use crate::routing::Router;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler
 pub fn is_openai_path(path: &str) -> bool {
@@ -59,8 +59,9 @@ pub fn start_unified_server(
     port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Result<()> {
-    let permission_checker =
-        addon_manager.as_ref().map(|m| m.permission_checker().clone());
+    let permission_checker = addon_manager
+        .as_ref()
+        .map(|m| m.permission_checker().clone());
     start_unified_server_with_permissions(
         config,
         db,
@@ -156,10 +157,7 @@ pub fn start_unified_server_with_permissions(
         .mtls
         .clone()
         .map(|c| {
-            crate::api::mtls::PickupMtlsConfig::new(
-                c.pickup_required,
-                c.client_cert_fingerprints,
-            )
+            crate::api::mtls::PickupMtlsConfig::new(c.pickup_required, c.client_cert_fingerprints)
         })
         .unwrap_or_default();
     let mtls_offers_client_auth = pickup_mtls.requests_client_cert();
@@ -179,9 +177,8 @@ pub fn start_unified_server_with_permissions(
         // Pinning the version here also pins AEAD-only cipher suites and
         // forward-secret key exchange (X25519 / P-256), eliminating the need
         // for an explicit cipher allowlist.
-        let builder = rustls::ServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS13,
-        ]);
+        let builder =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]);
 
         let mut tls_config = if mtls_offers_client_auth {
             builder
@@ -202,6 +199,7 @@ pub fn start_unified_server_with_permissions(
 
     // OAuth pending-state TTL purge: run once at startup, then hourly.
     crate::addon::oauth_cleanup::start_oauth_cleanup_task(db.clone());
+    crate::scheduler::start(db.clone(), addon_manager.clone());
 
     info!("Inicjalizacja unified HTTPS server na {}...", bind_addr);
 

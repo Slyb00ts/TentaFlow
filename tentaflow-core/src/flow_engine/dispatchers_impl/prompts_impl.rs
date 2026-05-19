@@ -51,7 +51,10 @@ mod tests {
     #[tokio::test]
     async fn returns_content_when_present() {
         let p = PromptsImpl::new(registry_with("greet", "hello"));
-        assert_eq!(p.get_prompt("greet", None).await.unwrap(), Some("hello".into()));
+        assert_eq!(
+            p.get_prompt("greet", None).await.unwrap(),
+            Some("hello".into())
+        );
     }
 
     #[tokio::test]

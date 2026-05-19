@@ -104,8 +104,12 @@ impl NodeAdapter for AddonNodeAdapter {
             (*ctx.initial_envelope).clone()
         };
 
-        let envelope_json = serde_json::to_vec(&input_envelope)
-            .map_err(|e| anyhow!("AddonNodeAdapter '{}': serialize envelope: {e}", self.node_type))?;
+        let envelope_json = serde_json::to_vec(&input_envelope).map_err(|e| {
+            anyhow!(
+                "AddonNodeAdapter '{}': serialize envelope: {e}",
+                self.node_type
+            )
+        })?;
 
         // Per-call fuel budget — operator moze nadpisac w node config,
         // inaczej DEFAULT_BLOCK_FUEL.

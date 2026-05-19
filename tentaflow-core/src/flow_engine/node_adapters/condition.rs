@@ -136,28 +136,44 @@ fn flow_value_to_json(v: &FlowValue) -> Value {
         FlowValue::Embedding(vec) => {
             Value::Array(vec.iter().map(|f| serde_json::json!(*f)).collect())
         }
-        FlowValue::Audio { blob_ref, mime, sample_rate } => serde_json::json!({
+        FlowValue::Audio {
+            blob_ref,
+            mime,
+            sample_rate,
+        } => serde_json::json!({
             "blob_id": blob_ref.id,
             "size_bytes": blob_ref.size_bytes,
             "sha256": blob_ref.sha256,
             "mime": mime,
             "sample_rate": sample_rate,
         }),
-        FlowValue::Image { blob_ref, mime, dims } => serde_json::json!({
+        FlowValue::Image {
+            blob_ref,
+            mime,
+            dims,
+        } => serde_json::json!({
             "blob_id": blob_ref.id,
             "size_bytes": blob_ref.size_bytes,
             "sha256": blob_ref.sha256,
             "mime": mime,
             "dims": dims,
         }),
-        FlowValue::Video { blob_ref, mime, duration_ms } => serde_json::json!({
+        FlowValue::Video {
+            blob_ref,
+            mime,
+            duration_ms,
+        } => serde_json::json!({
             "blob_id": blob_ref.id,
             "size_bytes": blob_ref.size_bytes,
             "sha256": blob_ref.sha256,
             "mime": mime,
             "duration_ms": duration_ms,
         }),
-        FlowValue::Other { blob_ref, mime, filename } => serde_json::json!({
+        FlowValue::Other {
+            blob_ref,
+            mime,
+            filename,
+        } => serde_json::json!({
             "blob_id": blob_ref.id,
             "size_bytes": blob_ref.size_bytes,
             "sha256": blob_ref.sha256,
@@ -179,8 +195,7 @@ fn resolve_json_path(value: &Value, path: &str) -> Value {
 }
 
 fn compare_numbers<F: Fn(f64, f64) -> bool>(a: &Value, b: &Value, cmp: F) -> bool {
-    let to_num =
-        |v: &Value| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64));
+    let to_num = |v: &Value| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64));
     match (to_num(a), to_num(b)) {
         (Some(x), Some(y)) => cmp(x, y),
         _ => false,

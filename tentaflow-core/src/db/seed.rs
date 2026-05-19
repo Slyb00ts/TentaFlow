@@ -342,7 +342,8 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             icon = excluded.icon, \
             params_schema = excluded.params_schema",
     )?;
-    for (node_type, category, label, description, default_config, icon, params_schema) in templates {
+    for (node_type, category, label, description, default_config, icon, params_schema) in templates
+    {
         let params_schema_opt: Option<&str> = if params_schema.is_empty() {
             None
         } else {
@@ -852,7 +853,10 @@ mod tests {
             3,
         );
         assert_eq!(st, "chat");
-        assert_eq!(def, 0, "Default Chat nie jest default w db (Standardowy pipeline LLM jest)");
+        assert_eq!(
+            def, 0,
+            "Default Chat nie jest default w db (Standardowy pipeline LLM jest)"
+        );
 
         let (st, def) = assert_dag(
             "Audio Chat",
@@ -964,7 +968,7 @@ mod tests {
                 &registry,
                 crate::flow_engine::validation::ValidationSource::UserDefined,
             )
-                .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
+            .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
         }
     }
 }

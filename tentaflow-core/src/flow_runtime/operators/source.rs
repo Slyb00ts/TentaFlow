@@ -239,7 +239,9 @@ async fn run_camera_source(
     // targets do not round down to a coarser ms interval — `1000/120 = 8 ms`
     // would otherwise permit ~125 fps on a 120-fps target.
     let min_emit_interval = if fps > 0 {
-        Some(Duration::from_nanos(1_000_000_000u64 / u64::from(fps.max(1))))
+        Some(Duration::from_nanos(
+            1_000_000_000u64 / u64::from(fps.max(1)),
+        ))
     } else {
         None
     };

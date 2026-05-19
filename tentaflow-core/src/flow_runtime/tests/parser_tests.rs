@@ -26,7 +26,10 @@ fn parse_minimal_flow_ok() {
     let def = parse_flow_definition(minimal_flow()).expect("parse");
     let compiled = compile(def).expect("compile");
     assert_eq!(compiled.def.id, "minimal");
-    assert_eq!(compiled.topo_order, vec!["src".to_string(), "snk".to_string()]);
+    assert_eq!(
+        compiled.topo_order,
+        vec!["src".to_string(), "snk".to_string()]
+    );
     assert_eq!(compiled.adjacency["src"], vec!["snk".to_string()]);
     assert!(compiled.adjacency["snk"].is_empty());
 }
@@ -63,9 +66,8 @@ fn reject_too_many_operators() {
             r#"{{ "id": "op{i}", "type": "Source", "params": {{}} }}"#
         ));
     }
-    let json = format!(
-        r#"{{ "schema_version": 1, "id": "x", "operators": [{ops}], "edges": [] }}"#
-    );
+    let json =
+        format!(r#"{{ "schema_version": 1, "id": "x", "operators": [{ops}], "edges": [] }}"#);
     let def = parse_flow_definition(&json).expect("parse");
     match compile(def) {
         Err(FlowCompileError::TooManyOperators { count: n }) if n == count => {}
@@ -138,8 +140,11 @@ fn reject_port_on_non_branch() {
     }"#;
     let def = parse_flow_definition(json).expect("parse");
     match compile(def) {
-        Err(FlowCompileError::PortOnNonBranch { edge_idx: 0, op_id, port })
-            if op_id == "src" && port == "true" => {}
+        Err(FlowCompileError::PortOnNonBranch {
+            edge_idx: 0,
+            op_id,
+            port,
+        }) if op_id == "src" && port == "true" => {}
         other => panic!("expected PortOnNonBranch, got {other:?}"),
     }
 }

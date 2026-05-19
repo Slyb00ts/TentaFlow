@@ -279,7 +279,10 @@ mod tests {
         let pool = make_pool();
         let sk = keypair(99);
         let pk = pk_b64(&sk);
-        assert!(pk.len() > 8, "test precondition: full key longer than prefix");
+        assert!(
+            pk.len() > 8,
+            "test precondition: full key longer than prefix"
+        );
         let bundle = b"data";
         let sig = sign_bundle(&sk, bundle);
         let f = write_bundle(bundle);

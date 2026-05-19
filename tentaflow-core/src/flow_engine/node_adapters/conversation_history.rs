@@ -33,9 +33,9 @@ impl ConversationHistoryNodeAdapter {
         {
             return Ok(s.to_string());
         }
-        ctx.session_id
-            .clone()
-            .ok_or_else(|| anyhow!("conversation_history adapter: no session_id (node config nor ctx.session_id)"))
+        ctx.session_id.clone().ok_or_else(|| {
+            anyhow!("conversation_history adapter: no session_id (node config nor ctx.session_id)")
+        })
     }
 }
 
@@ -141,10 +141,7 @@ mod tests {
             Ok(self.messages.clone())
         }
         async fn append(&self, session: &str, m: ChatMessage) -> Result<()> {
-            self.appended
-                .lock()
-                .unwrap()
-                .push((session.to_string(), m));
+            self.appended.lock().unwrap().push((session.to_string(), m));
             Ok(())
         }
     }

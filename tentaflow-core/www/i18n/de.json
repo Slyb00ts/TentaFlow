@@ -20,6 +20,7 @@
     "prompts": "Prompts",
     "models": "Modelle",
     "flows": "Flow-Builder",
+    "scheduler": "Scheduler",
     "playground": "Playground",
     "chat": "Chat",
     "rules": "Regeln",

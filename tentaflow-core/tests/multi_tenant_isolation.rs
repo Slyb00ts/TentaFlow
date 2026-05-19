@@ -118,7 +118,8 @@ fn per_org_sqlite_pools_back_distinct_files() {
         {
             let conn = pool_a.get().expect("a conn");
             conn.execute("CREATE TABLE marker (v TEXT)", []).unwrap();
-            conn.execute("INSERT INTO marker(v) VALUES ('A')", []).unwrap();
+            conn.execute("INSERT INTO marker(v) VALUES ('A')", [])
+                .unwrap();
         }
         // Pool B is owned by a different org — same addon_id, different file.
         let b_has_table: i64 = {
@@ -226,7 +227,9 @@ fn rbac_membership_in_org_a_is_invisible_in_org_b() {
 
     let m = PermissionMatrix::new();
     // org A: admin grants org.admin.
-    assert!(m.has_permission(&pool, "user-1", &org_a, "org.admin").unwrap());
+    assert!(m
+        .has_permission(&pool, "user-1", &org_a, "org.admin")
+        .unwrap());
     // org B: no membership → NoMembership error, not a silent deny / allow.
     let err = m
         .has_permission(&pool, "user-1", &org_b, "org.admin")
@@ -246,7 +249,9 @@ fn rbac_invalidate_after_membership_remove() {
     org_repo::add_membership(&pool, &org_a, "user-2", &viewer.role_id, "boot").unwrap();
 
     let m = PermissionMatrix::global();
-    assert!(m.has_permission(&pool, "user-2", &org_a, "org.read").unwrap());
+    assert!(m
+        .has_permission(&pool, "user-2", &org_a, "org.read")
+        .unwrap());
 
     // remove_membership invalidates the global cache so the next read sees
     // the new state. PermissionMatrix is process-wide so we use the same

@@ -79,7 +79,8 @@ impl NodeAdapter for OutputNodeAdapter {
         for prio in PORT_PRIORITY {
             let prio_type = self.input_port_type(prio);
             for inp in inputs {
-                let payload_kind = crate::flow_engine::types::FlowDataType::from_value(&inp.envelope.payload);
+                let payload_kind =
+                    crate::flow_engine::types::FlowDataType::from_value(&inp.envelope.payload);
                 if payload_kind == Some(prio_type) {
                     return Ok((*inp.envelope).clone());
                 }
@@ -147,10 +148,21 @@ mod tests {
         });
         let env_text = FlowEnvelope::with_payload(FlowValue::Text("priority-wins".into()));
         let inputs = vec![
-            NodeInput { from_node_id: "tts".into(), from_port: "full".into(), envelope: Arc::new(env_audio) },
-            NodeInput { from_node_id: "llm".into(), from_port: "stream".into(), envelope: Arc::new(env_text) },
+            NodeInput {
+                from_node_id: "tts".into(),
+                from_port: "full".into(),
+                envelope: Arc::new(env_audio),
+            },
+            NodeInput {
+                from_node_id: "llm".into(),
+                from_port: "stream".into(),
+                envelope: Arc::new(env_text),
+            },
         ];
-        let r = adapter.execute(&output_node(), &inputs, &stub_ctx()).await.unwrap();
+        let r = adapter
+            .execute(&output_node(), &inputs, &stub_ctx())
+            .await
+            .unwrap();
         assert_eq!(r.payload.as_text(), Some("priority-wins"));
     }
 
@@ -169,7 +181,10 @@ mod tests {
         let a = OutputNodeAdapter::new();
         let in_names: Vec<String> = a.input_ports().iter().map(|p| p.name.clone()).collect();
         let out_names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
-        assert_eq!(in_names, vec!["text", "audio", "image", "video", "embedding", "other"]);
+        assert_eq!(
+            in_names,
+            vec!["text", "audio", "image", "video", "embedding", "other"]
+        );
         assert_eq!(out_names, vec!["full"]);
         assert_eq!(a.node_type(), "output");
         assert_eq!(a.input_port_type("text"), FlowDataType::Text);

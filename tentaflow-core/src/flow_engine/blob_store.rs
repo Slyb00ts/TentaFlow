@@ -96,10 +96,7 @@ impl BlobStore for FileBlobStore {
                     let _ = fs::remove_file(&path).await;
                 }
                 Err(e) => {
-                    return Err(anyhow!(
-                        "verify dedup target {}: {e}",
-                        path.display()
-                    ));
+                    return Err(anyhow!("verify dedup target {}: {e}", path.display()));
                 }
             }
         }
@@ -108,10 +105,7 @@ impl BlobStore for FileBlobStore {
         // → fsync danych → rename na docelową nazwę. Crash przed rename = sierota
         // w temp; crash po rename = zdrowy plik. Brak corrupted-blob window
         // pod finalną nazwą.
-        let tmp_path = path.with_extension(format!(
-            "tmp-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
         let mut file = fs::File::create(&tmp_path)
             .await
             .with_context(|| format!("create temp {}", tmp_path.display()))?;
@@ -210,7 +204,9 @@ impl BlobStore for FileBlobStore {
                                 continue;
                             }
                         }
-                        let modified = meta.modified().unwrap_or_else(|_| std::time::SystemTime::now());
+                        let modified = meta
+                            .modified()
+                            .unwrap_or_else(|_| std::time::SystemTime::now());
                         if modified < cutoff {
                             if std::fs::remove_file(blob.path()).is_ok() {
                                 count += 1;
@@ -339,7 +335,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = FileBlobStore::new(dir.path().to_path_buf());
         let bytes = b"file blob content".to_vec();
-        let blob = store.put(bytes.clone(), "application/octet-stream").await.unwrap();
+        let blob = store
+            .put(bytes.clone(), "application/octet-stream")
+            .await
+            .unwrap();
 
         let on_disk = dir
             .path()
@@ -413,7 +412,10 @@ mod tests {
         // Po udanym put-cie żaden plik tmp nie powinien zostać.
         let mut leftovers = 0u32;
         for p in walkdir(&dir.path().to_path_buf()) {
-            if p.extension().and_then(|s| s.to_str()).map(|s| s.starts_with("tmp-")).unwrap_or(false)
+            if p.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("tmp-"))
+                .unwrap_or(false)
                 || p.to_string_lossy().contains(".tmp-")
             {
                 leftovers += 1;
@@ -445,10 +447,7 @@ mod tests {
 
         // gc retention=1h: old blob (>24h stary) usunięty, fresh (świeżutki)
         // zostaje.
-        let removed = store
-            .gc(Duration::from_secs(60 * 60))
-            .await
-            .expect("gc ok");
+        let removed = store.gc(Duration::from_secs(60 * 60)).await.expect("gc ok");
         assert_eq!(removed, 1, "exactly old blob removed");
         assert!(!old_path.exists(), "old blob file deleted");
         // Fresh nadal czytalny przez get (integrity check przechodzi).
@@ -494,7 +493,9 @@ mod tests {
     }
     impl Walker {
         fn new(root: &PathBuf) -> Self {
-            Self { stack: vec![root.clone()] }
+            Self {
+                stack: vec![root.clone()],
+            }
         }
     }
     impl Iterator for Walker {

@@ -221,9 +221,7 @@ impl Category {
     /// Audio; everything else defaults to text-in.
     pub fn default_input_modalities(self) -> &'static [&'static str] {
         match self {
-            Self::Llm | Self::Tts | Self::Embeddings | Self::Reranker | Self::ImageGen => {
-                &["text"]
-            }
+            Self::Llm | Self::Tts | Self::Embeddings | Self::Reranker | Self::ImageGen => &["text"],
             Self::Stt => &["audio"],
             Self::Vision => &["text", "image"],
             Self::Agents => &["text"],

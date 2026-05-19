@@ -214,7 +214,12 @@ mod tests {
         async fn stream_synthesize(
             &self,
             req: TtsRequest,
-        ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>> {
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<crate::flow_engine::dispatchers::TtsStreamChunk>,
+            >,
+        > {
             *self.last.lock().unwrap() = Some(req);
             let chunk = crate::flow_engine::dispatchers::TtsStreamChunk {
                 choice_index: 0,
@@ -274,7 +279,9 @@ mod tests {
         env.payload = FlowValue::Text("hello".into());
         env.meta.insert("speed".into(), json!(1.5));
         let mut ctx = stub_ctx();
-        let fake = Arc::new(FakeTts { last: Mutex::new(None) });
+        let fake = Arc::new(FakeTts {
+            last: Mutex::new(None),
+        });
         ctx.tts = fake.clone();
 
         TtsNodeAdapter::new()

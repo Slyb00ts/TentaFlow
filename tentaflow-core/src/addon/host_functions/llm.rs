@@ -117,7 +117,9 @@ pub fn llm_generate(
         ) {
             Ok(_) => {}
             Err(e) => {
-                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>().is_some() {
+                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>()
+                    .is_some()
+                {
                     audit_log(
                         caller.data(),
                         "llm.generate",
@@ -370,7 +372,9 @@ pub fn llm_generate_stream_start(
         ) {
             Ok(_) => {}
             Err(e) => {
-                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>().is_some() {
+                if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>()
+                    .is_some()
+                {
                     audit_log(
                         caller.data(),
                         "llm.generate_stream",
@@ -381,7 +385,10 @@ pub fn llm_generate_stream_start(
                     );
                     return ABI_ERR_PERMISSION;
                 }
-                warn!("llm_generate_stream_start: alias gate error for '{}': {}", model, e);
+                warn!(
+                    "llm_generate_stream_start: alias gate error for '{}': {}",
+                    model, e
+                );
                 return ABI_ERR_OPERATION;
             }
         }

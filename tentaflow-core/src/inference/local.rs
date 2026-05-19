@@ -357,7 +357,7 @@ impl LocalInferenceHandler {
             transcribed_text: None,
             speaker_id: None,
             speaker_name: None,
-        usage: None,
+            usage: None,
         };
         if chunk_tx.send(first).await.is_err() {
             return;
@@ -397,7 +397,7 @@ impl LocalInferenceHandler {
                 transcribed_text: None,
                 speaker_id: None,
                 speaker_name: None,
-            usage: None,
+                usage: None,
             };
 
             if chunk_tx.send(chunk).await.is_err() {

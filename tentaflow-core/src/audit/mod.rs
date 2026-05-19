@@ -74,7 +74,12 @@ mod risk_class_tests {
 
     #[test]
     fn risk_class_roundtrip() {
-        for rc in [RiskClass::A, RiskClass::B, RiskClass::C, RiskClass::Unclassified] {
+        for rc in [
+            RiskClass::A,
+            RiskClass::B,
+            RiskClass::C,
+            RiskClass::Unclassified,
+        ] {
             assert_eq!(RiskClass::from_str(rc.as_db_str()).unwrap(), rc);
         }
     }
@@ -318,13 +323,14 @@ impl AuditLogger {
                 request_id: None,
                 timestamp: &timestamp,
             };
-            let (prev_hash_blob, hash_blob) = match chain::compute_chain_for_insert(&conn, &hash_input) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Blad obliczenia hash audit chain: {}", e);
-                    continue;
-                }
-            };
+            let (prev_hash_blob, hash_blob) =
+                match chain::compute_chain_for_insert(&conn, &hash_input) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Blad obliczenia hash audit chain: {}", e);
+                        continue;
+                    }
+                };
 
             let result = stmt.execute(rusqlite::params![
                 timestamp,

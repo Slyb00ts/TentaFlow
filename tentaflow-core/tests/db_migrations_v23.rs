@@ -34,7 +34,15 @@ fn insert_camera(conn: &Connection, camera_id: &str, vendor: &str) -> rusqlite::
             camera_id, owner_addon_id, display_name, vendor, url,
             created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![camera_id, "test-addon", "Test Camera", vendor, "file:///tmp/x.mp4", 0_i64, 0_i64],
+        params![
+            camera_id,
+            "test-addon",
+            "Test Camera",
+            vendor,
+            "file:///tmp/x.mp4",
+            0_i64,
+            0_i64
+        ],
     )?;
     Ok(())
 }

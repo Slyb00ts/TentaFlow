@@ -129,10 +129,7 @@ pub fn get_organization(pool: &DbPool, org_id: &str) -> Result<Option<Organizati
     .map_err(map_db)
 }
 
-pub fn list_organizations(
-    pool: &DbPool,
-    status_filter: Option<&str>,
-) -> Result<Vec<Organization>> {
+pub fn list_organizations(pool: &DbPool, status_filter: Option<&str>) -> Result<Vec<Organization>> {
     let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
     let (sql, has_filter) = match status_filter {
         Some(_) => (
@@ -219,8 +216,10 @@ pub fn update_organization(pool: &DbPool, org_id: &str, patch: &OrgPatch) -> Res
         binds.len() + 1
     );
     binds.push(Box::new(org_id.to_string()));
-    let params_dyn: Vec<&dyn rusqlite::ToSql> =
-        binds.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+    let params_dyn: Vec<&dyn rusqlite::ToSql> = binds
+        .iter()
+        .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+        .collect();
     let n = conn
         .execute(&sql, rusqlite::params_from_iter(params_dyn.iter().copied()))
         .map_err(map_db)?;
@@ -366,10 +365,7 @@ pub fn list_memberships_for_user(
     Ok(out)
 }
 
-pub fn list_memberships_for_org(
-    pool: &DbPool,
-    org_id: &str,
-) -> Result<Vec<(String, Role)>> {
+pub fn list_memberships_for_org(pool: &DbPool, org_id: &str) -> Result<Vec<(String, Role)>> {
     let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
     let mut stmt = conn
         .prepare(
@@ -405,11 +401,7 @@ pub fn list_memberships_for_org(
     Ok(out)
 }
 
-pub fn get_user_role_in_org(
-    pool: &DbPool,
-    user_id: &str,
-    org_id: &str,
-) -> Result<Option<Role>> {
+pub fn get_user_role_in_org(pool: &DbPool, user_id: &str, org_id: &str) -> Result<Option<Role>> {
     let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
     let row = conn
         .query_row(
@@ -463,9 +455,8 @@ pub fn list_roles(pool: &DbPool) -> Result<Vec<Role>> {
 }
 
 fn parse_permissions(perms_json: &str) -> Result<Vec<String>> {
-    serde_json::from_str::<Vec<String>>(perms_json).map_err(|e| {
-        OrgError::DbError(format!("invalid permissions_json: {}", e))
-    })
+    serde_json::from_str::<Vec<String>>(perms_json)
+        .map_err(|e| OrgError::DbError(format!("invalid permissions_json: {}", e)))
 }
 
 // Re-export the public patch type under the documented name. We define the
@@ -540,16 +531,8 @@ mod tests {
     #[test]
     fn update_organization_patches_only_provided_fields() {
         let (_d, pool) = open_pool();
-        let org = create_organization(
-            &pool,
-            "Old",
-            "oldslug",
-            Some("a@x"),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let org =
+            create_organization(&pool, "Old", "oldslug", Some("a@x"), None, None, None).unwrap();
         let patch = OrgPatch {
             name: Some("New".to_string()),
             ..Default::default()
@@ -601,13 +584,9 @@ mod tests {
         let org = create_organization(&pool, "Org", "org", None, None, None, None).unwrap();
         let roles = list_roles(&pool).unwrap();
         let viewer = roles.iter().find(|r| r.name == "org_viewer").unwrap();
-        assert!(
-            add_membership(&pool, &org.org_id, "user-1", &viewer.role_id, "admin").unwrap()
-        );
+        assert!(add_membership(&pool, &org.org_id, "user-1", &viewer.role_id, "admin").unwrap());
         // Second call is a no-op (INSERT OR IGNORE returns 0 affected).
-        assert!(
-            !add_membership(&pool, &org.org_id, "user-1", &viewer.role_id, "admin").unwrap()
-        );
+        assert!(!add_membership(&pool, &org.org_id, "user-1", &viewer.role_id, "admin").unwrap());
     }
 
     #[test]
@@ -642,8 +621,14 @@ mod tests {
             .iter()
             .map(|(o, r)| (o.org_id.clone(), r.name.clone()))
             .collect();
-        assert_eq!(by_org.get(&o1.org_id).map(String::as_str), Some("org_admin"));
-        assert_eq!(by_org.get(&o2.org_id).map(String::as_str), Some("org_viewer"));
+        assert_eq!(
+            by_org.get(&o1.org_id).map(String::as_str),
+            Some("org_admin")
+        );
+        assert_eq!(
+            by_org.get(&o2.org_id).map(String::as_str),
+            Some("org_viewer")
+        );
     }
 
     #[test]
@@ -669,9 +654,14 @@ mod tests {
         let (_d, pool) = open_pool();
         let roles = list_roles(&pool).unwrap();
         assert_eq!(roles.len(), 5);
-        let names: std::collections::HashSet<_> =
-            roles.iter().map(|r| r.name.as_str()).collect();
-        for expected in ["org_admin", "org_operator", "org_viewer", "dpo", "supervisor"] {
+        let names: std::collections::HashSet<_> = roles.iter().map(|r| r.name.as_str()).collect();
+        for expected in [
+            "org_admin",
+            "org_operator",
+            "org_viewer",
+            "dpo",
+            "supervisor",
+        ] {
             assert!(names.contains(expected), "missing role {}", expected);
         }
     }
