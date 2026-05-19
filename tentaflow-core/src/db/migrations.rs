@@ -216,7 +216,59 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "legal_documents",
             MigrationStep::Rust(create_legal_documents_table),
         ),
+        (
+            38,
+            "backfill_admin_org_memberships",
+            MigrationStep::Rust(backfill_admin_org_memberships),
+        ),
     ]
+}
+
+// F2 P1.a follow-up — v32 (setup_multi_tenant) created the org_memberships
+// table but did not seed entries for pre-existing admin users. As a result
+// every legacy admin login resolves to `org_context=None` and every
+// dispatch path requiring OrgContext (cameras, recordings, frame_url, ...)
+// rejects the call. This step backfills every admin user from both legacy
+// `users` (F1a auth) and `user_accounts` (F2 user mgmt) into `org-default`
+// with role `role-org-admin`. Idempotent via `NOT EXISTS` guards.
+fn backfill_admin_org_memberships(conn: &Connection) -> Result<()> {
+    // Source 1: legacy `users` table (F1a). `role='admin'` is the only path
+    // by which someone can mint a JWT pre-F2.
+    conn.execute(
+        "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+         FROM users u \
+         WHERE u.role = 'admin' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM org_memberships m WHERE m.user_id = CAST(u.id AS TEXT) \
+           )",
+        [],
+    )?;
+
+    // Source 2: `user_accounts` table (F2 user mgmt). is_admin OR role='admin'.
+    // Guarded by table-existence probe — F1a installs that never ran user
+    // mgmt migrations skip this step cleanly.
+    let user_accounts_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_accounts'",
+        [],
+        |r| r.get(0),
+    )?;
+    if user_accounts_exists > 0 {
+        conn.execute(
+            "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+             SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+             FROM user_accounts u \
+             WHERE (u.is_admin = 1 OR u.role = 'admin') \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM org_memberships m WHERE m.user_id = CAST(u.id AS TEXT) \
+               )",
+            [],
+        )?;
+    }
+
+    Ok(())
 }
 
 // F2 P8.a — RODO/GDPR document registry. Stores PDF artifacts generated per
