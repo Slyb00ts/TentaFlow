@@ -36,8 +36,8 @@ use super::{
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    get_camera_for_addon, insert_camera, list_cameras_for_addon,
-    set_camera_credentials_encrypted, set_camera_onvif_resolved, soft_delete_camera, update_camera, CameraPatch, CameraRow,
+    get_camera_for_addon, insert_camera, list_cameras_for_addon, set_camera_credentials_encrypted,
+    set_camera_onvif_resolved, soft_delete_camera, update_camera, CameraPatch, CameraRow,
 };
 use crate::services::camera_ingest::{
     credentials::credentials_cipher, start_supervisor, CameraConfig, CameraIngestError,
@@ -125,7 +125,10 @@ fn display_name_valid(s: &str) -> bool {
     s.chars().all(|c| {
         c.is_alphanumeric()
             || c.is_whitespace()
-            || matches!(c, '-' | '_' | '.' | ',' | '(' | ')' | ':' | '\'' | '"' | '!' | '?')
+            || matches!(
+                c,
+                '-' | '_' | '.' | ',' | '(' | ')' | ':' | '\'' | '"' | '!' | '?'
+            )
     })
 }
 
@@ -142,6 +145,17 @@ fn profile_valid(s: &str) -> bool {
 // =============================================================================
 
 static SUPERVISOR: OnceCell<Arc<CameraIngestSupervisor>> = OnceCell::const_new();
+
+/// Boot-time wrapper around the supervisor lazy-init. Triggers
+/// `hydrate_supervisor_from_db` so RTSP sessions for active cameras come up
+/// before any addon UI is opened — pipeline must run for analysis Flow even
+/// if no user is currently watching the dashboard.
+pub async fn ensure_supervisor_started() -> Result<(), anyhow::Error> {
+    get_or_init_supervisor()
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("supervisor init failed: {:?}", e))
+}
 
 async fn get_or_init_supervisor() -> Result<Arc<CameraIngestSupervisor>, AbiError> {
     SUPERVISOR
@@ -181,7 +195,10 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
         }
     };
     let count = rows.len();
-    tracing::info!("camera_ingest: hydrating {} camera session(s) from DB", count);
+    tracing::info!(
+        "camera_ingest: hydrating {} camera session(s) from DB",
+        count
+    );
     for row in rows {
         let resolution = match (row.resolution_width, row.resolution_height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
@@ -422,10 +439,7 @@ fn status_to_str(s: crate::services::camera_ingest::CameraStatus) -> &'static st
     }
 }
 
-async fn build_camera_info(
-    sup: &CameraIngestSupervisor,
-    row: CameraRow,
-) -> CameraInfoOut {
+async fn build_camera_info(sup: &CameraIngestSupervisor, row: CameraRow) -> CameraInfoOut {
     let mut status = row.status.clone();
     let mut status_message = row.status_message.clone();
     let mut fps_actual = row.fps_actual;
@@ -468,8 +482,8 @@ fn read_input_toml(
     if enforce_payload_size(input_len as usize, PayloadKind::ServiceCall).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
-    let bytes = read_guest_bytes(memory, caller, input_ptr, input_len)
-        .ok_or(AbiError::Operation)?;
+    let bytes =
+        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|_| AbiError::Operation)
@@ -579,9 +593,7 @@ fn validate_retention(rc: &str) -> Result<(), &'static str> {
 /// AES-GCM blob ready for storage, or a static error tag describing why the
 /// input was rejected. The decoded plaintext is wiped from the temporary
 /// `String` by going out of scope; it is never logged or returned in errors.
-fn prepare_credentials_blob(
-    b64: Option<&str>,
-) -> Result<Option<Vec<u8>>, &'static str> {
+fn prepare_credentials_blob(b64: Option<&str>) -> Result<Option<Vec<u8>>, &'static str> {
     let Some(s) = b64 else {
         return Ok(None);
     };
@@ -626,7 +638,20 @@ fn validate_userinfo_plaintext(plain: &str) -> Result<(), &'static str> {
         c.is_ascii_alphanumeric()
             || matches!(
                 c,
-                '-' | '.' | '_' | '~' | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+                '-' | '.'
+                    | '_'
+                    | '~'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
             )
     };
     if !user.chars().all(safe) {
@@ -667,19 +692,15 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
     let redacted = redact_rtsp_url(url);
 
     let dur = Duration::from_secs(timeout_secs);
-    let stream = tokio::time::timeout(
-        dur,
-        tokio::net::TcpStream::connect((host.as_str(), port)),
-    )
-    .await
-    .map_err(|_| format!("connect timeout: {redacted}"))?
-    .map_err(|e| format!("tcp connect failed: {e}"))?;
+    let stream = tokio::time::timeout(dur, tokio::net::TcpStream::connect((host.as_str(), port)))
+        .await
+        .map_err(|_| format!("connect timeout: {redacted}"))?
+        .map_err(|e| format!("tcp connect failed: {e}"))?;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = stream;
-    let req = format!(
-        "OPTIONS {request_uri} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: TentaFlow/F1b\r\n\r\n"
-    );
+    let req =
+        format!("OPTIONS {request_uri} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: TentaFlow/F1b\r\n\r\n");
     tokio::time::timeout(dur, stream.write_all(req.as_bytes()))
         .await
         .map_err(|_| "write timeout".to_string())?
@@ -716,7 +737,10 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
 fn force_onvif_path(url: &str) -> Result<url::Url, String> {
     let mut parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("ONVIF probe requires http(s) URL, got: {}", parsed.scheme()));
+        return Err(format!(
+            "ONVIF probe requires http(s) URL, got: {}",
+            parsed.scheme()
+        ));
     }
     if !parsed.path().contains("/onvif/") {
         parsed.set_path("/onvif/device_service");
@@ -735,7 +759,10 @@ async fn onvif_test_connection(url: &str, timeout_secs: u64) -> Result<String, S
         .send()
         .await
         .map_err(|e| format!("http: {e}"))?;
-    Ok(format!("ONVIF endpoint responded HTTP {}", resp.status().as_u16()))
+    Ok(format!(
+        "ONVIF endpoint responded HTTP {}",
+        resp.status().as_u16()
+    ))
 }
 
 /// Result of an ONVIF SOAP resolve performed during `camera_add_v1` /
@@ -750,7 +777,9 @@ struct OnvifResolveOk {
 /// Reason tag for the audit log when an ONVIF resolve fails. Returned as a
 /// short stable string so operators can grep — never include user-supplied
 /// data here (host / credentials must not leak into audit rows).
-fn map_onvif_resolve_error(e: &crate::services::camera_ingest::onvif_media::OnvifError) -> (AbiError, &'static str) {
+fn map_onvif_resolve_error(
+    e: &crate::services::camera_ingest::onvif_media::OnvifError,
+) -> (AbiError, &'static str) {
     use crate::services::camera_ingest::onvif_media::OnvifError::*;
     match e {
         AuthFailed => (AbiError::Permission, "onvif_auth_failed"),
@@ -781,7 +810,12 @@ fn resolve_onvif_one_click(
     };
     let (username, password) = match plain.split_once(':') {
         Some((u, p)) if !u.is_empty() && !p.is_empty() => (u.to_string(), p.to_string()),
-        _ => return Err((AbiError::Operation, "credentials_missing_user_pass_separator")),
+        _ => {
+            return Err((
+                AbiError::Operation,
+                "credentials_missing_user_pass_separator",
+            ))
+        }
     };
     let creds = onvif_media::OnvifCredentials { username, password };
     let res = run_async(onvif_media::derive_rtsp_uri(
@@ -836,13 +870,27 @@ pub fn camera_add_v1(
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let mut input: CameraAddInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.add", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.add",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -852,33 +900,82 @@ pub fn camera_add_v1(
         } else {
             AbiError::Operation
         };
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return err.as_i32();
     }
     if let Err(reason) = validate_url(&input.url) {
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if !(1..=60).contains(&input.target_fps) {
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("target_fps_out_of_range"));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("target_fps_out_of_range"),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_retention(&input.retention_class) {
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_display_name(&input.display_name) {
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_profile(&input.profile) {
-        audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     let credentials_blob = match prepare_credentials_blob(input.credentials_b64.as_deref()) {
         Ok(v) => v,
         Err(reason) => {
-            audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some(reason));
+            audit(
+                caller.data(),
+                "camera.add",
+                None,
+                RiskClass::A,
+                "denied",
+                Some(reason),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -892,12 +989,26 @@ pub fn camera_add_v1(
     let onvif_token_to_persist;
     if input.vendor == "onvif" {
         let Some(blob) = credentials_blob.as_deref() else {
-            audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("missing_credentials"));
+            audit(
+                caller.data(),
+                "camera.add",
+                None,
+                RiskClass::A,
+                "denied",
+                Some("missing_credentials"),
+            );
             return AbiError::Operation.as_i32();
         };
         if let Some(tok) = &input.onvif_profile_token {
             if !profile_valid(tok) {
-                audit(caller.data(), "camera.add", None, RiskClass::A, "denied", Some("onvif_profile_token_invalid"));
+                audit(
+                    caller.data(),
+                    "camera.add",
+                    None,
+                    RiskClass::A,
+                    "denied",
+                    Some("onvif_profile_token_invalid"),
+                );
                 return AbiError::Operation.as_i32();
             }
         }
@@ -908,7 +1019,14 @@ pub fn camera_add_v1(
                 input.url = ok.rtsp_uri;
             }
             Err((err, reason)) => {
-                audit(caller.data(), "camera.add", None, RiskClass::A, "error", Some(reason));
+                audit(
+                    caller.data(),
+                    "camera.add",
+                    None,
+                    RiskClass::A,
+                    "error",
+                    Some(reason),
+                );
                 return err.as_i32();
             }
         }
@@ -932,7 +1050,11 @@ pub fn camera_add_v1(
     // ONVIF cameras are streamed as RTSP (the derived URI), so the
     // supervisor vendor is rewritten to `rtsp` while the DB row preserves
     // `onvif` for UI and re-derivation lookups.
-    let session_vendor = if input.vendor == "onvif" { "rtsp" } else { input.vendor.as_str() };
+    let session_vendor = if input.vendor == "onvif" {
+        "rtsp"
+    } else {
+        input.vendor.as_str()
+    };
     let cfg = CameraConfig {
         camera_id: camera_id.clone(),
         vendor: session_vendor.to_string(),
@@ -948,7 +1070,14 @@ pub fn camera_add_v1(
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.add", Some(&camera_id), RiskClass::A, "error", Some("supervisor_init_failed"));
+            audit(
+                caller.data(),
+                "camera.add",
+                Some(&camera_id),
+                RiskClass::A,
+                "error",
+                Some("supervisor_init_failed"),
+            );
             return e.as_i32();
         }
     };
@@ -985,11 +1114,25 @@ pub fn camera_add_v1(
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         // Compensate the started session so the registry stays consistent.
         let _ = run_async(sup.remove_camera(&camera_id));
-        audit(caller.data(), "camera.add", Some(&camera_id), RiskClass::A, "error", Some("db_insert_failed"));
+        audit(
+            caller.data(),
+            "camera.add",
+            Some(&camera_id),
+            RiskClass::A,
+            "error",
+            Some("db_insert_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
 
-    audit(caller.data(), "camera.add", Some(&camera_id), RiskClass::A, "ok", None);
+    audit(
+        caller.data(),
+        "camera.add",
+        Some(&camera_id),
+        RiskClass::A,
+        "ok",
+        None,
+    );
     let out = CameraAddOutput {
         camera_id: camera_id.clone(),
         status: "starting".to_string(),
@@ -1012,7 +1155,14 @@ pub fn camera_list_v1(
         None => return AbiError::Operation.as_i32(),
     };
     if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
-        audit(caller.data(), "camera.list", None, RiskClass::B, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.list",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
@@ -1021,7 +1171,14 @@ pub fn camera_list_v1(
     let rows = match list_cameras_for_addon(&db, &addon_id, org_id_for_query.as_deref()) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.list", None, RiskClass::B, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.list",
+                None,
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1039,7 +1196,14 @@ pub fn camera_list_v1(
     let out = match out {
         Ok(v) => v,
         Err(e) => {
-            audit(caller.data(), "camera.list", None, RiskClass::B, "error", Some("supervisor_unavailable"));
+            audit(
+                caller.data(),
+                "camera.list",
+                None,
+                RiskClass::B,
+                "error",
+                Some("supervisor_unavailable"),
+            );
             return e.as_i32();
         }
     };
@@ -1066,36 +1230,86 @@ pub fn camera_get_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.get", None, RiskClass::B, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.get",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
-        audit(caller.data(), "camera.get", None, RiskClass::B, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.get",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraIdInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.get", None, RiskClass::B, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.get",
+                None,
+                RiskClass::B,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
-        audit(caller.data(), "camera.get", None, RiskClass::B, "denied", Some("camera_id_invalid"));
+        audit(
+            caller.data(),
+            "camera.get",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("camera_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    let row = match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(r)) => r,
         Ok(None) => {
-            audit(caller.data(), "camera.get", Some(&input.camera_id), RiskClass::B, "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "camera.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.get", Some(&input.camera_id), RiskClass::B, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1123,7 +1337,14 @@ pub fn camera_get_v1(
             profile: row.profile,
         },
     };
-    audit(caller.data(), "camera.get", Some(&info.camera_id), RiskClass::B, "ok", None);
+    audit(
+        caller.data(),
+        "camera.get",
+        Some(&info.camera_id),
+        RiskClass::B,
+        "ok",
+        None,
+    );
     write_toml_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr)
 }
 
@@ -1146,48 +1367,107 @@ pub fn camera_update_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.update", None, RiskClass::A, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.update",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
-        audit(caller.data(), "camera.update", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.update",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraUpdateInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.update", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.update",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
-        audit(caller.data(), "camera.update", None, RiskClass::A, "denied", Some("camera_id_invalid"));
+        audit(
+            caller.data(),
+            "camera.update",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("camera_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
 
     if let Some(fps) = input.target_fps {
         if !(1..=60).contains(&fps) {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "denied", Some("target_fps_out_of_range"));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("target_fps_out_of_range"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
     if let Some(rc) = input.retention_class.as_ref() {
         if let Err(reason) = validate_retention(rc) {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "denied", Some(reason));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some(reason),
+            );
             return AbiError::Operation.as_i32();
         }
     }
     if let Some(n) = input.display_name.as_ref() {
         if let Err(reason) = validate_display_name(n) {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "denied", Some(reason));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some(reason),
+            );
             return AbiError::Operation.as_i32();
         }
     }
     if let Some(p) = input.profile.as_ref() {
         if let Err(reason) = validate_profile(p) {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "denied", Some(reason));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some(reason),
+            );
             return AbiError::Operation.as_i32();
         }
     }
@@ -1195,14 +1475,33 @@ pub fn camera_update_v1(
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
 
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
@@ -1235,19 +1534,53 @@ pub fn camera_update_v1(
         profile: input.profile.clone(),
     };
 
-    if update_camera(&db, &addon_id, &input.camera_id, &patch, caller.data().org_id.as_deref()).is_err() {
-        audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed"));
+    if update_camera(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        &patch,
+        caller.data().org_id.as_deref(),
+    )
+    .is_err()
+    {
+        audit(
+            caller.data(),
+            "camera.update",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "error",
+            Some("db_update_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
 
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    let row = match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(r)) => r,
         Ok(None) => {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "error", Some("row_disappeared_after_update"));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("row_disappeared_after_update"),
+            );
             return AbiError::Operation.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.update", Some(&input.camera_id), RiskClass::A, "error", Some("db_error_after_update"));
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error_after_update"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1274,7 +1607,14 @@ pub fn camera_update_v1(
     });
 
     let reason = format!("fields={}", diff.join(","));
-    audit(caller.data(), "camera.update", Some(&info.camera_id), RiskClass::A, "ok", Some(&reason));
+    audit(
+        caller.data(),
+        "camera.update",
+        Some(&info.camera_id),
+        RiskClass::A,
+        "ok",
+        Some(&reason),
+    );
     write_toml_capped(&memory, &mut caller, &info, out_ptr, out_cap, out_len_ptr)
 }
 
@@ -1297,37 +1637,87 @@ pub fn camera_remove_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.remove", None, RiskClass::A, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.remove",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
-        audit(caller.data(), "camera.remove", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.remove",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraIdInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.remove", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.remove",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
-        audit(caller.data(), "camera.remove", None, RiskClass::A, "denied", Some("camera_id_invalid"));
+        audit(
+            caller.data(),
+            "camera.remove",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("camera_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
 
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "camera.remove",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.remove",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
@@ -1337,14 +1727,33 @@ pub fn camera_remove_v1(
     // is effectively gone from the addon's perspective. A leftover in-memory
     // session is bounded by process lifetime and falls off at next restart
     // because reconciliation skips `removed_at IS NOT NULL` rows.
-    match soft_delete_camera(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    match soft_delete_camera(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(true) => {}
         Ok(false) => {
-            audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found"));
+            audit(
+                caller.data(),
+                "camera.remove",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_found"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.remove",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
@@ -1361,7 +1770,14 @@ pub fn camera_remove_v1(
         }
     }
 
-    audit(caller.data(), "camera.remove", Some(&input.camera_id), RiskClass::A, "ok", None);
+    audit(
+        caller.data(),
+        "camera.remove",
+        Some(&input.camera_id),
+        RiskClass::A,
+        "ok",
+        None,
+    );
     let out = CameraRemoveOut { removed: true };
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
@@ -1385,48 +1801,107 @@ pub fn camera_snapshot_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.snapshot", None, RiskClass::A, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.snapshot",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_SNAPSHOT, None) {
-        audit(caller.data(), "camera.snapshot", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.snapshot",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraIdInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.snapshot", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.snapshot",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
-        audit(caller.data(), "camera.snapshot", None, RiskClass::A, "denied", Some("camera_id_invalid"));
+        audit(
+            caller.data(),
+            "camera.snapshot",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("camera_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            audit(caller.data(), "camera.snapshot", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "camera.snapshot",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.snapshot", Some(&input.camera_id), RiskClass::A, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.snapshot",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
 
     let snap = run_async(async {
         let sup = get_or_init_supervisor().await?;
-        sup.snapshot(&input.camera_id).await.map_err(|e| map_ingest_error(&e))
+        sup.snapshot(&input.camera_id)
+            .await
+            .map_err(|e| map_ingest_error(&e))
     });
     let snap = match snap {
         Ok(v) => v,
         Err(e) => {
-            audit(caller.data(), "camera.snapshot", Some(&input.camera_id), RiskClass::A, "error", Some(&format!("abi_error={}", e.as_i32())));
+            audit(
+                caller.data(),
+                "camera.snapshot",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some(&format!("abi_error={}", e.as_i32())),
+            );
             return e.as_i32();
         }
     };
@@ -1448,7 +1923,10 @@ pub fn camera_snapshot_v1(
         Some(&out.camera_id),
         RiskClass::A,
         "ok",
-        Some(&format!("w={} h={} bytes={}", out.width, out.height, bytes_size)),
+        Some(&format!(
+            "w={} h={} bytes={}",
+            out.width, out.height, bytes_size
+        )),
     );
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
@@ -1472,36 +1950,86 @@ pub fn camera_health_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.health", None, RiskClass::B, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.health",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
-        audit(caller.data(), "camera.health", None, RiskClass::B, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.health",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraIdInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.health", None, RiskClass::B, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.health",
+                None,
+                RiskClass::B,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
-        audit(caller.data(), "camera.health", None, RiskClass::B, "denied", Some("camera_id_invalid"));
+        audit(
+            caller.data(),
+            "camera.health",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("camera_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    let row = match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(r)) => r,
         Ok(None) => {
-            audit(caller.data(), "camera.health", Some(&input.camera_id), RiskClass::B, "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "camera.health",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.health", Some(&input.camera_id), RiskClass::B, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.health",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1541,7 +2069,14 @@ pub fn camera_health_v1(
             },
         }
     });
-    audit(caller.data(), "camera.health", Some(&out.camera_id), RiskClass::B, "ok", None);
+    audit(
+        caller.data(),
+        "camera.health",
+        Some(&out.camera_id),
+        RiskClass::B,
+        "ok",
+        None,
+    );
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
@@ -1560,7 +2095,14 @@ pub fn camera_discover_v1(
         None => return AbiError::Operation.as_i32(),
     };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
-        audit(caller.data(), "camera.discover", None, RiskClass::B, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.discover",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let cameras = run_async(async {
@@ -1582,7 +2124,14 @@ pub fn camera_discover_v1(
             .collect(),
         Err(e) => {
             warn!("camera.discover ws-discovery failed: {e}");
-            audit(caller.data(), "camera.discover", None, RiskClass::B, "error", Some("ws_discovery_failed"));
+            audit(
+                caller.data(),
+                "camera.discover",
+                None,
+                RiskClass::B,
+                "error",
+                Some("ws_discovery_failed"),
+            );
             Vec::new()
         }
     };
@@ -1617,32 +2166,77 @@ pub fn camera_test_connection_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.test_connection", None, RiskClass::A, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.test_connection",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
-        audit(caller.data(), "camera.test_connection", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.test_connection",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraTestConnectionInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.test_connection", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.test_connection",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if input.vendor.is_empty() || input.vendor.len() > MAX_VENDOR {
-        audit(caller.data(), "camera.test_connection", None, RiskClass::A, "denied", Some("vendor_length"));
+        audit(
+            caller.data(),
+            "camera.test_connection",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("vendor_length"),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_url(&input.url) {
-        audit(caller.data(), "camera.test_connection", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            caller.data(),
+            "camera.test_connection",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if !vendor_testable(&input.vendor) {
-        audit(caller.data(), "camera.test_connection", None, RiskClass::A, "ok", Some("unsupported_vendor"));
+        audit(
+            caller.data(),
+            "camera.test_connection",
+            None,
+            RiskClass::A,
+            "ok",
+            Some("unsupported_vendor"),
+        );
         let out = CameraTestConnectionOut {
             ok: false,
             message: format!("vendor '{}' not supported", input.vendor),
@@ -1650,7 +2244,8 @@ pub fn camera_test_connection_v1(
         return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
     }
     let out = match input.vendor.as_str() {
-        "fake_file" => match crate::services::camera_ingest::fakefile::resolve_file_url(&input.url) {
+        "fake_file" => match crate::services::camera_ingest::fakefile::resolve_file_url(&input.url)
+        {
             Ok(_) => CameraTestConnectionOut {
                 ok: true,
                 message: "fake_file path readable".to_string(),
@@ -1662,27 +2257,46 @@ pub fn camera_test_connection_v1(
         },
         "rtsp" => {
             if let Err(e) = crate::services::camera_ingest::rtsp::validate_rtsp_url(&input.url) {
-                CameraTestConnectionOut { ok: false, message: e.to_string() }
+                CameraTestConnectionOut {
+                    ok: false,
+                    message: e.to_string(),
+                }
             } else {
                 match run_async(rtsp_test_connection(&input.url, 5)) {
                     Ok(()) => CameraTestConnectionOut {
                         ok: true,
                         message: "rtsp OPTIONS 200 OK".to_string(),
                     },
-                    Err(msg) => CameraTestConnectionOut { ok: false, message: msg },
+                    Err(msg) => CameraTestConnectionOut {
+                        ok: false,
+                        message: msg,
+                    },
                 }
             }
         }
         "onvif" => match run_async(onvif_test_connection(&input.url, 5)) {
-            Ok(note) => CameraTestConnectionOut { ok: true, message: note },
-            Err(msg) => CameraTestConnectionOut { ok: false, message: msg },
+            Ok(note) => CameraTestConnectionOut {
+                ok: true,
+                message: note,
+            },
+            Err(msg) => CameraTestConnectionOut {
+                ok: false,
+                message: msg,
+            },
         },
         other => CameraTestConnectionOut {
             ok: false,
             message: format!("vendor '{other}' has no test_connection handler"),
         },
     };
-    audit(caller.data(), "camera.test_connection", None, RiskClass::A, "ok", Some(&format!("ok={}", out.ok)));
+    audit(
+        caller.data(),
+        "camera.test_connection",
+        None,
+        RiskClass::A,
+        "ok",
+        Some(&format!("ok={}", out.ok)),
+    );
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
 
@@ -1705,43 +2319,100 @@ pub fn camera_credentials_rotate_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.credentials_rotate", None, RiskClass::A, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
-        audit(caller.data(), "camera.credentials_rotate", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "camera.credentials_rotate",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CameraCredentialsRotateInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.credentials_rotate", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !camera_id_valid(&input.camera_id) {
-        audit(caller.data(), "camera.credentials_rotate", None, RiskClass::A, "denied", Some("camera_id_invalid"));
+        audit(
+            caller.data(),
+            "camera.credentials_rotate",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("camera_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let new_blob = match prepare_credentials_blob(input.new_credentials_b64.as_deref()) {
         Ok(v) => v,
         Err(reason) => {
-            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some(reason));
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some(reason),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(&db, &addon_id, &input.camera_id, caller.data().org_id.as_deref()) {
+    let row = match get_camera_for_addon(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        caller.data().org_id.as_deref(),
+    ) {
         Ok(Some(r)) => r,
         Ok(None) => {
-            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1749,7 +2420,14 @@ pub fn camera_credentials_rotate_v1(
     // is local filesystem playback (no auth); other unknown vendors are
     // rejected explicitly to avoid storing dead blobs against them.
     if row.vendor != "rtsp" && row.vendor != "onvif" {
-        audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("vendor_has_no_credentials"));
+        audit(
+            caller.data(),
+            "camera.credentials_rotate",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "denied",
+            Some("vendor_has_no_credentials"),
+        );
         let out = CameraCredentialsRotateOut {
             rotated: false,
             reason: format!("vendor '{}' has no credentials field", row.vendor),
@@ -1768,21 +2446,42 @@ pub fn camera_credentials_rotate_v1(
         let onvif_url = match row.onvif_url.as_deref() {
             Some(u) => u,
             None => {
-                audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("onvif_url_missing"));
+                audit(
+                    caller.data(),
+                    "camera.credentials_rotate",
+                    Some(&input.camera_id),
+                    RiskClass::A,
+                    "error",
+                    Some("onvif_url_missing"),
+                );
                 return AbiError::Operation.as_i32();
             }
         };
         let blob = match blob_ref {
             Some(b) => b,
             None => {
-                audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "denied", Some("credentials_required_for_onvif"));
+                audit(
+                    caller.data(),
+                    "camera.credentials_rotate",
+                    Some(&input.camera_id),
+                    RiskClass::A,
+                    "denied",
+                    Some("credentials_required_for_onvif"),
+                );
                 return AbiError::Operation.as_i32();
             }
         };
         match resolve_onvif_one_click(onvif_url, blob, row.onvif_profile_token.as_deref()) {
             Ok(ok) => (ok.rtsp_uri, Some(ok.profile_token)),
             Err((abi, reason)) => {
-                audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some(reason));
+                audit(
+                    caller.data(),
+                    "camera.credentials_rotate",
+                    Some(&input.camera_id),
+                    RiskClass::A,
+                    "error",
+                    Some(reason),
+                );
                 return abi.as_i32();
             }
         }
@@ -1790,10 +2489,23 @@ pub fn camera_credentials_rotate_v1(
         (row.url.clone(), row.onvif_profile_token.clone())
     };
 
-    if set_camera_credentials_encrypted(&db, &addon_id, &input.camera_id, blob_ref, caller.data().org_id.as_deref())
-        .is_err()
+    if set_camera_credentials_encrypted(
+        &db,
+        &addon_id,
+        &input.camera_id,
+        blob_ref,
+        caller.data().org_id.as_deref(),
+    )
+    .is_err()
     {
-        audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed"));
+        audit(
+            caller.data(),
+            "camera.credentials_rotate",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "error",
+            Some("db_update_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -1808,7 +2520,14 @@ pub fn camera_credentials_rotate_v1(
             rotated_profile_token.as_deref(),
             caller.data().org_id.as_deref(),
         ) {
-            audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "error", Some("db_update_failed_onvif"));
+            audit(
+                caller.data(),
+                "camera.credentials_rotate",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_update_failed_onvif"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
@@ -1819,7 +2538,11 @@ pub fn camera_credentials_rotate_v1(
     // independent disconnect — which on a healthy RTSP feed never happens.
     // For ONVIF rows the supervisor still runs the session as `rtsp` against
     // the derived URI (matches camera_add_v1's session_vendor translation).
-    let session_vendor = if row.vendor == "onvif" { "rtsp" } else { row.vendor.as_str() };
+    let session_vendor = if row.vendor == "onvif" {
+        "rtsp"
+    } else {
+        row.vendor.as_str()
+    };
     let restart_cfg = CameraConfig {
         camera_id: row.camera_id.clone(),
         vendor: session_vendor.to_string(),
@@ -1853,7 +2576,14 @@ pub fn camera_credentials_rotate_v1(
         new_blob.is_none(),
         restart_note
     );
-    audit(caller.data(), "camera.credentials_rotate", Some(&input.camera_id), RiskClass::A, "ok", Some(&reason));
+    audit(
+        caller.data(),
+        "camera.credentials_rotate",
+        Some(&input.camera_id),
+        RiskClass::A,
+        "ok",
+        Some(&reason),
+    );
     let out = CameraCredentialsRotateOut {
         rotated: true,
         reason: if new_blob.is_some() {
@@ -1876,24 +2606,52 @@ pub fn camera_credentials_rotate_v1(
 /// TOML and oversized payloads without standing up an InstancePool.
 pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     if enforce_payload_size(raw_input.len(), PayloadKind::ServiceCall).is_err() {
-        audit(state, "camera.add", None, RiskClass::A, "error", Some("payload_too_large"));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "error",
+            Some("payload_too_large"),
+        );
         return AbiError::PayloadTooLarge.as_i32();
     }
     let raw = match std::str::from_utf8(raw_input) {
         Ok(s) => s,
         Err(_) => {
-            audit(state, "camera.add", None, RiskClass::A, "error", Some("input_read_failed"));
+            audit(
+                state,
+                "camera.add",
+                None,
+                RiskClass::A,
+                "error",
+                Some("input_read_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !check_permission(state, PERM_CAMERAS_WRITE, None) {
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some("missing_permission"));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let mut input: CameraAddInput = match toml::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(state, "camera.add", None, RiskClass::A, "error", Some("invalid_toml"));
+            audit(
+                state,
+                "camera.add",
+                None,
+                RiskClass::A,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1903,33 +2661,82 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         } else {
             AbiError::Operation
         };
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return err.as_i32();
     }
     if let Err(reason) = validate_url(&input.url) {
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if !(1..=60).contains(&input.target_fps) {
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some("target_fps_out_of_range"));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("target_fps_out_of_range"),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_retention(&input.retention_class) {
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_display_name(&input.display_name) {
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     if let Err(reason) = validate_profile(&input.profile) {
-        audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
     let credentials_blob = match prepare_credentials_blob(input.credentials_b64.as_deref()) {
         Ok(v) => v,
         Err(reason) => {
-            audit(state, "camera.add", None, RiskClass::A, "denied", Some(reason));
+            audit(
+                state,
+                "camera.add",
+                None,
+                RiskClass::A,
+                "denied",
+                Some(reason),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1940,12 +2747,26 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     let onvif_token_to_persist;
     if input.vendor == "onvif" {
         let Some(blob) = credentials_blob.as_deref() else {
-            audit(state, "camera.add", None, RiskClass::A, "denied", Some("missing_credentials"));
+            audit(
+                state,
+                "camera.add",
+                None,
+                RiskClass::A,
+                "denied",
+                Some("missing_credentials"),
+            );
             return AbiError::Operation.as_i32();
         };
         if let Some(tok) = &input.onvif_profile_token {
             if !profile_valid(tok) {
-                audit(state, "camera.add", None, RiskClass::A, "denied", Some("onvif_profile_token_invalid"));
+                audit(
+                    state,
+                    "camera.add",
+                    None,
+                    RiskClass::A,
+                    "denied",
+                    Some("onvif_profile_token_invalid"),
+                );
                 return AbiError::Operation.as_i32();
             }
         }
@@ -1956,7 +2777,14 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
                 input.url = ok.rtsp_uri;
             }
             Err((err, reason)) => {
-                audit(state, "camera.add", None, RiskClass::A, "error", Some(reason));
+                audit(
+                    state,
+                    "camera.add",
+                    None,
+                    RiskClass::A,
+                    "error",
+                    Some(reason),
+                );
                 return err.as_i32();
             }
         }
@@ -1973,7 +2801,11 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     let res_w = input.resolution_width.map(|v| v as i64);
     let res_h = input.resolution_height.map(|v| v as i64);
 
-    let session_vendor = if input.vendor == "onvif" { "rtsp" } else { input.vendor.as_str() };
+    let session_vendor = if input.vendor == "onvif" {
+        "rtsp"
+    } else {
+        input.vendor.as_str()
+    };
     let cfg = CameraConfig {
         camera_id: camera_id.clone(),
         vendor: session_vendor.to_string(),
@@ -1989,7 +2821,14 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
         Err(e) => {
-            audit(state, "camera.add", Some(&camera_id), RiskClass::A, "error", Some("supervisor_init_failed"));
+            audit(
+                state,
+                "camera.add",
+                Some(&camera_id),
+                RiskClass::A,
+                "error",
+                Some("supervisor_init_failed"),
+            );
             return e.as_i32();
         }
     };
@@ -1999,7 +2838,14 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
             CameraIngestError::QuotaExceeded(_) => "quota_exceeded".to_string(),
             other => format!("session_start_failed: {other}"),
         };
-        audit(state, "camera.add", Some(&camera_id), RiskClass::A, "error", Some(&reason));
+        audit(
+            state,
+            "camera.add",
+            Some(&camera_id),
+            RiskClass::A,
+            "error",
+            Some(&reason),
+        );
         return mapped.as_i32();
     }
 
@@ -2022,11 +2868,25 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
         let _ = run_async(sup.remove_camera(&camera_id));
-        audit(state, "camera.add", Some(&camera_id), RiskClass::A, "error", Some("db_insert_failed"));
+        audit(
+            state,
+            "camera.add",
+            Some(&camera_id),
+            RiskClass::A,
+            "error",
+            Some("db_insert_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
 
-    audit(state, "camera.add", Some(&camera_id), RiskClass::A, "ok", None);
+    audit(
+        state,
+        "camera.add",
+        Some(&camera_id),
+        RiskClass::A,
+        "ok",
+        None,
+    );
     AbiError::Ok.as_i32()
 }
 
