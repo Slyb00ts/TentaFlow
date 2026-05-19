@@ -75,7 +75,7 @@ pub fn ui_render(
         }
     };
 
-    let ui_value = match crate::addon::ui_framework::parse_and_validate_ui_json(&ui_value_raw) {
+    let ui_value = match crate::addon::ui::parse_and_validate_ui_json(&ui_value_raw) {
         Ok(v) => v,
         Err(_) => {
             audit_log(
