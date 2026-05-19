@@ -36,9 +36,7 @@ pub fn decode_to_pcm_f32(data: &[u8]) -> Result<Vec<f32>> {
     let format = detect_format(data);
 
     match format {
-        AudioFormat::Wav | AudioFormat::Mp3 | AudioFormat::Ogg => {
-            decode_symphonia(data, &format)
-        }
+        AudioFormat::Wav | AudioFormat::Mp3 | AudioFormat::Ogg => decode_symphonia(data, &format),
         AudioFormat::RawPcm16 => decode_raw_pcm16(data),
     }
 }

@@ -18,8 +18,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::services::catalog::{
-    CatalogEntry, CatalogEntryKind, CatalogSnapshot, InputModality, ModelInstance,
-    OutputModality, ServiceSurface, Strategy,
+    CatalogEntry, CatalogEntryKind, CatalogSnapshot, InputModality, ModelInstance, OutputModality,
+    ServiceSurface, Strategy,
 };
 use crate::services::handles_cache::LiveHandlesCache;
 use crate::services::runtime::context::{ContextLimitError, ExecutionContext};
@@ -132,7 +132,6 @@ pub fn local_node_id_provider_for_router(
 }
 
 impl AliasResolver {
-
     /// Walk the catalog from `req.requested_model`, expand aliases, drop
     /// candidates whose surface/modalities don't satisfy the request, and
     /// return what's left. The context is mutated to track the alias
@@ -198,12 +197,11 @@ impl AliasResolver {
                 fallback_targets,
                 ..
             } => {
-                ctx.enter_alias(&entry.id).map_err(|source| {
-                    ResolveError::AliasLimit {
+                ctx.enter_alias(&entry.id)
+                    .map_err(|source| ResolveError::AliasLimit {
                         requested: req.requested_model.to_string(),
                         source,
-                    }
-                })?;
+                    })?;
 
                 let result = self.walk_alias_targets(
                     req,
@@ -454,17 +452,13 @@ mod tests {
     fn local_service_model_emits_mesh_forward_when_handle_missing() {
         // Local node id is "local" but instance lives on "peer" — that's
         // the canonical "remote service" case. No live handle needed.
-        let entry = service_entry(
-            "m",
-            "peer",
-            vec![ServiceSurface::Chat],
-            vec![],
-            vec![],
-        );
+        let entry = service_entry("m", "peer", vec![ServiceSurface::Chat], vec![], vec![]);
         let snap = snapshot(vec![entry]);
         let resolver = resolver_for("local");
         let mut ctx = ExecutionContext::new(None);
-        let outcome = resolver.resolve(&chat_request("m"), &snap, &mut ctx).unwrap();
+        let outcome = resolver
+            .resolve(&chat_request("m"), &snap, &mut ctx)
+            .unwrap();
         assert_eq!(outcome.candidates.len(), 1);
         assert!(matches!(
             outcome.candidates[0],
@@ -557,13 +551,7 @@ mod tests {
     /// `CapabilityUnsupported` rather than silently downgrading.
     #[test]
     fn surface_mismatch_returns_capability_unsupported() {
-        let entry = service_entry(
-            "llama",
-            "peer",
-            vec![ServiceSurface::Chat],
-            vec![],
-            vec![],
-        );
+        let entry = service_entry("llama", "peer", vec![ServiceSurface::Chat], vec![], vec![]);
         let snap = snapshot(vec![entry]);
         let resolver = resolver_for("local");
         let mut ctx = ExecutionContext::new(None);
@@ -589,7 +577,9 @@ mod tests {
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
         let mut ctx = ExecutionContext::new(None);
-        let err = resolver.resolve(&chat_request("a"), &snap, &mut ctx).unwrap_err();
+        let err = resolver
+            .resolve(&chat_request("a"), &snap, &mut ctx)
+            .unwrap_err();
         match err {
             ResolveError::AliasLimit { source, .. } => {
                 assert!(matches!(source, ContextLimitError::AliasCycle { .. }));
@@ -648,7 +638,9 @@ mod tests {
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
         let mut ctx = ExecutionContext::new(None);
-        let err = resolver.resolve(&chat_request("loop"), &snap, &mut ctx).unwrap_err();
+        let err = resolver
+            .resolve(&chat_request("loop"), &snap, &mut ctx)
+            .unwrap_err();
         match err {
             ResolveError::AliasLimit { source, .. } => {
                 assert!(
@@ -711,7 +703,12 @@ mod tests {
                 vec![],
             ),
             // self-cycle alias used as a fallback
-            alias("broken-alias", "broken-alias", &[], Strategy::FirstAvailable),
+            alias(
+                "broken-alias",
+                "broken-alias",
+                &[],
+                Strategy::FirstAvailable,
+            ),
             service_entry(
                 "healthy-svc",
                 "peer-b",
@@ -771,7 +768,9 @@ mod tests {
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
         let mut ctx = ExecutionContext::new(None);
-        let err = resolver.resolve(&chat_request("a0"), &snap, &mut ctx).unwrap_err();
+        let err = resolver
+            .resolve(&chat_request("a0"), &snap, &mut ctx)
+            .unwrap_err();
         assert!(matches!(err, ResolveError::AliasLimit { .. }));
     }
 }

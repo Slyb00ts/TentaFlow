@@ -49,8 +49,10 @@ fn cipher_encrypts_and_decrypts_credentials() {
     let cipher = CredentialsCipher::load_or_generate_at(&path).unwrap();
 
     let blob = cipher.encrypt("admin:secret").unwrap();
-    assert!(!blob.windows(11).any(|w| w == b"admin:secret"),
-        "ciphertext must not contain plaintext byte sequence");
+    assert!(
+        !blob.windows(11).any(|w| w == b"admin:secret"),
+        "ciphertext must not contain plaintext byte sequence"
+    );
     let got = cipher.decrypt(&blob).unwrap();
     assert_eq!(got, "admin:secret");
 }
@@ -87,9 +89,10 @@ fn set_camera_credentials_round_trip_through_db() {
         set_camera_credentials_encrypted(&db, "addon-rot", &camera_id, Some(&blob), None).unwrap();
     assert!(updated, "row should be touched");
 
-    let row = tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id, None)
-        .unwrap()
-        .expect("row");
+    let row =
+        tentaflow_core::db::repository::get_camera_for_addon(&db, "addon-rot", &camera_id, None)
+            .unwrap()
+            .expect("row");
     let stored = row.credentials_encrypted.expect("blob persisted");
     assert_eq!(stored, blob);
     let plain = cipher.decrypt(&stored).unwrap();
@@ -111,15 +114,29 @@ fn cross_owner_set_credentials_returns_false() {
     let db = make_db();
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     insert_camera(
-        &db, &camera_id, "addon-owner", "front gate", "rtsp",
-        "rtsp://cam.local/stream", 30, None, None, "C", "default", None, None, None, None,
+        &db,
+        &camera_id,
+        "addon-owner",
+        "front gate",
+        "rtsp",
+        "rtsp://cam.local/stream",
+        30,
+        None,
+        None,
+        "C",
+        "default",
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let td = tempfile::tempdir().unwrap();
     let cipher = CredentialsCipher::load_or_generate_at(&fresh_key_path(&td, "k")).unwrap();
     let blob = cipher.encrypt("u:p").unwrap();
     let touched =
-        set_camera_credentials_encrypted(&db, "addon-stranger", &camera_id, Some(&blob), None).unwrap();
+        set_camera_credentials_encrypted(&db, "addon-stranger", &camera_id, Some(&blob), None)
+            .unwrap();
     assert!(!touched, "ownership guard must reject foreign addon");
 }
 
@@ -141,12 +158,17 @@ fn rotate_key_re_encrypts_every_row() {
         let cid = format!("cam_{}", uuid::Uuid::new_v4());
         let blob = old_cipher.encrypt(c).unwrap();
         insert_camera(
-            &db, &cid,
+            &db,
+            &cid,
             "addon-bulk",
             &format!("cam{i}"),
             "rtsp",
             "rtsp://x/y",
-            30, None, None, "C", "default",
+            30,
+            None,
+            None,
+            "C",
+            "default",
             Some(&blob),
             None,
             None,
@@ -182,8 +204,10 @@ fn rotate_key_re_encrypts_every_row() {
                 .expect("row");
         let blob = row.credentials_encrypted.unwrap();
         assert_eq!(new_cipher.decrypt(&blob).unwrap(), *expected);
-        assert!(old_cipher.decrypt(&blob).is_err(),
-            "old key must no longer decrypt rotated blob");
+        assert!(
+            old_cipher.decrypt(&blob).is_err(),
+            "old key must no longer decrypt rotated blob"
+        );
     }
 }
 
@@ -249,7 +273,10 @@ fn recovery_promotes_dot_new_when_live_key_stale() {
         .unwrap();
 
     // Confirm the stale live cipher cannot decrypt the new-key blob.
-    assert!(old_cipher.decrypt(&blob).is_err(), "old key must not decrypt");
+    assert!(
+        old_cipher.decrypt(&blob).is_err(),
+        "old key must not decrypt"
+    );
     drop(old_cipher);
 
     // Recovery: load_or_generate_at must rename .new → live and then load.
@@ -319,7 +346,20 @@ fn plaintext_credentials_reject_url_breakers() {
             c.is_ascii_alphanumeric()
                 || matches!(
                     c,
-                    '-' | '.' | '_' | '~' | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+                    '-' | '.'
+                        | '_'
+                        | '~'
+                        | '!'
+                        | '$'
+                        | '&'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '*'
+                        | '+'
+                        | ','
+                        | ';'
+                        | '='
                 )
         };
         let accepted = !user.is_empty()

@@ -490,12 +490,18 @@ impl MeshCommandExecutor {
             cfg_obj.insert("model_preset_id".into(), serde_json::Value::Null);
         }
         if let Some(preset_id) = model_preset_id {
-            cfg_obj.insert("model_preset_id".into(), serde_json::Value::String(preset_id));
+            cfg_obj.insert(
+                "model_preset_id".into(),
+                serde_json::Value::String(preset_id),
+            );
             cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
         }
         if let Some(util) = gpu_memory_utilization {
             if let Some(num) = serde_json::Number::from_f64(util as f64) {
-                cfg_obj.insert("gpu_memory_utilization".into(), serde_json::Value::Number(num));
+                cfg_obj.insert(
+                    "gpu_memory_utilization".into(),
+                    serde_json::Value::Number(num),
+                );
             }
         }
         if let Some(v) = max_model_len {
@@ -559,10 +565,7 @@ impl MeshCommandExecutor {
         if restart_after_save && was_running {
             let ports = actions.port_allocator.clone();
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
-                tracing::warn!(
-                    service_id,
-                    "service_update_remote: stop failed: {}", e
-                );
+                tracing::warn!(service_id, "service_update_remote: stop failed: {}", e);
             }
             {
                 let conn = match actions.db.lock() {

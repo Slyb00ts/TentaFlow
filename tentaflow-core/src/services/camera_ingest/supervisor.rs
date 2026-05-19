@@ -55,7 +55,12 @@ impl CameraIngestSupervisor {
         // the insert could otherwise blow past the cap.
         {
             let g = self.registry.read().await;
-            check_caps(&g, self.global_cap, self.per_addon_cap, config.owner_addon_id.as_deref())?;
+            check_caps(
+                &g,
+                self.global_cap,
+                self.per_addon_cap,
+                config.owner_addon_id.as_deref(),
+            )?;
             if g.contains_key(&config.camera_id) {
                 return Err(CameraIngestError::AlreadyExists(config.camera_id.clone()));
             }
@@ -235,11 +240,7 @@ async fn stop_and_join(handle: CameraHandle, timeout: Duration) {
     join_with_timeout(handle.id, handle.join_handle, timeout).await;
 }
 
-async fn join_with_timeout(
-    id: String,
-    join: tokio::task::JoinHandle<()>,
-    timeout: Duration,
-) {
+async fn join_with_timeout(id: String, join: tokio::task::JoinHandle<()>, timeout: Duration) {
     let abort = join.abort_handle();
     match tokio::time::timeout(timeout, join).await {
         Ok(Ok(())) => {}

@@ -107,12 +107,7 @@ fn loopback_addr_of(mgr: &IrohMeshManager) -> std::net::SocketAddr {
 /// blob — so we fetch each peer's combined `public_key_hex` and feed
 /// that. Once both sides record the trust, the pre-trust gate in
 /// `handle_mesh_uni` will let our 0x45 / 0x46 frames through.
-fn trust_each_other(
-    sec_a: &MeshSecurity,
-    sec_b: &MeshSecurity,
-    id_a: &str,
-    id_b: &str,
-) {
+fn trust_each_other(sec_a: &MeshSecurity, sec_b: &MeshSecurity, id_a: &str, id_b: &str) {
     let pub_a = sec_a.public_key_hex();
     let pub_b = sec_b.public_key_hex();
     sec_a

@@ -148,8 +148,8 @@ mod tests {
         let v = LegalAdminPayload::GenerateResponse(LegalDocumentGenerateResponse {
             doc_id: "33333333-3333-4333-8333-333333333333".into(),
             content_hash: "b".repeat(64),
-            signed_url: "/legal/33333333-3333-4333-8333-333333333333?token=XYZ&exp=999&org=O&nonce=N"
-                .into(),
+            signed_url:
+                "/legal/33333333-3333-4333-8333-333333333333?token=XYZ&exp=999&org=O&nonce=N".into(),
         });
         assert_eq!(round_trip!(LegalAdminPayload, v.clone()), v);
     }
@@ -179,8 +179,7 @@ mod tests {
             },
         ));
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 }

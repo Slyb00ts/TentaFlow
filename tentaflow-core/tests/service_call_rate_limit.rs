@@ -32,7 +32,10 @@ fn burst_of_100_allowed_then_101_denied() {
         );
     }
     match rl.check("addon-x") {
-        RateLimitResult::AddonLimit { addon_id, retry_after_secs } => {
+        RateLimitResult::AddonLimit {
+            addon_id,
+            retry_after_secs,
+        } => {
             assert_eq!(addon_id, "addon-x");
             assert!(retry_after_secs > 0.0);
         }
@@ -51,7 +54,10 @@ fn addon_isolation() {
     for _ in 0..5 {
         assert_eq!(rl.check("addon-a"), RateLimitResult::Allow);
     }
-    assert!(matches!(rl.check("addon-a"), RateLimitResult::AddonLimit { .. }));
+    assert!(matches!(
+        rl.check("addon-a"),
+        RateLimitResult::AddonLimit { .. }
+    ));
     for _ in 0..5 {
         assert_eq!(
             rl.check("addon-b"),
@@ -71,7 +77,10 @@ fn quota_refills_with_time() {
     });
     assert_eq!(rl.check("addon-r"), RateLimitResult::Allow);
     assert_eq!(rl.check("addon-r"), RateLimitResult::Allow);
-    assert!(matches!(rl.check("addon-r"), RateLimitResult::AddonLimit { .. }));
+    assert!(matches!(
+        rl.check("addon-r"),
+        RateLimitResult::AddonLimit { .. }
+    ));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(rl.check("addon-r"), RateLimitResult::Allow);
 }

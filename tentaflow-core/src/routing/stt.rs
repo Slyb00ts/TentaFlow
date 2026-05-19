@@ -63,9 +63,11 @@ impl Router {
                                 crate::services::runtime::executor::flow_outcome_to_stt_response(
                                     outcome,
                                 )
-                                .map_err(|e| crate::error::CoreError::InternalError {
-                                    message: format!("stt flow result: {e}"),
-                                    source: None,
+                                .map_err(|e| {
+                                    crate::error::CoreError::InternalError {
+                                        message: format!("stt flow result: {e}"),
+                                        source: None,
+                                    }
                                 })?;
                             return Ok(crate::routing::RouteResult {
                                 response,
@@ -85,7 +87,7 @@ impl Router {
                         }
                         Err(e) => {
                             return Err(
-                                crate::routing::dispatch_error_to_core(e, &request.model).into(),
+                                crate::routing::dispatch_error_to_core(e, &request.model).into()
                             );
                         }
                     }
@@ -139,7 +141,6 @@ impl Router {
         let _ = request;
         Err(crate::error::CoreError::AllBackendsUnavailable { model_name }.into())
     }
-
 
     /// Routuje audio request przez protocol-native interface.
     ///
@@ -278,8 +279,8 @@ impl Router {
                                     fallbacks_tried: 0,
                                     hop_count: 0,
                                     latency_ms: None,
-                        usage: None,
-                        finish_reason: None,
+                                    usage: None,
+                                    finish_reason: None,
                                 },
                             }),
                             Err(ExecutorError::SttRuntimeUnavailable) => {

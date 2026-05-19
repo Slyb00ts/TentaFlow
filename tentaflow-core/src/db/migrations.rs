@@ -129,16 +129,8 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (17, "model_visibility", MigrationStep::Sql(MODEL_VISIBILITY)),
         (18, "model_consumers", MigrationStep::Sql(MODEL_CONSUMERS)),
-        (
-            19,
-            "addon_uses_alias",
-            MigrationStep::Sql(ADDON_USES_ALIAS),
-        ),
-        (
-            20,
-            "addon_uses_model",
-            MigrationStep::Sql(ADDON_USES_MODEL),
-        ),
+        (19, "addon_uses_alias", MigrationStep::Sql(ADDON_USES_ALIAS)),
+        (20, "addon_uses_model", MigrationStep::Sql(ADDON_USES_MODEL)),
         (21, "cameras_table", MigrationStep::Sql(CAMERAS_TABLE)),
         (22, "recordings_table", MigrationStep::Sql(RECORDINGS_TABLE)),
         (
@@ -166,16 +158,8 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_vector_namespaces",
             MigrationStep::Sql(ADDON_VECTOR_NAMESPACES),
         ),
-        (
-            28,
-            "policy_claims",
-            MigrationStep::Sql(POLICY_CLAIMS),
-        ),
-        (
-            29,
-            "flow_invocations",
-            MigrationStep::Sql(FLOW_INVOCATIONS),
-        ),
+        (28, "policy_claims", MigrationStep::Sql(POLICY_CLAIMS)),
+        (29, "flow_invocations", MigrationStep::Sql(FLOW_INVOCATIONS)),
         (
             30,
             "cameras_onvif_metadata",
@@ -196,11 +180,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_aliases_strategy_round_robin",
             MigrationStep::Rust(model_aliases_strategy_round_robin),
         ),
-        (
-            34,
-            "gate_check_cache",
-            MigrationStep::Sql(GATE_CHECK_CACHE),
-        ),
+        (34, "gate_check_cache", MigrationStep::Sql(GATE_CHECK_CACHE)),
         (
             35,
             "cameras_metadata_supported",
@@ -221,6 +201,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "backfill_admin_org_memberships",
             MigrationStep::Rust(backfill_admin_org_memberships),
         ),
+        (39, "scheduled_jobs", MigrationStep::Sql(SCHEDULED_JOBS)),
     ]
 }
 
@@ -535,16 +516,31 @@ fn setup_multi_tenant(conn: &Connection) -> Result<()> {
             "role-org-admin",
             "org_admin",
             &[
-                "org.read", "org.write", "org.admin",
-                "user.read", "user.write", "user.assign_role",
-                "addon.install", "addon.upgrade", "addon.uninstall",
-                "camera.read", "camera.write", "camera.discover", "camera.metadata",
-                "service.read", "service.call",
-                "sql.read", "sql.write",
-                "vector.read", "vector.write",
-                "policy.read", "policy.write",
-                "gate.check", "flow.invoke",
-                "legal.read", "legal.write",
+                "org.read",
+                "org.write",
+                "org.admin",
+                "user.read",
+                "user.write",
+                "user.assign_role",
+                "addon.install",
+                "addon.upgrade",
+                "addon.uninstall",
+                "camera.read",
+                "camera.write",
+                "camera.discover",
+                "camera.metadata",
+                "service.read",
+                "service.call",
+                "sql.read",
+                "sql.write",
+                "vector.read",
+                "vector.write",
+                "policy.read",
+                "policy.write",
+                "gate.check",
+                "flow.invoke",
+                "legal.read",
+                "legal.write",
                 "rbac.elevate",
             ],
         ),
@@ -553,12 +549,16 @@ fn setup_multi_tenant(conn: &Connection) -> Result<()> {
             "org_operator",
             &[
                 "org.read",
-                "camera.read", "camera.write", "camera.discover",
-                "service.read", "service.call",
+                "camera.read",
+                "camera.write",
+                "camera.discover",
+                "service.read",
+                "service.call",
                 "sql.read",
                 "vector.read",
                 "policy.read",
-                "gate.check", "flow.invoke",
+                "gate.check",
+                "flow.invoke",
                 "legal.read",
             ],
         ),
@@ -580,21 +580,18 @@ fn setup_multi_tenant(conn: &Connection) -> Result<()> {
             "dpo",
             &[
                 "org.read",
-                "policy.read", "policy.write",
+                "policy.read",
+                "policy.write",
                 "gate.check",
-                "legal.read", "legal.write",
+                "legal.read",
+                "legal.write",
                 "rbac.elevate",
             ],
         ),
         (
             "role-supervisor",
             "supervisor",
-            &[
-                "org.read",
-                "policy.read",
-                "gate.check",
-                "rbac.elevate",
-            ],
+            &["org.read", "policy.read", "gate.check", "rbac.elevate"],
         ),
     ];
     for (role_id, name, perms) in role_seeds {
@@ -745,9 +742,7 @@ fn cameras_add_onvif_metadata_columns(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE cameras ADD COLUMN onvif_url TEXT NULL;")?;
     }
     if !has_token {
-        conn.execute_batch(
-            "ALTER TABLE cameras ADD COLUMN onvif_profile_token TEXT NULL;",
-        )?;
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN onvif_profile_token TEXT NULL;")?;
     }
     Ok(())
 }
@@ -916,9 +911,7 @@ fn frame_pickup_log_add_source_node_id(conn: &Connection) -> Result<()> {
     drop(rows);
     drop(stmt);
     if !has_col {
-        conn.execute_batch(
-            "ALTER TABLE frame_pickup_log ADD COLUMN source_node_id TEXT NULL;",
-        )?;
+        conn.execute_batch("ALTER TABLE frame_pickup_log ADD COLUMN source_node_id TEXT NULL;")?;
     }
     Ok(())
 }
@@ -2298,4 +2291,45 @@ INSERT INTO settings(key, value) VALUES
     ('mesh.advertise_hide_cgnat', '0'),
     ('mesh.advertise_prefer_same_subnet', '1'),
     ('mesh.iroh_relay_url', 'https://relay.nextapp.pl');
+"#;
+
+const SCHEDULED_JOBS: &str = r#"
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    target_type TEXT NOT NULL,
+    target_addon_id TEXT NOT NULL DEFAULT '',
+    target_action_id TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    schedule_kind TEXT NOT NULL,
+    schedule_expr TEXT NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    next_run_at TEXT,
+    max_runtime_seconds INTEGER NOT NULL DEFAULT 1800,
+    retry_policy_json TEXT NOT NULL DEFAULT '{"max_attempts":1,"backoff_seconds":60}',
+    concurrency_policy TEXT NOT NULL DEFAULT 'skip',
+    created_by_user_id INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+    ON scheduled_jobs(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_target
+    ON scheduled_jobs(target_type, target_addon_id, target_action_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_runs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    result_json TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job
+    ON scheduled_runs(job_id, scheduled_for DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status
+    ON scheduled_runs(status);
 "#;

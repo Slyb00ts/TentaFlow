@@ -76,7 +76,9 @@ fn map_db<E: std::fmt::Display>(e: E) -> PolicyError {
 }
 
 pub fn insert_claim(pool: &DbPool, claim: &NewClaim) -> Result<()> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     conn.execute(
         "INSERT INTO policy_claims (claim_id, claim_type, label, subject, scope, document_uri, \
             scope_addon_id, scope_namespace, valid_from, valid_until, issued_by_user, created_at) \
@@ -101,7 +103,9 @@ pub fn insert_claim(pool: &DbPool, claim: &NewClaim) -> Result<()> {
 }
 
 pub fn insert_signature(pool: &DbPool, sig: &NewSignature) -> Result<()> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     conn.execute(
         "INSERT INTO policy_claim_signatures (claim_id, signer_role, signer_user, signed_at, signature_b64) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -123,7 +127,9 @@ pub fn delete_signature(
     signer_role: &str,
     signer_user: &str,
 ) -> Result<bool> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     let n = conn
         .execute(
             "DELETE FROM policy_claim_signatures WHERE claim_id = ?1 AND signer_role = ?2 AND signer_user = ?3",
@@ -134,7 +140,9 @@ pub fn delete_signature(
 }
 
 pub fn get_claim(pool: &DbPool, claim_id: &str) -> Result<Option<ClaimRow>> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     conn.query_row(
         "SELECT claim_id, claim_type, label, subject, scope, document_uri, scope_addon_id, \
                 scope_namespace, valid_from, valid_until, revoked_at, revoked_reason, \
@@ -165,7 +173,9 @@ pub fn get_claim(pool: &DbPool, claim_id: &str) -> Result<Option<ClaimRow>> {
 }
 
 pub fn list_signatures(pool: &DbPool, claim_id: &str) -> Result<Vec<ClaimSignatureRow>> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     let mut stmt = conn
         .prepare(
             "SELECT claim_id, signer_role, signer_user, signed_at, signature_b64 \
@@ -191,7 +201,9 @@ pub fn list_signatures(pool: &DbPool, claim_id: &str) -> Result<Vec<ClaimSignatu
 }
 
 pub fn list_claims(pool: &DbPool, filter: &ListFilter) -> Result<Vec<ClaimRow>> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     // Build query dynamically — kept simple (one optional WHERE clause per
     // filter field). For active_only we filter post-fetch when no `now_utc`
     // is supplied (defensive: never silently drop rows because of a missing
@@ -229,24 +241,27 @@ pub fn list_claims(pool: &DbPool, filter: &ListFilter) -> Result<Vec<ClaimRow>> 
     let params_dyn: Vec<&dyn rusqlite::ToSql> =
         bind.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_dyn.iter().copied()), |row| {
-            Ok(ClaimRow {
-                claim_id: row.get(0)?,
-                claim_type: row.get(1)?,
-                label: row.get(2)?,
-                subject: row.get(3)?,
-                scope: row.get(4)?,
-                document_uri: row.get(5)?,
-                scope_addon_id: row.get(6)?,
-                scope_namespace: row.get(7)?,
-                valid_from: row.get(8)?,
-                valid_until: row.get(9)?,
-                revoked_at: row.get(10)?,
-                revoked_reason: row.get(11)?,
-                issued_by_user: row.get(12)?,
-                created_at: row.get(13)?,
-            })
-        })
+        .query_map(
+            rusqlite::params_from_iter(params_dyn.iter().copied()),
+            |row| {
+                Ok(ClaimRow {
+                    claim_id: row.get(0)?,
+                    claim_type: row.get(1)?,
+                    label: row.get(2)?,
+                    subject: row.get(3)?,
+                    scope: row.get(4)?,
+                    document_uri: row.get(5)?,
+                    scope_addon_id: row.get(6)?,
+                    scope_namespace: row.get(7)?,
+                    valid_from: row.get(8)?,
+                    valid_until: row.get(9)?,
+                    revoked_at: row.get(10)?,
+                    revoked_reason: row.get(11)?,
+                    issued_by_user: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            },
+        )
         .map_err(map_db)?;
     let mut out = Vec::new();
     for r in rows {
@@ -255,13 +270,10 @@ pub fn list_claims(pool: &DbPool, filter: &ListFilter) -> Result<Vec<ClaimRow>> 
     Ok(out)
 }
 
-pub fn revoke_claim(
-    pool: &DbPool,
-    claim_id: &str,
-    reason: &str,
-    revoked_at: &str,
-) -> Result<bool> {
-    let conn = pool.lock().map_err(|e| PolicyError::DbError(e.to_string()))?;
+pub fn revoke_claim(pool: &DbPool, claim_id: &str, reason: &str, revoked_at: &str) -> Result<bool> {
+    let conn = pool
+        .lock()
+        .map_err(|e| PolicyError::DbError(e.to_string()))?;
     let n = conn
         .execute(
             "UPDATE policy_claims SET revoked_at = ?1, revoked_reason = ?2 \

@@ -417,13 +417,15 @@ pub async fn respawn(
             None,
             preserved_port,
         )),
-        DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new_with_port(
-            manifest,
-            user_config,
-            ports.clone(),
-            None,
-            preserved_port,
-        )),
+        DeployMethod::NativePythonBundle => {
+            Box::new(python_bundle::PythonBundleDeploy::new_with_port(
+                manifest,
+                user_config,
+                ports.clone(),
+                None,
+                preserved_port,
+            ))
+        }
         DeployMethod::Docker => Box::new(docker::DockerDeploy::new_with_port(
             manifest,
             user_config,
@@ -989,8 +991,7 @@ mod apply_parameters_deploy_tests {
     #[test]
     fn empty_parameters_returns_empty_application() {
         let m = manifest_with_params(vec![]);
-        let (app, req) =
-            apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
+        let (app, req) = apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
         assert!(app.env.is_empty());
         assert!(req.ollama_options.is_empty());
     }
@@ -1003,8 +1004,7 @@ mod apply_parameters_deploy_tests {
             0.9,
         )]);
         let user_config = json!({ "parameters": { "gpu_memory_utilization": 0.6 } });
-        let (app, _) =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap();
+        let (app, _) = apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap();
         assert_eq!(app.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.6");
     }
 
@@ -1015,8 +1015,7 @@ mod apply_parameters_deploy_tests {
             "GPU_MEMORY_UTILIZATION",
             0.9,
         )]);
-        let (app, _) =
-            apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
+        let (app, _) = apply_parameters_deploy(&m, &json!({}), DeployTarget::Docker).unwrap();
         assert_eq!(app.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.9");
     }
 
@@ -1028,8 +1027,7 @@ mod apply_parameters_deploy_tests {
             0.9,
         )]);
         let user_config = json!({ "parameters": { "gpu_memory_utilization": 2.0 } });
-        let err =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
+        let err = apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
         assert!(matches!(err, ParameterError::OutOfRange { .. }));
     }
 
@@ -1041,8 +1039,7 @@ mod apply_parameters_deploy_tests {
             0.9,
         )]);
         let user_config = json!({ "parameters": { "gpu_memory_utilization": "not a float" } });
-        let err =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
+        let err = apply_parameters_deploy(&m, &user_config, DeployTarget::Docker).unwrap_err();
         assert!(matches!(err, ParameterError::TypeMismatch { .. }));
     }
 
@@ -1143,7 +1140,10 @@ mod apply_parameters_deploy_tests {
         let (app, req) =
             apply_parameters_deploy(&m, &user_config, DeployTarget::NativeEmbedded).unwrap();
         assert_eq!(app.whisper.get("default_beam_size").unwrap(), &json!(8));
-        assert_eq!(req.whisper_overridable.get("default_beam_size").unwrap(), &json!(8));
+        assert_eq!(
+            req.whisper_overridable.get("default_beam_size").unwrap(),
+            &json!(8)
+        );
     }
 
     #[test]
@@ -1177,8 +1177,7 @@ mod apply_parameters_deploy_tests {
         });
 
         let user_config = json!({ "parameters": { "context_size": 16384 } });
-        let (app, req) =
-            apply_parameters_deploy(&m, &user_config, DeployTarget::External).unwrap();
+        let (app, req) = apply_parameters_deploy(&m, &user_config, DeployTarget::External).unwrap();
         assert!(app.env.is_empty());
         assert_eq!(req.ollama_options.get("num_ctx").unwrap(), &json!(16384));
     }
@@ -1197,9 +1196,10 @@ pub fn merge_config_json(
     if !value.is_object() {
         value = serde_json::Value::Object(serde_json::Map::new());
     }
-    let to_value_map = |m: &HashMap<String, serde_json::Value>| -> serde_json::Map<String, serde_json::Value> {
-        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
+    let to_value_map =
+        |m: &HashMap<String, serde_json::Value>| -> serde_json::Map<String, serde_json::Value> {
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
     let rtp = serde_json::json!({
         "ollama_options": to_value_map(&request_time.ollama_options),
         "python_request": to_value_map(&request_time.python_request),
@@ -1257,7 +1257,6 @@ pub(crate) fn auto_gpu_memory_utilization() -> Option<f64> {
     let rounded = (ratio * 100.0).floor() / 100.0;
     Some(rounded)
 }
-
 
 /// Wynik aplikacji typed schemy parametrów dla konkretnego deployu.
 /// **Deploy-time** wartości — konsumowane raz przy spawnie procesu albo
@@ -1320,10 +1319,7 @@ pub enum ParameterError {
         options: Vec<String>,
     },
     #[error("parameter '{key}' has no binding for deploy target {target:?}")]
-    NoBindingForTarget {
-        key: String,
-        target: DeployTarget,
-    },
+    NoBindingForTarget { key: String, target: DeployTarget },
 }
 
 /// Aplikuje typed schemę parametrów z manifestu do `user_config.parameters`
@@ -1355,9 +1351,7 @@ pub fn apply_parameters_deploy(
     let mut app = ParameterApplication::default();
     let mut req = RequestTimeParameters::default();
 
-    let user_params = user_config
-        .get("parameters")
-        .and_then(|v| v.as_object());
+    let user_params = user_config.get("parameters").and_then(|v| v.as_object());
 
     for p in &manifest.parameters {
         let value = user_params

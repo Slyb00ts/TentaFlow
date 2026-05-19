@@ -197,9 +197,7 @@ pub async fn handle_request(
         ("POST", "/v1/audio/speech") => handle_audio_tts(req, router).await,
 
         // Audio TTS streaming (TentaFlow-specific, NIE OpenAI-compatible)
-        ("POST", "/v1/audio/speech/stream") => {
-            handle_audio_tts_stream(req, router).await
-        }
+        ("POST", "/v1/audio/speech/stream") => handle_audio_tts_stream(req, router).await,
 
         // Audio flow streaming (Krok 5 — request leci przez flow_engine
         // streaming, audio chunki z `EnvelopeDelta::Audio`. Dla flow z
@@ -367,10 +365,7 @@ async fn handle_chat_completions(
         }
     } else {
         // === NON-STREAMING MODE: JSON ===
-        match router
-            .route_chat_completion(request, user_ctx)
-            .await
-        {
+        match router.route_chat_completion(request, user_ctx).await {
             Ok(route_result) => {
                 let body = serde_json::to_vec(&route_result.response).unwrap();
                 let mut resp = json_response(StatusCode::OK, body);
@@ -833,11 +828,10 @@ async fn handle_audio_speech_flow_stream(
         ));
     }
 
-    let (initial, mut meta) =
-        crate::services::runtime::executor::tts_request_to_initial_envelope(
-            &api_request,
-            user_ctx.clone(),
-        );
+    let (initial, mut meta) = crate::services::runtime::executor::tts_request_to_initial_envelope(
+        &api_request,
+        user_ctx.clone(),
+    );
     let cancel = tokio_util::sync::CancellationToken::new();
     meta.cancel_token = cancel.clone();
 
@@ -861,8 +855,7 @@ async fn handle_audio_speech_flow_stream(
     };
 
     let body_chunks = crate::routing::audio_stream::envelope_stream_to_audio_chunks(stream_exec);
-    let wrapped =
-        crate::flow_engine::cancel_on_drop::CancelOnDropStream::new(body_chunks, cancel);
+    let wrapped = crate::flow_engine::cancel_on_drop::CancelOnDropStream::new(body_chunks, cancel);
 
     let body: std::pin::Pin<
         Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,

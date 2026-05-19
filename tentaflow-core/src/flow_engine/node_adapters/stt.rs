@@ -287,9 +287,7 @@ mod tests {
                 text: "Cześć!".into(),
                 detected_language: Some("pl".into()),
                 duration: Some(1.25),
-                segments_json: Some(
-                    r#"[{"id":0,"start":0.0,"end":1.25,"text":"Cześć!"}]"#.into(),
-                ),
+                segments_json: Some(r#"[{"id":0,"start":0.0,"end":1.25,"text":"Cześć!"}]"#.into()),
                 speakers_json: None,
             })
         }
@@ -302,14 +300,11 @@ mod tests {
         let mut env = audio_envelope();
         env.meta.insert("prompt".into(), json!("Pan Kowalski"));
         env.meta.insert("temperature".into(), json!(0.2));
-        env.meta.insert("response_format".into(), json!("verbose_json"));
+        env.meta
+            .insert("response_format".into(), json!("verbose_json"));
 
         let out = SttNodeAdapter::new()
-            .execute(
-                &node(json!({"model": "whisper"})),
-                &[input(env)],
-                &ctx,
-            )
+            .execute(&node(json!({"model": "whisper"})), &[input(env)], &ctx)
             .await
             .unwrap();
 
@@ -323,7 +318,10 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("segments array");
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].get("text").and_then(|v| v.as_str()), Some("Cześć!"));
+        assert_eq!(
+            segments[0].get("text").and_then(|v| v.as_str()),
+            Some("Cześć!")
+        );
     }
 
     #[tokio::test]

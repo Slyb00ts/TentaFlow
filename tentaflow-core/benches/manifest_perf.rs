@@ -37,8 +37,7 @@ fn bench_manifest_parse(c: &mut Criterion) {
 
     group.bench_function("parse_validate", |b| {
         b.iter(|| {
-            let manifest = parse_manifest_toml(black_box(MANIFEST_SRC))
-                .expect("manifest parse");
+            let manifest = parse_manifest_toml(black_box(MANIFEST_SRC)).expect("manifest parse");
             black_box(manifest);
         });
     });

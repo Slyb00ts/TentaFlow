@@ -101,12 +101,12 @@ mod tests {
         let ctx = stub_ctx_with_initial(env);
 
         let adapter = TriggerNodeAdapter::new();
-        let out = adapter
-            .execute(&trigger_node(), &[], &ctx)
-            .await
-            .unwrap();
+        let out = adapter.execute(&trigger_node(), &[], &ctx).await.unwrap();
         assert_eq!(out.payload.as_text(), Some("hi"));
-        assert_eq!(out.meta.get("model").and_then(|v| v.as_str()), Some("gpt-4"));
+        assert_eq!(
+            out.meta.get("model").and_then(|v| v.as_str()),
+            Some("gpt-4")
+        );
     }
 
     #[tokio::test]
@@ -131,7 +131,10 @@ mod tests {
         let a = TriggerNodeAdapter::new();
         assert!(a.input_ports().is_empty());
         let names: Vec<String> = a.output_ports().iter().map(|p| p.name.clone()).collect();
-        assert_eq!(names, vec!["text", "audio", "image", "video", "embedding", "other"]);
+        assert_eq!(
+            names,
+            vec!["text", "audio", "image", "video", "embedding", "other"]
+        );
         assert_eq!(a.node_type(), "trigger");
         assert_eq!(a.output_port_type("text"), FlowDataType::Text);
         assert_eq!(a.output_port_type("audio"), FlowDataType::Audio);

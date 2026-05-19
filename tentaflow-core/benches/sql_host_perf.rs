@@ -63,7 +63,8 @@ fn populate(pool: &AddonDbPool, rows: i64) {
             .prepare("INSERT INTO bench_kv (id, k, v, n) VALUES (?1, ?2, ?3, ?4)")
             .unwrap();
         for i in 1..=rows {
-            stmt.execute(params![i, format!("k{}", i), format!("v{}", i), i]).unwrap();
+            stmt.execute(params![i, format!("k{}", i), format!("v{}", i), i])
+                .unwrap();
         }
     }
     tx.commit().unwrap();

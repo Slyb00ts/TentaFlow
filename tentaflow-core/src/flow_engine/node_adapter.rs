@@ -45,10 +45,7 @@ impl UsageSink {
     /// Zwraca per-node usage w kolejności wpisywania, zachowuje wewnętrzny
     /// stan (executor woła to per-node po execute żeby dorzucić do TraceStep).
     pub fn snapshot(&self) -> Vec<(String, TokenUsage)> {
-        self.inner
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Suma wszystkich token usage zarejestrowanych do tej pory.
@@ -243,8 +240,7 @@ pub trait StreamingNodeAdapter: NodeAdapter {
 /// instalacji addonu (np. block z `addon.{id}.{name}`). Zwraca `None` gdy nie
 /// znajduje match'a; registry zwraca wynik z `dynamic_resolver` jeśli builtin
 /// map nie zawiera node_type.
-pub type DynamicAdapterResolver =
-    Arc<dyn Fn(&str) -> Option<Arc<dyn NodeAdapter>> + Send + Sync>;
+pub type DynamicAdapterResolver = Arc<dyn Fn(&str) -> Option<Arc<dyn NodeAdapter>> + Send + Sync>;
 
 /// Registry z typed accessorem dla LLM (plan v4.1 — bez downcastu) + streaming
 /// slot (Krok 2) + dynamic_resolver dla addon block adapterów. Adaptery
@@ -293,7 +289,8 @@ impl AdapterRegistry {
     {
         let typed: Arc<dyn LlmAdapter> = adapter.clone();
         let generic: Arc<dyn NodeAdapter> = adapter;
-        self.adapters.insert(generic.node_type().to_string(), generic);
+        self.adapters
+            .insert(generic.node_type().to_string(), generic);
         self.llm = Some(typed);
     }
 
@@ -321,9 +318,7 @@ impl AdapterRegistry {
             return true;
         }
         let resolver = self.dynamic_resolver.read().clone();
-        resolver
-            .map(|r| r(node_type).is_some())
-            .unwrap_or(false)
+        resolver.map(|r| r(node_type).is_some()).unwrap_or(false)
     }
 
     pub fn llm(&self) -> Option<&Arc<dyn LlmAdapter>> {
@@ -429,8 +424,12 @@ pub mod test_support {
         async fn stream_synthesize(
             &self,
             _req: TtsRequest,
-        ) -> Result<futures::stream::BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>>
-        {
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<crate::flow_engine::dispatchers::TtsStreamChunk>,
+            >,
+        > {
             Ok(Box::pin(futures::stream::empty()))
         }
     }

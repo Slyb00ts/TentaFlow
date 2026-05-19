@@ -107,7 +107,9 @@ pub async fn run(
                                     toml::Value::Table(toml::value::Table::new()),
                                 );
                                 for (_, edge) in &outbound {
-                                    edge.send(FlowMessage::Record(toml::Value::Table(wrap.clone())));
+                                    edge.send(FlowMessage::Record(toml::Value::Table(
+                                        wrap.clone(),
+                                    )));
                                 }
                                 continue;
                             }
@@ -151,7 +153,9 @@ pub async fn run(
                                         toml::Value::Table(toml::value::Table::new()),
                                     );
                                     for (_, edge) in &outbound {
-                                        edge.send(FlowMessage::Record(toml::Value::Table(wrap.clone())));
+                                        edge.send(FlowMessage::Record(toml::Value::Table(
+                                            wrap.clone(),
+                                        )));
                                     }
                                     continue;
                                 }
@@ -193,25 +197,19 @@ pub async fn run(
 
                 match outcome {
                     Ok(Ok(resp)) => {
-                        let parsed: serde_json::Value =
-                            serde_json::from_str(&resp.response_json).unwrap_or_else(|_| {
+                        let parsed: serde_json::Value = serde_json::from_str(&resp.response_json)
+                            .unwrap_or_else(|_| {
                                 serde_json::Value::String(resp.response_json.clone())
                             });
                         let mut record = record;
                         if let toml::Value::Table(ref mut t) = record {
-                            t.insert(
-                                "prediction".to_string(),
-                                super::json_to_toml(&parsed),
-                            );
+                            t.insert("prediction".to_string(), super::json_to_toml(&parsed));
                         } else {
                             // If the inbound record is not a table we wrap it
                             // so the prediction field is reachable downstream.
                             let mut wrap = toml::value::Table::new();
                             wrap.insert("input".to_string(), record);
-                            wrap.insert(
-                                "prediction".to_string(),
-                                super::json_to_toml(&parsed),
-                            );
+                            wrap.insert("prediction".to_string(), super::json_to_toml(&parsed));
                             record = toml::Value::Table(wrap);
                         }
                         for (_, edge) in &outbound {
@@ -273,7 +271,9 @@ pub async fn run(
                                     toml::Value::Table(toml::value::Table::new()),
                                 );
                                 for (_, edge) in &outbound {
-                                    edge.send(FlowMessage::Record(toml::Value::Table(wrap.clone())));
+                                    edge.send(FlowMessage::Record(toml::Value::Table(
+                                        wrap.clone(),
+                                    )));
                                 }
                             }
                             OnError::Fail => {
@@ -306,7 +306,9 @@ pub async fn run(
                                     toml::Value::Table(toml::value::Table::new()),
                                 );
                                 for (_, edge) in &outbound {
-                                    edge.send(FlowMessage::Record(toml::Value::Table(wrap.clone())));
+                                    edge.send(FlowMessage::Record(toml::Value::Table(
+                                        wrap.clone(),
+                                    )));
                                 }
                             }
                             OnError::Fail => {

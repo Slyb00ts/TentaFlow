@@ -692,8 +692,12 @@ mod services_manifest_build {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum BindingTarget {
-        Env { name: String },
-        LlamacppField { field: String },
+        Env {
+            name: String,
+        },
+        LlamacppField {
+            field: String,
+        },
         WhisperField {
             field: String,
             #[serde(default)]
@@ -704,8 +708,12 @@ mod services_manifest_build {
             #[serde(default)]
             request_override: bool,
         },
-        OllamaOptions { key: String },
-        PythonRequestBody { field: String },
+        OllamaOptions {
+            key: String,
+        },
+        PythonRequestBody {
+            field: String,
+        },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1180,13 +1188,12 @@ mod services_manifest_build {
                 ParameterKind::Float => p.default.is_f64() || p.default.is_i64(),
                 ParameterKind::Int => p.default.is_i64() || p.default.is_u64(),
                 ParameterKind::Bool => p.default.is_boolean(),
-                ParameterKind::Enum => p.default.is_string()
-                    && p.options
-                        .as_ref()
-                        .is_some_and(|opts| {
-                            opts.iter()
-                                .any(|o| Some(o.as_str()) == p.default.as_str())
-                        }),
+                ParameterKind::Enum => {
+                    p.default.is_string()
+                        && p.options.as_ref().is_some_and(|opts| {
+                            opts.iter().any(|o| Some(o.as_str()) == p.default.as_str())
+                        })
+                }
                 ParameterKind::String => p.default.is_string(),
             };
             if !default_ok {
@@ -1197,7 +1204,10 @@ mod services_manifest_build {
             }
             // Default w zakresie (gdy range).
             if let Some(range) = p.range {
-                let value = p.default.as_f64().or_else(|| p.default.as_i64().map(|v| v as f64));
+                let value = p
+                    .default
+                    .as_f64()
+                    .or_else(|| p.default.as_i64().map(|v| v as f64));
                 if let Some(v) = value {
                     if v < range.min || v > range.max {
                         errors.push(format!(
@@ -1828,4 +1838,3 @@ fn detect_wasm_bindgen_version() -> Option<String> {
     // Format: "wasm-bindgen 0.2.100"
     text.split_whitespace().nth(1).map(|s| s.to_string())
 }
-

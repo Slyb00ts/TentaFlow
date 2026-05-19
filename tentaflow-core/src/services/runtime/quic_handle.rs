@@ -696,7 +696,6 @@ impl ServiceManager {
     // instantiates `BackendHandle::Quic` via
     // `services::handles_cache::build_handle` on every snapshot diff, plants
     // it into `live_handles`, and spawns a per-handle reconnect loop.
-
 }
 
 #[cfg(test)]
@@ -932,7 +931,7 @@ mod snapshot_helpers_tests {
                 endpoint_url: None,
                 restart_count: 0,
                 health_last_err: None,
-            progress_message: None,
+                progress_message: None,
                 models: vec![tentaflow_protocol::ServiceModelEntry {
                     model_name: "qwen-tiny".into(),
                     display_name: None,
@@ -996,7 +995,7 @@ mod snapshot_helpers_tests {
                 endpoint_url: None,
                 restart_count: 0,
                 health_last_err: None,
-            progress_message: None,
+                progress_message: None,
                 models: vec![tentaflow_protocol::ServiceModelEntry {
                     model_name: "qwen-tiny".into(),
                     display_name: None,

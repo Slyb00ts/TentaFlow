@@ -12,8 +12,7 @@
 #![cfg(feature = "camera")]
 
 use tentaflow_core::services::camera_ingest::onvif_media::{
-    derive_rtsp_uri, get_profiles, get_stream_uri, OnvifCredentials, OnvifError,
-    StreamProtocol,
+    derive_rtsp_uri, get_profiles, get_stream_uri, OnvifCredentials, OnvifError, StreamProtocol,
 };
 use wiremock::matchers::{header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -129,7 +128,10 @@ async fn get_stream_uri_smoke_returns_rtsp_uri() {
     let stream = get_stream_uri(&url, &creds(), "MainProfile", StreamProtocol::Tcp, 5_000)
         .await
         .expect("ok");
-    assert_eq!(stream.rtsp_uri, "rtsp://192.168.10.42:554/onvif/profile1/media.smp");
+    assert_eq!(
+        stream.rtsp_uri,
+        "rtsp://192.168.10.42:554/onvif/profile1/media.smp"
+    );
     assert_eq!(stream.profile_token, "MainProfile");
 }
 
@@ -196,7 +198,9 @@ async fn derive_rtsp_uri_one_shot_picks_first_profile() {
         .await;
 
     let url = format!("{}/onvif/device_service", server.uri());
-    let stream = derive_rtsp_uri(&url, &creds(), None, 5_000).await.expect("ok");
+    let stream = derive_rtsp_uri(&url, &creds(), None, 5_000)
+        .await
+        .expect("ok");
     assert_eq!(stream.profile_token, "MainProfile");
     assert!(stream.rtsp_uri.starts_with("rtsp://"));
 }
@@ -251,8 +255,14 @@ async fn envelope_carries_password_digest_and_escapes_username() {
     assert_eq!(received.len(), 1);
     let body = String::from_utf8_lossy(&received[0].body);
     // WS-Security envelope shape
-    assert!(body.contains("UsernameToken"), "missing UsernameToken: {body}");
-    assert!(body.contains("PasswordDigest"), "missing digest variant: {body}");
+    assert!(
+        body.contains("UsernameToken"),
+        "missing UsernameToken: {body}"
+    );
+    assert!(
+        body.contains("PasswordDigest"),
+        "missing digest variant: {body}"
+    );
     assert!(body.contains("<Nonce"), "missing Nonce: {body}");
     assert!(body.contains("<Created"), "missing Created: {body}");
     // The injection must be entity-escaped — raw `<a>` must not appear
@@ -261,5 +271,8 @@ async fn envelope_carries_password_digest_and_escapes_username() {
         body.contains("&lt;a&gt;&amp;&quot;b&apos;"),
         "username not escaped: {body}"
     );
-    assert!(!body.contains("<Username><a>"), "raw injection present: {body}");
+    assert!(
+        !body.contains("<Username><a>"),
+        "raw injection present: {body}"
+    );
 }

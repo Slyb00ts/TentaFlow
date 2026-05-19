@@ -25,8 +25,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex as ParkingMutex;
-use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::errors::AbiError;
+use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::host_functions::camera::test_api::{
     camera_add_with_raw_input, camera_id_valid_for_test, display_name_valid_for_test,
     profile_valid_for_test, reset_supervisor_for_test,
@@ -40,9 +40,7 @@ use tentaflow_core::db::repository::{
     get_camera_for_addon, insert_camera, list_cameras_for_addon, soft_delete_camera,
 };
 use tentaflow_core::db::DbPool;
-use tentaflow_core::services::camera_ingest::{
-    fakefile, CameraConfig, CameraIngestError,
-};
+use tentaflow_core::services::camera_ingest::{fakefile, CameraConfig, CameraIngestError};
 
 fn make_db() -> DbPool {
     tentaflow_core::db::init(std::path::Path::new(":memory:")).expect("core db init")
@@ -201,8 +199,21 @@ fn resolve_file_url_rejects_empty_input() {
 
 fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
     insert_camera(
-        db, camera_id, owner, "display", "fake_file", url, 30, None, None, "C",
-        "default", None, None, None, None,
+        db,
+        camera_id,
+        owner,
+        "display",
+        "fake_file",
+        url,
+        30,
+        None,
+        None,
+        "C",
+        "default",
+        None,
+        None,
+        None,
+        None,
     )
     .expect("insert");
 }
@@ -226,7 +237,10 @@ fn cross_addon_soft_delete_no_op_for_foreign_owner() {
     let removed = soft_delete_camera(&db, "addon-b", &id, None).unwrap();
     assert!(!removed, "foreign soft-delete must be no-op");
     let mine = get_camera_for_addon(&db, "addon-a", &id, None).unwrap();
-    assert!(mine.is_some(), "owner's camera survives foreign delete attempt");
+    assert!(
+        mine.is_some(),
+        "owner's camera survives foreign delete attempt"
+    );
 }
 
 #[test]
@@ -250,10 +264,9 @@ fn cross_addon_list_does_not_leak_other_owners() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_rejects_unsupported_vendor() {
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let err = sup
         .add_camera(CameraConfig {
             camera_id: uniq("cam_sec_vendor"),
@@ -271,10 +284,9 @@ async fn supervisor_rejects_unsupported_vendor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_rejects_zero_and_oversized_fps() {
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     for bad_fps in [0u32, 61u32, 1000u32] {
         let err = sup
             .add_camera(CameraConfig {
@@ -294,10 +306,9 @@ async fn supervisor_rejects_zero_and_oversized_fps() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_rejects_missing_file_url() {
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let err = sup
         .add_camera(CameraConfig {
             camera_id: uniq("cam_sec_missing"),
@@ -381,7 +392,11 @@ fn read_camera_add_audit(db: &DbPool, addon_id: &str) -> Vec<(String, String, Op
         .expect("prepare");
     let rows = stmt
         .query_map(rusqlite::params![addon_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
         })
         .expect("query");
     rows.filter_map(|r| r.ok()).collect()
@@ -394,12 +409,19 @@ fn malformed_toml_input_returns_operation_and_audits_invalid_toml() {
     let state = make_state(&db, &addon_id, vec!["cameras.write".into()]);
     let bad_toml = b"this is not valid toml = [[[[";
     let rc = camera_add_with_raw_input(&state, bad_toml);
-    assert_eq!(rc, AbiError::Operation.as_i32(), "malformed TOML must map to Operation");
+    assert_eq!(
+        rc,
+        AbiError::Operation.as_i32(),
+        "malformed TOML must map to Operation"
+    );
     let entries = read_camera_add_audit(&db, &addon_id);
     assert_eq!(entries.len(), 1, "exactly one audit row, got {entries:?}");
     assert_eq!(entries[0].1, "error");
     let reason = entries[0].2.as_deref().unwrap_or("");
-    assert!(reason.contains("invalid_toml"), "reason should be invalid_toml, got {reason:?}");
+    assert!(
+        reason.contains("invalid_toml"),
+        "reason should be invalid_toml, got {reason:?}"
+    );
 }
 
 #[test]
@@ -410,7 +432,11 @@ fn oversized_input_returns_payload_too_large_and_audits() {
     // 9 MiB — over the 8 MiB PayloadKind::ServiceCall ceiling.
     let big = vec![b'a'; 9 * 1024 * 1024];
     let rc = camera_add_with_raw_input(&state, &big);
-    assert_eq!(rc, AbiError::PayloadTooLarge.as_i32(), "9 MiB payload must trip PayloadTooLarge");
+    assert_eq!(
+        rc,
+        AbiError::PayloadTooLarge.as_i32(),
+        "9 MiB payload must trip PayloadTooLarge"
+    );
     let entries = read_camera_add_audit(&db, &addon_id);
     assert_eq!(entries.len(), 1, "exactly one audit row");
     assert_eq!(entries[0].1, "error");
@@ -438,10 +464,9 @@ fn quota_lock() -> std::sync::MutexGuard<'static, ()> {
 async fn dos_quota_per_addon_blocks_after_cap() {
     let _g = quota_lock();
     reset_supervisor_for_test().await;
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     // We register configs against a non-existent path so spawn_session fails
     // at resolve_file_url AFTER the quota check passes. The quota path itself
     // doesn't depend on a real GStreamer pipeline — it counts registry
@@ -513,10 +538,9 @@ async fn dos_quota_per_addon_blocks_after_cap() {
 async fn dos_quota_below_cap_succeeds() {
     let _g = quota_lock();
     reset_supervisor_for_test().await;
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("q.mp4");
     std::fs::write(&file, b"x").unwrap();

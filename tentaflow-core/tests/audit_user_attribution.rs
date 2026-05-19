@@ -21,8 +21,8 @@ use std::sync::Arc;
 use parking_lot::Mutex as PlMutex;
 
 use tentaflow_core::addon::event_bus::EventBus;
-use tentaflow_core::addon::host_functions::flow::test_api as flow_api;
 use tentaflow_core::addon::host_functions::audit_log_with_risk;
+use tentaflow_core::addon::host_functions::flow::test_api as flow_api;
 use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::{AddonManifest, AddonState};
 use tentaflow_core::audit::RiskClass;
@@ -145,9 +145,7 @@ async fn flow_invoke_records_actor_user_id() {
     // Authenticated operator user_id = 42.
     let state = make_state(db.clone(), addon_id, Some(42), false);
     state.permission_checker.refresh_all();
-    let payload = format!(
-        "flow_id = \"{flow_id}\"\nwait_ms = 5000\n\n[input]\nvalue = 1\n"
-    );
+    let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 5000\n\n[input]\nvalue = 1\n");
 
     let outcome = {
         let sched = sched.clone();
@@ -190,9 +188,7 @@ async fn flow_invoke_system_call_records_null_user_id() {
 
     // Background / boot path — no authenticated user, system-trusted call.
     let state = make_state(db.clone(), addon_id, None, true);
-    let payload = format!(
-        "flow_id = \"{flow_id}\"\nwait_ms = 5000\n\n[input]\nvalue = 1\n"
-    );
+    let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 5000\n\n[input]\nvalue = 1\n");
 
     let outcome = {
         let sched = sched.clone();

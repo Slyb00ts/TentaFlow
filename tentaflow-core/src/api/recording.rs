@@ -105,7 +105,9 @@ impl RecordingOutcome {
 /// Wire-mapped by the HTTP layer to 200 / 404 / 413 / 500.
 #[derive(Debug)]
 pub enum RecordingFileOutcome {
-    Ok { bytes: Vec<u8> },
+    Ok {
+        bytes: Vec<u8>,
+    },
     /// File row exists in DB but the on-disk file is gone — wire-mapped to 404
     /// rather than 500 because the caller's signed URL is now stale.
     FileMissing,
@@ -247,32 +249,98 @@ pub fn handle_recording_url(
     ctx: RequestContext<'_>,
 ) -> RecordingOutcome {
     if !validate_ref_format(path_ref) {
-        return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("invalid_ref_format"));
+        return audit_and_return(
+            pool,
+            path_ref,
+            "Unclassified",
+            None,
+            ctx,
+            RecordingOutcome::BadRequest("invalid_ref_format"),
+        );
     }
     let token = match query.token.as_deref() {
         Some(t) if !t.is_empty() => t,
-        _ => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("missing_token")),
+        _ => {
+            return audit_and_return(
+                pool,
+                path_ref,
+                "Unclassified",
+                None,
+                ctx,
+                RecordingOutcome::BadRequest("missing_token"),
+            )
+        }
     };
     let exp_ms = match query.exp_ms {
         Some(v) => v,
-        None => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("missing_exp")),
+        None => {
+            return audit_and_return(
+                pool,
+                path_ref,
+                "Unclassified",
+                None,
+                ctx,
+                RecordingOutcome::BadRequest("missing_exp"),
+            )
+        }
     };
     let ref_param = match query.ref_param.as_deref() {
         Some(r) if !r.is_empty() => r,
-        _ => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("missing_ref")),
+        _ => {
+            return audit_and_return(
+                pool,
+                path_ref,
+                "Unclassified",
+                None,
+                ctx,
+                RecordingOutcome::BadRequest("missing_ref"),
+            )
+        }
     };
     if ref_param != path_ref {
-        return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::BadRequest("ref_path_mismatch"));
+        return audit_and_return(
+            pool,
+            path_ref,
+            "Unclassified",
+            None,
+            ctx,
+            RecordingOutcome::BadRequest("ref_path_mismatch"),
+        );
     }
 
     if let Err(e) = issuer.verify(path_ref, exp_ms, token) {
-        return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::Denied(e));
+        return audit_and_return(
+            pool,
+            path_ref,
+            "Unclassified",
+            None,
+            ctx,
+            RecordingOutcome::Denied(e),
+        );
     }
 
     let row: RecordingRow = match get_recording_by_ref(pool, path_ref) {
         Ok(Some(r)) => r,
-        Ok(None) => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::NotFound),
-        Err(_) => return audit_and_return(pool, path_ref, "Unclassified", None, ctx, RecordingOutcome::InternalError("db_error")),
+        Ok(None) => {
+            return audit_and_return(
+                pool,
+                path_ref,
+                "Unclassified",
+                None,
+                ctx,
+                RecordingOutcome::NotFound,
+            )
+        }
+        Err(_) => {
+            return audit_and_return(
+                pool,
+                path_ref,
+                "Unclassified",
+                None,
+                ctx,
+                RecordingOutcome::InternalError("db_error"),
+            )
+        }
     };
 
     let content_type = match row.kind.as_str() {
@@ -304,7 +372,14 @@ pub async fn read_recording_file(
     ctx: RequestContext<'_>,
 ) -> RecordingFileOutcome {
     let outcome = read_recording_file_inner(file_path, expected_size).await;
-    audit_recording_file_access(pool, recording_ref, retention_class, owner_addon_id, ctx, &outcome);
+    audit_recording_file_access(
+        pool,
+        recording_ref,
+        retention_class,
+        owner_addon_id,
+        ctx,
+        &outcome,
+    );
     outcome
 }
 
@@ -468,7 +543,10 @@ fn audit_and_return(
 ) -> RecordingOutcome {
     let result = outcome.audit_result();
     let reason = outcome.audit_reason();
-    let severity = if matches!(&outcome, RecordingOutcome::Denied(_) | RecordingOutcome::NotFound) {
+    let severity = if matches!(
+        &outcome,
+        RecordingOutcome::Denied(_) | RecordingOutcome::NotFound
+    ) {
         "warn"
     } else if matches!(&outcome, RecordingOutcome::InternalError(_)) {
         "error"
@@ -565,10 +643,7 @@ mod tests {
             RecordingOutcome::Denied(SignedUrlError::Expired).http_status(),
             403
         );
-        assert_eq!(
-            RecordingOutcome::InternalError("x").http_status(),
-            500
-        );
+        assert_eq!(RecordingOutcome::InternalError("x").http_status(), 500);
     }
 
     #[test]
@@ -578,7 +653,10 @@ mod tests {
         assert_eq!(RecordingFileOutcome::FileIntegrityError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::IoError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::PathTraversal.http_status(), 403);
-        assert_eq!(RecordingFileOutcome::Ok { bytes: vec![] }.http_status(), 200);
+        assert_eq!(
+            RecordingFileOutcome::Ok { bytes: vec![] }.http_status(),
+            200
+        );
     }
 
     #[test]
@@ -595,7 +673,9 @@ mod tests {
     fn test_validate_ref_format_rejects_garbage() {
         assert!(!validate_ref_format("../../etc/passwd"));
         assert!(!validate_ref_format("snap_not-a-uuid"));
-        assert!(!validate_ref_format("frame_550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!validate_ref_format(
+            "frame_550e8400-e29b-41d4-a716-446655440000"
+        ));
         assert!(!validate_ref_format(""));
     }
 }

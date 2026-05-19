@@ -5,9 +5,7 @@
 //       QUIC LLM routing, protocol-native completion.
 // =============================================================================
 
-use crate::api::openai::types::{
-    ChatCompletionRequest, ChatCompletionResponse,
-};
+use crate::api::openai::types::{ChatCompletionRequest, ChatCompletionResponse};
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::envelope::FlowExecutionOutcome;
@@ -112,12 +110,9 @@ impl Router {
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
-            let (initial, meta) = crate::routing::build_initial_envelope_for_user(
-                &request,
-                user.clone(),
-                &blobs,
-            )
-            .await?;
+            let (initial, meta) =
+                crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
+                    .await?;
 
             match dispatcher
                 .try_dispatch(&request.model, "chat", initial, meta)
@@ -129,10 +124,8 @@ impl Router {
                         completion_tokens: outcome.usage.completion_tokens,
                         total_tokens: outcome.usage.total_tokens,
                     };
-                    let finish_reason = outcome
-                        .finish_reason
-                        .as_openai_str()
-                        .map(|s| s.to_string());
+                    let finish_reason =
+                        outcome.finish_reason.as_openai_str().map(|s| s.to_string());
                     let response = flow_outcome_to_chat_response(outcome, &request.model);
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
@@ -317,7 +310,7 @@ impl Router {
                         transcribed_text: None,
                         speaker_id: None,
                         speaker_name: None,
-                                        }),
+                    }),
                     metrics,
                 })
             }
@@ -460,8 +453,7 @@ mod audio_policy_tests {
     /// modelu, albo eksplicitnie do `/v1/audio/transcriptions`.
     #[test]
     fn text_only_target_rejects_audio() {
-        let snap =
-            snapshot_with(vec![chat_entry("bielik-11b", vec![InputModality::Text])]);
+        let snap = snapshot_with(vec![chat_entry("bielik-11b", vec![InputModality::Text])]);
         assert!(!catalog_target_accepts_audio(&snap, "bielik-11b"));
     }
 
@@ -508,10 +500,7 @@ mod audio_policy_tests {
     fn alias_audio_falls_through_to_audio_capable_fallback() {
         use crate::services::catalog::Strategy;
         let primary = chat_entry("text-llm", vec![InputModality::Text]);
-        let fallback = chat_entry(
-            "omni-llm",
-            vec![InputModality::Text, InputModality::Audio],
-        );
+        let fallback = chat_entry("omni-llm", vec![InputModality::Text, InputModality::Audio]);
         let alias = CatalogEntry {
             id: "smart-chat".into(),
             kind: CatalogEntryKind::Alias {
@@ -554,4 +543,3 @@ mod audio_policy_tests {
         assert!(!catalog_target_accepts_audio(&snap, "txt-only"));
     }
 }
-

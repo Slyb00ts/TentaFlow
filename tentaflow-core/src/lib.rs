@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod net;
 pub mod prompt_registry;
 pub mod routing;
+pub mod scheduler;
 pub mod services;
 pub mod services_repo;
 pub mod stt;

@@ -96,7 +96,10 @@ fn install_compiles_and_registers_flow() {
         .get("flow-runtime-test", "test-flow")
         .expect("flow registered");
     assert_eq!(compiled.def.operators.len(), 2);
-    assert_eq!(compiled.topo_order, vec!["src".to_string(), "snk".to_string()]);
+    assert_eq!(
+        compiled.topo_order,
+        vec!["src".to_string(), "snk".to_string()]
+    );
 
     // Cleanup so other tests do not see this entry.
     registry::global().unregister_addon("flow-runtime-test");

@@ -78,9 +78,13 @@ pub struct MetadataFrame {
 pub enum MetadataMessage {
     Frame(MetadataFrame),
     /// Backpressure signal — N frames dropped since the previous delivery.
-    Drop { count: u64 },
+    Drop {
+        count: u64,
+    },
     /// Camera removed or pull loop exited. Subscribers should stop polling.
-    CameraOffline { reason: String },
+    CameraOffline {
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -133,11 +137,7 @@ impl MetadataBus {
         self.subscribe_with_capacity(camera_id, METADATA_SUBSCRIBER_CAPACITY)
     }
 
-    pub fn subscribe_with_capacity(
-        &self,
-        camera_id: &str,
-        capacity: usize,
-    ) -> MetadataSubscriber {
+    pub fn subscribe_with_capacity(&self, camera_id: &str, capacity: usize) -> MetadataSubscriber {
         let stream_id = MetadataStreamId::new();
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let drop_counter = Arc::new(AtomicU64::new(0));
@@ -170,10 +170,7 @@ impl MetadataBus {
     /// returns the camera_id so the caller (the host fn) can release the
     /// pull-supervisor refcount. `None` means the stream was already
     /// unsubscribed or never existed.
-    pub fn unsubscribe_by_stream_id(
-        &self,
-        stream_id: &MetadataStreamId,
-    ) -> Option<String> {
+    pub fn unsubscribe_by_stream_id(&self, stream_id: &MetadataStreamId) -> Option<String> {
         for mut entry in self.inner.iter_mut() {
             let camera_id = entry.key().clone();
             let entries = entry.value_mut();

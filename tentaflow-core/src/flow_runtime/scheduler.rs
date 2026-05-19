@@ -47,9 +47,7 @@ use crate::db::DbPool;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 use super::bounded_drop_oldest::BoundedDropOldest;
-use super::operators::{
-    self, OperatorContext, OperatorError, OutboundEdge,
-};
+use super::operators::{self, OperatorContext, OperatorError, OutboundEdge};
 use super::registry;
 use super::types::{CompiledFlow, OperatorType};
 
@@ -257,12 +255,13 @@ impl FlowScheduler {
         actor_user_id: Option<i64>,
         org_id: Option<String>,
     ) -> Result<InvocationStatus, InvokeError> {
-        let flow = registry::global()
-            .get(addon_id, flow_id)
-            .ok_or_else(|| InvokeError::FlowNotFound {
-                addon_id: addon_id.to_string(),
-                flow_id: flow_id.to_string(),
-            })?;
+        let flow =
+            registry::global()
+                .get(addon_id, flow_id)
+                .ok_or_else(|| InvokeError::FlowNotFound {
+                    addon_id: addon_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })?;
 
         let invocation_id = uuid::Uuid::now_v7().to_string();
         let started_at = Utc::now().to_rfc3339();
@@ -324,8 +323,7 @@ impl FlowScheduler {
             }
         };
         let operators_completed = Arc::new(AtomicI64::new(0));
-        let sink_outputs: Arc<AsyncMutex<Vec<toml::Value>>> =
-            Arc::new(AsyncMutex::new(Vec::new()));
+        let sink_outputs: Arc<AsyncMutex<Vec<toml::Value>>> = Arc::new(AsyncMutex::new(Vec::new()));
 
         {
             let mut g = self.in_flight.lock();
@@ -504,12 +502,7 @@ impl FlowScheduler {
         }
     }
 
-    async fn emit_concurrency_cap_audit(
-        &self,
-        addon_id: &str,
-        org_id: Option<&str>,
-        cap: usize,
-    ) {
+    async fn emit_concurrency_cap_audit(&self, addon_id: &str, org_id: Option<&str>, cap: usize) {
         let db = self.db.clone();
         let addon = addon_id.to_string();
         let org = org_id
@@ -938,9 +931,7 @@ async fn load_declared_permissions(db: &DbPool, addon_id: &str) -> Vec<String> {
     let pool = db.clone();
     let addon = addon_id.to_string();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-        let conn = pool
-            .lock()
-            .map_err(|e| anyhow!("db pool poisoned: {e}"))?;
+        let conn = pool.lock().map_err(|e| anyhow!("db pool poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT permission_type FROM addon_declared_permissions WHERE addon_id = ?1",
         )?;
@@ -1000,7 +991,6 @@ async fn dispatch_operator(
     }
 }
 
-
 // -----------------------------------------------------------------------------
 // Edge construction
 // -----------------------------------------------------------------------------
@@ -1044,7 +1034,11 @@ fn encode_sink_outputs(outs: &[toml::Value]) -> Option<String> {
     table.insert("records".to_string(), toml::Value::Array(outs.to_vec()));
     match toml::to_string(&toml::Value::Table(table)) {
         Ok(s) => {
-            debug!("flow_runtime: encoded {} sink records ({} bytes)", outs.len(), s.len());
+            debug!(
+                "flow_runtime: encoded {} sink records ({} bytes)",
+                outs.len(),
+                s.len()
+            );
             Some(s)
         }
         Err(e) => {

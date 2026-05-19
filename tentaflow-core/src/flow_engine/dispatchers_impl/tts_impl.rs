@@ -93,10 +93,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
         // gdyby klient łączył chunki bez separowania nagłówka. Etap 3c
         // wpina ten sam preprocessing co blocking synthesize: pierwszy chunk
         // musi być czystym PCM, inaczej klient słyszy klik z RIFF nagłówka.
-        if bytes.len() >= 12
-            && &bytes[0..4] == b"RIFF"
-            && &bytes[8..12] == b"WAVE"
-        {
+        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
             if let Ok(stripped) = strip_wav_header(&bytes) {
                 bytes = stripped;
             }
@@ -123,8 +120,8 @@ impl TtsDispatcher for TtsDispatcherImpl {
             return Ok(Box::pin(futures::stream::once(async move { Ok(chunk) })));
         }
 
-        let stream = futures::stream::iter(
-            chunks.into_iter().enumerate().map(move |(idx, chunk_bytes)| {
+        let stream = futures::stream::iter(chunks.into_iter().enumerate().map(
+            move |(idx, chunk_bytes)| {
                 let is_last = idx + 1 == total;
                 Ok(TtsStreamChunk {
                     choice_index: 0,
@@ -137,8 +134,8 @@ impl TtsDispatcher for TtsDispatcherImpl {
                         None
                     },
                 })
-            }),
-        );
+            },
+        ));
 
         // take_while: gdy cancel_token cancelled przed kolejnym chunk'iem,
         // EOF zamiast emit. Backend blocking synthesize już skończył przed
@@ -174,7 +171,7 @@ mod tests {
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&16u32.to_le_bytes());
         wav.extend_from_slice(&[0u8; 16]); // fmt body
-        // data chunk
+                                           // data chunk
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&8u32.to_le_bytes());
         wav.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]);

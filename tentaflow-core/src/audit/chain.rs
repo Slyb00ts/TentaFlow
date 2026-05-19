@@ -54,10 +54,7 @@ pub struct AuditRowHashInput<'a> {
 /// Canonical byte representation of an audit row for hashing. Stable across
 /// rustc versions and platforms — just `\0`-joined UTF-8.
 pub fn canonical_row_bytes(input: &AuditRowHashInput<'_>) -> Vec<u8> {
-    let user = input
-        .user_id
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+    let user = input.user_id.map(|v| v.to_string()).unwrap_or_default();
     let parts: [&str; 17] = [
         &user,
         input.addon_id.unwrap_or(""),
@@ -103,9 +100,7 @@ pub fn compute_hash(row_bytes: &[u8], prev_hash: &ChainHash) -> ChainHash {
 /// Fetch the most recent non-NULL `hash` from `audit_log`. Returns `None`
 /// when the chain has not started yet (every row is legacy / pre-P4 or the
 /// table is empty), in which case the caller MUST use [`GENESIS_PREV_HASH`].
-pub fn latest_chain_hash(
-    conn: &rusqlite::Connection,
-) -> rusqlite::Result<Option<ChainHash>> {
+pub fn latest_chain_hash(conn: &rusqlite::Connection) -> rusqlite::Result<Option<ChainHash>> {
     let row: Option<Vec<u8>> = conn
         .query_row(
             "SELECT hash FROM audit_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1",

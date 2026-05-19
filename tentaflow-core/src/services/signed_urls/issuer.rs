@@ -240,8 +240,7 @@ impl SignedUrlIssuer {
         let state = self.keys.read();
         let mut matched = false;
         let expected_current = hmac_sign(&state.current, payload.as_bytes());
-        if provided.len() == expected_current.len()
-            && bool::from(provided.ct_eq(&expected_current))
+        if provided.len() == expected_current.len() && bool::from(provided.ct_eq(&expected_current))
         {
             matched = true;
         }
@@ -333,7 +332,9 @@ mod tests {
     fn test_verify_wrong_ref_fails() {
         let i = frame_issuer();
         let u = i.issue("frame_a".into(), 120).unwrap();
-        let err = i.verify("frame_b", u.expiry_unix_ms, &u.token_b64).unwrap_err();
+        let err = i
+            .verify("frame_b", u.expiry_unix_ms, &u.token_b64)
+            .unwrap_err();
         assert_eq!(err, SignedUrlError::InvalidSignature);
     }
 
@@ -432,7 +433,10 @@ mod tests {
     #[test]
     fn test_ref_invalid() {
         let i = frame_issuer();
-        assert_eq!(i.issue("".into(), 120).unwrap_err(), SignedUrlError::RefInvalid);
+        assert_eq!(
+            i.issue("".into(), 120).unwrap_err(),
+            SignedUrlError::RefInvalid
+        );
         let big = "a".repeat(257);
         assert_eq!(i.issue(big, 120).unwrap_err(), SignedUrlError::RefInvalid);
     }

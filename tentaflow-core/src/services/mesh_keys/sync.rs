@@ -12,9 +12,7 @@ use tracing::{debug, warn};
 
 use tentaflow_protocol::mesh::{HmacKeyEntry, HmacKeysSyncPayload};
 
-use crate::services::mesh_keys::{
-    mesh_key_pool, short_key_id, KeyScope, PeerKeyState,
-};
+use crate::services::mesh_keys::{mesh_key_pool, short_key_id, KeyScope, PeerKeyState};
 use crate::services::{
     frame_url_issuer, legal_url_issuer, pickup_token_issuer, recording_url_issuer,
 };
@@ -158,8 +156,7 @@ mod tests {
                     scope: KeyScope::PickupToken.as_str().into(),
                     current_key: vec![1u8; 32],
                     previous_key: vec![2u8; 32],
-                    previous_expires_unix_ms: crate::services::mesh_keys::now_unix_ms()
-                        + 30_000,
+                    previous_expires_unix_ms: crate::services::mesh_keys::now_unix_ms() + 30_000,
                     key_id: vec![0u8; 8],
                 },
                 HmacKeyEntry {

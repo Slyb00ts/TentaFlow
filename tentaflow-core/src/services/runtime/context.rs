@@ -203,8 +203,8 @@ mod tests {
         ctx.enter_alias("primary").unwrap();
         ctx.enter_alias("fallback-a").unwrap();
         ctx.leave_alias(); // back out of fallback-a
-        // Sibling branch can now visit fallback-b and even revisit a
-        // previously-popped alias by name.
+                           // Sibling branch can now visit fallback-b and even revisit a
+                           // previously-popped alias by name.
         ctx.enter_alias("fallback-b").unwrap();
         ctx.leave_alias();
         ctx.enter_alias("fallback-a").unwrap();

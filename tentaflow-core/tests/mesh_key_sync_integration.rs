@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use tentaflow_core::services::mesh_keys::sync::{forget_peer, ingest_advertise};
-use tentaflow_core::services::mesh_keys::{KeyScope, mesh_key_pool, now_unix_ms};
+use tentaflow_core::services::mesh_keys::{mesh_key_pool, now_unix_ms, KeyScope};
 use tentaflow_core::services::pickup_tokens::PickupTokenIssuer;
 use tentaflow_core::services::signed_urls::{SignedUrlIssuer, UrlScope};
 use tentaflow_protocol::mesh::{HmacKeyEntry, HmacKeysSyncPayload};
@@ -84,15 +84,14 @@ fn pickup_token_minted_on_a_verifies_on_b_through_mesh_pool() {
     let issuer_a = PickupTokenIssuer::new_for_tests(key_a, Duration::from_secs(30));
     let issuer_b = PickupTokenIssuer::new_for_tests(key_b, Duration::from_secs(30));
 
-    let (token, _payload) = issuer_a.issue(
-        "frame_p3b_1".into(),
-        "svc-p3b".into(),
-        "req-p3b-1".into(),
-    );
+    let (token, _payload) =
+        issuer_a.issue("frame_p3b_1".into(), "svc-p3b".into(), "req-p3b-1".into());
     let wire = token.wire();
 
     // Pre-condition: B does NOT yet know A's key — verify must fail.
-    let err = issuer_b.verify_only(&wire).expect_err("B without mesh sync must reject");
+    let err = issuer_b
+        .verify_only(&wire)
+        .expect_err("B without mesh sync must reject");
     assert_eq!(
         err,
         tentaflow_core::services::pickup_tokens::PickupVerifyError::InvalidSignature,
@@ -114,7 +113,9 @@ fn pickup_token_minted_on_a_verifies_on_b_through_mesh_pool() {
 
     // After forget_peer (disconnect / revoke) the verify must close.
     forget_peer(peer_id);
-    let err = issuer_b.verify_only(&wire).expect_err("after forget verify rejects");
+    let err = issuer_b
+        .verify_only(&wire)
+        .expect_err("after forget verify rejects");
     assert_eq!(
         err,
         tentaflow_core::services::pickup_tokens::PickupVerifyError::InvalidSignature
@@ -142,7 +143,11 @@ fn signed_url_minted_on_a_verifies_on_b_for_both_scopes() {
 
     // Pre-sync: both fail on B.
     assert!(frame_b
-        .verify(&frame_url.ref_id, frame_url.expiry_unix_ms, &frame_url.token_b64)
+        .verify(
+            &frame_url.ref_id,
+            frame_url.expiry_unix_ms,
+            &frame_url.token_b64
+        )
         .is_err());
     assert!(rec_b
         .verify(&rec_url.ref_id, rec_url.expiry_unix_ms, &rec_url.token_b64)
@@ -154,7 +159,11 @@ fn signed_url_minted_on_a_verifies_on_b_for_both_scopes() {
 
     // Post-sync: both verify on B.
     frame_b
-        .verify(&frame_url.ref_id, frame_url.expiry_unix_ms, &frame_url.token_b64)
+        .verify(
+            &frame_url.ref_id,
+            frame_url.expiry_unix_ms,
+            &frame_url.token_b64,
+        )
         .expect("frame URL verifies on B through mesh pool");
     rec_b
         .verify(&rec_url.ref_id, rec_url.expiry_unix_ms, &rec_url.token_b64)
@@ -162,7 +171,11 @@ fn signed_url_minted_on_a_verifies_on_b_for_both_scopes() {
 
     forget_peer(peer_id);
     assert!(frame_b
-        .verify(&frame_url.ref_id, frame_url.expiry_unix_ms, &frame_url.token_b64)
+        .verify(
+            &frame_url.ref_id,
+            frame_url.expiry_unix_ms,
+            &frame_url.token_b64
+        )
         .is_err());
     assert!(rec_b
         .verify(&rec_url.ref_id, rec_url.expiry_unix_ms, &rec_url.token_b64)
@@ -180,11 +193,7 @@ fn rotation_grace_window_propagated_through_advertise() {
     let issuer_b = PickupTokenIssuer::new_for_tests([0xEE; 32], Duration::from_secs(30));
 
     // A issues under OLD key, then rotates.
-    let (token_old, _) = issuer_a.issue(
-        "frame_old".into(),
-        "svc".into(),
-        "req-rot-old".into(),
-    );
+    let (token_old, _) = issuer_a.issue("frame_old".into(), "svc".into(), "req-rot-old".into());
     issuer_a.rotate_in_memory(new);
 
     // A advertises both keys (new + previous-window grace).
@@ -212,11 +221,7 @@ fn rotation_grace_window_propagated_through_advertise() {
         .expect("rotated-out key verifies via mesh grace window");
 
     // A token minted under the NEW key after rotation also verifies on B.
-    let (token_new, _) = issuer_a.issue(
-        "frame_new".into(),
-        "svc".into(),
-        "req-rot-new".into(),
-    );
+    let (token_new, _) = issuer_a.issue("frame_new".into(), "svc".into(), "req-rot-new".into());
     issuer_b
         .verify_only(&token_new.wire())
         .expect("new key verifies via mesh pool");
@@ -238,10 +243,8 @@ fn rotation_grace_window_propagated_through_advertise() {
 /// asserts the gate pattern is still present in the handler scope.
 #[test]
 fn receive_handler_has_is_trusted_gate() {
-    let src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/mesh/pipeline.rs"),
-    )
-    .expect("pipeline.rs must be readable from CARGO_MANIFEST_DIR");
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mesh/pipeline.rs"))
+        .expect("pipeline.rs must be readable from CARGO_MANIFEST_DIR");
 
     // Locate the handler arm; everything we care about lives in the block
     // immediately after this match arm header until the next top-level arm.

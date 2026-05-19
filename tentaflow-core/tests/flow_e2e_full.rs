@@ -205,9 +205,8 @@ async fn flow_e2e_install_then_invoke_returns_filtered_records() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload = format!(
-        "flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n"
-    );
+    let payload =
+        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n");
 
     let outcome = {
         let sched = sched.clone();
@@ -226,7 +225,10 @@ async fn flow_e2e_install_then_invoke_returns_filtered_records() {
         out.operators_completed, 3,
         "every operator must report completed"
     );
-    assert!(out.finished_at.is_some(), "completed must carry finished_at");
+    assert!(
+        out.finished_at.is_some(),
+        "completed must carry finished_at"
+    );
 
     // Sink emits result_toml = `[[records]]` table array. value=10.0 passes
     // threshold (min=5.0) so all 3 source records survive.
@@ -258,9 +260,8 @@ async fn flow_e2e_threshold_filters_low_values() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload = format!(
-        "flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 2.0\n"
-    );
+    let payload =
+        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 2.0\n");
 
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
@@ -319,9 +320,8 @@ async fn flow_e2e_addon_uninstall_drops_flow() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload = format!(
-        "flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 1000\n\n[input]\nvalue = 10.0\n"
-    );
+    let payload =
+        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 1000\n\n[input]\nvalue = 10.0\n");
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_invoke(&state, &sched, &payload)
@@ -349,9 +349,8 @@ async fn flow_e2e_audit_log_records_invocation_lifecycle() {
         &addon_id,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload = format!(
-        "flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n"
-    );
+    let payload =
+        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n");
     let outcome = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_invoke(&state, &sched, &payload)
@@ -408,9 +407,8 @@ async fn flow_e2e_cross_addon_cannot_read_status() {
         &addon_a,
         vec![flow_api::PERM_FLOW_INVOKE.to_string()],
     );
-    let payload = format!(
-        "flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n"
-    );
+    let payload =
+        format!("flow_id = \"{FIXTURE_FLOW_ID}\"\nwait_ms = 5000\n\n[input]\nvalue = 10.0\n");
     let started = tokio::task::spawn_blocking({
         let sched = sched.clone();
         move || flow_api::dispatch_invoke(&state_a, &sched, &payload)

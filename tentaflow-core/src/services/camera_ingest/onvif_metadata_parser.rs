@@ -79,19 +79,13 @@ pub fn parse_metadata_xml(xml: &str) -> Vec<MetadataItem> {
 /// element. Returns the inner block, the open-tag body (for attribute
 /// access), and the absolute end-of-element offset. Self-closing
 /// `<Object .../>` elements carry no payload and are skipped.
-fn next_object_block<'a>(
-    xml: &'a str,
-    start: usize,
-) -> Option<(&'a str, &'a str, usize)> {
+fn next_object_block<'a>(xml: &'a str, start: usize) -> Option<(&'a str, &'a str, usize)> {
     let mut cursor = start;
     while cursor < xml.len() {
         let rest = &xml[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -173,19 +167,13 @@ fn parse_or_child(attr: Option<&str>, inner: Option<&str>, child_tag: &str) -> O
 
 /// Find the first occurrence of `tag` and return (open_tag_body, inner_block).
 /// `open_tag_body` is None when the element is self-closing (no inner block).
-fn find_element_open_and_inner(
-    xml: &str,
-    tag: &str,
-) -> Option<(Option<String>, Option<String>)> {
+fn find_element_open_and_inner(xml: &str, tag: &str) -> Option<(Option<String>, Option<String>)> {
     let mut cursor = 0usize;
     while cursor < xml.len() {
         let rest = &xml[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -336,7 +324,8 @@ mod tests {
     fn malformed_xml_is_tolerated_no_panic() {
         // Truncated payload — parser must not panic, just return what it
         // can extract (likely empty).
-        let truncated = "<tt:Object ObjectId=\"1\"><tt:Appearance><tt:Shape><tt:BoundingBox left=\"0.1\"";
+        let truncated =
+            "<tt:Object ObjectId=\"1\"><tt:Appearance><tt:Shape><tt:BoundingBox left=\"0.1\"";
         let _ = parse_metadata_xml(truncated);
         // Random garbage.
         let garbage = "<<<><<<><><><";

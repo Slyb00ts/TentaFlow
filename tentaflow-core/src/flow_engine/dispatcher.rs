@@ -19,12 +19,12 @@ use crate::auth::acl;
 use crate::db::{repository, DbPool};
 use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
+use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
     MetricsSink, NoopMetrics, PiiRulesStore, PromptStore, SttDispatcher, TtsCleaningStore,
     TtsDispatcher,
 };
-use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers_impl::{
     AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
     MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
@@ -34,9 +34,7 @@ use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
 };
 use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
-use crate::flow_engine::node_adapter::{
-    AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink,
-};
+use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     CombineNodeAdapter, ConditionNodeAdapter, ConversationHistoryNodeAdapter,
     EmbeddingsNodeAdapter, LlmNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter,
@@ -120,7 +118,8 @@ pub struct FlowDispatcher {
     /// `AddonFlowRegistry` udostępniany handlerom GUI (Flow Builder lista
     /// templates dorzuca tu addon blocks). Ustawiany przez `set_addon_resolver`
     /// razem z resolverem dla AdapterRegistry — single touchpoint w main.rs.
-    addon_flow_blocks: parking_lot::RwLock<Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>>>,
+    addon_flow_blocks:
+        parking_lot::RwLock<Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>>>,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -186,9 +185,9 @@ impl FlowDispatcher {
         let pii_rules: Arc<dyn PiiRulesStore> = Arc::new(PiiRulesStoreImpl::new(db.clone()));
         let tts_cleaning: Arc<dyn TtsCleaningStore> =
             Arc::new(TtsCleaningStoreImpl::new(db.clone()));
-        let history: Arc<dyn ConversationHistoryStore> = Arc::new(
-            ConversationHistoryImpl::new(service_manager.conversation_cache.clone()),
-        );
+        let history: Arc<dyn ConversationHistoryStore> = Arc::new(ConversationHistoryImpl::new(
+            service_manager.conversation_cache.clone(),
+        ));
         let quic_finder = Arc::new(ServiceManagerQuicFinder::new(service_manager.clone()));
         let memory: Arc<dyn MemoryStore> = Arc::new(MemoryStoreImpl::new(quic_finder));
 
@@ -261,9 +260,7 @@ impl FlowDispatcher {
     /// Zwraca `AddonFlowRegistry` jesli `set_addon_resolver` zostalo wolane.
     /// Handler `FlowNodeTemplatesListRequest` uzywa do dorzucenia addon
     /// blocks do palety Flow Buildera.
-    pub fn addon_flow_blocks(
-        &self,
-    ) -> Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>> {
+    pub fn addon_flow_blocks(&self) -> Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>> {
         self.addon_flow_blocks.read().clone()
     }
 
@@ -348,7 +345,12 @@ impl FlowDispatcher {
         if !self.acl_allow(flow_id, &meta) {
             return Err(DispatchError::Denied { flow_id });
         }
-        let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry, crate::flow_engine::validation::ValidationSource::UserDefined) {
+        let compiled = match CompiledFlow::from_json(
+            flow.id,
+            &flow.flow_json,
+            &self.registry,
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        ) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 warn!(flow_id, "compile failed: {e}");
@@ -394,15 +396,11 @@ impl FlowDispatcher {
                 }
                 cached.compiled.clone()
             }
-            ResolvedFlow::NotFound => {
-                self.compile_synthetic_streaming(service_type, model_name)?
-            }
+            ResolvedFlow::NotFound => self.compile_synthetic_streaming(service_type, model_name)?,
             ResolvedFlow::CompileFailed => {
                 return Err(DispatchError::CompileFailed {
                     flow_id: 0,
-                    msg: format!(
-                        "user-defined streaming flow for '{model_name}/{service_type}'"
-                    ),
+                    msg: format!("user-defined streaming flow for '{model_name}/{service_type}'"),
                 });
             }
         };
@@ -488,13 +486,15 @@ impl FlowDispatcher {
         .await??;
         match resolved {
             Some(flow) => {
-                let compiled = match CompiledFlow::from_json(flow.id, &flow.flow_json, &self.registry, crate::flow_engine::validation::ValidationSource::UserDefined) {
+                let compiled = match CompiledFlow::from_json(
+                    flow.id,
+                    &flow.flow_json,
+                    &self.registry,
+                    crate::flow_engine::validation::ValidationSource::UserDefined,
+                ) {
                     Ok(c) => Arc::new(c),
                     Err(e) => {
-                        warn!(
-                            cache_key,
-                            "compile failed for flow id={}: {e}", flow.id
-                        );
+                        warn!(cache_key, "compile failed for flow id={}: {e}", flow.id);
                         // Negative cache TYLKO dla compile failure. Admin musi
                         // naprawić flow_json — synthetic fallback NIE aktywuje
                         // tutaj (admin chciał konkretny flow).
@@ -641,10 +641,8 @@ fn wrap_blocking_as_stream(
                 let text_delta = match &other {
                     FlowValue::Text(t) => t.clone(),
                     FlowValue::Empty => String::new(),
-                    v => serde_json::to_string(
-                        &crate::flow_engine::converter::payload_to_json(v),
-                    )
-                    .unwrap_or_default(),
+                    v => serde_json::to_string(&crate::flow_engine::converter::payload_to_json(v))
+                        .unwrap_or_default(),
                 };
                 Ok(EnvelopeDelta::Llm(LlmStreamChunk {
                     choice_index: 0,
@@ -711,8 +709,7 @@ mod tests {
     #[test]
     fn registry_includes_all_node_types() {
         let r = build_registry();
-        let types: std::collections::BTreeSet<&str> =
-            r.registered_types().into_iter().collect();
+        let types: std::collections::BTreeSet<&str> = r.registered_types().into_iter().collect();
         for expected in [
             "trigger",
             "output",
@@ -825,8 +822,8 @@ mod tests {
 
         let blobs = Arc::new(InMemoryBlobStore::new());
         let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let blob_ref = futures::executor::block_on(blobs.put(bytes.clone(), "audio/wav"))
-            .expect("put");
+        let blob_ref =
+            futures::executor::block_on(blobs.put(bytes.clone(), "audio/wav")).expect("put");
 
         let mut env = FlowEnvelope::empty();
         env.payload = FlowValue::Audio {

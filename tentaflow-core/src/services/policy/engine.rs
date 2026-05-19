@@ -59,7 +59,9 @@ pub struct ClaimContext {
 fn parse_rfc3339_utc(s: &str, field: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| PolicyError::DbError(format!("invalid RFC3339 timestamp in {field} ('{s}'): {e}")))
+        .map_err(|e| {
+            PolicyError::DbError(format!("invalid RFC3339 timestamp in {field} ('{s}'): {e}"))
+        })
 }
 
 /// Signer entry returned in the verified payload (role + user identity).
@@ -84,17 +86,16 @@ pub struct ClaimVerified {
 /// `PolicyError` variant — the host function callers map this to either an
 /// `AbiError::GateNotSatisfied` (addon-visible) or a CLI "invalid: reason"
 /// line. The engine never returns `Ok` for a revoked or expired claim.
-pub fn verify_claim(
-    pool: &DbPool,
-    claim_id: &str,
-    ctx: &ClaimContext,
-) -> Result<ClaimVerified> {
+pub fn verify_claim(pool: &DbPool, claim_id: &str, ctx: &ClaimContext) -> Result<ClaimVerified> {
     // Hot-path cache short-circuit. The cache stores decisions per
     // (claim_id, blake3(org_id | addon_id | gate_id | resource_scope)) so
     // an allow for org A cannot be replayed for org B. Cache hits skip the
     // DB roundtrip entirely; the wall-clock guard inside `cache::get`
     // re-checks claim expiry before serving so default-deny is preserved.
-    let org_for_hash = ctx.org_id.as_deref().unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let org_for_hash = ctx
+        .org_id
+        .as_deref()
+        .unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let ctx_hash = cache::compute_ctx_hash(
         org_for_hash,
         &ctx.addon_id,
@@ -182,9 +183,7 @@ pub fn verify_claim(
     for role in &ctx.required_signer_roles {
         let role_present = sigs.iter().any(|s| &s.signer_role == role);
         if !role_present {
-            return Err(PolicyError::MissingRequiredSigner {
-                role: role.clone(),
-            });
+            return Err(PolicyError::MissingRequiredSigner { role: role.clone() });
         }
     }
 
@@ -391,12 +390,8 @@ mod tests {
         repo::insert_claim(&pool, &c).unwrap();
         repo::insert_signature(&pool, &sig("c1", "dpo", "a")).unwrap();
         repo::insert_signature(&pool, &sig("c1", "supervisor", "b")).unwrap();
-        let err = verify_claim(
-            &pool,
-            "c1",
-            &ctx("addon-x", "dpia", Some("attributes")),
-        )
-        .unwrap_err();
+        let err =
+            verify_claim(&pool, "c1", &ctx("addon-x", "dpia", Some("attributes"))).unwrap_err();
         assert!(matches!(err, PolicyError::ClaimScopeMismatch { .. }));
     }
 

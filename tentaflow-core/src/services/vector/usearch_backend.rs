@@ -16,9 +16,9 @@
 //     `chmod 0o600` to keep embeddings (PII for face vectors) from leaking to
 //     other local users via the default 0644 umask.
 
-use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
+use std::path::PathBuf;
 
 use parking_lot::RwLock;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};

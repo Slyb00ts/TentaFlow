@@ -172,7 +172,8 @@ mod tests {
     #[test]
     fn resolve_org_context_default_org_when_unspecified() {
         let (_d, pool) = open_pool();
-        let org_a = org_repo::create_organization(&pool, "Only", "only", None, None, None, None).unwrap();
+        let org_a =
+            org_repo::create_organization(&pool, "Only", "only", None, None, None, None).unwrap();
         let viewer = role_id(&pool, "org_viewer");
         org_repo::add_membership(&pool, &org_a.org_id, "u-1", &viewer, "boot").unwrap();
 

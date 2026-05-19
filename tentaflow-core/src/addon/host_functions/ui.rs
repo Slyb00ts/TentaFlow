@@ -75,8 +75,7 @@ pub fn ui_render(
         }
     };
 
-    let ui_value = match crate::addon::ui_framework::parse_and_validate_ui_json(&ui_value_raw)
-    {
+    let ui_value = match crate::addon::ui_framework::parse_and_validate_ui_json(&ui_value_raw) {
         Ok(v) => v,
         Err(_) => {
             audit_log(
@@ -101,12 +100,10 @@ pub fn ui_render(
     // `AddonUiPanelGetRequest` najpierw szuka per-user, fallback do 0.
     if let Some(cache) = caller.data().ui_panels.clone() {
         let key_user = caller.data().user_id.unwrap_or(0);
-        cache
-            .write()
-            .insert(
-                (key_user, addon_id.clone(), panel_id.clone()),
-                ui_value.clone(),
-            );
+        cache.write().insert(
+            (key_user, addon_id.clone(), panel_id.clone()),
+            ui_value.clone(),
+        );
     }
 
     // Event "ui.panel_rendered" zostaje — inne addony moga reagowac (np.

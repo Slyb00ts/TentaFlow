@@ -129,7 +129,10 @@ mod tests {
     use crate::services::signed_urls::UrlScope;
 
     fn issuer() -> Arc<SignedUrlIssuer> {
-        Arc::new(SignedUrlIssuer::new_for_tests(UrlScope::LegalUrl, [0x77u8; 32]))
+        Arc::new(SignedUrlIssuer::new_for_tests(
+            UrlScope::LegalUrl,
+            [0x77u8; 32],
+        ))
     }
 
     const DOC: &str = "11111111-1111-4111-8111-111111111111";
@@ -139,8 +142,15 @@ mod tests {
     fn mint_and_verify_round_trip() {
         let iss = issuer();
         let url = mint_legal_url(&iss, DOC, ORG, 600).expect("mint");
-        verify_legal_token(&iss, DOC, ORG, &url.nonce, url.expiry_unix_ms, &url.token_b64)
-            .expect("verify");
+        verify_legal_token(
+            &iss,
+            DOC,
+            ORG,
+            &url.nonce,
+            url.expiry_unix_ms,
+            &url.token_b64,
+        )
+        .expect("verify");
         assert!(url.signed_url.starts_with("/legal/"));
         assert!(url.signed_url.contains("token="));
         assert!(url.signed_url.contains("exp="));

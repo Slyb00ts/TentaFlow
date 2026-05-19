@@ -282,8 +282,8 @@ mod middleware_tests {
             fallbacks_tried: 1,
             hop_count: 0,
             latency_ms: Some(12.34),
-        usage: None,
-        finish_reason: None,
+            usage: None,
+            finish_reason: None,
         };
         let json = serde_json::to_string(&m).expect("serialize");
         assert!(json.contains("\"served_by_node\":\"node-1\""));

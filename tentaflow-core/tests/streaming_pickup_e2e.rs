@@ -221,7 +221,9 @@ async fn core_handler(
         _ => Response::builder()
             .status(status)
             .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from_static(b"{\"error\":\"pickup_failed\"}")))
+            .body(Full::new(Bytes::from_static(
+                b"{\"error\":\"pickup_failed\"}",
+            )))
             .unwrap(),
     }
 }
@@ -450,7 +452,9 @@ async fn test_e2e_pickup_wire_returns_bbox() {
     ];
     let mut payload = vec![0xABu8; 720 * 480 * 3];
     payload[..16].copy_from_slice(&sentinel);
-    let raw_ref = core.storage.insert(mk_frame("cam-e2e", 720, 480, payload.clone()));
+    let raw_ref = core
+        .storage
+        .insert(mk_frame("cam-e2e", 720, 480, payload.clone()));
 
     let resp = drive_dispatch(
         &yolo,
@@ -466,7 +470,10 @@ async fn test_e2e_pickup_wire_returns_bbox() {
     .await;
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.expect("json body");
-    assert_eq!(body["frame_size_bytes"].as_u64().unwrap(), payload.len() as u64);
+    assert_eq!(
+        body["frame_size_bytes"].as_u64().unwrap(),
+        payload.len() as u64
+    );
     assert_eq!(body["width"].as_u64().unwrap(), 720);
     assert_eq!(body["height"].as_u64().unwrap(), 480);
     assert_eq!(body["pixel_format"].as_str().unwrap(), "rgb24");
@@ -492,7 +499,9 @@ async fn test_e2e_replay_rejected_on_wire() {
     let core = spawn_core_pickup_server().await;
     let yolo = spawn_mock_yolo(format!("http://{}", core.addr)).await;
 
-    let raw_ref = core.storage.insert(mk_frame("cam-replay", 8, 4, vec![1; 96]));
+    let raw_ref = core
+        .storage
+        .insert(mk_frame("cam-replay", 8, 4, vec![1; 96]));
     let (token, _) = core.issuer.issue(
         raw_ref.as_str().to_string(),
         "yolo-svc".into(),

@@ -129,19 +129,47 @@ pub fn verify_pickup_headers(
 ) -> Result<VerifiedPickup, PickupOutcome> {
     let token = match req.pickup_token {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_token"), None)),
+        _ => {
+            return Err(log_outcome(
+                db,
+                req,
+                PickupOutcome::BadHeaders("missing_token"),
+                None,
+            ))
+        }
     };
     let frame_ref = match req.frame_ref {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_frame_ref"), None)),
+        _ => {
+            return Err(log_outcome(
+                db,
+                req,
+                PickupOutcome::BadHeaders("missing_frame_ref"),
+                None,
+            ))
+        }
     };
     let service_id = match req.service_id {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_service_id"), None)),
+        _ => {
+            return Err(log_outcome(
+                db,
+                req,
+                PickupOutcome::BadHeaders("missing_service_id"),
+                None,
+            ))
+        }
     };
     let request_id = match req.request_id {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(log_outcome(db, req, PickupOutcome::BadHeaders("missing_request_id"), None)),
+        _ => {
+            return Err(log_outcome(
+                db,
+                req,
+                PickupOutcome::BadHeaders("missing_request_id"),
+                None,
+            ))
+        }
     };
 
     let (payload, source) = match issuer.verify_only_with_source(token) {

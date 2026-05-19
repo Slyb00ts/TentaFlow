@@ -47,8 +47,7 @@ fn open_pool() -> (TempDir, DbPool) {
 }
 
 fn trust(pool: &DbPool, pk: &str, label: &str) {
-    repository::insert_trusted_publisher(pool, pk, label, None, None)
-        .expect("insert trust row");
+    repository::insert_trusted_publisher(pool, pk, label, None, None).expect("insert trust row");
 }
 
 /// Builds an addon directory tree:

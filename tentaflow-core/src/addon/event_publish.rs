@@ -64,7 +64,13 @@ pub fn publish_event(
     event_type: &str,
     payload: serde_json::Value,
 ) -> Result<(), EventPublishError> {
-    if !permission_granted(permissions, caller, permission_checker, "events", Some(event_type)) {
+    if !permission_granted(
+        permissions,
+        caller,
+        permission_checker,
+        "events",
+        Some(event_type),
+    ) {
         emit_audit(
             db,
             caller,

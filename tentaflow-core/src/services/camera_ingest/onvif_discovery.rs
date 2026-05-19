@@ -152,13 +152,25 @@ fn parse_probe_match(body: &[u8], source_ip: &str) -> Result<DiscoveredCamera, D
         std::str::from_utf8(body).map_err(|e| DiscoveryError::InvalidResponse(e.to_string()))?;
 
     let xaddrs = extract_xml_text(text, "XAddrs")
-        .map(|s| s.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let types = extract_xml_text(text, "Types")
-        .map(|s| s.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let scopes = extract_xml_text(text, "Scopes")
-        .map(|s| s.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let message_id = extract_xml_text(text, "MessageID").unwrap_or_default();
 
@@ -196,10 +208,7 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
         // Skip closing tags, comments, processing instructions.
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -300,7 +309,9 @@ mod tests {
     fn test_parse_probe_match_basic_response() {
         let cam = parse_probe_match(SAMPLE_REPLY.as_bytes(), "192.168.1.50").expect("parse");
         assert_eq!(cam.xaddrs, vec!["http://192.168.1.50/onvif/device_service"]);
-        assert!(cam.types.contains(&"dn:NetworkVideoTransmitter".to_string()));
+        assert!(cam
+            .types
+            .contains(&"dn:NetworkVideoTransmitter".to_string()));
         assert_eq!(cam.manufacturer, "Hikvision");
         assert_eq!(cam.model, "DS-2CD2042WD");
         assert_eq!(cam.message_id, "urn:uuid:reply-1");
@@ -321,9 +332,15 @@ mod tests {
     #[test]
     fn test_extract_xml_text_handles_namespace_prefix() {
         let xml = "<root><d:XAddrs>http://x/y</d:XAddrs></root>";
-        assert_eq!(extract_xml_text(xml, "XAddrs").as_deref(), Some("http://x/y"));
+        assert_eq!(
+            extract_xml_text(xml, "XAddrs").as_deref(),
+            Some("http://x/y")
+        );
         let xml2 = "<root><XAddrs>http://a/b</XAddrs></root>";
-        assert_eq!(extract_xml_text(xml2, "XAddrs").as_deref(), Some("http://a/b"));
+        assert_eq!(
+            extract_xml_text(xml2, "XAddrs").as_deref(),
+            Some("http://a/b")
+        );
     }
 
     #[test]

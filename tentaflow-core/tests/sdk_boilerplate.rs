@@ -6,9 +6,7 @@
 
 use rusqlite::Connection;
 use tentaflow_core::addon::errors::AbiError;
-use tentaflow_core::addon::host_functions::abi_helpers::{
-    enforce_payload_size, PayloadKind,
-};
+use tentaflow_core::addon::host_functions::abi_helpers::{enforce_payload_size, PayloadKind};
 use tentaflow_core::addon::sdk_version::{check_compatibility, SdkVersionError, CORE_SDK_VERSION};
 use tentaflow_core::audit::RiskClass;
 
@@ -49,7 +47,11 @@ fn abi_error_codes_unique_and_match_spec() {
     let mut seen = std::collections::HashSet::new();
     for (variant, expected_code) in pairs {
         assert_eq!(variant.as_i32(), expected_code, "Bad i32 for {:?}", variant);
-        assert!(seen.insert(expected_code), "Duplicate code {}", expected_code);
+        assert!(
+            seen.insert(expected_code),
+            "Duplicate code {}",
+            expected_code
+        );
     }
     assert_eq!(seen.len(), 25, "Brakuje wariantow AbiError");
 }
@@ -57,16 +59,31 @@ fn abi_error_codes_unique_and_match_spec() {
 #[test]
 fn abi_error_descriptions_exist() {
     let variants = [
-        AbiError::Ok, AbiError::Permission, AbiError::NotFound,
-        AbiError::NoAvailableTarget, AbiError::Timeout, AbiError::Operation,
-        AbiError::OutputBufferTooSmall, AbiError::Conflict, AbiError::SqlSyntax,
-        AbiError::SqlConstraint, AbiError::SqlNoResult, AbiError::QuotaExceeded,
-        AbiError::CameraUnreachable, AbiError::CameraAuthFailed,
-        AbiError::CameraVendorUnsupported, AbiError::StreamNotFound,
-        AbiError::StreamClosed, AbiError::Backpressure, AbiError::RecordingNotFound,
-        AbiError::RecordingPurged, AbiError::RecordingTimeOutOfRing,
-        AbiError::PayloadTooLarge, AbiError::GateNotSatisfied,
-        AbiError::FrameTokenInvalid, AbiError::FramePurged,
+        AbiError::Ok,
+        AbiError::Permission,
+        AbiError::NotFound,
+        AbiError::NoAvailableTarget,
+        AbiError::Timeout,
+        AbiError::Operation,
+        AbiError::OutputBufferTooSmall,
+        AbiError::Conflict,
+        AbiError::SqlSyntax,
+        AbiError::SqlConstraint,
+        AbiError::SqlNoResult,
+        AbiError::QuotaExceeded,
+        AbiError::CameraUnreachable,
+        AbiError::CameraAuthFailed,
+        AbiError::CameraVendorUnsupported,
+        AbiError::StreamNotFound,
+        AbiError::StreamClosed,
+        AbiError::Backpressure,
+        AbiError::RecordingNotFound,
+        AbiError::RecordingPurged,
+        AbiError::RecordingTimeOutOfRing,
+        AbiError::PayloadTooLarge,
+        AbiError::GateNotSatisfied,
+        AbiError::FrameTokenInvalid,
+        AbiError::FramePurged,
     ];
     for v in variants {
         assert!(!v.description().is_empty(), "Empty description for {:?}", v);

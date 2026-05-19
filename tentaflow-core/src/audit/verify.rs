@@ -14,7 +14,9 @@
 
 use rusqlite::Connection;
 
-use super::chain::{compute_hash, canonical_row_bytes, AuditRowHashInput, ChainHash, GENESIS_PREV_HASH};
+use super::chain::{
+    canonical_row_bytes, compute_hash, AuditRowHashInput, ChainHash, GENESIS_PREV_HASH,
+};
 
 /// Reason a particular row failed verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,8 +215,9 @@ mod tests {
         risk_class: &str,
         result: Option<&str>,
     ) -> i64 {
-        let prev_hash =
-            super::super::chain::latest_chain_hash(conn).expect("latest").unwrap_or(GENESIS_PREV_HASH);
+        let prev_hash = super::super::chain::latest_chain_hash(conn)
+            .expect("latest")
+            .unwrap_or(GENESIS_PREV_HASH);
 
         // Use a deterministic timestamp so test runs are reproducible. Match
         // the SQLite `datetime('now')` format ("YYYY-MM-DD HH:MM:SS").

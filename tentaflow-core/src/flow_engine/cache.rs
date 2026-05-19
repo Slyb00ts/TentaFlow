@@ -62,8 +62,8 @@ impl CompiledFlow {
         registry: &AdapterRegistry,
         source: crate::flow_engine::validation::ValidationSource,
     ) -> Result<Self, CompileError> {
-        let definition: FlowDefinition = serde_json::from_str(flow_json)
-            .map_err(|e| CompileError::Json(e.to_string()))?;
+        let definition: FlowDefinition =
+            serde_json::from_str(flow_json).map_err(|e| CompileError::Json(e.to_string()))?;
         Self::compile(flow_id, definition, registry, source)
     }
 
@@ -189,12 +189,10 @@ impl CompiledFlow {
             let Some(edge) = next_edge else { break };
             // Sprawdź czy konsument to output (sink). Output node
             // zatrzymuje chain — nie idzie do chain Vec.
-            let consumer_def_idx = self
-                .definition
-                .nodes
-                .iter()
-                .position(|n| n.id == edge.to);
-            let Some(consumer_pos) = consumer_def_idx else { break };
+            let consumer_def_idx = self.definition.nodes.iter().position(|n| n.id == edge.to);
+            let Some(consumer_pos) = consumer_def_idx else {
+                break;
+            };
             let consumer_node = &self.definition.nodes[consumer_pos];
             if consumer_node.node_type == "output" {
                 break;
@@ -444,7 +442,13 @@ mod tests {
             ],
             "edges": [{"from":"t","to":"o","from_port":"text","to_port":"text"}]
         }"#;
-        let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap();
+        let cf = CompiledFlow::from_json(
+            1,
+            json,
+            &registry(),
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap();
         assert_eq!(cf.execution_order.len(), 2);
         assert!(!cf.is_streaming);
         assert_eq!(cf.trigger_run_idx(), Some(0));
@@ -464,7 +468,13 @@ mod tests {
             ]
         }"#;
         // Synthetic source — testujemy R7 streaming end-shape, nie R-SAFETY.
-        let cf = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::Synthetic).unwrap();
+        let cf = CompiledFlow::from_json(
+            1,
+            json,
+            &registry(),
+            crate::flow_engine::validation::ValidationSource::Synthetic,
+        )
+        .unwrap();
         assert!(cf.is_streaming);
         assert_eq!(cf.streaming_llm_run_idx(), Some(1));
         // Stage 3d Krok 2c: chain pusty dla direct LLM → output (output
@@ -529,14 +539,26 @@ mod tests {
                 {"from":"b","to":"a","from_port":"true"}
             ]
         }"#;
-        let err = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
+        let err = CompiledFlow::from_json(
+            1,
+            json,
+            &registry(),
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap_err();
         assert!(matches!(err, CompileError::Cycle { .. }));
     }
 
     #[test]
     fn compile_rejects_empty_flow() {
         let json = r#"{"nodes":[],"edges":[]}"#;
-        let err = CompiledFlow::from_json(1, json, &registry(), crate::flow_engine::validation::ValidationSource::UserDefined).unwrap_err();
+        let err = CompiledFlow::from_json(
+            1,
+            json,
+            &registry(),
+            crate::flow_engine::validation::ValidationSource::UserDefined,
+        )
+        .unwrap_err();
         assert!(matches!(err, CompileError::Empty));
     }
 
@@ -597,8 +619,14 @@ mod tests {
 
         cache.synthetic_set("d", synthetic_compiled());
         assert_eq!(cache.synthetic_len(), 3);
-        assert!(cache.synthetic_get("a").is_some(), "a powinien zostać (touch)");
-        assert!(cache.synthetic_get("b").is_none(), "b powinien być evicted (LRU)");
+        assert!(
+            cache.synthetic_get("a").is_some(),
+            "a powinien zostać (touch)"
+        );
+        assert!(
+            cache.synthetic_get("b").is_none(),
+            "b powinien być evicted (LRU)"
+        );
         assert!(cache.synthetic_get("c").is_some());
         assert!(cache.synthetic_get("d").is_some());
     }

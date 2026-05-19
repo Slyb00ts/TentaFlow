@@ -156,13 +156,7 @@ pub fn apply_migrations(
 
     let mut applied_count = 0usize;
     for mig in &migrations {
-        let outcome = apply_single_migration(
-            addon_id,
-            addon_version,
-            mig,
-            &pool,
-            core_db,
-        )?;
+        let outcome = apply_single_migration(addon_id, addon_version, mig, &pool, core_db)?;
         if outcome == ApplyOutcome::Applied {
             applied_count += 1;
         }
@@ -233,7 +227,9 @@ fn apply_single_migration(
     // 2. Apply w transakcji per-addon SQLite (atomic).
     let start = Instant::now();
     let apply_result: Result<(), String> = (|| {
-        let mut conn = addon_pool.get().map_err(|_| "pool get failed".to_string())?;
+        let mut conn = addon_pool
+            .get()
+            .map_err(|_| "pool get failed".to_string())?;
         let tx = conn
             .transaction()
             .map_err(|e| format!("BEGIN failed: {e}"))?;
@@ -337,7 +333,10 @@ mod tests {
             let mig_dir = bundle.path().join("migrations");
             write_migrations(
                 &mig_dir,
-                &[("001_init.sql", "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")],
+                &[(
+                    "001_init.sql",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+                )],
             );
             let core_db = setup_core_db();
             let n = apply_migrations(
@@ -352,7 +351,8 @@ mod tests {
             assert_eq!(n, 1);
 
             // Sprawdz tabele w per-addon DB.
-            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-init-test").unwrap();
+            let pool =
+                super::super::storage_sql::open_addon_db("org-default", "mig-init-test").unwrap();
             let conn = pool.get().unwrap();
             let count: i64 = conn
                 .query_row(
@@ -375,14 +375,29 @@ mod tests {
             write_migrations(
                 &mig_dir,
                 &[
-                    ("002_add_col.sql", "ALTER TABLE items ADD COLUMN ts INTEGER;"),
-                    ("001_init.sql", "CREATE TABLE items (id INTEGER PRIMARY KEY);"),
+                    (
+                        "002_add_col.sql",
+                        "ALTER TABLE items ADD COLUMN ts INTEGER;",
+                    ),
+                    (
+                        "001_init.sql",
+                        "CREATE TABLE items (id INTEGER PRIMARY KEY);",
+                    ),
                 ],
             );
             let core_db = setup_core_db();
-            let n = apply_migrations("mig-order-test", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
+            let n = apply_migrations(
+                "mig-order-test",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
             assert_eq!(n, 2);
-            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-order-test").unwrap();
+            let pool =
+                super::super::storage_sql::open_addon_db("org-default", "mig-order-test").unwrap();
             let conn = pool.get().unwrap();
             // ts kolumna istnieje (drugi migration zaaplikowany po pierwszym).
             let info_cols: Vec<String> = conn
@@ -402,11 +417,30 @@ mod tests {
         with_tmp_home(|| {
             let bundle = tempfile::tempdir().unwrap();
             let mig_dir = bundle.path().join("migrations");
-            write_migrations(&mig_dir, &[("001_init.sql", "CREATE TABLE x (id INTEGER);")]);
+            write_migrations(
+                &mig_dir,
+                &[("001_init.sql", "CREATE TABLE x (id INTEGER);")],
+            );
             let core_db = setup_core_db();
-            let n1 = apply_migrations("mig-idem", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
+            let n1 = apply_migrations(
+                "mig-idem",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
             assert_eq!(n1, 1);
-            let n2 = apply_migrations("mig-idem", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
+            let n2 = apply_migrations(
+                "mig-idem",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
             assert_eq!(n2, 0, "drugi run skip");
             super::super::storage_sql::close_addon_db("org-default", "mig-idem");
         });
@@ -417,12 +451,34 @@ mod tests {
         with_tmp_home(|| {
             let bundle = tempfile::tempdir().unwrap();
             let mig_dir = bundle.path().join("migrations");
-            write_migrations(&mig_dir, &[("001_init.sql", "CREATE TABLE x (id INTEGER);")]);
+            write_migrations(
+                &mig_dir,
+                &[("001_init.sql", "CREATE TABLE x (id INTEGER);")],
+            );
             let core_db = setup_core_db();
-            apply_migrations("mig-hash", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
+            apply_migrations(
+                "mig-hash",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
             // Zmodyfikuj tresc migracji po apply.
-            std::fs::write(mig_dir.join("001_init.sql"), "CREATE TABLE x (id INTEGER, extra TEXT);").unwrap();
-            let res = apply_migrations("mig-hash", "0.1.0", "migrations", bundle.path(), &core_db, "org-default");
+            std::fs::write(
+                mig_dir.join("001_init.sql"),
+                "CREATE TABLE x (id INTEGER, extra TEXT);",
+            )
+            .unwrap();
+            let res = apply_migrations(
+                "mig-hash",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            );
             assert!(res.is_err(), "hash mismatch powinien byc wykryty");
             super::super::storage_sql::close_addon_db("org-default", "mig-hash");
         });
@@ -442,7 +498,14 @@ mod tests {
                 )],
             );
             let core_db = setup_core_db();
-            let res = apply_migrations("mig-fail", "0.1.0", "migrations", bundle.path(), &core_db, "org-default");
+            let res = apply_migrations(
+                "mig-fail",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            );
             assert!(res.is_err());
             let pool = super::super::storage_sql::open_addon_db("org-default", "mig-fail").unwrap();
             let conn = pool.get().unwrap();
@@ -473,7 +536,15 @@ mod tests {
                 ],
             );
             let core_db = setup_core_db();
-            let n = apply_migrations("mig-invalid", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
+            let n = apply_migrations(
+                "mig-invalid",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
             assert_eq!(n, 1, "tylko 001_init.sql zaakceptowane");
             super::super::storage_sql::close_addon_db("org-default", "mig-invalid");
         });
@@ -486,7 +557,14 @@ mod tests {
             let mig_dir = bundle.path().join("migrations");
             write_migrations(&mig_dir, &[("001_bad.sql", "CREATE TABL x (;")]);
             let core_db = setup_core_db();
-            let _ = apply_migrations("mig-status", "0.1.0", "migrations", bundle.path(), &core_db, "org-default");
+            let _ = apply_migrations(
+                "mig-status",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            );
             let conn = core_db.lock().unwrap();
             let status: String = conn
                 .query_row(
@@ -506,8 +584,24 @@ mod tests {
         with_tmp_home(|| {
             let bundle = tempfile::tempdir().unwrap();
             let core_db = setup_core_db();
-            assert!(apply_migrations("mig-trav", "0.1.0", "../etc", bundle.path(), &core_db, "org-default").is_err());
-            assert!(apply_migrations("mig-trav", "0.1.0", "/tmp", bundle.path(), &core_db, "org-default").is_err());
+            assert!(apply_migrations(
+                "mig-trav",
+                "0.1.0",
+                "../etc",
+                bundle.path(),
+                &core_db,
+                "org-default"
+            )
+            .is_err());
+            assert!(apply_migrations(
+                "mig-trav",
+                "0.1.0",
+                "/tmp",
+                bundle.path(),
+                &core_db,
+                "org-default"
+            )
+            .is_err());
         });
     }
 
@@ -516,7 +610,15 @@ mod tests {
         with_tmp_home(|| {
             let bundle = tempfile::tempdir().unwrap();
             let core_db = setup_core_db();
-            let n = apply_migrations("mig-nodir", "0.1.0", "migrations", bundle.path(), &core_db, "org-default").unwrap();
+            let n = apply_migrations(
+                "mig-nodir",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
             assert_eq!(n, 0);
             super::super::storage_sql::close_addon_db("org-default", "mig-nodir");
         });

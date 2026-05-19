@@ -366,7 +366,10 @@ mod tests {
     fn strategy_db_parsing_falls_back_to_first_available() {
         assert_eq!(Strategy::from_db(None), Strategy::FirstAvailable);
         assert_eq!(Strategy::from_db(Some("")), Strategy::FirstAvailable);
-        assert_eq!(Strategy::from_db(Some("FirstAvailable")), Strategy::FirstAvailable);
+        assert_eq!(
+            Strategy::from_db(Some("FirstAvailable")),
+            Strategy::FirstAvailable
+        );
         assert_eq!(Strategy::from_db(Some("round_robin")), Strategy::RoundRobin);
         assert_eq!(Strategy::from_db(Some("Round-Robin")), Strategy::RoundRobin);
         assert_eq!(Strategy::from_db(Some("garbage")), Strategy::FirstAvailable);

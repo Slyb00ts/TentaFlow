@@ -19,16 +19,14 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use tentaflow_core::addon::errors::AbiError;
 use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::host_functions::camera_metadata::test_api;
 use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
 use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
 use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::{AddonManifest, AddonState};
-use tentaflow_core::addon::errors::AbiError;
-use tentaflow_core::db::repository::{
-    insert_camera, set_camera_metadata_supported,
-};
+use tentaflow_core::db::repository::{insert_camera, set_camera_metadata_supported};
 use tentaflow_core::db::DbPool;
 use tentaflow_core::services::camera_ingest::metadata_bus::{metadata_bus, MetadataMessage};
 use tentaflow_core::services::camera_ingest::metadata_supervisor::MetadataPullSupervisor;
@@ -176,7 +174,12 @@ fn subscribe_foreign_addon_returns_not_found() {
     let cam = unique_camera_id();
     insert_test_camera(&db, &cam, "addon-owner", None, true);
     // Same org, different addon — must be invisible.
-    let state = make_state(&db, "addon-other", None, vec!["camera.metadata".to_string()]);
+    let state = make_state(
+        &db,
+        "addon-other",
+        None,
+        vec!["camera.metadata".to_string()],
+    );
     let err = test_api::precheck_subscribe(&state, &cam).expect_err("must deny");
     assert_eq!(err, AbiError::NotFound);
 }

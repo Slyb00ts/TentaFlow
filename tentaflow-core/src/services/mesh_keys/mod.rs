@@ -269,17 +269,13 @@ impl MeshKeyPool {
 
     /// Acquire the per-name 5 s rate-limit slot. Public-in-crate so the
     /// gating can be exercised independently of an actual mesh handle.
-    pub(crate) fn reserve_rate_limit_slot(
-        &self,
-        rotated_name: &str,
-    ) -> Result<(), BroadcastError> {
+    pub(crate) fn reserve_rate_limit_slot(&self, rotated_name: &str) -> Result<(), BroadcastError> {
         let mut last = self.last_broadcast.lock();
         let now = Instant::now();
         if let Some(prev) = last.get(rotated_name) {
             let elapsed = now.saturating_duration_since(*prev);
             if elapsed < BROADCAST_RATE_LIMIT {
-                let retry_after_secs =
-                    (BROADCAST_RATE_LIMIT - elapsed).as_secs().saturating_add(1);
+                let retry_after_secs = (BROADCAST_RATE_LIMIT - elapsed).as_secs().saturating_add(1);
                 return Err(BroadcastError::RateLimited { retry_after_secs });
             }
         }
@@ -423,7 +419,11 @@ pub fn emit_broadcast_audit(
                 "retry_after_secs": *retry_after_secs,
             })
             .to_string();
-            ("denied", format!("rate_limited retry_after={retry_after_secs}s"), details)
+            (
+                "denied",
+                format!("rate_limited retry_after={retry_after_secs}s"),
+                details,
+            )
         }
         Err(BroadcastError::NoTrustedPeers) => {
             let details = serde_json::json!({
@@ -621,7 +621,9 @@ mod tests {
 
     #[test]
     fn broadcast_error_display_is_human_readable() {
-        let e = BroadcastError::RateLimited { retry_after_secs: 3 };
+        let e = BroadcastError::RateLimited {
+            retry_after_secs: 3,
+        };
         assert!(e.to_string().contains("rate limited"));
         let e = BroadcastError::NoTrustedPeers;
         assert!(e.to_string().contains("no trusted peers"));

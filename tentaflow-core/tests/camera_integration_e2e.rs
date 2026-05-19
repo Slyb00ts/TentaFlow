@@ -85,10 +85,7 @@ fn make_state(db: db::DbPool, permissions: Vec<String>) -> AddonState {
     }
 }
 
-fn create_test_store(
-    engine: &wasmtime::Engine,
-    state: AddonState,
-) -> wasmtime::Store<AddonState> {
+fn create_test_store(engine: &wasmtime::Engine, state: AddonState) -> wasmtime::Store<AddonState> {
     let mut store = wasmtime::Store::new(engine, state);
     store.set_fuel(1_000_000_000).expect("set_fuel");
     store.epoch_deadline_trap();
@@ -300,7 +297,8 @@ async fn camera_addon_lifecycle_e2e() {
         .collect();
 
     let find = |action: &str, result: &str| -> Option<&&AuditEntry> {
-        mine.iter().find(|e| e.action == action && e.result == result)
+        mine.iter()
+            .find(|e| e.action == action && e.result == result)
     };
 
     let add_entry = find("camera.add", "ok").unwrap_or_else(|| {
@@ -401,13 +399,19 @@ async fn camera_addon_path_traversal_blocked() {
     // SymlinkNotAllowed, which the host audits as session_start_failed
     // wrapping the supervisor error string.
     let entries = fetch_audit_entries(&db, "camera.add");
-    let blocked = entries.iter().find(|e| e.result == "error").unwrap_or_else(|| {
-        panic!("expected error audit entry for camera.add; got {entries:?}");
-    });
+    let blocked = entries
+        .iter()
+        .find(|e| e.result == "error")
+        .unwrap_or_else(|| {
+            panic!("expected error audit entry for camera.add; got {entries:?}");
+        });
     assert_eq!(blocked.risk_class, "A", "camera.add must be risk A");
     let reason = blocked.error_message.as_deref().unwrap_or("");
     assert!(
-        reason.contains("symlink_not_allowed") || reason.contains("symlink not allowed") || reason.contains("file_not_found") || reason.contains("file not found"),
+        reason.contains("symlink_not_allowed")
+            || reason.contains("symlink not allowed")
+            || reason.contains("file_not_found")
+            || reason.contains("file not found"),
         "expected guard reason in error_message, got: {reason:?}"
     );
 }
@@ -433,7 +437,11 @@ async fn camera_addon_permission_denied_without_write() {
     .expect("on_request");
 
     assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp={resp}");
-    assert_eq!(resp["granted"], serde_json::Value::Bool(false), "must be denied");
+    assert_eq!(
+        resp["granted"],
+        serde_json::Value::Bool(false),
+        "must be denied"
+    );
 
     // Audit log MUST record a camera.add denial with missing_permission reason
     // and risk_class A.
@@ -450,7 +458,10 @@ async fn camera_addon_permission_denied_without_write() {
         .unwrap_or_else(|| {
             panic!("expected denied audit with missing_permission reason; got {entries:?}");
         });
-    assert_eq!(denied.risk_class, "A", "permission-denied camera.add must be risk A");
+    assert_eq!(
+        denied.risk_class, "A",
+        "permission-denied camera.add must be risk A"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

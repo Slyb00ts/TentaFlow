@@ -168,7 +168,9 @@ fn build_alias_info(
         owner,
         current_target: row.target_model,
         fallback_targets,
-        strategy: row.strategy.unwrap_or_else(|| "first_available".to_string()),
+        strategy: row
+            .strategy
+            .unwrap_or_else(|| "first_available".to_string()),
         is_active: row.is_active,
         last_used_target,
         last_used_at,
@@ -181,10 +183,7 @@ fn build_alias_info(
 // Internal logic — alias_list_owned
 // =============================================================================
 
-fn do_alias_list_owned(
-    db: &DbPool,
-    caller_addon_id: &str,
-) -> Result<Vec<AliasInfoOut>, AbiError> {
+fn do_alias_list_owned(db: &DbPool, caller_addon_id: &str) -> Result<Vec<AliasInfoOut>, AbiError> {
     let conn = db.lock().map_err(|_| AbiError::Operation)?;
     let mut stmt = conn
         .prepare(
@@ -210,12 +209,10 @@ fn do_alias_list_owned(
             })
         })
         .map_err(|_| AbiError::Operation)?;
-    let collected: Vec<AliasCoreRow> = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            warn!("alias_list_owned: failed to collect alias rows: {}", e);
-            AbiError::Operation
-        })?;
+    let collected: Vec<AliasCoreRow> = rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+        warn!("alias_list_owned: failed to collect alias rows: {}", e);
+        AbiError::Operation
+    })?;
     let mut out = Vec::with_capacity(collected.len());
     for row in collected {
         out.push(build_alias_info(&conn, row, caller_addon_id)?);
@@ -321,10 +318,16 @@ pub fn alias_get_v1(
     let info = match do_alias_get(&db, &alias_id, &addon_id) {
         Ok(v) => v,
         Err(e) => {
-            let validation_failed = matches!(e, AbiError::NotFound)
-                || matches!(e, AbiError::Operation);
+            let validation_failed =
+                matches!(e, AbiError::NotFound) || matches!(e, AbiError::Operation);
             let (result_kind, reason) = audit_outcome_for_error(e, validation_failed);
-            audit(caller.data(), "alias.get", Some(&alias_id), result_kind, Some(reason));
+            audit(
+                caller.data(),
+                "alias.get",
+                Some(&alias_id),
+                result_kind,
+                Some(reason),
+            );
             return e.as_i32();
         }
     };
@@ -360,7 +363,13 @@ pub fn alias_list_owned_v1(
     };
 
     if !check_permission(caller.data(), PERM_ALIAS_READ, None) {
-        audit(caller.data(), "alias.list_owned", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "alias.list_owned",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
 
@@ -371,7 +380,13 @@ pub fn alias_list_owned_v1(
         Ok(v) => v,
         Err(e) => {
             let (result_kind, reason) = audit_outcome_for_error(e, false);
-            audit(caller.data(), "alias.list_owned", None, result_kind, Some(reason));
+            audit(
+                caller.data(),
+                "alias.list_owned",
+                None,
+                result_kind,
+                Some(reason),
+            );
             return e.as_i32();
         }
     };

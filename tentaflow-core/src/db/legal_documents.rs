@@ -130,11 +130,7 @@ pub fn list_by_org(
 /// Fetch a single document. Tenant-scoped on purpose: a caller from org A
 /// passing the id of an org B row gets `Ok(None)`, same shape as a genuine
 /// miss. No row leak across tenants.
-pub fn get_by_id(
-    conn: &Connection,
-    doc_id: &str,
-    org_id: &str,
-) -> Result<Option<LegalDocument>> {
+pub fn get_by_id(conn: &Connection, doc_id: &str, org_id: &str) -> Result<Option<LegalDocument>> {
     let sql = format!(
         "SELECT {COLS} FROM legal_documents \
          WHERE id = ?1 AND org_id = ?2"
@@ -147,12 +143,7 @@ pub fn get_by_id(
 
 /// Attach the signed-URL HMAC reference once it has been minted by the
 /// recording_url tier. Returns `Err` if the row does not exist for this org.
-pub fn set_signed_url_ref(
-    conn: &Connection,
-    doc_id: &str,
-    org_id: &str,
-    ref_: &str,
-) -> Result<()> {
+pub fn set_signed_url_ref(conn: &Connection, doc_id: &str, org_id: &str, ref_: &str) -> Result<()> {
     let affected = conn.execute(
         "UPDATE legal_documents SET signed_url_ref = ?1 \
          WHERE id = ?2 AND org_id = ?3",
@@ -174,12 +165,7 @@ pub fn set_signed_url_ref(
 /// rows and returns `Ok(RevokeOutcome::AlreadyRevoked)` — the original
 /// timestamp and audit trail stay untouched. Callers distinguish a genuinely
 /// missing row via the pre-check (`get_by_id`).
-pub fn revoke(
-    conn: &Connection,
-    doc_id: &str,
-    org_id: &str,
-    now_ms: i64,
-) -> Result<RevokeOutcome> {
+pub fn revoke(conn: &Connection, doc_id: &str, org_id: &str, now_ms: i64) -> Result<RevokeOutcome> {
     let affected = conn.execute(
         "UPDATE legal_documents SET revoked_at = ?1 \
          WHERE id = ?2 AND org_id = ?3 AND revoked_at IS NULL",

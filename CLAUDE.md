@@ -76,8 +76,11 @@ dla administratorów. Obsługiwane tryby harmonogramu: `once` (RFC3339),
 `minute hour * * *`. Scheduler startuje raz procesowo z dashboard/unified server
 i jest odporny na restart przez wyliczanie `next_run_at` z trwałej bazy.
 Zapis joba waliduje, że wskazany addon jest zainstalowany, włączony i ma
-deklarowane narzędzie w manifeście. UI ma szybkie presety dla Eureki:
-`sync_new` codziennie o `03:15` oraz `retry_failed` codziennie o `03:45`.
+deklarowane narzędzie w manifeście. UI jest uniwersalne: admin najpierw wybiera
+addon, potem jedną z funkcji zadeklarowanych przez ten addon, a payload JSON jest
+generowany z parametrów narzędzia. Przed wykonaniem joba scheduler uruchamia
+instancję addonu, jeśli wybrany addon nie ma aktywnej instancji WASM; samo
+wywołanie nadal idzie przez standardowe sprawdzenie uprawnień `call_tool`.
 
 ## Eureka MF Addon
 

@@ -86,5 +86,8 @@ async fn source_threshold_sink_end_to_end() {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    assert!(drop_arr.is_empty(), "expected zero records, got {drop_arr:?}");
+    assert!(
+        drop_arr.is_empty(),
+        "expected zero records, got {drop_arr:?}"
+    );
 }

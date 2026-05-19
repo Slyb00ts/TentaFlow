@@ -8,9 +8,7 @@
 //       direct executor żeby zachować ultra-low latency LAN budżet.
 // =============================================================================
 
-use crate::api::openai::types::{
-    EmbeddingRequest, EmbeddingResponse,
-};
+use crate::api::openai::types::{EmbeddingRequest, EmbeddingResponse};
 use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
 
@@ -88,9 +86,11 @@ impl Router {
                             &request,
                             expected_count,
                         )
-                        .map_err(|e| crate::error::CoreError::InternalError {
-                            message: format!("embeddings flow result: {e}"),
-                            source: None,
+                        .map_err(|e| {
+                            crate::error::CoreError::InternalError {
+                                message: format!("embeddings flow result: {e}"),
+                                source: None,
+                            }
                         })?;
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
@@ -149,13 +149,13 @@ impl Router {
             .into());
         }
 
-        let executor = self
-            .executor
-            .read()
-            .clone()
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: model.to_string(),
-            })?;
+        let executor =
+            self.executor
+                .read()
+                .clone()
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: model.to_string(),
+                })?;
 
         let request = EmbeddingRequest {
             model: model.to_string(),
@@ -191,8 +191,7 @@ impl Router {
         // Convert `EmbeddingResponse` → protocol-native `ModelResponse`
         // (the reverse handler expects the rkyv-encoded protocol shape).
         let request_id = uuid::Uuid::new_v4().to_string();
-        let embeddings: Vec<Vec<f32>> =
-            response.data.into_iter().map(|d| d.embedding).collect();
+        let embeddings: Vec<Vec<f32>> = response.data.into_iter().map(|d| d.embedding).collect();
         let dimensions = embeddings.first().map(|v| v.len()).unwrap_or(0);
         let proto_response = ModelResponse {
             request_id,
@@ -218,9 +217,9 @@ fn executor_err_to_core(
     use crate::services::runtime::executor::ExecutorError;
     use crate::services::runtime::resolver::ResolveError;
     match err {
-        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => CoreError::ModelNotFound {
-            model_name: m,
-        },
+        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
+            CoreError::ModelNotFound { model_name: m }
+        }
         ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
             CoreError::InvalidRequest {
                 message: format!(

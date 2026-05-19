@@ -162,8 +162,8 @@ fn read_toml(
     if enforce_payload_size(input_len as usize, PayloadKind::VectorItem).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
-    let bytes = read_guest_bytes(memory, caller, input_ptr, input_len)
-        .ok_or(AbiError::Operation)?;
+    let bytes =
+        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|_| AbiError::Operation)
@@ -244,10 +244,7 @@ fn spec_metric(spec: &VectorNamespaceSpec) -> Result<Metric, &'static str> {
 /// window) happens in `enforce_gate_with_policy` below, which delegates to
 /// `services::policy::verify_claim` against the addon manifest `[[gate]]`
 /// entry referenced by `spec.gate`.
-pub fn check_gate(
-    spec: &VectorNamespaceSpec,
-    claim_id: Option<&str>,
-) -> Result<(), AbiError> {
+pub fn check_gate(spec: &VectorNamespaceSpec, claim_id: Option<&str>) -> Result<(), AbiError> {
     let Some(_gate_id) = spec.gate.as_deref() else {
         return Ok(());
     };
@@ -941,5 +938,8 @@ pub fn vector_delete_v1(
 /// `#[doc(hidden)]` — not part of the addon-facing API.
 #[doc(hidden)]
 pub mod test_api {
-    pub use super::{check_gate, decode_vector, enforce_gate_with_policy, map_vector_error, GateDenial, MAX_SEARCH_K};
+    pub use super::{
+        check_gate, decode_vector, enforce_gate_with_policy, map_vector_error, GateDenial,
+        MAX_SEARCH_K,
+    };
 }

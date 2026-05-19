@@ -29,9 +29,9 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use tentaflow_core::api::frames::{
-    handle_frame_url, parse_query as parse_frame_query, FrameOutcome, HDR_FRAME_HEIGHT,
-    HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
-    RequestContext as FrameRequestContext,
+    handle_frame_url, parse_query as parse_frame_query, FrameOutcome,
+    RequestContext as FrameRequestContext, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT,
+    HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
 };
 use tentaflow_core::api::recording::{
     handle_recording_url, parse_query as parse_rec_query, read_recording_file,
@@ -73,8 +73,14 @@ fn audit_log_count(db: &DbPool, action: &str, result: &str) -> i64 {
 
 async fn spawn_server() -> Env {
     let db = make_db();
-    let rec_issuer = Arc::new(SignedUrlIssuer::new_for_tests(UrlScope::Recording, [77u8; 32]));
-    let frame_issuer = Arc::new(SignedUrlIssuer::new_for_tests(UrlScope::FrameUrl, [88u8; 32]));
+    let rec_issuer = Arc::new(SignedUrlIssuer::new_for_tests(
+        UrlScope::Recording,
+        [77u8; 32],
+    ));
+    let frame_issuer = Arc::new(SignedUrlIssuer::new_for_tests(
+        UrlScope::FrameUrl,
+        [88u8; 32],
+    ));
     let storage = Arc::new(FrameStorage::new(64));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -100,9 +106,7 @@ async fn spawn_server() -> Env {
                     let rec = rec.clone();
                     let frame = frame.clone();
                     let storage = storage.clone();
-                    async move {
-                        Ok::<_, Infallible>(router(req, &db, &rec, &frame, &storage).await)
-                    }
+                    async move { Ok::<_, Infallible>(router(req, &db, &rec, &frame, &storage).await) }
                 });
                 let _ = http1::Builder::new()
                     .serve_connection(TokioIo::new(sock), svc)
@@ -135,14 +139,14 @@ async fn router(
     drop(req);
 
     // Mirror production: any non-empty body on these GETs is a 413.
-    if (path.starts_with("/recordings/") || path.starts_with("/frames/"))
-        && method == Method::GET
-    {
+    if (path.starts_with("/recordings/") || path.starts_with("/frames/")) && method == Method::GET {
         if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
             return Response::builder()
                 .status(StatusCode::PAYLOAD_TOO_LARGE)
                 .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from_static(b"{\"error\":\"body_not_allowed\"}")))
+                .body(Full::new(Bytes::from_static(
+                    b"{\"error\":\"body_not_allowed\"}",
+                )))
                 .unwrap();
         }
         let cl = headers
@@ -154,7 +158,9 @@ async fn router(
             return Response::builder()
                 .status(StatusCode::PAYLOAD_TOO_LARGE)
                 .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from_static(b"{\"error\":\"body_not_allowed\"}")))
+                .body(Full::new(Bytes::from_static(
+                    b"{\"error\":\"body_not_allowed\"}",
+                )))
                 .unwrap();
         }
     }
@@ -172,7 +178,10 @@ async fn router(
                     .unwrap();
             }
         };
-        let ctx = RecordingRequestContext { source_ip: Some("127.0.0.1"), user_agent: None };
+        let ctx = RecordingRequestContext {
+            source_ip: Some("127.0.0.1"),
+            user_agent: None,
+        };
         let outcome = handle_recording_url(path_ref, &q, rec_issuer, db, ctx);
         let auth_status = outcome.http_status();
         return match outcome {
@@ -207,7 +216,9 @@ async fn router(
                     _ => Response::builder()
                         .status(status)
                         .header("Content-Type", "application/json")
-                        .body(Full::new(Bytes::from_static(b"{\"error\":\"unavailable\"}")))
+                        .body(Full::new(Bytes::from_static(
+                            b"{\"error\":\"unavailable\"}",
+                        )))
                         .unwrap(),
                 }
             }
@@ -232,7 +243,10 @@ async fn router(
                     .unwrap();
             }
         };
-        let fctx = FrameRequestContext { source_ip: Some("127.0.0.1"), user_agent: None };
+        let fctx = FrameRequestContext {
+            source_ip: Some("127.0.0.1"),
+            user_agent: None,
+        };
         let outcome = handle_frame_url(path_ref, &q, frame_issuer, storage, db, fctx);
         let status = outcome.http_status();
         return match outcome {
@@ -310,7 +324,9 @@ async fn save_and_register(
     std::env::set_var("HOME", tmp_home.path());
 
     let rgb = rgb_buf(64, 48);
-    let saved = save_snapshot_rgb24(camera_id, &rgb, 64, 48).await.expect("save");
+    let saved = save_snapshot_rgb24(camera_id, &rgb, 64, 48)
+        .await
+        .expect("save");
     let path_str = saved.file_path.to_string_lossy().to_string();
     let png_bytes = tokio::fs::read(&saved.file_path).await.expect("read png");
 
@@ -332,7 +348,12 @@ async fn save_and_register(
     )
     .expect("insert");
 
-    (saved.recording_ref.as_str().to_string(), tmp_home, png_bytes, guard)
+    (
+        saved.recording_ref.as_str().to_string(),
+        tmp_home,
+        png_bytes,
+        guard,
+    )
 }
 
 fn frame_storage_insert(storage: &FrameStorage, camera_id: &str, payload: Vec<u8>) -> String {
@@ -360,17 +381,22 @@ fn frame_storage_insert(storage: &FrameStorage, camera_id: &str, payload: Vec<u8
 #[tokio::test]
 async fn test_e2e_recording_url_returns_png() {
     let env = spawn_server().await;
-    let (rec_ref, _home, png_bytes, _home_guard) = save_and_register(&env, "addon-a", "cam_e2e_ok").await;
+    let (rec_ref, _home, png_bytes, _home_guard) =
+        save_and_register(&env, "addon-a", "cam_e2e_ok").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
         "http://{}/recordings/{}?{}",
-        env.addr, rec_ref, signed.query_string()
+        env.addr,
+        rec_ref,
+        signed.query_string()
     );
     let resp = reqwest::get(&url).await.expect("get");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
         Some("image/png")
     );
     let body = resp.bytes().await.expect("body");
@@ -381,7 +407,8 @@ async fn test_e2e_recording_url_returns_png() {
 #[tokio::test]
 async fn test_e2e_recording_url_token_tampered_returns_403() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-tamper", "cam_e2e_tamper").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-tamper", "cam_e2e_tamper").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     // Flip the last byte of the token b64. base64 padding chars are common at
@@ -400,18 +427,24 @@ async fn test_e2e_recording_url_token_tampered_returns_403() {
     );
     let resp = reqwest::get(&url).await.expect("get");
     assert_eq!(resp.status().as_u16(), 403);
-    assert_eq!(audit_log_count(&env.db, "recording_url_access", "denied"), 1);
+    assert_eq!(
+        audit_log_count(&env.db, "recording_url_access", "denied"),
+        1
+    );
 }
 
 #[tokio::test]
 async fn test_e2e_recording_url_multi_fetch_in_ttl() {
     let env = spawn_server().await;
-    let (rec_ref, _home, png_bytes, _home_guard) = save_and_register(&env, "addon-multi", "cam_e2e_multi").await;
+    let (rec_ref, _home, png_bytes, _home_guard) =
+        save_and_register(&env, "addon-multi", "cam_e2e_multi").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
         "http://{}/recordings/{}?{}",
-        env.addr, rec_ref, signed.query_string()
+        env.addr,
+        rec_ref,
+        signed.query_string()
     );
     for _ in 0..3 {
         let resp = reqwest::get(&url).await.expect("get");
@@ -425,7 +458,8 @@ async fn test_e2e_recording_url_multi_fetch_in_ttl() {
 #[tokio::test]
 async fn test_e2e_recording_url_purged_returns_404() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-purge", "cam_e2e_purge").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-purge", "cam_e2e_purge").await;
 
     // Soft-delete directly via SQL — bypassing the host-fn purge path so the
     // test stays focused on the HTTP layer's NotFound branch.
@@ -440,11 +474,16 @@ async fn test_e2e_recording_url_purged_returns_404() {
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
         "http://{}/recordings/{}?{}",
-        env.addr, rec_ref, signed.query_string()
+        env.addr,
+        rec_ref,
+        signed.query_string()
     );
     let resp = reqwest::get(&url).await.expect("get");
     assert_eq!(resp.status().as_u16(), 404);
-    assert_eq!(audit_log_count(&env.db, "recording_url_access", "not_found"), 1);
+    assert_eq!(
+        audit_log_count(&env.db, "recording_url_access", "not_found"),
+        1
+    );
 }
 
 #[tokio::test]
@@ -462,13 +501,17 @@ async fn test_e2e_recording_url_missing_query_params_returns_400() {
     let resp2 = reqwest::get(&url2).await.expect("get");
     assert_eq!(resp2.status().as_u16(), 400);
 
-    assert_eq!(audit_log_count(&env.db, "recording_url_access", "bad_request"), 2);
+    assert_eq!(
+        audit_log_count(&env.db, "recording_url_access", "bad_request"),
+        2
+    );
 }
 
 #[tokio::test]
 async fn test_e2e_recording_url_ref_mismatch_returns_400() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-mismatch", "cam_e2e_mm").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-mismatch", "cam_e2e_mm").await;
 
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     // Path ref differs from query ref — must reject before signature verify.
@@ -493,23 +536,34 @@ async fn test_e2e_frame_url_returns_rgb24_bytes() {
     let payload = vec![0x42u8; 8 * 4 * 3];
     let frame_ref = frame_storage_insert(&env.storage, "cam_e2e_frame", payload.clone());
 
-    let signed = env.frame_issuer.issue(frame_ref.clone(), 120).expect("issue");
+    let signed = env
+        .frame_issuer
+        .issue(frame_ref.clone(), 120)
+        .expect("issue");
     let url = format!(
         "http://{}/frames/{}?{}",
-        env.addr, frame_ref, signed.query_string()
+        env.addr,
+        frame_ref,
+        signed.query_string()
     );
     let resp = reqwest::get(&url).await.expect("get");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        resp.headers().get(HDR_FRAME_WIDTH).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(HDR_FRAME_WIDTH)
+            .and_then(|v| v.to_str().ok()),
         Some("8")
     );
     assert_eq!(
-        resp.headers().get(HDR_FRAME_HEIGHT).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(HDR_FRAME_HEIGHT)
+            .and_then(|v| v.to_str().ok()),
         Some("4")
     );
     assert_eq!(
-        resp.headers().get(HDR_FRAME_PIXEL_FORMAT).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(HDR_FRAME_PIXEL_FORMAT)
+            .and_then(|v| v.to_str().ok()),
         Some("rgb24")
     );
     let body = resp.bytes().await.expect("body");
@@ -525,7 +579,9 @@ async fn test_e2e_frame_url_evicted_returns_404() {
     let signed = env.frame_issuer.issue(phantom.clone(), 120).expect("issue");
     let url = format!(
         "http://{}/frames/{}?{}",
-        env.addr, phantom, signed.query_string()
+        env.addr,
+        phantom,
+        signed.query_string()
     );
     let resp = reqwest::get(&url).await.expect("get");
     assert_eq!(resp.status().as_u16(), 404);
@@ -537,10 +593,15 @@ async fn test_e2e_frame_url_multi_fetch_in_ttl_ok() {
     let env = spawn_server().await;
     let payload = vec![0x77u8; 8 * 4 * 3];
     let frame_ref = frame_storage_insert(&env.storage, "cam_multi", payload.clone());
-    let signed = env.frame_issuer.issue(frame_ref.clone(), 120).expect("issue");
+    let signed = env
+        .frame_issuer
+        .issue(frame_ref.clone(), 120)
+        .expect("issue");
     let url = format!(
         "http://{}/frames/{}?{}",
-        env.addr, frame_ref, signed.query_string()
+        env.addr,
+        frame_ref,
+        signed.query_string()
     );
     for _ in 0..3 {
         let resp = reqwest::get(&url).await.expect("get");
@@ -558,7 +619,8 @@ async fn test_e2e_frame_url_multi_fetch_in_ttl_ok() {
 #[tokio::test]
 async fn test_e2e_recording_url_duplicate_token_returns_400() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-dup", "cam_e2e_dup").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-dup", "cam_e2e_dup").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     let url = format!(
         "http://{}/recordings/{}?token={}&token=XX&exp={}&ref={}",
@@ -592,13 +654,16 @@ async fn test_e2e_recording_url_unknown_key_returns_400() {
 #[tokio::test]
 async fn test_e2e_recording_url_chunked_body_rejected_413() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-chunk", "cam_e2e_chunk").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-chunk", "cam_e2e_chunk").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     // Hand-roll the request because reqwest collapses GET-with-body in odd
     // ways. We use a raw TCP write of an HTTP/1.1 request with
     // `Transfer-Encoding: chunked` so the server's pre-collect gate fires.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut sock = tokio::net::TcpStream::connect(env.addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(env.addr)
+        .await
+        .expect("connect");
     let request = format!(
         "GET /recordings/{rec_ref}?{query} HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
         rec_ref = rec_ref,
@@ -607,7 +672,11 @@ async fn test_e2e_recording_url_chunked_body_rejected_413() {
     );
     sock.write_all(request.as_bytes()).await.expect("write");
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sock.read_to_end(&mut buf)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sock.read_to_end(&mut buf),
+    )
+    .await;
     let head = String::from_utf8_lossy(&buf);
     assert!(
         head.starts_with("HTTP/1.1 413"),
@@ -622,7 +691,9 @@ async fn test_e2e_recording_url_content_length_nonzero_rejected_413() {
     let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-cl", "cam_e2e_cl").await;
     let signed = env.rec_issuer.issue(rec_ref.clone(), 300).expect("issue");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut sock = tokio::net::TcpStream::connect(env.addr).await.expect("connect");
+    let mut sock = tokio::net::TcpStream::connect(env.addr)
+        .await
+        .expect("connect");
     let body = "x";
     let request = format!(
         "GET /recordings/{rec_ref}?{query} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {clen}\r\n\r\n{body}",
@@ -634,7 +705,11 @@ async fn test_e2e_recording_url_content_length_nonzero_rejected_413() {
     );
     sock.write_all(request.as_bytes()).await.expect("write");
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sock.read_to_end(&mut buf)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sock.read_to_end(&mut buf),
+    )
+    .await;
     let head = String::from_utf8_lossy(&buf);
     assert!(
         head.starts_with("HTTP/1.1 413"),
@@ -646,7 +721,8 @@ async fn test_e2e_recording_url_content_length_nonzero_rejected_413() {
 #[tokio::test]
 async fn test_e2e_recording_url_missing_file_returns_404() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-miss", "cam_e2e_miss").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-miss", "cam_e2e_miss").await;
     // Delete the file on disk; DB row is still there.
     {
         let conn = env.db.lock().expect("db lock");
@@ -674,7 +750,8 @@ async fn test_e2e_recording_url_missing_file_returns_404() {
 #[tokio::test]
 async fn test_e2e_recording_url_file_size_mismatch_returns_500() {
     let env = spawn_server().await;
-    let (rec_ref, _home, _, _home_guard) = save_and_register(&env, "addon-int", "cam_e2e_int").await;
+    let (rec_ref, _home, _, _home_guard) =
+        save_and_register(&env, "addon-int", "cam_e2e_int").await;
     // Bump the DB-recorded size so it disagrees with on-disk reality.
     {
         let conn = env.db.lock().expect("db lock");
@@ -700,7 +777,10 @@ async fn test_e2e_frame_url_duplicate_key_returns_400() {
     let env = spawn_server().await;
     let payload = vec![0x11u8; 8 * 4 * 3];
     let frame_ref = frame_storage_insert(&env.storage, "cam_dup_f", payload);
-    let signed = env.frame_issuer.issue(frame_ref.clone(), 120).expect("issue");
+    let signed = env
+        .frame_issuer
+        .issue(frame_ref.clone(), 120)
+        .expect("issue");
     let url = format!(
         "http://{}/frames/{}?token={}&token=XX&exp={}&ref={}",
         env.addr,
@@ -718,7 +798,10 @@ async fn test_e2e_frame_url_token_tampered_returns_403() {
     let env = spawn_server().await;
     let payload = vec![0x33u8; 8 * 4 * 3];
     let frame_ref = frame_storage_insert(&env.storage, "cam_tamper_frame", payload);
-    let signed = env.frame_issuer.issue(frame_ref.clone(), 120).expect("issue");
+    let signed = env
+        .frame_issuer
+        .issue(frame_ref.clone(), 120)
+        .expect("issue");
     let mut tampered = signed.token_b64.clone();
     let last = tampered.pop().unwrap_or('A');
     tampered.push(if last == 'A' { 'B' } else { 'A' });
@@ -741,7 +824,8 @@ async fn test_path_traversal_via_db_corruption_rejected() {
     // recordings base dir. The handler must refuse with 403 PathTraversal
     // even though the HMAC signature is valid.
     let env = spawn_server().await;
-    let (rec_ref, _home, _png, _home_guard) = save_and_register(&env, "addon-traversal", "cam_trav").await;
+    let (rec_ref, _home, _png, _home_guard) =
+        save_and_register(&env, "addon-traversal", "cam_trav").await;
 
     // Overwrite the file_path with /etc/passwd — outside the recordings base.
     {
@@ -765,7 +849,11 @@ async fn test_path_traversal_via_db_corruption_rejected() {
     // base — `read_recording_file` must return PathTraversal, which maps
     // strictly to 403. A 404 here would mean the containment check is
     // silently degraded into a missing-file branch, hiding a regression.
-    assert_eq!(resp.status().as_u16(), 403, "path traversal must produce 403, not the missing-file branch");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "path traversal must produce 403, not the missing-file branch"
+    );
 }
 
 #[tokio::test]
@@ -779,4 +867,3 @@ async fn test_invalid_ref_format_returns_400() {
     let resp = reqwest::get(&url).await.expect("get");
     assert_eq!(resp.status().as_u16(), 400);
 }
-

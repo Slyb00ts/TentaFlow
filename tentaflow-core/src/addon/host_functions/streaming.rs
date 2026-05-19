@@ -20,12 +20,14 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller};
+use super::{
+    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
+};
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::get_camera_for_addon;
 use crate::services::streaming::{NextOutcome, StreamFilter, StreamMessage, StreamSubscriber};
-use crate::services::{streaming_bus};
+use crate::services::streaming_bus;
 
 // =============================================================================
 // Permission
@@ -157,7 +159,13 @@ const MAX_STREAMS_PER_ADDON: usize = 16;
 /// addon plus accumulated leakage from other addons.
 const MAX_STREAMS_GLOBAL: usize = 256;
 
-fn audit(state: &AddonState, action: &str, resource_id: Option<&str>, result: &str, reason: Option<&str>) {
+fn audit(
+    state: &AddonState,
+    action: &str,
+    resource_id: Option<&str>,
+    result: &str,
+    reason: Option<&str>,
+) {
     audit_log_with_risk(
         state,
         action,
@@ -183,8 +191,11 @@ fn read_input_toml(
     if enforce_payload_size(input_len as usize, PayloadKind::ServiceCall).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
-    let bytes = read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
-    std::str::from_utf8(bytes).map(|s| s.to_string()).map_err(|_| AbiError::Operation)
+    let bytes =
+        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .map_err(|_| AbiError::Operation)
 }
 
 fn write_toml_capped<T: Serialize>(
@@ -202,7 +213,14 @@ fn write_toml_capped<T: Serialize>(
     if enforce_payload_size(serialized.len(), PayloadKind::ServiceCall).is_err() {
         return AbiError::PayloadTooLarge.as_i32();
     }
-    write_output_with_retry_semantics(memory, caller, serialized.as_bytes(), out_ptr, out_cap, out_len_ptr)
+    write_output_with_retry_semantics(
+        memory,
+        caller,
+        serialized.as_bytes(),
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+    )
 }
 
 /// Parses `camera:<camera_id>` — returns the trailing camera id. F1a only
@@ -246,26 +264,53 @@ pub fn stream_subscribe_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "stream.subscribe", None, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "stream.subscribe",
+                None,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_STREAMS_SUBSCRIBE, None) {
-        audit(caller.data(), "stream.subscribe", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "stream.subscribe",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: SubscribeInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "stream.subscribe", None, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "stream.subscribe",
+                None,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     let camera_id = match parse_target(&input.target) {
         Ok(c) => c.to_string(),
         Err(e) => {
-            audit(caller.data(), "stream.subscribe", None, "denied", Some("invalid_target"));
+            audit(
+                caller.data(),
+                "stream.subscribe",
+                None,
+                "denied",
+                Some("invalid_target"),
+            );
             return e.as_i32();
         }
     };
@@ -278,11 +323,23 @@ pub fn stream_subscribe_v1(
     match get_camera_for_addon(&db, &addon_id, &camera_id, caller.data().org_id.as_deref()) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            audit(caller.data(), "stream.subscribe", Some(&camera_id), "denied", Some("not_found_or_not_owned"));
+            audit(
+                caller.data(),
+                "stream.subscribe",
+                Some(&camera_id),
+                "denied",
+                Some("not_found_or_not_owned"),
+            );
             return AbiError::NotFound.as_i32();
         }
         Err(_) => {
-            audit(caller.data(), "stream.subscribe", Some(&camera_id), "error", Some("db_error"));
+            audit(
+                caller.data(),
+                "stream.subscribe",
+                Some(&camera_id),
+                "error",
+                Some("db_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     }
@@ -291,17 +348,32 @@ pub fn stream_subscribe_v1(
     // otherwise the channel + drop counter outlive the reject path.
     let registry = subscribers();
     if registry.len() >= MAX_STREAMS_GLOBAL {
-        audit(caller.data(), "stream.subscribe", Some(&camera_id), "denied", Some("streams_quota_global"));
+        audit(
+            caller.data(),
+            "stream.subscribe",
+            Some(&camera_id),
+            "denied",
+            Some("streams_quota_global"),
+        );
         return AbiError::QuotaExceeded.as_i32();
     }
     let per_addon = registry.iter().filter(|e| e.key().0 == addon_id).count();
     if per_addon >= MAX_STREAMS_PER_ADDON {
-        audit(caller.data(), "stream.subscribe", Some(&camera_id), "denied", Some("streams_quota_per_addon"));
+        audit(
+            caller.data(),
+            "stream.subscribe",
+            Some(&camera_id),
+            "denied",
+            Some("streams_quota_per_addon"),
+        );
         return AbiError::QuotaExceeded.as_i32();
     }
 
     let filter = match input.filter {
-        Some(f) => StreamFilter { max_fps: f.max_fps, skip_frames: f.skip_frames },
+        Some(f) => StreamFilter {
+            max_fps: f.max_fps,
+            skip_frames: f.skip_frames,
+        },
         None => StreamFilter::default(),
     };
     let sub = streaming_bus().subscribe(&camera_id, filter);
@@ -314,7 +386,13 @@ pub fn stream_subscribe_v1(
         },
     );
 
-    audit(caller.data(), "stream.subscribe", Some(&camera_id), "ok", Some(&format!("stream_id={}", stream_id)));
+    audit(
+        caller.data(),
+        "stream.subscribe",
+        Some(&camera_id),
+        "ok",
+        Some(&format!("stream_id={}", stream_id)),
+    );
     let out = SubscribeOutput { stream_id };
     write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
 }
@@ -338,24 +416,51 @@ pub fn stream_next_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "stream.next", None, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "stream.next",
+                None,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_STREAMS_SUBSCRIBE, None) {
-        audit(caller.data(), "stream.next", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "stream.next",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: NextInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "stream.next", None, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "stream.next",
+                None,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !stream_id_valid(&input.stream_id) {
-        audit(caller.data(), "stream.next", None, "denied", Some("stream_id_invalid"));
+        audit(
+            caller.data(),
+            "stream.next",
+            None,
+            "denied",
+            Some("stream_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let timeout = Duration::from_millis(input.timeout_ms.min(MAX_TIMEOUT_MS));
@@ -364,7 +469,13 @@ pub fn stream_next_v1(
     let sub_arc = match subscribers().get(&(addon_id.clone(), input.stream_id.clone())) {
         Some(slot) => slot.subscriber.clone(),
         None => {
-            audit(caller.data(), "stream.next", Some(&input.stream_id), "denied", Some("stream_not_found"));
+            audit(
+                caller.data(),
+                "stream.next",
+                Some(&input.stream_id),
+                "denied",
+                Some("stream_not_found"),
+            );
             return AbiError::StreamNotFound.as_i32();
         }
     };
@@ -375,7 +486,10 @@ pub fn stream_next_v1(
     });
 
     match msg {
-        NextOutcome::Message(StreamMessage::Frame { frame_ref, metadata }) => {
+        NextOutcome::Message(StreamMessage::Frame {
+            frame_ref,
+            metadata,
+        }) => {
             let pf = match metadata.pixel_format {
                 crate::services::frame_storage::FramePixelFormat::Rgb24 => "rgb24",
             };
@@ -388,20 +502,44 @@ pub fn stream_next_v1(
                 pixel_format: pf,
                 timestamp_unix_ms: metadata.timestamp_unix_ms,
             };
-            audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("frame"));
+            audit(
+                caller.data(),
+                "stream.next",
+                Some(&input.stream_id),
+                "ok",
+                Some("frame"),
+            );
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
         NextOutcome::Message(StreamMessage::Drop { count }) => {
-            let out = NextDropOutput { r#type: "drop", count };
-            audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some(&format!("drop={}", count)));
+            let out = NextDropOutput {
+                r#type: "drop",
+                count,
+            };
+            audit(
+                caller.data(),
+                "stream.next",
+                Some(&input.stream_id),
+                "ok",
+                Some(&format!("drop={}", count)),
+            );
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
         NextOutcome::Message(StreamMessage::CameraOffline { reason }) => {
             // Camera left the bus — evict the subscriber slot so future
             // calls fail fast with StreamNotFound.
             subscribers().remove(&(addon_id, input.stream_id.clone()));
-            let out = NextCameraOfflineOutput { r#type: "camera_offline", reason: &reason };
-            audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("camera_offline"));
+            let out = NextCameraOfflineOutput {
+                r#type: "camera_offline",
+                reason: &reason,
+            };
+            audit(
+                caller.data(),
+                "stream.next",
+                Some(&input.stream_id),
+                "ok",
+                Some("camera_offline"),
+            );
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
         NextOutcome::Closed => {
@@ -409,13 +547,27 @@ pub fn stream_next_v1(
             // dropped, supervisor exit). Evict registry entry and surface a
             // distinct `stream_closed` type so the addon stops polling.
             subscribers().remove(&(addon_id, input.stream_id.clone()));
-            let out = NextStreamClosedOutput { r#type: "stream_closed" };
-            audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("stream_closed"));
+            let out = NextStreamClosedOutput {
+                r#type: "stream_closed",
+            };
+            audit(
+                caller.data(),
+                "stream.next",
+                Some(&input.stream_id),
+                "ok",
+                Some("stream_closed"),
+            );
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
         NextOutcome::Timeout => {
             let out = NextTimeoutOutput { r#type: "timeout" };
-            audit(caller.data(), "stream.next", Some(&input.stream_id), "ok", Some("timeout"));
+            audit(
+                caller.data(),
+                "stream.next",
+                Some(&input.stream_id),
+                "ok",
+                Some("timeout"),
+            );
             write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr)
         }
     }
@@ -440,24 +592,51 @@ pub fn stream_close_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "stream.close", None, "error",
-                Some(if e == AbiError::PayloadTooLarge { "payload_too_large" } else { "input_read_failed" }));
+            audit(
+                caller.data(),
+                "stream.close",
+                None,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "input_read_failed"
+                }),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_STREAMS_SUBSCRIBE, None) {
-        audit(caller.data(), "stream.close", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "stream.close",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: CloseInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "stream.close", None, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "stream.close",
+                None,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if !stream_id_valid(&input.stream_id) {
-        audit(caller.data(), "stream.close", None, "denied", Some("stream_id_invalid"));
+        audit(
+            caller.data(),
+            "stream.close",
+            None,
+            "denied",
+            Some("stream_id_invalid"),
+        );
         return AbiError::Operation.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
@@ -468,11 +647,23 @@ pub fn stream_close_v1(
     // `StreamId` here so the explicit `unsubscribe(camera_id, &sid)` path is
     // skipped — the lazy reap path covers it.
     if subscribers().remove(&key).is_some() {
-        audit(caller.data(), "stream.close", Some(&input.stream_id), "ok", None);
+        audit(
+            caller.data(),
+            "stream.close",
+            Some(&input.stream_id),
+            "ok",
+            None,
+        );
         let out = CloseOutput { closed: true };
         return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
     }
-    audit(caller.data(), "stream.close", Some(&input.stream_id), "denied", Some("stream_not_found"));
+    audit(
+        caller.data(),
+        "stream.close",
+        Some(&input.stream_id),
+        "denied",
+        Some("stream_not_found"),
+    );
     AbiError::StreamNotFound.as_i32()
 }
 

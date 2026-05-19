@@ -155,10 +155,7 @@ impl NodeAdapter for SpeakerContextNodeAdapter {
                     } else {
                         "personalization_continue_prompt"
                     };
-                    (
-                        Self::pick_prompt_id(node, key),
-                        vec![("name", name)],
-                    )
+                    (Self::pick_prompt_id(node, key), vec![("name", name)])
                 } else {
                     (
                         Self::pick_prompt_id(node, "medium_confidence_known_prompt"),
@@ -181,10 +178,7 @@ impl NodeAdapter for SpeakerContextNodeAdapter {
                         Vec::new(),
                     )
                 } else if !is_first {
-                    (
-                        Self::pick_prompt_id(node, "new_voice_prompt"),
-                        Vec::new(),
-                    )
+                    (Self::pick_prompt_id(node, "new_voice_prompt"), Vec::new())
                 } else {
                     (
                         Self::pick_prompt_id(node, "unknown_user_prompt"),
@@ -295,7 +289,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out.context.system_prompts, vec!["Welcome Piotr".to_string()]);
+        assert_eq!(
+            out.context.system_prompts,
+            vec!["Welcome Piotr".to_string()]
+        );
     }
 
     #[tokio::test]

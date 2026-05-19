@@ -7,8 +7,8 @@
 #![cfg(feature = "dashboard-api")]
 
 use tentaflow_core::api::mtls::{
-    apply_universal_security_headers, fingerprint_hex, pickup_mtls_config,
-    set_pickup_mtls_config, PickupMtlsConfig, HSTS_HEADER_VALUE,
+    apply_universal_security_headers, fingerprint_hex, pickup_mtls_config, set_pickup_mtls_config,
+    PickupMtlsConfig, HSTS_HEADER_VALUE,
 };
 
 #[test]

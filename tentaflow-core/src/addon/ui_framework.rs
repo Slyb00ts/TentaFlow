@@ -582,9 +582,7 @@ fn validate_camera_id(id: &str) -> anyhow::Result<()> {
 /// shape (single component, `{components: [...]}`, or full panel) with
 /// normalized fields (e.g. clamped `ttl_secs`) so the cached panel reflects
 /// what the host actually accepted.
-pub fn parse_and_validate_ui_json(
-    json: &serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
+pub fn parse_and_validate_ui_json(json: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
     if let Some(arr) = json.get("components").and_then(|v| v.as_array()) {
         let mut normalized = Vec::with_capacity(arr.len());
         for v in arr {
@@ -595,7 +593,10 @@ pub fn parse_and_validate_ui_json(
         }
         let mut out = json.clone();
         if let Some(obj) = out.as_object_mut() {
-            obj.insert("components".to_string(), serde_json::Value::Array(normalized));
+            obj.insert(
+                "components".to_string(),
+                serde_json::Value::Array(normalized),
+            );
         }
         Ok(out)
     } else {
