@@ -150,6 +150,25 @@ pub fn build_rtsp_pipeline(
 ) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
 
+    // Strip vendor-specific query parameters that ask the server to wrap RTP
+    // in SRTP/SRTCP (e.g. UniFi Protect `?enableSrtp`). Our pipeline only
+    // handles plain RTP — rtspsrc honors the cipher suite advertised in SDP
+    // `a=crypto` but cannot decrypt SRTP without an explicit srtpdec branch.
+    // rtsps:// already gives transport-layer TLS encryption, which is what
+    // matters for confidentiality on the camera link. Leaving `?enableSrtp`
+    // in the URL caused UniFi to wrap every RTP packet in SRTP, which the
+    // downstream rtph264depay/h264parse could not parse — pipeline failed
+    // with `not-negotiated (-4)` immediately after PLAY.
+    let url_owned: String;
+    let url: &str = if let Some(stripped) = url.split_once("?enableSrtp") {
+        url_owned = format!("{}{}", stripped.0, stripped.1.trim_start_matches('&'));
+        let trimmed = url_owned.trim_end_matches(|c| c == '?' || c == '&');
+        tracing::info!("rtsp: stripped ?enableSrtp from URL");
+        trimmed
+    } else {
+        url
+    };
+
     // `protocols` is GstRTSPLowerTrans (GFlags) — can't be set as raw u32.
     // We pass through stringified flags which gst-rs parses via GFlags::from_str:
     //   - rtsp://  -> "udp+udp-mcast+tcp" (default behavior, UDP preferred)
