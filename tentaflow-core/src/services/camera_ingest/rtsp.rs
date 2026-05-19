@@ -239,6 +239,20 @@ pub fn build_rtsp_pipeline(
     decodebin.set_property("force-sw-decoders", true);
     let fsd_active: bool = decodebin.property("force-sw-decoders");
     tracing::info!("rtsp: decodebin force-sw-decoders={}", fsd_active);
+    // RTP input capsfilter — pins decodebin's input to `application/x-rtp,
+    // media=video`. Without this, decodebin may briefly see ambiguous caps
+    // during rtspsrc setup and abort the pipeline with `not-negotiated (-4)`
+    // before its first output pad is exposed. Verified by replicating the
+    // exact pipeline in gst-launch: bare `rtspsrc ! decodebin` failed, while
+    // `rtspsrc ! application/x-rtp,media=video ! decodebin` succeeded.
+    let rtp_caps = gst::Caps::builder("application/x-rtp")
+        .field("media", "video")
+        .build();
+    let rtp_filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &rtp_caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp capsfilter: {e}")))?;
+
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
@@ -263,13 +277,18 @@ pub fn build_rtsp_pipeline(
         .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink: {e}")))?;
 
     pipeline
-        .add_many([&rtspsrc, &decodebin, &convert, &capsfilter, &appsink])
+        .add_many([&rtspsrc, &rtp_filter, &decodebin, &convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many: {e}")))?;
 
-    // Static tail: convert → capsfilter → appsink. decodebin's src pad is
-    // dynamic and is linked in a separate pad-added handler below.
+    // Static segments:
+    //   rtp_filter → decodebin (capsfilter pins RTP video before autoplug)
+    //   convert → capsfilter → appsink (after decode)
+    // rtspsrc → rtp_filter is dynamic (pad-added below) and decodebin → convert
+    // is dynamic (decoder src pad appears after autoplug).
+    gst::Element::link(&rtp_filter, &decodebin)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → decodebin: {e}")))?;
     gst::Element::link_many([&convert, &capsfilter, &appsink])
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many: {e}")))?;
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many tail: {e}")))?;
 
     // decodebin's video output pad appears dynamically once the codec is
     // identified. Wire it into videoconvert when caps say video/x-raw.
@@ -308,8 +327,11 @@ pub fn build_rtsp_pipeline(
         .map_err(|_| CameraIngestError::PipelineBuild("appsink downcast failed".into()))?;
     install_frame_callback(&appsink_app, camera_id, mailbox, counters);
 
-    // Alias for rtspsrc → decodebin dynamic linking below (was `depay`).
-    let depay = decodebin.clone();
+    // Alias for rtspsrc dynamic linking below — points at the rtp capsfilter
+    // (was `depay`/`decodebin` in earlier revisions). The dynamic pad from
+    // rtspsrc now feeds into `rtp_filter`, which is statically linked to
+    // `decodebin` above.
+    let depay = rtp_filter.clone();
 
     // Dynamic pad-added handler — link only the video RTP pad.
     //
