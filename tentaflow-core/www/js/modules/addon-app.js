@@ -124,6 +124,7 @@ function renderComponent(c, ctx) {
     case 'code':     return renderCode(c);
     case 'badge':    return renderBadge(c);
     case 'live_camera_tile': return renderLiveCameraTile(c, ctx);
+    case 'video_stream': return renderVideoStream(c);
     default:         return renderUnknown(c.type);
   }
 }
@@ -470,6 +471,20 @@ function renderLiveCameraTile(c, ctx) {
   // Kontekst panelu — niezbedny dla addonUiActionRequest wewnatrz CE.
   if (ctx?.addonId) el.setAttribute('addon-id', ctx.addonId);
   if (ctx?.panelId) el.setAttribute('panel-id', ctx.panelId);
+  return el;
+}
+
+function renderVideoStream(c) {
+  // <tf-video-stream> trzyma MediaSource + binary WS subscription —
+  // tutaj tylko mapujemy pola JSON na atrybuty (analogicznie do
+  // renderLiveCameraTile).
+  const el = document.createElement('tf-video-stream');
+  const streamId = String(c.stream_id ?? c.streamId ?? '');
+  if (streamId) el.setAttribute('stream-id', streamId);
+  const label = c.label;
+  if (typeof label === 'string' && label.length > 0) el.setAttribute('label', label);
+  const heightPx = Number(c.height_px ?? c.heightPx);
+  if (Number.isFinite(heightPx) && heightPx > 0) el.setAttribute('height-px', String(heightPx));
   return el;
 }
 

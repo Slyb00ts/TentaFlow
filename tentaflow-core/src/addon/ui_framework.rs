@@ -128,6 +128,25 @@ pub enum UiComponent {
         #[serde(skip_serializing_if = "Option::is_none")]
         height_px: Option<u32>,
     },
+
+    /// Live fMP4 video tile fed by a StreamHub-registered binary stream
+    /// (Chunk B/C/D). The frontend opens a binary WS subscription on
+    /// `stream_id`, parses the SubscribeResponse + Frame chunks through
+    /// MediaSource Extensions and renders into a `<video>` element. Unlike
+    /// `LiveCameraTile` (snapshot polling) this is a continuous video feed.
+    VideoStream {
+        /// Hub stream id. Today only `camera:<camera_id>` is registered by
+        /// the camera pipeline; future tiers (`audio:`, `screen:`) will use
+        /// the same component once a hub source is registered for them.
+        stream_id: String,
+        /// Optional label rendered as an overlay (e.g. camera name + status).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// Optional fixed height in pixels (default: 320 enforced by the
+        /// custom element).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height_px: Option<u32>,
+    },
 }
 
 fn default_live_tile_ttl() -> u32 {
@@ -137,6 +156,11 @@ fn default_live_tile_ttl() -> u32 {
 /// Validation constants for `UiComponent::LiveCameraTile`.
 pub const LIVE_CAMERA_TILE_TTL_MIN: u32 = 5;
 pub const LIVE_CAMERA_TILE_TTL_MAX: u32 = 300;
+
+/// Stream-id prefix accepted by `UiComponent::VideoStream`. Mirrors the
+/// permission gate in `dispatch::stream` so the host rejects unsupported
+/// kinds before the panel ever reaches the frontend.
+pub const VIDEO_STREAM_CAMERA_PREFIX: &str = "camera:";
 
 fn default_badge_color() -> String {
     "blue".to_string()
@@ -513,6 +537,10 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
             }
             Ok(())
         }
+        UiComponent::VideoStream { stream_id, .. } => {
+            validate_video_stream_id(stream_id)?;
+            Ok(())
+        }
         UiComponent::Card { children, .. } => {
             for c in children {
                 validate_and_normalize_component(c)?;
@@ -572,6 +600,21 @@ fn validate_camera_id(id: &str) -> anyhow::Result<()> {
     if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
         anyhow::bail!("LiveCameraTile.camera_id invalid format");
     }
+    Ok(())
+}
+
+/// Stream-id contract for `UiComponent::VideoStream`: today only
+/// `camera:<camera_id>` is supported. Any other prefix is rejected to keep
+/// the surface aligned with the dispatch-layer permission gate (which
+/// only knows how to authorize `camera:`); future tiers will register
+/// their own prefixes here and in `dispatch::stream`.
+fn validate_video_stream_id(id: &str) -> anyhow::Result<()> {
+    if !id.starts_with(VIDEO_STREAM_CAMERA_PREFIX) {
+        anyhow::bail!("VideoStream.stream_id unsupported prefix");
+    }
+    let suffix = &id[VIDEO_STREAM_CAMERA_PREFIX.len()..];
+    validate_camera_id(suffix)
+        .map_err(|_| anyhow::anyhow!("VideoStream.stream_id invalid camera id"))?;
     Ok(())
 }
 
@@ -749,6 +792,53 @@ mod tests {
         let mut c = UiComponent::LiveCameraTile {
             camera_id: "not-a-uuid".to_string(),
             ttl_secs: 30,
+            label: None,
+            height_px: None,
+        };
+        assert!(validate_and_normalize_component(&mut c).is_err());
+    }
+
+    #[test]
+    fn video_stream_serde_round_trip() {
+        let stream_id = "camera:cam_550e8400-e29b-41d4-a716-446655440000".to_string();
+        let original = UiComponent::VideoStream {
+            stream_id: stream_id.clone(),
+            label: Some("Front Door · online".to_string()),
+            height_px: Some(320),
+        };
+        let json = serde_json::to_value(&original).expect("serialize");
+        assert_eq!(json["type"], "video_stream");
+        assert_eq!(json["stream_id"], stream_id.as_str());
+        assert_eq!(json["height_px"], 320);
+        let back: UiComponent = serde_json::from_value(json).expect("deserialize");
+        match back {
+            UiComponent::VideoStream {
+                stream_id: sid,
+                label,
+                height_px,
+            } => {
+                assert_eq!(sid, stream_id);
+                assert_eq!(label.as_deref(), Some("Front Door · online"));
+                assert_eq!(height_px, Some(320));
+            }
+            _ => panic!("variant changed during round-trip"),
+        }
+    }
+
+    #[test]
+    fn video_stream_rejects_unknown_prefix() {
+        let mut c = UiComponent::VideoStream {
+            stream_id: "audio:cam_550e8400-e29b-41d4-a716-446655440000".to_string(),
+            label: None,
+            height_px: None,
+        };
+        assert!(validate_and_normalize_component(&mut c).is_err());
+    }
+
+    #[test]
+    fn video_stream_rejects_malformed_camera_id() {
+        let mut c = UiComponent::VideoStream {
+            stream_id: "camera:not-a-cam".to_string(),
             label: None,
             height_px: None,
         };
