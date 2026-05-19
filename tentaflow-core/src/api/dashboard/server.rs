@@ -167,6 +167,8 @@ impl DashboardServer {
         let port_allocator = self.port_allocator.clone();
         let mesh_services_registry = self.mesh_services_registry.clone();
 
+        crate::scheduler::start(db.clone(), addon_manager.clone());
+
         // Wire up cross-node service action handlers (krok N3b). The mesh
         // command executor is created by `start_mesh_pipeline` long before
         // AppState (db_pool + port_allocator + iroh) is fully assembled, so
@@ -385,8 +387,8 @@ fn pickup_outcome_to_response(
     outcome: crate::api::frame_pickup::PickupOutcome,
 ) -> Response<DashboardBody> {
     use crate::api::frame_pickup::{
-        PickupOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_PTS,
-        HDR_FRAME_TS_MS, HDR_FRAME_WIDTH,
+        PickupOutcome, HDR_FRAME_HEIGHT, HDR_FRAME_PIXEL_FORMAT, HDR_FRAME_PTS, HDR_FRAME_TS_MS,
+        HDR_FRAME_WIDTH,
     };
     let status = outcome.http_status();
     match outcome {
@@ -473,9 +475,8 @@ fn pickup_outcome_to_response(
 /// twice over are useless) and a hard cap (LRU-evict the oldest 25 % once
 /// `MAX_AUDIT_ENTRIES` is reached). Without these the map would grow
 /// unbounded under a flood of unique forged-token attackers.
-static RATE_LIMIT_AUDIT: std::sync::OnceLock<
-    dashmap::DashMap<String, (std::time::Instant, u32)>,
-> = std::sync::OnceLock::new();
+static RATE_LIMIT_AUDIT: std::sync::OnceLock<dashmap::DashMap<String, (std::time::Instant, u32)>> =
+    std::sync::OnceLock::new();
 const AUDIT_429_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const AUDIT_IDLE_EVICT_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 const MAX_AUDIT_ENTRIES: usize = 10_000;
@@ -491,13 +492,13 @@ fn sweep_rate_limit_audit(now: std::time::Instant) {
     if map.len() < 1_000 {
         return;
     }
-    map.retain(|_, (last_seen, _)| now.saturating_duration_since(*last_seen) < AUDIT_IDLE_EVICT_AFTER);
+    map.retain(|_, (last_seen, _)| {
+        now.saturating_duration_since(*last_seen) < AUDIT_IDLE_EVICT_AFTER
+    });
     if map.len() >= MAX_AUDIT_ENTRIES {
         let target = MAX_AUDIT_ENTRIES * 3 / 4;
-        let mut snapshot: Vec<(String, std::time::Instant)> = map
-            .iter()
-            .map(|e| (e.key().clone(), e.value().0))
-            .collect();
+        let mut snapshot: Vec<(String, std::time::Instant)> =
+            map.iter().map(|e| (e.key().clone(), e.value().0)).collect();
         snapshot.sort_by_key(|(_, ts)| *ts);
         let drop_count = snapshot.len().saturating_sub(target);
         for (key, _) in snapshot.into_iter().take(drop_count) {
@@ -570,7 +571,9 @@ fn check_signed_url_rate_limit(
     use crate::api::rate_limit::{rate_limiter, RateLimitResult};
     match rate_limiter().check(ip) {
         RateLimitResult::Allow => Ok(()),
-        RateLimitResult::IpLimit { retry_after_secs, .. } => Err(build_rate_limit_response(
+        RateLimitResult::IpLimit {
+            retry_after_secs, ..
+        } => Err(build_rate_limit_response(
             db,
             ip,
             user_agent,
@@ -1033,13 +1036,19 @@ pub async fn handle_request(
                     .unwrap());
             }
         }
-        if let Err(resp) =
-            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/core/frame/pickup")
-        {
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/core/frame/pickup",
+        ) {
             return Ok(resp);
         }
         let hdr = |name: &str| -> Option<String> {
-            req.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
         };
         let token = hdr(HDR_PICKUP_TOKEN);
         let frame_ref = hdr(HDR_FRAME_REF);
@@ -1118,8 +1127,7 @@ pub async fn handle_request(
                         .await;
                         match fetch {
                             Ok((bytes, meta)) => {
-                                let pixel_format: &'static str = match meta.pixel_format.as_str()
-                                {
+                                let pixel_format: &'static str = match meta.pixel_format.as_str() {
                                     "rgb24" => "rgb24",
                                     _ => "rgb24",
                                 };
@@ -1224,9 +1232,39 @@ pub async fn handle_request(
                 timestamp_unix_ms,
                 pts,
             } => {
+                // Frame storage holds raw RGB24. For browser `<img src>` we
+                // must re-encode to JPEG — `application/octet-stream` would
+                // fail to render and the dashboard would show a broken image.
+                // Quality 75 is a good MVP balance (~50-150 KB per 1080p
+                // frame). Later we will replace this snapshot polling with
+                // WebRTC (Krok 5) and the JPEG re-encode disappears.
+                let mut jpeg_buf: Vec<u8> = Vec::with_capacity(bytes.len() / 8);
+                let color = if pixel_format == "rgb24" {
+                    image::ExtendedColorType::Rgb8
+                } else {
+                    image::ExtendedColorType::Rgb8
+                };
+                use image::ImageEncoder;
+                let encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 75);
+                let encode_result =
+                    encoder.write_image(&bytes, width, height, color);
+                let (content_type, body_bytes) = match encode_result {
+                    Ok(()) => ("image/jpeg", jpeg_buf),
+                    Err(e) => {
+                        tracing::warn!(
+                            width,
+                            height,
+                            pixel_format,
+                            error = %e,
+                            "frames: JPEG encode failed, falling back to raw RGB"
+                        );
+                        ("application/octet-stream", bytes.to_vec())
+                    }
+                };
                 let mut builder = Response::builder()
                     .status(status)
-                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Type", content_type)
                     .header(HDR_FRAME_WIDTH, width.to_string())
                     .header(HDR_FRAME_HEIGHT, height.to_string())
                     .header(HDR_FRAME_PIXEL_FORMAT, pixel_format)
@@ -1235,7 +1273,7 @@ pub async fn handle_request(
                     builder = builder.header(HDR_FRAME_PTS, p.to_string());
                 }
                 builder = apply_signed_url_security_headers(builder);
-                let body = Bytes::copy_from_slice(&bytes);
+                let body = Bytes::from(body_bytes);
                 return Ok(builder.body(Either::Left(Full::new(body))).unwrap());
             }
             FrameOutcome::BadRequest(why) => {
@@ -1263,7 +1301,10 @@ pub async fn handle_request(
     // Wired under `feature = "camera"` because the recording subsystem
     // (snapshot encoder + segment muxer + DB row helpers) is camera-gated.
     #[cfg(feature = "camera")]
-    if method == Method::GET && path.starts_with("/recordings/") && path.len() > "/recordings/".len() {
+    if method == Method::GET
+        && path.starts_with("/recordings/")
+        && path.len() > "/recordings/".len()
+    {
         use crate::api::recording::{
             handle_recording_url, parse_query, read_recording_file, RecordingFileOutcome,
             RecordingOutcome, RequestContext,
@@ -1402,8 +1443,7 @@ pub async fn handle_request(
                 content_hash,
                 generated_at,
             } => {
-                let file_outcome =
-                    read_legal_file(&db, path_doc_id, &org_id, &pdf_path, ctx).await;
+                let file_outcome = read_legal_file(&db, path_doc_id, &org_id, &pdf_path, ctx).await;
                 let status = file_outcome.http_status();
                 return match file_outcome {
                     LegalFileOutcome::Ok { bytes } => Ok(apply_signed_url_security_headers(
@@ -1778,4 +1818,3 @@ fn extract_ws_user_session(
 
     Some((claims.user_id, role))
 }
-
