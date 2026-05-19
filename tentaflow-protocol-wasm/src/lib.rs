@@ -5115,6 +5115,54 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "revokedAtMs", (resp.revoked_at_ms as f64).into());
             }
         },
+        MessageBody::StreamBody(payload) => match payload {
+            // Request variants never legitimately decode in a response path.
+            // Surface the tag only — same defense-in-depth as
+            // CameraAdminPayload request-in-response handling.
+            tentaflow_protocol::StreamPayload::SubscribeRequest(_) => {
+                set(&obj, "variant", "StreamSubscribeRequest".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
+            }
+            tentaflow_protocol::StreamPayload::CloseRequest(_) => {
+                set(&obj, "variant", "StreamCloseRequest".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
+            }
+            tentaflow_protocol::StreamPayload::SubscribeResponse(resp) => {
+                set(&obj, "variant", "StreamSubscribeResponse".into());
+                set(&obj, "stream_id", resp.stream_id.clone().into());
+                set(&obj, "streamId", resp.stream_id.into());
+                set(&obj, "mime_type", resp.mime_type.clone().into());
+                set(&obj, "mimeType", resp.mime_type.into());
+                set(&obj, "has_init_segment", resp.has_init_segment.into());
+                set(&obj, "hasInitSegment", resp.has_init_segment.into());
+            }
+            tentaflow_protocol::StreamPayload::Frame(frame) => {
+                set(&obj, "variant", "StreamFrame".into());
+                set(&obj, "stream_id", frame.stream_id.clone().into());
+                set(&obj, "streamId", frame.stream_id.into());
+                set(&obj, "is_init", frame.is_init.into());
+                set(&obj, "isInit", frame.is_init.into());
+                set(
+                    &obj,
+                    "data",
+                    js_sys::Uint8Array::from(&frame.data[..]).into(),
+                );
+            }
+            tentaflow_protocol::StreamPayload::Closed(c) => {
+                set(&obj, "variant", "StreamClosed".into());
+                set(&obj, "stream_id", c.stream_id.clone().into());
+                set(&obj, "streamId", c.stream_id.into());
+                set(&obj, "reason", c.reason.into());
+            }
+        },
     }
     Ok(obj.into())
 }
@@ -8054,6 +8102,39 @@ pub fn encode_legal_document_revoke_request(doc_id: String) -> Result<Vec<u8>, J
     encode_body_inner(&MessageBody::LegalAdminBody(
         tentaflow_protocol::LegalAdminPayload::RevokeRequest(
             tentaflow_protocol::LegalDocumentRevokeRequest { doc_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
+// Stream pub/sub (Chunk B) — `MessageBody::StreamBody(StreamPayload)`.
+// Client only encodes the two request variants; frame / closed / response
+// variants are server-issued and travel through `decode_message_body_inner`.
+// =============================================================================
+
+/// MessageBody::StreamBody(SubscribeRequest) — subscribe this connection to a
+/// hub-registered stream. The server first answers with a SubscribeResponse
+/// (mime + has_init_segment), then pushes a sequence of Frame chunks on the
+/// same correlation id, terminating with a single Closed payload.
+#[wasm_bindgen(js_name = encodeStreamSubscribeRequest)]
+pub fn encode_stream_subscribe_request(stream_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::StreamBody(
+        tentaflow_protocol::StreamPayload::SubscribeRequest(
+            tentaflow_protocol::StreamSubscribeRequest { stream_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::StreamBody(CloseRequest) — release a live subscription early
+/// (e.g. UI tile navigates away). Reuses the original correlation id; the
+/// server cancels the streaming task and emits a final Closed frame.
+#[wasm_bindgen(js_name = encodeStreamCloseRequest)]
+pub fn encode_stream_close_request(stream_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::StreamBody(
+        tentaflow_protocol::StreamPayload::CloseRequest(
+            tentaflow_protocol::StreamCloseRequest { stream_id },
         ),
     ))
     .map_err(|e| JsError::new(&e))

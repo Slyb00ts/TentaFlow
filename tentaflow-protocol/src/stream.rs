@@ -1,0 +1,177 @@
+// =============================================================================
+// File: stream.rs
+// Purpose: Binary stream pub/sub protocol — packed into a single
+//          `MessageBody::StreamBody(StreamPayload)` slot so the whole live
+//          streaming surface burns one discriminant of the rkyv 0.8 256-variant
+//          budget (same pattern as `CameraAdminPayload` / `LegalAdminPayload`).
+//
+//          Wire shape:
+//            * client -> server: `SubscribeRequest { stream_id }` on a fresh
+//              correlation_id; optional `CloseRequest { stream_id }` reusing
+//              the same correlation_id to detach early.
+//            * server -> client: `SubscribeResponse` (one), then a series of
+//              `Frame` payloads (init segment first when present, then media
+//              chunks), terminated by a single `Closed` carrying a static
+//              reason string. The server-side streaming task wraps each chunk
+//              in an envelope with `IS_STREAM_CHUNK` / `IS_STREAM_END`.
+// =============================================================================
+
+use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+
+/// Inner payload for `MessageBody::StreamBody`. See module docs for the
+/// request/response ordering contract.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub enum StreamPayload {
+    /// Client -> server. Asks the hub to subscribe this WS connection to the
+    /// named stream. The server first answers with `SubscribeResponse`
+    /// (mime + has_init_segment hint), then pushes a sequence of `Frame`
+    /// chunks on the same correlation id.
+    SubscribeRequest(StreamSubscribeRequest),
+    /// Server -> client. Single message confirming subscription metadata
+    /// (MIME for `MediaSource.addSourceBuffer`, init-segment availability).
+    SubscribeResponse(StreamSubscribeResponse),
+    /// Server -> client. Binary chunk. The first chunk after
+    /// `SubscribeResponse` carries `is_init = true` when the hub has a cached
+    /// init segment (ftyp+moov for fMP4); subsequent chunks carry media
+    /// segments (moof+mdat) with `is_init = false`.
+    Frame(StreamFramePayload),
+    /// Client -> server. Releases the subscription early (e.g. UI tile
+    /// navigates away). Matched against the WS connection's active
+    /// subscription by `stream_id`.
+    CloseRequest(StreamCloseRequest),
+    /// Server -> client. Terminal frame for the subscription. `reason` is one
+    /// of the static strings `subscriber_lagged`, `source_unregistered`,
+    /// `client_request`, `internal_error` — callers match on the string.
+    Closed(StreamClosedPayload),
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct StreamSubscribeRequest {
+    /// Hub-registered stream id, e.g. `camera:<uuid>` for the camera tier.
+    pub stream_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct StreamSubscribeResponse {
+    pub stream_id: String,
+    /// MIME type ready to feed into `MediaSource.addSourceBuffer`.
+    pub mime_type: String,
+    /// `true` when the next `Frame` will carry `is_init = true`.
+    pub has_init_segment: bool,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct StreamFramePayload {
+    pub stream_id: String,
+    /// `true` for the MSE init segment (ftyp+moov), `false` for media chunks.
+    pub is_init: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct StreamCloseRequest {
+    pub stream_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct StreamClosedPayload {
+    pub stream_id: String,
+    /// Static reason tag. One of `subscriber_lagged`, `source_unregistered`,
+    /// `client_request`, `internal_error`.
+    pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_body::MessageBody;
+
+    macro_rules! round_trip {
+        ($ty:ty, $value:expr) => {{
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&$value).expect("encode");
+            rkyv::from_bytes::<$ty, rkyv::rancor::Error>(&bytes).expect("decode")
+        }};
+    }
+
+    #[test]
+    fn subscribe_request_round_trip() {
+        let v = StreamPayload::SubscribeRequest(StreamSubscribeRequest {
+            stream_id: "camera:550e8400-e29b-41d4-a716-446655440000".into(),
+        });
+        assert_eq!(round_trip!(StreamPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn subscribe_response_round_trip() {
+        let v = StreamPayload::SubscribeResponse(StreamSubscribeResponse {
+            stream_id: "camera:xyz".into(),
+            mime_type: "video/mp4; codecs=\"avc1.64001f\"".into(),
+            has_init_segment: true,
+        });
+        assert_eq!(round_trip!(StreamPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn frame_payload_round_trip() {
+        let v = StreamPayload::Frame(StreamFramePayload {
+            stream_id: "camera:xyz".into(),
+            is_init: false,
+            data: vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        });
+        assert_eq!(round_trip!(StreamPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn close_request_round_trip() {
+        let v = StreamPayload::CloseRequest(StreamCloseRequest {
+            stream_id: "camera:xyz".into(),
+        });
+        assert_eq!(round_trip!(StreamPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn closed_payload_round_trip() {
+        let v = StreamPayload::Closed(StreamClosedPayload {
+            stream_id: "camera:xyz".into(),
+            reason: "subscriber_lagged".into(),
+        });
+        assert_eq!(round_trip!(StreamPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn message_body_stream_subscribe_round_trip() {
+        let body = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
+            StreamSubscribeRequest {
+                stream_id: "camera:abc".into(),
+            },
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_stream_frame_round_trip() {
+        let body = MessageBody::StreamBody(StreamPayload::Frame(StreamFramePayload {
+            stream_id: "camera:abc".into(),
+            is_init: true,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+}
