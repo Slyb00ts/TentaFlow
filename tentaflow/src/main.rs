@@ -663,6 +663,19 @@ async fn run_server(args: Args) -> Result<()> {
         mesh_services_registry.clone(),
     )?;
 
+    // Boot-time camera ingest hydrate. Without this, `CameraIngestSupervisor`
+    // stays empty until SOMEONE opens TentaVision UI in a browser — kamera nie
+    // produkuje klatek, analiza Flow nie ma na czym pracować, status zostaje
+    // "starting" forever. Cameras are a core resource (not an addon resource),
+    // so they must come up at boot just like the dashboard server itself.
+    tokio::spawn(async {
+        if let Err(e) =
+            tentaflow_core::addon::host_functions::camera::ensure_supervisor_started().await
+        {
+            tracing::warn!("boot: camera supervisor hydrate failed: {e}");
+        }
+    });
+
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
 
     // Czekaj na SIGINT (Ctrl+C) lub SIGTERM (docker stop / systemd). Oba sa
