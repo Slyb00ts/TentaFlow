@@ -193,15 +193,16 @@ pub fn build_rtsp_pipeline(
         protocols_str
     );
 
-    let depay = gst::ElementFactory::make("rtph264depay")
+    // `decodebin` autoplugs the right depayloader + parser + decoder based
+    // on the RTP caps actually delivered by the server. Previous pipeline
+    // hard-wired rtph264depay+h264parse+avdec_h264 which `not-negotiated`s
+    // out when the NVR streams H.265 (UniFi G4/G5, Hikvision IPC-Bxxx,
+    // Dahua N-series with HEVC profile) or MJPEG. Using decodebin keeps the
+    // pipeline codec-agnostic; downstream we still cap to RGB so the appsink
+    // contract (raw RGB24 frames) is unchanged.
+    let decodebin = gst::ElementFactory::make("decodebin")
         .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtph264depay: {e}")))?;
-    let parser = gst::ElementFactory::make("h264parse")
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("h264parse: {e}")))?;
-    let decoder = gst::ElementFactory::make("avdec_h264")
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("avdec_h264: {e}")))?;
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("decodebin: {e}")))?;
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
@@ -226,12 +227,43 @@ pub fn build_rtsp_pipeline(
         .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink: {e}")))?;
 
     pipeline
-        .add_many([&rtspsrc, &depay, &parser, &decoder, &convert, &capsfilter, &appsink])
+        .add_many([&rtspsrc, &decodebin, &convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many: {e}")))?;
 
-    // Static section: depay → parser → decoder → convert → capsfilter → appsink.
-    gst::Element::link_many([&depay, &parser, &decoder, &convert, &capsfilter, &appsink])
+    // Static tail: convert → capsfilter → appsink. decodebin's src pad is
+    // dynamic and is linked in a separate pad-added handler below.
+    gst::Element::link_many([&convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many: {e}")))?;
+
+    // decodebin's video output pad appears dynamically once the codec is
+    // identified. Wire it into videoconvert when caps say video/x-raw.
+    let convert_weak = convert.downgrade();
+    decodebin.connect_pad_added(move |_dec, src_pad| {
+        let Some(convert) = convert_weak.upgrade() else {
+            return;
+        };
+        let Some(sink_pad) = convert.static_pad("sink") else {
+            return;
+        };
+        if sink_pad.is_linked() {
+            return;
+        }
+        let Some(caps) = src_pad.current_caps() else {
+            return;
+        };
+        let Some(structure) = caps.structure(0) else {
+            return;
+        };
+        if !structure.name().starts_with("video/") {
+            tracing::debug!("rtsp: decodebin produced non-video pad ({})", structure.name());
+            return;
+        }
+        if let Err(e) = src_pad.link(&sink_pad) {
+            tracing::warn!("rtsp: decodebin → videoconvert link failed: {e:?}");
+        } else {
+            tracing::info!("rtsp: decodebin video pad linked (codec auto-detected)");
+        }
+    });
 
     // Wire the appsink frame callback before pad-added so the very first
     // sample is captured.
@@ -239,6 +271,9 @@ pub fn build_rtsp_pipeline(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| CameraIngestError::PipelineBuild("appsink downcast failed".into()))?;
     install_frame_callback(&appsink_app, camera_id, mailbox, counters);
+
+    // Alias for rtspsrc → decodebin dynamic linking below (was `depay`).
+    let depay = decodebin.clone();
 
     // Dynamic pad-added handler — link only the video RTP pad.
     //
