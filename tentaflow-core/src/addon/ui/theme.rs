@@ -196,6 +196,78 @@ pub enum Size {
 }
 
 // =============================================================================
+// IconName — whitelist nazw ikon (renderer mapuje na SVG sprite / atlas)
+// =============================================================================
+
+/// Whitelisted set of icon names. Addon NIGDY nie sends raw SVG/PNG — tylko
+/// semantic name z tej listy. Renderer (HTML: SVG sprite z `icons.svg`,
+/// WGPU: texture atlas) wybiera konkretny glif. Nowe ikony dodajemy tutaj
+/// po dodaniu sprite'u do renderera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IconName {
+    Home,
+    Dashboard,
+    Cameras,
+    Alarms,
+    Profiles,
+    Models,
+    Zones,
+    Audit,
+    Evidence,
+    Settings,
+    Help,
+
+    Add,
+    Edit,
+    Delete,
+    Save,
+    Cancel,
+    Search,
+    Filter,
+    Refresh,
+    More,
+    Close,
+    Check,
+
+    Video,
+    Image,
+    Person,
+    Vehicle,
+    Face,
+    Document,
+    File,
+    Folder,
+    Code,
+
+    Success,
+    Warning,
+    Danger,
+    Info,
+    Locked,
+    Unlocked,
+    Eye,
+    EyeOff,
+
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    ChevronUp,
+    ChevronDown,
+    ChevronLeft,
+    ChevronRight,
+
+    Power,
+    Settings2,
+    User,
+    Users,
+    Logout,
+    Bell,
+    Star,
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -295,6 +367,21 @@ mod tests {
         let j = serde_json::to_value(&s).expect("serialize");
         let back: Size = serde_json::from_value(j).expect("deserialize");
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn icon_name_round_trip_snake_case() {
+        let j = serde_json::to_value(IconName::ChevronRight).expect("serialize");
+        assert_eq!(j, serde_json::json!("chevron_right"));
+        let back: IconName = serde_json::from_value(j).expect("deserialize");
+        assert_eq!(back, IconName::ChevronRight);
+    }
+
+    #[test]
+    fn icon_name_rejects_unknown() {
+        let j = serde_json::json!("not_a_real_icon");
+        let r: Result<IconName, _> = serde_json::from_value(j);
+        assert!(r.is_err());
     }
 
     #[test]
