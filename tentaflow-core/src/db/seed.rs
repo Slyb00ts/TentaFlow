@@ -28,6 +28,24 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         migrate_sha256_passwords(&tx)?;
     }
 
+    // F2 P1.a — every admin in `users` must have an `org_memberships` row in
+    // `org-default` with `role-org-admin`, otherwise binary-WS resolves the
+    // session to `org_context=None` and every dispatch path that filters by
+    // org (cameras, recordings, frame_url, ...) rejects the call.
+    // Migration v38 backfills this for pre-existing deployments, but on a
+    // fresh DB v38 runs BEFORE this seed inserts the admin user — so the
+    // membership table stays empty. Seed therefore re-applies the same
+    // invariant after creating users. Idempotent via INSERT OR IGNORE on
+    // the (org_id, user_id) primary key.
+    tx.execute(
+        "INSERT OR IGNORE INTO org_memberships \
+            (org_id, user_id, role_id, granted_at, granted_by) \
+         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+         FROM users u WHERE u.role = 'admin'",
+        [],
+    )?;
+
     // Domyslne ustawienia
     let jwt_secret = generate_jwt_secret();
     let settings: &[(&str, &str)] = &[
