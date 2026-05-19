@@ -187,6 +187,29 @@ pub fn build_rtsp_pipeline(
         // shown by `gst-inspect-1.0 rtspsrc | grep tls`).
         rtspsrc.set_property_from_str("tls-validation-flags", "no-flags");
     }
+
+    // `select-stream` is emitted PRE-SETUP for every stream advertised in the
+    // server SDP. Returning false tells rtspsrc to skip subscribing entirely
+    // for that stream — no RTP/RTCP traffic, no pad creation downstream. We
+    // accept video only. Without this filter, rtspsrc creates dynamic pads
+    // for audio streams (AAC + OPUS on UniFi Protect), nothing is linked to
+    // those pads, and the next sample push fails with `not-linked (-1)` →
+    // `Internal data stream error` → pipeline restart loop.
+    rtspsrc.connect("select-stream", false, |values| {
+        let caps = match values.get(2).and_then(|v| v.get::<gst::Caps>().ok()) {
+            Some(c) => c,
+            None => return Some(true.to_value()),
+        };
+        let media = caps
+            .structure(0)
+            .and_then(|s| s.get::<String>("media").ok())
+            .unwrap_or_default();
+        let include = media == "video";
+        if !include {
+            tracing::info!("rtsp: select-stream skipping {} stream", media);
+        }
+        Some(include.to_value())
+    });
     tracing::info!(
         "rtsp: built pipeline url_scheme={} protocols={}",
         if is_tls { "rtsps" } else { "rtsp" },
