@@ -7,6 +7,7 @@ pub mod feedback;
 pub mod form;
 pub mod layout;
 pub mod legacy;
+pub mod specialized;
 pub mod theme;
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,7 @@ pub enum UiComponent {
     Form(form::FormComponent),
     Feedback(feedback::FeedbackComponent),
     Action(action::ActionComponent),
+    Specialized(specialized::SpecializedComponent),
     Legacy(legacy::LegacyComponent),
 }
 
@@ -189,6 +191,8 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
             .map_err(|e| anyhow::anyhow!("feedback validation failed: {}", e)),
         UiComponent::Action(a) => action::validate_and_normalize(a)
             .map_err(|e| anyhow::anyhow!("action validation failed: {}", e)),
+        UiComponent::Specialized(s) => specialized::validate_and_normalize(s)
+            .map_err(|e| anyhow::anyhow!("specialized validation failed: {}", e)),
         UiComponent::Legacy(legacy) => legacy::validate_and_normalize(legacy),
     }
 }
