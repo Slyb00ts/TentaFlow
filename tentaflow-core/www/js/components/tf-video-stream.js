@@ -283,6 +283,11 @@ class TfVideoStream extends HTMLElement {
   _drainAppendQueue() {
     if (this._appending) return;
     if (!this._sourceBuffer) return;
+    // SourceBuffer moze zostac usuniety z MediaSource gdy MS przeszedl
+    // do stanu 'closed'/'ended' po wczesniejszym appendBuffer error.
+    // Probowanie operacji na takim sourceBuffer rzuca InvalidStateError
+    // ("SourceBuffer has been removed from the parent media source").
+    if (!this._mediaSource || this._mediaSource.readyState !== 'open') return;
     if (this._sourceBuffer.updating) return;
     if (this._appendQueue.length === 0) return;
     const bytes = this._appendQueue.shift();
@@ -308,7 +313,16 @@ class TfVideoStream extends HTMLElement {
 
   _maybeTrimBuffer() {
     if (!this._sourceBuffer || this._sourceBuffer.updating) return;
-    const ranges = this._sourceBuffer.buffered;
+    // Sprawdz czy MediaSource jest dalej otwarte — czytanie `.buffered` z
+    // sourceBuffer usunietego z MS rzuca InvalidStateError.
+    if (!this._mediaSource || this._mediaSource.readyState !== 'open') return;
+    let ranges;
+    try {
+      ranges = this._sourceBuffer.buffered;
+    } catch (e) {
+      // SourceBuffer usuniety z parent MS — restart pipeline'u.
+      return;
+    }
     if (ranges.length === 0) return;
     const start = ranges.start(0);
     const end = ranges.end(ranges.length - 1);
