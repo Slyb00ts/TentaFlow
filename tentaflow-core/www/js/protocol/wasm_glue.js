@@ -3616,6 +3616,45 @@ export function encodeSsoProvidersListRequest() {
 }
 
 /**
+ * MessageBody::StreamBody(CloseRequest) — release a live subscription early
+ * (e.g. UI tile navigates away). Reuses the original correlation id; the
+ * server cancels the streaming task and emits a final Closed frame.
+ * @param {string} stream_id
+ * @returns {Uint8Array}
+ */
+export function encodeStreamCloseRequest(stream_id) {
+    const ptr0 = passStringToWasm0(stream_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeStreamCloseRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::StreamBody(SubscribeRequest) — subscribe this connection to a
+ * hub-registered stream. The server first answers with a SubscribeResponse
+ * (mime + has_init_segment), then pushes a sequence of Frame chunks on the
+ * same correlation id, terminating with a single Closed payload.
+ * @param {string} stream_id
+ * @returns {Uint8Array}
+ */
+export function encodeStreamSubscribeRequest(stream_id) {
+    const ptr0 = passStringToWasm0(stream_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeStreamSubscribeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::SubscribeResumeRequest { resume_token }.
  * Klient po reconnect przekazuje token z poprzedniej SubscribeResumeOffer.
  * @param {Uint8Array} resume_token
