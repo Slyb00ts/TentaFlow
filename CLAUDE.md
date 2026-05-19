@@ -63,6 +63,44 @@ WebTransport `/wt/api` + WebSocket `/ws/api` fallback, binary `MessageBody` prot
 - Services in mesh ↔ Core: QUIC tunnel (mesh control plane)
 - Sub-second response, low overhead, full request/response binary serialization
 
+## Admin Scheduler
+
+Scheduler administracyjny działa w `tentaflow-core/src/scheduler/` i trzyma
+stan w SQLite (`scheduled_jobs`, `scheduled_runs`). Uruchamia wyłącznie funkcje
+addonów przez `AddonManager::call_tool`, a dashboard komunikuje się z nim przez
+binary protocol (`SchedulerBody(SchedulerPayload)`), nie przez REST.
+
+Ekran admina jest w `www/js/modules/scheduler.js` i jest podpięty do menu tylko
+dla administratorów. Obsługiwane tryby harmonogramu: `once` (RFC3339),
+`interval` (`30m`, `1h`, `1d`) oraz prosty dzienny `cron` w formacie
+`minute hour * * *`. Scheduler startuje raz procesowo z dashboard/unified server
+i jest odporny na restart przez wyliczanie `next_run_at` z trwałej bazy.
+Zapis joba waliduje, że wskazany addon jest zainstalowany, włączony i ma
+deklarowane narzędzie w manifeście. UI ma szybkie presety dla Eureki:
+`sync_new` codziennie o `03:15` oraz `retry_failed` codziennie o `03:45`.
+
+## Eureka MF Addon
+
+Bundled addon `tentaflow-core/addons/eureka/` indeksuje publiczne informacje z
+`https://eureka.mf.gov.pl/api/public/v1/informacje/{id}` do własnego SQLite.
+Nie używa żadnego endpointu REST TentaFlow: LLM wywołuje narzędzia addonu przez
+standardowy mechanizm addon tools, a przyszłe uruchomienia cykliczne powinny iść
+przez admin scheduler.
+Manifest addonu deklaruje wymagany cel zewnętrzny przez `[[network_rule]]`:
+`tcp://eureka.mf.gov.pl:443`. Host function `http.request` działa fail-closed:
+samo uprawnienie `http.request` nie pozwala na ruch wychodzący bez zgodnej i
+zatwierdzonej reguły w `addon_network_rules`. Deklaracje manifestu nie są
+zatwierdzane automatycznie przy instalacji, także gdy `required=true`; admin
+zatwierdza je w zakładce Network addona, a UI zapisuje realne pole `approved`
+używane przez host functions.
+
+Narzędzia: `search` (lokalne wyszukiwanie po SQLite), `get_entry` (pobranie lub
+odświeżenie pojedynczego wpisu), `sync_new` (dzienny skan nowych ID), `full_dump`
+(wznawialny zrzut zakresu ID w batchach), `retry_failed` (ponowienie wpisów ze
+statusem `error`), `recent` (najnowsze lokalne wpisy) oraz `stats`. Checkpointy
+są w tabeli `eureka_sync_state`, wpisy w `eureka_entries`, a status każdego
+sprawdzonego identyfikatora w `eureka_fetch_status`.
+
 ### Tier 2: HTTP REST secondary
 
 Reserved for external integrations that cannot use the binary protocol:
