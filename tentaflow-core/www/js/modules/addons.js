@@ -22,7 +22,8 @@ import { ToolsTab } from '/js/modules/addons/tools.js';
 import { ResourcesTab } from '/js/modules/addons/resources.js';
 import { NetworkTab } from '/js/modules/addons/network.js';
 import { BindingsTab } from '/js/modules/addons/bindings.js';
-import { openInstallWizard } from '/js/modules/addons/install-wizard.js';
+// `openInstallWizard` reserved for the future "Install from ZIP" flow on the
+// addons list page; it is no longer triggered from the per-addon header.
 
 // --- Stan listy ------------------------------------------------------------
 let addonsList = [];
@@ -575,8 +576,13 @@ function renderDetailHeader(d) {
     }));
   }
 
+  // Note: previously had "Konfiguruj" button which opened the install wizard
+  // (F2-P7 6-step UI). Removed — that wizard is for fresh installs only, and
+  // for an already-installed addon it duplicated functionality covered by
+  // the per-addon tabs (Ustawienia / Uprawnienia / OAuth / Sieć / etc.).
+  // The TentaVision-specific cameras step shouldn't appear for unrelated
+  // addons either. Settings tab is the canonical configuration surface.
   const actions = isAdmin ? `
-    <tf-button variant="ghost" icon="settings" id="hdr-configure">${escapeHtml(I18n.t('install_wizard.configure'))}</tf-button>
     <tf-button variant="ghost" icon="refresh" id="hdr-reload">${escapeHtml(I18n.t('addon_reload.button'))}</tf-button>
     <tf-button variant="danger" icon="trash" id="hdr-uninstall">${escapeHtml(I18n.t('addon_uninstall.button'))}</tf-button>
   ` : '';
@@ -594,24 +600,6 @@ function renderDetailHeader(d) {
   `;
   host.querySelector('#hdr-reload')?.addEventListener('click', onReloadAddon);
   host.querySelector('#hdr-uninstall')?.addEventListener('click', onUninstallAddon);
-  host.querySelector('#hdr-configure')?.addEventListener('click', () => {
-    openInstallWizard({
-      addonId: currentAddonId,
-      manifest: {
-        name: d.name || currentAddonId,
-        version: d.version || '',
-        description: d.description || '',
-        permissions: (d.permissions || []).map((p) => ({
-          permission_id: p.permissionId ?? p.permission_id,
-          display_name: p.displayName ?? p.display_name,
-          description: p.description,
-          risk: p.risk,
-        })),
-        storage: {},
-        aliases: [],
-      },
-    });
-  });
 }
 
 async function switchTab(tabId) {
