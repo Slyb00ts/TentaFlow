@@ -1,6 +1,7 @@
 // === File: addon/ui/mod.rs — top-level UiComponent sum + PanelTree + JSON entry points ===
 
 pub mod container;
+pub mod data_display;
 pub mod layout;
 pub mod legacy;
 pub mod theme;
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 pub enum UiComponent {
     Layout(layout::LayoutComponent),
     Container(container::ContainerComponent),
+    DataDisplay(data_display::DataDisplayComponent),
     Legacy(legacy::LegacyComponent),
 }
 
@@ -173,6 +175,8 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
         UiComponent::Layout(layout) => validate_layout(layout),
         UiComponent::Container(c) => container::validate_and_normalize(c)
             .map_err(|e| anyhow::anyhow!("container validation failed: {}", e)),
+        UiComponent::DataDisplay(d) => data_display::validate_and_normalize(d)
+            .map_err(|e| anyhow::anyhow!("data_display validation failed: {}", e)),
         UiComponent::Legacy(legacy) => legacy::validate_and_normalize(legacy),
     }
 }
