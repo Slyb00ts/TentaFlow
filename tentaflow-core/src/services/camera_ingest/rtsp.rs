@@ -336,6 +336,11 @@ pub async fn run_rtsp_session(
     // Connection attempt counter — reset when we successfully reach Online.
     let mut attempt: u32 = 0;
     let mut backoff = policy.initial_backoff;
+    // Sticky last failure reason — survives across health ticks while the
+    // pipeline is in pre-Online state. Cleared when first frame arrives.
+    // Without this the UI sees `status_message = None` 99% of the time
+    // because health ticks publish every second but failures publish once.
+    let mut last_error: Option<String> = None;
 
     publish(&health_tx, &cam_id, CameraStatus::Starting, None, &counters, None);
 
@@ -549,6 +554,7 @@ pub async fn run_rtsp_session(
                             // next disconnect starts the schedule fresh.
                             attempt = 0;
                             backoff = policy.initial_backoff;
+                            last_error = None;
                         } else if tokio::time::Instant::now() >= warmup_deadline {
                             break Some("no frames within warmup window".into());
                         }
@@ -559,10 +565,13 @@ pub async fn run_rtsp_session(
                     } else {
                         CameraStatus::Starting
                     };
+                    // Keep sticky last_error visible while still warming up so
+                    // the UI shows the actual failure reason instead of empty.
+                    let msg = if online { None } else { last_error.clone() };
                     let _ = health_tx.send(CameraHealth {
                         camera_id: cam_id.clone(),
                         status,
-                        status_message: None,
+                        status_message: msg,
                         fps_actual: avg,
                         last_frame_at: last_at,
                         frames_total: total,
@@ -604,11 +613,15 @@ pub async fn run_rtsp_session(
         }
 
         let wait = jittered(&policy, backoff);
+        let msg = format!("reconnect attempt {attempt} in {:?}: {reason}", wait);
+        // Persist as sticky so subsequent in-pipeline health ticks keep it
+        // visible until the camera comes online.
+        last_error = Some(msg.clone());
         publish(
             &health_tx,
             &cam_id,
             CameraStatus::Starting,
-            Some(format!("reconnect attempt {attempt} in {:?}: {reason}", wait)),
+            Some(msg),
             &counters,
             None,
         );
