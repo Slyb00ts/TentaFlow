@@ -146,13 +146,64 @@ static SUPERVISOR: OnceCell<Arc<CameraIngestSupervisor>> = OnceCell::const_new()
 async fn get_or_init_supervisor() -> Result<Arc<CameraIngestSupervisor>, AbiError> {
     SUPERVISOR
         .get_or_try_init(|| async {
-            start_supervisor().await.map(Arc::new).map_err(|e| {
+            let sup = start_supervisor().await.map(Arc::new).map_err(|e| {
                 warn!("camera_ingest supervisor init failed: {e}");
                 AbiError::Operation
-            })
+            })?;
+            // Hydrate sessions for every active camera surviving from the
+            // previous process lifecycle. Without this, cameras stay
+            // "starting" forever after a restart because the supervisor
+            // registry is empty and `get_health()` returns NotFound.
+            hydrate_supervisor_from_db(&sup).await;
+            Ok(sup)
         })
         .await
         .cloned()
+}
+
+/// Re-spawns one session per active camera in `cameras` table on supervisor
+/// init. Errors are logged at warn — a single bad camera must not block
+/// the rest from coming online. Uses the global DB pool because the
+/// supervisor singleton has no caller context at first-init time.
+async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
+    let pool = match crate::db::global_pool() {
+        Some(p) => p,
+        None => {
+            warn!("camera_ingest: no global DB pool — skipping hydrate");
+            return;
+        }
+    };
+    let rows = match crate::db::repository::list_all_active_cameras(&pool) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("camera_ingest: hydrate query failed: {e}");
+            return;
+        }
+    };
+    let count = rows.len();
+    tracing::info!("camera_ingest: hydrating {} camera session(s) from DB", count);
+    for row in rows {
+        let resolution = match (row.resolution_width, row.resolution_height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+            _ => None,
+        };
+        let cfg = CameraConfig {
+            camera_id: row.camera_id.clone(),
+            vendor: row.vendor.clone(),
+            url: row.url.clone(),
+            target_fps: row.target_fps.max(1) as u32,
+            resolution,
+            owner_addon_id: Some(row.owner_addon_id.clone()),
+            credentials_encrypted: row.credentials_encrypted.clone(),
+        };
+        if let Err(e) = sup.add_camera(cfg).await {
+            warn!(
+                "camera_ingest: failed to hydrate camera_id={} vendor={}: {}",
+                row.camera_id, row.vendor, e
+            );
+        }
+    }
+    tracing::info!("camera_ingest: hydrate complete ({} camera(s))", count);
 }
 
 /// Drains every camera session on the process-wide supervisor without
