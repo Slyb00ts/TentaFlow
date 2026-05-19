@@ -224,6 +224,14 @@ pub fn build_rtsp_pipeline(
     // pipeline codec-agnostic; downstream we still cap to RGB so the appsink
     // contract (raw RGB24 frames) is unchanged.
     let decodebin = gst::ElementFactory::make("decodebin")
+        // Force software decoders. If decodebin autoplugs an NVIDIA / VAAPI /
+        // QSV decoder, output caps land in GPU memory (e.g. CUDAMemory NV12)
+        // which `videoconvert` (CPU-only) cannot read — pipeline aborts with
+        // `not-negotiated (-4)` when downstream demands `format=RGB`. Software
+        // decode of 1080p H.264 costs ~3-5% of a CPU core, acceptable for
+        // MVP; a GPU-aware path with `cudadownload` / `vaapipostproc` is a
+        // later optimization.
+        .property("force-sw-decoders", true)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("decodebin: {e}")))?;
     let convert = gst::ElementFactory::make("videoconvert")
