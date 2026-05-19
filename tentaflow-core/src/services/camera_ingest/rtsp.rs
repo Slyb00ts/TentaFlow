@@ -326,10 +326,14 @@ pub fn build_rtsp_pipeline(
     // appsink consumer cannot block the mux branch (and vice versa).
     let queue_a = gst::ElementFactory::make("queue")
         .property("name", "queue_branch_a")
-        .property("leaky", 2u32 /* GST_QUEUE_LEAK_DOWNSTREAM */)
         .property("max-size-buffers", 30u32)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a: {e}")))?;
+    // `leaky` is a GFlags enum (GstQueueLeaky), not a raw uint — the gst-rs
+    // builder API panics if we pass `2u32`. Use stringified value parsed by
+    // GFlags::from_str. "downstream" = drop the oldest buffer when the queue
+    // fills up, matching the previous numeric `2` literal.
+    queue_a.set_property_from_str("leaky", "downstream");
 
     pipeline
         .add_many([
@@ -587,10 +591,10 @@ fn attach_mp4_branch(
 
     let queue_b = gst::ElementFactory::make("queue")
         .property("name", "queue_branch_b")
-        .property("leaky", 2u32)
         .property("max-size-buffers", 60u32)
         .build()
         .map_err(|e| format!("queue_b build: {e}"))?;
+    queue_b.set_property_from_str("leaky", "downstream");
     let depay = gst::ElementFactory::make("rtph264depay")
         .build()
         .map_err(|e| format!("rtph264depay build: {e}"))?;
