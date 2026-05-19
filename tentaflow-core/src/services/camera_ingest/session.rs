@@ -131,6 +131,16 @@ pub enum SessionCommand {
     Restart(CameraConfig),
     GetHealth(oneshot::Sender<CameraHealth>),
     Snapshot(oneshot::Sender<std::result::Result<SnapshotData, CameraIngestError>>),
+    /// Attach an on-demand fMP4 mux branch (Branch B) to the running
+    /// pipeline and route its appsink output into the supplied publisher.
+    /// Sent by the `StreamHub` factory the first time a consumer subscribes
+    /// to `camera:<id>`. Idempotent: if a branch is already attached the
+    /// session marks the publisher unsupported (its waiter will fail clean).
+    AttachMp4Branch(std::sync::Arc<super::stream_publisher::Mp4StreamPublisher>),
+    /// Detach the fMP4 mux branch and return the pipeline to baseline.
+    /// Posted by `Mp4StreamPublisher::drop` when the hub releases the last
+    /// strong reference (i.e. the last subscriber went away).
+    DetachMp4Branch,
 }
 
 /// External handle to a running session, stored in the supervisor registry.
@@ -303,6 +313,18 @@ async fn run_session(
                         // the match stays exhaustive and a stray signal does
                         // not crash the task.
                     }
+                    Some(SessionCommand::AttachMp4Branch(pub_)) => {
+                        // fake_file is a synthetic looped source — H.264 mux
+                        // branching is meaningful only for live RTSP streams.
+                        // Mark the publisher unsupported so the hub-side
+                        // `init_segment()` returns None immediately instead
+                        // of stalling for the full 3 s timeout window.
+                        pub_.mark_unsupported();
+                    }
+                    Some(SessionCommand::DetachMp4Branch) => {
+                        // No branch ever attached for fake_file — nothing to
+                        // tear down. Drop arrives here on publisher destruct.
+                    }
                     Some(SessionCommand::GetHealth(reply)) => {
                         let h = health_tx.borrow().clone();
                         let _ = reply.send(h);
@@ -459,6 +481,15 @@ async fn drain_until_stop(
                 // Terminal state: config updates and restart signals are
                 // no-ops; the supervisor is expected to remove/re-add the
                 // camera to recover.
+            }
+            SessionCommand::AttachMp4Branch(pub_) => {
+                // Session is dead — attach is impossible, but the hub-side
+                // `init_segment()` waiter must not block. Surface a clean
+                // failure so the WS handler sees `FactoryFailed` quickly.
+                pub_.mark_unsupported();
+            }
+            SessionCommand::DetachMp4Branch => {
+                // Already drained / pipeline already Null — no-op.
             }
         }
     }

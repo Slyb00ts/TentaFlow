@@ -17,6 +17,7 @@ pub mod onvif_media;
 pub mod onvif_metadata_parser;
 pub mod rtsp;
 pub mod session;
+pub mod stream_publisher;
 pub mod supervisor;
 
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
