@@ -29,6 +29,7 @@ use super::fakefile::{ensure_gst_initialized, FrameCounters, FrameMailbox, Lates
 use super::session::{
     CameraConfig, CameraHealth, CameraStatus, PixelFormat, SessionCommand, SnapshotData,
 };
+use super::stream_publisher::Mp4StreamPublisher;
 use crate::services::frame_storage::{FrameMetadata, FramePixelFormat, StoredFrame};
 use crate::services::{frame_storage, streaming_bus};
 
@@ -136,6 +137,16 @@ pub fn validate_rtsp_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Pipeline plus the handles the session needs to attach an on-demand
+/// fMP4 mux branch (Branch B). `tee` is the always-present RTP fan-out and
+/// `rtp_filter_src_pad` is its sink-side reference — both are kept alive
+/// for the lifetime of the pipeline so the attach helper can request a new
+/// source pad and link a fresh mux branch without rebuilding from scratch.
+pub struct RtspPipelineHandles {
+    pub pipeline: gst::Pipeline,
+    pub tee: gst::Element,
+}
+
 /// Build the typed-element RTSP pipeline. `rtspsrc`'s source pad is dynamic
 /// (it appears once SDP negotiation completes), so we register a
 /// `pad-added` handler that links it to `rtph264depay` only for video
@@ -146,7 +157,7 @@ pub fn build_rtsp_pipeline(
     timeout_secs: u32,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
-) -> Result<gst::Pipeline> {
+) -> Result<RtspPipelineHandles> {
     let pipeline = gst::Pipeline::new();
 
     // Strip vendor-specific query parameters that ask the server to wrap RTP
@@ -294,10 +305,38 @@ pub fn build_rtsp_pipeline(
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink: {e}")))?;
 
+    // `tee` fans the RTP stream out between Branch A (decode → RGB → appsink,
+    // always present, drives the existing frame_storage / streaming_bus path)
+    // and an optional Branch B (rtph264depay → h264parse → mp4mux → appsink)
+    // attached on demand by `attach_mp4_branch` when a consumer subscribes
+    // to the `camera:<id>` stream through `StreamHub`. Without the tee the
+    // pipeline could feed only one downstream consumer at a time; with it
+    // Branch B can come and go without disturbing Branch A.
+    let tee = gst::ElementFactory::make("tee")
+        .property("name", "rtp_tee")
+        // allow-not-linked=true tolerates the gap between pipeline start and
+        // first Branch B attach (and between Branch B detach and end of
+        // session) — without it tee would push to a vanished pad and trip
+        // `not-linked (-1)` immediately after request_pad release.
+        .property("allow-not-linked", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee: {e}")))?;
+
+    // Branch A queue — decouples RTP fan-out from decode latency so a slow
+    // appsink consumer cannot block the mux branch (and vice versa).
+    let queue_a = gst::ElementFactory::make("queue")
+        .property("name", "queue_branch_a")
+        .property("leaky", 2u32 /* GST_QUEUE_LEAK_DOWNSTREAM */)
+        .property("max-size-buffers", 30u32)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a: {e}")))?;
+
     pipeline
         .add_many([
             &rtspsrc,
             &rtp_filter,
+            &tee,
+            &queue_a,
             &decodebin,
             &convert,
             &capsfilter,
@@ -306,12 +345,24 @@ pub fn build_rtsp_pipeline(
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many: {e}")))?;
 
     // Static segments:
-    //   rtp_filter → decodebin (capsfilter pins RTP video before autoplug)
+    //   rtp_filter → tee (capsfilter pins RTP video before fan-out)
+    //   tee.src_0 → queue_a → decodebin (request pad, Branch A always-on)
     //   convert → capsfilter → appsink (after decode)
     // rtspsrc → rtp_filter is dynamic (pad-added below) and decodebin → convert
     // is dynamic (decoder src pad appears after autoplug).
-    gst::Element::link(&rtp_filter, &decodebin)
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → decodebin: {e}")))?;
+    gst::Element::link(&rtp_filter, &tee)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → tee: {e}")))?;
+    let tee_src_a = tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("tee src_%u request failed".into()))?;
+    let queue_a_sink = queue_a
+        .static_pad("sink")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a sink pad missing".into()))?;
+    tee_src_a
+        .link(&queue_a_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
+    gst::Element::link(&queue_a, &decodebin)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a → decodebin: {e}")))?;
     gst::Element::link_many([&convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many tail: {e}")))?;
 
@@ -417,7 +468,7 @@ pub fn build_rtsp_pipeline(
         });
     });
 
-    Ok(pipeline)
+    Ok(RtspPipelineHandles { pipeline, tee })
 }
 
 fn install_frame_callback(
@@ -488,6 +539,158 @@ fn install_frame_callback(
     );
 }
 
+/// Live handle to an attached fMP4 mux branch. The session keeps one of
+/// these in `Option<Mp4BranchState>` while a consumer is subscribed; on
+/// detach we walk these elements back to NULL and remove them from the
+/// pipeline so the mux state machine resets cleanly for the next attach.
+struct Mp4BranchState {
+    tee_src_pad: gst::Pad,
+    elements: Vec<gst::Element>,
+}
+
+/// Build and link Branch B (RTP → rtph264depay → h264parse → mp4mux → appsink)
+/// onto the running pipeline. Returns the branch state for later teardown,
+/// or `None` if the RTP caps say the stream is not H.264 (HEVC, MJPEG, …).
+///
+/// The mp4mux output goes through an appsink whose callback forwards each
+/// buffer to the supplied publisher via a `Weak` ref — that keeps the
+/// pipeline from accidentally pinning the hub-side `Arc` alive past the
+/// last subscriber.
+fn attach_mp4_branch(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+) -> std::result::Result<Mp4BranchState, String> {
+    // Codec gate: branch B muxer is hardwired for H.264 ES. We probe the RTP
+    // caps via the static sink pad on `tee` — by the time the first
+    // subscriber subscribes the pipeline is already PLAYING and caps have
+    // been negotiated. A missing caps probe means rtspsrc has not produced
+    // a pad yet; we treat that as transient and refuse politely.
+    let tee_sink = tee
+        .static_pad("sink")
+        .ok_or_else(|| "tee has no sink pad".to_string())?;
+    let caps = tee_sink
+        .current_caps()
+        .ok_or_else(|| "tee caps not yet negotiated".to_string())?;
+    let s = caps
+        .structure(0)
+        .ok_or_else(|| "empty caps on tee sink".to_string())?;
+    let encoding_name: String = s
+        .get::<String>("encoding-name")
+        .map_err(|e| format!("rtp caps missing encoding-name: {e}"))?;
+    if !encoding_name.eq_ignore_ascii_case("H264") {
+        return Err(format!(
+            "mp4 streaming requires H.264 (rtp encoding={})",
+            encoding_name
+        ));
+    }
+
+    let queue_b = gst::ElementFactory::make("queue")
+        .property("name", "queue_branch_b")
+        .property("leaky", 2u32)
+        .property("max-size-buffers", 60u32)
+        .build()
+        .map_err(|e| format!("queue_b build: {e}"))?;
+    let depay = gst::ElementFactory::make("rtph264depay")
+        .build()
+        .map_err(|e| format!("rtph264depay build: {e}"))?;
+    let parse = gst::ElementFactory::make("h264parse")
+        // mp4mux needs AVC sample format (length-prefixed NALUs) — the
+        // default byte-stream out of rtph264depay would otherwise force
+        // mp4mux to refuse with `not-negotiated`.
+        .property_from_str("config-interval", "-1")
+        .build()
+        .map_err(|e| format!("h264parse build: {e}"))?;
+    // `streamable=true` writes ftyp+moov on the first fragment (init segment
+    // for MSE) and produces moof+mdat fragments thereafter, without an
+    // ending mfra/mvex finalize — exactly what a live MSE consumer needs.
+    // `fragment-duration` is in milliseconds; 200 ms strikes a balance
+    // between latency and overhead.
+    let mux = gst::ElementFactory::make("mp4mux")
+        .property("fragment-duration", 200u32)
+        .property("streamable", true)
+        .build()
+        .map_err(|e| format!("mp4mux build: {e}"))?;
+    let sink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_mp4")
+        .property("emit-signals", false)
+        // Mux fragments must be drained promptly to keep latency bounded —
+        // sync=false lets the appsink consume as fast as the muxer emits.
+        .property("sync", false)
+        .property("max-buffers", 8u32)
+        .property("drop", false)
+        .build()
+        .map_err(|e| format!("appsink_b build: {e}"))?;
+
+    pipeline
+        .add_many([&queue_b, &depay, &parse, &mux, &sink])
+        .map_err(|e| format!("add_many branch B: {e}"))?;
+
+    let tee_src_pad = tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| "tee src_%u request for branch B failed".to_string())?;
+    let queue_b_sink = queue_b
+        .static_pad("sink")
+        .ok_or_else(|| "queue_b sink pad missing".to_string())?;
+    tee_src_pad
+        .link(&queue_b_sink)
+        .map_err(|e| format!("tee → queue_b: {e:?}"))?;
+    gst::Element::link_many([&queue_b, &depay, &parse, &mux, &sink])
+        .map_err(|e| format!("link branch B: {e}"))?;
+
+    let appsink_b = sink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| "appsink_b downcast failed".to_string())?;
+    let pub_weak = std::sync::Arc::downgrade(publisher);
+    appsink_b.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                let bytes = map.as_slice().to_vec();
+                if let Some(pub_arc) = pub_weak.upgrade() {
+                    pub_arc.push_chunk(bytes);
+                }
+                // No-op when publisher has been dropped — the session will
+                // soon receive DetachMp4Branch and tear this appsink down.
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    // Bring every new element up to the pipeline's current state so the
+    // mux branch starts producing without needing a full pipeline restart.
+    for el in [&queue_b, &depay, &parse, &mux, &sink] {
+        el.sync_state_with_parent()
+            .map_err(|e| format!("sync_state branch B element: {e}"))?;
+    }
+
+    Ok(Mp4BranchState {
+        tee_src_pad,
+        elements: vec![queue_b, depay, parse, mux, sink],
+    })
+}
+
+/// Walk Branch B's elements back to NULL and remove them from the pipeline.
+/// Idempotent: the caller is expected to `.take()` the state once.
+fn detach_mp4_branch(pipeline: &gst::Pipeline, tee: &gst::Element, state: Mp4BranchState) {
+    // Unlink the request pad first so the upstream tee stops pushing into
+    // a half-disposed branch. `unlink` on an already-unlinked pad is a no-op.
+    if let Some(peer) = state.tee_src_pad.peer() {
+        let _ = state.tee_src_pad.unlink(&peer);
+    }
+    for el in &state.elements {
+        let _ = el.set_state(gst::State::Null);
+    }
+    let refs: Vec<&gst::Element> = state.elements.iter().collect();
+    if let Err(e) = pipeline.remove_many(refs) {
+        tracing::warn!("rtsp: branch B remove_many failed: {e:?}");
+    }
+    tee.release_request_pad(&state.tee_src_pad);
+}
+
 /// Entry point invoked by `spawn_session` for `vendor='rtsp'`. Drives the
 /// reconnect loop, owns the active pipeline, and translates control messages
 /// and bus events into health updates. Exits cleanly on
@@ -552,14 +755,14 @@ pub async fn run_rtsp_session(
             attempt = attempt,
             "rtsp: building pipeline"
         );
-        let pipeline = match build_rtsp_pipeline(
+        let handles = match build_rtsp_pipeline(
             cam_id.clone(),
             &final_url,
             timeout_secs,
             mailbox.clone(),
             counters.clone(),
         ) {
-            Ok(p) => p,
+            Ok(h) => h,
             Err(e) => {
                 let reason = redact_url_in_text(&format!("build failed: {e}"));
                 tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: pipeline build failed");
@@ -576,6 +779,13 @@ pub async fn run_rtsp_session(
                 return;
             }
         };
+        let pipeline = &handles.pipeline;
+        let tee = handles.tee.clone();
+        // Branch B mux state — `Some` whenever a consumer is subscribed.
+        // The session re-establishes Branch B on every pipeline rebuild
+        // (i.e. after reconnect) because element state machines do not
+        // survive across `set_state(Null)`.
+        let mut branch_b: Option<Mp4BranchState> = None;
 
         tracing::info!(camera_id = %cam_id, "rtsp: setting pipeline state -> Playing");
         if let Err(e) = pipeline.set_state(gst::State::Playing) {
@@ -694,6 +904,46 @@ pub async fn run_rtsp_session(
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             };
                             let _ = reply.send(snap);
+                        }
+                        Some(SessionCommand::AttachMp4Branch(publisher)) => {
+                            if branch_b.is_some() {
+                                // Already attached for a previous subscriber.
+                                // The hub guarantees only one publisher per
+                                // stream id at a time, so this is a stray
+                                // signal — fail the new publisher cleanly.
+                                tracing::debug!(
+                                    camera_id = %cam_id,
+                                    "rtsp: attach_mp4_branch ignored — branch already active"
+                                );
+                                publisher.mark_unsupported();
+                            } else {
+                                match attach_mp4_branch(pipeline, &tee, &publisher) {
+                                    Ok(state) => {
+                                        tracing::info!(
+                                            camera_id = %cam_id,
+                                            "rtsp: branch B attached (fMP4 mux)"
+                                        );
+                                        branch_b = Some(state);
+                                    }
+                                    Err(reason) => {
+                                        tracing::warn!(
+                                            camera_id = %cam_id,
+                                            reason = %reason,
+                                            "rtsp: branch B attach refused"
+                                        );
+                                        publisher.mark_unsupported();
+                                    }
+                                }
+                            }
+                        }
+                        Some(SessionCommand::DetachMp4Branch) => {
+                            if let Some(state) = branch_b.take() {
+                                detach_mp4_branch(pipeline, &tee, state);
+                                tracing::info!(
+                                    camera_id = %cam_id,
+                                    "rtsp: branch B detached"
+                                );
+                            }
                         }
                     }
                 }
@@ -886,6 +1136,17 @@ async fn sleep_with_cancel(
                         *config = new_config;
                         return true;
                     }
+                    Some(SessionCommand::AttachMp4Branch(publisher)) => {
+                        // No pipeline is running during reconnect backoff;
+                        // refuse the attach cleanly so the hub-side waiter
+                        // unblocks immediately and the caller sees
+                        // `FactoryFailed`. The next subscriber after
+                        // reconnect succeeds will trigger a fresh attach.
+                        publisher.mark_unsupported();
+                    }
+                    Some(SessionCommand::DetachMp4Branch) => {
+                        // Branch already absent (no pipeline) — no-op.
+                    }
                 }
             }
             _ = &mut sleeper => return true,
@@ -935,6 +1196,10 @@ async fn drain_until_stop(
                 let _ = reply.send(Err(CameraIngestError::SnapshotFailed(msg)));
             }
             SessionCommand::UpdateConfig(_) | SessionCommand::Restart(_) => {}
+            SessionCommand::AttachMp4Branch(publisher) => {
+                publisher.mark_unsupported();
+            }
+            SessionCommand::DetachMp4Branch => {}
         }
     }
 }

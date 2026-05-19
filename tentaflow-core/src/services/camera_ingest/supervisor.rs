@@ -17,6 +17,8 @@ use super::fakefile::ensure_gst_initialized;
 use super::session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, SessionCommand, SnapshotData,
 };
+use super::stream_publisher::Mp4StreamPublisher;
+use crate::services::stream_hub::StreamHub;
 
 /// Maximum concurrent cameras the supervisor allows per owning addon.
 /// Bounds RAM, file descriptors, and GStreamer state machines against a
@@ -85,7 +87,11 @@ impl CameraIngestSupervisor {
             } else if g.contains_key(&handle.id) {
                 Outcome::Raced
             } else {
+                let camera_id = handle.id.clone();
+                let cmd_tx = handle.cmd_tx.clone();
                 g.insert(handle.id.clone(), handle);
+                drop(g);
+                register_stream_factory(camera_id, cmd_tx);
                 return Ok(());
             }
         };
@@ -133,6 +139,10 @@ impl CameraIngestSupervisor {
             g.remove(camera_id)
                 .ok_or_else(|| CameraIngestError::NotFound(camera_id.to_string()))?
         };
+        // Drop the stream hub factory before tearing the session down so the
+        // next subscribe call after remove cleanly returns `NotRegistered`
+        // instead of racing against a half-dead session.
+        StreamHub::global().unregister_factory(&format!("camera:{camera_id}"));
         stop_and_join(handle, Duration::from_secs(10)).await;
         crate::services::streaming_bus()
             .close_camera(camera_id, "removed")
@@ -191,7 +201,9 @@ impl CameraIngestSupervisor {
             let mut g = self.registry.write().await;
             g.drain().map(|(_, h)| h).collect()
         };
+        let hub = StreamHub::global();
         for h in &handles {
+            hub.unregister_factory(&format!("camera:{}", h.id));
             let _ = h.cmd_tx.send(SessionCommand::Stop).await;
         }
         let bus = crate::services::streaming_bus();
@@ -275,4 +287,47 @@ impl Default for CameraIngestSupervisor {
 pub async fn start_supervisor() -> Result<CameraIngestSupervisor> {
     ensure_gst_initialized()?;
     Ok(CameraIngestSupervisor::new())
+}
+
+/// Register a fresh `StreamHub` factory under `camera:<id>` that wires every
+/// subscribe call to the running camera session. The factory creates a fresh
+/// `Mp4StreamPublisher`, posts `AttachMp4Branch` to the session in a detached
+/// task (so the factory closure stays synchronous), and yields the publisher
+/// as a `BinaryStreamSource` for the hub to cache. When the hub drops its
+/// last strong reference (final unsubscribe) the publisher's `Drop` impl
+/// posts `DetachMp4Branch` and the session's mux branch is torn down.
+fn register_stream_factory(
+    camera_id: String,
+    cmd_tx: tokio::sync::mpsc::Sender<SessionCommand>,
+) {
+    let stream_id = format!("camera:{}", camera_id);
+    let camera_id_factory = camera_id.clone();
+    let factory = Box::new(move || {
+        let publisher = std::sync::Arc::new(Mp4StreamPublisher::new(
+            camera_id_factory.clone(),
+            cmd_tx.clone(),
+        ));
+        // Detach the attach signal from the synchronous factory call. The
+        // factory closure may run under the hub's read lock — blocking it on
+        // an mpsc::send would deadlock if the session task is itself trying
+        // to grab the hub for an unrelated operation.
+        let cmd_tx_attach = cmd_tx.clone();
+        let pub_for_attach = std::sync::Arc::clone(&publisher);
+        tokio::spawn(async move {
+            if cmd_tx_attach
+                .send(SessionCommand::AttachMp4Branch(pub_for_attach.clone()))
+                .await
+                .is_err()
+            {
+                // Session has stopped before the factory ran — wake any
+                // hub-side waiter immediately so it does not stall the
+                // full 3 s init segment timeout.
+                pub_for_attach.mark_unsupported();
+            }
+        });
+        Ok(publisher as std::sync::Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
+    });
+    if let Err(e) = StreamHub::global().register_factory(stream_id.clone(), factory) {
+        tracing::warn!(camera_id = %camera_id, stream_id = %stream_id, "register_stream_factory failed: {e}");
+    }
 }
