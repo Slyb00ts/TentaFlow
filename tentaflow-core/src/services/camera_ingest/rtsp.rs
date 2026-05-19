@@ -233,34 +233,63 @@ pub fn build_rtsp_pipeline(
     install_frame_callback(&appsink_app, camera_id, mailbox, counters);
 
     // Dynamic pad-added handler — link only the video RTP pad.
+    //
+    // rtspsrc emits `pad-added` as soon as the pad is created, but `current_caps()`
+    // can still be None at that moment — RTP caps are negotiated asynchronously
+    // and may only land on the pad after a `notify::caps` signal. For multi-
+    // stream sources (UniFi Protect publishes 2 audio + 1 video pads, Hikvision
+    // similar) every pad arrives without caps, so the `current_caps() -> None ->
+    // return` early-exit silently drops the video pad and the pipeline never
+    // produces frames. We therefore try to link immediately if caps are present,
+    // and fall back to a one-shot `notify::caps` watcher otherwise.
     let depay_weak = depay.downgrade();
+    let try_link = std::sync::Arc::new(
+        move |src_pad: &gst::Pad| -> std::ops::ControlFlow<(), ()> {
+            // ControlFlow::Break = handled (linked, skipped, or impossible) — no
+            // need to keep watching. ControlFlow::Continue = caps not yet known.
+            let Some(depay) = depay_weak.upgrade() else {
+                return std::ops::ControlFlow::Break(());
+            };
+            let Some(sink_pad) = depay.static_pad("sink") else {
+                return std::ops::ControlFlow::Break(());
+            };
+            if sink_pad.is_linked() {
+                return std::ops::ControlFlow::Break(());
+            }
+            let Some(caps) = src_pad.current_caps() else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let Some(structure) = caps.structure(0) else {
+                return std::ops::ControlFlow::Break(());
+            };
+            let media: Option<String> = structure.get::<String>("media").ok();
+            if media.as_deref() != Some("video") {
+                tracing::debug!(
+                    "rtsp: skipping non-video pad (media={:?})",
+                    media
+                );
+                return std::ops::ControlFlow::Break(());
+            }
+            if let Err(e) = src_pad.link(&sink_pad) {
+                tracing::warn!("rtsp: failed to link rtspsrc → depay: {e:?}");
+            } else {
+                tracing::info!("rtsp: video pad linked");
+            }
+            std::ops::ControlFlow::Break(())
+        },
+    );
+    let try_link_pad = try_link.clone();
     rtspsrc.connect_pad_added(move |_src, src_pad| {
-        let Some(depay) = depay_weak.upgrade() else {
-            return;
-        };
-        let Some(sink_pad) = depay.static_pad("sink") else {
-            return;
-        };
-        if sink_pad.is_linked() {
+        if try_link_pad(src_pad).is_break() {
             return;
         }
-        // Filter on media=video so audio/metadata streams do not get wired
-        // into the H.264 decoder. Default-deny: if caps are missing or the
-        // `media` field is unreadable, refuse the link instead of forwarding
-        // arbitrary payloads to the H.264 path.
-        let Some(caps) = src_pad.current_caps() else {
-            return;
-        };
-        let Some(structure) = caps.structure(0) else {
-            return;
-        };
-        let media: Option<String> = structure.get::<String>("media").ok();
-        if media.as_deref() != Some("video") {
-            return;
-        }
-        if let Err(e) = src_pad.link(&sink_pad) {
-            tracing::warn!("rtsp: failed to link rtspsrc → depay: {e:?}");
-        }
+        // Caps not negotiated yet — re-try on every caps change. We rely on
+        // the sink_pad.is_linked() check inside try_link to keep this
+        // idempotent across multiple `notify::caps` emissions.
+        let try_link_notify = try_link_pad.clone();
+        src_pad.connect_notify_local(Some("caps"), move |pad, _spec| {
+            let _ = try_link_notify(pad);
+        });
     });
 
     Ok(pipeline)
@@ -347,7 +376,19 @@ pub async fn run_rtsp_session(
     // because health ticks publish every second but failures publish once.
     let mut last_error: Option<String> = None;
 
-    publish(&health_tx, &cam_id, CameraStatus::Starting, None, &counters, None);
+    publish(
+        &health_tx,
+        &cam_id,
+        CameraStatus::Starting,
+        Some("łączenie z kamerą…".to_string()),
+        &counters,
+        None,
+    );
+    // Initial sticky reason — overwritten on first failure with the actual
+    // GStreamer error. Without this the UI sees an empty `Komunikat` between
+    // T=0 (pipeline build) and T=warmup_deadline (first failure publish),
+    // which can be 5–30 seconds while user thinks nothing is happening.
+    last_error = Some("łączenie z kamerą…".to_string());
 
     'outer: loop {
         // Resolve credentials at every (re)build so an in-flight
