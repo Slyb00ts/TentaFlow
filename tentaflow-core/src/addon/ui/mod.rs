@@ -1,5 +1,6 @@
 // === File: addon/ui/mod.rs — top-level UiComponent sum + PanelTree + JSON entry points ===
 
+pub mod container;
 pub mod layout;
 pub mod legacy;
 pub mod theme;
@@ -11,8 +12,8 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Top-level komponent SDK UI. Sum type kategorii: `Layout` (Chunk 2.1),
-/// `Legacy` (pre-2.1 — usuwane stopniowo w 2.2-2.6). Kolejne kategorie:
-/// Container/DataDisplay/Feedback/Form/Action/Specialized — dorzucane
+/// `Container` (Chunk 2.2) i `Legacy` (pre-2.1 — usuwane stopniowo w 2.3-2.6).
+/// Kolejne kategorie: DataDisplay/Feedback/Form/Action/Specialized — dorzucane
 /// w następnych chunkach.
 ///
 /// Wariant na poziomie JSON jest rozpoznawany przez serde `untagged` —
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 #[serde(untagged)]
 pub enum UiComponent {
     Layout(layout::LayoutComponent),
+    Container(container::ContainerComponent),
     Legacy(legacy::LegacyComponent),
 }
 
@@ -30,9 +32,8 @@ pub enum UiComponent {
 // =============================================================================
 
 /// Drzewo UI addonu w formacie v2. `root` to lista komponentów najwyższego
-/// poziomu, `overlays` to slot top-level dla modali/drawerów/toastów
-/// (poza flow rozkładu), `navigation` definiuje strukturę tabsów/routingu
-/// addona (Chunk 2.2 doprecyzowuje).
+/// poziomu, `overlays` to slot top-level dla modali/drawerów/popoverów
+/// (poza flow rozkładu), `navigation` definiuje strukturę nawigacji addona.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PanelTree {
     pub root: Vec<UiComponent>,
@@ -42,22 +43,42 @@ pub struct PanelTree {
     pub navigation: Option<NavigationSpec>,
 }
 
-/// Overlay top-level (modal/drawer/toast) — pełna struktura w Chunk 2.2.
-/// Na tym etapie tylko identyfikator + zawartość, żeby PanelTree miał
-/// stabilny kształt już teraz.
+/// Overlay top-level (modal/drawer/popover). `content` MUSI być wariantem
+/// `UiComponent::Container(Window | Drawer | Popover)`; inne typy są
+/// odrzucane przez `parse_and_validate_ui_json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Overlay {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub content: Vec<UiComponent>,
+    #[serde(default = "Overlay::default_visible")]
+    pub visible: bool,
+    pub content: Box<UiComponent>,
+    #[serde(default = "Overlay::default_z_index")]
+    pub z_index: u32,
 }
 
-/// Specyfikacja nawigacji addonu (tabs + routing przez `panel_navigate`) —
-/// pełna struktura w Chunk 2.2.
+impl Overlay {
+    fn default_visible() -> bool {
+        true
+    }
+    fn default_z_index() -> u32 {
+        1000
+    }
+}
+
+/// Specyfikacja nawigacji addonu. `breadcrumb` to hierarchiczna ścieżka do
+/// bieżącego panelu, `current_panel` pomaga rendererowi podświetlić aktywny
+/// item w NavTabs/Sidebar, a `sidebar` to top-level navigation tree addonu.
+///
+/// `sidebar` trzyma sekcje przez `Vec<SidebarSection>` zamiast referencji do
+/// całego wariantu `ContainerComponent::Sidebar`, żeby uniknąć cyklicznych
+/// zależności typu w drzewie i utrzymać prostszy JSON shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NavigationSpec {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breadcrumb: Option<container::Breadcrumb>,
+    pub current_panel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar: Option<Vec<container::SidebarSection>>,
 }
 
 // =============================================================================
@@ -125,29 +146,33 @@ impl PanelFormat {
 ///
 /// Validation contract matches pre-2.1: malformed components are hard
 /// errors (no silent drop), `LiveCameraTile.ttl_secs` is clamped,
-/// `camera_id`/`stream_id` are strictly checked. Error messages never
-/// echo addon input.
+/// `camera_id`/`stream_id` are strictly checked. Container-overlay
+/// placement is enforced: `Window`/`Drawer`/`Popover` only live in
+/// `overlays[].content`. Error messages never echo addon input.
 pub fn parse_and_validate_ui_json(json: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let parsed: PanelFormat = serde_json::from_value(json.clone())
         .map_err(|e| anyhow::anyhow!("invalid panel json: {}", e))?;
     let mut tree = parsed.into_tree();
     for c in &mut tree.root {
+        reject_overlay_kind_in_root(c)?;
         validate_and_normalize_component(c)?;
     }
     for overlay in &mut tree.overlays {
-        for c in &mut overlay.content {
-            validate_and_normalize_component(c)?;
-        }
+        validate_overlay_content_kind(&overlay.content)?;
+        validate_and_normalize_component(&mut overlay.content)?;
     }
     Ok(serde_json::to_value(&tree)?)
 }
 
 /// Recursively validate+normalize a single component. Layout container
 /// children are visited transparently; legacy components delegate to
-/// `legacy::validate_and_normalize` (preserves pre-2.1 invariants).
+/// `legacy::validate_and_normalize` (preserves pre-2.1 invariants);
+/// container components delegate to `container::validate_and_normalize`.
 pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::Result<()> {
     match component {
         UiComponent::Layout(layout) => validate_layout(layout),
+        UiComponent::Container(c) => container::validate_and_normalize(c)
+            .map_err(|e| anyhow::anyhow!("container validation failed: {}", e)),
         UiComponent::Legacy(legacy) => legacy::validate_and_normalize(legacy),
     }
 }
@@ -157,12 +182,14 @@ fn validate_layout(layout: &mut layout::LayoutComponent) -> anyhow::Result<()> {
     match layout {
         Stack { children, .. } => {
             for c in children {
+                reject_overlay_kind_in_root(c)?;
                 validate_and_normalize_component(c)?;
             }
             Ok(())
         }
         Grid { children, .. } => {
             for item in children {
+                reject_overlay_kind_in_root(&item.component)?;
                 validate_and_normalize_component(&mut item.component)?;
             }
             Ok(())
@@ -170,11 +197,34 @@ fn validate_layout(layout: &mut layout::LayoutComponent) -> anyhow::Result<()> {
         Split {
             primary, secondary, ..
         } => {
+            reject_overlay_kind_in_root(primary)?;
+            reject_overlay_kind_in_root(secondary)?;
             validate_and_normalize_component(primary)?;
             validate_and_normalize_component(secondary)?;
             Ok(())
         }
         Spacer { .. } | Divider { .. } => Ok(()),
+    }
+}
+
+/// Reject `Window`/`Drawer`/`Popover` placed outside of `overlays[].content`.
+/// Recursion to children happens inside the normal validator — this only
+/// checks the current node.
+fn reject_overlay_kind_in_root(component: &UiComponent) -> anyhow::Result<()> {
+    if let UiComponent::Container(c) = component {
+        if container::is_overlay_kind(c) {
+            anyhow::bail!("overlay_kind_outside_overlays");
+        }
+    }
+    Ok(())
+}
+
+/// `Overlay.content` MUSI być `Container::Window | Drawer | Popover`. Inne
+/// typy są błędem — addon ma świadomie wybrać overlay kind.
+fn validate_overlay_content_kind(component: &UiComponent) -> anyhow::Result<()> {
+    match component {
+        UiComponent::Container(c) if container::is_overlay_kind(c) => Ok(()),
+        _ => anyhow::bail!("overlay_content_must_be_overlay_container"),
     }
 }
 
@@ -211,6 +261,17 @@ mod tests {
 
     fn good_cam_id() -> String {
         "cam_550e8400-e29b-41d4-a716-446655440000".to_string()
+    }
+
+    fn window_overlay_content() -> UiComponent {
+        UiComponent::Container(container::ContainerComponent::Window {
+            title: "Confirm".to_string(),
+            size: container::WindowSize::Md,
+            dismissable: true,
+            on_close: None,
+            children: vec![],
+            footer: vec![],
+        })
     }
 
     #[test]
@@ -303,10 +364,9 @@ mod tests {
             })],
             overlays: vec![Overlay {
                 id: "confirm".to_string(),
-                content: vec![UiComponent::Legacy(LegacyComponent::Text {
-                    content: "Sure?".to_string(),
-                    style: None,
-                })],
+                visible: true,
+                content: Box::new(window_overlay_content()),
+                z_index: 1000,
             }],
             navigation: None,
         };
@@ -335,5 +395,126 @@ mod tests {
         });
         let v = parse_components_from_json(&json);
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn window_in_root_is_rejected() {
+        let json = serde_json::json!({
+            "root": [
+                {
+                    "type": "window",
+                    "title": "no",
+                    "children": []
+                }
+            ]
+        });
+        let err = parse_and_validate_ui_json(&json).expect_err("must reject");
+        assert!(format!("{}", err).contains("overlay_kind_outside_overlays"));
+    }
+
+    #[test]
+    fn window_in_overlay_content_is_ok() {
+        let json = serde_json::json!({
+            "root": [],
+            "overlays": [
+                {
+                    "id": "ov",
+                    "content": {
+                        "type": "window",
+                        "title": "Confirm",
+                        "children": []
+                    }
+                }
+            ]
+        });
+        let out = parse_and_validate_ui_json(&json).expect("ok");
+        assert_eq!(out["overlays"][0]["content"]["type"], "window");
+    }
+
+    #[test]
+    fn overlay_with_non_overlay_content_is_rejected() {
+        let json = serde_json::json!({
+            "root": [],
+            "overlays": [
+                {
+                    "id": "ov",
+                    "content": {
+                        "type": "card",
+                        "children": []
+                    }
+                }
+            ]
+        });
+        let err = parse_and_validate_ui_json(&json).expect_err("must reject");
+        assert!(
+            format!("{}", err).contains("overlay_content_must_be_overlay_container")
+        );
+    }
+
+    #[test]
+    fn drawer_nested_inside_stack_is_rejected() {
+        let json = serde_json::json!({
+            "root": [
+                {
+                    "type": "stack",
+                    "direction": "vertical",
+                    "gap": "md",
+                    "align": "stretch",
+                    "justify": "start",
+                    "children": [
+                        {
+                            "type": "drawer",
+                            "title": "no",
+                            "children": []
+                        }
+                    ]
+                }
+            ]
+        });
+        let err = parse_and_validate_ui_json(&json).expect_err("must reject");
+        assert!(format!("{}", err).contains("overlay_kind_outside_overlays"));
+    }
+
+    #[test]
+    fn card_in_root_is_accepted() {
+        let json = serde_json::json!({
+            "root": [
+                {
+                    "type": "card",
+                    "title": "Hello",
+                    "children": [
+                        { "type": "text", "content": "body" }
+                    ]
+                }
+            ]
+        });
+        let out = parse_and_validate_ui_json(&json).expect("ok");
+        assert_eq!(out["root"][0]["type"], "card");
+    }
+
+    #[test]
+    fn navigation_spec_round_trip_with_sidebar() {
+        let nav = NavigationSpec {
+            breadcrumb: Some(container::Breadcrumb {
+                items: vec![container::BreadcrumbItem {
+                    label: "Home".to_string(),
+                    panel_id: Some("dashboard".to_string()),
+                }],
+            }),
+            current_panel: "dashboard".to_string(),
+            sidebar: Some(vec![container::SidebarSection {
+                heading: Some("Main".to_string()),
+                items: vec![container::SidebarItem {
+                    id: "home".to_string(),
+                    label: "Home".to_string(),
+                    icon: Some(theme::IconName::Home),
+                    badge: None,
+                    panel_id: Some("dashboard".to_string()),
+                }],
+            }]),
+        };
+        let j = serde_json::to_value(&nav).expect("serialize");
+        let back: NavigationSpec = serde_json::from_value(j).expect("deserialize");
+        assert_eq!(back, nav);
     }
 }
