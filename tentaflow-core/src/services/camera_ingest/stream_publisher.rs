@@ -62,6 +62,12 @@ pub struct Mp4StreamPublisher {
     init_ready: Notify,
     chunks_tx: broadcast::Sender<Bytes>,
     cmd_tx: mpsc::Sender<SessionCommand>,
+    // mp4mux emits raw fMP4 boxes split across arbitrary `GstBuffer`s. We
+    // accumulate them here, parse 8-byte box headers, and forward to MSE
+    // subscribers as complete segments. See `push_chunk` for the rules.
+    parser_buf: Mutex<Vec<u8>>,
+    pending_init: Mutex<Vec<u8>>,
+    media_buf: Mutex<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Mp4StreamPublisher {
@@ -84,6 +90,9 @@ impl Mp4StreamPublisher {
     pub fn new(camera_id: String, cmd_tx: mpsc::Sender<SessionCommand>) -> Self {
         let (chunks_tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
+            parser_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
+            pending_init: Mutex::new(Vec::with_capacity(2048)),
+            media_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
             stream_id: format!("camera:{}", camera_id),
             init_segment: Mutex::new(None),
             init_ready: Notify::new(),
@@ -92,23 +101,89 @@ impl Mp4StreamPublisher {
         }
     }
 
-    /// Push one mux fragment from the appsink callback. The first call seeds
-    /// the init segment and wakes any waiter blocked in `init_segment()`;
-    /// every later call broadcasts to live subscribers. We do not signal an
-    /// error when the broadcast channel has no receivers — that simply means
-    /// nobody is listening yet (the publisher exists between the factory
-    /// call and the first subscriber receiver attach).
+    /// Push bytes from the `mp4mux` appsink. The muxer flushes raw fMP4
+    /// boxes in arbitrary chunks — a single `GstBuffer` may contain a partial
+    /// box, a full box, or several boxes concatenated. Browser MSE needs the
+    /// init segment (`ftyp` + `moov`) delivered as ONE blob, then each media
+    /// segment (`moof` + `mdat`) delivered as its own blob — splitting in the
+    /// wrong place crashes the `SourceBuffer` (`InvalidStateError` and
+    /// `SourceBuffer has been removed`).
+    ///
+    /// We accumulate bytes in `parser_buf`, parse 8-byte box headers, and:
+    ///   - while `init_segment` is None: keep appending boxes until we see the
+    ///     first `moof` — everything before it is the init segment;
+    ///   - once init is sealed: each `moof+mdat` pair becomes one broadcast
+    ///     chunk (browser appends them as one media segment).
     pub fn push_chunk(&self, bytes: Vec<u8>) {
-        let chunk = Bytes::from(bytes);
-        let mut guard = self.init_segment.lock();
-        if guard.is_none() {
-            *guard = Some(chunk);
-            drop(guard);
-            self.init_ready.notify_waiters();
-            return;
+        let mut buf = self.parser_buf.lock();
+        buf.extend_from_slice(&bytes);
+
+        // Drain as many complete top-level boxes as possible.
+        loop {
+            if buf.len() < 8 {
+                break;
+            }
+            let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            let kind = [buf[4], buf[5], buf[6], buf[7]];
+            // `size == 0` would mean "to end of file" — mp4mux never emits
+            // that for streamable output. `size == 1` would mean 64-bit
+            // largesize follows; again not produced by mp4mux for our caps.
+            // Treat either as a parser desync and refuse to advance.
+            if size < 8 || buf.len() < size {
+                break;
+            }
+            // Detach the box bytes from the front of the buffer.
+            let box_bytes: Vec<u8> = buf.drain(..size).collect();
+
+            let mut init_guard = self.init_segment.lock();
+            if init_guard.is_none() {
+                // Building the init segment: ftyp / moov / styp / sidx /
+                // anything BEFORE the first `moof` belongs here.
+                if &kind == b"moof" {
+                    // Init phase complete — seal what we have and start the
+                    // first media segment with this `moof`.
+                    let pending = std::mem::take(&mut self.pending_init.lock().clone());
+                    if !pending.is_empty() {
+                        *init_guard = Some(Bytes::from(pending));
+                        drop(init_guard);
+                        self.init_ready.notify_waiters();
+                    } else {
+                        // mp4mux emitted `moof` before any init box — shouldn't
+                        // happen with default dash-or-mss fragment mode. Treat
+                        // the moof as start of media regardless; subscribers
+                        // attaching later will time out waiting for init.
+                        drop(init_guard);
+                    }
+                    // Stash this moof; we need its mdat counterpart before
+                    // emitting a complete media segment.
+                    self.media_buf.lock().extend_from_slice(&box_bytes);
+                } else {
+                    self.pending_init.lock().extend_from_slice(&box_bytes);
+                }
+                continue;
+            }
+            drop(init_guard);
+
+            // Media phase — pair every `moof` with the following `mdat` and
+            // broadcast the pair as a single MSE media segment. Stray boxes
+            // (`free`, `mfra`, …) are forwarded immediately so the receiver
+            // SourceBuffer never sees a half-finished append.
+            match &kind {
+                b"moof" => {
+                    self.media_buf.lock().extend_from_slice(&box_bytes);
+                }
+                b"mdat" => {
+                    let mut media = self.media_buf.lock();
+                    media.extend_from_slice(&box_bytes);
+                    let segment = std::mem::take(&mut *media);
+                    drop(media);
+                    let _ = self.chunks_tx.send(Bytes::from(segment));
+                }
+                _ => {
+                    let _ = self.chunks_tx.send(Bytes::from(box_bytes));
+                }
+            }
         }
-        drop(guard);
-        let _ = self.chunks_tx.send(chunk);
     }
 
     /// Mark the publisher as permanently undeliverable. Called by the session
