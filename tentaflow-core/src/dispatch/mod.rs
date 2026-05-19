@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod recorder;
 pub mod resume_token;
 pub mod state;
+pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
@@ -434,6 +435,13 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::LegalAdminPayload::RevokeResponse(_) => {
                 "LegalDocumentRevokeResponse"
             }
+        },
+        MessageBody::StreamBody(p) => match p {
+            tentaflow_protocol::StreamPayload::SubscribeRequest(_) => "StreamSubscribeRequest",
+            tentaflow_protocol::StreamPayload::SubscribeResponse(_) => "StreamSubscribeResponse",
+            tentaflow_protocol::StreamPayload::Frame(_) => "StreamFrame",
+            tentaflow_protocol::StreamPayload::CloseRequest(_) => "StreamCloseRequest",
+            tentaflow_protocol::StreamPayload::Closed(_) => "StreamClosed",
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",

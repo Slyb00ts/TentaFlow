@@ -4065,6 +4065,11 @@ pub enum MessageBody {
     // 256-variant limit + dashboard RODO surface (P8.d).
     LegalAdminBody(crate::legal::LegalAdminPayload),
 
+    // ---- Binary stream pub/sub (Chunk B) ----
+    // Subscribe/Frame/Close/Closed for the live streaming surface, packed
+    // into a single discriminant to stay inside the 256-variant cap.
+    StreamBody(crate::stream::StreamPayload),
+
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
     Error(ProtocolError),

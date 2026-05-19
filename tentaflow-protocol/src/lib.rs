@@ -27,6 +27,7 @@ pub mod mesh;
 pub mod message_body;
 pub mod pii;
 pub mod profiling;
+pub mod stream;
 pub mod types;
 pub mod vision;
 
@@ -41,6 +42,10 @@ pub use legal::{
     LegalAdminPayload, LegalDocumentGenerateRequest, LegalDocumentGenerateResponse,
     LegalDocumentRevokeRequest, LegalDocumentRevokeResponse, LegalDocumentSummary,
     LegalDocumentsListRequest, LegalDocumentsListResponse,
+};
+pub use stream::{
+    StreamCloseRequest, StreamClosedPayload, StreamFramePayload, StreamPayload,
+    StreamSubscribeRequest, StreamSubscribeResponse,
 };
 pub use mesh::*;
 pub use message_body::{
