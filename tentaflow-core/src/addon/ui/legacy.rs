@@ -195,7 +195,7 @@ pub fn validate_and_normalize(component: &mut LegacyComponent) -> anyhow::Result
 
 /// Camera id contract: `cam_<uuid v4>` (length 40). See ui_framework.rs
 /// pre-2.1 for original docstring — error messages never echo input.
-fn validate_camera_id(id: &str) -> anyhow::Result<()> {
+pub(super) fn validate_camera_id(id: &str) -> anyhow::Result<()> {
     if id.len() != 40 || !id.starts_with("cam_") {
         anyhow::bail!("LiveCameraTile.camera_id invalid format");
     }
