@@ -182,8 +182,16 @@ pub fn build_rtsp_pipeline(
     // RTSPS session. Acceptable for typical surveillance deployments where
     // the camera link is L2.
     if is_tls {
-        rtspsrc.set_property_from_str("tls-validation-flags", "");
+        // Empty string panics in gst-rs GFlags parser; use the canonical
+        // GTlsCertificateFlags value name `no-flags` (matches the 0x0 entry
+        // shown by `gst-inspect-1.0 rtspsrc | grep tls`).
+        rtspsrc.set_property_from_str("tls-validation-flags", "no-flags");
     }
+    tracing::info!(
+        "rtsp: built pipeline url_scheme={} protocols={}",
+        if is_tls { "rtsps" } else { "rtsp" },
+        protocols_str
+    );
 
     let depay = gst::ElementFactory::make("rtph264depay")
         .build()
@@ -411,6 +419,11 @@ pub async fn run_rtsp_session(
                 return;
             }
         };
+        tracing::info!(
+            camera_id = %cam_id,
+            attempt = attempt,
+            "rtsp: building pipeline"
+        );
         let pipeline = match build_rtsp_pipeline(
             cam_id.clone(),
             &final_url,
@@ -421,6 +434,7 @@ pub async fn run_rtsp_session(
             Ok(p) => p,
             Err(e) => {
                 let reason = redact_url_in_text(&format!("build failed: {e}"));
+                tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: pipeline build failed");
                 publish(
                     &health_tx,
                     &cam_id,
@@ -435,9 +449,11 @@ pub async fn run_rtsp_session(
             }
         };
 
+        tracing::info!(camera_id = %cam_id, "rtsp: setting pipeline state -> Playing");
         if let Err(e) = pipeline.set_state(gst::State::Playing) {
             let raw_reason = format!("set_state(Playing) failed: {e}");
             let reason = redact_url_in_text(&raw_reason);
+            tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: set_state Playing failed");
             let _ = pipeline.set_state(gst::State::Null);
             streaming_bus().close_camera(&cam_id, &reason).await;
             // A pure state-set failure is recoverable in principle, but it
