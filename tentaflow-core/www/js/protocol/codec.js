@@ -2705,6 +2705,37 @@ export const encode = {
     );
   },
 
+  /** MessageBody::StreamBody(SubscribeRequest) — subskrypcja strumienia
+   *  zarejestrowanego w StreamHub (Chunk B). Server odpowiada
+   *  SubscribeResponse + sekwencja Frame chunkow + Closed na tym samym
+   *  correlation_id. Payload: { streamId }. */
+  streamSubscribeRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
+    const body = _wasm.encodeStreamSubscribeRequest(streamId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::StreamBody(CloseRequest) — wczesna rezygnacja z aktywnej
+   *  subskrypcji. Wysylane na tym samym correlation_id co oryginalny
+   *  SubscribeRequest. Payload: { streamId }. */
+  streamCloseRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
+    const body = _wasm.encodeStreamCloseRequest(streamId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
 };
 
 // =============================================================================
