@@ -15,8 +15,8 @@ pub mod repo;
 pub use error::{OrgError, Result};
 pub use repo::{
     add_membership, create_organization, delete_organization, get_organization,
-    get_user_role_in_org, list_memberships_for_org, list_memberships_for_user,
-    list_organizations, list_roles, remove_membership, update_organization, OrgPatch,
+    get_user_role_in_org, list_memberships_for_org, list_memberships_for_user, list_organizations,
+    list_roles, remove_membership, update_organization, OrgPatch,
 };
 
 /// Slug of the default organization created by migration v32. All historical
@@ -53,4 +53,3 @@ pub struct OrgMembership {
     pub granted_at: String,
     pub granted_by: String,
 }
-

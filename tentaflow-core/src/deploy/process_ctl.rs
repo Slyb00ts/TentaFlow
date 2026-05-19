@@ -103,7 +103,12 @@ fn terminate_impl(pid: u32) -> Result<()> {
             if errno2 == libc::ESRCH {
                 return Ok(());
             }
-            anyhow::bail!("SIGTERM pid={} group_errno={} pid_errno={}", pid, errno, errno2);
+            anyhow::bail!(
+                "SIGTERM pid={} group_errno={} pid_errno={}",
+                pid,
+                errno,
+                errno2
+            );
         }
     }
     Ok(())
@@ -124,7 +129,12 @@ fn force_kill(pid: u32) -> Result<()> {
             if errno2 == libc::ESRCH {
                 return Ok(());
             }
-            anyhow::bail!("SIGKILL pid={} group_errno={} pid_errno={}", pid, errno, errno2);
+            anyhow::bail!(
+                "SIGKILL pid={} group_errno={} pid_errno={}",
+                pid,
+                errno,
+                errno2
+            );
         }
     }
     Ok(())

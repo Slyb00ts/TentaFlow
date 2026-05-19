@@ -271,7 +271,13 @@ pub fn handle_legal_url(
     }
 
     if let Err(e) = verify_legal_token(issuer, path_doc_id, org_id, nonce, exp_ms, token) {
-        return audit_and_return(pool, path_doc_id, Some(org_id), ctx, LegalOutcome::Denied(e));
+        return audit_and_return(
+            pool,
+            path_doc_id,
+            Some(org_id),
+            ctx,
+            LegalOutcome::Denied(e),
+        );
     }
 
     let conn_guard = match pool.lock() {
@@ -418,7 +424,17 @@ fn audit_and_return(
     } else {
         "info"
     };
-    write_audit_row(pool, doc_id, org_id, ctx, "legal.download", result, reason, severity, None);
+    write_audit_row(
+        pool,
+        doc_id,
+        org_id,
+        ctx,
+        "legal.download",
+        result,
+        reason,
+        severity,
+        None,
+    );
     outcome
 }
 
@@ -429,20 +445,28 @@ fn audit_legal_file_access(
     ctx: RequestContext<'_>,
     outcome: &LegalFileOutcome,
 ) {
-    let (result, reason, severity, size): (&'static str, Option<String>, &'static str, Option<i64>) =
-        match outcome {
-            LegalFileOutcome::Ok { bytes } => ("ok", None, "info", Some(bytes.len() as i64)),
-            LegalFileOutcome::FileMissing => {
-                ("not_found", Some("file_missing".into()), "warn", None)
-            }
-            LegalFileOutcome::FileTooLarge => {
-                ("error", Some("file_exceeds_response_cap".into()), "error", None)
-            }
-            LegalFileOutcome::PathTraversal => {
-                ("denied", Some("path_outside_legal_root".into()), "error", None)
-            }
-            LegalFileOutcome::IoError => ("error", Some("file_read_failed".into()), "error", None),
-        };
+    let (result, reason, severity, size): (
+        &'static str,
+        Option<String>,
+        &'static str,
+        Option<i64>,
+    ) = match outcome {
+        LegalFileOutcome::Ok { bytes } => ("ok", None, "info", Some(bytes.len() as i64)),
+        LegalFileOutcome::FileMissing => ("not_found", Some("file_missing".into()), "warn", None),
+        LegalFileOutcome::FileTooLarge => (
+            "error",
+            Some("file_exceeds_response_cap".into()),
+            "error",
+            None,
+        ),
+        LegalFileOutcome::PathTraversal => (
+            "denied",
+            Some("path_outside_legal_root".into()),
+            "error",
+            None,
+        ),
+        LegalFileOutcome::IoError => ("error", Some("file_read_failed".into()), "error", None),
+    };
     write_audit_row(
         pool,
         doc_id,
@@ -538,13 +562,14 @@ mod tests {
 
     #[test]
     fn parse_query_happy() {
-        let q = parse_query(
-            "token=abc&exp=1234&org=11111111-1111-4111-8111-111111111111&nonce=n",
-        )
-        .expect("ok");
+        let q = parse_query("token=abc&exp=1234&org=11111111-1111-4111-8111-111111111111&nonce=n")
+            .expect("ok");
         assert_eq!(q.token.as_deref(), Some("abc"));
         assert_eq!(q.exp_ms, Some(1234));
-        assert_eq!(q.org.as_deref(), Some("11111111-1111-4111-8111-111111111111"));
+        assert_eq!(
+            q.org.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
         assert_eq!(q.nonce.as_deref(), Some("n"));
     }
 
@@ -578,10 +603,7 @@ mod tests {
 
     #[test]
     fn outcome_http_status_codes() {
-        assert_eq!(
-            LegalOutcome::BadRequest("x").http_status(),
-            400
-        );
+        assert_eq!(LegalOutcome::BadRequest("x").http_status(), 400);
         assert_eq!(LegalOutcome::NotFound.http_status(), 404);
         assert_eq!(
             LegalOutcome::Denied(SignedUrlError::InvalidSignature).http_status(),
@@ -591,4 +613,3 @@ mod tests {
         assert_eq!(LegalOutcome::InternalError("x").http_status(), 500);
     }
 }
-

@@ -279,13 +279,21 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "camera_remove_v1", camera::camera_remove_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_remove_v1: {e}"))?;
         linker
-            .func_wrap("tentaflow", "camera_snapshot_v1", camera::camera_snapshot_v1)
+            .func_wrap(
+                "tentaflow",
+                "camera_snapshot_v1",
+                camera::camera_snapshot_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_snapshot_v1: {e}"))?;
         linker
             .func_wrap("tentaflow", "camera_health_v1", camera::camera_health_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_health_v1: {e}"))?;
         linker
-            .func_wrap("tentaflow", "camera_discover_v1", camera::camera_discover_v1)
+            .func_wrap(
+                "tentaflow",
+                "camera_discover_v1",
+                camera::camera_discover_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_discover_v1: {e}"))?;
         linker
             .func_wrap(
@@ -304,7 +312,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
 
         // --- Streaming API (F1a M1.W7 — TentaVision frame bus + PickupToken) ---
         linker
-            .func_wrap("tentaflow", "stream_subscribe_v1", streaming::stream_subscribe_v1)
+            .func_wrap(
+                "tentaflow",
+                "stream_subscribe_v1",
+                streaming::stream_subscribe_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja stream_subscribe_v1: {e}"))?;
         linker
             .func_wrap("tentaflow", "stream_next_v1", streaming::stream_next_v1)
@@ -569,9 +581,10 @@ pub fn audit_log_with_risk(
         // pre-F2 chained row on disk; a column-only addition keeps the
         // verifier compatible with historical rows. Fallback to
         // `org-default` for system / boot starts that have no org context.
-        let org_for_row = state.org_id.as_deref().unwrap_or(
-            crate::services::org::DEFAULT_ORG_ID,
-        );
+        let org_for_row = state
+            .org_id
+            .as_deref()
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID);
         let _ = conn.execute(
             "INSERT INTO audit_log (user_id, addon_id, instance_id, action, resource_type, resource_id, result, error_message, action_hash, risk_class, related_claim_id, request_id, timestamp, prev_hash, hash, org_id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",

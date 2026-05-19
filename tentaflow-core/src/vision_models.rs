@@ -121,8 +121,8 @@ pub async fn ensure_for_kind(
     }
 
     // SCRFD jest obsłużony wyżej; wszystkie pozostałe silniki mają URL.
-    let (filename, url) = url_for_kind(kind)
-        .expect("url_for_kind should return Some for non-SCRFD vision engines");
+    let (filename, url) =
+        url_for_kind(kind).expect("url_for_kind should return Some for non-SCRFD vision engines");
 
     let dest = vision_models_dir().join(filename);
     if file_ok(&dest) {

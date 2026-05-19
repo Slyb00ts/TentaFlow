@@ -31,7 +31,9 @@ use super::{
 };
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
-use crate::flow_runtime::scheduler::{FlowScheduler, InvocationStatus, InvokeError, MAX_SYNC_WAIT_MS};
+use crate::flow_runtime::scheduler::{
+    FlowScheduler, InvocationStatus, InvokeError, MAX_SYNC_WAIT_MS,
+};
 
 // =============================================================================
 // Permission + audit constants
@@ -148,8 +150,8 @@ fn read_toml_input(
     if enforce_payload_size(input_len as usize, PayloadKind::Secret).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
-    let bytes = read_guest_bytes(memory, caller, input_ptr, input_len)
-        .ok_or(AbiError::Operation)?;
+    let bytes =
+        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|_| AbiError::Operation)
@@ -253,7 +255,15 @@ pub fn dispatch_invoke(
     // callers (is_system_call=true with no user_id) record NULL.
     let actor_user_id = state.user_id;
     let org_id = state.org_id.clone();
-    match run_invoke(scheduler, &state.addon_id, &input.flow_id, input.input.clone(), input.wait_ms, actor_user_id, org_id) {
+    match run_invoke(
+        scheduler,
+        &state.addon_id,
+        &input.flow_id,
+        input.input.clone(),
+        input.wait_ms,
+        actor_user_id,
+        org_id,
+    ) {
         Ok(out) => {
             audit(
                 state,
@@ -290,7 +300,14 @@ pub fn run_invoke(
     org_id: Option<String>,
 ) -> Result<FlowInvocationOutput, (AbiError, &'static str)> {
     let wait_ms = wait_ms.min(MAX_SYNC_WAIT_MS);
-    let res = block_on_runtime(scheduler.invoke(addon_id, flow_id, input, wait_ms, actor_user_id, org_id));
+    let res = block_on_runtime(scheduler.invoke(
+        addon_id,
+        flow_id,
+        input,
+        wait_ms,
+        actor_user_id,
+        org_id,
+    ));
     match res {
         Ok(status) => Ok(FlowInvocationOutput::from(status)),
         Err(e) => Err(map_invoke_error(&e)),
@@ -428,7 +445,13 @@ pub fn flow_invoke_v1(
     let toml_str = match read_toml_input(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), ACTION_INVOKE, None, "denied", Some("payload_invalid"));
+            audit(
+                caller.data(),
+                ACTION_INVOKE,
+                None,
+                "denied",
+                Some("payload_invalid"),
+            );
             return e.as_i32();
         }
     };
@@ -459,7 +482,13 @@ pub fn flow_status_v1(
     let toml_str = match read_toml_input(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), ACTION_STATUS, None, "denied", Some("payload_invalid"));
+            audit(
+                caller.data(),
+                ACTION_STATUS,
+                None,
+                "denied",
+                Some("payload_invalid"),
+            );
             return e.as_i32();
         }
     };
@@ -490,7 +519,13 @@ pub fn flow_cancel_v1(
     let toml_str = match read_toml_input(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), ACTION_CANCEL, None, "denied", Some("payload_invalid"));
+            audit(
+                caller.data(),
+                ACTION_CANCEL,
+                None,
+                "denied",
+                Some("payload_invalid"),
+            );
             return e.as_i32();
         }
     };

@@ -24,10 +24,7 @@ pub fn flow_outcome_to_chat_response(
         FlowValue::Empty => Cow::Borrowed(""),
         other => Cow::Owned(serde_json::to_string(&payload_to_json(other)).unwrap_or_default()),
     };
-    let finish_reason = outcome
-        .finish_reason
-        .as_openai_str()
-        .map(|s| s.to_string());
+    let finish_reason = outcome.finish_reason.as_openai_str().map(|s| s.to_string());
 
     ChatCompletionResponse {
         id: generate_response_id(),
@@ -156,7 +153,11 @@ pub(crate) fn payload_to_json(v: &FlowValue) -> serde_json::Value {
             "mime": mime,
         }),
         FlowValue::Embedding(e) => serde_json::json!({"type":"embedding","values":e}),
-        FlowValue::Other { blob_ref, mime, filename } => serde_json::json!({
+        FlowValue::Other {
+            blob_ref,
+            mime,
+            filename,
+        } => serde_json::json!({
             "type": "other",
             "blob_id": blob_ref.id,
             "mime": mime,

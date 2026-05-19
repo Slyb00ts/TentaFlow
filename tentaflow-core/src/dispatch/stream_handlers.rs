@@ -131,11 +131,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     .reasoning_content
                     .as_deref()
                     .filter(|s| !s.is_empty());
-                let content = choice
-                    .delta
-                    .content
-                    .as_deref()
-                    .filter(|s| !s.is_empty());
+                let content = choice.delta.content.as_deref().filter(|s| !s.is_empty());
 
                 if let Some(r) = reasoning {
                     let payload = if in_thinking {

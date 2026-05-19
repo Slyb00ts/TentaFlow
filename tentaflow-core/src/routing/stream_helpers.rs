@@ -124,7 +124,7 @@ fn make_chunk(
         transcribed_text: None,
         speaker_id: None,
         speaker_name: None,
-    usage: None,
+        usage: None,
     }
 }
 
@@ -196,6 +196,10 @@ mod tests {
         let collected: Vec<_> = converted.collect().await;
 
         assert_eq!(collected.len(), 1);
-        assert!(collected[0].as_ref().unwrap_err().to_string().contains("remote failed"));
+        assert!(collected[0]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("remote failed"));
     }
 }

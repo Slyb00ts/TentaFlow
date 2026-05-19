@@ -20,8 +20,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    close_outbound, emit_op_audit, next_record, read_param_string, record_field_dot,
-    send_to_port, OnError, OperatorContext, OperatorError, OutboundEdge,
+    close_outbound, emit_op_audit, next_record, read_param_string, record_field_dot, send_to_port,
+    OnError, OperatorContext, OperatorError, OutboundEdge,
 };
 use crate::flow_runtime::bounded_drop_oldest::BoundedDropOldest;
 use crate::flow_runtime::scheduler::FlowMessage;
@@ -138,7 +138,9 @@ fn parse_literal(s: &str) -> Result<Literal, OperatorError> {
     let s = s.trim();
     if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
         if s.len() < 2 {
-            return Err(OperatorError::BadParams("branch: malformed quoted literal".to_string()));
+            return Err(OperatorError::BadParams(
+                "branch: malformed quoted literal".to_string(),
+            ));
         }
         // Unescape: \" → ", \' → ', \\ → \. Lexer above treats `\<quote>` as
         // a literal quote inside the string; this routine collapses the
@@ -266,7 +268,9 @@ pub async fn run(
                                 "branch",
                                 "error",
                                 "error",
-                                Some(serde_json::json!({"reason": "eval_failed", "field": expr.field})),
+                                Some(
+                                    serde_json::json!({"reason": "eval_failed", "field": expr.field}),
+                                ),
                                 ctx.org_id.as_deref(),
                             );
                             close_outbound(&outbound);

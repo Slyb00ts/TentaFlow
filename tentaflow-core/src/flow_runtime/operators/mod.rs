@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
-use std::time::Duration;
 use tracing::warn;
 
 use crate::addon::event_bus::EventBus;
@@ -133,7 +133,10 @@ impl OnError {
 
 /// Reads a string param. Returns `None` for missing key or non-string type.
 pub fn read_param_string(params: &toml::Value, key: &str) -> Option<String> {
-    params.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 pub fn read_param_u32(params: &toml::Value, key: &str) -> Option<u32> {
@@ -253,11 +256,12 @@ pub fn emit_op_audit(
         Ok(c) => c,
         Err(_) => return,
     };
-    let timestamp = chrono::Utc::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut details_obj = serde_json::Map::new();
-    details_obj.insert("flow_id".to_string(), serde_json::Value::String(flow_id.to_string()));
+    details_obj.insert(
+        "flow_id".to_string(),
+        serde_json::Value::String(flow_id.to_string()),
+    );
     details_obj.insert(
         "invocation_id".to_string(),
         serde_json::Value::String(invocation_id.to_string()),
@@ -293,7 +297,8 @@ pub fn emit_op_audit(
         request_id: None,
         timestamp: &timestamp,
     };
-    let (prev_hash, hash) = match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input) {
+    let (prev_hash, hash) = match crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)
+    {
         Ok(p) => p,
         Err(e) => {
             warn!("flow_runtime op audit: chain compute failed: {e}");
@@ -306,7 +311,17 @@ pub fn emit_op_audit(
             (timestamp, user_id, addon_id, action, resource_type, resource_id, \
              result, error_message, severity, risk_class, details, prev_hash, hash, org_id) \
          VALUES (?1, NULL, ?2, ?3, 'flow', ?4, ?5, NULL, 'info', 'C', ?6, ?7, ?8, ?9)",
-        rusqlite::params![timestamp, addon_id, action, flow_id, result, details_json, prev_hash, hash, org_for_row],
+        rusqlite::params![
+            timestamp,
+            addon_id,
+            action,
+            flow_id,
+            result,
+            details_json,
+            prev_hash,
+            hash,
+            org_for_row
+        ],
     );
 }
 
@@ -332,9 +347,7 @@ pub fn toml_to_json(v: &toml::Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
-        toml::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(toml_to_json).collect())
-        }
+        toml::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_to_json).collect()),
         toml::Value::Table(t) => {
             let mut m = serde_json::Map::with_capacity(t.len());
             for (k, vv) in t.iter() {
@@ -362,9 +375,7 @@ pub fn json_to_toml(v: &serde_json::Value) -> toml::Value {
             }
         }
         serde_json::Value::String(s) => toml::Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            toml::Value::Array(arr.iter().map(json_to_toml).collect())
-        }
+        serde_json::Value::Array(arr) => toml::Value::Array(arr.iter().map(json_to_toml).collect()),
         serde_json::Value::Object(map) => {
             let mut t = toml::value::Table::new();
             for (k, vv) in map.iter() {

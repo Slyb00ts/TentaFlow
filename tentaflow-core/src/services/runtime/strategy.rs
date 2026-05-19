@@ -73,7 +73,8 @@ mod tests {
     use crate::services::handles_cache::BackendHandle;
 
     fn target(name: &str) -> ResolvedExecutionTarget {
-        ResolvedExecutionTarget::Local { service_id: 1,
+        ResolvedExecutionTarget::Local {
+            service_id: 1,
             model_name: name.to_string(),
             handle: BackendHandle::Embedded {
                 model_name: name.to_string(),
@@ -88,7 +89,13 @@ mod tests {
         let cands = vec![target("a"), target("b"), target("c")];
         let state = StrategyState::new();
         let ranked = rank(&cands, Strategy::FirstAvailable, &state);
-        assert_eq!(ranked.iter().map(|t| t.requested_model()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|t| t.requested_model())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]

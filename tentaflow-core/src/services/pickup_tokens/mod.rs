@@ -254,8 +254,7 @@ impl PickupTokenIssuer {
         if peer_keys.is_empty() {
             return Err(local_result.unwrap_err());
         }
-        let (payload, _key) =
-            parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire)?;
+        let (payload, _key) = parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire)?;
         if now_unix_ms() > payload.expiry_unix_ms {
             return Err(PickupVerifyError::Expired);
         }
@@ -278,8 +277,7 @@ impl PickupTokenIssuer {
         let peer_entries = crate::services::mesh_keys::mesh_key_pool()
             .verify_keys_with_peers_for(crate::services::mesh_keys::KeyScope::PickupToken);
         let peer_keys: Vec<[u8; 32]> = peer_entries.iter().map(|(_, k)| *k).collect();
-        let peer_match =
-            parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire);
+        let peer_match = parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire);
 
         if let Ok((payload, key)) = local_match {
             // Local match wins — it owns the inflight + one-shot lifecycle.
@@ -327,9 +325,7 @@ impl PickupTokenIssuer {
         self.mesh_consumed.retain(|_, ts| *ts > cutoff);
 
         match self.mesh_consumed.entry(wire.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                Err(PickupVerifyError::AlreadyConsumed)
-            }
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(PickupVerifyError::AlreadyConsumed),
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(Instant::now());
                 Ok(())
@@ -377,8 +373,7 @@ impl PickupTokenIssuer {
         if peer_keys.is_empty() {
             return Err(local_result.unwrap_err());
         }
-        let (payload, _key) =
-            parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire)?;
+        let (payload, _key) = parse_and_verify_multi(peer_keys.iter().map(|k| k.as_slice()), wire)?;
         if now_unix_ms() > payload.expiry_unix_ms {
             return Err(PickupVerifyError::Expired);
         }
@@ -416,10 +411,7 @@ impl Default for PickupTokenIssuer {
 /// HMAC has already been validated by `parse_and_verify_multi`; this pass
 /// runs constant-time comparisons against every candidate key to avoid a
 /// timing channel that would leak "which peer's token did I just receive".
-fn identify_matching_peer(
-    peer_entries: &[(String, [u8; 32])],
-    wire: &str,
-) -> Option<String> {
+fn identify_matching_peer(peer_entries: &[(String, [u8; 32])], wire: &str) -> Option<String> {
     use subtle::ConstantTimeEq;
     let (payload_b64, sig_b64) = wire.split_once('.')?;
     let provided = base64::Engine::decode(
@@ -430,8 +422,7 @@ fn identify_matching_peer(
     let mut found: Option<String> = None;
     for (node_id, key) in peer_entries {
         let expected = self::token::hmac_sign(key, payload_b64);
-        let hit = provided.len() == expected.len()
-            && bool::from(provided.ct_eq(&expected));
+        let hit = provided.len() == expected.len() && bool::from(provided.ct_eq(&expected));
         if hit && found.is_none() {
             found = Some(node_id.clone());
         }
@@ -451,8 +442,8 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use self::token::sign_payload;
+    use super::*;
 
     fn issuer() -> PickupTokenIssuer {
         PickupTokenIssuer::new_for_tests([5u8; 32], Duration::from_secs(30))
@@ -528,14 +519,10 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let path = td.path().join("pickup_token.key");
 
-        let k_a = crate::services::key_storage::PersistentKey::load_or_generate_at(
-            KEY_NAME, &path,
-        )
-        .unwrap();
-        let k_b = crate::services::key_storage::PersistentKey::load_or_generate_at(
-            KEY_NAME, &path,
-        )
-        .unwrap();
+        let k_a = crate::services::key_storage::PersistentKey::load_or_generate_at(KEY_NAME, &path)
+            .unwrap();
+        let k_b = crate::services::key_storage::PersistentKey::load_or_generate_at(KEY_NAME, &path)
+            .unwrap();
         assert_eq!(
             k_a.bytes(),
             k_b.bytes(),
@@ -545,7 +532,9 @@ mod tests {
         // Build issuer B from the disk-loaded key and sign-then-verify.
         let iss = PickupTokenIssuer::new_for_tests(*k_b.bytes(), Duration::from_secs(30));
         let (t, _) = iss.issue("frame_p".into(), "svc".into(), "req-p".into());
-        let p = iss.consume_one_shot(&t.wire()).expect("disk-loaded key verifies");
+        let p = iss
+            .consume_one_shot(&t.wire())
+            .expect("disk-loaded key verifies");
         assert_eq!(p.raw_ref, "frame_p");
     }
 
@@ -629,9 +618,7 @@ mod tests {
 
         // Local issuer uses a different key (the default test key 5u8).
         let i = issuer();
-        let (got_payload, src) = i
-            .verify_only_with_source(&tok.wire())
-            .expect("peer verify");
+        let (got_payload, src) = i.verify_only_with_source(&tok.wire()).expect("peer verify");
         assert_eq!(got_payload.raw_ref, "frame_peer");
         match src {
             VerifySource::Peer(id) => assert_eq!(id, peer_node),
@@ -651,7 +638,9 @@ mod tests {
         let (t, _) = i.issue("frame_r".into(), "svc".into(), "req-r".into());
         i.rotate_in_memory([0x22u8; 32]);
         // Same wire should still verify via the previous-key fallback.
-        let p = i.consume_one_shot(&t.wire()).expect("previous key still valid");
+        let p = i
+            .consume_one_shot(&t.wire())
+            .expect("previous key still valid");
         assert_eq!(p.raw_ref, "frame_r");
     }
 }

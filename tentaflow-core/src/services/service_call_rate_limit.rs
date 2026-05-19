@@ -51,7 +51,10 @@ impl Default for ServiceCallRateLimitConfig {
 #[derive(Debug, PartialEq)]
 pub enum RateLimitResult {
     Allow,
-    AddonLimit { addon_id: String, retry_after_secs: f64 },
+    AddonLimit {
+        addon_id: String,
+        retry_after_secs: f64,
+    },
 }
 
 #[derive(Debug)]
@@ -135,11 +138,10 @@ impl ServiceCallRateLimiter {
                 last_seen: now,
             });
         entry.last_seen = now;
-        match entry.bucket.refill_and_peek(
-            self.config.per_addon_capacity,
-            refill_per_sec,
-            now,
-        ) {
+        match entry
+            .bucket
+            .refill_and_peek(self.config.per_addon_capacity, refill_per_sec, now)
+        {
             Ok(()) => {
                 entry.bucket.commit_one();
                 RateLimitResult::Allow
@@ -221,7 +223,9 @@ fn sweep_audit_map(now: Instant) {
     if map.len() < 1_000 {
         return;
     }
-    map.retain(|_, (last_seen, _)| now.saturating_duration_since(*last_seen) < AUDIT_IDLE_EVICT_AFTER);
+    map.retain(|_, (last_seen, _)| {
+        now.saturating_duration_since(*last_seen) < AUDIT_IDLE_EVICT_AFTER
+    });
     if map.len() >= MAX_AUDIT_ENTRIES {
         let target = MAX_AUDIT_ENTRIES * 3 / 4;
         let mut snapshot: Vec<(String, Instant)> =
@@ -257,7 +261,9 @@ pub fn note_denial_for_audit(addon_id: &str) -> AuditEmitDecision {
         .and_modify(|(anchor, count)| {
             *count = count.saturating_add(1);
             if now.saturating_duration_since(*anchor) >= AUDIT_DENY_WINDOW {
-                decision = AuditEmitDecision::Emit { denied_count: *count };
+                decision = AuditEmitDecision::Emit {
+                    denied_count: *count,
+                };
                 *anchor = now;
                 *count = 0;
             }
@@ -301,7 +307,10 @@ mod tests {
             assert_eq!(rl.check("addon-a"), RateLimitResult::Allow);
         }
         match rl.check("addon-a") {
-            RateLimitResult::AddonLimit { addon_id, retry_after_secs } => {
+            RateLimitResult::AddonLimit {
+                addon_id,
+                retry_after_secs,
+            } => {
                 assert_eq!(addon_id, "addon-a");
                 assert!(retry_after_secs > 0.0);
             }
@@ -315,7 +324,10 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(rl.check("addon-a"), RateLimitResult::Allow);
         }
-        assert!(matches!(rl.check("addon-a"), RateLimitResult::AddonLimit { .. }));
+        assert!(matches!(
+            rl.check("addon-a"),
+            RateLimitResult::AddonLimit { .. }
+        ));
         // addon-b still has a fresh bucket.
         for _ in 0..3 {
             assert_eq!(rl.check("addon-b"), RateLimitResult::Allow);
@@ -346,7 +358,10 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(rl.check("addon-a"), RateLimitResult::Allow);
         }
-        assert!(matches!(rl.check("addon-a"), RateLimitResult::AddonLimit { .. }));
+        assert!(matches!(
+            rl.check("addon-a"),
+            RateLimitResult::AddonLimit { .. }
+        ));
         std::thread::sleep(Duration::from_millis(1_100));
         assert_eq!(rl.check("addon-a"), RateLimitResult::Allow);
     }
@@ -393,7 +408,10 @@ mod tests {
             AuditEmitDecision::Skip => panic!("first denial must emit"),
         }
         for _ in 0..10 {
-            assert!(matches!(note_denial_for_audit(&id), AuditEmitDecision::Skip));
+            assert!(matches!(
+                note_denial_for_audit(&id),
+                AuditEmitDecision::Skip
+            ));
         }
     }
 }

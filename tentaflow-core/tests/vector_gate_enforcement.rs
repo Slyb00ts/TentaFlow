@@ -85,9 +85,9 @@ fn make_state(
         db: pool.clone(),
         permissions: Vec::new(),
         event_bus: Arc::new(tentaflow_core::addon::event_bus::EventBus::new()),
-        permission_checker: Arc::new(
-            tentaflow_core::addon::permissions::PermissionChecker::new(pool),
-        ),
+        permission_checker: Arc::new(tentaflow_core::addon::permissions::PermissionChecker::new(
+            pool,
+        )),
         fuel_consumed: 0,
         is_system_call: true,
         rate_limiter: None,
@@ -205,7 +205,14 @@ fn gated_namespace_with_revoked_claim_denied() {
 #[test]
 fn gated_namespace_with_namespace_scoped_claim_matches() {
     let (_d, pool) = open_pool();
-    issue(&pool, "c1", "dpia", None, Some("faces"), &[("dpo", "alice")]);
+    issue(
+        &pool,
+        "c1",
+        "dpia",
+        None,
+        Some("faces"),
+        &[("dpo", "alice")],
+    );
     let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
     let spec = vector_spec("faces", Some("d4-historical"));
     enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap();
@@ -214,7 +221,14 @@ fn gated_namespace_with_namespace_scoped_claim_matches() {
 #[test]
 fn gated_namespace_with_addon_scoped_claim_rejects_wrong_addon() {
     let (_d, pool) = open_pool();
-    issue(&pool, "c1", "dpia", Some("addon-y"), None, &[("dpo", "alice")]);
+    issue(
+        &pool,
+        "c1",
+        "dpia",
+        Some("addon-y"),
+        None,
+        &[("dpo", "alice")],
+    );
     let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
     let spec = vector_spec("faces", Some("d4-historical"));
     let denial = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();
@@ -230,7 +244,14 @@ fn gate_denial_carries_attempted_claim_id_for_audit_chain() {
     // `audit_log.related_claim_id`. The previous version returned only
     // (AbiError, reason) and the chain was incomplete on denials.
     let (_d, pool) = open_pool();
-    issue(&pool, "c1", "dpia", Some("addon-y"), None, &[("dpo", "alice")]);
+    issue(
+        &pool,
+        "c1",
+        "dpia",
+        Some("addon-y"),
+        None,
+        &[("dpo", "alice")],
+    );
     let state = make_state(pool, "addon-x", vec![gate("d4-historical")]);
     let spec = vector_spec("faces", Some("d4-historical"));
     let denial = enforce_gate_with_policy(&state, &spec, Some("c1")).unwrap_err();

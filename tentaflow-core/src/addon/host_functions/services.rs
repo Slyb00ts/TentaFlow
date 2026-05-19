@@ -96,7 +96,12 @@ pub fn service_list_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit_service(caller.data(), "service.list", "error", Some("input_read_failed"));
+            audit_service(
+                caller.data(),
+                "service.list",
+                "error",
+                Some("input_read_failed"),
+            );
             return e.as_i32();
         }
     };
@@ -129,7 +134,12 @@ pub fn service_list_v1(
             // Without a router the addon is running in a stripped test/boot
             // environment (no mesh registry wired). Return an empty list
             // rather than fabricating data.
-            audit_service(caller.data(), "service.list", "ok", Some("router_unavailable"));
+            audit_service(
+                caller.data(),
+                "service.list",
+                "ok",
+                Some("router_unavailable"),
+            );
             let empty = ServiceListOutput::default();
             return write_toml_capped(&memory, &mut caller, &empty, out_ptr, out_cap, out_len_ptr);
         }
@@ -158,8 +168,11 @@ pub fn service_list_v1(
             None => true,
         })
         .map(|s| {
-            let mut caps: Vec<String> =
-                s.models.iter().flat_map(|m| m.capabilities.clone()).collect();
+            let mut caps: Vec<String> = s
+                .models
+                .iter()
+                .flat_map(|m| m.capabilities.clone())
+                .collect();
             caps.sort();
             caps.dedup();
             ServiceInfoOut {
@@ -352,8 +365,8 @@ fn read_input_toml(
     if input_len == 0 {
         return Ok(String::new());
     }
-    let bytes = read_guest_bytes(memory, caller, input_ptr, input_len)
-        .ok_or(AbiError::Operation)?;
+    let bytes =
+        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|_| AbiError::Operation)
@@ -441,8 +454,11 @@ pub mod test_api {
             .filter(|s| status.map_or(true, |st| s.status == st))
             .filter(|s| node_id.map_or(true, |n| s.node_id == n))
             .map(|s| {
-                let mut caps: Vec<String> =
-                    s.models.iter().flat_map(|m| m.capabilities.clone()).collect();
+                let mut caps: Vec<String> = s
+                    .models
+                    .iter()
+                    .flat_map(|m| m.capabilities.clone())
+                    .collect();
                 caps.sort();
                 caps.dedup();
                 ServiceListItem {

@@ -192,7 +192,10 @@ mod tests {
         let def = synthetic_chat_stream("qwen3.5-0.8b");
         let compiled = CompiledFlow::compile(0, def, &min_registry(), ValidationSource::Synthetic)
             .expect("compile");
-        assert!(compiled.is_streaming, "stream-port edge musi włączyć is_streaming");
+        assert!(
+            compiled.is_streaming,
+            "stream-port edge musi włączyć is_streaming"
+        );
     }
 
     #[test]

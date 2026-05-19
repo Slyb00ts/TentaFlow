@@ -14,9 +14,7 @@ use tentaflow_core::addon::host_functions::gate::{
     required_signer_roles_for_gate,
 };
 use tentaflow_core::addon::manifest::{ClaimRequirement, GateSpec};
-use tentaflow_core::services::policy::{
-    self, ClaimContext, NewClaim, NewSignature, PolicyError,
-};
+use tentaflow_core::services::policy::{self, ClaimContext, NewClaim, NewSignature, PolicyError};
 
 fn open_pool() -> (TempDir, tentaflow_core::db::DbPool) {
     let d = TempDir::new().unwrap();
@@ -88,7 +86,12 @@ fn issue_claim(
 #[test]
 fn gate_check_v1_engine_path_ok_with_required_signers() {
     let (_d, pool) = open_pool();
-    issue_claim(&pool, "c1", "dpia", &[("dpo", "alice"), ("supervisor", "bob")]);
+    issue_claim(
+        &pool,
+        "c1",
+        "dpia",
+        &[("dpo", "alice"), ("supervisor", "bob")],
+    );
     let g = gate(vec![
         req("approval", Some("dpo")),
         req("approval", Some("supervisor")),

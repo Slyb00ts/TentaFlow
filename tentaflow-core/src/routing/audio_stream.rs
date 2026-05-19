@@ -98,10 +98,7 @@ mod tests {
     use futures::StreamExt;
 
     fn make_exec(deltas: Vec<EnvelopeDelta>) -> StreamingExecution {
-        let stream = futures::stream::iter(
-            deltas.into_iter().map(Ok::<_, anyhow::Error>),
-        )
-        .boxed();
+        let stream = futures::stream::iter(deltas.into_iter().map(Ok::<_, anyhow::Error>)).boxed();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(FlowExecutionOutcome {
             final_envelope: FlowEnvelope::empty(),
@@ -118,7 +115,9 @@ mod tests {
     }
 
     async fn collect_frames(
-        mut stream: Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>,
+        mut stream: Pin<
+            Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+        >,
     ) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(frame) = stream.next().await {
@@ -145,7 +144,10 @@ mod tests {
         assert_eq!(frames.len(), 2, "audio + DONE");
         let audio = &frames[0];
         assert!(audio.starts_with("data: "));
-        assert!(audio.contains("AQID"), "base64 of [01 02 03] = AQID, got {audio}");
+        assert!(
+            audio.contains("AQID"),
+            "base64 of [01 02 03] = AQID, got {audio}"
+        );
         assert!(audio.contains("audio/wav"));
         assert!(audio.contains("16000"));
         assert!(audio.contains("\"stop\""));

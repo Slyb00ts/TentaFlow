@@ -27,20 +27,13 @@ use tentaflow_core::db::repository::{
     soft_delete_camera, update_camera, CameraPatch,
 };
 use tentaflow_core::db::DbPool;
-use tentaflow_core::services::camera_ingest::{
-    fakefile, CameraConfig, CameraIngestError,
-};
+use tentaflow_core::services::camera_ingest::{fakefile, CameraConfig, CameraIngestError};
 
 fn make_db() -> DbPool {
     tentaflow_core::db::init(std::path::Path::new(":memory:")).expect("core db init")
 }
 
-fn insert(
-    db: &DbPool,
-    camera_id: &str,
-    owner: &str,
-    url: &str,
-) {
+fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
     insert_camera(
         db,
         camera_id,
@@ -111,7 +104,9 @@ fn db_update_patches_only_provided_fields() {
         ..Default::default()
     };
     assert!(update_camera(&db, "addon-a", "cam_u", &patch, None).expect("update"));
-    let row = get_camera_for_addon(&db, "addon-a", "cam_u", None).unwrap().unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_u", None)
+        .unwrap()
+        .unwrap();
     assert_eq!(row.display_name, "new name");
     assert_eq!(row.target_fps, 15);
     assert_eq!(row.retention_class, "B");
@@ -129,7 +124,9 @@ fn db_update_foreign_owner_does_not_match() {
         ..Default::default()
     };
     assert!(!update_camera(&db, "addon-b", "cam_u2", &patch, None).expect("update"));
-    let row = get_camera_for_addon(&db, "addon-a", "cam_u2", None).unwrap().unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_u2", None)
+        .unwrap()
+        .unwrap();
     assert_eq!(row.display_name, "display");
 }
 
@@ -139,7 +136,10 @@ fn db_soft_delete_then_get_returns_none() {
     insert(&db, "cam_s", "addon-a", "/tmp/s.mp4");
     assert!(soft_delete_camera(&db, "addon-a", "cam_s", None).expect("delete"));
     let row = get_camera_for_addon(&db, "addon-a", "cam_s", None).unwrap();
-    assert!(row.is_none(), "soft-deleted row must not appear in active queries");
+    assert!(
+        row.is_none(),
+        "soft-deleted row must not appear in active queries"
+    );
 }
 
 #[test]
@@ -159,7 +159,9 @@ fn db_re_insert_after_soft_delete_allowed_by_partial_unique_index() {
     soft_delete_camera(&db, "addon-a", "cam_recycle", None).unwrap();
     // Second insert must succeed.
     insert(&db, "cam_recycle", "addon-a", "/tmp/r2.mp4");
-    let row = get_camera_for_addon(&db, "addon-a", "cam_recycle", None).unwrap().unwrap();
+    let row = get_camera_for_addon(&db, "addon-a", "cam_recycle", None)
+        .unwrap()
+        .unwrap();
     assert_eq!(row.url, "/tmp/r2.mp4");
 }
 
@@ -184,7 +186,10 @@ fn db_re_insert_active_id_collides() {
         None,
         None,
     );
-    assert!(res.is_err(), "active row must trigger unique index violation");
+    assert!(
+        res.is_err(),
+        "active row must trigger unique index violation"
+    );
 }
 
 #[test]
@@ -249,10 +254,9 @@ async fn supervisor_add_and_health_via_test_api() {
     // Share the lock with reset-drain tests — otherwise a parallel drain
     // wipes our session before the health probe finishes.
     let _g = drain_mutex().lock().unwrap();
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_test_add");
     let cfg = CameraConfig {
         camera_id: id.clone(),
@@ -273,10 +277,9 @@ async fn supervisor_add_and_health_via_test_api() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_rejects_unsupported_vendor() {
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_bad_vendor");
     let err = sup
         .add_camera(CameraConfig {
@@ -295,10 +298,9 @@ async fn supervisor_rejects_unsupported_vendor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_rejects_fps_out_of_range() {
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_bad_fps");
     let err = sup
         .add_camera(CameraConfig {
@@ -335,10 +337,9 @@ async fn supervisor_snapshot_returns_rgb24_frame() {
     let Some(path) = sample_path() else {
         panic!("sample_traffic.mp4 missing");
     };
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_snap");
     sup.add_camera(CameraConfig {
         camera_id: id.clone(),
@@ -368,7 +369,10 @@ async fn supervisor_snapshot_returns_rgb24_frame() {
 fn camera_id_valid_accepts_uuid_v4_format() {
     use tentaflow_core::addon::host_functions::camera::test_api::camera_id_valid_for_test;
     let id = format!("cam_{}", uuid::Uuid::new_v4());
-    assert!(camera_id_valid_for_test(&id), "fresh uuid id must validate: {id}");
+    assert!(
+        camera_id_valid_for_test(&id),
+        "fresh uuid id must validate: {id}"
+    );
 }
 
 #[test]
@@ -376,14 +380,21 @@ fn camera_id_valid_rejects_bad_inputs() {
     use tentaflow_core::addon::host_functions::camera::test_api::camera_id_valid_for_test;
     assert!(!camera_id_valid_for_test(""));
     assert!(!camera_id_valid_for_test("cam_short"));
-    assert!(!camera_id_valid_for_test("cam_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")); // not hex
-    // Uppercase hex not allowed (DB stores lowercase from uuid crate).
-    assert!(!camera_id_valid_for_test("cam_DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF"));
+    assert!(!camera_id_valid_for_test(
+        "cam_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    )); // not hex
+        // Uppercase hex not allowed (DB stores lowercase from uuid crate).
+    assert!(!camera_id_valid_for_test(
+        "cam_DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF"
+    ));
     // No prefix.
     let raw = uuid::Uuid::new_v4().to_string();
     assert!(!camera_id_valid_for_test(&raw));
     // Wrong prefix.
-    assert!(!camera_id_valid_for_test(&format!("camera_{}", uuid::Uuid::new_v4())));
+    assert!(!camera_id_valid_for_test(&format!(
+        "camera_{}",
+        uuid::Uuid::new_v4()
+    )));
 }
 
 #[test]
@@ -428,7 +439,10 @@ async fn supervisor_init_is_singleton_under_concurrent_callers() {
     });
     let a = h1.await.expect("join1").expect("sup1");
     let b = h2.await.expect("join2").expect("sup2");
-    assert!(StdArc::ptr_eq(&a, &b), "supervisor must be a process-wide singleton");
+    assert!(
+        StdArc::ptr_eq(&a, &b),
+        "supervisor must be a process-wide singleton"
+    );
 }
 
 /// Cross-test mutex used by tests that mutate the shared supervisor's
@@ -468,10 +482,9 @@ async fn supervisor_reset_drains_sessions_without_dropping_singleton() {
     tentaflow_core::addon::host_functions::camera::test_api::reset_supervisor_for_test().await;
 
     // Singleton survives, but the session is gone.
-    let sup_after =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor still alive");
+    let sup_after = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor still alive");
     assert!(std::sync::Arc::ptr_eq(&sup_before, &sup_after));
     let err = sup_after.get_health(&id).await.unwrap_err();
     assert!(matches!(err, CameraIngestError::NotFound(_)));
@@ -498,10 +511,9 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         return;
     };
     let _g = drain_mutex().lock().unwrap();
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let db = make_db();
     let id = uniq("cam_recycle_e2e");
     insert(&db, &id, "addon-recycle", path.to_str().unwrap());
@@ -544,10 +556,9 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_rejects_missing_file_path_fakefile() {
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_missing_path");
     let err = sup
         .add_camera(CameraConfig {
@@ -566,7 +577,12 @@ async fn supervisor_rejects_missing_file_path_fakefile() {
     // because the row is never inserted on failure under the Issue #7
     // reorder (supervisor first, DB second).
     assert!(
-        matches!(err, CameraIngestError::FileNotFound(_) | CameraIngestError::PipelineBuild(_) | CameraIngestError::Internal(_)),
+        matches!(
+            err,
+            CameraIngestError::FileNotFound(_)
+                | CameraIngestError::PipelineBuild(_)
+                | CameraIngestError::Internal(_)
+        ),
         "expected FileNotFound or pipeline-side failure, got {err:?}"
     );
 }
@@ -577,10 +593,9 @@ async fn supervisor_fps_actual_approaches_target_after_warmup() {
     let Some(path) = sample_path() else {
         panic!("sample_traffic.mp4 missing");
     };
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_fps");
     sup.add_camera(CameraConfig {
         camera_id: id.clone(),
@@ -610,10 +625,9 @@ async fn supervisor_remove_closes_streaming_bus() {
         return;
     };
     let _g = drain_mutex().lock().unwrap();
-    let sup =
-        tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
-            .await
-            .expect("supervisor init");
+    let sup = tentaflow_core::addon::host_functions::camera::test_api::supervisor_for_tests()
+        .await
+        .expect("supervisor init");
     let id = uniq("cam_close_bus");
     sup.add_camera(CameraConfig {
         camera_id: id.clone(),
@@ -648,6 +662,9 @@ async fn supervisor_remove_closes_streaming_bus() {
             NextOutcome::Timeout => continue,
         }
     }
-    assert!(saw_terminal, "subscriber must observe terminal event after remove");
+    assert!(
+        saw_terminal,
+        "subscriber must observe terminal event after remove"
+    );
     assert!(bus.list_subscribers(&id).is_empty());
 }

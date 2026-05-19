@@ -16,7 +16,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
-use super::{audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller};
+use super::{
+    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
+};
 use crate::addon::errors::AbiError;
 use crate::addon::manifest::{ClaimRequirement, GateSpec};
 use crate::audit::RiskClass;
@@ -143,14 +145,10 @@ pub fn policy_error_to_reason(err: &PolicyError) -> (&'static str, String) {
     match err {
         PolicyError::ClaimNotFound(_) => ("claim_not_found", err.to_string()),
         PolicyError::ClaimRevoked { .. } => ("claim_revoked", err.to_string()),
-        PolicyError::ClaimNotInValidityPeriod { .. } => {
-            ("claim_outside_validity", err.to_string())
-        }
+        PolicyError::ClaimNotInValidityPeriod { .. } => ("claim_outside_validity", err.to_string()),
         PolicyError::ClaimTypeMismatch { .. } => ("claim_type_mismatch", err.to_string()),
         PolicyError::ClaimScopeMismatch { .. } => ("claim_scope_mismatch", err.to_string()),
-        PolicyError::MissingRequiredSigner { .. } => {
-            ("missing_required_signer", err.to_string())
-        }
+        PolicyError::MissingRequiredSigner { .. } => ("missing_required_signer", err.to_string()),
         PolicyError::DbError(_) => ("policy_db_error", err.to_string()),
     }
 }
@@ -169,8 +167,8 @@ fn read_toml(
     if enforce_payload_size(input_len as usize, PayloadKind::Secret).is_err() {
         return Err(AbiError::PayloadTooLarge);
     }
-    let bytes = read_guest_bytes(memory, caller, input_ptr, input_len)
-        .ok_or(AbiError::Operation)?;
+    let bytes =
+        read_guest_bytes(memory, caller, input_ptr, input_len).ok_or(AbiError::Operation)?;
     std::str::from_utf8(bytes)
         .map(|s| s.to_string())
         .map_err(|_| AbiError::Operation)
@@ -233,7 +231,13 @@ pub fn gate_check_v1(
     let input: GateCheckInput = match toml::from_str(&toml_str) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), None, None, "denied", Some("toml_parse_error"));
+            audit(
+                caller.data(),
+                None,
+                None,
+                "denied",
+                Some("toml_parse_error"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -270,7 +274,12 @@ pub fn gate_check_v1(
     let addon_id = caller.data().addon_id.clone();
     let org_id = caller.data().org_id.clone();
     let pool = caller.data().db.clone();
-    let ctx = build_context(&addon_id, org_id.as_deref(), &gate, resource_scope.as_deref());
+    let ctx = build_context(
+        &addon_id,
+        org_id.as_deref(),
+        &gate,
+        resource_scope.as_deref(),
+    );
 
     let result = verify_claim(&pool, &claim_id, &ctx);
     match result {
@@ -342,10 +351,7 @@ mod tests {
 
     #[test]
     fn primary_claim_type_picks_non_approval() {
-        let g = make_gate(vec![
-            req("approval", Some("dpo")),
-            req("dpia", None),
-        ]);
+        let g = make_gate(vec![req("approval", Some("dpo")), req("dpia", None)]);
         assert_eq!(primary_claim_type_for_gate(&g), "dpia");
     }
 

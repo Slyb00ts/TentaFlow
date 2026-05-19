@@ -69,9 +69,8 @@ pub async fn save_snapshot_rgb24(
 }
 
 fn encode_png_sync(rgb24: Vec<u8>, width: u32, height: u32) -> Result<Vec<u8>> {
-    let img = RgbImage::from_raw(width, height, rgb24).ok_or_else(|| {
-        RecordingError::PngEncode("invalid dimensions vs buffer size".into())
-    })?;
+    let img = RgbImage::from_raw(width, height, rgb24)
+        .ok_or_else(|| RecordingError::PngEncode("invalid dimensions vs buffer size".into()))?;
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
     img.write_to(&mut cursor, ImageFormat::Png)
@@ -102,10 +101,7 @@ mod tests {
         v
     }
 
-    fn temp_home_guard() -> (
-        std::sync::MutexGuard<'static, ()>,
-        tempfile::TempDir,
-    ) {
+    fn temp_home_guard() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
         let guard = super::super::storage::home_sandbox_lock();
         let d = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", d.path());
@@ -116,7 +112,9 @@ mod tests {
     async fn test_save_snapshot_basic() {
         let _home = temp_home_guard();
         let rgb = rgb_buf(64, 48);
-        let saved = save_snapshot_rgb24("cam_unit", &rgb, 64, 48).await.expect("save ok");
+        let saved = save_snapshot_rgb24("cam_unit", &rgb, 64, 48)
+            .await
+            .expect("save ok");
         assert!(saved.file_path.exists());
         assert!(saved.file_size_bytes > 0);
         assert_eq!(saved.hash_sha256.len(), 64);
@@ -140,15 +138,22 @@ mod tests {
     async fn test_save_snapshot_invalid_dimensions() {
         let _home = temp_home_guard();
         let rgb = vec![0u8; 100]; // not 64*48*3
-        let err = save_snapshot_rgb24("cam_unit", &rgb, 64, 48).await.unwrap_err();
-        assert!(matches!(err, RecordingError::InvalidDimensions(100, 64, 48)));
+        let err = save_snapshot_rgb24("cam_unit", &rgb, 64, 48)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RecordingError::InvalidDimensions(100, 64, 48)
+        ));
     }
 
     #[tokio::test]
     async fn test_save_snapshot_rejects_bad_camera_id() {
         let _home = temp_home_guard();
         let rgb = rgb_buf(4, 4);
-        let err = save_snapshot_rgb24("../escape", &rgb, 4, 4).await.unwrap_err();
+        let err = save_snapshot_rgb24("../escape", &rgb, 4, 4)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RecordingError::InvalidCameraId));
     }
 

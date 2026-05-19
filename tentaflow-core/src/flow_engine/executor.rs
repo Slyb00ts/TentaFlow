@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 use crate::db::{repository, DbPool};
 use crate::flow_engine::cache::CompiledFlow;
 use crate::flow_engine::envelope::{
-    ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue, NodeInput, TokenUsage, TraceStatus, TraceStep,
+    ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue,
+    NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext};
 
@@ -273,12 +274,7 @@ pub async fn execute_streaming(
                 &ctx,
             )
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "chain node '{}' process_stream failed: {e}",
-                    chain_node.id
-                )
-            })?;
+            .map_err(|e| anyhow!("chain node '{}' process_stream failed: {e}", chain_node.id))?;
     }
 
     let cancel = ctx.cancel_token.clone();
@@ -608,7 +604,9 @@ mod chain_integration_tests {
     //! (synthetic-style audit skip), więc nie potrzebujemy realnej tabeli flows.
     use super::*;
     use crate::flow_engine::blob_store::{BlobRef, BlobStore, InMemoryBlobStore};
-    use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, TtsDispatcher, TtsRequest, TtsResponse};
+    use crate::flow_engine::dispatchers::{
+        LlmDispatcher, LlmRequest, TtsDispatcher, TtsRequest, TtsResponse,
+    };
     use crate::flow_engine::envelope::{
         AudioStreamChunk, EnvelopeDelta, FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk,
         TokenUsage,

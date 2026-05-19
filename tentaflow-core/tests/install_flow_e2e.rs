@@ -127,8 +127,7 @@ async fn owner_install_writes_alias_owner_and_visibility_rows() {
         vec![],
     );
 
-    mgr.install_manifest_aliases(&manifest)
-        .expect("install ok");
+    mgr.install_manifest_aliases(&manifest).expect("install ok");
 
     // model_aliases: dwa wpisy z poprawnym targetem.
     let n_aliases = count_no_params(
@@ -214,11 +213,7 @@ async fn required_uses_alias_unknown_target_rejects_install() {
     let manifest = manifest_with(
         "needy-addon",
         vec![],
-        vec![uses_alias(
-            "missing-alias",
-            true,
-            "blocks_start_without_it",
-        )],
+        vec![uses_alias("missing-alias", true, "blocks_start_without_it")],
         vec![],
     );
 
@@ -358,7 +353,8 @@ async fn runtime_resolve_for_granted_consumer_succeeds() {
 
     // Owner can always resolve its own alias.
     let owner_target =
-        resolve_model_alias_for_addon(&db, "shared-alias", Some("owner-r"), None, None).expect("owner ok");
+        resolve_model_alias_for_addon(&db, "shared-alias", Some("owner-r"), None, None)
+            .expect("owner ok");
     assert!(
         owner_target.is_some(),
         "owner must be able to resolve its own alias"
@@ -374,8 +370,7 @@ async fn runtime_resolve_for_granted_consumer_succeeds() {
     );
 
     // Unrelated addon without a uses_alias row must NOT resolve.
-    let stranger =
-        resolve_model_alias_for_addon(&db, "shared-alias", Some("stranger"), None, None);
+    let stranger = resolve_model_alias_for_addon(&db, "shared-alias", Some("stranger"), None, None);
     assert!(
         stranger.is_err() || stranger.unwrap().is_none(),
         "stranger addon without uses_alias row must not resolve"

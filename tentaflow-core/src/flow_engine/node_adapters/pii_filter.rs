@@ -18,7 +18,9 @@ use tracing::{debug, warn};
 use crate::flow_engine::envelope::{
     EnvelopeDelta, EnvelopeDeltaKind, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
 };
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter};
+use crate::flow_engine::node_adapter::{
+    ExecutionContext, NodeAdapter, PortSpec, StreamingNodeAdapter,
+};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const REGEX_SIZE_LIMIT: usize = 1_000_000;
@@ -144,10 +146,8 @@ impl NodeAdapter for PiiFilterNodeAdapter {
         }
 
         out.payload = FlowValue::Text(text);
-        out.meta.insert(
-            "pii_rules_applied".into(),
-            serde_json::json!(applied),
-        );
+        out.meta
+            .insert("pii_rules_applied".into(), serde_json::json!(applied));
         Ok(out)
     }
 }
@@ -316,10 +316,7 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                             ));
                         }
                         Some(Err(e)) => {
-                            return Some((
-                                Err(e),
-                                (upstream, compiled, buffers, max_chars, eof),
-                            ));
+                            return Some((Err(e), (upstream, compiled, buffers, max_chars, eof)));
                         }
                         None => {
                             eof = true;
@@ -403,9 +400,7 @@ mod tests {
             replacement: "[EMAIL]".into(),
         }]));
 
-        let env = FlowEnvelope::with_payload(FlowValue::Text(
-            "kontakt: foo@bar.com".into(),
-        ));
+        let env = FlowEnvelope::with_payload(FlowValue::Text("kontakt: foo@bar.com".into()));
         let out = PiiFilterNodeAdapter
             .execute(&pii_node(), &[make_input(env)], &ctx)
             .await
@@ -570,7 +565,10 @@ mod tests {
         };
         assert_eq!(c.text_delta, "abcdefghijklmnopqrstuvwx");
         assert_eq!(c.choice_index, 0);
-        assert!(out.next().await.is_none(), "stream should EOF after over_cap flush");
+        assert!(
+            out.next().await.is_none(),
+            "stream should EOF after over_cap flush"
+        );
     }
 
     /// Codex review Krok 2a v2 P2: finish_reason w środku stream'u +
@@ -658,10 +656,7 @@ mod tests {
             panic!("expected Llm");
         };
         assert_eq!(c.text_delta, "Powiem ci [REDACTED].");
-        assert_eq!(
-            c.reasoning_delta.as_deref(),
-            Some("Myślę o [REDACTED].")
-        );
+        assert_eq!(c.reasoning_delta.as_deref(), Some("Myślę o [REDACTED]."));
     }
 
     /// Stage 3d Krok 2a P1 fix: reasoning_delta też filtrowany przez PII

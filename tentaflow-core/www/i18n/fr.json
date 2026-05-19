@@ -20,6 +20,7 @@
     "prompts": "Invites",
     "models": "Modèles",
     "flows": "Constructeur de flux",
+    "scheduler": "Planificateur",
     "playground": "Bac à sable",
     "chat": "Chat",
     "rules": "Règles",

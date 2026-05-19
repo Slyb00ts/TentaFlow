@@ -239,9 +239,9 @@ fn recover_interrupted_rotation(path: &PathBuf) -> Result<(), CredentialsError> 
 /// to `<path>.tmp` with mode 0600 first, then rename in place. Creates the
 /// parent directory if missing.
 fn generate_key_file(path: &PathBuf) -> Result<(), CredentialsError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| CredentialsError::Io(io::Error::new(io::ErrorKind::Other, "no parent dir")))?;
+    let parent = path.parent().ok_or_else(|| {
+        CredentialsError::Io(io::Error::new(io::ErrorKind::Other, "no parent dir"))
+    })?;
     std::fs::create_dir_all(parent)?;
 
     let mut key = [0u8; 32];

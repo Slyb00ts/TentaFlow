@@ -76,7 +76,15 @@ fn test_v24_accepts_null_and_non_null_source() {
             (raw_frame_ref, service_id, caller_addon_id, request_id,
              picked_up_at, result, source_node_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params!["frame_b", "svc-1", "addon-1", "req-2", 2_000_i64, "ok", "peer-node-X"],
+        params![
+            "frame_b",
+            "svc-1",
+            "addon-1",
+            "req-2",
+            2_000_i64,
+            "ok",
+            "peer-node-X"
+        ],
     )
     .expect("insert non-NULL source");
 

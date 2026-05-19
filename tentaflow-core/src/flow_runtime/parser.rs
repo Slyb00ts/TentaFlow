@@ -76,7 +76,8 @@ pub fn load_from_addon_dir(
 ) -> Result<CompiledFlow, FlowCompileError> {
     let resolved = crate::util::path_safety::safe_resolve(addon_dir, relative_path)
         .map_err(|e| FlowCompileError::Path(e.to_string()))?;
-    let bytes = std::fs::read_to_string(&resolved).map_err(|e| FlowCompileError::Io(e.to_string()))?;
+    let bytes =
+        std::fs::read_to_string(&resolved).map_err(|e| FlowCompileError::Io(e.to_string()))?;
     let def = parse_flow_definition(&bytes)?;
     compile(def)
 }
@@ -272,11 +273,7 @@ fn topo_sort(adj: &HashMap<String, Vec<String>>) -> Result<Vec<String>, FlowComp
     if out.len() != adj.len() {
         // Should not happen — cycle detection precedes topo. Defensive.
         return Err(FlowCompileError::Cycle {
-            involved: adj
-                .keys()
-                .filter(|k| !out.contains(k))
-                .cloned()
-                .collect(),
+            involved: adj.keys().filter(|k| !out.contains(k)).cloned().collect(),
         });
     }
     Ok(out)

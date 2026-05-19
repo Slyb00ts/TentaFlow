@@ -13,7 +13,9 @@ use async_trait::async_trait;
 
 use super::{build_user_context, ModelRuntimeSlot};
 use crate::api::openai::types::{EmbeddingInput, EmbeddingRequest};
-use crate::flow_engine::dispatchers::{EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse};
+use crate::flow_engine::dispatchers::{
+    EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse,
+};
 use crate::flow_engine::envelope::TokenUsage;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 

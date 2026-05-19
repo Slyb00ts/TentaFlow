@@ -26,7 +26,10 @@ fn burst_allowed_then_ip_limit_with_retry_after() {
         assert_eq!(rl.check(ip), RateLimitResult::Allow);
     }
     match rl.check(ip) {
-        RateLimitResult::IpLimit { ip: got, retry_after_secs } => {
+        RateLimitResult::IpLimit {
+            ip: got,
+            retry_after_secs,
+        } => {
             assert_eq!(got, ip);
             assert!(retry_after_secs > 0.0);
             assert!(retry_after_secs <= 1.0);

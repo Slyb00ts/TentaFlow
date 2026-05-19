@@ -98,12 +98,10 @@ fn distinct_addon_pools_back_distinct_files() {
         // Write a sentinel row through pool A.
         {
             let conn = pool_a.get().expect("a conn");
-            conn.execute(
-                "CREATE TABLE sentinel (v TEXT NOT NULL)",
-                [],
-            )
-            .unwrap();
-            conn.execute("INSERT INTO sentinel(v) VALUES ('from-A')", []).unwrap();
+            conn.execute("CREATE TABLE sentinel (v TEXT NOT NULL)", [])
+                .unwrap();
+            conn.execute("INSERT INTO sentinel(v) VALUES ('from-A')", [])
+                .unwrap();
         }
 
         // Pool B's database must not see that table at all.
@@ -216,7 +214,8 @@ fn symlink_between_addon_dirs_does_not_punch_through_pool_keying() {
 
         let pool_a = storage_sql::open_addon_db("org-default", "sym-a").expect("A pool");
         let conn = pool_a.get().expect("A conn");
-        conn.execute("CREATE TABLE marker_a (id INTEGER)", []).unwrap();
+        conn.execute("CREATE TABLE marker_a (id INTEGER)", [])
+            .unwrap();
 
         let pool_b = storage_sql::open_addon_db("org-default", "sym-b").expect("B pool");
         let conn_b = pool_b.get().expect("B conn");
@@ -271,11 +270,9 @@ fn sql_bound_parameters_with_path_shape_stay_inside_addon_db() {
             // Read it back through the same pool — bytes round-trip
             // unchanged. This confirms SQLite treats the param as data.
             let (got_path, got_blob): (String, Vec<u8>) = conn
-                .query_row(
-                    "SELECT path, blob FROM files LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                .query_row("SELECT path, blob FROM files LIMIT 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .unwrap();
             assert_eq!(got_path, traversal);
             assert_eq!(got_blob, b"sensitive");
@@ -303,7 +300,8 @@ fn sql_bound_parameters_with_path_shape_stay_inside_addon_db() {
         // /etc/passwd (or any host path) was not opened. We assert the
         // observable side: A's data dir still does NOT contain a file
         // literally named after the traversal payload.
-        let a_dir = tentaflow_core::addon::fs_sandbox::addon_data_dir("org-default", "sql-iso-a").unwrap();
+        let a_dir =
+            tentaflow_core::addon::fs_sandbox::addon_data_dir("org-default", "sql-iso-a").unwrap();
         let candidate = a_dir.join(traversal);
         assert!(
             !candidate.exists(),

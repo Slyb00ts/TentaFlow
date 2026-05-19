@@ -375,9 +375,8 @@ impl NamespaceManager {
         let Some((dim, metric_str, path)) = row else {
             return Ok(None);
         };
-        let metric = Metric::parse(&metric_str).ok_or_else(|| {
-            VectorError::Db(format!("invalid metric '{metric_str}' in DB row"))
-        })?;
+        let metric = Metric::parse(&metric_str)
+            .ok_or_else(|| VectorError::Db(format!("invalid metric '{metric_str}' in DB row")))?;
         Ok(Some((dim, metric, path)))
     }
 
@@ -441,12 +440,7 @@ impl NamespaceManager {
     /// addons (no host function); reached from the CLI in a later phase.
     /// Idempotent: missing row / missing file are both treated as success so
     /// the operation can be retried after a partial failure.
-    pub fn delete_namespace(
-        &self,
-        org_id: &str,
-        addon_id: &str,
-        namespace: &str,
-    ) -> Result<()> {
+    pub fn delete_namespace(&self, org_id: &str, addon_id: &str, namespace: &str) -> Result<()> {
         validate_org_id(org_id)?;
         validate_addon_id(addon_id)?;
         validate_namespace_name(namespace)?;
@@ -558,7 +552,10 @@ mod tests {
                 .unwrap();
         }
         let res = mgr.get_or_create(ORG_A, "addon_a", "overflow", 4, Metric::Cosine);
-        assert!(matches!(res, Err(VectorError::NamespaceQuotaExceeded { .. })));
+        assert!(matches!(
+            res,
+            Err(VectorError::NamespaceQuotaExceeded { .. })
+        ));
     }
 
     #[test]
@@ -649,11 +646,27 @@ mod tests {
     fn test_upsert_with_quota_replace_does_not_increment_count() {
         let (_dir, mgr) = mgr();
         let c1 = mgr
-            .upsert_with_quota(ORG_A, "addon_a", "ns1", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine)
+            .upsert_with_quota(
+                ORG_A,
+                "addon_a",
+                "ns1",
+                1,
+                &[1.0, 0.0, 0.0],
+                3,
+                Metric::Cosine,
+            )
             .unwrap();
         assert_eq!(c1, 1);
         let c2 = mgr
-            .upsert_with_quota(ORG_A, "addon_a", "ns1", 1, &[0.0, 1.0, 0.0], 3, Metric::Cosine)
+            .upsert_with_quota(
+                ORG_A,
+                "addon_a",
+                "ns1",
+                1,
+                &[0.0, 1.0, 0.0],
+                3,
+                Metric::Cosine,
+            )
             .unwrap();
         assert_eq!(c2, 1);
     }
@@ -661,8 +674,16 @@ mod tests {
     #[test]
     fn test_upsert_with_quota_blocks_new_insert_at_cap() {
         let (_dir, mgr) = mgr();
-        mgr.upsert_with_quota(ORG_A, "addon_a", "ns1", 1, &[1.0, 0.0, 0.0], 3, Metric::Cosine)
-            .unwrap();
+        mgr.upsert_with_quota(
+            ORG_A,
+            "addon_a",
+            "ns1",
+            1,
+            &[1.0, 0.0, 0.0],
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
         {
             let conn = mgr.pool.lock().unwrap();
             conn.execute(
@@ -673,7 +694,15 @@ mod tests {
             .unwrap();
         }
         let err = mgr
-            .upsert_with_quota(ORG_A, "addon_a", "ns1", 999, &[0.0, 0.0, 1.0], 3, Metric::Cosine)
+            .upsert_with_quota(
+                ORG_A,
+                "addon_a",
+                "ns1",
+                999,
+                &[0.0, 0.0, 1.0],
+                3,
+                Metric::Cosine,
+            )
             .unwrap_err();
         assert!(matches!(err, VectorError::VectorQuotaExceeded { .. }));
     }

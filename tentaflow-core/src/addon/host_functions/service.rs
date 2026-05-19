@@ -10,7 +10,8 @@
 
 use tracing::warn;
 
-use super::{audit_log, get_memory, read_guest_string, write_guest_output, AddonState, WasmCaller,
+use super::{
+    audit_log, get_memory, read_guest_string, write_guest_output, AddonState, WasmCaller,
     ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_ERR_RATE_LIMIT,
 };
 
@@ -36,23 +37,23 @@ pub fn service_request(
         None => return ABI_ERR_OPERATION,
     };
 
-    let service_name =
-        match read_guest_string(&memory, &caller, service_name_ptr, service_name_len) {
-            Some(s) => s.to_string(),
-            None => {
-                warn!("service_request: niepoprawny wskaznik service_name");
-                return ABI_ERR_OPERATION;
-            }
-        };
+    let service_name = match read_guest_string(&memory, &caller, service_name_ptr, service_name_len)
+    {
+        Some(s) => s.to_string(),
+        None => {
+            warn!("service_request: niepoprawny wskaznik service_name");
+            return ABI_ERR_OPERATION;
+        }
+    };
 
-    let request_json =
-        match read_guest_string(&memory, &caller, request_json_ptr, request_json_len) {
-            Some(s) => s.to_string(),
-            None => {
-                warn!("service_request: niepoprawny wskaznik request_json");
-                return ABI_ERR_OPERATION;
-            }
-        };
+    let request_json = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len)
+    {
+        Some(s) => s.to_string(),
+        None => {
+            warn!("service_request: niepoprawny wskaznik request_json");
+            return ABI_ERR_OPERATION;
+        }
+    };
 
     let state = caller.data();
     let req = ServiceCallRequest {
@@ -74,10 +75,7 @@ pub fn service_request(
     let db = state.db.clone();
     let permission_checker = state.permission_checker.clone();
     let permissions = state.permissions.clone();
-    let service_manager = state
-        .router
-        .as_ref()
-        .map(|r| r.service_manager().clone());
+    let service_manager = state.router.as_ref().map(|r| r.service_manager().clone());
 
     let outcome = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {

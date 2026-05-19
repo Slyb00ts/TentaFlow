@@ -32,8 +32,6 @@ const SchedulerScreen = {
           <div class="sub" id="scheduler-sub">Harmonogramy funkcji addonow</div>
         </div>
         <div class="actions">
-          <tf-button variant="ghost" icon="clock" id="scheduler-eureka-sync">Eureka sync</tf-button>
-          <tf-button variant="ghost" icon="refresh" id="scheduler-eureka-retry">Eureka retry</tf-button>
           <tf-button variant="ghost" icon="refresh" id="scheduler-refresh">Odśwież</tf-button>
           <tf-button variant="primary" icon="plus" id="scheduler-new">Nowy job</tf-button>
         </div>
@@ -65,8 +63,6 @@ const SchedulerScreen = {
 
   async mount() {
     byId('scheduler-refresh')?.addEventListener('click', loadAll);
-    byId('scheduler-eureka-sync')?.addEventListener('click', () => createEurekaPreset('sync_new'));
-    byId('scheduler-eureka-retry')?.addEventListener('click', () => createEurekaPreset('retry_failed'));
     byId('scheduler-new')?.addEventListener('click', () => {
       selectedJobId = null;
       runs = [];
@@ -178,11 +174,14 @@ function renderForm() {
   const host = byId('scheduler-form');
   if (!host) return;
   const job = selectedJob();
-  const actionValue = job ? `${job.target_addon_id}::${job.target_action_id}` : firstActionValue();
+  const addonId = job?.target_addon_id || firstAddonId();
+  const actionId = job?.target_action_id || firstActionId(addonId);
+  const actionValue = `${addonId}::${actionId}`;
   const kind = job?.schedule_kind || 'interval';
   const payload = job?.payload_json || '{}';
   const enabled = job?.enabled ?? true;
   const action = actionByValue(actionValue);
+  const addonIds = uniqueAddonIds();
 
   host.innerHTML = `
     <div class="scheduler-selected-action" id="scheduler-action-summary">
@@ -191,13 +190,24 @@ function renderForm() {
       <span>${escapeHtml(action?.description || '')}</span>
     </div>
     <div class="scheduler-form-grid">
-      <tf-input id="scheduler-name" label="Nazwa" value="${escapeAttr(job?.name || '')}" placeholder="Eureka daily sync"></tf-input>
+      <tf-input id="scheduler-name" label="Nazwa" value="${escapeAttr(job?.name || '')}" placeholder="Dzienna synchronizacja"></tf-input>
       <div>
-        <span class="tf-label">Funkcja addona</span>
-        <tf-select id="scheduler-action" value="${escapeAttr(actionValue)}">
-          ${actions.map(action => `
-            <option value="${escapeAttr(`${action.addon_id}::${action.action_id}`)}">
-              ${escapeHtml(action.addon_id)} / ${escapeHtml(action.action_id)}
+        <span class="tf-label">Addon</span>
+        <tf-select id="scheduler-addon" value="${escapeAttr(addonId)}">
+          ${addonIds.map(id => `
+            <option value="${escapeAttr(id)}">
+              ${escapeHtml(id)}
+            </option>
+          `).join('')}
+        </tf-select>
+      </div>
+
+      <div>
+        <span class="tf-label">Funkcja</span>
+        <tf-select id="scheduler-action" value="${escapeAttr(actionId)}">
+          ${actionsForAddon(addonId).map(item => `
+            <option value="${escapeAttr(item.action_id)}">
+              ${escapeHtml(item.display_name || item.action_id)}
             </option>
           `).join('')}
         </tf-select>
@@ -226,17 +236,31 @@ function renderForm() {
     </div>
   `;
 
+  byId('scheduler-addon')?.addEventListener('change', () => {
+    const selectedAddon = byId('scheduler-addon')?.value || '';
+    const actionSelect = byId('scheduler-action');
+    if (actionSelect) {
+      actionSelect.innerHTML = actionsForAddon(selectedAddon).map(item => `
+        <option value="${escapeAttr(item.action_id)}">
+          ${escapeHtml(item.display_name || item.action_id)}
+        </option>
+      `).join('');
+      actionSelect.value = firstActionId(selectedAddon);
+    }
+    resetPayloadFromSchema();
+    updateActionSummary();
+  });
   byId('scheduler-action')?.addEventListener('change', () => {
     updateActionSummary();
-    fillPayloadFromSchema();
+    resetPayloadFromSchema();
   });
-  if (!job && actions.length) fillPayloadFromSchema();
+  if (!job && actions.length) resetPayloadFromSchema();
 }
 
 function updateActionSummary() {
   const host = byId('scheduler-action-summary');
   if (!host) return;
-  const action = actionByValue(byId('scheduler-action')?.value || '');
+  const action = selectedAction();
   host.innerHTML = `
     <span class="tf-chip info">${escapeHtml(action?.addon_id || 'addon')}</span>
     <strong>${escapeHtml(action?.display_name || action?.action_id || 'Wybierz funkcję')}</strong>
@@ -244,10 +268,10 @@ function updateActionSummary() {
   `;
 }
 
-function fillPayloadFromSchema() {
+function resetPayloadFromSchema() {
   const payloadEl = byId('scheduler-payload');
-  if (!payloadEl || payloadEl.value.trim() !== '{}') return;
-  const action = actionByValue(byId('scheduler-action')?.value || '');
+  if (!payloadEl) return;
+  const action = selectedAction();
   const schema = parseJson(action?.parameters_schema);
   const props = schema?.properties || {};
   const sample = {};
@@ -257,43 +281,9 @@ function fillPayloadFromSchema() {
   payloadEl.value = JSON.stringify(sample, null, 2);
 }
 
-async function createEurekaPreset(actionId) {
-  const action = actions.find(item => item.addon_id === 'eureka' && item.action_id === actionId);
-  if (!action) {
-    toast('Addon Eureka nie jest zainstalowany albo narzędzie nie jest dostępne', 'error');
-    return;
-  }
-  const isRetry = actionId === 'retry_failed';
-  const body = {
-    id: null,
-    name: isRetry ? 'Eureka: ponawianie błędów' : 'Eureka: dzienna synchronizacja',
-    enabled: true,
-    target_addon_id: 'eureka',
-    target_action_id: actionId,
-    payload_json: JSON.stringify(isRetry
-      ? { batch_size: 100, max_errors: 10 }
-      : { batch_size: 250, max_consecutive_missing: 50, max_errors: 5 }),
-    schedule_kind: 'cron',
-    schedule_expr: isRetry ? '45 3 * * *' : '15 3 * * *',
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-    max_runtime_seconds: isRetry ? 1800 : 3600,
-    retry_policy_json: JSON.stringify({ max_attempts: 1, backoff_seconds: 60 }),
-    concurrency_policy: 'skip',
-  };
-  try {
-    const resp = await ApiBinary.one('schedulerJobUpsertRequest', { jobJson: JSON.stringify(body) });
-    const saved = parseJson(resp.jobJson || resp.job_json || '{}');
-    selectedJobId = saved.id;
-    toast('Preset Eureki zapisany', 'success');
-    await loadAll();
-  } catch (err) {
-    toast(`Preset Eureki: ${err.message}`, 'error');
-  }
-}
-
 async function saveJob() {
-  const action = byId('scheduler-action')?.value || '';
-  const [addonId, actionId] = action.split('::');
+  const addonId = byId('scheduler-addon')?.value || '';
+  const actionId = byId('scheduler-action')?.value || '';
   const payloadEl = byId('scheduler-payload');
   const payloadValue = payloadEl?.value || '{}';
   try {
@@ -370,9 +360,28 @@ function renderRuns() {
   `).join('');
 }
 
-function firstActionValue() {
-  const action = actions[0];
-  return action ? `${action.addon_id}::${action.action_id}` : '';
+function firstAddonId() {
+  return uniqueAddonIds()[0] || '';
+}
+
+function firstActionId(addonId) {
+  return actionsForAddon(addonId)[0]?.action_id || '';
+}
+
+function uniqueAddonIds() {
+  return [...new Set(actions.map(action => action.addon_id).filter(Boolean))].sort();
+}
+
+function actionsForAddon(addonId) {
+  return actions
+    .filter(action => action.addon_id === addonId)
+    .sort((a, b) => String(a.display_name || a.action_id).localeCompare(String(b.display_name || b.action_id)));
+}
+
+function selectedAction() {
+  const addonId = byId('scheduler-addon')?.value || '';
+  const actionId = byId('scheduler-action')?.value || '';
+  return actions.find(action => action.addon_id === addonId && action.action_id === actionId) || null;
 }
 
 function actionByValue(value) {

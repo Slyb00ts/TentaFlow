@@ -99,10 +99,13 @@ impl RateLimiter {
 
         self.sweep_if_needed(now);
 
-        let mut entry = self.per_ip.entry(ip.to_string()).or_insert_with(|| IpEntry {
-            bucket: TokenBucket::new(self.config.per_ip_capacity),
-            last_seen: now,
-        });
+        let mut entry = self
+            .per_ip
+            .entry(ip.to_string())
+            .or_insert_with(|| IpEntry {
+                bucket: TokenBucket::new(self.config.per_ip_capacity),
+                last_seen: now,
+            });
         entry.last_seen = now;
         if let Err(retry) = entry.bucket.refill_and_peek(
             self.config.per_ip_capacity,
@@ -119,14 +122,18 @@ impl RateLimiter {
             // Poisoned mutex — fail-open is unacceptable; treat as global
             // denial with conservative 1 s retry. Process is in a bad state
             // and a poisoned global is a strong signal of broader breakage.
-            return RateLimitResult::GlobalLimit { retry_after_secs: 1.0 };
+            return RateLimitResult::GlobalLimit {
+                retry_after_secs: 1.0,
+            };
         };
         if let Err(retry) = g.refill_and_peek(
             self.config.global_capacity,
             self.config.global_refill_per_sec,
             now,
         ) {
-            return RateLimitResult::GlobalLimit { retry_after_secs: retry };
+            return RateLimitResult::GlobalLimit {
+                retry_after_secs: retry,
+            };
         }
 
         entry.bucket.commit_one();
@@ -201,7 +208,10 @@ mod tests {
             assert_eq!(rl.check("1.2.3.4"), RateLimitResult::Allow);
         }
         match rl.check("1.2.3.4") {
-            RateLimitResult::IpLimit { ip, retry_after_secs } => {
+            RateLimitResult::IpLimit {
+                ip,
+                retry_after_secs,
+            } => {
                 assert_eq!(ip, "1.2.3.4");
                 assert!(retry_after_secs > 0.0 && retry_after_secs <= 1.0);
             }

@@ -431,7 +431,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "LegalDocumentGenerateResponse"
             }
             tentaflow_protocol::LegalAdminPayload::RevokeRequest(_) => "LegalDocumentRevokeRequest",
-            tentaflow_protocol::LegalAdminPayload::RevokeResponse(_) => "LegalDocumentRevokeResponse",
+            tentaflow_protocol::LegalAdminPayload::RevokeResponse(_) => {
+                "LegalDocumentRevokeResponse"
+            }
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",
@@ -447,6 +449,40 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::HubModelSearchRequest { .. } => "HubModelSearchRequest",
         MessageBody::HubModelSearchResponse { .. } => "HubModelSearchResponse",
         MessageBody::HubDownloadProgressBody(_) => "HubDownloadProgress",
+        MessageBody::SchedulerBody(p) => match p {
+            tentaflow_protocol::SchedulerPayload::JobsListRequest(_) => "SchedulerJobsListRequest",
+            tentaflow_protocol::SchedulerPayload::JobsListResponse(_) => {
+                "SchedulerJobsListResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::ActionsListRequest(_) => {
+                "SchedulerActionsListRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::ActionsListResponse(_) => {
+                "SchedulerActionsListResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::RunsListRequest(_) => "SchedulerRunsListRequest",
+            tentaflow_protocol::SchedulerPayload::RunsListResponse(_) => {
+                "SchedulerRunsListResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::JobUpsertRequest(_) => {
+                "SchedulerJobUpsertRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::JobUpsertResponse(_) => {
+                "SchedulerJobUpsertResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::JobDeleteRequest(_) => {
+                "SchedulerJobDeleteRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::JobDeleteResponse(_) => {
+                "SchedulerJobDeleteResponse"
+            }
+            tentaflow_protocol::SchedulerPayload::JobRunNowRequest(_) => {
+                "SchedulerJobRunNowRequest"
+            }
+            tentaflow_protocol::SchedulerPayload::JobRunNowResponse(_) => {
+                "SchedulerJobRunNowResponse"
+            }
+        },
         MessageBody::FlowListRequest => "FlowListRequest",
         MessageBody::FlowListResponse { .. } => "FlowListResponse",
         MessageBody::FlowDetailRequest { .. } => "FlowDetailRequest",
@@ -503,8 +539,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResUpdate(_) => "ServiceConfigUpdateResponse",
             tentaflow_protocol::ServicePayload::ReqVramHint(_) => "ServiceVramHintRequest",
             tentaflow_protocol::ServicePayload::ResVramHint(_) => "ServiceVramHintResponse",
-            tentaflow_protocol::ServicePayload::ReqEnginePresets(_) => "ServiceEnginePresetsRequest",
-            tentaflow_protocol::ServicePayload::ResEnginePresets(_) => "ServiceEnginePresetsResponse",
+            tentaflow_protocol::ServicePayload::ReqEnginePresets(_) => {
+                "ServiceEnginePresetsRequest"
+            }
+            tentaflow_protocol::ServicePayload::ResEnginePresets(_) => {
+                "ServiceEnginePresetsResponse"
+            }
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {

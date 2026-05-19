@@ -26,9 +26,7 @@
 mod client;
 mod server;
 
-pub use client::{
-    fetch_from_peer, FrameProxyClient, FrameProxyError, DEFAULT_FETCH_TIMEOUT,
-};
+pub use client::{fetch_from_peer, FrameProxyClient, FrameProxyError, DEFAULT_FETCH_TIMEOUT};
 pub use server::handle_request;
 
 use std::sync::Arc;

@@ -16,14 +16,14 @@ use rusqlite::Transaction;
 #[cfg(feature = "docker")]
 use std::path::PathBuf;
 
-use super::{
-    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy, LogSink,
-    PreparedDeploy,
-};
 #[cfg(feature = "docker")]
 use super::{
     build_endpoint_url, category_tag, models_from_manifest, resolve_display_name,
     smart_health_probe, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+};
+use super::{
+    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy, LogSink,
+    PreparedDeploy,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;

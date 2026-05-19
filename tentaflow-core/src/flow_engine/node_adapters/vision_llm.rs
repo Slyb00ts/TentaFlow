@@ -107,12 +107,10 @@ impl VisionNodeAdapter {
             .find(|m| matches!(m.role, ChatRole::User))
             .and_then(|m| match &m.content {
                 ChatMessageContent::Text(t) if !t.is_empty() => Some(t.clone()),
-                ChatMessageContent::Parts(parts) => parts
-                    .iter()
-                    .find_map(|p| match p {
-                        MessagePart::Text { text } if !text.is_empty() => Some(text.clone()),
-                        _ => None,
-                    }),
+                ChatMessageContent::Parts(parts) => parts.iter().find_map(|p| match p {
+                    MessagePart::Text { text } if !text.is_empty() => Some(text.clone()),
+                    _ => None,
+                }),
                 _ => None,
             })
         {

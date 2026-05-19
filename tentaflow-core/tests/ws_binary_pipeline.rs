@@ -43,7 +43,7 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
         correlation_id: env.correlation_id,
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
-            org_context: None,
+        org_context: None,
     };
     // dispatch jest async — kazdy test buduje wlasny tokio runtime, zeby
     // zachowac sync `#[test]` API w tych testach pipeline.

@@ -145,7 +145,9 @@ pub struct RequestTimeParameters {
 /// Generic key-value pair dla typed parametrow propagowanych przez wire.
 /// Wartosc jako serialized JSON string (rkyv nie obsluguje natywnie
 /// `serde_json::Value`).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 #[rkyv(derive(Debug))]
 pub struct KeyValue {
     pub key: String,
@@ -241,7 +243,9 @@ pub struct ServicePauseResponse {
 /// są materializowane do `services.config_json` jako manifest schema
 /// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
 /// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct ServiceUpdateRequest {
     pub service_id: i64,
     /// See `ServiceDeleteRequest::node_id` — None = local node.
@@ -777,6 +781,81 @@ pub struct AuditLogCleanupRequest {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AuditLogCleanupResponse {
     pub deleted_count: u64,
+}
+
+// ----- Scheduler screen (Admin only) -----
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobsListRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobsListResponse {
+    pub jobs_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerActionsListRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerActionsListResponse {
+    pub actions_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerRunsListRequest {
+    pub job_id: String,
+    pub limit: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerRunsListResponse {
+    pub runs_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobUpsertRequest {
+    pub job_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobUpsertResponse {
+    pub job_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobDeleteRequest {
+    pub job_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobDeleteResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobRunNowRequest {
+    pub job_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobRunNowResponse {
+    pub run_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerPayload {
+    JobsListRequest(SchedulerJobsListRequest),
+    JobsListResponse(SchedulerJobsListResponse),
+    ActionsListRequest(SchedulerActionsListRequest),
+    ActionsListResponse(SchedulerActionsListResponse),
+    RunsListRequest(SchedulerRunsListRequest),
+    RunsListResponse(SchedulerRunsListResponse),
+    JobUpsertRequest(SchedulerJobUpsertRequest),
+    JobUpsertResponse(SchedulerJobUpsertResponse),
+    JobDeleteRequest(SchedulerJobDeleteRequest),
+    JobDeleteResponse(SchedulerJobDeleteResponse),
+    JobRunNowRequest(SchedulerJobRunNowRequest),
+    JobRunNowResponse(SchedulerJobRunNowResponse),
 }
 
 // =============================================================================
@@ -1868,14 +1947,18 @@ pub struct NimCatalogListResponse {
 // f64 fields drop Eq; PartialEq only.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmGpuInfo {
     pub index: u32,
     pub name: String,
     pub memory_gb: f64,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmRecommendRequest {
     pub model: String,
     pub gpus: Vec<DeployVllmGpuInfo>,
@@ -1892,7 +1975,9 @@ pub struct DeployVllmRecommendRequest {
     pub lock_tensor_parallel: Option<bool>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmConfig {
     pub tensor_parallel: u32,
     pub pipeline_parallel: u32,
@@ -1902,7 +1987,9 @@ pub struct DeployVllmConfig {
     pub gpu_memory_utilization: f64,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmModelSpecSummary {
     pub model_type: String,
     pub architectures: Vec<String>,
@@ -1919,7 +2006,9 @@ pub struct DeployVllmModelSpecSummary {
     pub bytes_per_param: f64,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmVramEstimate {
     pub model_weights_gb: f64,
     pub kv_cache_gb: f64,
@@ -1932,7 +2021,9 @@ pub struct DeployVllmVramEstimate {
     pub warnings: Vec<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmGpuCompatibility {
     pub used_tp: u32,
     pub used_pp: u32,
@@ -1942,7 +2033,9 @@ pub struct DeployVllmGpuCompatibility {
     pub warning: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmRecommendResponse {
     pub model_spec: DeployVllmModelSpecSummary,
     pub vram_estimate: DeployVllmVramEstimate,
@@ -1962,7 +2055,9 @@ pub struct DeployVllmRecommendResponse {
 /// tensorrt-llm uzywaja `auto_fit_config` z mapowaniem do typed pol; inne
 /// silniki maja proste defaulty per kategoria). Zwraca typed mape
 /// `parameter.key → JSON value` ktora wizard pre-filluje do formularza.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct EngineRecommendRequest {
     pub engine_id: String,
     pub model_repo: String,
@@ -1970,7 +2065,9 @@ pub struct EngineRecommendRequest {
     pub hf_token: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct EngineRecommendResponse {
     /// JSON-serialized values per parameter key. Wizard JS deserializuje
     /// zgodnie z `parameter.kind` z manifestu.
@@ -2323,10 +2420,14 @@ pub struct AddonResourcesSetResponse {
 /// Zmergowana regula sieciowa zadeklarowana w manifescie + status pokrycia.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AddonNetworkRuleDecl {
+    pub rule_id: String,
     pub host: String,
     pub port: Option<i32>,
+    pub protocol: String,
     pub mode: String,
     pub status: String,
+    pub required: bool,
+    pub approved: bool,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -3629,6 +3730,9 @@ pub enum MessageBody {
     AuditLogCleanupRequestBody(AuditLogCleanupRequest),
     AuditLogCleanupResponseBody(AuditLogCleanupResponse),
 
+    // ----- Scheduler -----
+    SchedulerBody(SchedulerPayload),
+
     // ---- Portainer (R-LIST + R-STREAM dla logs) ----
     ContainerListRequest,
     ContainerListResponse {
@@ -4305,8 +4409,8 @@ mod tests {
             GpuTargets, ProfileScope, ProfileSourceFlags, ProfileTarget, ProfilingPayload,
             ProfilingStartRequest,
         };
-        let body = MessageBody::ProfilingBody(ProfilingPayload::StartRequest(
-            ProfilingStartRequest {
+        let body =
+            MessageBody::ProfilingBody(ProfilingPayload::StartRequest(ProfilingStartRequest {
                 node_id: "node-x".into(),
                 scope: ProfileScope {
                     sources: ProfileSourceFlags(
@@ -4320,8 +4424,7 @@ mod tests {
                 },
                 label: "deep-profile".into(),
                 elevation_password: String::new(),
-            },
-        ));
+            }));
         assert_eq!(round_trip(body.clone()), body);
     }
 

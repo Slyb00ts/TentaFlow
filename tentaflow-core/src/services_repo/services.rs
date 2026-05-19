@@ -349,17 +349,16 @@ pub fn update_config_json(conn: &Connection, id: i64, config_json: &str) -> Resu
 /// w logice — supervisor uzywa do raportowania UX-friendly statusu startu
 /// jak "warming up — alive 30s, waiting for /v1/models"). `None` =
 /// wyczyść message (przy Running success / Failed error).
-pub fn update_progress_message(
-    conn: &Connection,
-    id: i64,
-    msg: Option<&str>,
-) -> Result<()> {
+pub fn update_progress_message(conn: &Connection, id: i64, msg: Option<&str>) -> Result<()> {
     let n = conn.execute(
         "UPDATE services SET progress_message = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
         params![id, msg],
     )?;
     if n == 0 {
-        return Err(anyhow!("update_progress_message: service id={} not found", id));
+        return Err(anyhow!(
+            "update_progress_message: service id={} not found",
+            id
+        ));
     }
     Ok(())
 }

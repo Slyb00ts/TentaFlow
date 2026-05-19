@@ -15,18 +15,18 @@ pub mod instance_pool;
 pub mod lifecycle;
 pub mod manifest;
 pub mod migrations;
-pub mod sdk_version;
-pub mod storage_sql;
-pub mod storage_sql_exec;
 pub mod oauth;
 pub mod oauth_cleanup;
 pub mod oauth_crypto;
 pub mod oauth_master_key;
 pub mod oauth_refresh_guard;
 pub mod permissions;
-pub mod signature;
 pub mod rate_limiter;
 pub mod runtime;
+pub mod sdk_version;
+pub mod signature;
+pub mod storage_sql;
+pub mod storage_sql_exec;
 pub mod tool_dispatch;
 pub mod ui_framework;
 pub mod utils;
@@ -203,11 +203,10 @@ impl AddonApplicationSection {
         use std::sync::OnceLock;
         static PANEL_RX: OnceLock<Regex> = OnceLock::new();
         static ICON_RX: OnceLock<Regex> = OnceLock::new();
-        let panel_rx = PANEL_RX.get_or_init(|| {
-            Regex::new(r"^[a-z0-9][a-z0-9_-]*$").expect("static regex")
-        });
-        let icon_rx = ICON_RX
-            .get_or_init(|| Regex::new(r"^[a-z][a-z0-9-]*$").expect("static regex"));
+        let panel_rx =
+            PANEL_RX.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9_-]*$").expect("static regex"));
+        let icon_rx =
+            ICON_RX.get_or_init(|| Regex::new(r"^[a-z][a-z0-9-]*$").expect("static regex"));
 
         if self.entry_panel.is_empty() || self.entry_panel.len() > 64 {
             bail!(
@@ -220,10 +219,7 @@ impl AddonApplicationSection {
         }
         let title_len = self.title.chars().count();
         if !(1..=60).contains(&title_len) {
-            bail!(
-                "application.title length {} out of range 1..=60",
-                title_len
-            );
+            bail!("application.title length {} out of range 1..=60", title_len);
         }
         let icon_len = self.icon.chars().count();
         if !(1..=40).contains(&icon_len) {
@@ -448,8 +444,7 @@ pub struct AddonState {
     /// Shared cache UI panel state — host function `ui_render` zapisuje tu
     /// drzewo komponentow, MessageBody handler `AddonUiPanelGetRequest`
     /// odczytuje. `None` w testach event_bus w izolacji.
-    pub ui_panels:
-        Option<Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>>,
+    pub ui_panels: Option<Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -763,9 +758,10 @@ impl AddonManager {
             upsert_uses_model_within_tx,
         };
 
-        let mut conn = self.db.lock().map_err(|e| {
-            anyhow::anyhow!("db lock for alias install: {}", e)
-        })?;
+        let mut conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("db lock for alias install: {}", e))?;
         let tx = conn.transaction()?;
 
         // 1. Register owned [[alias]] entries: model_aliases + ownership +
@@ -788,20 +784,15 @@ impl AddonManager {
                 )
             })?;
 
-            set_alias_visibility_within_tx(
-                &tx,
-                alias_id,
-                alias_spec.visibility.as_db_str(),
-                None,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "addon '{}' alias '{}' visibility write failed: {}",
-                    manifest.addon_id,
-                    alias_spec.id,
-                    e
-                )
-            })?;
+            set_alias_visibility_within_tx(&tx, alias_id, alias_spec.visibility.as_db_str(), None)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "addon '{}' alias '{}' visibility write failed: {}",
+                        manifest.addon_id,
+                        alias_spec.id,
+                        e
+                    )
+                })?;
 
             // Revoke manifest-granted consumers that were dropped from the
             // current manifest (reinstall path). Admin-granted rows
@@ -815,19 +806,16 @@ impl AddonManager {
                 }
                 _ => &[],
             };
-            let revoked = revoke_obsolete_manifest_consumers_within_tx(
-                &tx,
-                alias_id,
-                desired_consumers,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "addon '{}' alias '{}' consumer revoke failed: {}",
-                    manifest.addon_id,
-                    alias_spec.id,
-                    e
-                )
-            })?;
+            let revoked =
+                revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, desired_consumers)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "addon '{}' alias '{}' consumer revoke failed: {}",
+                            manifest.addon_id,
+                            alias_spec.id,
+                            e
+                        )
+                    })?;
             for consumer in &revoked {
                 audit_consumer_revoked_by_manifest_within_tx(
                     &tx,
@@ -917,8 +905,7 @@ impl AddonManager {
             if lookup_alias_visibility_within_tx(&tx, &alias_spec.id)?.is_none() {
                 continue;
             }
-            let transitions =
-                reconcile_uses_alias_for_alias_within_tx(&tx, &alias_spec.id)?;
+            let transitions = reconcile_uses_alias_for_alias_within_tx(&tx, &alias_spec.id)?;
             for (consumer, before, after) in transitions {
                 audit_reconcile_uses_alias_within_tx(
                     &tx,
@@ -1208,10 +1195,7 @@ impl AddonManager {
     /// - `enabled = true`: aktualizuje flage; jezeli addon ma service mode,
     ///   startuje swiezo instancje.
     pub fn set_addon_enabled(&self, addon_id: &str, enabled: bool) -> Result<()> {
-        info!(
-            "Toggle is_enabled dla addonu '{}' -> {}",
-            addon_id, enabled
-        );
+        info!("Toggle is_enabled dla addonu '{}' -> {}", addon_id, enabled);
 
         {
             let conn = self.db.lock().unwrap();
@@ -1352,9 +1336,9 @@ impl AddonManager {
         // Wyciagnij instancje (lock briefly)
         let mut addon_instance = {
             let mut instances = instances_map.lock();
-            let addon_instances = instances
-                .get_mut(addon_id)
-                .ok_or_else(|| anyhow::anyhow!("addon '{}' nie ma uruchomionych instancji", addon_id))?;
+            let addon_instances = instances.get_mut(addon_id).ok_or_else(|| {
+                anyhow::anyhow!("addon '{}' nie ma uruchomionych instancji", addon_id)
+            })?;
             let pos = addon_instances
                 .iter()
                 .position(|i| i.instance_id == instance_id)
@@ -1797,9 +1781,9 @@ impl AddonManager {
         // Permission: addon musi miec "flow_blocks" (opcjonalnie z resource =
         // block_type, ale dla MVP wystarczy ogolne). Brak uprawnien = bail.
         if let Some(uid) = user_id {
-            let perm = self
-                .permission_checker
-                .check(addon_id, uid, "flow_blocks", Some(block_type));
+            let perm =
+                self.permission_checker
+                    .check(addon_id, uid, "flow_blocks", Some(block_type));
             if !perm.is_granted() {
                 bail!(
                     "Brak uprawnien 'flow_blocks' dla addonu '{}' (user_id={})",

@@ -750,10 +750,24 @@ risk = "low"
 "#;
     let m = parse_manifest_toml(toml).expect("host_permissions must parse");
     assert_eq!(m.ui_components.len(), 2);
-    let with_perms = m.ui_components.iter().find(|c| c.id == "u-with-perms").unwrap();
-    assert_eq!(with_perms.host_permissions, vec!["alias.read".to_string(), "camera.read".to_string()]);
-    let presentational = m.ui_components.iter().find(|c| c.id == "u-presentational").unwrap();
-    assert!(presentational.host_permissions.is_empty(), "default empty when omitted");
+    let with_perms = m
+        .ui_components
+        .iter()
+        .find(|c| c.id == "u-with-perms")
+        .unwrap();
+    assert_eq!(
+        with_perms.host_permissions,
+        vec!["alias.read".to_string(), "camera.read".to_string()]
+    );
+    let presentational = m
+        .ui_components
+        .iter()
+        .find(|c| c.id == "u-presentational")
+        .unwrap();
+    assert!(
+        presentational.host_permissions.is_empty(),
+        "default empty when omitted"
+    );
 }
 
 // =============================================================================
@@ -850,7 +864,10 @@ fn test_backward_compat_teams_bot() {
     // teams-bot declares its alias set at M1.W5 — chunk B introduces
     // `[[alias]]` blocks (teams-stt, teams-tts, teams-summary, teams-vision-face).
     // The assertion guards parser compatibility, not the manifest's contents.
-    assert!(!m.aliases.is_empty(), "teams-bot must declare aliases (post-M1.W5)");
+    assert!(
+        !m.aliases.is_empty(),
+        "teams-bot must declare aliases (post-M1.W5)"
+    );
 }
 
 // =============================================================================
@@ -999,10 +1016,7 @@ wasm_file = "a.wasm"
 max_concurrency = "lots"
 "#;
     let err = parse_manifest_toml(toml).unwrap_err().to_string();
-    assert!(
-        err.contains("max_concurrency"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("max_concurrency"), "unexpected error: {err}");
 }
 
 #[test]
@@ -1018,5 +1032,8 @@ wasm_file = "a.wasm"
 rate_limit_per_min = -1
 "#;
     let err = parse_manifest_toml(toml).unwrap_err().to_string();
-    assert!(err.contains("rate_limit_per_min"), "unexpected error: {err}");
+    assert!(
+        err.contains("rate_limit_per_min"),
+        "unexpected error: {err}"
+    );
 }

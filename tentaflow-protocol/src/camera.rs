@@ -190,14 +190,11 @@ mod tests {
     #[test]
     fn camera_admin_body_discover_request_round_trip() {
         use crate::message_body::MessageBody;
-        let body =
-            MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverRequest(
-                CameraDiscoverRequest {},
-            ));
-        let bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::DiscoverRequest(
+            CameraDiscoverRequest {},
+        ));
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -214,10 +211,8 @@ mod tests {
                 target_fps: Some(10),
             },
         ));
-        let bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -244,10 +239,8 @@ mod tests {
                 ],
             },
         ));
-        let bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -280,8 +273,7 @@ mod tests {
             },
         ));
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -295,8 +287,7 @@ mod tests {
             },
         ));
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 
@@ -310,10 +301,8 @@ mod tests {
                 profile_token: "Profile_1".into(),
             },
         ));
-        let bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
-        let decoded =
-            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode message body");
+        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);
     }
 }

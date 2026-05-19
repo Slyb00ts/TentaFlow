@@ -79,8 +79,14 @@ fn flush_window(
     let saturated = count > i64::MAX as u64;
     let count_i64 = if saturated { i64::MAX } else { count as i64 };
     let mut t = toml::value::Table::new();
-    t.insert("window_start".to_string(), toml::Value::String(start.to_string()));
-    t.insert("window_end".to_string(), toml::Value::String(end.to_string()));
+    t.insert(
+        "window_start".to_string(),
+        toml::Value::String(start.to_string()),
+    );
+    t.insert(
+        "window_end".to_string(),
+        toml::Value::String(end.to_string()),
+    );
     t.insert("count".to_string(), toml::Value::Integer(count_i64));
     t.insert("value".to_string(), toml::Value::Float(value));
     samples.clear();
@@ -102,9 +108,8 @@ pub async fn run(
     }
     let op_str = read_param_string(&ctx.params, "op")
         .ok_or_else(|| OperatorError::BadParams("aggregate: 'op' required".to_string()))?;
-    let op = AggOp::from_str(&op_str).ok_or_else(|| {
-        OperatorError::BadParams(format!("aggregate: unknown op '{op_str}'"))
-    })?;
+    let op = AggOp::from_str(&op_str)
+        .ok_or_else(|| OperatorError::BadParams(format!("aggregate: unknown op '{op_str}'")))?;
     let field = read_param_string(&ctx.params, "field");
     if op.requires_field() && field.is_none() {
         return Err(OperatorError::BadParams(format!(

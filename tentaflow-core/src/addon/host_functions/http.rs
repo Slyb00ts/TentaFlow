@@ -2,9 +2,9 @@
 // Plik: addon/host_functions/http.rs
 // Opis: Host function HTTP API — proxy HTTP request z audit logowaniem.
 //       Addon nie wykonuje requestow bezposrednio — Core proxy sprawdza
-//       uprawnienia (dozwolone domeny), waliduje URL (SSRF) i loguje kazdy request.
-// Uprawnienia: "http" z resource=<domain> (per-domain whitelist). Fail-closed —
-//              brak uprawnienia blokuje request zanim opusci proces Core.
+//       uprawnienia, reguly sieciowe, waliduje URL (SSRF) i loguje kazdy request.
+// Uprawnienia: "http.request" oraz zatwierdzona network_rule dla host:port.
+//              Fail-closed — brak deklaracji blokuje request zanim opusci proces Core.
 // =============================================================================
 
 use std::sync::OnceLock;
@@ -184,18 +184,44 @@ pub fn http_request(
         return ABI_ERR_PERMISSION;
     }
 
-    // Wyodrebnij domene z URL do sprawdzenia uprawnien
-    let domain = extract_domain(&url);
+    let (domain, port) = match extract_http_destination(&url) {
+        Some(destination) => destination,
+        None => {
+            audit_log(
+                caller.data(),
+                "http.request",
+                Some("http"),
+                Some(&url),
+                "denied",
+                Some("niepoprawny cel HTTP"),
+            );
+            return ABI_ERR_PERMISSION;
+        }
+    };
 
-    // Sprawdz uprawnienie http z wzorcem domeny
-    if !check_permission(caller.data(), "http", Some(&domain)) {
+    if !check_permission(caller.data(), "http.request", None) {
         audit_log(
             caller.data(),
             "http.request",
             Some("http"),
             Some(&url),
             "denied",
-            Some(&format!("domena '{}' niedozwolona", domain)),
+            Some("brak uprawnienia 'http.request'"),
+        );
+        return ABI_ERR_PERMISSION;
+    }
+
+    if !is_http_destination_approved(caller.data(), &domain, port) {
+        audit_log(
+            caller.data(),
+            "http.request",
+            Some("http"),
+            Some(&url),
+            "denied",
+            Some(&format!(
+                "brak zatwierdzonej network_rule dla {}:{}",
+                domain, port
+            )),
         );
         return ABI_ERR_PERMISSION;
     }
@@ -271,23 +297,37 @@ pub fn http_request(
 // Funkcje pomocnicze
 // =============================================================================
 
-/// Wyodrebnia domene z URL
-fn extract_domain(url: &str) -> String {
-    // Usun schemat
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
+/// Wyodrebnia publiczny host i port HTTP z URL.
+fn extract_http_destination(url: &str) -> Option<(String, u16)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    let port = parsed.port_or_known_default()?;
+    Some((host, port))
+}
 
-    // Pobierz domene (do pierwszego / lub :)
-    without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .split(':')
-        .next()
-        .unwrap_or(without_scheme)
-        .to_string()
+/// Sprawdza czy manifest addonu i DB pozwalaja na konkretny cel HTTP.
+fn is_http_destination_approved(state: &AddonState, domain: &str, port: u16) -> bool {
+    let rule = match state.manifest.network_rules.iter().find(|rule| {
+        rule.protocol == "tcp" && rule.port == port && rule.host.eq_ignore_ascii_case(domain)
+    }) {
+        Some(rule) => rule,
+        None => return false,
+    };
+
+    match state.db.lock() {
+        Ok(conn) => {
+            conn.query_row(
+                "SELECT approved FROM addon_network_rules \
+                 WHERE addon_id = ?1 AND rule_id = ?2 AND protocol = 'tcp' \
+                   AND host = ?3 COLLATE NOCASE AND port = ?4",
+                rusqlite::params![&state.addon_id, &rule.id, domain, port],
+                |row| row.get::<_, i32>(0),
+            )
+            .unwrap_or(0)
+                == 1
+        }
+        Err(_) => false,
+    }
 }
 
 /// Sprawdza HTTP rate limit addonu przez DB (fallback gdy brak in-memory rate limiter).
@@ -411,12 +451,12 @@ mod tests {
     use crate::addon::host_functions::check_permission;
     use crate::addon::host_functions::network::NetworkConnectionManager;
     use crate::addon::permissions::PermissionChecker;
-    use crate::addon::AddonManifest;
+    use crate::addon::{AddonManifest, ManifestNetworkRule};
     use parking_lot::Mutex;
     use std::path::Path;
     use std::sync::Arc;
 
-    fn make_state(permissions: Vec<String>) -> AddonState {
+    fn make_state(permissions: Vec<String>, network_rules: Vec<ManifestNetworkRule>) -> AddonState {
         let db = crate::db::init(Path::new(":memory:")).unwrap();
         AddonState {
             addon_id: "http-test-addon".to_string(),
@@ -432,7 +472,10 @@ mod tests {
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
             settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),
-            manifest: Arc::new(AddonManifest::default()),
+            manifest: Arc::new(AddonManifest {
+                network_rules,
+                ..AddonManifest::default()
+            }),
             memory_limit: 64 * 1024 * 1024,
             oauth_refresh_guard: std::sync::Arc::new(
                 crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
@@ -446,11 +489,63 @@ mod tests {
 
     #[test]
     fn http_request_denied_without_permission() {
-        // Addon bez uprawnienia "http" — fail-closed, gatekeeper odrzuca.
-        let state = make_state(vec!["storage".to_string()]);
+        let state = make_state(vec!["storage".to_string()], Vec::new());
         assert!(
-            !check_permission(&state, "http", Some("example.com")),
-            "Brak 'http' w permissions → Denied"
+            !check_permission(&state, "http.request", None),
+            "Brak 'http.request' w permissions odrzuca request"
         );
+    }
+
+    #[test]
+    fn http_destination_denied_without_network_rule() {
+        let state = make_state(
+            vec!["http.request".to_string(), "http".to_string()],
+            Vec::new(),
+        );
+
+        assert!(!is_http_destination_approved(&state, "example.com", 443));
+    }
+
+    #[test]
+    fn http_destination_requires_approved_network_rule() {
+        let rule = ManifestNetworkRule {
+            id: "example-https".to_string(),
+            protocol: "tcp".to_string(),
+            host: "example.com".to_string(),
+            port: 443,
+            description: Some("Test".to_string()),
+            required: true,
+        };
+        let state = make_state(
+            vec!["http.request".to_string(), "http".to_string()],
+            vec![rule],
+        );
+
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO addon_network_rules \
+                 (addon_id, rule_id, protocol, host, port, description, required, approved) \
+                 VALUES (?1, 'example-https', 'tcp', 'example.com', 443, 'Test', 1, 0)",
+                rusqlite::params![&state.addon_id],
+            )
+            .unwrap();
+        }
+
+        assert!(!is_http_destination_approved(&state, "example.com", 443));
+
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE addon_network_rules SET approved = 1 \
+                 WHERE addon_id = ?1 AND rule_id = 'example-https'",
+                rusqlite::params![&state.addon_id],
+            )
+            .unwrap();
+        }
+
+        assert!(is_http_destination_approved(&state, "example.com", 443));
+        assert!(!is_http_destination_approved(&state, "other.example", 443));
+        assert!(!is_http_destination_approved(&state, "example.com", 80));
     }
 }

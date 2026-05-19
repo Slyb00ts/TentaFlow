@@ -84,7 +84,9 @@ impl AbiError {
             Self::NoAvailableTarget => "Brak dostepnego targetu dla aliasu",
             Self::Timeout => "Przekroczono limit czasu",
             Self::Operation => "Ogolny blad operacji",
-            Self::OutputBufferTooSmall => "Bufor wyjsciowy za maly (out_len_ptr ma wymagany rozmiar)",
+            Self::OutputBufferTooSmall => {
+                "Bufor wyjsciowy za maly (out_len_ptr ma wymagany rozmiar)"
+            }
             Self::Conflict => "Konflikt stanu (np. duplikat)",
             Self::SqlSyntax => "Bledna skladnia SQL",
             Self::SqlConstraint => "Naruszenie constraint SQL",
@@ -151,7 +153,11 @@ mod tests {
     fn abi_error_codes_unique() {
         let mut seen = std::collections::HashSet::new();
         for e in ALL {
-            assert!(seen.insert(e.as_i32()), "Duplicate AbiError code: {}", e.as_i32());
+            assert!(
+                seen.insert(e.as_i32()),
+                "Duplicate AbiError code: {}",
+                e.as_i32()
+            );
         }
         // 25 wariantow razem z Ok=0.
         assert_eq!(ALL.len(), 25);

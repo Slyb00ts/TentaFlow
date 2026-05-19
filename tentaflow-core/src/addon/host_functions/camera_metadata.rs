@@ -196,7 +196,13 @@ pub fn camera_metadata_subscribe_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.metadata.subscribe", None, "error", Some("input_read_failed"));
+            audit(
+                caller.data(),
+                "camera.metadata.subscribe",
+                None,
+                "error",
+                Some("input_read_failed"),
+            );
             return e.as_i32();
         }
     };
@@ -213,7 +219,13 @@ pub fn camera_metadata_subscribe_v1(
     let input: SubscribeInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.metadata.subscribe", None, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.metadata.subscribe",
+                None,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -330,17 +342,16 @@ pub fn camera_metadata_subscribe_v1(
 
     // Then spawn (or refcount) the pull task.
     let supervisor = MetadataPullSupervisor::global();
-    let ensure_res = block_in_place_on(supervisor.ensure_pull_task(
-        &input.camera_id,
-        creds,
-        events_url,
-    ));
+    let ensure_res =
+        block_in_place_on(supervisor.ensure_pull_task(&input.camera_id, creds, events_url));
     if let Err(e) = ensure_res {
         // Roll back the bus subscription so the registry is consistent.
         metadata_bus().unsubscribe(&input.camera_id, &stream_id);
         let (abi_err, reason) = match e {
             SupervisorError::AuthFailed => (AbiError::Permission, "onvif_auth_failed"),
-            SupervisorError::Transport(_) => (AbiError::CameraUnreachable, "onvif_transport_failure"),
+            SupervisorError::Transport(_) => {
+                (AbiError::CameraUnreachable, "onvif_transport_failure")
+            }
         };
         audit(
             caller.data(),
@@ -391,7 +402,13 @@ pub fn camera_metadata_unsubscribe_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit(caller.data(), "camera.metadata.unsubscribe", None, "error", Some("input_read_failed"));
+            audit(
+                caller.data(),
+                "camera.metadata.unsubscribe",
+                None,
+                "error",
+                Some("input_read_failed"),
+            );
             return e.as_i32();
         }
     };
@@ -408,7 +425,13 @@ pub fn camera_metadata_unsubscribe_v1(
     let input: UnsubscribeInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "camera.metadata.unsubscribe", None, "error", Some("invalid_toml"));
+            audit(
+                caller.data(),
+                "camera.metadata.unsubscribe",
+                None,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -443,8 +466,17 @@ pub fn camera_metadata_unsubscribe_v1(
                     "denied",
                     Some("subscription_not_found"),
                 );
-                let out = UnsubscribeOutput { unsubscribed: false };
-                return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
+                let out = UnsubscribeOutput {
+                    unsubscribed: false,
+                };
+                return write_toml_capped(
+                    &memory,
+                    &mut caller,
+                    &out,
+                    out_ptr,
+                    out_cap,
+                    out_len_ptr,
+                );
             }
         }
     }
@@ -465,7 +497,9 @@ pub fn camera_metadata_unsubscribe_v1(
                 "ok",
                 Some("already_unsubscribed"),
             );
-            let out = UnsubscribeOutput { unsubscribed: false };
+            let out = UnsubscribeOutput {
+                unsubscribed: false,
+            };
             return write_toml_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr);
         }
     };
@@ -511,18 +545,39 @@ pub fn camera_metadata_poll_v1(
     let raw = match read_input_toml(&memory, &caller, input_ptr, input_len) {
         Ok(s) => s,
         Err(e) => {
-            audit_with_risk(caller.data(), "camera.metadata.poll", None, RiskClass::C, "error", Some("input_read_failed"));
+            audit_with_risk(
+                caller.data(),
+                "camera.metadata.poll",
+                None,
+                RiskClass::C,
+                "error",
+                Some("input_read_failed"),
+            );
             return e.as_i32();
         }
     };
     if !check_permission(caller.data(), PERM_CAMERA_METADATA, None) {
-        audit_with_risk(caller.data(), "camera.metadata.poll", None, RiskClass::C, "denied", Some("missing_permission"));
+        audit_with_risk(
+            caller.data(),
+            "camera.metadata.poll",
+            None,
+            RiskClass::C,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
     let input: PollInput = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
-            audit_with_risk(caller.data(), "camera.metadata.poll", None, RiskClass::C, "error", Some("invalid_toml"));
+            audit_with_risk(
+                caller.data(),
+                "camera.metadata.poll",
+                None,
+                RiskClass::C,
+                "error",
+                Some("invalid_toml"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -579,8 +634,7 @@ pub fn camera_metadata_poll_v1(
             // Drain synchronously.
             while frames.len() < max_items && !camera_offline {
                 let mut sub_guard = active.subscriber.lock();
-                let next =
-                    block_in_place_on(sub_guard.next(Duration::from_millis(0)));
+                let next = block_in_place_on(sub_guard.next(Duration::from_millis(0)));
                 drop(sub_guard);
                 match next {
                     NextOutcome::Timeout | NextOutcome::Closed => {
@@ -723,7 +777,13 @@ fn write_toml_capped<T: Serialize>(
     )
 }
 
-fn audit(state: &AddonState, action: &str, resource_id: Option<&str>, result: &str, reason: Option<&str>) {
+fn audit(
+    state: &AddonState,
+    action: &str,
+    resource_id: Option<&str>,
+    result: &str,
+    reason: Option<&str>,
+) {
     // Default risk class for subscribe/unsubscribe: B (mutates supervisor
     // state). Poll callers use `audit_with_risk` with `RiskClass::C` since
     // a poll is a read-only drain of an existing subscriber's mpsc queue.
@@ -772,10 +832,7 @@ pub mod test_api {
     /// Mirror of the host-fn permission check + ownership + metadata_supported
     /// gate. Returns the same ABI error codes the WASM caller would see.
     /// Used by tests to validate denials without a live ONVIF endpoint.
-    pub fn precheck_subscribe(
-        state: &AddonState,
-        camera_id: &str,
-    ) -> Result<(), AbiError> {
+    pub fn precheck_subscribe(state: &AddonState, camera_id: &str) -> Result<(), AbiError> {
         if !check_permission(state, PERM_CAMERA_METADATA, None) {
             return Err(AbiError::Permission);
         }
@@ -795,10 +852,7 @@ pub mod test_api {
     /// Convenience: programmatically register a subscription against the
     /// process-wide registry so the poll/unsubscribe paths can be tested in
     /// isolation. Returns the synthetic subscription_id.
-    pub fn register_active_subscription(
-        addon_id: &str,
-        camera_id: &str,
-    ) -> String {
+    pub fn register_active_subscription(addon_id: &str, camera_id: &str) -> String {
         let subscriber = metadata_bus().subscribe(camera_id);
         let stream_id = subscriber.stream_id.clone();
         let active = Arc::new(ActiveSubscription {

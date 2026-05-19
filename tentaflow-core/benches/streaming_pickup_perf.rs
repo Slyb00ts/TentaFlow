@@ -331,9 +331,7 @@ mod http_bench {
                         let i = i.clone();
                         let s = s.clone();
                         let d = d.clone();
-                        async move {
-                            Ok::<_, Infallible>(handler(req, &i, &s, &d).await)
-                        }
+                        async move { Ok::<_, Infallible>(handler(req, &i, &s, &d).await) }
                     });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(sock), svc)

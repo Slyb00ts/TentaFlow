@@ -60,8 +60,7 @@ fn make_state(
 ) -> AddonState {
     let event_bus = Arc::new(EventBus::new());
     let permission_checker = Arc::new(PermissionChecker::new(db.clone()));
-    let settings_cipher =
-        Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32]));
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32]));
 
     AddonState {
         addon_id: addon_id.to_string(),
@@ -110,11 +109,10 @@ async fn flow_invoke_denied_without_permission() {
     // No permissions declared → dispatch must return Permission.
     let state = make_state(db, &addon, vec![]);
     let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 100\n");
-    let out = tokio::task::spawn_blocking(move || {
-        flow_api::dispatch_invoke(&state, &sched, &payload)
-    })
-    .await
-    .expect("join");
+    let out =
+        tokio::task::spawn_blocking(move || flow_api::dispatch_invoke(&state, &sched, &payload))
+            .await
+            .expect("join");
     match out {
         flow_api::DispatchOutcome::Err(AbiError::Permission) => {}
         other => panic!("expected Permission, got {:?}", abi_label(&other)),
@@ -129,17 +127,12 @@ async fn flow_invoke_ok_with_permission_returns_completed() {
     let flow_id = format!("flow-{}", uuid::Uuid::new_v4());
     registry::global().register(&addon, make_flow(&flow_id));
 
-    let state = make_state(
-        db,
-        &addon,
-        vec![flow_api::PERM_FLOW_INVOKE.to_string()],
-    );
+    let state = make_state(db, &addon, vec![flow_api::PERM_FLOW_INVOKE.to_string()]);
     let payload = format!("flow_id = \"{flow_id}\"\nwait_ms = 5000\n");
-    let out = tokio::task::spawn_blocking(move || {
-        flow_api::dispatch_invoke(&state, &sched, &payload)
-    })
-    .await
-    .expect("join");
+    let out =
+        tokio::task::spawn_blocking(move || flow_api::dispatch_invoke(&state, &sched, &payload))
+            .await
+            .expect("join");
     match out {
         flow_api::DispatchOutcome::Ok(o) => {
             assert_eq!(o.status, "completed", "got {:?}", o);

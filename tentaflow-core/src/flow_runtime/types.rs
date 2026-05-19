@@ -95,13 +95,19 @@ pub struct CompiledFlow {
 /// install path can surface a precise diagnostic to the operator.
 #[derive(Debug, thiserror::Error)]
 pub enum FlowCompileError {
-    #[error("unsupported schema_version: {found} (this Core accepts {})", SUPPORTED_SCHEMA_VERSION)]
+    #[error(
+        "unsupported schema_version: {found} (this Core accepts {})",
+        SUPPORTED_SCHEMA_VERSION
+    )]
     UnsupportedSchemaVersion { found: u32 },
 
     #[error("flow has no operators")]
     EmptyFlow,
 
-    #[error("flow has {count} operators, exceeds limit of {}", MAX_OPERATORS_PER_FLOW)]
+    #[error(
+        "flow has {count} operators, exceeds limit of {}",
+        MAX_OPERATORS_PER_FLOW
+    )]
     TooManyOperators { count: usize },
 
     #[error("duplicate operator id '{0}'")]

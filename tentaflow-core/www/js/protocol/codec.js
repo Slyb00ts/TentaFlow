@@ -1886,6 +1886,77 @@ export const encode = {
     );
   },
 
+  schedulerJobsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerActionsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerActionsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerRunsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerRunsListRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+      Number(payload.limit ?? 20) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobUpsertRequest(
+      typeof payload.jobJson === 'string' ? payload.jobJson : JSON.stringify(payload.job ?? payload),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobDeleteRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  schedulerJobRunNowRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSchedulerJobRunNowRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /**
    * MessageBody::AuditLogExportRequest — Admin. Eksport CSV z filtrami
    * (max 100_000 wierszy). payload: { userId?, addonId?, action?, fromDate?, toDate?, search? }

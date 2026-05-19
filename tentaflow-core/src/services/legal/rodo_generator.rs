@@ -60,12 +60,9 @@ const DEFAULT_RECIPIENTS: &[(&str, &str)] = &[
 // Embedded DejaVu Sans family — vendored under `assets/fonts/dejavu/` so PDF
 // generation does not depend on system fonts (deterministic in CI, in Docker,
 // and on operator laptops without DejaVu installed).
-const FONT_REGULAR: &[u8] =
-    include_bytes!("../../../assets/fonts/dejavu/DejaVuSans.ttf");
-const FONT_BOLD: &[u8] =
-    include_bytes!("../../../assets/fonts/dejavu/DejaVuSans-Bold.ttf");
-const FONT_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/dejavu/DejaVuSans-Oblique.ttf");
+const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/dejavu/DejaVuSans.ttf");
+const FONT_BOLD: &[u8] = include_bytes!("../../../assets/fonts/dejavu/DejaVuSans-Bold.ttf");
+const FONT_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/dejavu/DejaVuSans-Oblique.ttf");
 const FONT_BOLD_ITALIC: &[u8] =
     include_bytes!("../../../assets/fonts/dejavu/DejaVuSans-BoldOblique.ttf");
 
@@ -212,7 +209,10 @@ pub fn generate(
             frames_days,
             recordings_days,
         },
-        data_categories: DEFAULT_DATA_CATEGORIES.iter().map(|s| (*s).to_string()).collect(),
+        data_categories: DEFAULT_DATA_CATEGORIES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         recipients: DEFAULT_RECIPIENTS
             .iter()
             .map(|(n, p)| RecipientCtx {
@@ -321,14 +321,12 @@ pub async fn generate_async(
     now_ms: i64,
 ) -> Result<RodoGenerationOutput, RodoGenerationError> {
     tokio::task::spawn_blocking(move || {
-        let conn = db
-            .lock()
-            .map_err(|_| {
-                RodoGenerationError::Db(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                    Some("db pool mutex poisoned".to_string()),
-                ))
-            })?;
+        let conn = db.lock().map_err(|_| {
+            RodoGenerationError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some("db pool mutex poisoned".to_string()),
+            ))
+        })?;
         generate(&conn, &legal_root, &input, now_ms)
     })
     .await
@@ -358,11 +356,7 @@ fn load_org(conn: &Connection, org_id: &str) -> Result<Option<OrgRow>, RodoGener
     Ok(row)
 }
 
-fn is_member(
-    conn: &Connection,
-    org_id: &str,
-    user_id: &str,
-) -> Result<bool, RodoGenerationError> {
+fn is_member(conn: &Connection, org_id: &str, user_id: &str) -> Result<bool, RodoGenerationError> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM org_memberships WHERE org_id = ?1 AND user_id = ?2",
         params![org_id, user_id],
@@ -396,14 +390,17 @@ fn parse_retention(json_blob: Option<&str>) -> (u32, u32) {
             return (frames, recordings);
         }
     }
-    (DEFAULT_RETENTION_FRAMES_DAYS, DEFAULT_RETENTION_RECORDINGS_DAYS)
+    (
+        DEFAULT_RETENTION_FRAMES_DAYS,
+        DEFAULT_RETENTION_RECORDINGS_DAYS,
+    )
 }
 
 fn format_iso_date(now_ms: i64) -> String {
     // YYYY-MM-DD only — keep the doc body locale-neutral and stable.
     let secs = now_ms / 1000;
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let dt =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_else(chrono::Utc::now);
     dt.format("%Y-%m-%d").to_string()
 }
 
@@ -488,9 +485,7 @@ fn render_pdf(text: &str, _variant: RodoVariant) -> Result<Vec<u8>, RodoGenerati
         italic: FontData::new(FONT_ITALIC.to_vec(), None)
             .map_err(|e| RodoGenerationError::PdfGeneration(format!("font italic: {e}")))?,
         bold_italic: FontData::new(FONT_BOLD_ITALIC.to_vec(), None)
-            .map_err(|e| {
-                RodoGenerationError::PdfGeneration(format!("font bold_italic: {e}"))
-            })?,
+            .map_err(|e| RodoGenerationError::PdfGeneration(format!("font bold_italic: {e}")))?,
     };
 
     let mut doc = Document::new(family);

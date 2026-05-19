@@ -60,7 +60,14 @@ async fn source_emits_count_records_then_eof() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let status = sched
-        .invoke(&addon, &flow_id, toml::Value::Integer(42), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Integer(42),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(status.status, "completed");
@@ -92,7 +99,14 @@ async fn source_rejects_unknown_camera_id() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let status = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(status.status, "failed");
@@ -122,7 +136,14 @@ async fn source_rejects_empty_camera_id() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let status = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(status.status, "failed");
@@ -330,7 +351,14 @@ async fn branch_rejects_unparseable_expr() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(s.status, "failed");
@@ -373,7 +401,10 @@ async fn branch_expr_with_op_in_string_literal() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let input = toml::from_str::<toml::Value>("name = \"abc<def\"").unwrap();
-    let s = sched.invoke(&addon, &flow_id, input, 5_000, None, None).await.expect("invoke");
+    let s = sched
+        .invoke(&addon, &flow_id, input, 5_000, None, None)
+        .await
+        .expect("invoke");
     assert_eq!(s.status, "completed");
     let recs = extract_records(s.result_toml.as_deref().unwrap());
     assert_eq!(recs.len(), 1, "expected one record on `true` port");
@@ -449,7 +480,10 @@ async fn aggregate_sum_correctness() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let input = toml::from_str::<toml::Value>("v = 7").unwrap();
-    let s = sched.invoke(&addon, &flow_id, input, 5_000, None, None).await.expect("invoke");
+    let s = sched
+        .invoke(&addon, &flow_id, input, 5_000, None, None)
+        .await
+        .expect("invoke");
     let recs = extract_records(s.result_toml.as_deref().unwrap());
     assert_eq!(recs.len(), 1);
     let value = recs[0].get("value").and_then(|v| v.as_float()).unwrap();
@@ -516,7 +550,14 @@ async fn predict_alias_revoked_midstream_skips_remaining() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(s.status, "completed", "skip policy must not fail the flow");
@@ -557,7 +598,14 @@ async fn predict_unknown_alias_returns_not_found() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(s.status, "failed");
@@ -587,7 +635,10 @@ async fn sink_invocation_result_collects_records() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let input = toml::from_str::<toml::Value>("k = 'v'").unwrap();
-    let s = sched.invoke(&addon, &flow_id, input, 5_000, None, None).await.expect("invoke");
+    let s = sched
+        .invoke(&addon, &flow_id, input, 5_000, None, None)
+        .await
+        .expect("invoke");
     let recs = extract_records(s.result_toml.as_deref().unwrap());
     assert_eq!(recs.len(), 2);
 }
@@ -612,7 +663,14 @@ async fn sink_sql_exec_requires_permission() {
     registry::global().register(&addon, compile_flow(&json));
     // Addon has zero declared permissions — sql.write missing → fail.
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(s.status, "failed");
@@ -643,7 +701,14 @@ async fn sink_ui_notify_requires_events_permission() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     // Addon has zero declared permissions — `events` missing → publish_event
@@ -658,7 +723,10 @@ async fn sink_ui_notify_requires_events_permission() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(count >= 1, "expected at least one denied event.publish audit row");
+    assert!(
+        count >= 1,
+        "expected at least one denied event.publish audit row"
+    );
 }
 
 #[tokio::test]
@@ -690,7 +758,14 @@ async fn sink_sql_exec_honors_cancel() {
     registry::global().register(&addon, compile_flow(&json));
     let started = std::time::Instant::now();
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 1_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            1_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     let elapsed = started.elapsed();
@@ -804,7 +879,14 @@ async fn camera_source_emits_frames_from_bus() {
     // Launch detached; push frames; close camera to drive natural completion
     // (result_toml is only written on the `completed` terminal status).
     let initial = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 0, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            0,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     let invocation_id = initial.invocation_id.clone();
@@ -826,7 +908,10 @@ async fn camera_source_emits_frames_from_bus() {
         records
     );
     let first = &records[0];
-    assert_eq!(first.get("camera_id").and_then(|v| v.as_str()), Some(camera_id.as_str()));
+    assert_eq!(
+        first.get("camera_id").and_then(|v| v.as_str()),
+        Some(camera_id.as_str())
+    );
     assert!(first.get("raw_ref").and_then(|v| v.as_str()).is_some());
     assert!(first.get("ts").and_then(|v| v.as_integer()).is_some());
 }
@@ -859,7 +944,14 @@ async fn camera_source_respects_fps_rate_limit() {
     registry::global().register(&addon, compile_flow(&json));
 
     let initial = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 0, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            0,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     let invocation_id = initial.invocation_id.clone();
@@ -907,7 +999,14 @@ async fn camera_source_unknown_camera_id_fails_fast() {
     );
     registry::global().register(&addon, compile_flow(&json));
     let status = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(status.status, "failed");
@@ -947,7 +1046,14 @@ async fn camera_source_rejects_cross_addon_owner() {
     );
     registry::global().register(&addon_b, compile_flow(&json));
     let status = sched
-        .invoke(&addon_b, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon_b,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(status.status, "failed");
@@ -982,7 +1088,14 @@ async fn camera_source_camera_offline_completes_cleanly() {
     registry::global().register(&addon, compile_flow(&json));
 
     let initial = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 0, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            0,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     let invocation_id = initial.invocation_id.clone();
@@ -1017,7 +1130,14 @@ async fn sink_event_requires_bus() {
     // No event_bus bound on this scheduler → operator fails with
     // SubsystemNotInitialized("event_bus").
     let s = sched
-        .invoke(&addon, &flow_id, toml::Value::Table(Default::default()), 5_000, None, None)
+        .invoke(
+            &addon,
+            &flow_id,
+            toml::Value::Table(Default::default()),
+            5_000,
+            None,
+            None,
+        )
         .await
         .expect("invoke");
     assert_eq!(s.status, "failed");

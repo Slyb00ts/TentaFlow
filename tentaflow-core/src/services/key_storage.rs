@@ -198,7 +198,10 @@ fn generate_key_file(path: &PathBuf) -> Result<(), KeyStorageError> {
 
     let mut key = [0u8; KEY_LEN];
     getrandom::fill(&mut key).map_err(|e| {
-        KeyStorageError::Io(io::Error::new(io::ErrorKind::Other, format!("getrandom: {e}")))
+        KeyStorageError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            format!("getrandom: {e}"),
+        ))
     })?;
 
     let tmp = path.with_extension("key.tmp");
@@ -310,7 +313,9 @@ fn recover_interrupted_rotation(path: &PathBuf) -> Result<(), KeyStorageError> {
     }
 
     let live_valid = matches!(std::fs::metadata(path), Ok(_))
-        && std::fs::read(path).map(|b| b.len() == KEY_LEN).unwrap_or(false);
+        && std::fs::read(path)
+            .map(|b| b.len() == KEY_LEN)
+            .unwrap_or(false);
 
     if live_valid {
         // Both valid: live wins. The CLI rotate can be retried by the
@@ -421,11 +426,10 @@ pub mod watcher {
                             // Catch a panicking callback so the watcher
                             // loop survives a bad rotate.
                             let old_copy = *old;
-                            let result = std::panic::catch_unwind(
-                                std::panic::AssertUnwindSafe(|| {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     on_change(&old_copy, &new_bytes);
-                                }),
-                            );
+                                }));
                             if let Err(e) = result {
                                 tracing::error!(
                                     target: "tentaflow::key_storage::watcher",
@@ -515,7 +519,10 @@ mod tests {
             &[0xAAu8; KEY_LEN],
             "live must win when both live and .new are valid"
         );
-        assert!(new_path.exists(), ".new must be left in place for operator retry");
+        assert!(
+            new_path.exists(),
+            ".new must be left in place for operator retry"
+        );
     }
 
     #[test]
@@ -560,7 +567,11 @@ mod tests {
         write_key_bytes(&new_path, &new_bytes).unwrap();
 
         let k = PersistentKey::load_or_generate_at("pickup_token", &live).unwrap();
-        assert_eq!(k.bytes(), &new_bytes, ".new must be promoted when live is missing");
+        assert_eq!(
+            k.bytes(),
+            &new_bytes,
+            ".new must be promoted when live is missing"
+        );
         assert!(!new_path.exists());
         assert!(live.exists());
 
@@ -700,8 +711,8 @@ mod tests {
     #[tokio::test]
     async fn test_watcher_ignores_touch_with_same_bytes() {
         // mtime moves but bytes don't change — callback must not fire.
-        use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
 
         let td = TempDir::new().unwrap();
         let path = td.path().join("pickup_token.key");
@@ -724,6 +735,10 @@ mod tests {
         write_key_bytes(&path, &[0x55u8; KEY_LEN]).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no-op touches must not invoke callback");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no-op touches must not invoke callback"
+        );
     }
 }

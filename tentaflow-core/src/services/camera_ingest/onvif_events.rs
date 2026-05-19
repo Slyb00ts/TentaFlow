@@ -34,9 +34,7 @@ use crate::services::camera_ingest::onvif_media::{
     build_envelope_pub, contains_tag_pub, extract_open_tag_attr_pub, extract_xml_text_pub,
     find_close_tag_pub, send_soap_pub, xml_escape_pub, OnvifCredentials, OnvifError,
 };
-use crate::services::camera_ingest::onvif_metadata_parser::{
-    parse_metadata_xml, MetadataItem,
-};
+use crate::services::camera_ingest::onvif_metadata_parser::{parse_metadata_xml, MetadataItem};
 
 const ACTION_CREATE_PULL_POINT: &str =
     "http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest";
@@ -126,13 +124,7 @@ pub async fn pull_messages(
         limit = limit,
     );
     let envelope = build_envelope_pub(creds, &body);
-    let resp = send_soap_pub(
-        subscription_uri,
-        ACTION_PULL_MESSAGES,
-        envelope,
-        timeout_ms,
-    )
-    .await?;
+    let resp = send_soap_pub(subscription_uri, ACTION_PULL_MESSAGES, envelope, timeout_ms).await?;
     parse_pull_messages_response(&resp)
 }
 
@@ -151,8 +143,7 @@ pub async fn unsubscribe_pull_point(
     creds: &OnvifCredentials,
     timeout_ms: u32,
 ) -> Result<(), OnvifError> {
-    let body =
-        r#"<wsnt:Unsubscribe xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"/>"#;
+    let body = r#"<wsnt:Unsubscribe xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"/>"#;
     let envelope = build_envelope_pub(creds, body);
     match send_soap_pub(subscription_uri, ACTION_UNSUBSCRIBE, envelope, timeout_ms).await {
         Ok(_) => Ok(()),
@@ -173,9 +164,7 @@ fn _force_use_of_xml_escape() {
 // Response parsing
 // =============================================================================
 
-fn parse_create_subscription_response(
-    xml: &str,
-) -> Result<PullPointSubscription, OnvifError> {
+fn parse_create_subscription_response(xml: &str) -> Result<PullPointSubscription, OnvifError> {
     if !contains_tag_pub(xml, "CreatePullPointSubscriptionResponse") {
         return Err(OnvifError::MalformedResponse(
             "no <CreatePullPointSubscriptionResponse> in body".into(),
@@ -189,9 +178,8 @@ fn parse_create_subscription_response(
             "missing <Address> in CreatePullPointSubscriptionResponse".into(),
         )
     })?;
-    let termination_time_text = extract_xml_text_pub(xml, "TerminationTime").ok_or_else(|| {
-        OnvifError::MalformedResponse("missing <TerminationTime>".into())
-    })?;
+    let termination_time_text = extract_xml_text_pub(xml, "TerminationTime")
+        .ok_or_else(|| OnvifError::MalformedResponse("missing <TerminationTime>".into()))?;
     let termination_time_unix = parse_iso8601_to_unix(&termination_time_text).ok_or_else(|| {
         OnvifError::MalformedResponse(format!(
             "TerminationTime is not ISO-8601: {termination_time_text}"
@@ -239,10 +227,7 @@ fn next_notification_block(xml: &str, start: usize) -> Option<(&str, usize)> {
         let rest = &xml[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -279,10 +264,7 @@ fn extract_message_utc_time(block: &str) -> Option<i64> {
         let rest = &block[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }
@@ -316,10 +298,7 @@ fn extract_source_token(block: &str) -> Option<String> {
         let rest = &block[cursor..];
         let lt = rest.find('<')?;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/')
-            || after_lt.starts_with('!')
-            || after_lt.starts_with('?')
-        {
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
             cursor += lt + 1;
             continue;
         }

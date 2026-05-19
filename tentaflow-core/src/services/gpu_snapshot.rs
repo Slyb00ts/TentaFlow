@@ -151,7 +151,10 @@ fn query_compute_apps() -> Result<Vec<(String, Vec<GpuProcessInfo>)>> {
         ])
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("nvidia-smi --query-compute-apps exit {:?}", out.status.code());
+        anyhow::bail!(
+            "nvidia-smi --query-compute-apps exit {:?}",
+            out.status.code()
+        );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut map: std::collections::HashMap<String, Vec<GpuProcessInfo>> =
@@ -205,7 +208,10 @@ mod tests {
             external_processes: Vec::new(),
         };
         let r2 = recommended_utilization(&crowded);
-        assert!(r2 <= 0.05 + 0.10, "crowded GPU should clamp to 0.10, got {r2}");
+        assert!(
+            r2 <= 0.05 + 0.10,
+            "crowded GPU should clamp to 0.10, got {r2}"
+        );
         assert!(r2 >= 0.10);
     }
 

@@ -134,7 +134,9 @@ pub fn json_to_sqlite_value(v: &JsonValue) -> Result<SqliteValue, StorageSqlErro
                     .map_err(|_| StorageSqlError::InvalidParams("invalid base64".into()))?;
                 Ok(SqliteValue::Blob(bytes))
             } else {
-                Err(StorageSqlError::InvalidParams("unknown object shape".into()))
+                Err(StorageSqlError::InvalidParams(
+                    "unknown object shape".into(),
+                ))
             }
         }
         JsonValue::Array(_) => Err(StorageSqlError::InvalidParams("array not allowed".into())),

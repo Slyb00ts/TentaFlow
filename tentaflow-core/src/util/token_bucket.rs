@@ -34,7 +34,9 @@ impl TokenBucket {
         refill_per_sec: f64,
         now: Instant,
     ) -> std::result::Result<(), f64> {
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         if elapsed > 0.0 {
             self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity as f64);
             self.last_refill = now;

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::addon::errors::AbiError;
 use crate::addon::storage_sql_exec::{
-    exec_for_addon, is_ddl, query_for_addon, query_one_for_addon, query_hash_short,
+    exec_for_addon, is_ddl, query_for_addon, query_hash_short, query_one_for_addon,
     transaction_for_addon, StorageSqlError,
 };
 use crate::audit::RiskClass;
@@ -306,8 +306,10 @@ fn sql_query_inner(
             )
         }
         Err(e) => {
-            let outcome = if matches!(e, StorageSqlError::NotReadOnly | StorageSqlError::DdlBlocked)
-            {
+            let outcome = if matches!(
+                e,
+                StorageSqlError::NotReadOnly | StorageSqlError::DdlBlocked
+            ) {
                 "denied"
             } else {
                 "error"
@@ -416,7 +418,10 @@ pub fn sql_transaction_v1(
             Some(q) => q.to_string(),
             None => return AbiError::Operation.as_i32(),
         };
-        let params_val = s.get("params").cloned().unwrap_or(JsonValue::Array(Vec::new()));
+        let params_val = s
+            .get("params")
+            .cloned()
+            .unwrap_or(JsonValue::Array(Vec::new()));
         let params: Vec<JsonValue> = match params_val.as_array().cloned() {
             Some(a) => a,
             None => return AbiError::Operation.as_i32(),
@@ -605,7 +610,9 @@ mod tests {
     #[test]
     fn is_read_only_handles_leading_comments() {
         assert!(is_read_only("-- foo\nSELECT 1"));
-        assert!(is_read_only("/* foo */ WITH t AS (SELECT 1) SELECT * FROM t"));
+        assert!(is_read_only(
+            "/* foo */ WITH t AS (SELECT 1) SELECT * FROM t"
+        ));
         assert!(!is_read_only("/* foo */ INSERT INTO x VALUES (1)"));
     }
 }

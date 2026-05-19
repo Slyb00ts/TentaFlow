@@ -73,7 +73,9 @@ fn v32_seeds_5_standard_roles() {
         .query_row("SELECT count(*) FROM roles", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 5);
-    let mut stmt = conn.prepare("SELECT name FROM roles ORDER BY name").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM roles ORDER BY name")
+        .unwrap();
     let names: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
@@ -81,7 +83,13 @@ fn v32_seeds_5_standard_roles() {
         .collect();
     assert_eq!(
         names,
-        vec!["dpo", "org_admin", "org_operator", "org_viewer", "supervisor"]
+        vec![
+            "dpo",
+            "org_admin",
+            "org_operator",
+            "org_viewer",
+            "supervisor"
+        ]
     );
 }
 
@@ -151,11 +159,9 @@ fn v32_backfills_existing_rows_to_default_org() {
         )
         .unwrap();
     let assigned_user: String = conn
-        .query_row(
-            "SELECT org_id FROM users WHERE username='alice'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT org_id FROM users WHERE username='alice'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(assigned_audit, "org-default");
     assert_eq!(assigned_user, "org-default");

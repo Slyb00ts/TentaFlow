@@ -32,8 +32,8 @@ pub mod mesh_registry;
 pub mod org;
 pub mod pickup_tokens;
 pub mod policy;
-pub mod rbac;
 pub mod ports;
+pub mod rbac;
 pub mod recording;
 pub mod registry;
 pub mod runtime;
@@ -75,8 +75,7 @@ static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceL
 pub fn vector_namespace_manager(
     pool: &crate::db::DbPool,
 ) -> &'static Arc<vector::NamespaceManager> {
-    VECTOR_NAMESPACE_MANAGER
-        .get_or_init(|| Arc::new(vector::NamespaceManager::new(pool.clone())))
+    VECTOR_NAMESPACE_MANAGER.get_or_init(|| Arc::new(vector::NamespaceManager::new(pool.clone())))
 }
 
 pub fn frame_storage() -> &'static Arc<frame_storage::FrameStorage> {
@@ -156,8 +155,9 @@ pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
 
 pub fn frame_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
     FRAME_URL_ISSUER.get_or_init(|| {
-        let issuer =
-            Arc::new(signed_urls::SignedUrlIssuer::new(signed_urls::UrlScope::FrameUrl));
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::FrameUrl,
+        ));
         if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::FrameUrl.key_name()) {
             let weak = Arc::downgrade(&issuer);
             key_storage::watcher::spawn_key_watcher(
@@ -168,9 +168,7 @@ pub fn frame_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
-                    trigger_mesh_broadcast_on_rotate(
-                        signed_urls::UrlScope::FrameUrl.key_name(),
-                    );
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::FrameUrl.key_name());
                 },
             );
         }
@@ -193,9 +191,7 @@ pub fn recording_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
-                    trigger_mesh_broadcast_on_rotate(
-                        signed_urls::UrlScope::Recording.key_name(),
-                    );
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::Recording.key_name());
                 },
             );
         }
@@ -223,9 +219,7 @@ pub fn legal_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
-                    trigger_mesh_broadcast_on_rotate(
-                        signed_urls::UrlScope::LegalUrl.key_name(),
-                    );
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::LegalUrl.key_name());
                 },
             );
         }

@@ -2207,7 +2207,9 @@ mod tests {
 
     #[test]
     fn substitute_ternary_all_truthy_aliases() {
-        for alias in ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON", "enabled", "Enabled"] {
+        for alias in [
+            "1", "true", "True", "TRUE", "yes", "YES", "on", "ON", "enabled", "Enabled",
+        ] {
             let mut env = HashMap::new();
             env.insert("FLAG".to_string(), alias.to_string());
             let s = substitute_vars("${FLAG?yes:no}", &env, Path::new("/tmp/b"));
@@ -2217,7 +2219,9 @@ mod tests {
 
     #[test]
     fn substitute_ternary_falsy_aliases() {
-        for alias in ["0", "false", "False", "no", "NO", "off", "disabled", "", "garbage"] {
+        for alias in [
+            "0", "false", "False", "no", "NO", "off", "disabled", "", "garbage",
+        ] {
             let mut env = HashMap::new();
             env.insert("FLAG".to_string(), alias.to_string());
             let s = substitute_vars("${FLAG?yes:no}", &env, Path::new("/tmp/b"));

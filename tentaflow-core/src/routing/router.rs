@@ -72,16 +72,13 @@ pub struct Router {
     /// Clone, a RwLock samo przez się nie jest Clone — Arc dzieli ten sam
     /// slot miedzy klonami zeby executor wspolny dla wszystkich call sites.
     pub(crate) executor: Arc<
-        parking_lot::RwLock<
-            Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
-        >,
+        parking_lot::RwLock<Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>>,
     >,
 
     /// R2d (Codex M1): SttRuntime wpiety przez `Router::start` po
     /// `Arc::new(router)` zeby trzymal `Weak<Router>` (anty-cykl).
     /// `None` w testach DB-less.
-    pub(crate) stt_runtime:
-        Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
+    pub(crate) stt_runtime: Arc<parking_lot::RwLock<Option<Arc<crate::services::stt::SttRuntime>>>>,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -414,7 +411,6 @@ impl Router {
             .get_quic_embedding_client(service_name)
             .await
     }
-
 
     /// Pobierz status wszystkich serwisow (do diagnostyki/health check)
     pub async fn get_service_status(&self) -> std::collections::HashMap<String, String> {

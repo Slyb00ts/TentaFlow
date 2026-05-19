@@ -9,9 +9,9 @@
 //       force-remove stale containers przy starcie.
 // =============================================================================
 
-use anyhow::Result;
 #[cfg(feature = "docker")]
 use anyhow::Context;
+use anyhow::Result;
 #[cfg(feature = "docker")]
 use std::collections::HashMap;
 #[cfg(feature = "docker")]

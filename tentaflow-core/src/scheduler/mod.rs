@@ -283,6 +283,16 @@ async fn execute_job(
     };
 
     let task = tokio::task::spawn_blocking(move || {
+        if actor_user_id <= 0 {
+            bail!("scheduler run requires an actor user id");
+        }
+        if !addon_manager.has_running_instance(&addon_id) {
+            addon_manager
+                .start_addon(&addon_id, Some(actor_user_id), None)
+                .map_err(|e| {
+                    anyhow::anyhow!("nie udalo sie uruchomic addonu '{}': {e}", addon_id)
+                })?;
+        }
         addon_manager.call_tool(&addon_id, &action_id, params, actor_user_id)
     });
     let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), task).await;

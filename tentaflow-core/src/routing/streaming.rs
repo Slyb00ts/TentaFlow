@@ -5,9 +5,7 @@
 //       buffering.
 // =============================================================================
 
-use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest,
-};
+use crate::api::openai::types::{ChatCompletionChunk, ChatCompletionRequest};
 use crate::error::Result;
 use crate::routing::router::Router;
 
@@ -28,11 +26,11 @@ fn envelope_stream_to_chunk_stream(
     include_usage: bool,
 ) -> std::pin::Pin<
     Box<
-        dyn futures::Stream<Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>>
-            + Send,
+        dyn futures::Stream<
+                Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
+            > + Send,
     >,
 > {
-    
     use crate::flow_engine::envelope::EnvelopeDelta;
     use futures::StreamExt;
 
@@ -132,7 +130,9 @@ fn envelope_stream_to_chunk_stream(
                             Some((Ok(tail), SplitState::Done))
                         }
                         Err(_) => {
-                            tracing::warn!("flow finalizer dropped without outcome — no usage tail");
+                            tracing::warn!(
+                                "flow finalizer dropped without outcome — no usage tail"
+                            );
                             None
                         }
                     },
@@ -267,15 +267,14 @@ where
 
     let inner = Box::pin(inner)
         as std::pin::Pin<
-            Box<
-                dyn futures::Stream<
-                        Item = crate::error::Result<ChatCompletionChunk>,
-                    > + Send,
-            >,
+            Box<dyn futures::Stream<Item = crate::error::Result<ChatCompletionChunk>> + Send>,
         >;
 
     let composite = futures::stream::unfold(
-        UsageSplitState::Active { inner, include_usage },
+        UsageSplitState::Active {
+            inner,
+            include_usage,
+        },
         |state| async move {
             match state {
                 UsageSplitState::Active {
@@ -291,7 +290,10 @@ where
                         // Regular chunk — przepuszczamy bez zmian.
                         return Some((
                             Ok(next),
-                            UsageSplitState::Active { inner, include_usage },
+                            UsageSplitState::Active {
+                                inner,
+                                include_usage,
+                            },
                         ));
                     }
                     // Chunk niesie usage. Decyzja per flag.
@@ -301,7 +303,10 @@ where
                         stripped.usage = None;
                         return Some((
                             Ok(stripped),
-                            UsageSplitState::Active { inner, include_usage },
+                            UsageSplitState::Active {
+                                inner,
+                                include_usage,
+                            },
                         ));
                     }
                     // include_usage=true: split na finish chunk + tail.
@@ -325,7 +330,11 @@ where
                     };
                     Some((
                         Ok(finish_chunk),
-                        UsageSplitState::EmitTail { tail, inner, include_usage },
+                        UsageSplitState::EmitTail {
+                            tail,
+                            inner,
+                            include_usage,
+                        },
                     ))
                 }
                 UsageSplitState::EmitTail {
@@ -334,7 +343,10 @@ where
                     include_usage,
                 } => Some((
                     Ok(tail),
-                    UsageSplitState::Active { inner, include_usage },
+                    UsageSplitState::Active {
+                        inner,
+                        include_usage,
+                    },
                 )),
                 UsageSplitState::Done => None,
             }
@@ -368,7 +380,6 @@ enum UsageSplitState {
     },
     Done,
 }
-
 
 impl Router {
     /// Routuje chat completion request (STREAMING MODE) przez flow_engine
@@ -467,12 +478,8 @@ impl Router {
             let blobs = dispatcher.blobs();
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
             let (initial_stream, meta_stream) =
-                crate::routing::build_initial_envelope_for_user(
-                    &request,
-                    user.clone(),
-                    &blobs,
-                )
-                .await?;
+                crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
+                    .await?;
             // Disconnect bridge: ten sam cancel_token co w meta dostaje
             // CancelOnDropStream poniżej, więc gdy hyper droppuje SSE body
             // (klient się rozłączył), token zostaje cancelled i finalizer
@@ -520,8 +527,8 @@ impl Router {
                         fallbacks_tried: 0,
                         hop_count: 0,
                         latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
-                    usage: None,
-                    finish_reason: None,
+                        usage: None,
+                        finish_reason: None,
                     };
                     return Ok(crate::routing::RouteResult {
                         response: filtered,
@@ -555,9 +562,7 @@ impl Router {
 #[cfg(test)]
 mod include_usage_tests {
     use super::*;
-    use crate::api::openai::types::{
-        ChatCompletionChunk, ChunkChoice, Delta, Usage,
-    };
+    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta, Usage};
     use futures::StreamExt;
 
     fn chunk_with_usage(text: &str, finish: bool, usage: Option<Usage>) -> ChatCompletionChunk {
@@ -574,11 +579,7 @@ mod include_usage_tests {
                     reasoning_content: None,
                     tool_calls: None,
                 },
-                finish_reason: if finish {
-                    Some("stop".into())
-                } else {
-                    None
-                },
+                finish_reason: if finish { Some("stop".into()) } else { None },
                 logprobs: None,
             }],
             system_fingerprint: None,
@@ -611,7 +612,10 @@ mod include_usage_tests {
         assert!(c1.usage.is_none());
         let c2 = out.next().await.unwrap().unwrap();
         assert_eq!(c2.choices[0].finish_reason.as_deref(), Some("stop"));
-        assert!(c2.usage.is_none(), "usage stripped when include_usage=false");
+        assert!(
+            c2.usage.is_none(),
+            "usage stripped when include_usage=false"
+        );
         assert!(out.next().await.is_none());
     }
 
@@ -657,5 +661,4 @@ mod include_usage_tests {
             .await;
         assert_eq!(collected.len(), 2);
     }
-
 }

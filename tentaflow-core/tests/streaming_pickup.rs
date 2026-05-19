@@ -87,7 +87,13 @@ fn test_pickup_token_issue_and_verify_basic() {
     };
     let outcome = handle_pickup(pr, &iss, &storage, &db);
     match outcome {
-        PickupOutcome::Ok { bytes, width, height, pixel_format, .. } => {
+        PickupOutcome::Ok {
+            bytes,
+            width,
+            height,
+            pixel_format,
+            ..
+        } => {
             assert_eq!(&*bytes, &[1, 2, 3, 4]);
             assert_eq!(width, 4);
             assert_eq!(height, 2);
@@ -267,11 +273,7 @@ fn test_pickup_token_unknown_rejected() {
     let key = [99u8; 32];
     let iss_a = PickupTokenIssuer::new_for_tests(key, Duration::from_secs(30));
     let iss_b = PickupTokenIssuer::new_for_tests(key, Duration::from_secs(30));
-    let (tok, _) = iss_a.issue(
-        raw_ref.as_str().to_string(),
-        "svc".into(),
-        "req".into(),
-    );
+    let (tok, _) = iss_a.issue(raw_ref.as_str().to_string(), "svc".into(), "req".into());
     let wire = tok.wire();
     let db = make_db();
 
@@ -327,11 +329,7 @@ fn test_pickup_frame_purged_after_lru_eviction() {
     assert!(storage.get(&r1).is_none(), "r1 must be evicted");
 
     let iss = issuer(Duration::from_secs(30));
-    let (tok, _) = iss.issue(
-        r1.as_str().to_string(),
-        "svc".into(),
-        "req".into(),
-    );
+    let (tok, _) = iss.issue(r1.as_str().to_string(), "svc".into(), "req".into());
     let wire = tok.wire();
     let db = make_db();
     let outcome = handle_pickup(
@@ -419,10 +417,18 @@ fn test_concurrent_double_consume_race() {
     };
 
     let outcomes: Vec<_> = (0..2).map(mk_handle).map(|h| h.join().unwrap()).collect();
-    let oks = outcomes.iter().filter(|o| matches!(o, PickupOutcome::Ok { .. })).count();
+    let oks = outcomes
+        .iter()
+        .filter(|o| matches!(o, PickupOutcome::Ok { .. }))
+        .count();
     let consumed = outcomes
         .iter()
-        .filter(|o| matches!(o, PickupOutcome::Unauthorized(PickupVerifyError::AlreadyConsumed)))
+        .filter(|o| {
+            matches!(
+                o,
+                PickupOutcome::Unauthorized(PickupVerifyError::AlreadyConsumed)
+            )
+        })
         .count();
     assert_eq!(oks, 1, "exactly one consumer must win the race");
     assert_eq!(consumed, 1, "the loser must observe AlreadyConsumed");
@@ -488,7 +494,11 @@ fn test_request_id_mismatch_preserves_token() {
     let storage = FrameStorage::new(8);
     let raw_ref = storage.insert(mk_frame("cam", &[0xab]));
     let iss = issuer(Duration::from_secs(30));
-    let (tok, _) = iss.issue(raw_ref.as_str().to_string(), "svc".into(), "req-good".into());
+    let (tok, _) = iss.issue(
+        raw_ref.as_str().to_string(),
+        "svc".into(),
+        "req-good".into(),
+    );
     let wire = tok.wire();
     let db = make_db();
 

@@ -246,7 +246,10 @@ fn addon_migrations_applied_primary_key_idempotent() {
          VALUES ('foo', '001_init.sql', 'xyz', '1.0.1', 'success')",
         [],
     );
-    assert!(dup.is_err(), "PRIMARY KEY (addon_id, migration_name) blokuje duplikat");
+    assert!(
+        dup.is_err(),
+        "PRIMARY KEY (addon_id, migration_name) blokuje duplikat"
+    );
 }
 
 #[test]

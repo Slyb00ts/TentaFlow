@@ -18,9 +18,7 @@
 
 use std::time::Duration;
 
-use tentaflow_core::services::camera_ingest::{
-    start_supervisor, CameraConfig, CameraStatus,
-};
+use tentaflow_core::services::camera_ingest::{start_supervisor, CameraConfig, CameraStatus};
 
 fn rtsp_test_url() -> Option<String> {
     std::env::var("TENTAFLOW_TEST_RTSP_URL").ok()
@@ -33,9 +31,15 @@ async fn test_rtsp_connect_and_receive_frames() {
         panic!("TENTAFLOW_TEST_RTSP_URL not set — see file header for setup");
     };
     let sup = start_supervisor().await.expect("supervisor");
-    sup.add_camera(CameraConfig::new_unowned("rtsp_cam_1", "rtsp", url, 30, None))
-        .await
-        .expect("add rtsp camera");
+    sup.add_camera(CameraConfig::new_unowned(
+        "rtsp_cam_1",
+        "rtsp",
+        url,
+        30,
+        None,
+    ))
+    .await
+    .expect("add rtsp camera");
 
     // Allow up to 15 s to negotiate the RTSP session and decode the first
     // frames. Real cameras typically settle in 1-3 s; CI VMs are slower.
@@ -56,7 +60,11 @@ async fn test_rtsp_connect_and_receive_frames() {
         h.status,
         h.status_message
     );
-    assert!(h.frames_total > 10, "expected >10 frames, got {}", h.frames_total);
+    assert!(
+        h.frames_total > 10,
+        "expected >10 frames, got {}",
+        h.frames_total
+    );
     sup.shutdown().await.ok();
 }
 
@@ -71,9 +79,15 @@ async fn test_rtsp_reconnect_on_server_restart() {
         panic!("TENTAFLOW_TEST_RTSP_URL not set");
     };
     let sup = start_supervisor().await.expect("supervisor");
-    sup.add_camera(CameraConfig::new_unowned("rtsp_cam_2", "rtsp", url, 30, None))
-        .await
-        .expect("add rtsp camera");
+    sup.add_camera(CameraConfig::new_unowned(
+        "rtsp_cam_2",
+        "rtsp",
+        url,
+        30,
+        None,
+    ))
+    .await
+    .expect("add rtsp camera");
 
     tokio::time::sleep(Duration::from_secs(5)).await;
     let h1 = sup.get_health("rtsp_cam_2").await.expect("health");

@@ -144,7 +144,6 @@ pub enum CancellationStatus {
     AlreadyCompleted,
 }
 
-
 // ============================================================================
 // UNIFIED MODEL PROTOCOL - Universal Format dla wszystkich modeli
 // ============================================================================

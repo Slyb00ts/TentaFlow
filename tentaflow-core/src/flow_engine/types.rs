@@ -51,9 +51,7 @@ impl FlowDataType {
     /// `Any` na której kolwiek stronie = wildcard (compatible z każdym
     /// konkretnym typem). Inaczej wymaga dokładnego match'a.
     pub fn compatible_with(self, other: FlowDataType) -> bool {
-        matches!(self, FlowDataType::Any)
-            || matches!(other, FlowDataType::Any)
-            || self == other
+        matches!(self, FlowDataType::Any) || matches!(other, FlowDataType::Any) || self == other
     }
 
     /// Mapowanie z `FlowValue` na typ. `Empty` → `None` (brak payloadu ≠

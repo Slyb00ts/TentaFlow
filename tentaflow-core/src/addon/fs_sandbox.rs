@@ -127,7 +127,9 @@ mod tests {
     use super::*;
 
     fn with_tmp_home<F: FnOnce()>(f: F) {
-        let _guard = super::test_home_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
@@ -150,11 +152,7 @@ mod tests {
             "abc-123-def",
             "0",
         ] {
-            assert!(
-                validate_addon_id(id).is_ok(),
-                "powinno akceptowac: {}",
-                id
-            );
+            assert!(validate_addon_id(id).is_ok(), "powinno akceptowac: {}", id);
         }
     }
 

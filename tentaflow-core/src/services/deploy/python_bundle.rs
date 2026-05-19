@@ -17,8 +17,8 @@ use rusqlite::Transaction;
 use super::{
     auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
     host_os_supported, models_from_manifest, query_cuda0_vram_mib, resolve_display_name,
-    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogSink,
-    PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
+    RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -231,8 +231,7 @@ impl DeployStrategy for PythonBundleDeploy {
         let user_explicit_ratio = if !is_vllm {
             None
         } else {
-            env
-                .get("GPU_MEMORY_UTILIZATION")
+            env.get("GPU_MEMORY_UTILIZATION")
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| {
                     self.user_config
@@ -240,18 +239,22 @@ impl DeployStrategy for PythonBundleDeploy {
                         .and_then(|v| v.as_f64())
                 })
         };
-        let from_vllm_args = if !is_vllm { None } else { env.get("VLLM_ARGS").and_then(|raw| {
-            let mut iter = raw.split_whitespace();
-            while let Some(tok) = iter.next() {
-                if tok == "--gpu-memory-utilization" {
-                    return iter.next().and_then(|v| v.parse::<f64>().ok());
-                }
-                if let Some(rest) = tok.strip_prefix("--gpu-memory-utilization=") {
-                    return rest.parse::<f64>().ok();
-                }
-            }
+        let from_vllm_args = if !is_vllm {
             None
-        }) };
+        } else {
+            env.get("VLLM_ARGS").and_then(|raw| {
+                let mut iter = raw.split_whitespace();
+                while let Some(tok) = iter.next() {
+                    if tok == "--gpu-memory-utilization" {
+                        return iter.next().and_then(|v| v.parse::<f64>().ok());
+                    }
+                    if let Some(rest) = tok.strip_prefix("--gpu-memory-utilization=") {
+                        return rest.parse::<f64>().ok();
+                    }
+                }
+                None
+            })
+        };
         // Wybor finalnej wartosci:
         //   1. user explicit (osobne pole) — zawsze wygrywa, manual mode
         //   2. wartosc w vllm_args (gdy wizard manual jeszcze nie laduje
@@ -498,10 +501,7 @@ mod tests {
     #[test]
     fn strip_removes_multiple_occurrences() {
         let raw = "--gpu-memory-utilization 0.9 --max-model-len 4096 --gpu-memory-utilization 0.6";
-        assert_eq!(
-            strip_gpu_memory_utilization(raw),
-            "--max-model-len 4096"
-        );
+        assert_eq!(strip_gpu_memory_utilization(raw), "--max-model-len 4096");
     }
 
     #[test]
