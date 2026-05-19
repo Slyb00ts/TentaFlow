@@ -11172,6 +11172,26 @@ pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) 
     Ok(())
 }
 
+/// Boot-time hydration helper: every active camera across all addons and
+/// orgs. Used by `CameraIngestSupervisor` on first `get_or_init_supervisor`
+/// to re-spawn sessions for cameras that survived the previous process
+/// lifecycle. There is no tenant filter — the supervisor is process-wide
+/// and the org boundary is enforced at the host-fn dispatch layer, not at
+/// the pipeline layer.
+#[cfg(feature = "camera")]
+pub fn list_all_active_cameras(pool: &DbPool) -> Result<Vec<CameraRow>> {
+    let conn = acquire(pool)?;
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE removed_at IS NULL ORDER BY camera_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], row_to_camera)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Returns every active camera (`removed_at IS NULL`) owned by `addon_id`,
 /// ordered by `camera_id` for stable output. When `org_id` is `Some`, the
 /// query further narrows to rows that belong to the calling tenant — the
