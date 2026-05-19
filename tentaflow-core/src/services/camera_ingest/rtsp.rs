@@ -74,9 +74,8 @@ pub fn redact_rtsp_url(url: &str) -> String {
 /// `rtsp://` or `rtsps://` followed by anything up to `@`.
 pub fn redact_url_in_text(text: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(rtsps?)://[^@\s/]+@").expect("redact regex must compile")
-    });
+    let re =
+        RE.get_or_init(|| Regex::new(r"(rtsps?)://[^@\s/]+@").expect("redact regex must compile"));
     re.replace_all(text, "$1://***:***@").into_owned()
 }
 
@@ -296,7 +295,14 @@ pub fn build_rtsp_pipeline(
         .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink: {e}")))?;
 
     pipeline
-        .add_many([&rtspsrc, &rtp_filter, &decodebin, &convert, &capsfilter, &appsink])
+        .add_many([
+            &rtspsrc,
+            &rtp_filter,
+            &decodebin,
+            &convert,
+            &capsfilter,
+            &appsink,
+        ])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many: {e}")))?;
 
     // Static segments:
@@ -329,7 +335,10 @@ pub fn build_rtsp_pipeline(
             return;
         };
         if !structure.name().starts_with("video/") {
-            tracing::debug!("rtsp: decodebin produced non-video pad ({})", structure.name());
+            tracing::debug!(
+                "rtsp: decodebin produced non-video pad ({})",
+                structure.name()
+            );
             return;
         }
         if let Err(e) = src_pad.link(&sink_pad) {
@@ -363,8 +372,8 @@ pub fn build_rtsp_pipeline(
     // produces frames. We therefore try to link immediately if caps are present,
     // and fall back to a one-shot `notify::caps` watcher otherwise.
     let depay_weak = depay.downgrade();
-    let try_link = std::sync::Arc::new(
-        move |src_pad: &gst::Pad| -> std::ops::ControlFlow<(), ()> {
+    let try_link =
+        std::sync::Arc::new(move |src_pad: &gst::Pad| -> std::ops::ControlFlow<(), ()> {
             // ControlFlow::Break = handled (linked, skipped, or impossible) — no
             // need to keep watching. ControlFlow::Continue = caps not yet known.
             let Some(depay) = depay_weak.upgrade() else {
@@ -384,10 +393,7 @@ pub fn build_rtsp_pipeline(
             };
             let media: Option<String> = structure.get::<String>("media").ok();
             if media.as_deref() != Some("video") {
-                tracing::debug!(
-                    "rtsp: skipping non-video pad (media={:?})",
-                    media
-                );
+                tracing::debug!("rtsp: skipping non-video pad (media={:?})", media);
                 return std::ops::ControlFlow::Break(());
             }
             if let Err(e) = src_pad.link(&sink_pad) {
@@ -396,8 +402,7 @@ pub fn build_rtsp_pipeline(
                 tracing::info!("rtsp: video pad linked");
             }
             std::ops::ControlFlow::Break(())
-        },
-    );
+        });
     let try_link_pad = try_link.clone();
     rtspsrc.connect_pad_added(move |_src, src_pad| {
         if try_link_pad(src_pad).is_break() {
@@ -424,6 +429,9 @@ fn install_frame_callback(
     let mailbox_cb = mailbox.clone();
     let counters_cb = counters.clone();
     let camera_id_cb = camera_id;
+    let logged_first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let logged_first_cb = logged_first.clone();
+    let camera_id_log = camera_id_cb.clone();
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -433,6 +441,14 @@ fn install_frame_callback(
                 let s = caps.structure(0).ok_or(gst::FlowError::Error)?;
                 let width: i32 = s.get("width").map_err(|_| gst::FlowError::Error)?;
                 let height: i32 = s.get("height").map_err(|_| gst::FlowError::Error)?;
+                if !logged_first_cb.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    tracing::info!(
+                        camera_id = %camera_id_log,
+                        width,
+                        height,
+                        "rtsp: first frame in appsink callback"
+                    );
+                }
                 let pts_ns = buffer.pts().map(|t| t.nseconds());
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let bytes = map.as_slice().to_vec();
@@ -590,9 +606,7 @@ pub async fn run_rtsp_session(
                 &health_tx,
                 &cam_id,
                 CameraStatus::Starting,
-                Some(format!(
-                    "reconnect attempt {attempt} in {wait:?}: {reason}"
-                )),
+                Some(format!("reconnect attempt {attempt} in {wait:?}: {reason}")),
                 &counters,
                 None,
             );
@@ -729,6 +743,11 @@ pub async fn run_rtsp_session(
                             attempt = 0;
                             backoff = policy.initial_backoff;
                             last_error = None;
+                            tracing::info!(
+                                camera_id = %cam_id,
+                                total,
+                                "rtsp: camera ONLINE — first frames flowing"
+                            );
                         } else if tokio::time::Instant::now() >= warmup_deadline {
                             break Some("no frames within warmup window".into());
                         }
@@ -766,9 +785,8 @@ pub async fn run_rtsp_session(
             backoff = policy.initial_backoff;
             continue 'outer;
         }
-        let reason = redact_url_in_text(
-            &inner_reason.unwrap_or_else(|| "unknown pipeline failure".into()),
-        );
+        let reason =
+            redact_url_in_text(&inner_reason.unwrap_or_else(|| "unknown pipeline failure".into()));
         tracing::warn!(camera_id = %cam_id, reason = %reason, "rtsp pipeline failed; reconnecting");
         streaming_bus().close_camera(&cam_id, &reason).await;
 
