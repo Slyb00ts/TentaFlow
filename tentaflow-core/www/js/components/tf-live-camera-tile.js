@@ -123,7 +123,7 @@ class TfLiveCameraTile extends HTMLElement {
     const cameraId = this.getAttribute('camera-id') ?? '';
     const ttl = this._ttlSecs();
     if (!cameraId) {
-      this._showError();
+      this._showError('Brak identyfikatora kamery.');
       return;
     }
     this._fetching = true;
@@ -137,11 +137,24 @@ class TfLiveCameraTile extends HTMLElement {
       this._applyUrl(url);
       this._scheduleRefresh((ttl * 1000) / 2);
     } catch (e) {
-      console.warn('[tf-live-camera-tile] frame_url fetch failed:', e?.message ?? e);
-      this._showError();
-      // Wolniejszy backoff po bledzie — zeby kamera w stanie awarii nie
-      // generowala bezsensownego ruchu na binary WS.
-      this._scheduleRefresh((ttl * 1000) * ERROR_BACKOFF_MULT);
+      const message = String(e?.message ?? e ?? '');
+      const code = e?.code;
+      console.warn('[tf-live-camera-tile] frame_url fetch failed:', code, message);
+      // Camera dopiero startuje albo nie ma jeszcze klatki w LRU — pipeline
+      // produkuje pierwszą klatkę w ciągu setek ms. Retry 1.5 s zamiast
+      // wolnego ttl*2 backoffu który by zatrzymał refresh na minutę.
+      // ProtocolErrorCode::NotFound = 9 (z tentaflow-protocol/src/message_body.rs).
+      const startingState =
+        code === 9 || /no_frame_available|not[_ ]found|404/i.test(message);
+      if (startingState) {
+        this._showError('Łączenie z kamerą…');
+        this._scheduleRefresh(1500);
+      } else {
+        this._showError('Brak podglądu kamery');
+        // Wolniejszy backoff dla prawdziwych błędów (permission, rate limit,
+        // db down) żeby nie spamować WS.
+        this._scheduleRefresh((ttl * 1000) * ERROR_BACKOFF_MULT);
+      }
     } finally {
       this._fetching = false;
     }
@@ -156,12 +169,17 @@ class TfLiveCameraTile extends HTMLElement {
     if (this._errorEl) this._errorEl.hidden = true;
   }
 
-  _showError() {
+  _showError(text) {
     if (this._img) {
       this._img.removeAttribute('src');
       this._img.hidden = true;
     }
-    if (this._errorEl) this._errorEl.hidden = false;
+    if (this._errorEl) {
+      if (typeof text === 'string' && text.length > 0) {
+        this._errorEl.textContent = text;
+      }
+      this._errorEl.hidden = false;
+    }
   }
 }
 
