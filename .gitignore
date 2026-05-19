@@ -166,3 +166,10 @@ __pycache__/
 
 # Notatki robocze — nie wysylamy do remote
 notes/
+
+# Codex CLI session state — lokalne
+.context/
+
+# npm lockfiles — repo nie używa Node poza tests/e2e (Playwright)
+package-lock.json
+tests/e2e/package-lock.json
