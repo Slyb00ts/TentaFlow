@@ -1,7 +1,9 @@
 // === File: addon/ui/mod.rs — top-level UiComponent sum + PanelTree + JSON entry points ===
 
+pub mod action;
 pub mod container;
 pub mod data_display;
+pub mod feedback;
 pub mod form;
 pub mod layout;
 pub mod legacy;
@@ -28,6 +30,8 @@ pub enum UiComponent {
     Container(container::ContainerComponent),
     DataDisplay(data_display::DataDisplayComponent),
     Form(form::FormComponent),
+    Feedback(feedback::FeedbackComponent),
+    Action(action::ActionComponent),
     Legacy(legacy::LegacyComponent),
 }
 
@@ -181,6 +185,10 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
             .map_err(|e| anyhow::anyhow!("data_display validation failed: {}", e)),
         UiComponent::Form(f) => form::validate_and_normalize(f)
             .map_err(|e| anyhow::anyhow!("form validation failed: {}", e)),
+        UiComponent::Feedback(fb) => feedback::validate_and_normalize(fb)
+            .map_err(|e| anyhow::anyhow!("feedback validation failed: {}", e)),
+        UiComponent::Action(a) => action::validate_and_normalize(a)
+            .map_err(|e| anyhow::anyhow!("action validation failed: {}", e)),
         UiComponent::Legacy(legacy) => legacy::validate_and_normalize(legacy),
     }
 }
