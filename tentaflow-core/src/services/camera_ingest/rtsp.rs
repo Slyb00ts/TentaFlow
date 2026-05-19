@@ -150,6 +150,14 @@ pub fn build_rtsp_pipeline(
 ) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
 
+    // GstRTSPLowerTrans bitmask: 0x1=udp, 0x2=udp-mcast, 0x4=tcp, 0x8=http,
+    // 0x10=tls. Default rtspsrc value is 0x7 (udp+udp-mcast+tcp) which
+    // EXCLUDES TLS — rtsps:// URLs would silently fail to connect. We pick:
+    //   - rtsp://  -> 0x7 (default behavior, UDP preferred, TCP fallback)
+    //   - rtsps:// -> 0x14 (tcp+tls, TLS over TCP; udp-over-tls is rare)
+    let is_tls = url.starts_with("rtsps://");
+    let protocols_mask: u32 = if is_tls { 0x14 } else { 0x7 };
+
     let rtspsrc = gst::ElementFactory::make("rtspsrc")
         .property("location", url)
         .property("latency", 200u32)
@@ -157,11 +165,20 @@ pub fn build_rtsp_pipeline(
         .property("timeout", (timeout_secs as u64).saturating_mul(1_000_000))
         // Disable rtspsrc's internal retry — we manage reconnect at session level.
         .property("retry", 0u32)
-        // TCP fallback if UDP setup fails — improves NAT/firewall traversal.
-        // 0=udp, 1=udp-mcast, 2=tcp, 3=http, 4=tls — passed as bitmask via
-        // protocols property (default 0x7).
+        .property("protocols", protocols_mask)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("rtspsrc: {e}")))?;
+
+    // Self-signed certs are common in surveillance NVRs (UniFi Protect,
+    // Hikvision, Dahua). GIO TlsCertificateFlags::empty() (0) disables all
+    // validation — operator-installed cameras live on trusted LAN segments
+    // and `[[network_rule]]` ACL (when wired) gates which hosts can be
+    // reached anyway. Documented trade-off: an attacker on-path between
+    // tentaflow and the NVR could MITM the RTSPS session. Acceptable for
+    // typical surveillance deployments where the camera link is L2.
+    if is_tls {
+        rtspsrc.set_property("tls-validation-flags", 0u32);
+    }
 
     let depay = gst::ElementFactory::make("rtph264depay")
         .build()
