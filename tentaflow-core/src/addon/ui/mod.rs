@@ -2,6 +2,7 @@
 
 pub mod container;
 pub mod data_display;
+pub mod form;
 pub mod layout;
 pub mod legacy;
 pub mod theme;
@@ -26,6 +27,7 @@ pub enum UiComponent {
     Layout(layout::LayoutComponent),
     Container(container::ContainerComponent),
     DataDisplay(data_display::DataDisplayComponent),
+    Form(form::FormComponent),
     Legacy(legacy::LegacyComponent),
 }
 
@@ -177,6 +179,8 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
             .map_err(|e| anyhow::anyhow!("container validation failed: {}", e)),
         UiComponent::DataDisplay(d) => data_display::validate_and_normalize(d)
             .map_err(|e| anyhow::anyhow!("data_display validation failed: {}", e)),
+        UiComponent::Form(f) => form::validate_and_normalize(f)
+            .map_err(|e| anyhow::anyhow!("form validation failed: {}", e)),
         UiComponent::Legacy(legacy) => legacy::validate_and_normalize(legacy),
     }
 }
