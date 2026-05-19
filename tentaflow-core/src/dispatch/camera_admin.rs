@@ -23,12 +23,8 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::db::repository;
 use crate::services::camera_ingest::credentials::credentials_cipher;
-use crate::services::camera_ingest::onvif_discovery::{
-    discover as ws_discover, DiscoveryOptions,
-};
-use crate::services::camera_ingest::onvif_media::{
-    derive_rtsp_uri, OnvifCredentials, OnvifError,
-};
+use crate::services::camera_ingest::onvif_discovery::{discover as ws_discover, DiscoveryOptions};
+use crate::services::camera_ingest::onvif_media::{derive_rtsp_uri, OnvifCredentials, OnvifError};
 use crate::services::rbac::OrgContext;
 
 const PERM_DISCOVER: &str = "camera.discover";
@@ -101,10 +97,9 @@ struct DiscoverRateLimiter {
 
 impl DiscoverRateLimiter {
     fn check(&self, org_id: &str) -> Result<(), f64> {
-        let entry = self
-            .buckets
-            .entry(org_id.to_string())
-            .or_insert_with(|| Mutex::new(crate::util::token_bucket::TokenBucket::new(DISCOVER_BURST)));
+        let entry = self.buckets.entry(org_id.to_string()).or_insert_with(|| {
+            Mutex::new(crate::util::token_bucket::TokenBucket::new(DISCOVER_BURST))
+        });
         let mut bucket = entry.lock();
         let now = Instant::now();
         bucket
@@ -129,12 +124,9 @@ struct FrameUrlRateLimiter {
 
 impl FrameUrlRateLimiter {
     fn check(&self, user_key: &str) -> Result<(), f64> {
-        let entry = self
-            .buckets
-            .entry(user_key.to_string())
-            .or_insert_with(|| {
-                Mutex::new(crate::util::token_bucket::TokenBucket::new(FRAME_URL_BURST))
-            });
+        let entry = self.buckets.entry(user_key.to_string()).or_insert_with(|| {
+            Mutex::new(crate::util::token_bucket::TokenBucket::new(FRAME_URL_BURST))
+        });
         let mut bucket = entry.lock();
         let now = Instant::now();
         bucket
@@ -370,23 +362,19 @@ fn validate_profile_token(token: &str) -> Result<(), &'static str> {
 
 fn map_onvif_error(e: &OnvifError) -> ProtocolError {
     match e {
-        OnvifError::AuthFailed => ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "onvif_auth_failed",
-        ),
-        OnvifError::NoProfiles => ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "onvif_no_profiles",
-        ),
+        OnvifError::AuthFailed => {
+            ProtocolError::new(ProtocolErrorCode::PolicyDenied, "onvif_auth_failed")
+        }
+        OnvifError::NoProfiles => {
+            ProtocolError::new(ProtocolErrorCode::NotAvailable, "onvif_no_profiles")
+        }
         OnvifError::ProfileNotFound(_) => ProtocolError::not_found("onvif_profile_not_found"),
-        OnvifError::Timeout(_) => ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "onvif_timeout",
-        ),
-        OnvifError::Transport(_) => ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "onvif_transport_failure",
-        ),
+        OnvifError::Timeout(_) => {
+            ProtocolError::new(ProtocolErrorCode::NotAvailable, "onvif_timeout")
+        }
+        OnvifError::Transport(_) => {
+            ProtocolError::new(ProtocolErrorCode::NotAvailable, "onvif_transport_failure")
+        }
         OnvifError::SoapFault(_) | OnvifError::MalformedResponse(_) => {
             ProtocolError::bad_request("onvif_invalid_response")
         }
@@ -683,6 +671,11 @@ async fn camera_frame_url(
     ctx: &HandlerContext,
     req: CameraFrameUrlRequest,
 ) -> Result<CameraFrameUrlResponse, ProtocolError> {
+    tracing::info!(
+        camera_id = %req.camera_id,
+        ttl_secs = req.ttl_secs,
+        "camera.frame_url dispatch entry"
+    );
     let org = require_org(ctx)?;
     if !org.has(PERM_READ) {
         audit_frame_url(
@@ -771,21 +764,31 @@ async fn camera_frame_url(
         return Err(ProtocolError::not_found("camera_not_found"));
     }
 
-    let (frame_ref, _stored) = match crate::services::frame_storage()
-        .latest_for_camera(&req.camera_id)
-    {
-        Some(p) => p,
-        None => {
-            audit_frame_url(
-                ctx,
-                org,
-                "denied",
-                None,
-                &serde_json::json!({"reason": "no_frame_available"}),
-            );
-            return Err(ProtocolError::not_found("no_frame_available"));
-        }
-    };
+    let (frame_ref, _stored) =
+        match crate::services::frame_storage().latest_for_camera(&req.camera_id) {
+            Some(p) => {
+                tracing::info!(
+                    camera_id = %req.camera_id,
+                    frame_ref = %p.0.as_str(),
+                    "camera.frame_url: latest frame found in storage"
+                );
+                p
+            }
+            None => {
+                tracing::warn!(
+                    camera_id = %req.camera_id,
+                    "camera.frame_url: no_frame_available — latest_for_camera returned None"
+                );
+                audit_frame_url(
+                    ctx,
+                    org,
+                    "denied",
+                    None,
+                    &serde_json::json!({"reason": "no_frame_available"}),
+                );
+                return Err(ProtocolError::not_found("no_frame_available"));
+            }
+        };
 
     let issued = match crate::services::frame_url_issuer()
         .issue(frame_ref.as_str().to_string(), req.ttl_secs as u64)
@@ -804,6 +807,11 @@ async fn camera_frame_url(
         }
     };
     let signed_url = format!("/frames/{}?{}", frame_ref.as_str(), issued.query_string());
+    tracing::info!(
+        camera_id = %req.camera_id,
+        signed_url = %signed_url,
+        "camera.frame_url: success — returning signed URL"
+    );
     audit_frame_url(
         ctx,
         org,
