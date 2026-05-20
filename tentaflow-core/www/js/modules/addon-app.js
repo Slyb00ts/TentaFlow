@@ -21,6 +21,7 @@ import {
   animatedRemove,
   prefersReducedMotion,
 } from '/js/modules/motion.js';
+import { renderIcon } from '/js/modules/sdk-icons.js';
 import '/js/components/tf-canvas.js';
 import '/js/components/tf-sparkline.js';
 import '/js/components/tf-heatmap.js';
@@ -2695,30 +2696,6 @@ function renderFpsCounter(c) {
   if (c.label) el.setAttribute('label', c.label);
   if (c.format) el.setAttribute('format', c.format);
   if (c.show_sparkline) el.setAttribute('show-sparkline', '');
-  return el;
-}
-
-// =============================================================================
-// Icon (whitelist; brak SVG sprite — placeholder text glyph)
-// =============================================================================
-
-const ICON_GLYPH = {
-  home: '⌂', dashboard: '▦', cameras: '📷', alarms: '🔔', profiles: '👤', models: '🧠',
-  zones: '🗺', audit: '📋', evidence: '🗂', settings: '⚙', help: '?',
-  add: '+', edit: '✎', delete: '🗑', save: '💾', cancel: '✕', search: '🔍', filter: '⌕',
-  refresh: '⟳', more: '⋯', close: '×', check: '✓',
-  video: '▶', image: '🖼', person: '🧑', vehicle: '🚗', face: '😐', document: '📄', file: '📁', folder: '📂', code: '⌨',
-  success: '✓', warning: '⚠', danger: '⚠', info: 'ℹ', locked: '🔒', unlocked: '🔓', eye: '👁', eye_off: '⊘',
-  arrow_up: '↑', arrow_down: '↓', arrow_left: '←', arrow_right: '→',
-  chevron_up: '⌃', chevron_down: '⌄', chevron_left: '‹', chevron_right: '›',
-  power: '⏻', settings2: '⚙', user: '👤', users: '👥', logout: '⎋', bell: '🔔', star: '★',
-};
-
-function renderIcon(name) {
-  const el = document.createElement('span');
-  el.className = `sdk-icon i-${name}`;
-  el.setAttribute('aria-hidden', 'true');
-  el.textContent = ICON_GLYPH[name] || '·';
   return el;
 }
 

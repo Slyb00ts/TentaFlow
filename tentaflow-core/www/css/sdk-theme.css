@@ -985,12 +985,19 @@
   border-radius: var(--sdk-radius-sm);
 }
 
-/* Icon placeholder — kazda IconName mapuje na <span class="sdk-icon i-<name>"> */
+/* Icon — IconName mapuje na <svg class="sdk-icon"><use href="/img/icons.svg#icon-X"/></svg>.
+   Path-y w sprite mają stroke: currentColor + fill: none, więc kolor dziedziczy
+   z `color` rodzica (np. `color: var(--sdk-color-primary)`). */
 .sdk-icon {
   display: inline-block;
-  width: 16px; height: 16px;
-  text-align: center;
-  line-height: 16px;
-  font-size: 14px;
+  width: 16px;
+  height: 16px;
   flex: 0 0 auto;
+  vertical-align: middle;
+  color: currentColor;
+  pointer-events: none;
 }
+.sdk-icon-sm { width: 14px; height: 14px; }
+.sdk-icon-md { width: 16px; height: 16px; }
+.sdk-icon-lg { width: 20px; height: 20px; }
+.sdk-icon-xl { width: 32px; height: 32px; }
