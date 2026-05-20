@@ -207,6 +207,10 @@ pub struct NavTabItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<IconName>,
     pub panel_id: String,
+    /// Optional count badge rendered next to the label (e.g. "24" for camera
+    /// count). Display-only — does not affect navigation behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
 }
 
 /// Lista pozycji breadcrumb. Wydzielona z `ContainerComponent::Toolbar`,
@@ -594,6 +598,7 @@ mod tests {
                 label: "Home".to_string(),
                 icon: None,
                 panel_id: "dashboard".to_string(),
+                badge: None,
             }],
             active_id: "missing".to_string(),
         };
@@ -609,6 +614,7 @@ mod tests {
                 label: "Home".to_string(),
                 icon: None,
                 panel_id: "BadPanelID!".to_string(),
+                badge: None,
             }],
             active_id: "home".to_string(),
         };
