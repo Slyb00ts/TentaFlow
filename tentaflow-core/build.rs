@@ -89,9 +89,26 @@ fn main() {
             // WAZNE: usun RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS z parent process —
             // build-rust.sh ustawia flagi iOS (-mios-version-min, libclang_rt.ios.a)
             // ktore powoduja blad linkera WASM (rust-lld nie obsluguje flag iOS)
+            // KRYTYCZNE: root .cargo/config.toml ma `target-dir = "target_shared"`.
+            // Sub-cargo dziedziczy ten config przez parent traversal → WASM
+            // ladowal w repo_root/target_shared/wasm32-wasip1/release/ zamiast
+            // w addon_dir/target/wasm32-wasip1/release/ gdzie build.rs go szuka.
+            // Skutek: build.rs print'owal "kompilacja zakonczona pomyslnie" ale
+            // potem "brak pliku .wasm" i embedowal STARY bundled WASM z db.
+            // Override CARGO_TARGET_DIR explicit na addon-local target/, env
+            // var wygrywa z config.toml.
+            // Absolute path required — current_dir() zmienia CWD na addon_dir,
+            // a relative "target" interpretowane od nowego CWD = duplikacja
+            // (addon_dir/addon_dir/target). Canonicalize z addon_dir (relative
+            // od tentaflow-core/) → absolute.
+            let addon_target = match addon_dir.canonicalize() {
+                Ok(p) => p.join("target"),
+                Err(_) => addon_dir.join("target"),
+            };
             let status = Command::new("cargo")
                 .args(["build", "--target", "wasm32-wasip1", "--release"])
                 .current_dir(&addon_dir)
+                .env("CARGO_TARGET_DIR", &addon_target)
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .env_remove("CFLAGS")
