@@ -340,7 +340,8 @@
    Heatmap — cells dostają delay przez JS (cascadeHeatmapCells)
    ============================================================================= */
 
-.sdk-heatmap-cell {
+.sdk-heatmap-cell,
+.tf-heatmap-cell {
   animation: sdk-fade-in var(--sdk-duration-fast) var(--sdk-easing-decelerate) both;
 }
 
