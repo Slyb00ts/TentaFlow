@@ -8,8 +8,8 @@
 use tracing::info;
 
 use super::{
-    audit_log, check_permission, get_memory, read_guest_string, AddonState, WasmCaller,
-    ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
+    audit_log, check_permission, get_memory, read_guest_bytes, read_guest_string, AddonState,
+    WasmCaller, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 
 // =============================================================================
@@ -117,6 +117,134 @@ pub fn ui_render(
     audit_log(
         caller.data(),
         "ui.render",
+        Some("ui"),
+        Some(&panel_id),
+        "ok",
+        None,
+    );
+
+    ABI_OK
+}
+
+// =============================================================================
+// ui_render_binary — renderowanie panelu UI z bincode-encoded PanelTree
+// =============================================================================
+
+/// Host function: renderuje panel UI z binary-encoded PanelTree (MessagePack).
+///
+/// Pomija sciezke JSON: addon zakoduje typed `PanelTree` przez `rmp-serde`,
+/// host robi `rmp_serde::from_slice` jeden raz i waliduje od razu.
+/// MessagePack wybrane zamiast postcard/bincode bo `UiComponent` to
+/// `#[serde(untagged)]` — postcard/bincode rzucaja `DeserializeAnyNotSupported`.
+/// Payload ~2-3× mniejszy niz JSON, parsing kilkukrotnie szybszy.
+///
+/// ABI:
+/// - panel_id_ptr/panel_id_len: identyfikator panelu (UTF-8)
+/// - binary_ptr/binary_len: bincode-encoded `PanelTree`
+/// - Zwraca: ABI_OK lub kod bledu
+pub fn ui_render_binary(
+    mut caller: WasmCaller<'_, AddonState>,
+    panel_id_ptr: i32,
+    panel_id_len: i32,
+    binary_ptr: i32,
+    binary_len: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return ABI_ERR_OPERATION,
+    };
+
+    let panel_id = match read_guest_string(&memory, &caller, panel_id_ptr, panel_id_len) {
+        Some(s) => s.to_string(),
+        None => return ABI_ERR_OPERATION,
+    };
+
+    // Detach guest memory borrow before any `caller.data_mut()` access.
+    let binary_bytes = match read_guest_bytes(&memory, &caller, binary_ptr, binary_len) {
+        Some(b) => b.to_vec(),
+        None => return ABI_ERR_OPERATION,
+    };
+
+    if !check_permission(caller.data(), "ui", None) {
+        audit_log(
+            caller.data(),
+            "ui.render_binary",
+            Some("ui"),
+            Some(&panel_id),
+            "denied",
+            None,
+        );
+        return ABI_ERR_PERMISSION;
+    }
+
+    // Single-pass: msgpack → PanelTree → validate. No JSON parsing.
+    let mut panel_tree: tentaflow_ui_schema::PanelTree =
+        match rmp_serde::from_slice(&binary_bytes) {
+            Ok(t) => t,
+            Err(_) => {
+                audit_log(
+                    caller.data(),
+                    "ui.render_binary",
+                    Some("ui"),
+                    Some(&panel_id),
+                    "denied",
+                    Some("msgpack decode failed"),
+                );
+                return ABI_ERR_OPERATION;
+            }
+        };
+
+    if tentaflow_ui_schema::validate_panel_tree(&mut panel_tree).is_err() {
+        audit_log(
+            caller.data(),
+            "ui.render_binary",
+            Some("ui"),
+            Some(&panel_id),
+            "denied",
+            Some("ui component validation failed"),
+        );
+        return ABI_ERR_OPERATION;
+    }
+
+    let addon_id = caller.data().addon_id.clone();
+    info!(
+        "ui_render_binary: addon='{}', panel_id='{}', bytes={}",
+        addon_id,
+        panel_id,
+        binary_bytes.len()
+    );
+
+    let cache_user_id = caller.data().user_id;
+    if let Some(cache) = caller.data().ui_panels.clone() {
+        let key_user = cache_user_id.unwrap_or(0);
+        cache.write().insert(
+            (key_user, addon_id.clone(), panel_id.clone()),
+            panel_tree.clone(),
+        );
+    }
+
+    // Event bus payload pozostaje JSON-owy (event_bus wymaga `Value`).
+    // Serializacja tylko raz, tylko gdy jest zywy subskrybent — ale bus
+    // sam tego nie filtruje, wiec serializujemy zawsze (jak w ui_render).
+    let tree_value = serde_json::to_value(&panel_tree).unwrap_or(serde_json::Value::Null);
+    caller
+        .data()
+        .event_bus
+        .publish(crate::addon::event_bus::Event {
+            event_type: "ui.panel_rendered".to_string(),
+            source_addon: Some(addon_id.clone()),
+            source_user: cache_user_id,
+            payload: serde_json::json!({
+                "addon_id": &addon_id,
+                "panel_id": &panel_id,
+                "tree": tree_value,
+            }),
+            timestamp: chrono::Utc::now(),
+        });
+
+    audit_log(
+        caller.data(),
+        "ui.render_binary",
         Some("ui"),
         Some(&panel_id),
         "ok",

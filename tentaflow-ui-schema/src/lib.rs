@@ -327,6 +327,51 @@ mod tests {
     }
 
     #[test]
+    fn panel_tree_msgpack_round_trip_preserves_untagged_variants() {
+        // `UiComponent` is `#[serde(untagged)]`. postcard + bincode both
+        // reject untagged enums (they need `deserialize_any`, which only
+        // self-describing formats provide). MessagePack via `rmp-serde`
+        // with named fields (`to_vec_named`) round-trips correctly and
+        // still produces a payload meaningfully smaller than JSON.
+        let tree = PanelTree {
+            root: vec![
+                UiComponent::Layout(layout::LayoutComponent::Stack {
+                    direction: theme::Direction::Vertical,
+                    gap: theme::Spacing::Md,
+                    align: theme::Align::Stretch,
+                    justify: theme::Justify::Start,
+                    wrap: false,
+                    padding: None,
+                    children: vec![UiComponent::Legacy(LegacyComponent::Text {
+                        content: "hi".to_string(),
+                        style: None,
+                    })],
+                }),
+            ],
+            overlays: vec![Overlay {
+                id: "modal-1".to_string(),
+                visible: true,
+                content: Box::new(window_overlay_content()),
+                z_index: 1000,
+            }],
+            navigation: None,
+        };
+
+        let bytes = rmp_serde::to_vec_named(&tree).expect("msgpack encode");
+        let decoded: PanelTree = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(tree, decoded);
+
+        // Payload is meaningfully smaller than JSON for the same content.
+        let json = serde_json::to_string(&tree).expect("json encode");
+        assert!(
+            bytes.len() < json.len(),
+            "msgpack payload {} should be < json {}",
+            bytes.len(),
+            json.len()
+        );
+    }
+
+    #[test]
     fn panel_tree_parses_legacy_components_shape() {
         let json = serde_json::json!({
             "components": [

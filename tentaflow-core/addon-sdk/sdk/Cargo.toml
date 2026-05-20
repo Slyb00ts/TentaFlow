@@ -15,3 +15,8 @@ tentaflow-ui-schema = { path = "../../../tentaflow-ui-schema" }
 base64 = "0.22"
 # TOML dla Camera API (F1a M1.W6) — payloady host functions camera_*_v1.
 toml = "0.8"
+# Binary codec dla `render_panel_binary` (addon→host UI ABI). MessagePack
+# (rmp-serde) wybrany zamiast postcard/bincode bo `UiComponent` to
+# `#[serde(untagged)]` — postcard/bincode wymagaja `deserialize_any` ktore
+# obsluguja tylko self-describing formaty.
+rmp-serde = "1.3"
