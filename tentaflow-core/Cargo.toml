@@ -64,6 +64,10 @@ vector = ["dep:usearch"]
 # Protocol (zawsze)
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 
+# Typed UI schema shared with `tentaflow-addon-sdk` so guest addons build
+# `PanelTree` values directly instead of serializing through `serde_json::Value`.
+tentaflow-ui-schema = { path = "../tentaflow-ui-schema" }
+
 # Proc-macro #[handler] + #[policy] + #[observed]
 tentaflow-macros = { path = "../tentaflow-macros" }
 

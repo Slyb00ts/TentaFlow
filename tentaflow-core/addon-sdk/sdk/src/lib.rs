@@ -5,8 +5,30 @@
 //       eventy, UI, sekrety, logi, rejestracja narzedzi).
 // =============================================================================
 
+//! # Typed UI primitives
+//!
+//! For new addons, use [`render_panel_typed`] together with `ui::PanelTree`
+//! and the typed component sub-enums (`ui::layout::*`, `ui::container::*`,
+//! `ui::data_display::*`, etc.). This eliminates the intermediate
+//! `serde_json::Value` allocation that `render_panel(panel_id, json!({}))`
+//! performs — addons measured a ~5× reduction in guest CPU time and ~3×
+//! fewer heap allocations per render. See `notes/addon-ui-perf-plan.md` in
+//! the TentaFlow repo for the diagnosis and migration plan.
+//!
+//! The legacy [`render_panel`] entry point that accepts `serde_json::Value`
+//! is preserved for addons that have not yet migrated.
+
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
+/// Typed UI schema (PanelTree, UiComponent, theme tokens, layout/container/
+/// form/feedback/action/data_display/specialized sub-enums). Re-exported
+/// 1:1 from `tentaflow-ui-schema`, the same crate the host links against —
+/// so a `PanelTree` value produced here serializes byte-for-byte to what
+/// the host expects.
+pub mod ui {
+    pub use tentaflow_ui_schema::*;
+}
 
 // =============================================================================
 // AbiError — kanoniczne kody bledow ABI dla F1a host functions
@@ -769,9 +791,33 @@ pub fn subscribe_event(
 /// `content` to drzewo komponentow UI (zgodne z `UiComponent` w Core); panel jest
 /// przekazywany do GUI przez event "ui.panel_rendered".
 /// Wymaga uprawnienia "ui" w manifescie addonu.
+///
+/// Legacy entry point — accepts `serde_json::Value`, which forces an extra
+/// allocation pass per render. New code should use [`render_panel_typed`]
+/// with a typed [`ui::PanelTree`] instead.
 pub fn render_panel(panel_id: &str, content: serde_json::Value) -> Result<(), String> {
     let ui_json = serde_json::to_string(&content)
         .map_err(|e| format!("Blad serializacji panelu UI: {}", e))?;
+    ui_render_raw(panel_id, &ui_json)
+}
+
+/// Renders an addon UI panel from a typed [`ui::PanelTree`].
+///
+/// Skips the intermediate `serde_json::Value` allocation that
+/// [`render_panel`] performs — the tree is serialized straight to JSON in
+/// a single pass. Cuts guest-side CPU and allocations versus the legacy
+/// `json!({...})` macro pattern (see `notes/addon-ui-perf-plan.md` §2).
+/// Requires the `ui` permission in the addon manifest.
+pub fn render_panel_typed(panel_id: &str, tree: &ui::PanelTree) -> Result<(), String> {
+    let ui_json = serde_json::to_string(tree)
+        .map_err(|e| format!("Blad serializacji panelu UI: {}", e))?;
+    ui_render_raw(panel_id, &ui_json)
+}
+
+/// Internal: ship a pre-serialized panel JSON across the ABI boundary.
+/// Shared by [`render_panel`] and [`render_panel_typed`] so the unsafe
+/// pointer dance lives in one place.
+fn ui_render_raw(panel_id: &str, ui_json: &str) -> Result<(), String> {
     let pid = panel_id.as_bytes();
     let uj = ui_json.as_bytes();
     let result = unsafe {
@@ -1298,13 +1344,14 @@ pub fn sql_transaction(statements: &[(&str, &[SqlValue])]) -> Result<u64, AbiErr
 
 /// Prelude — importuj wszystkie najczesciej uzywane typy i funkcje
 pub mod prelude {
+    pub use crate::ui;
     pub use crate::{
         read_string, write_string,
         generate,
         store_get, store_set,
         http_get, http_post, http_send, HttpRequest, HttpResponse,
         publish_event, subscribe_event, Event,
-        render_panel, notify, notify_with_level,
+        render_panel, render_panel_typed, notify, notify_with_level,
         secret_get_value, secret_set_value,
         get_current_user, CurrentUser,
         register_tool,

@@ -710,8 +710,8 @@ fn validate_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addon::ui::container::ContainerComponent;
-    use crate::addon::ui::legacy::LegacyComponent;
+    use crate::container::ContainerComponent;
+    use crate::legacy::LegacyComponent;
 
     fn good_cam_id() -> String {
         "cam_550e8400-e29b-41d4-a716-446655440000".to_string()
@@ -727,7 +727,7 @@ mod tests {
     fn window_overlay() -> UiComponent {
         UiComponent::Container(ContainerComponent::Window {
             title: "x".to_string(),
-            size: crate::addon::ui::container::WindowSize::Md,
+            size: crate::container::WindowSize::Md,
             dismissable: true,
             on_close: None,
             children: vec![],

@@ -498,7 +498,7 @@ pub(crate) fn is_overlay_kind(c: &ContainerComponent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addon::ui::legacy::LegacyComponent;
+    use crate::legacy::LegacyComponent;
 
     fn leaf(text: &str) -> UiComponent {
         UiComponent::Legacy(LegacyComponent::Text {

@@ -1,4 +1,10 @@
-// === File: addon/ui/mod.rs — top-level UiComponent sum + PanelTree + JSON entry points ===
+// === File: tentaflow-ui-schema/src/lib.rs — typed UI primitives shared between host and addons ===
+//
+// This crate exposes the schema (no host services) so both `tentaflow-core`
+// (validation + storage) and `tentaflow-addon-sdk` (guest WASM) consume the
+// same types. Addons build `PanelTree` values directly and ship them via
+// `serde_json::to_string`, eliminating an intermediate `serde_json::Value`
+// in both directions. See `notes/addon-ui-perf-plan.md` for the rationale.
 
 pub mod action;
 pub mod container;

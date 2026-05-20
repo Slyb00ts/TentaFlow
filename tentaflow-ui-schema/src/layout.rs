@@ -116,7 +116,7 @@ pub struct GridItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addon::ui::legacy::LegacyComponent;
+    use crate::legacy::LegacyComponent;
 
     fn leaf_text(content: &str) -> UiComponent {
         UiComponent::Legacy(LegacyComponent::Text {
