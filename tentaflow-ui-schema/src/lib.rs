@@ -169,6 +169,32 @@ pub fn parse_and_validate_ui_json(json: &serde_json::Value) -> anyhow::Result<se
     let parsed: PanelFormat = serde_json::from_value(json.clone())
         .map_err(|e| anyhow::anyhow!("invalid panel json: {}", e))?;
     let mut tree = parsed.into_tree();
+    validate_panel_tree(&mut tree)?;
+    Ok(serde_json::to_value(&tree)?)
+}
+
+/// Single-pass parse + validate from JSON string into a typed `PanelTree`.
+/// Avoids the intermediate `serde_json::Value` round-trip that
+/// `parse_and_validate_ui_json` performs (5x serde passes on the
+/// `ui_render` hot path collapse to 2x — see `notes/addon-ui-perf-plan.md`).
+///
+/// Accepts both v2 (`{root: [...], overlays: [...]}`) and legacy v1
+/// (`{components: [...]}`) JSON shapes via the untagged `PanelFormat`
+/// deserialize impl, so addons that have not migrated to the typed
+/// builder API keep working.
+pub fn parse_and_validate_panel_tree(json_str: &str) -> anyhow::Result<PanelTree> {
+    let parsed: PanelFormat = serde_json::from_str(json_str)
+        .map_err(|e| anyhow::anyhow!("invalid panel tree json: {}", e))?;
+    let mut tree = parsed.into_tree();
+    validate_panel_tree(&mut tree)?;
+    Ok(tree)
+}
+
+/// Validate + normalise a typed `PanelTree` in place. Used by both the
+/// JSON parser entry points and callers that built the tree
+/// programmatically (e.g. test fixtures) so the validation contract
+/// lives in exactly one place.
+pub fn validate_panel_tree(tree: &mut PanelTree) -> anyhow::Result<()> {
     for c in &mut tree.root {
         reject_overlay_kind_in_root(c)?;
         validate_and_normalize_component(c)?;
@@ -177,7 +203,7 @@ pub fn parse_and_validate_ui_json(json: &serde_json::Value) -> anyhow::Result<se
         validate_overlay_content_kind(&overlay.content)?;
         validate_and_normalize_component(&mut overlay.content)?;
     }
-    Ok(serde_json::to_value(&tree)?)
+    Ok(())
 }
 
 /// Recursively validate+normalize a single component. Layout container
@@ -516,6 +542,49 @@ mod tests {
         });
         let out = parse_and_validate_ui_json(&json).expect("ok");
         assert_eq!(out["root"][0]["type"], "card");
+    }
+
+    #[test]
+    fn parse_and_validate_panel_tree_accepts_v2_shape() {
+        let json = r#"{"root":[{"type":"text","content":"hi"}]}"#;
+        let tree = parse_and_validate_panel_tree(json).expect("ok");
+        assert_eq!(tree.root.len(), 1);
+        assert!(tree.overlays.is_empty());
+    }
+
+    #[test]
+    fn parse_and_validate_panel_tree_accepts_legacy_components_shape() {
+        let json = r#"{"components":[{"type":"text","content":"hi"},{"type":"divider"}]}"#;
+        let tree = parse_and_validate_panel_tree(json).expect("ok");
+        assert_eq!(tree.root.len(), 2);
+    }
+
+    #[test]
+    fn parse_and_validate_panel_tree_rejects_window_in_root() {
+        let json = r#"{"root":[{"type":"window","title":"no","children":[]}]}"#;
+        let err = parse_and_validate_panel_tree(json).expect_err("must reject");
+        assert!(format!("{}", err).contains("overlay_kind_outside_overlays"));
+    }
+
+    #[test]
+    fn parse_and_validate_panel_tree_clamps_ttl() {
+        let json = format!(
+            r#"{{"components":[{{"type":"live_camera_tile","camera_id":"{}","ttl_secs":9999}}]}}"#,
+            good_cam_id()
+        );
+        let tree = parse_and_validate_panel_tree(&json).expect("ok");
+        match &tree.root[0] {
+            UiComponent::Legacy(LegacyComponent::LiveCameraTile { ttl_secs, .. }) => {
+                assert_eq!(*ttl_secs, LIVE_CAMERA_TILE_TTL_MAX);
+            }
+            other => panic!("unexpected component: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_and_validate_panel_tree_rejects_malformed_json() {
+        let err = parse_and_validate_panel_tree("not json at all").expect_err("must reject");
+        assert!(format!("{}", err).contains("invalid panel tree json"));
     }
 
     #[test]
