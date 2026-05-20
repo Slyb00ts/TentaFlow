@@ -2163,9 +2163,11 @@ pub fn container_list(
     // Real Docker API integration wymaga bollard async — w sync handler
     // zwracamy zarejestrowane kontenery z Service registry (proxy).
     // Pelne portainer integration jako oddzielny stream handler w przyszlosci.
-    Ok(MessageBody::ContainerListResponse {
-        containers: Vec::new(),
-    })
+    Ok(MessageBody::ContainerBody(
+        tentaflow_protocol::ContainerPayload::ListResponse {
+            containers: Vec::new(),
+        },
+    ))
 }
 
 #[handler(variant = "ContainerStartRequest", since = (1, 0))]
@@ -2176,11 +2178,15 @@ pub fn container_start(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     match req {
-        MessageBody::ContainerStartRequest { container_id: _ } => {
+        MessageBody::ContainerBody(tentaflow_protocol::ContainerPayload::StartRequest {
+            container_id: _,
+        }) => {
             // Real Docker start wymaga async bollard — zwracamy started=true
             // jako synchroniczny ack; klient powinien obserwowac ContainerList
             // dla potwierdzenia state change.
-            Ok(MessageBody::ContainerStartResponse { started: true })
+            Ok(MessageBody::ContainerBody(
+                tentaflow_protocol::ContainerPayload::StartResponse { started: true },
+            ))
         }
         _ => Err(ProtocolError::bad_request("expected ContainerStartRequest")),
     }
@@ -2194,9 +2200,11 @@ pub fn container_stop(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     match req {
-        MessageBody::ContainerStopRequest { container_id: _ } => {
-            Ok(MessageBody::ContainerStopResponse { stopped: true })
-        }
+        MessageBody::ContainerBody(tentaflow_protocol::ContainerPayload::StopRequest {
+            container_id: _,
+        }) => Ok(MessageBody::ContainerBody(
+            tentaflow_protocol::ContainerPayload::StopResponse { stopped: true },
+        )),
         _ => Err(ProtocolError::bad_request("expected ContainerStopRequest")),
     }
 }
