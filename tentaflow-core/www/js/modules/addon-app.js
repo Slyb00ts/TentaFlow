@@ -521,6 +521,7 @@ function renderCard(c, ctx) {
 function renderSectionCard(c, ctx) {
   const el = document.createElement('section');
   el.className = 'sdk-section-card';
+  if (c.accent) el.dataset.accent = c.accent;
   if (c.title || (c.actions && c.actions.length)) {
     const head = document.createElement('header');
     head.className = 'sdk-section-card-header';
@@ -633,9 +634,14 @@ function renderNavTabs(c, ctx) {
     const tab = document.createElement('button');
     tab.type = 'button';
     const active = item.id === c.active_id;
-    tab.className = `sdk-nav-tab${active ? ' active' : ''}`;
+    tab.className = `sdk-nav-tab${active ? ' active' : ''}${item.locked ? ' locked' : ''}`;
     tab.setAttribute('role', 'tab');
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    if (item.locked) {
+      tab.setAttribute('aria-disabled', 'true');
+      tab.disabled = true;
+      tab.title = 'Funkcja zablokowana (wymaga licencji)';
+    }
     tab.tabIndex = active ? 0 : -1;
     if (item.icon) tab.appendChild(renderIcon(item.icon));
     tab.appendChild(document.createTextNode(' ' + (item.label ?? '')));
@@ -645,7 +651,16 @@ function renderNavTabs(c, ctx) {
       badge.textContent = item.badge;
       tab.appendChild(badge);
     }
-    tab.addEventListener('click', () => navigateToPanel(ctx, item.panel_id));
+    if (item.locked) {
+      const lock = document.createElement('span');
+      lock.className = 'sdk-nav-tab-lock';
+      lock.setAttribute('aria-hidden', 'true');
+      lock.textContent = '🔒';
+      tab.appendChild(lock);
+    }
+    if (!item.locked) {
+      tab.addEventListener('click', () => navigateToPanel(ctx, item.panel_id));
+    }
     el.appendChild(tab);
   }
   attachKeyboardNav(el, '.sdk-nav-tab', {
@@ -1026,6 +1041,14 @@ function renderChipV2(c, ctx) {
     el.classList.add('clickable');
     el.addEventListener('click', () => dispatchAction(ctx, null, c.on_click, {}));
   }
+  // Status-type chips with live-state labels get a pulsing indicator dot.
+  // The label list matches the surveillance dashboard mockup (online,
+  // krytyczne, runtime online, ostrzeżenie, alert).
+  const label = (c.label || '').toLowerCase();
+  const pulseLabels = ['online', 'krytyczne', 'alert', 'aktywny', 'live'];
+  if ((c.kind === 'status' || c.kind === 'state') && pulseLabels.some((p) => label.includes(p))) {
+    el.classList.add('sdk-chip-pulse');
+  }
   if (c.icon) el.appendChild(renderIcon(c.icon));
   el.appendChild(document.createTextNode(c.label || ''));
   if (c.dismissible && c.on_dismiss) {
@@ -1178,6 +1201,11 @@ function renderImageV2(c) {
 function renderStat(c) {
   const el = document.createElement('div');
   el.className = 'sdk-stat';
+  if (c.accent) {
+    // Carry accent on the stat element so a wrapping card can use :has()
+    // CSS to render the coloured left-border (mockup KPI tiles).
+    el.dataset.accent = c.accent;
+  }
   if (c.icon) {
     const i = renderIcon(c.icon);
     i.style.color = `var(--sdk-color-${(c.accent || 'primary').replace(/_/g, '-')})`;
@@ -1186,14 +1214,23 @@ function renderStat(c) {
   const v = document.createElement('div');
   v.className = 'sdk-stat-value';
   const rawValue = c.value || '';
-  v.textContent = rawValue;
+  const main = document.createElement('span');
+  main.className = 'sdk-stat-value-main';
+  main.textContent = rawValue;
+  v.appendChild(main);
+  if (c.value_suffix) {
+    const sfx = document.createElement('span');
+    sfx.className = 'sdk-stat-value-suffix';
+    sfx.textContent = c.value_suffix;
+    v.appendChild(sfx);
+  }
   if (c.accent) v.style.color = `var(--sdk-color-${c.accent.replace(/_/g, '-')})`;
   el.appendChild(v);
-  // Animacja licznika 0 -> wartosc — jesli da sie wyparsowac liczbe z tekstu.
+  // Counter animation 0 -> value when the value parses as a number.
   const parsed = parseStatValue(String(rawValue));
   if (parsed && parsed.num !== 0 && !prefersReducedMotion()) {
-    v.textContent = parsed.format(0);
-    requestAnimationFrame(() => animateNumber(v, 0, parsed.num, 800, parsed.format));
+    main.textContent = parsed.format(0);
+    requestAnimationFrame(() => animateNumber(main, 0, parsed.num, 800, parsed.format));
   }
   const l = document.createElement('div');
   l.className = 'sdk-stat-label';

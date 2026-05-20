@@ -1109,3 +1109,103 @@
 .sdk-icon-md { width: 16px; height: 16px; }
 .sdk-icon-lg { width: 20px; height: 20px; }
 .sdk-icon-xl { width: 32px; height: 32px; }
+
+/* =============================================================================
+   Dashboard polish (KPI tiles, alarm cards, NavTab squeeze, pulse chip).
+   Tuned to match the TentaVision surveillance mockup.
+   ============================================================================= */
+
+/* Stat label rendered as small caps caption (mockup KPI tiles). */
+.sdk-stat-label {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 11px;
+  color: var(--sdk-color-text-muted);
+  margin-top: var(--sdk-spacing-xs);
+}
+
+/* Numeric main + faded suffix ("22 / 24") inside a single .sdk-stat-value. */
+.sdk-stat-value { display: flex; align-items: baseline; gap: 4px; }
+.sdk-stat-value-main { font-size: inherit; font-weight: inherit; color: inherit; }
+.sdk-stat-value-suffix {
+  font-size: 0.5em;
+  color: var(--sdk-color-text-muted);
+  font-weight: 400;
+}
+
+/* Coloured left border on the wrapping Card when the inner Stat carries an
+   accent. Uses :has() (supported in all modern browsers). */
+.sdk-card:has(> .sdk-card-body > .sdk-stat[data-accent="warning"]) {
+  border-left: 3px solid var(--sdk-color-warning);
+}
+.sdk-card:has(> .sdk-card-body > .sdk-stat[data-accent="danger"]) {
+  border-left: 3px solid var(--sdk-color-danger);
+}
+.sdk-card:has(> .sdk-card-body > .sdk-stat[data-accent="success"]) {
+  border-left: 3px solid var(--sdk-color-success);
+}
+.sdk-card:has(> .sdk-card-body > .sdk-stat[data-accent="accent"]) {
+  border-left: 3px solid var(--sdk-color-accent);
+}
+.sdk-card:has(> .sdk-card-body > .sdk-stat[data-accent="info"]) {
+  border-left: 3px solid var(--sdk-color-info, var(--sdk-color-accent));
+}
+
+/* Avatar XL (header hero tile in addon dashboard). */
+.sdk-avatar.xl {
+  width: 64px;
+  height: 64px;
+  font-size: 20px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--sdk-color-primary, var(--sdk-color-accent)), var(--sdk-color-accent));
+  color: #fff;
+}
+
+/* Pulsing status dot rendered before chip label. */
+.sdk-chip-pulse::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 6px;
+  animation: sdk-chip-pulse 1.5s infinite;
+  vertical-align: middle;
+}
+@keyframes sdk-chip-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.85); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sdk-chip-pulse::before { animation: none; }
+}
+
+/* NavTabs squeeze: keep the strip on one line in the surveillance dashboard
+   (12+ tabs) — scrollable only when even the squeezed labels overflow. */
+.sdk-nav-tabs {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+.sdk-nav-tab {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.sdk-nav-tab.locked {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.sdk-nav-tab.locked:hover {
+  background: transparent;
+}
+.sdk-nav-tab-lock {
+  margin-left: 4px;
+  font-size: 0.85em;
+}
+
+/* Alarm SectionCard accent border (severity ribbon on the left). */
+.sdk-section-card[data-accent="danger"] { border-left: 4px solid var(--sdk-color-danger); padding-left: var(--sdk-spacing-md); }
+.sdk-section-card[data-accent="warning"] { border-left: 4px solid var(--sdk-color-warning); padding-left: var(--sdk-spacing-md); }
+.sdk-section-card[data-accent="info"] { border-left: 4px solid var(--sdk-color-info, var(--sdk-color-accent)); padding-left: var(--sdk-spacing-md); }
+.sdk-section-card[data-accent="success"] { border-left: 4px solid var(--sdk-color-success); padding-left: var(--sdk-spacing-md); }

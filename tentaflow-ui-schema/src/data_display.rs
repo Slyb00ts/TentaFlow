@@ -96,6 +96,11 @@ pub enum DataDisplayComponent {
     },
     Stat {
         value: String,
+        /// Optional small suffix appended after `value` (e.g. "/ 24" rendered
+        /// at ~0.5em, muted) — used for "22 / 24" style KPIs where only the
+        /// total slice should fade visually.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value_suffix: Option<String>,
         label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sublabel: Option<String>,
@@ -826,6 +831,7 @@ mod tests {
     fn stat_round_trip() {
         let c = DataDisplayComponent::Stat {
             value: "1,234".into(),
+            value_suffix: None,
             label: "Frames".into(),
             sublabel: Some("today".into()),
             trend: Some(StatTrend {
@@ -1182,6 +1188,7 @@ mod tests {
     fn stat_trend_delta_too_long_is_rejected() {
         let mut c = DataDisplayComponent::Stat {
             value: "v".into(),
+            value_suffix: None,
             label: "l".into(),
             sublabel: None,
             trend: Some(StatTrend {

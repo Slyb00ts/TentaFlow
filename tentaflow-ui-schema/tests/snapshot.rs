@@ -96,6 +96,7 @@ fn snapshot_card_container() {
 fn snapshot_stat_data_display() {
     let stat = DataDisplayComponent::Stat {
         value: "42".to_string(),
+        value_suffix: None,
         label: "Active".to_string(),
         sublabel: None,
         trend: None,
