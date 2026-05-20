@@ -2,9 +2,13 @@
 // Plik: components/tf-canvas.js
 // Opis: Custom element <tf-canvas> renderujacy liste DrawCommand z SDK
 // (SpecializedComponent::Canvas). Polecenia ustawiane sa przez property
-// `commands` (Array<DrawCommand>), eventy pointerdown/move/up wysylane sa
-// callbackiem `onPointer({ x, y, action, button })`.
+// `commands` (Array<DrawCommand>), eventy pointerdown/move/up/cancel wysylane
+// sa callbackiem `onPointer({ x, y, action, button })`. Esc emituje cancel.
+// Komenda `image` rozwiazuje `ImageSource` (w tym signed_frame) przez
+// `/js/utils/signed-frame.js` i cache'uje obiekty Image per URL.
 // =============================================================================
+
+import { resolveImageSource } from '/js/utils/signed-frame.js';
 
 class TfCanvas extends HTMLElement {
   constructor() {
@@ -18,6 +22,16 @@ class TfCanvas extends HTMLElement {
     this._throttleMs = 0;
     this._lastPointerTs = 0;
     this._canvas = null;
+    // Cache obiektów Image — klucz: signed URL, wartość: HTMLImageElement.
+    // Trzymamy je w komponencie (nie globalnie), bo cykl życia jest powiązany
+    // z DOM-em; przy detachu cały komponent znika z GC.
+    this._imageCache = new Map();
+    // RAF throttling redraw-a po async swapach (image load / resolve).
+    this._redrawScheduled = false;
+    // Numer wersji commands — używamy do anulowania nieaktualnych pre-resolve'ów,
+    // gdyby setter `commands` strzelił w trakcie poprzedniego pre-resolve passa.
+    this._commandsVersion = 0;
+    this._onKeyDown = this._onKeyDown.bind(this);
   }
 
   connectedCallback() {
@@ -29,11 +43,17 @@ class TfCanvas extends HTMLElement {
       this._canvas.addEventListener('pointerup', (e) => this._emitPointer(e, 'up'));
       this.appendChild(this._canvas);
     }
+    window.addEventListener('keydown', this._onKeyDown);
     this._render();
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener('keydown', this._onKeyDown);
   }
 
   set commands(value) {
     this._commands = Array.isArray(value) ? value : [];
+    this._commandsVersion += 1;
     if (this.isConnected) this._render();
   }
 
@@ -81,7 +101,72 @@ class TfCanvas extends HTMLElement {
     this._onPointer({ x, y, action, button: ev.button });
   }
 
+  _onKeyDown(ev) {
+    if (ev.key !== 'Escape') return;
+    if (!this._onPointer) return;
+    // Esc anuluje aktywne rysowanie. Addon (np. m09 ZoneEditor) decyduje
+    // czy reset stanu czy ignor.
+    this._onPointer({ x: 0, y: 0, action: 'cancel', button: 0 });
+    ev.preventDefault();
+  }
+
+  _requestRedraw() {
+    if (this._redrawScheduled || !this.isConnected) return;
+    this._redrawScheduled = true;
+    requestAnimationFrame(() => {
+      this._redrawScheduled = false;
+      this._renderSync();
+    });
+  }
+
   _render() {
+    // Pre-resolve commands typu `image` (signed_frame potrzebuje round-tripa).
+    // Po pre-resolve odpalamy sync draw. Wszystkie inne komendy nie wymagają
+    // async, więc rysują się natychmiast po pierwszej iteracji.
+    this._preResolveImages().then(() => this._renderSync());
+  }
+
+  async _preResolveImages() {
+    const version = this._commandsVersion;
+    const imageCommands = this._commands.filter((c) => c && c.kind === 'image');
+    if (imageCommands.length === 0) return;
+
+    await Promise.all(
+      imageCommands.map(async (cmd) => {
+        try {
+          cmd._resolved = await resolveImageSource(cmd.source);
+        } catch (err) {
+          console.warn('[tf-canvas] image resolve failed:', err?.code, err?.message);
+          cmd._resolved = { kind: 'placeholder' };
+        }
+      }),
+    );
+
+    // Jeśli commands zmieniły się w trakcie pre-resolve — porzucamy wynik;
+    // świeższy setter wystartuje nowy pass.
+    if (version !== this._commandsVersion) return;
+
+    // Pre-load HTMLImageElement dla resolved URL-i. Po `onload` wymuszamy redraw,
+    // żeby pierwsza pełna klatka pojawiła się bez czekania na kolejny refresh.
+    for (const cmd of imageCommands) {
+      const r = cmd._resolved;
+      if (!r || r.kind !== 'url') continue;
+      if (this._imageCache.has(r.url)) continue;
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = () => this._requestRedraw();
+      img.onerror = () => {
+        // Niepowodzenie ładowania traktujemy jak placeholder — usuwamy z cache,
+        // żeby kolejny render mógł spróbować ponownie (np. po wygaśnięciu URL-a).
+        this._imageCache.delete(r.url);
+        this._requestRedraw();
+      };
+      img.src = r.url;
+      this._imageCache.set(r.url, img);
+    }
+  }
+
+  _renderSync() {
     if (!this._canvas) return;
     const cv = this._canvas;
     cv.width = this._width;
@@ -95,7 +180,7 @@ class TfCanvas extends HTMLElement {
       ctx.fillRect(0, 0, cv.width, cv.height);
     }
     for (const cmd of this._commands) {
-      drawCommand(ctx, cmd);
+      drawCommand(ctx, cmd, this._imageCache);
     }
   }
 }
@@ -130,7 +215,7 @@ function colorVar(role) {
   return v || '#888';
 }
 
-function drawCommand(ctx, cmd) {
+function drawCommand(ctx, cmd, imageCache) {
   if (!cmd || typeof cmd.kind !== 'string') return;
   switch (cmd.kind) {
     case 'line':
@@ -193,13 +278,73 @@ function drawCommand(ctx, cmd) {
       ctx.fillText(String(cmd.text ?? ''), cmd.pos.x, cmd.pos.y);
       break;
     case 'image':
-      // Zrodla obrazow obslugujemy przez addon UI render w warstwie wyzszej
-      // — Canvas nie ma kontekstu addona do rozwiazania signed_frame. Pomijamy
-      // ten command w MVP; addon ma uzyc <tf-video-stream> dla strumieni.
+      drawImageCommand(ctx, cmd, imageCache);
       break;
     default:
       break;
   }
+}
+
+function drawImageCommand(ctx, cmd, imageCache) {
+  const x = Number(cmd.x) || 0;
+  const y = Number(cmd.y) || 0;
+  const w = Number(cmd.width) || 0;
+  const h = Number(cmd.height) || 0;
+  if (w <= 0 || h <= 0) return;
+
+  const opacity = Number.isFinite(Number(cmd.opacity)) ? Number(cmd.opacity) : 1.0;
+  const prevAlpha = ctx.globalAlpha;
+  ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
+
+  const resolved = cmd._resolved;
+  if (resolved && resolved.kind === 'url') {
+    const img = imageCache.get(resolved.url);
+    if (img && img.complete && img.naturalWidth > 0) {
+      ctx.drawImage(img, x, y, w, h);
+      ctx.globalAlpha = prevAlpha;
+      return;
+    }
+    // Obraz jeszcze nie załadowany — rysujemy placeholder; redraw odpali się
+    // z `onload` w pre-resolve passie.
+    drawImagePlaceholder(ctx, x, y, w, h);
+    ctx.globalAlpha = prevAlpha;
+    return;
+  }
+
+  // resolved.kind === 'placeholder' albo brak (np. pre-resolve nie zdążył).
+  drawImagePlaceholder(ctx, x, y, w, h);
+  ctx.globalAlpha = prevAlpha;
+}
+
+function drawImagePlaceholder(ctx, x, y, w, h) {
+  ctx.fillStyle = colorVar('bg_surface');
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = colorVar('border');
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  ctx.setLineDash([]);
+
+  // Glyph "image" — prosty piktogram (góra + okrąg + trójkąty), uniwersalny
+  // jak ikona w SVG sprite. Nie ładujemy tu SVG-ka, bo wymagałby async
+  // i drugi kanał renderu; rysujemy ścieżkę natywnie w kontekście 2d.
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  const size = Math.min(w, h) * 0.35;
+  if (size < 6) return;
+  ctx.fillStyle = colorVar('text_subtle');
+  ctx.globalAlpha *= 0.6;
+  ctx.beginPath();
+  ctx.arc(cx - size * 0.3, cy - size * 0.2, size * 0.18, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx - size * 0.6, cy + size * 0.5);
+  ctx.lineTo(cx - size * 0.1, cy - size * 0.05);
+  ctx.lineTo(cx + size * 0.2, cy + size * 0.25);
+  ctx.lineTo(cx + size * 0.55, cy - size * 0.15);
+  ctx.lineTo(cx + size * 0.6, cy + size * 0.5);
+  ctx.closePath();
+  ctx.fill();
 }
 
 function mapTextAlign(a) {
