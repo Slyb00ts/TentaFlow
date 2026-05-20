@@ -152,21 +152,43 @@
 .sdk-tab.active { color: var(--sdk-color-text); border-bottom-color: var(--sdk-color-primary); }
 .sdk-tab-pane { padding-top: var(--sdk-spacing-md); }
 
-.sdk-nav-tabs { display: flex; gap: var(--sdk-spacing-xs); border-bottom: 1px solid var(--sdk-color-border); }
+/* NavTabs ulozone w jeden rzad pod toolbarem (mockup m01 — `.tabs-bar`).
+   Overflow-x: auto pozwala scrollowac taby przy waskim viewport bez wrapowania,
+   ktore zaburzaloby ksztalt headera addona. */
+.sdk-nav-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--sdk-color-border);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  margin: 0 calc(var(--sdk-spacing-md) * -1);
+  padding: 0 var(--sdk-spacing-md);
+}
+.sdk-nav-tabs::-webkit-scrollbar { height: 4px; }
+.sdk-nav-tabs::-webkit-scrollbar-thumb { background: var(--sdk-color-border); border-radius: 2px; }
 .sdk-nav-tab {
   background: transparent;
   border: none;
   color: var(--sdk-color-text-muted);
-  padding: var(--sdk-spacing-sm) var(--sdk-spacing-md);
+  padding: 10px var(--sdk-spacing-md);
   cursor: pointer;
   font-size: var(--sdk-text-body);
+  font-weight: var(--sdk-fw-medium, 500);
   border-bottom: 2px solid transparent;
   display: inline-flex;
   align-items: center;
-  gap: var(--sdk-spacing-xs);
+  gap: 6px;
+  white-space: nowrap;
+  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
 }
-.sdk-nav-tab:hover { color: var(--sdk-color-text); }
-.sdk-nav-tab.active { color: var(--sdk-color-text); border-bottom-color: var(--sdk-color-primary); }
+.sdk-nav-tab:hover {
+  color: var(--sdk-color-text);
+  background: var(--sdk-color-bg-elevated);
+}
+.sdk-nav-tab.active {
+  color: var(--sdk-color-text);
+  border-bottom-color: var(--sdk-color-primary);
+}
 
 .sdk-toolbar {
   display: flex;
