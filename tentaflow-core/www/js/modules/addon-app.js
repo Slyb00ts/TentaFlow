@@ -84,11 +84,23 @@ async function refreshPanel(addonId, panelId) {
     const content = await fetchAndBuildContent(addonId, panelId);
     shell.innerHTML = '';
     shell.appendChild(content);
+    shell.dataset.activePanelId = panelId;
     return;
   }
 
-  // Kolejny render — fade-out starego, fetch nowego, fade-in.
+  // Same-panel update (action response, validation re-render): wymieniamy
+  // DOM w miejscu bez fade-out/in. Pełna tranzycja zostawia ~400 ms okna
+  // w którym overlay (modal "Dodaj kamerę") miga między starym a nowym
+  // portalem. Tranzycję rezerwujemy dla przejść między panelami.
+  const samePanel = shell.dataset.activePanelId === panelId;
+  if (samePanel) {
+    const content = await fetchAndBuildContent(addonId, panelId);
+    if (existing.parentNode) existing.replaceWith(content);
+    return;
+  }
+
   await panelTransition(existing, () => fetchAndBuildContent(addonId, panelId));
+  shell.dataset.activePanelId = panelId;
 }
 
 async function fetchAndBuildContent(addonId, panelId) {
@@ -143,14 +155,6 @@ async function fetchAndBuildContent(addonId, panelId) {
 }
 
 function renderPanelInto(root, panel, ctx) {
-  // Usun stare overlay portale przed nowym renderingiem panelu
-  document.querySelectorAll('[data-sdk-overlay-portal]').forEach((n) => {
-    if (typeof n.__popoverCleanup === 'function') {
-      try { n.__popoverCleanup(); } catch (e) { console.warn('[overlay] cleanup:', e); }
-    }
-    n.remove();
-  });
-
   const title = panel?.title ?? '';
   // PanelTree v2 ma `root: [...]`; legacy ma `components: [...]`.
   const components = Array.isArray(panel?.root)
@@ -188,12 +192,68 @@ function renderPanelInto(root, panel, ctx) {
   panelEl.appendChild(main);
   root.appendChild(panelEl);
 
-  // Overlay portale (window/drawer/popover) trafiaja do body, nie do shell
+  // Overlay portale (window/drawer/popover) trafiaja do body, nie do shell.
+  // Diffujemy po id zamiast niszczyc + odtwarzac wszystko — full rebuild
+  // niszczyl animacje open/close modali (np. "Dodaj kamere") za kazdym
+  // refreshem panelu po akcji.
+  const existingPortals = document.querySelectorAll('[data-sdk-overlay-portal]');
+  const keepIds = new Set();
   for (const overlay of overlays) {
-    if (overlay && overlay.visible !== false) {
+    if (!overlay || overlay.visible === false) continue;
+    keepIds.add(overlay.id || '');
+  }
+  existingPortals.forEach((node) => {
+    const id = node.dataset.sdkOverlayPortal || '';
+    if (!keepIds.has(id)) {
+      if (typeof node.__popoverCleanup === 'function') {
+        try { node.__popoverCleanup(); } catch (e) { console.warn('[overlay] cleanup:', e); }
+      }
+      node.remove();
+    }
+  });
+  const remainingPortals = new Map();
+  document.querySelectorAll('[data-sdk-overlay-portal]').forEach((n) => {
+    remainingPortals.set(n.dataset.sdkOverlayPortal || '', n);
+  });
+  for (const overlay of overlays) {
+    if (!overlay || overlay.visible === false) continue;
+    const id = overlay.id || '';
+    if (remainingPortals.has(id)) {
+      // Existing portal — refresh content in place, keep open animation.
+      refreshOverlayPortal(remainingPortals.get(id), overlay, ctx);
+    } else {
       const portal = createOverlayPortal(overlay, ctx);
       if (portal) document.body.appendChild(portal);
     }
+  }
+}
+
+function refreshOverlayPortal(portal, overlay, ctx) {
+  const c = overlay.content;
+  if (!c) return;
+  if (c.type === 'window') {
+    const win = portal.querySelector(':scope > .sdk-window');
+    if (!win) return;
+    const newWin = buildWindow(c, ctx, overlay);
+    portal.replaceChild(newWin, win);
+  } else if (c.type === 'drawer') {
+    const dr = portal.querySelector(':scope > .sdk-drawer');
+    if (!dr) return;
+    const newDr = buildDrawer(c, ctx, overlay);
+    portal.replaceChild(newDr, dr);
+  } else if (c.type === 'popover') {
+    const old = portal.querySelector(':scope > .sdk-popover');
+    if (!old) return;
+    const fresh = buildPopover(c, ctx, overlay);
+    fresh.style.pointerEvents = 'auto';
+    portal.replaceChild(fresh, old);
+    if (typeof portal.__popoverCleanup === 'function') {
+      try { portal.__popoverCleanup(); } catch (e) { console.warn('[overlay] cleanup:', e); }
+    }
+    const placement = c.placement || 'bottom-start';
+    queueMicrotask(() => {
+      portal.__popoverCleanup = attachPopover(fresh, c.target_id, placement);
+    });
   }
 }
 
