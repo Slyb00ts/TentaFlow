@@ -20,6 +20,9 @@ class TfSparkline extends HTMLElement {
       this._canvas = document.createElement('canvas');
       this._canvas.style.display = 'block';
       this.appendChild(this._canvas);
+      // Delikatny fade-in przy pierwszym pojawieniu sie — canvas-line draw
+      // animation wymagalaby wlasnej petli rAF, ktora bije sie z update'ami.
+      this.classList.add('sdk-animate-fade-in');
     }
     this._render();
   }
