@@ -292,8 +292,8 @@ fn validate_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addon::ui::container::{ContainerComponent, WindowSize};
-    use crate::addon::ui::legacy::LegacyComponent;
+    use crate::container::{ContainerComponent, WindowSize};
+    use crate::legacy::LegacyComponent;
 
     fn legacy_text(s: &str) -> UiComponent {
         UiComponent::Legacy(LegacyComponent::Text {

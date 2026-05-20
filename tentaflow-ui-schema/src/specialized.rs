@@ -753,8 +753,8 @@ fn is_valid_stream_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addon::ui::action::ActionComponent;
-    use crate::addon::ui::UiComponent;
+    use crate::action::ActionComponent;
+    use crate::UiComponent;
 
     fn good_cam_id() -> String {
         "cam_550e8400-e29b-41d4-a716-446655440000".to_string()
