@@ -13,6 +13,14 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, byId } from '/js/utils.js';
+import {
+  panelTransition,
+  animateNumber,
+  parseStatValue,
+  staggerEnter,
+  animatedRemove,
+  prefersReducedMotion,
+} from '/js/modules/motion.js';
 import '/js/components/tf-canvas.js';
 import '/js/components/tf-sparkline.js';
 import '/js/components/tf-heatmap.js';
@@ -57,29 +65,47 @@ async function refreshPanel(addonId, panelId) {
   const shell = document.querySelector('.addon-app-shell');
   if (!shell) return;
 
+  const existing = shell.querySelector(':scope > .addon-app-content');
+  // Pierwszy render albo loading placeholder — wstawiamy bez tranzycji.
+  if (!existing) {
+    const content = await fetchAndBuildContent(addonId, panelId);
+    shell.innerHTML = '';
+    shell.appendChild(content);
+    return;
+  }
+
+  // Kolejny render — fade-out starego, fetch nowego, fade-in.
+  await panelTransition(existing, () => fetchAndBuildContent(addonId, panelId));
+}
+
+async function fetchAndBuildContent(addonId, panelId) {
+  const content = document.createElement('div');
+  content.className = 'addon-app-content';
+
   let response;
   try {
     response = await ApiBinary.one('addonUiPanelGetRequest', { addonId, panelId });
   } catch (e) {
-    shell.innerHTML = errorBlock(`Nie udało się pobrać panelu: ${e.message}`);
-    return;
+    content.innerHTML = errorBlock(`Nie udało się pobrać panelu: ${e.message}`);
+    return content;
   }
 
   const treeJson = response?.treeJson ?? response?.tree_json ?? '';
   if (!treeJson) {
-    shell.innerHTML = emptyBlock(addonId, panelId);
-    return;
+    content.innerHTML = emptyBlock(addonId, panelId);
+    return content;
   }
 
   let panel;
   try {
     panel = JSON.parse(treeJson);
   } catch (e) {
-    shell.innerHTML = errorBlock(`Panel UI ma niepoprawny JSON: ${e.message}`);
-    return;
+    content.innerHTML = errorBlock(`Panel UI ma niepoprawny JSON: ${e.message}`);
+    return content;
   }
 
-  renderPanelInto(shell, panel, { addonId, panelId });
+  renderPanelInto(content, panel, { addonId, panelId });
+  return content;
 }
 
 function renderPanelInto(root, panel, ctx) {
@@ -403,6 +429,17 @@ function renderSplit(c, ctx) {
 function renderCard(c, ctx) {
   const el = document.createElement('section');
   el.className = 'sdk-card';
+  if (c.on_click) {
+    el.classList.add('sdk-card-interactive');
+    el.addEventListener('click', (ev) => {
+      // Nie wyzwalaj on_click karty gdy klik trafil w interaktywne dziecko
+      if (ev.target.closest('button, a, input, select, textarea, [role="button"]') !== el) {
+        const inner = ev.target.closest('button, a, input, select, textarea, [role="button"]');
+        if (inner && el.contains(inner) && inner !== el) return;
+      }
+      dispatchAction(ctx, null, c.on_click, {});
+    });
+  }
   if (c.padding) el.style.padding = spacingVar(c.padding);
   if (c.title || c.subtitle || c.icon || (c.actions && c.actions.length)) {
     const head = document.createElement('header');
@@ -834,7 +871,10 @@ function buildPopover(c, ctx, overlay) {
 }
 
 function closeOverlay(portalEl, onClose, ctx) {
-  if (portalEl) portalEl.remove();
+  if (portalEl) {
+    // Animowane zamkniecie — backdrop fade-out, content (jesli wewnatrz) jedzie razem.
+    animatedRemove(portalEl, 'leaving', 150);
+  }
   if (onClose) dispatchAction(ctx, null, onClose, {});
 }
 
@@ -966,9 +1006,16 @@ function renderStat(c) {
   }
   const v = document.createElement('div');
   v.className = 'sdk-stat-value';
-  v.textContent = c.value || '';
+  const rawValue = c.value || '';
+  v.textContent = rawValue;
   if (c.accent) v.style.color = `var(--sdk-color-${c.accent.replace(/_/g, '-')})`;
   el.appendChild(v);
+  // Animacja licznika 0 -> wartosc — jesli da sie wyparsowac liczbe z tekstu.
+  const parsed = parseStatValue(String(rawValue));
+  if (parsed && parsed.num !== 0 && !prefersReducedMotion()) {
+    v.textContent = parsed.format(0);
+    requestAnimationFrame(() => animateNumber(v, 0, parsed.num, 800, parsed.format));
+  }
   const l = document.createElement('div');
   l.className = 'sdk-stat-label';
   l.textContent = c.label || '';
@@ -1081,6 +1128,7 @@ function renderListV2(c, ctx) {
     }
     el.appendChild(li);
   }
+  requestAnimationFrame(() => staggerEnter(el, ':scope > .sdk-list-item', 30, 250));
   return el;
 }
 
@@ -1119,6 +1167,7 @@ function renderTimeline(c) {
     }
     el.appendChild(li);
   }
+  requestAnimationFrame(() => staggerEnter(el, ':scope > .sdk-timeline-item', 35, 250));
   return el;
 }
 
@@ -1186,6 +1235,11 @@ function renderTableV2(c, ctx) {
   }
   t.appendChild(tbody);
   wrap.appendChild(t);
+  if (rows.length > 0 && rows.length <= 30) {
+    // Stagger enter tylko dla rozsądnie krótkich tabel — przy 200 wierszach
+    // delay sumarycznie wybiega poza 60fps budget i wygląda na lag.
+    requestAnimationFrame(() => staggerEnter(tbody, ':scope > tr', 20, 250));
+  }
   if (c.pagination) {
     const pg = document.createElement('div');
     pg.className = 'sdk-table-pagination';
