@@ -530,8 +530,10 @@ const RADIO_GROUP_MIN_OPTIONS: usize = 2;
 
 /// Validate a single form component, recursing into embedded `UiComponent`
 /// children (`Form.children`, `FormField.child`, `FormGroup.children`).
-/// Error strings are static and never echo addon-controlled input.
-pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'static str> {
+/// Leaf errors are static reason codes; container errors propagate the
+/// child's chain so the addon log shows the deepest failure instead of a
+/// generic `*_children_invalid`.
+pub fn validate_and_normalize(component: &mut FormComponent) -> anyhow::Result<()> {
     use FormComponent::*;
     match component {
         Input {
@@ -541,7 +543,7 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             ..
         } => {
             if matches!(kind, InputKind::Password) && value.is_some() {
-                return Err("password_initial_value_forbidden");
+                anyhow::bail!("password_initial_value_forbidden");
             }
             for v in validations.iter() {
                 validate_validation(v)?;
@@ -563,7 +565,7 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             validate_select_options_unique(options)?;
             if let Some(v) = value {
                 if !options.iter().any(|o| o.value == *v) {
-                    return Err("select_value_not_in_options");
+                    anyhow::bail!("select_value_not_in_options");
                 }
             }
             for v in validations.iter() {
@@ -581,12 +583,12 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             validate_select_options_unique(options)?;
             for v in values.iter() {
                 if !options.iter().any(|o| o.value == *v) {
-                    return Err("multi_select_value_not_in_options");
+                    anyhow::bail!("multi_select_value_not_in_options");
                 }
             }
             if let Some(max) = max_selections {
                 if (values.len() as u32) > *max {
-                    return Err("multi_select_too_many_selected");
+                    anyhow::bail!("multi_select_too_many_selected");
                 }
             }
             for v in validations.iter() {
@@ -599,12 +601,12 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             options, value, ..
         } => {
             if options.len() < RADIO_GROUP_MIN_OPTIONS {
-                return Err("radio_group_too_few_options");
+                anyhow::bail!("radio_group_too_few_options");
             }
             validate_radio_options_unique(options)?;
             if let Some(v) = value {
                 if !options.iter().any(|o| o.value == *v) {
-                    return Err("radio_group_value_not_in_options");
+                    anyhow::bail!("radio_group_value_not_in_options");
                 }
             }
             Ok(())
@@ -616,12 +618,12 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             ..
         } => {
             if !(RADIO_CARD_COLUMNS_MIN..=RADIO_CARD_COLUMNS_MAX).contains(columns) {
-                return Err("radio_card_columns_out_of_range");
+                anyhow::bail!("radio_card_columns_out_of_range");
             }
             validate_radio_card_options_unique(options)?;
             if let Some(v) = value {
                 if !options.iter().any(|o| o.value == *v) {
-                    return Err("radio_card_value_not_in_options");
+                    anyhow::bail!("radio_card_value_not_in_options");
                 }
             }
             for o in options.iter() {
@@ -639,16 +641,16 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             ..
         } => {
             if !(min < max) {
-                return Err("slider_min_not_less_than_max");
+                anyhow::bail!("slider_min_not_less_than_max");
             }
             if let Some(v) = value {
                 if v < min || v > max {
-                    return Err("slider_value_out_of_range");
+                    anyhow::bail!("slider_value_out_of_range");
                 }
             }
             for m in marks.iter() {
                 if m.value < *min || m.value > *max {
-                    return Err("slider_mark_out_of_range");
+                    anyhow::bail!("slider_mark_out_of_range");
                 }
             }
             Ok(())
@@ -657,10 +659,10 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             min, max, value, ..
         } => {
             if !(min < max) {
-                return Err("slider_min_not_less_than_max");
+                anyhow::bail!("slider_min_not_less_than_max");
             }
             if value < min || value > max {
-                return Err("slider_value_out_of_range");
+                anyhow::bail!("slider_value_out_of_range");
             }
             Ok(())
         }
@@ -700,14 +702,14 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             }
             if let (Some(f), Some(t)) = (from.as_deref(), to.as_deref()) {
                 if f > t {
-                    return Err("date_range_from_after_to");
+                    anyhow::bail!("date_range_from_after_to");
                 }
             }
             for p in presets.iter() {
                 validate_iso_date(&p.from)?;
                 validate_iso_date(&p.to)?;
                 if p.from > p.to {
-                    return Err("date_range_from_after_to");
+                    anyhow::bail!("date_range_from_after_to");
                 }
             }
             Ok(())
@@ -723,10 +725,10 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
         } => {
             if let Some(max) = max_files {
                 if *max == 0 {
-                    return Err("file_upload_max_files_zero");
+                    anyhow::bail!("file_upload_max_files_zero");
                 }
                 if (files.len() as u32) > *max {
-                    return Err("file_upload_too_many_files");
+                    anyhow::bail!("file_upload_too_many_files");
                 }
             }
             Ok(())
@@ -735,9 +737,9 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
         Form { children, .. } => {
             for c in children.iter_mut() {
                 super::reject_overlay_kind_in_root(c)
-                    .map_err(|_| "form_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("form_children: {e}"))?;
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "form_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("form_children: {e}"))?;
             }
             Ok(())
         }
@@ -745,65 +747,66 @@ pub fn validate_and_normalize(component: &mut FormComponent) -> Result<(), &'sta
             field_id, child, ..
         } => {
             if field_id.is_empty() {
-                return Err("form_field_id_empty");
+                anyhow::bail!("form_field_id_empty");
             }
             super::reject_overlay_kind_in_root(child)
-                .map_err(|_| "form_field_child_invalid")?;
+                .map_err(|e| anyhow::anyhow!("form_field_child: {e}"))?;
             super::validate_and_normalize_component(child)
-                .map_err(|_| "form_field_child_invalid")?;
+                .map_err(|e| anyhow::anyhow!("form_field_child: {e}"))?;
             Ok(())
         }
         FormGroup { children, .. } => {
             for c in children.iter_mut() {
                 super::reject_overlay_kind_in_root(c)
-                    .map_err(|_| "form_group_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("form_group_children: {e}"))?;
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "form_group_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("form_group_children: {e}"))?;
             }
             Ok(())
         }
     }
 }
 
-fn validate_validation(v: &Validation) -> Result<(), &'static str> {
+fn validate_validation(v: &Validation) -> anyhow::Result<()> {
     match v {
         Validation::Required => Ok(()),
         Validation::MinLength { .. } | Validation::MaxLength { .. } => Ok(()),
         Validation::Pattern { regex } => {
-            regex::Regex::new(regex).map_err(|_| "validation_pattern_invalid_regex")?;
+            regex::Regex::new(regex)
+                .map_err(|_| anyhow::anyhow!("validation_pattern_invalid_regex"))?;
             Ok(())
         }
         Validation::Range { min, max } => {
             if !(min < max) {
-                return Err("validation_range_min_not_less_than_max");
+                anyhow::bail!("validation_range_min_not_less_than_max");
             }
             Ok(())
         }
         Validation::Custom { action_id, .. } => {
             if action_id.is_empty() {
-                return Err("validation_custom_action_id_empty");
+                anyhow::bail!("validation_custom_action_id_empty");
             }
             Ok(())
         }
     }
 }
 
-fn validate_select_options_unique(options: &[SelectOption]) -> Result<(), &'static str> {
+fn validate_select_options_unique(options: &[SelectOption]) -> anyhow::Result<()> {
     let mut seen: Vec<&str> = Vec::with_capacity(options.len());
     for o in options {
         if seen.iter().any(|s| *s == o.value.as_str()) {
-            return Err("select_duplicate_option_value");
+            anyhow::bail!("select_duplicate_option_value");
         }
         seen.push(o.value.as_str());
     }
     Ok(())
 }
 
-fn validate_radio_options_unique(options: &[RadioOption]) -> Result<(), &'static str> {
+fn validate_radio_options_unique(options: &[RadioOption]) -> anyhow::Result<()> {
     let mut seen: Vec<&str> = Vec::with_capacity(options.len());
     for o in options {
         if seen.iter().any(|s| *s == o.value.as_str()) {
-            return Err("radio_group_duplicate_option_value");
+            anyhow::bail!("radio_group_duplicate_option_value");
         }
         seen.push(o.value.as_str());
     }
@@ -812,11 +815,11 @@ fn validate_radio_options_unique(options: &[RadioOption]) -> Result<(), &'static
 
 fn validate_radio_card_options_unique(
     options: &[RadioCardOption],
-) -> Result<(), &'static str> {
+) -> anyhow::Result<()> {
     let mut seen: Vec<&str> = Vec::with_capacity(options.len());
     for o in options {
         if seen.iter().any(|s| *s == o.value.as_str()) {
-            return Err("radio_card_duplicate_option_value");
+            anyhow::bail!("radio_card_duplicate_option_value");
         }
         seen.push(o.value.as_str());
     }
@@ -826,17 +829,17 @@ fn validate_radio_card_options_unique(
 /// ISO 8601 `YYYY-MM-DD` shape check: ASCII digits at positions 0..4, 5..7,
 /// 8..10 and dashes at 4 and 7. Does not validate calendar correctness
 /// (no leap-year math) — the renderer's date picker normalises that.
-fn validate_iso_date(s: &str) -> Result<(), &'static str> {
+fn validate_iso_date(s: &str) -> anyhow::Result<()> {
     let b = s.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
-        return Err("date_format_invalid");
+        anyhow::bail!("date_format_invalid");
     }
     for (i, &c) in b.iter().enumerate() {
         if i == 4 || i == 7 {
             continue;
         }
         if !c.is_ascii_digit() {
-            return Err("date_format_invalid");
+            anyhow::bail!("date_format_invalid");
         }
     }
     Ok(())
@@ -845,23 +848,23 @@ fn validate_iso_date(s: &str) -> Result<(), &'static str> {
 /// `HH:MM` 24-hour clock shape check. Does not enforce HH < 24 or MM < 60
 /// strictly — renderer's time picker clamps that. We only reject obviously
 /// malformed strings (wrong length, wrong separator, non-digits).
-fn validate_iso_time(s: &str) -> Result<(), &'static str> {
+fn validate_iso_time(s: &str) -> anyhow::Result<()> {
     let b = s.as_bytes();
     if b.len() != 5 || b[2] != b':' {
-        return Err("time_format_invalid");
+        anyhow::bail!("time_format_invalid");
     }
     for (i, &c) in b.iter().enumerate() {
         if i == 2 {
             continue;
         }
         if !c.is_ascii_digit() {
-            return Err("time_format_invalid");
+            anyhow::bail!("time_format_invalid");
         }
     }
     Ok(())
 }
 
-fn validate_image_source(src: &ImageSource) -> Result<(), &'static str> {
+fn validate_image_source(src: &ImageSource) -> anyhow::Result<()> {
     if let ImageSource::SignedFrame { camera_id, .. } = src {
         validate_camera_id(camera_id)?;
     }
@@ -871,9 +874,9 @@ fn validate_image_source(src: &ImageSource) -> Result<(), &'static str> {
 const CAMERA_ID_LEN: usize = 40;
 const CAMERA_ID_PREFIX: &str = "cam_";
 
-fn validate_camera_id(id: &str) -> Result<(), &'static str> {
+fn validate_camera_id(id: &str) -> anyhow::Result<()> {
     if id.len() != CAMERA_ID_LEN || !id.starts_with(CAMERA_ID_PREFIX) {
-        return Err("image_camera_id_invalid_format");
+        anyhow::bail!("image_camera_id_invalid_format");
     }
     let uuid = &id[CAMERA_ID_PREFIX.len()..];
     let bytes = uuid.as_bytes();
@@ -881,17 +884,17 @@ fn validate_camera_id(id: &str) -> Result<(), &'static str> {
         let dash_pos = matches!(i, 8 | 13 | 18 | 23);
         if dash_pos {
             if b != b'-' {
-                return Err("image_camera_id_invalid_format");
+                anyhow::bail!("image_camera_id_invalid_format");
             }
         } else if !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-            return Err("image_camera_id_invalid_format");
+            anyhow::bail!("image_camera_id_invalid_format");
         }
     }
     if bytes[14] != b'4' {
-        return Err("image_camera_id_invalid_format");
+        anyhow::bail!("image_camera_id_invalid_format");
     }
     if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
-        return Err("image_camera_id_invalid_format");
+        anyhow::bail!("image_camera_id_invalid_format");
     }
     Ok(())
 }
@@ -1381,7 +1384,7 @@ mod tests {
             on_submit: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "password_initial_value_forbidden");
+        assert!(err.to_string().contains("password_initial_value_forbidden"));
     }
 
     #[test]
@@ -1415,7 +1418,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "select_duplicate_option_value");
+        assert!(err.to_string().contains("select_duplicate_option_value"));
     }
 
     #[test]
@@ -1440,7 +1443,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "select_value_not_in_options");
+        assert!(err.to_string().contains("select_value_not_in_options"));
     }
 
     #[test]
@@ -1465,7 +1468,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "multi_select_value_not_in_options");
+        assert!(err.to_string().contains("multi_select_value_not_in_options"));
     }
 
     #[test]
@@ -1499,7 +1502,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "multi_select_too_many_selected");
+        assert!(err.to_string().contains("multi_select_too_many_selected"));
     }
 
     #[test]
@@ -1521,7 +1524,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "radio_group_too_few_options");
+        assert!(err.to_string().contains("radio_group_too_few_options"));
     }
 
     #[test]
@@ -1556,7 +1559,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "radio_card_columns_out_of_range");
+        assert!(err.to_string().contains("radio_card_columns_out_of_range"));
     }
 
     #[test]
@@ -1580,7 +1583,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "radio_card_columns_out_of_range");
+        assert!(err.to_string().contains("radio_card_columns_out_of_range"));
     }
 
     #[test]
@@ -1599,7 +1602,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "slider_min_not_less_than_max");
+        assert!(err.to_string().contains("slider_min_not_less_than_max"));
     }
 
     #[test]
@@ -1618,7 +1621,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "slider_value_out_of_range");
+        assert!(err.to_string().contains("slider_value_out_of_range"));
     }
 
     #[test]
@@ -1635,7 +1638,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "slider_value_out_of_range");
+        assert!(err.to_string().contains("slider_value_out_of_range"));
     }
 
     #[test]
@@ -1652,7 +1655,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "date_format_invalid");
+        assert!(err.to_string().contains("date_format_invalid"));
     }
 
     #[test]
@@ -1670,7 +1673,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "date_range_from_after_to");
+        assert!(err.to_string().contains("date_range_from_after_to"));
     }
 
     #[test]
@@ -1685,7 +1688,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "time_format_invalid");
+        assert!(err.to_string().contains("time_format_invalid"));
     }
 
     #[test]
@@ -1720,7 +1723,7 @@ mod tests {
             helper: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "file_upload_too_many_files");
+        assert!(err.to_string().contains("file_upload_too_many_files"));
     }
 
     #[test]
@@ -1738,7 +1741,7 @@ mod tests {
             helper: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "file_upload_max_files_zero");
+        assert!(err.to_string().contains("file_upload_max_files_zero"));
     }
 
     #[test]
@@ -1751,7 +1754,7 @@ mod tests {
             child: Box::new(legacy_text("x")),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "form_field_id_empty");
+        assert!(err.to_string().contains("form_field_id_empty"));
     }
 
     #[test]
@@ -1767,7 +1770,8 @@ mod tests {
             disabled: false,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "form_children_invalid");
+        assert!(err.to_string().contains("form_children"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -1780,7 +1784,8 @@ mod tests {
             child: Box::new(window_overlay()),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "form_field_child_invalid");
+        assert!(err.to_string().contains("form_field_child"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -1791,7 +1796,8 @@ mod tests {
             children: vec![window_overlay()],
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "form_group_children_invalid");
+        assert!(err.to_string().contains("form_group_children"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -1800,7 +1806,7 @@ mod tests {
             regex: "(unclosed".into(),
         };
         let err = validate_validation(&v).expect_err("must reject");
-        assert_eq!(err, "validation_pattern_invalid_regex");
+        assert!(err.to_string().contains("validation_pattern_invalid_regex"));
     }
 
     #[test]
@@ -1810,7 +1816,7 @@ mod tests {
             max: 1.0,
         };
         let err = validate_validation(&v).expect_err("must reject");
-        assert_eq!(err, "validation_range_min_not_less_than_max");
+        assert!(err.to_string().contains("validation_range_min_not_less_than_max"));
     }
 
     #[test]
@@ -1820,7 +1826,7 @@ mod tests {
             debounce_ms: None,
         };
         let err = validate_validation(&v).expect_err("must reject");
-        assert_eq!(err, "validation_custom_action_id_empty");
+        assert!(err.to_string().contains("validation_custom_action_id_empty"));
     }
 
     #[test]
@@ -1845,7 +1851,7 @@ mod tests {
             on_submit: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "validation_pattern_invalid_regex");
+        assert!(err.to_string().contains("validation_pattern_invalid_regex"));
     }
 
     #[test]
@@ -1883,7 +1889,7 @@ mod tests {
             on_change: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "image_camera_id_invalid_format");
+        assert!(err.to_string().contains("image_camera_id_invalid_format"));
     }
 
     #[test]

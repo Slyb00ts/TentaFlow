@@ -549,11 +549,12 @@ const CAMERA_ID_PREFIX: &str = "cam_";
 
 /// Validate a single data-display component, recursing into embedded
 /// children (`Component` cells, `KeyValueItem::Component`, `Table` expanded
-/// rows, `EmptyState` actions). Error strings are static and never echo
-/// addon-controlled input.
+/// rows, `EmptyState` actions). Leaf errors are static reason codes;
+/// container errors propagate the child's chain so the addon log shows the
+/// deepest failure instead of a generic `*_invalid`.
 pub fn validate_and_normalize(
     component: &mut DataDisplayComponent,
-) -> Result<(), &'static str> {
+) -> anyhow::Result<()> {
     use DataDisplayComponent::*;
     match component {
         Text { .. } | Heading { .. } | Badge { .. } | Tag { .. } => Ok(()),
@@ -561,7 +562,7 @@ pub fn validate_and_normalize(
         Avatar { initials, image_source, .. } => {
             if let Some(s) = initials {
                 if s.chars().count() > AVATAR_INITIALS_MAX_LEN {
-                    return Err("avatar_initials_too_long");
+                    anyhow::bail!("avatar_initials_too_long");
                 }
             }
             if let Some(src) = image_source {
@@ -573,7 +574,7 @@ pub fn validate_and_normalize(
         Stat { trend, .. } => {
             if let Some(t) = trend {
                 if t.delta.chars().count() > STAT_TREND_DELTA_MAX_LEN {
-                    return Err("stat_trend_delta_too_long");
+                    anyhow::bail!("stat_trend_delta_too_long");
                 }
             }
             Ok(())
@@ -604,16 +605,16 @@ pub fn validate_and_normalize(
         EmptyState { actions, .. } => {
             for a in actions {
                 super::reject_overlay_kind_in_root(a)
-                    .map_err(|_| "empty_state_actions_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("empty_state_actions: {e}"))?;
                 super::validate_and_normalize_component(a)
-                    .map_err(|_| "empty_state_actions_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("empty_state_actions: {e}"))?;
             }
             Ok(())
         }
     }
 }
 
-fn validate_image_source(src: &ImageSource) -> Result<(), &'static str> {
+fn validate_image_source(src: &ImageSource) -> anyhow::Result<()> {
     if let ImageSource::SignedFrame { camera_id, .. } = src {
         validate_camera_id(camera_id)?;
     }
@@ -621,11 +622,11 @@ fn validate_image_source(src: &ImageSource) -> Result<(), &'static str> {
 }
 
 /// Local copy of the legacy `cam_<uuid v4>` shape check. Kept here rather
-/// than imported from `legacy.rs` to keep this module free of `anyhow`
-/// (validator surface is `Result<_, &'static str>`).
-fn validate_camera_id(id: &str) -> Result<(), &'static str> {
+/// than imported from `legacy.rs` so we don't cross-link modules just for
+/// one helper.
+fn validate_camera_id(id: &str) -> anyhow::Result<()> {
     if id.len() != CAMERA_ID_LEN || !id.starts_with(CAMERA_ID_PREFIX) {
-        return Err("image_camera_id_invalid_format");
+        anyhow::bail!("image_camera_id_invalid_format");
     }
     let uuid = &id[CAMERA_ID_PREFIX.len()..];
     let bytes = uuid.as_bytes();
@@ -633,27 +634,27 @@ fn validate_camera_id(id: &str) -> Result<(), &'static str> {
         let dash_pos = matches!(i, 8 | 13 | 18 | 23);
         if dash_pos {
             if b != b'-' {
-                return Err("image_camera_id_invalid_format");
+                anyhow::bail!("image_camera_id_invalid_format");
             }
         } else if !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-            return Err("image_camera_id_invalid_format");
+            anyhow::bail!("image_camera_id_invalid_format");
         }
     }
     if bytes[14] != b'4' {
-        return Err("image_camera_id_invalid_format");
+        anyhow::bail!("image_camera_id_invalid_format");
     }
     if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
-        return Err("image_camera_id_invalid_format");
+        anyhow::bail!("image_camera_id_invalid_format");
     }
     Ok(())
 }
 
-fn validate_cell_value(value: &mut CellValue) -> Result<(), &'static str> {
+fn validate_cell_value(value: &mut CellValue) -> anyhow::Result<()> {
     if let CellValue::Component { value } = value {
         super::reject_overlay_kind_in_root(value)
-            .map_err(|_| "cell_component_overlay_not_allowed")?;
+            .map_err(|e| anyhow::anyhow!("cell_component: {e}"))?;
         super::validate_and_normalize_component(value)
-            .map_err(|_| "cell_component_invalid")?;
+            .map_err(|e| anyhow::anyhow!("cell_component: {e}"))?;
     }
     Ok(())
 }
@@ -662,11 +663,11 @@ fn validate_table(
     columns: &[TableColumn],
     rows: &mut [TableRow],
     pagination: Option<&mut TablePagination>,
-) -> Result<(), &'static str> {
+) -> anyhow::Result<()> {
     let mut col_ids: Vec<&str> = Vec::with_capacity(columns.len());
     for c in columns {
         if col_ids.iter().any(|s| *s == c.id.as_str()) {
-            return Err("table_duplicate_column_id");
+            anyhow::bail!("table_duplicate_column_id");
         }
         col_ids.push(c.id.as_str());
     }
@@ -674,11 +675,11 @@ fn validate_table(
     let mut row_ids: Vec<&str> = Vec::with_capacity(rows.len());
     for r in rows.iter() {
         if row_ids.iter().any(|s| *s == r.id.as_str()) {
-            return Err("table_duplicate_row_id");
+            anyhow::bail!("table_duplicate_row_id");
         }
         row_ids.push(r.id.as_str());
         if r.cells.len() != columns.len() {
-            return Err("table_row_cell_count_mismatch");
+            anyhow::bail!("table_row_cell_count_mismatch");
         }
     }
 
@@ -688,9 +689,9 @@ fn validate_table(
         }
         for child in r.expanded_content.iter_mut() {
             super::reject_overlay_kind_in_root(child)
-                .map_err(|_| "table_expanded_overlay_not_allowed")?;
+                .map_err(|e| anyhow::anyhow!("table_expanded: {e}"))?;
             super::validate_and_normalize_component(child)
-                .map_err(|_| "table_expanded_invalid")?;
+                .map_err(|e| anyhow::anyhow!("table_expanded: {e}"))?;
         }
     }
 
@@ -702,7 +703,7 @@ fn validate_table(
         } = &p.mode
         {
             if *total_pages > 0 && *current_page > *total_pages {
-                return Err("pagination_current_exceeds_total");
+                anyhow::bail!("pagination_current_exceeds_total");
             }
         }
     }
@@ -1036,7 +1037,7 @@ mod tests {
             empty_state: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "table_row_cell_count_mismatch");
+        assert!(err.to_string().contains("table_row_cell_count_mismatch"));
     }
 
     #[test]
@@ -1070,7 +1071,7 @@ mod tests {
             empty_state: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "table_duplicate_column_id");
+        assert!(err.to_string().contains("table_duplicate_column_id"));
     }
 
     #[test]
@@ -1107,7 +1108,7 @@ mod tests {
             empty_state: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "table_duplicate_row_id");
+        assert!(err.to_string().contains("table_duplicate_row_id"));
     }
 
     #[test]
@@ -1168,7 +1169,8 @@ mod tests {
             empty_state: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "cell_component_overlay_not_allowed");
+        assert!(err.to_string().contains("cell_component"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -1181,7 +1183,7 @@ mod tests {
             status: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "avatar_initials_too_long");
+        assert!(err.to_string().contains("avatar_initials_too_long"));
     }
 
     #[test]
@@ -1200,7 +1202,7 @@ mod tests {
             accent: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "stat_trend_delta_too_long");
+        assert!(err.to_string().contains("stat_trend_delta_too_long"));
     }
 
     #[test]
@@ -1231,7 +1233,7 @@ mod tests {
             empty_state: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "pagination_current_exceeds_total");
+        assert!(err.to_string().contains("pagination_current_exceeds_total"));
     }
 
     #[test]
@@ -1248,7 +1250,7 @@ mod tests {
             fit: ImageFit::Cover,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "image_camera_id_invalid_format");
+        assert!(err.to_string().contains("image_camera_id_invalid_format"));
     }
 
     #[test]
@@ -1280,7 +1282,7 @@ mod tests {
             status: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "image_camera_id_invalid_format");
+        assert!(err.to_string().contains("image_camera_id_invalid_format"));
     }
 
     #[test]
@@ -1292,7 +1294,8 @@ mod tests {
             actions: vec![window_overlay()],
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "empty_state_actions_invalid");
+        assert!(err.to_string().contains("empty_state_actions"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
