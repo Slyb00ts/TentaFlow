@@ -22,6 +22,7 @@ import {
   prefersReducedMotion,
 } from '/js/modules/motion.js';
 import { renderIcon } from '/js/modules/sdk-icons.js';
+import { resolveImageSource } from '/js/utils/signed-frame.js';
 import '/js/components/tf-canvas.js';
 import '/js/components/tf-sparkline.js';
 import '/js/components/tf-heatmap.js';
@@ -948,7 +949,7 @@ function renderTag(c) {
 function renderAvatar(c) {
   const el = document.createElement('span');
   el.className = `sdk-avatar ${c.size || 'md'} ${c.shape || 'circle'}`;
-  applyImageSource(el, c.image_source, c.initials);
+  renderImageSourceSync(el, c.image_source, { fallbackInitials: c.initials });
   if (c.status) {
     const dot = document.createElement('span');
     dot.className = `sdk-avatar-status ${c.status}`;
@@ -957,25 +958,106 @@ function renderAvatar(c) {
   return el;
 }
 
-function applyImageSource(targetEl, source, fallbackInitials) {
+/**
+ * Renderuje `ImageSource` SDK synchronicznie do `targetEl`. Dla `signed_frame`
+ * wstawia placeholder od razu i podmienia go na <img> z signed URL, gdy
+ * resolver dostarczy odpowiedź. Cache w `/js/utils/signed-frame.js` ogranicza
+ * liczbę żądań do core (TTL 5 min, margines 1 min).
+ *
+ * options:
+ *   fallbackInitials — string pokazywany gdy source pusty
+ *   alt              — opis dla <img>
+ *   imgClass         — dodatkowa klasa CSS dla <img> (np. "sdk-image cover")
+ *   width / height   — wymiary <img>
+ */
+function renderImageSourceSync(targetEl, source, options = {}) {
   if (!source) {
-    if (fallbackInitials) targetEl.textContent = fallbackInitials;
+    if (options.fallbackInitials) targetEl.textContent = options.fallbackInitials;
     return;
   }
+
   if (source.kind === 'url') {
-    const img = document.createElement('img');
-    if (isSafeImageSrc(source.url)) img.src = source.url;
-    img.alt = '';
-    targetEl.appendChild(img);
-  } else if (source.kind === 'signed_frame') {
-    // Signed-frame zostawiamy na Faza 3 — wymaga API rozwiazania frame_ref.
-    targetEl.textContent = '⌧';
-    targetEl.title = `signed_frame:${source.camera_id}`;
-  } else if (source.kind === 'initials') {
-    targetEl.textContent = source.text || '';
-    targetEl.style.background = `var(--sdk-color-${(source.background || 'primary').replace(/_/g, '-')})`;
+    if (isSafeImageSrc(source.url)) {
+      appendImg(targetEl, source.url, options);
+    } else {
+      appendPlaceholder(targetEl);
+    }
+    return;
   }
-  // placeholder — pusty default
+
+  if (source.kind === 'initials') {
+    appendInitials(targetEl, source.text || options.fallbackInitials || '?', source.background);
+    return;
+  }
+
+  if (source.kind === 'signed_frame') {
+    // Synchroniczny placeholder z shimmer, async swap gdy URL gotowy.
+    const loading = document.createElement('span');
+    loading.className = 'sdk-image-loading';
+    loading.title = `signed_frame:${source.camera_id || ''}`;
+    targetEl.appendChild(loading);
+    resolveImageSource(source)
+      .then((resolved) => {
+        if (!loading.isConnected) return;
+        if (resolved.kind === 'url' && isSafeImageSrc(resolved.url)) {
+          const img = buildImg(resolved.url, options);
+          if (!prefersReducedMotion()) {
+            img.classList.add('sdk-animate-fade-in');
+          }
+          loading.replaceWith(img);
+        } else {
+          const ph = buildPlaceholder();
+          loading.replaceWith(ph);
+        }
+      })
+      .catch((err) => {
+        console.warn('[addon-app] signed_frame resolve failed:', err?.code, err?.message);
+        if (loading.isConnected) loading.replaceWith(buildPlaceholder());
+      });
+    return;
+  }
+
+  appendPlaceholder(targetEl);
+}
+
+function buildImg(url, options) {
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = options.alt || '';
+  if (options.imgClass) img.className = options.imgClass;
+  if (options.width) img.width = options.width;
+  if (options.height) img.height = options.height;
+  return img;
+}
+
+function appendImg(targetEl, url, options) {
+  targetEl.appendChild(buildImg(url, options));
+}
+
+function buildPlaceholder() {
+  const ph = document.createElement('span');
+  ph.className = 'sdk-image-placeholder';
+  ph.appendChild(renderIcon('image'));
+  return ph;
+}
+
+function appendPlaceholder(targetEl) {
+  targetEl.appendChild(buildPlaceholder());
+}
+
+function appendInitials(targetEl, text, background) {
+  // Avatar już ma swój fundamentowy styl — dla niego wystarczy tekst + tło inline.
+  // Dla innych użyć (Image, RadioCard) opakowujemy w `.sdk-image-initials`.
+  if (targetEl.classList.contains('sdk-avatar')) {
+    targetEl.textContent = text;
+    targetEl.style.background = `var(--sdk-color-${(background || 'primary').replace(/_/g, '-')})`;
+    return;
+  }
+  const span = document.createElement('span');
+  span.className = 'sdk-image-initials';
+  span.textContent = text;
+  span.style.background = `var(--sdk-color-${(background || 'primary').replace(/_/g, '-')})`;
+  targetEl.appendChild(span);
 }
 
 function renderImageV2(c) {
@@ -983,17 +1065,12 @@ function renderImageV2(c) {
   wrap.className = 'sdk-image-wrap';
   if (c.radius && c.radius !== 'none') wrap.style.borderRadius = `var(--sdk-radius-${c.radius})`;
   wrap.style.overflow = 'hidden';
-  if (c.source?.kind === 'url' && isSafeImageSrc(c.source.url)) {
-    const img = document.createElement('img');
-    img.className = `sdk-image ${c.fit || 'cover'}`;
-    img.src = c.source.url;
-    img.alt = c.alt || '';
-    if (c.width) img.width = c.width;
-    if (c.height) img.height = c.height;
-    wrap.appendChild(img);
-  } else {
-    applyImageSource(wrap, c.source, null);
-  }
+  renderImageSourceSync(wrap, c.source, {
+    alt: c.alt || '',
+    imgClass: `sdk-image ${c.fit || 'cover'}`,
+    width: c.width,
+    height: c.height,
+  });
   return wrap;
 }
 
@@ -1600,6 +1677,12 @@ function renderRadioCardGroup(c, ctx) {
     card.className = `sdk-radio-card${c.value === opt.value ? ' selected' : ''}`;
     if (opt.disabled) card.disabled = true;
     if (opt.icon) card.appendChild(renderIcon(opt.icon));
+    if (opt.image) {
+      const media = document.createElement('span');
+      media.className = 'sdk-radio-card-media';
+      renderImageSourceSync(media, opt.image, { imgClass: 'sdk-image cover' });
+      card.appendChild(media);
+    }
     const body = document.createElement('div');
     const t = document.createElement('div');
     t.className = 'sdk-radio-card-title';

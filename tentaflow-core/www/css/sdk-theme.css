@@ -437,6 +437,73 @@
 .sdk-image.contain { object-fit: contain; }
 .sdk-image.fill { object-fit: fill; }
 
+/* Placeholder rysowany gdy ImageSource jest pusty albo signed_frame zwrócił
+   brak preview. Trzymamy minimalne wymiary by rodzic (avatar/image wrap)
+   nie zapadł się do zera. */
+.sdk-image-placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-width: 24px;
+  min-height: 24px;
+  color: var(--sdk-color-text-subtle);
+  background: var(--sdk-color-bg-surface);
+  border: 1px solid var(--sdk-color-border);
+  border-radius: inherit;
+}
+.sdk-image-placeholder svg { width: 40%; height: 40%; opacity: 0.6; }
+
+/* Inicjały — używane gdy ImageSource::Initials renderuje się poza avatarem
+   (np. Image v2, RadioCard media). */
+.sdk-image-initials {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-width: 24px;
+  min-height: 24px;
+  font-weight: var(--sdk-fw-semibold);
+  color: var(--sdk-color-text-inverse);
+  border-radius: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Loading state — shimmer reużywający keyframes `sdk-shimmer` z theme. */
+.sdk-image-loading {
+  display: inline-block;
+  width: 100%;
+  height: 100%;
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    var(--sdk-color-bg-surface) 0%,
+    var(--sdk-color-bg-elevated) 50%,
+    var(--sdk-color-bg-surface) 100%
+  );
+  background-size: 200% 100%;
+  animation: sdk-shimmer 1.4s infinite linear;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sdk-image-loading { animation: none; }
+}
+
+/* Slot media w karcie radio (np. miniatura kamery z signed_frame). */
+.sdk-radio-card-media {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: var(--sdk-radius-sm);
+  background: var(--sdk-color-bg-surface);
+}
+.sdk-radio-card-media > * { width: 100%; height: 100%; }
+
 .sdk-stat {
   display: flex; flex-direction: column; gap: var(--sdk-spacing-xs);
   padding: var(--sdk-spacing-md);
