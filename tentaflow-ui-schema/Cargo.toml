@@ -1,0 +1,17 @@
+[package]
+name = "tentaflow-ui-schema"
+version = "0.1.0"
+edition = "2021"
+description = "Schema typed primitives for TentaFlow addon UI (PanelTree, UiComponent + sub-enums). Shared between host (tentaflow-core) and guest (tentaflow-addon-sdk) so addons can build UI from typed structs instead of `serde_json::Value`."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `anyhow` is used by host-side validators (`parse_and_validate_ui_json`,
+# `validate_and_normalize_component`). It is wasm-compatible, so guest
+# addons that only build PanelTree values still link cleanly — LTO strips
+# the unused validator code in release builds.
+anyhow = "1"
+# Used by `form::validate_validation` to reject malformed regex patterns
+# submitted by addons (host-side validation only).
+regex = "1"

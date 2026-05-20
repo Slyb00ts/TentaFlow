@@ -903,7 +903,7 @@ fn validate_camera_id(id: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addon::ui::legacy::LegacyComponent;
+    use crate::legacy::LegacyComponent;
 
     fn legacy_text(s: &str) -> UiComponent {
         UiComponent::Legacy(LegacyComponent::Text {
@@ -913,9 +913,9 @@ mod tests {
     }
 
     fn window_overlay() -> UiComponent {
-        UiComponent::Container(crate::addon::ui::container::ContainerComponent::Window {
+        UiComponent::Container(crate::container::ContainerComponent::Window {
             title: "x".to_string(),
-            size: crate::addon::ui::container::WindowSize::Md,
+            size: crate::container::WindowSize::Md,
             dismissable: true,
             on_close: None,
             children: vec![],

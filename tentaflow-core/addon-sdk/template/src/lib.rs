@@ -46,36 +46,34 @@ pub extern "C" fn on_start() -> i32 {
         }),
     );
 
-    // Wyrenderuj panel UI addonu
-    let panel = json!({
-        "type": "column",
-        "children": [
-            {
-                "type": "text",
-                "props": {
-                    "content": "Template Addon",
-                    "variant": "heading",
-                    "size": "lg"
-                }
-            },
-            {
-                "type": "text",
-                "props": {
-                    "content": "Status: aktywny",
-                    "color": "green"
-                }
-            },
-            {
-                "type": "button",
-                "props": {
-                    "label": "Wyslij powitanie",
-                    "action_id": "greet"
-                }
-            }
-        ]
-    });
+    // Render the addon UI panel using typed primitives. `render_panel_typed`
+    // serializes the `PanelTree` straight to JSON — no intermediate
+    // `serde_json::Value` allocation versus the legacy `json!({...})` macro
+    // path (see `notes/addon-ui-perf-plan.md`).
+    use ui::legacy::LegacyComponent;
+    use ui::{PanelTree, UiComponent};
 
-    if let Err(e) = render_panel("main", panel) {
+    let panel = PanelTree {
+        root: vec![UiComponent::Legacy(LegacyComponent::Card {
+            title: "Template Addon".to_string(),
+            children: vec![
+                UiComponent::Legacy(LegacyComponent::Text {
+                    content: "Status: aktywny".to_string(),
+                    style: None,
+                }),
+                UiComponent::Legacy(LegacyComponent::Button {
+                    id: "greet_button".to_string(),
+                    label: "Wyslij powitanie".to_string(),
+                    action: "greet".to_string(),
+                    style: None,
+                }),
+            ],
+        })],
+        overlays: vec![],
+        navigation: None,
+    };
+
+    if let Err(e) = render_panel_typed("main", &panel) {
         log::warn(&format!("Blad renderowania panelu UI: {}", e));
     }
 
