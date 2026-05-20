@@ -253,3 +253,58 @@
   opacity: 0.55;
   cursor: not-allowed;
 }
+
+/* =============================================================================
+   Chunk 4.4 — walidacja pol formularza (async Custom + built-in)
+   ============================================================================= */
+
+.sdk-field-error {
+  color: var(--sdk-color-danger);
+  font-size: var(--sdk-text-caption);
+  margin-top: var(--sdk-spacing-xs);
+  display: flex;
+  align-items: center;
+  gap: var(--sdk-spacing-xs);
+}
+
+.sdk-field-validating {
+  color: var(--sdk-color-text-muted);
+  font-size: var(--sdk-text-caption);
+  margin-top: var(--sdk-spacing-xs);
+  display: flex;
+  align-items: center;
+  gap: var(--sdk-spacing-xs);
+}
+
+.sdk-input-error .sdk-input,
+.sdk-input-error .sdk-textarea,
+.sdk-input-error .sdk-select,
+.sdk-input-error input,
+.sdk-input-error textarea,
+.sdk-input-error select {
+  border-color: var(--sdk-color-danger);
+}
+
+/* =============================================================================
+   Chunk 4.4 — focus rings (a11y)
+   :focus-visible — ring tylko przy keyboard, nie przy mouse click
+   ============================================================================= */
+
+:where(.addon-app-shell button,
+       .addon-app-shell a,
+       .addon-app-shell input,
+       .addon-app-shell textarea,
+       .addon-app-shell select,
+       .addon-app-shell [tabindex]):focus-visible {
+  outline: 2px solid var(--sdk-color-primary);
+  outline-offset: 2px;
+  border-radius: var(--sdk-radius-sm);
+}
+
+.addon-app-shell .sdk-card-interactive:focus-visible,
+.addon-app-shell .sdk-tab:focus-visible,
+.addon-app-shell .sdk-nav-tab:focus-visible {
+  outline: 2px solid var(--sdk-color-primary);
+  outline-offset: 4px;
+}
+
