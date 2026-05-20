@@ -22,7 +22,7 @@ pub enum LayoutComponent {
         justify: Justify,
         #[serde(default)]
         wrap: bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         padding: Option<Spacing>,
         children: Vec<UiComponent>,
     },
@@ -33,7 +33,7 @@ pub enum LayoutComponent {
         columns: GridTrack,
         rows: GridTrack,
         gap: Spacing,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         areas: Option<Vec<Vec<String>>>,
         children: Vec<GridItem>,
     },
