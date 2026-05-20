@@ -57,26 +57,13 @@ pub fn ui_render(
         return ABI_ERR_PERMISSION;
     }
 
-    // Waliduj JSON UI — najpierw parse, potem strict semantic validation
-    // (camera_id UUID v4, ttl_secs zakres, itd.). Bez tego addon moglby
-    // wstrzyknac dowolny camera_id do panelu, co wycieklo by do frontu.
-    let ui_value_raw: serde_json::Value = match serde_json::from_str(&ui_json_str) {
-        Ok(v) => v,
-        Err(_) => {
-            audit_log(
-                caller.data(),
-                "ui.render",
-                Some("ui"),
-                Some(&panel_id),
-                "error",
-                Some("invalid ui json"),
-            );
-            return ABI_ERR_OPERATION;
-        }
-    };
-
-    let ui_value = match crate::addon::ui::parse_and_validate_ui_json(&ui_value_raw) {
-        Ok(v) => v,
+    // Single-pass parse + validate straight from the guest JSON string
+    // into a typed `PanelTree`. Replaces the previous str→Value→PanelTree
+    // →Value pipeline (3 serde passes) with one. The cache stores the
+    // typed tree directly so `AddonUiPanelGetRequest` does not deserialize
+    // it again on read.
+    let panel_tree = match crate::addon::ui::parse_and_validate_panel_tree(&ui_json_str) {
+        Ok(t) => t,
         Err(_) => {
             audit_log(
                 caller.data(),
@@ -98,27 +85,31 @@ pub fn ui_render(
     // user_id=None) zapisuje default panel pod sentinel 0; user-initiated
     // ui_render z `on_request` zapisuje pod realnym user_id.
     // `AddonUiPanelGetRequest` najpierw szuka per-user, fallback do 0.
+    let cache_user_id = caller.data().user_id;
     if let Some(cache) = caller.data().ui_panels.clone() {
-        let key_user = caller.data().user_id.unwrap_or(0);
+        let key_user = cache_user_id.unwrap_or(0);
         cache.write().insert(
             (key_user, addon_id.clone(), panel_id.clone()),
-            ui_value.clone(),
+            panel_tree.clone(),
         );
     }
 
     // Event "ui.panel_rendered" zostaje — inne addony moga reagowac (np.
     // notification overlay) + przyszly push do frontu przez bus subscribe.
+    // Bus payload pozostaje JSON-owy (event_bus ma generic `Value`
+    // payload), ale serializujemy tylko tutaj — cache trzyma typed tree.
+    let tree_value = serde_json::to_value(&panel_tree).unwrap_or(serde_json::Value::Null);
     caller
         .data()
         .event_bus
         .publish(crate::addon::event_bus::Event {
             event_type: "ui.panel_rendered".to_string(),
             source_addon: Some(addon_id.clone()),
-            source_user: caller.data().user_id,
+            source_user: cache_user_id,
             payload: serde_json::json!({
                 "addon_id": &addon_id,
                 "panel_id": &panel_id,
-                "tree": &ui_value,
+                "tree": tree_value,
             }),
             timestamp: chrono::Utc::now(),
         });

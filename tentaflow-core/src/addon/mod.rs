@@ -448,7 +448,7 @@ pub struct AddonState {
     /// Shared cache UI panel state — host function `ui_render` zapisuje tu
     /// drzewo komponentow, MessageBody handler `AddonUiPanelGetRequest`
     /// odczytuje. `None` w testach event_bus w izolacji.
-    pub ui_panels: Option<Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>>,
+    pub ui_panels: Option<Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -514,7 +514,7 @@ pub struct AddonManager {
     /// `tree` w tym cache; frontend GUI pyta przez MessageBody
     /// `AddonUiPanelGetRequest`. Push do frontu przez bus subscribe wraca
     /// w przyszlej iteracji.
-    ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>>,
+    ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>>,
 }
 
 /// Returns the subset of `owned` alias names that should be activated on
@@ -573,7 +573,9 @@ impl AddonManager {
 
     /// Zwraca handle do cache UI panel state — host function `ui_render`
     /// uzywa do zapisu, handler `AddonUiPanelGetRequest` do odczytu.
-    pub fn ui_panels(&self) -> Arc<PlRwLock<HashMap<(i64, String, String), serde_json::Value>>> {
+    pub fn ui_panels(
+        &self,
+    ) -> Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>> {
         self.ui_panels.clone()
     }
 
