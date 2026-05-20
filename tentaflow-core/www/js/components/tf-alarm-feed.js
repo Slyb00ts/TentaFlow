@@ -91,10 +91,18 @@ class TfAlarmFeed extends HTMLElement {
   _renderList() {
     const el = this._listEl;
     if (!el) return;
+    // Trzymamy mape ostatnio wyrenderowanych itemow zeby nowe wjezdzaly z
+    // animacja, a stare nie re-animowaly sie przy kazdym update.
+    const seen = this._seenIds || new Set();
+    const nextSeen = new Set();
     el.innerHTML = '';
     for (const item of this._items) {
       const row = document.createElement('div');
       row.className = `sdk-alarm-item sev-${item.severity}`;
+      // Nowy element -> CSS sdk-alarm-item juz ma animation. Stary (juz widziany)
+      // -> wylaczamy animacje zeby uniknac flash.
+      if (seen.has(item.id)) row.style.animation = 'none';
+      nextSeen.add(item.id);
       if (this._onItemClick) {
         row.style.cursor = 'pointer';
         row.addEventListener('click', () => this._onItemClick(item.raw));
@@ -109,6 +117,7 @@ class TfAlarmFeed extends HTMLElement {
       row.appendChild(m);
       el.appendChild(row);
     }
+    this._seenIds = nextSeen;
   }
 }
 

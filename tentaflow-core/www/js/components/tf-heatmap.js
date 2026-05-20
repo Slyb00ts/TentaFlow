@@ -82,6 +82,10 @@ class TfHeatmap extends HTMLElement {
         if (this._onCellClick) {
           cell.addEventListener('click', () => this._onCellClick({ row: r, col: c, value: v }));
         }
+        // Cascade enter — kazda komorka dostaje delay = idx * 4ms (CSS keyframe
+        // sdk-heatmap-cell jest zdefiniowany w sdk-motion.css). prefers-reduced-motion
+        // jest respektowany globalnie przez media query w sdk-motion.css.
+        cell.style.animationDelay = `${(r * cols + c) * 4}ms`;
         g.appendChild(cell);
       }
     }
