@@ -639,6 +639,12 @@ function renderNavTabs(c, ctx) {
     tab.tabIndex = active ? 0 : -1;
     if (item.icon) tab.appendChild(renderIcon(item.icon));
     tab.appendChild(document.createTextNode(' ' + (item.label ?? '')));
+    if (item.badge) {
+      const badge = document.createElement('span');
+      badge.className = 'sdk-nav-tab-badge';
+      badge.textContent = item.badge;
+      tab.appendChild(badge);
+    }
     tab.addEventListener('click', () => navigateToPanel(ctx, item.panel_id));
     el.appendChild(tab);
   }
