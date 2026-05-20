@@ -95,26 +95,11 @@ async function fetchAndBuildContent(addonId, panelId) {
   const content = document.createElement('div');
   content.className = 'addon-app-content';
 
-  // Lazy panel rendering: addon pre-renderuje tylko `overview` w on_start.
-  // Dla pozostałych paneli musimy najpierw poprosić addon o ich zbudowanie
-  // (akcja panel-navigate), potem pobrać już zacache'owane drzewo z hosta.
-  // Akcja jest idempotentna — jeśli panel już jest w cache, addon wszystko
-  // i tak nadpisuje świeżą zawartością. Pomijamy dla `overview` (cache hit
-  // gwarantowany od on_start).
-  if (panelId && panelId !== 'overview') {
-    try {
-      await ApiBinary.one('addonUiActionRequest', {
-        addonId,
-        panelId,
-        actionId: 'panel-navigate',
-        params: { panel_id: panelId },
-      });
-    } catch (e) {
-      content.innerHTML = errorBlock(`Nie udało się przygotować panelu: ${e.message}`);
-      return content;
-    }
-  }
-
+  // Trust the cache first. Po wykonaniu poprzedniej akcji addon zwykle sam
+  // wywoluje `render_panel_by_id`, wiec drzewo jest juz w cache hosta. Drugie,
+  // bezwarunkowe `panel-navigate` to byl duplikat ui_render na kazda akcje.
+  // Lazy fallback ponizej obsluguje pierwszy wjazd na panel ktorego addon nie
+  // zbudowal w `on_start`.
   let response;
   try {
     response = await ApiBinary.one('addonUiPanelGetRequest', { addonId, panelId });
@@ -123,7 +108,23 @@ async function fetchAndBuildContent(addonId, panelId) {
     return content;
   }
 
-  const treeJson = response?.treeJson ?? response?.tree_json ?? '';
+  let treeJson = response?.treeJson ?? response?.tree_json ?? '';
+  if (!treeJson && panelId && panelId !== 'overview') {
+    try {
+      await ApiBinary.one('addonUiActionRequest', {
+        addonId,
+        panelId,
+        actionId: 'panel-navigate',
+        params: { panel_id: panelId },
+      });
+      response = await ApiBinary.one('addonUiPanelGetRequest', { addonId, panelId });
+      treeJson = response?.treeJson ?? response?.tree_json ?? '';
+    } catch (e) {
+      content.innerHTML = errorBlock(`Nie udało się przygotować panelu: ${e.message}`);
+      return content;
+    }
+  }
+
   if (!treeJson) {
     content.innerHTML = emptyBlock(addonId, panelId);
     return content;
@@ -1728,7 +1729,11 @@ function renderInputV2(c, ctx) {
     sfx.textContent = c.suffix;
     wrapIcon.appendChild(sfx);
   }
-  attachChange(input, c.on_change, ctx, { id: c.id });
+  // Text inputs trzymaja wartosc lokalnie w DOM. Nie wysylamy `on_change`
+  // per keystroke ani per blur — agregator formularza (`collectFormValues`)
+  // czyta `value` dopiero przy submit/akcji wykorzystujacej dane. Dzieki temu
+  // uderzenie w klawisz nie wywoluje round-tripu host->addon->ui_render, ktory
+  // przebudowywal DOM i kasowal focus.
   if (c.on_submit) {
     input.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') {
@@ -1766,7 +1771,7 @@ function renderTextarea(c, ctx) {
   if (c.disabled) ta.disabled = true;
   if (c.readonly) ta.readOnly = true;
   if (c.required) ta.required = true;
-  attachChange(ta, c.on_change, ctx, { id: c.id });
+  // Textarea trzyma wartosc lokalnie w DOM (patrz `renderInputV2`).
   const shell = buildFieldShell(c, ta, ctx);
   attachValidation(ta, shell, c, ctx);
   return shell;
@@ -2684,6 +2689,15 @@ function renderFilterChips(c, ctx) {
 function renderWizardFooter(c, ctx) {
   const el = document.createElement('footer');
   el.className = 'sdk-wizard-footer';
+  // Wizard footer zwykle siedzi w window/drawer poza znacznikiem `<form>`,
+  // a wartosci pol musza dotrzec do addona w momencie klikniecia "Dalej".
+  // Zbieramy je z kontenera overlaya (lub panelu glownego, gdy footer jest
+  // pomiedzy children panelu), tak jak `renderFormV2` robi to dla `<form>`.
+  const collectScope = () =>
+    el.closest('[data-sdk-overlay-portal]')
+    || el.closest('.sdk-window')
+    || el.closest('.sdk-drawer')
+    || el.closest('.addon-app-content');
   const left = document.createElement('div');
   if (c.on_cancel) {
     const cancel = document.createElement('button');
@@ -2710,7 +2724,10 @@ function renderWizardFooter(c, ctx) {
     b.type = 'button';
     b.className = 'sdk-button variant-secondary';
     b.textContent = c.back_label || 'Wstecz';
-    b.addEventListener('click', () => dispatchAction(ctx, null, c.on_back, {}));
+    b.addEventListener('click', () => {
+      const values = collectFormValues(collectScope());
+      dispatchAction(ctx, null, c.on_back, { values });
+    });
     right.appendChild(b);
   }
   if (c.on_next) {
@@ -2719,7 +2736,10 @@ function renderWizardFooter(c, ctx) {
     n.className = 'sdk-button';
     n.textContent = c.next_label || 'Dalej';
     if (c.next_disabled) n.disabled = true;
-    n.addEventListener('click', () => dispatchAction(ctx, null, c.on_next, {}));
+    n.addEventListener('click', () => {
+      const values = collectFormValues(collectScope());
+      dispatchAction(ctx, null, c.on_next, { values });
+    });
     right.appendChild(n);
   }
   el.appendChild(right);
