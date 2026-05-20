@@ -461,7 +461,8 @@ pub enum CellValue {
         label: String,
     },
     Chip {
-        kind: ChipKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ChipKind>,
         label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         icon: Option<IconName>,
@@ -1300,6 +1301,42 @@ mod tests {
         let j = serde_json::to_value(&comp).expect("ser");
         let back: UiComponent = serde_json::from_value(j).expect("de");
         assert_eq!(back, comp);
+    }
+
+    #[test]
+    fn cell_value_chip_omits_kind_when_none() {
+        // Addons may emit chip cells without a semantic `kind`; the wire form
+        // must skip the field entirely so the renderer falls back to defaults.
+        let v = CellValue::Chip {
+            kind: None,
+            label: "x".into(),
+            icon: None,
+        };
+        let j = serde_json::to_value(&v).expect("serialize");
+        assert_eq!(j, serde_json::json!({"cell": "chip", "label": "x"}));
+        let back: CellValue = serde_json::from_value(j).expect("deserialize");
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn cell_value_chip_with_kind_and_icon_round_trip() {
+        let v = CellValue::Chip {
+            kind: Some(ChipKind::Status),
+            label: "x".into(),
+            icon: Some(IconName::Plus),
+        };
+        let j = serde_json::to_value(&v).expect("serialize");
+        assert_eq!(
+            j,
+            serde_json::json!({
+                "cell": "chip",
+                "kind": "status",
+                "label": "x",
+                "icon": "plus"
+            })
+        );
+        let back: CellValue = serde_json::from_value(j).expect("deserialize");
+        assert_eq!(back, v);
     }
 
     #[test]
