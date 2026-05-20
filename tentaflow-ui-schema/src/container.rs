@@ -39,11 +39,15 @@ pub enum ContainerComponent {
 
     /// Wariant `Card` przeznaczony do zagnieżdżenia wewnątrz innej karty —
     /// bez własnego shadow/radius, żeby nie tworzyć "karty w karcie" wizualnie.
+    /// `accent` (opcjonalne) maluje lewą wstążkę w kolorze semantycznym
+    /// (np. severity dla wiersza alarmu).
     SectionCard {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         actions: Vec<UiComponent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accent: Option<super::theme::Color>,
         children: Vec<UiComponent>,
     },
 
@@ -211,6 +215,15 @@ pub struct NavTabItem {
     /// count). Display-only — does not affect navigation behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub badge: Option<String>,
+    /// When `true` the tab renders with a lock glyph and is non-interactive
+    /// (renderer suppresses click → `panel_navigate`). Used to communicate
+    /// gated functionality (e.g. Re-ID requires a paid licence).
+    #[serde(default, skip_serializing_if = "is_default_false")]
+    pub locked: bool,
+}
+
+fn is_default_false(v: &bool) -> bool {
+    !*v
 }
 
 /// Lista pozycji breadcrumb. Wydzielona z `ContainerComponent::Toolbar`,
@@ -317,9 +330,14 @@ pub(crate) fn validate_panel_id(id: &str) -> Result<(), &'static str> {
 /// Walidacja pojedynczego komponentu kontenerowego + rekurencyjna walidacja
 /// dzieci. Walidacja overlay-only kinds (Window/Drawer/Popover) jest osobno
 /// w `mod.rs` (kontekstowa: w root[] vs overlay.content).
+///
+/// Zwraca `anyhow::Result<()>` aby propagować konkretną przyczynę błędu
+/// pierwszego dziecka, które nie przeszło walidacji (zamiast zjadać ją do
+/// generycznego `card_children_invalid`). Własne błędy enum-variantu (np.
+/// duplikat id, brak `active_id`) pozostają statycznymi, krótkimi kodami.
 pub fn validate_and_normalize(
     component: &mut ContainerComponent,
-) -> Result<(), &'static str> {
+) -> anyhow::Result<()> {
     use ContainerComponent::*;
     match component {
         Card {
@@ -327,11 +345,11 @@ pub fn validate_and_normalize(
         } => {
             for c in actions {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "card_actions_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("card_actions: {e}"))?;
             }
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "card_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("card_children: {e}"))?;
             }
             Ok(())
         }
@@ -340,18 +358,18 @@ pub fn validate_and_normalize(
         } => {
             for c in actions {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "section_card_actions_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("section_card_actions: {e}"))?;
             }
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "section_card_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("section_card_children: {e}"))?;
             }
             Ok(())
         }
         Section { children, .. } => {
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "section_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("section_children: {e}"))?;
             }
             Ok(())
         }
@@ -359,19 +377,19 @@ pub fn validate_and_normalize(
             let mut seen: Vec<&str> = Vec::with_capacity(tabs.len());
             for t in tabs.iter() {
                 if seen.iter().any(|s| *s == t.id.as_str()) {
-                    return Err("tabs_duplicate_tab_id");
+                    anyhow::bail!("tabs_duplicate_tab_id");
                 }
                 seen.push(t.id.as_str());
             }
             if let Some(active) = active_id {
                 if !tabs.iter().any(|t| &t.id == active) {
-                    return Err("tabs_active_not_in_items");
+                    anyhow::bail!("tabs_active_not_in_items");
                 }
             }
             for t in tabs.iter_mut() {
                 for c in &mut t.children {
                     super::validate_and_normalize_component(c)
-                        .map_err(|_| "tabs_children_invalid")?;
+                        .map_err(|e| anyhow::anyhow!("tabs_children: {e}"))?;
                 }
             }
             Ok(())
@@ -380,20 +398,20 @@ pub fn validate_and_normalize(
             let mut seen: Vec<&str> = Vec::with_capacity(items.len());
             for it in items.iter() {
                 if seen.iter().any(|s| *s == it.id.as_str()) {
-                    return Err("nav_tabs_duplicate_id");
+                    anyhow::bail!("nav_tabs_duplicate_id");
                 }
                 seen.push(it.id.as_str());
-                validate_panel_id(&it.panel_id)?;
+                validate_panel_id(&it.panel_id).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             if !items.iter().any(|i| &i.id == active_id) {
-                return Err("nav_tabs_active_not_in_items");
+                anyhow::bail!("nav_tabs_active_not_in_items");
             }
             Ok(())
         }
         Toolbar { actions, .. } => {
             for c in actions {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "toolbar_actions_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("toolbar_actions: {e}"))?;
             }
             Ok(())
         }
@@ -407,11 +425,11 @@ pub fn validate_and_normalize(
             for s in sections.iter() {
                 for it in s.items.iter() {
                     if seen.iter().any(|x| *x == it.id.as_str()) {
-                        return Err("sidebar_duplicate_id");
+                        anyhow::bail!("sidebar_duplicate_id");
                     }
                     seen.push(it.id.as_str());
                     if let Some(pid) = &it.panel_id {
-                        validate_panel_id(pid)?;
+                        validate_panel_id(pid).map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     if &it.id == active_id {
                         found_active = true;
@@ -419,20 +437,20 @@ pub fn validate_and_normalize(
                 }
             }
             if !found_active {
-                return Err("sidebar_active_not_in_items");
+                anyhow::bail!("sidebar_active_not_in_items");
             }
             Ok(())
         }
         Collapsible { children, .. } => {
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "collapsible_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("collapsible_children: {e}"))?;
             }
             Ok(())
         }
         Tooltip { target, .. } => {
             super::validate_and_normalize_component(target)
-                .map_err(|_| "tooltip_target_invalid")?;
+                .map_err(|e| anyhow::anyhow!("tooltip_target: {e}"))?;
             Ok(())
         }
         Window {
@@ -440,32 +458,32 @@ pub fn validate_and_normalize(
         } => {
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "window_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("window_children: {e}"))?;
             }
             for c in footer {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "window_footer_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("window_footer: {e}"))?;
             }
             Ok(())
         }
         Drawer { children, .. } => {
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "drawer_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("drawer_children: {e}"))?;
             }
             Ok(())
         }
         Popover { children, .. } => {
             for c in children {
                 super::validate_and_normalize_component(c)
-                    .map_err(|_| "popover_children_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("popover_children: {e}"))?;
             }
             Ok(())
         }
         Breadcrumb { items } => {
             for it in items.iter() {
                 if let Some(pid) = &it.panel_id {
-                    validate_panel_id(pid)?;
+                    validate_panel_id(pid).map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
             }
             Ok(())
@@ -476,7 +494,7 @@ pub fn validate_and_normalize(
             ..
         } => {
             if *total_pages > 0 && *current_page > *total_pages {
-                return Err("pagination_current_exceeds_total");
+                anyhow::bail!("pagination_current_exceeds_total");
             }
             Ok(())
         }
@@ -572,7 +590,7 @@ mod tests {
             active_id: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "tabs_duplicate_tab_id");
+        assert_eq!(err.to_string(), "tabs_duplicate_tab_id");
     }
 
     #[test]
@@ -587,7 +605,7 @@ mod tests {
             active_id: Some("missing".to_string()),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "tabs_active_not_in_items");
+        assert_eq!(err.to_string(), "tabs_active_not_in_items");
     }
 
     #[test]
@@ -599,11 +617,12 @@ mod tests {
                 icon: None,
                 panel_id: "dashboard".to_string(),
                 badge: None,
+                locked: false,
             }],
             active_id: "missing".to_string(),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "nav_tabs_active_not_in_items");
+        assert_eq!(err.to_string(), "nav_tabs_active_not_in_items");
     }
 
     #[test]
@@ -615,11 +634,12 @@ mod tests {
                 icon: None,
                 panel_id: "BadPanelID!".to_string(),
                 badge: None,
+                locked: false,
             }],
             active_id: "home".to_string(),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "panel_id_invalid_format");
+        assert_eq!(err.to_string(), "panel_id_invalid_format");
     }
 
     #[test]
@@ -639,7 +659,7 @@ mod tests {
             active_id: "missing".to_string(),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "sidebar_active_not_in_items");
+        assert_eq!(err.to_string(), "sidebar_active_not_in_items");
     }
 
     #[test]
@@ -671,7 +691,7 @@ mod tests {
             active_id: "x".to_string(),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "sidebar_duplicate_id");
+        assert_eq!(err.to_string(), "sidebar_duplicate_id");
     }
 
     #[test]
@@ -683,7 +703,7 @@ mod tests {
             sibling_count: 1,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "pagination_current_exceeds_total");
+        assert_eq!(err.to_string(), "pagination_current_exceeds_total");
     }
 
     #[test]
@@ -740,7 +760,7 @@ mod tests {
             }],
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "panel_id_invalid_format");
+        assert_eq!(err.to_string(), "panel_id_invalid_format");
     }
 
     #[test]
