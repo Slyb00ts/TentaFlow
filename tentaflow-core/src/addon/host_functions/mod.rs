@@ -122,6 +122,10 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .map_err(|e| anyhow::anyhow!("Rejestracja ui_render: {e}"))?;
 
     linker
+        .func_wrap("tentaflow", "ui_render_binary", ui::ui_render_binary)
+        .map_err(|e| anyhow::anyhow!("Rejestracja ui_render_binary: {e}"))?;
+
+    linker
         .func_wrap("tentaflow", "ui_notify", ui::ui_notify)
         .map_err(|e| anyhow::anyhow!("Rejestracja ui_notify: {e}"))?;
 

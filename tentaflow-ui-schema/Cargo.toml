@@ -15,3 +15,10 @@ anyhow = "1"
 # Used by `form::validate_validation` to reject malformed regex patterns
 # submitted by addons (host-side validation only).
 regex = "1"
+# Binary serde codec used by `render_panel_binary` (addon→host UI ABI).
+# MessagePack (rmp-serde) was picked over postcard/bincode because
+# `UiComponent` is `#[serde(untagged)]` — both postcard and bincode reject
+# untagged enums (they require `deserialize_any`, which only self-describing
+# formats support). MessagePack is self-describing, ~5-10× faster than JSON
+# and ~2-3× smaller on the wire.
+rmp-serde = "1.3"
