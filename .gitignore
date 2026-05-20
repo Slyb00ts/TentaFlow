@@ -3,6 +3,11 @@
 # =============================================================================
 target/
 target_shared/
+
+# Runtime data (SQLite, HMAC keys, container bundles, model cache).
+# Wczesniej trzymane w target/debug/ — `cargo clean` je wywalal. Teraz
+# osobny katalog `.runtime/` poza target/.
+/.runtime/
 obj/
 bin/
 *.o
