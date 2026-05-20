@@ -95,6 +95,26 @@ async function fetchAndBuildContent(addonId, panelId) {
   const content = document.createElement('div');
   content.className = 'addon-app-content';
 
+  // Lazy panel rendering: addon pre-renderuje tylko `overview` w on_start.
+  // Dla pozostałych paneli musimy najpierw poprosić addon o ich zbudowanie
+  // (akcja panel-navigate), potem pobrać już zacache'owane drzewo z hosta.
+  // Akcja jest idempotentna — jeśli panel już jest w cache, addon wszystko
+  // i tak nadpisuje świeżą zawartością. Pomijamy dla `overview` (cache hit
+  // gwarantowany od on_start).
+  if (panelId && panelId !== 'overview') {
+    try {
+      await ApiBinary.one('addonUiActionRequest', {
+        addonId,
+        panelId,
+        actionId: 'panel-navigate',
+        params: { panel_id: panelId },
+      });
+    } catch (e) {
+      content.innerHTML = errorBlock(`Nie udało się przygotować panelu: ${e.message}`);
+      return content;
+    }
+  }
+
   let response;
   try {
     response = await ApiBinary.one('addonUiPanelGetRequest', { addonId, panelId });
