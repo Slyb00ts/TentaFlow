@@ -49,8 +49,12 @@ use permissions::PermissionChecker;
 // Stale konfiguracyjne
 // =============================================================================
 
-/// Domyslna ilosc paliwa (fuel) dla kazdej operacji WASM (10M instrukcji)
-const DEFAULT_FUEL_LIMIT: u64 = 10_000_000;
+/// Domyslna ilosc paliwa (fuel) dla kazdej operacji WASM. Bumped z 10M do
+/// 200M po obserwacji ze legit-rozmiarowe addony (TentaVision z 14 panelami
+/// + AccessMatrix + StepProgress + Charts) potrzebuja >50M na samo on_start.
+/// Pojedyncza intra-procesowa instrukcja WASM to nanosekundy, wiec 200M ~=
+/// 0.5–2 sek scisle limitu CPU per wywolanie — wciaz tanio dla DoS-guard.
+const DEFAULT_FUEL_LIMIT: u64 = 200_000_000;
 
 /// Domyslny limit pamieci WASM w bajtach (256 MB)
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;

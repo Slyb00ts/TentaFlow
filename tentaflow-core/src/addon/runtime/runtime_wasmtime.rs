@@ -59,6 +59,14 @@ pub fn create_engine() -> Result<WasmEngine> {
     config.memory_reservation(DEFAULT_MEMORY_LIMIT_BYTES as u64);
     config.memory_reservation_for_growth(0);
 
+    // WASM stack — wasmtime default = 512 KB. Za malo dla addonow ktore
+    // buduja glebokie drzewa `serde_json::Value` (kazdy zagniezdzony Object
+    // dodaje stack frame). Zaobserwowane trap'y w TentaVision::on_start gdy
+    // pre-renderowane 11 paneli (kazdy z Card→Stack→Grid→Card→...). 8 MB
+    // daje komfortowy zapas dla addonow renderujacych podobne UI; jesli
+    // ktorys addon legitnie potrzebuje wiecej, podbijemy globalnie.
+    config.max_wasm_stack(8 * 1024 * 1024);
+
     let engine = WasmEngine::new(&config)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc silnika Wasmtime: {e}"))?;
 
