@@ -7,12 +7,27 @@
    ============================================================================= */
 
 .addon-app-shell {
-  padding: 24px 28px 48px;
-  max-width: 960px;
-  margin: 0 auto;
+  /* Mockup m01 (designs/tentavision-v1/m01-dashboard.html) wymaga full-bleed
+     layoutu — addon sam zarzadza wewnetrzna struktura (toolbar, nav_tabs, grid).
+     Stara wartosc max-width: 960px zwezala caly content do waskiej kolumny. */
+  width: 100%;
+  padding: 24px 32px 48px;
+  margin: 0;
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+@media (min-width: 1600px) {
+  .addon-app-shell {
+    padding: 32px 48px 56px;
+  }
+}
+
+@media (max-width: 720px) {
+  .addon-app-shell {
+    padding: 16px 14px 32px;
+  }
 }
 
 .addon-app-title {
