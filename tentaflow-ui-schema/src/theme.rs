@@ -254,8 +254,14 @@ pub enum IconName {
     ArrowLeft,
     ArrowRight,
     ChevronUp,
+    // Kebab-case aliases (`chevron-down`/`-left`/`-right`) accepted on
+    // deserialize for compatibility with addons that source wire names
+    // straight from the dashboard sprite whitelist.
+    #[serde(alias = "chevron-down")]
     ChevronDown,
+    #[serde(alias = "chevron-left")]
     ChevronLeft,
+    #[serde(alias = "chevron-right")]
     ChevronRight,
 
     Power,
@@ -265,6 +271,189 @@ pub enum IconName {
     Logout,
     Bell,
     Star,
+
+    // -------------------------------------------------------------------------
+    // Dashboard sprite whitelist parity (`tentaflow-core/www/js/app.js`
+    // `ADDON_ICON_WHITELIST`). Wire names below are the canonical strings
+    // addons send via `json!("icon": "<wire>")`; renderer maps each to
+    // `<symbol id="icon-<wire>">` in `www/img/icons.svg`.
+    // -------------------------------------------------------------------------
+    #[serde(rename = "alert")]
+    Alert,
+    #[serde(rename = "apps")]
+    Apps,
+    #[serde(rename = "arrow")]
+    Arrow,
+    #[serde(rename = "arrow-out")]
+    ArrowOut,
+    #[serde(rename = "ban")]
+    Ban,
+    #[serde(rename = "bar-chart")]
+    BarChart,
+    #[serde(rename = "bolt")]
+    Bolt,
+    #[serde(rename = "brain")]
+    Brain,
+    #[serde(rename = "branch")]
+    Branch,
+    #[serde(rename = "catalog")]
+    Catalog,
+    #[serde(rename = "chart-line")]
+    ChartLine,
+    #[serde(rename = "chat")]
+    Chat,
+    #[serde(rename = "chip")]
+    Chip,
+    #[serde(rename = "clock")]
+    Clock,
+    #[serde(rename = "clock-glance")]
+    ClockGlance,
+    #[serde(rename = "cloud")]
+    Cloud,
+    #[serde(rename = "cluster")]
+    Cluster,
+    #[serde(rename = "collapse")]
+    Collapse,
+    #[serde(rename = "copy")]
+    Copy,
+    #[serde(rename = "core")]
+    Core,
+    #[serde(rename = "cpu")]
+    Cpu,
+    #[serde(rename = "cylinder")]
+    Cylinder,
+    #[serde(rename = "database")]
+    Database,
+    #[serde(rename = "desktop")]
+    Desktop,
+    #[serde(rename = "docker")]
+    Docker,
+    #[serde(rename = "download")]
+    Download,
+    #[serde(rename = "external-link")]
+    ExternalLink,
+    #[serde(rename = "file-text")]
+    FileText,
+    #[serde(rename = "flow")]
+    Flow,
+    #[serde(rename = "globe")]
+    Globe,
+    #[serde(rename = "globe-grid")]
+    GlobeGrid,
+    #[serde(rename = "gpu")]
+    Gpu,
+    #[serde(rename = "grid-rows")]
+    GridRows,
+    #[serde(rename = "grip")]
+    Grip,
+    #[serde(rename = "home-simple")]
+    HomeSimple,
+    #[serde(rename = "host")]
+    Host,
+    #[serde(rename = "iface-lan")]
+    IfaceLan,
+    #[serde(rename = "iface-loop")]
+    IfaceLoop,
+    #[serde(rename = "iface-tb")]
+    IfaceTb,
+    #[serde(rename = "iface-virt")]
+    IfaceVirt,
+    #[serde(rename = "iface-vpn")]
+    IfaceVpn,
+    #[serde(rename = "iface-wifi")]
+    IfaceWifi,
+    #[serde(rename = "key")]
+    Key,
+    #[serde(rename = "line-chart")]
+    LineChart,
+    #[serde(rename = "list")]
+    List,
+    #[serde(rename = "lock")]
+    Lock,
+    #[serde(rename = "management")]
+    Management,
+    #[serde(rename = "max")]
+    Max,
+    #[serde(rename = "meeting")]
+    Meeting,
+    #[serde(rename = "message")]
+    Message,
+    #[serde(rename = "mic")]
+    Mic,
+    #[serde(rename = "min")]
+    Min,
+    #[serde(rename = "model")]
+    Model,
+    #[serde(rename = "network")]
+    Network,
+    #[serde(rename = "network-svg")]
+    NetworkSvg,
+    #[serde(rename = "os")]
+    Os,
+    #[serde(rename = "paperclip")]
+    Paperclip,
+    #[serde(rename = "pause")]
+    Pause,
+    #[serde(rename = "pi")]
+    Pi,
+    #[serde(rename = "pin")]
+    Pin,
+    #[serde(rename = "play")]
+    Play,
+    #[serde(rename = "plus")]
+    Plus,
+    #[serde(rename = "prompt")]
+    Prompt,
+    #[serde(rename = "puzzle")]
+    Puzzle,
+    #[serde(rename = "question")]
+    Question,
+    #[serde(rename = "rag-db")]
+    RagDb,
+    #[serde(rename = "ram")]
+    Ram,
+    #[serde(rename = "record")]
+    Record,
+    #[serde(rename = "record-dot")]
+    RecordDot,
+    #[serde(rename = "registry")]
+    Registry,
+    #[serde(rename = "rotate")]
+    Rotate,
+    #[serde(rename = "rules")]
+    Rules,
+    #[serde(rename = "send")]
+    Send,
+    #[serde(rename = "services")]
+    Services,
+    #[serde(rename = "share")]
+    Share,
+    #[serde(rename = "shield")]
+    Shield,
+    #[serde(rename = "sparkle")]
+    Sparkle,
+    #[serde(rename = "speaker")]
+    Speaker,
+    #[serde(rename = "speaker-alt")]
+    SpeakerAlt,
+    #[serde(rename = "stop")]
+    Stop,
+    #[serde(rename = "transform")]
+    Transform,
+    #[serde(rename = "trash")]
+    Trash,
+    #[serde(rename = "trend")]
+    Trend,
+    #[serde(rename = "unlock")]
+    Unlock,
+    #[serde(rename = "volume")]
+    Volume,
+    #[serde(rename = "workflow-app")]
+    WorkflowApp,
+    #[serde(rename = "x")]
+    X,
+    #[serde(rename = "zap")]
+    Zap,
 }
 
 // =============================================================================
@@ -375,6 +564,58 @@ mod tests {
         assert_eq!(j, serde_json::json!("chevron_right"));
         let back: IconName = serde_json::from_value(j).expect("deserialize");
         assert_eq!(back, IconName::ChevronRight);
+    }
+
+    #[test]
+    fn icon_name_kebab_aliases_for_chevrons_deserialize() {
+        // Existing snake_case variants still serialize as snake; kebab is only
+        // an alias to accept on deserialize (dashboard whitelist parity).
+        let down: IconName = serde_json::from_value(serde_json::json!("chevron-down")).unwrap();
+        assert_eq!(down, IconName::ChevronDown);
+        let left: IconName = serde_json::from_value(serde_json::json!("chevron-left")).unwrap();
+        assert_eq!(left, IconName::ChevronLeft);
+        let right: IconName = serde_json::from_value(serde_json::json!("chevron-right")).unwrap();
+        assert_eq!(right, IconName::ChevronRight);
+        assert_eq!(
+            serde_json::to_value(IconName::ChevronDown).unwrap(),
+            serde_json::json!("chevron_down")
+        );
+    }
+
+    #[test]
+    fn icon_name_whitelist_variants_round_trip() {
+        // Spot-check a representative slice of the new whitelist-derived
+        // variants. Each wire name MUST round-trip verbatim.
+        let cases: &[(IconName, &str)] = &[
+            (IconName::Plus, "plus"),
+            (IconName::X, "x"),
+            (IconName::Alert, "alert"),
+            (IconName::Trash, "trash"),
+            (IconName::Chip, "chip"),
+            (IconName::Clock, "clock"),
+            (IconName::ExternalLink, "external-link"),
+            (IconName::FileText, "file-text"),
+            (IconName::WorkflowApp, "workflow-app"),
+            (IconName::IfaceWifi, "iface-wifi"),
+            (IconName::RagDb, "rag-db"),
+            (IconName::RecordDot, "record-dot"),
+            (IconName::ClockGlance, "clock-glance"),
+            (IconName::SpeakerAlt, "speaker-alt"),
+            (IconName::NetworkSvg, "network-svg"),
+            (IconName::GlobeGrid, "globe-grid"),
+            (IconName::HomeSimple, "home-simple"),
+            (IconName::GridRows, "grid-rows"),
+            (IconName::ArrowOut, "arrow-out"),
+            (IconName::BarChart, "bar-chart"),
+            (IconName::LineChart, "line-chart"),
+            (IconName::ChartLine, "chart-line"),
+        ];
+        for (variant, wire) in cases {
+            let j = serde_json::to_value(variant).expect("serialize");
+            assert_eq!(j, serde_json::json!(wire), "serialize {wire}");
+            let back: IconName = serde_json::from_value(j).expect("deserialize");
+            assert_eq!(back, *variant, "round-trip {wire}");
+        }
     }
 
     #[test]
