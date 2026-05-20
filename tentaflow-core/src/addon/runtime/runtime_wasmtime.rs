@@ -62,10 +62,20 @@ pub fn create_engine() -> Result<WasmEngine> {
     // WASM stack — wasmtime default = 512 KB. Za malo dla addonow ktore
     // buduja glebokie drzewa `serde_json::Value` (kazdy zagniezdzony Object
     // dodaje stack frame). Zaobserwowane trap'y w TentaVision::on_start gdy
-    // pre-renderowane 11 paneli (kazdy z Card→Stack→Grid→Card→...). 8 MB
-    // daje komfortowy zapas dla addonow renderujacych podobne UI; jesli
-    // ktorys addon legitnie potrzebuje wiecej, podbijemy globalnie.
-    config.max_wasm_stack(8 * 1024 * 1024);
+    // pre-renderowane 11 paneli (kazdy z Card→Stack→Grid→Card→...).
+    //
+    // Wasmtime wymaga `max_wasm_stack <= async_stack_size`. Default
+    // async_stack_size = 2 MB, wiec ustawiamy oba: async = 8 MB (gosc rust
+    // dostaje pelen budget), max_wasm = 6 MB (zostawiamy 2 MB margines na
+    // ramki async runtime'u). Jesli kiedys addony beda potrzebowac wiecej,
+    // podbij oba symetrycznie.
+    // Wasmtime 44 validates max_wasm_stack <= async_stack_size on Engine
+    // creation. Both calls must succeed (panic if feature missing).
+    config.async_stack_size(16 * 1024 * 1024);
+    config.max_wasm_stack(4 * 1024 * 1024);
+    info!(
+        "stack config: async_stack=16MB, max_wasm_stack=4MB"
+    );
 
     let engine = WasmEngine::new(&config)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc silnika Wasmtime: {e}"))?;
