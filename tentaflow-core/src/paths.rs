@@ -29,9 +29,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Directory where the tentaflow binary lives. Derived from `current_exe()`
-/// once at startup; falls back to CWD if introspection fails.
-/// `TENTAFLOW_HOME` env var overrides it (useful for tests / dev).
+/// Directory where TentaFlow keeps persistent runtime data (SQLite, HMAC
+/// keys, container bundles, model cache). Resolved once at startup and
+/// cached. Resolution order:
+///   1. `TENTAFLOW_HOME` env var if set and creatable.
+///   2. Repo-local `<repo_root>/.runtime/` when source tree is detected
+///      (parent of CARGO_MANIFEST_DIR or any ancestor containing `.git`).
+///      Idempotent migration from the old `target/{debug,release}/`
+///      layout runs on first init when `.runtime/` does not yet exist.
+///   3. `~/.tentaflow/` when running as an installed binary outside the
+///      source tree.
+///   4. Directory containing `current_exe()` (last resort — preserves the
+///      old behavior for unusual deployments where neither a repo nor a
+///      home directory is reachable).
 pub fn tentaflow_home() -> &'static Path {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
     HOME.get_or_init(|| {
@@ -41,6 +51,15 @@ pub fn tentaflow_home() -> &'static Path {
                 return p;
             }
         }
+        if let Some(repo_runtime) = detect_repo_runtime() {
+            let _ = std::fs::create_dir_all(&repo_runtime);
+            migrate_legacy_runtime_into(&repo_runtime);
+            return repo_runtime;
+        }
+        if let Some(home) = dirs_home_tentaflow() {
+            let _ = std::fs::create_dir_all(&home);
+            return home;
+        }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 return dir.to_path_buf();
@@ -48,6 +67,124 @@ pub fn tentaflow_home() -> &'static Path {
         }
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     })
+}
+
+/// Walk up from likely source-tree anchors looking for a directory that
+/// contains both a top-level crate (`tentaflow/Cargo.toml`) and either a
+/// `.git/` directory or a `target_shared/` sibling. Returns
+/// `<anchor>/.runtime/` when matched.
+fn detect_repo_runtime() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(manifest));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    for start in candidates {
+        let mut cur: Option<&Path> = Some(start.as_path());
+        while let Some(dir) = cur {
+            let is_repo_root = dir.join(".git").exists()
+                || (dir.join("tentaflow").join("Cargo.toml").exists()
+                    && dir.join("tentaflow-core").join("Cargo.toml").exists());
+            if is_repo_root {
+                return Some(dir.join(".runtime"));
+            }
+            cur = dir.parent();
+        }
+    }
+    None
+}
+
+/// `~/.tentaflow/` for installed binaries running outside a source tree.
+fn dirs_home_tentaflow() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))?;
+    let p = PathBuf::from(raw);
+    if p.as_os_str().is_empty() {
+        return None;
+    }
+    Some(p.join(".tentaflow"))
+}
+
+/// One-shot copy of the legacy `target/<profile>/{data,keys,containers,
+/// cache,models}` layout into the new `.runtime/` root. Best-effort: any
+/// IO error is logged via stderr and ignored — the next call to
+/// `ensure_app_dirs()` will create whatever is still missing. Only runs
+/// when the destination directory does NOT yet contain the corresponding
+/// child (so re-runs after a successful migration are no-ops, and a user
+/// who manually copied/cleaned the new layout is never overwritten).
+fn migrate_legacy_runtime_into(dest: &Path) {
+    let Some(repo_root) = dest.parent() else {
+        return;
+    };
+    // Legacy locations the old `tentaflow_home()` resolved to: the
+    // `current_exe()` parent inside cargo's per-crate target dir.
+    let legacy_roots = [
+        repo_root.join("tentaflow").join("target").join("debug"),
+        repo_root.join("tentaflow").join("target").join("release"),
+        repo_root.join("target_shared").join("debug"),
+        repo_root.join("target_shared").join("release"),
+    ];
+    // Subdirs that hold persistent state. `models/` is intentionally
+    // excluded — it can be tens of GB of HF cache, and is harmless to
+    // re-download. `cache/` (venv bundles) is also skipped for the same
+    // reason; both will be re-created on demand.
+    let migrate_children = ["data", "keys", "containers"];
+    for src_root in &legacy_roots {
+        if !src_root.is_dir() {
+            continue;
+        }
+        for child in &migrate_children {
+            let src = src_root.join(child);
+            let dst = dest.join(child);
+            if !src.is_dir() || dst.exists() {
+                continue;
+            }
+            if let Err(e) = copy_dir_recursive(&src, &dst) {
+                eprintln!(
+                    "tentaflow: legacy runtime migration {} -> {} failed: {}",
+                    src.display(),
+                    dst.display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_symlink() {
+            // Symlinks inside container bundles point at sibling files
+            // we're already copying. Replicate the link verbatim.
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&from)?;
+                let _ = std::fs::remove_file(&to);
+                std::os::unix::fs::symlink(target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(&from, &to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Shared root for every model file and cache. Docker containers mount
