@@ -182,6 +182,16 @@ extern "C" {
         ui_json_ptr: i32, ui_json_len: i32,
     ) -> i32;
 
+    /// Renderowanie panelu UI — binary protocol (bincode-encoded PanelTree).
+    /// Pozwala pominac JSON serialize/parse w sciezce addon→host
+    /// (ok. 20× szybsze, payload ~2-3× mniejszy).
+    /// ABI: (panel_id_ptr, panel_id_len, binary_ptr, binary_len) -> i32
+    /// Zgodne z host function w host_functions/ui.rs::ui_render_binary
+    fn ui_render_binary(
+        panel_id_ptr: i32, panel_id_len: i32,
+        binary_ptr: i32, binary_len: i32,
+    ) -> i32;
+
     /// Wyswietlenie powiadomienia
     /// ABI: (title_ptr, title_len, body_ptr, body_len, level_ptr, level_len) -> i32
     /// Zgodne z host function w host_functions/ui.rs::ui_notify
@@ -814,6 +824,36 @@ pub fn render_panel_typed(panel_id: &str, tree: &ui::PanelTree) -> Result<(), St
     ui_render_raw(panel_id, &ui_json)
 }
 
+/// Renders an addon UI panel by shipping a MessagePack-encoded `PanelTree`
+/// directly across the addon↔host ABI. No JSON anywhere on the addon side.
+///
+/// On the host side this drops the `parse_and_validate_panel_tree(&str)`
+/// JSON parser entirely — the host calls `rmp_serde::from_slice` once and
+/// goes straight into `validate_panel_tree`. End-to-end this is several
+/// times faster than [`render_panel_typed`] for non-trivial trees and the
+/// wire payload is ~2-3× smaller (no whitespace, no quoting, integer-
+/// tagged field names). MessagePack was picked over postcard/bincode
+/// because `UiComponent` uses `#[serde(untagged)]`, which only self-
+/// describing formats can decode. See `notes/addon-ui-perf-plan.md` §2 P3.
+///
+/// Requires the `ui` permission in the addon manifest. Frontend wire
+/// format is unchanged (host still serves panels as JSON via `panel_get`).
+pub fn render_panel_binary(panel_id: &str, tree: &ui::PanelTree) -> Result<(), String> {
+    let encoded = rmp_serde::to_vec_named(tree)
+        .map_err(|e| format!("Blad serializacji msgpack panelu UI: {}", e))?;
+    let pid = panel_id.as_bytes();
+    let result = unsafe {
+        ui_render_binary(
+            pid.as_ptr() as i32, pid.len() as i32,
+            encoded.as_ptr() as i32, encoded.len() as i32,
+        )
+    };
+    if result < 0 {
+        return Err(format!("Blad renderowania panelu UI (binary): {}", result));
+    }
+    Ok(())
+}
+
 /// Internal: ship a pre-serialized panel JSON across the ABI boundary.
 /// Shared by [`render_panel`] and [`render_panel_typed`] so the unsafe
 /// pointer dance lives in one place.
@@ -1351,7 +1391,7 @@ pub mod prelude {
         store_get, store_set,
         http_get, http_post, http_send, HttpRequest, HttpResponse,
         publish_event, subscribe_event, Event,
-        render_panel, render_panel_typed, notify, notify_with_level,
+        render_panel, render_panel_typed, render_panel_binary, notify, notify_with_level,
         secret_get_value, secret_set_value,
         get_current_user, CurrentUser,
         register_tool,
