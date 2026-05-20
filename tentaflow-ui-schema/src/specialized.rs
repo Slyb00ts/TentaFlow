@@ -449,16 +449,17 @@ const SCHEDULE_DAYS: usize = 7;
 const SCHEDULE_HOURS: usize = 24;
 
 /// Validate and normalise a `SpecializedComponent`. Recurses into
-/// `WelcomeHero.actions` through the central recursive validator. Error
-/// reasons are static strings — they never echo addon input.
+/// `WelcomeHero.actions` through the central recursive validator. Leaf
+/// errors are static reason codes; container errors propagate the child's
+/// chain so the addon log shows the deepest failure.
 pub fn validate_and_normalize(
     component: &mut SpecializedComponent,
-) -> Result<(), &'static str> {
+) -> anyhow::Result<()> {
     use SpecializedComponent::*;
     match component {
         Canvas { commands, .. } => {
             if commands.len() > CANVAS_MAX_COMMANDS {
-                return Err("canvas_too_many_commands");
+                anyhow::bail!("canvas_too_many_commands");
             }
             for cmd in commands.iter() {
                 validate_draw_command(cmd)?;
@@ -467,25 +468,25 @@ pub fn validate_and_normalize(
         }
         Sparkline { points, .. } => {
             if points.len() < SPARKLINE_MIN_POINTS {
-                return Err("sparkline_too_few_points");
+                anyhow::bail!("sparkline_too_few_points");
             }
             if points.len() > SPARKLINE_MAX_POINTS {
-                return Err("sparkline_too_many_points");
+                anyhow::bail!("sparkline_too_many_points");
             }
             Ok(())
         }
         StackedBar { data, colors, .. } => {
             if data.is_empty() {
-                return Err("stacked_bar_no_data");
+                anyhow::bail!("stacked_bar_no_data");
             }
             let series_count = data[0].values.len();
             for item in data.iter() {
                 if item.values.len() != series_count {
-                    return Err("stacked_bar_inconsistent_series");
+                    anyhow::bail!("stacked_bar_inconsistent_series");
                 }
             }
             if !colors.is_empty() && colors.len() < series_count {
-                return Err("stacked_bar_colors_too_few");
+                anyhow::bail!("stacked_bar_colors_too_few");
             }
             Ok(())
         }
@@ -498,21 +499,21 @@ pub fn validate_and_normalize(
             ..
         } => {
             if *rows == 0 || *cols == 0 {
-                return Err("heatmap_invalid_dimensions");
+                anyhow::bail!("heatmap_invalid_dimensions");
             }
             if values.len() as u32 != *rows {
-                return Err("heatmap_row_count_mismatch");
+                anyhow::bail!("heatmap_row_count_mismatch");
             }
             for row in values.iter() {
                 if row.len() as u32 != *cols {
-                    return Err("heatmap_col_count_mismatch");
+                    anyhow::bail!("heatmap_col_count_mismatch");
                 }
             }
             if !row_labels.is_empty() && row_labels.len() as u32 != *rows {
-                return Err("heatmap_row_labels_mismatch");
+                anyhow::bail!("heatmap_row_labels_mismatch");
             }
             if !col_labels.is_empty() && col_labels.len() as u32 != *cols {
-                return Err("heatmap_col_labels_mismatch");
+                anyhow::bail!("heatmap_col_labels_mismatch");
             }
             Ok(())
         }
@@ -520,17 +521,17 @@ pub fn validate_and_normalize(
             roles, resources, ..
         } => {
             if roles.is_empty() {
-                return Err("access_matrix_no_roles");
+                anyhow::bail!("access_matrix_no_roles");
             }
             let mut seen_ids: Vec<&str> = Vec::with_capacity(resources.len());
             for res in resources.iter() {
                 if seen_ids.iter().any(|s| *s == res.id.as_str()) {
-                    return Err("access_matrix_duplicate_resource_id");
+                    anyhow::bail!("access_matrix_duplicate_resource_id");
                 }
                 seen_ids.push(res.id.as_str());
                 for perm in res.permissions.iter() {
                     if !roles.iter().any(|r| r == &perm.role) {
-                        return Err("access_matrix_unknown_role");
+                        anyhow::bail!("access_matrix_unknown_role");
                     }
                 }
             }
@@ -538,11 +539,11 @@ pub fn validate_and_normalize(
         }
         WeeklyScheduleGrid { values, .. } => {
             if values.len() != SCHEDULE_DAYS {
-                return Err("schedule_must_have_7_days");
+                anyhow::bail!("schedule_must_have_7_days");
             }
             for day in values.iter() {
                 if day.len() != SCHEDULE_HOURS {
-                    return Err("schedule_must_have_24_hours");
+                    anyhow::bail!("schedule_must_have_24_hours");
                 }
             }
             Ok(())
@@ -554,28 +555,28 @@ pub fn validate_and_normalize(
             ..
         } => {
             if !is_valid_stream_id(stream_id) {
-                return Err("video_tile_invalid_stream_id");
+                anyhow::bail!("video_tile_invalid_stream_id");
             }
             if let Some(cam) = camera_id {
                 super::legacy::validate_camera_id(cam)
-                    .map_err(|_| "video_tile_invalid_camera_id")?;
+                    .map_err(|e| anyhow::anyhow!("video_tile_camera_id: {e}"))?;
             }
             if let Some(h) = height_px {
                 if *h < VIDEO_TILE_MIN_HEIGHT || *h > VIDEO_TILE_MAX_HEIGHT {
-                    return Err("video_tile_invalid_height");
+                    anyhow::bail!("video_tile_invalid_height");
                 }
             }
             Ok(())
         }
         WelcomeHero { title, actions, .. } => {
             if title.is_empty() {
-                return Err("welcome_hero_title_empty");
+                anyhow::bail!("welcome_hero_title_empty");
             }
             for a in actions.iter_mut() {
                 super::reject_overlay_kind_in_root(a)
-                    .map_err(|_| "welcome_hero_action_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("welcome_hero_action: {e}"))?;
                 super::validate_and_normalize_component(a)
-                    .map_err(|_| "welcome_hero_action_invalid")?;
+                    .map_err(|e| anyhow::anyhow!("welcome_hero_action: {e}"))?;
             }
             Ok(())
         }
@@ -585,10 +586,10 @@ pub fn validate_and_normalize(
             ..
         } => {
             if steps.is_empty() {
-                return Err("step_progress_empty");
+                anyhow::bail!("step_progress_empty");
             }
             if (*active_index as usize) >= steps.len() {
-                return Err("step_progress_active_out_of_range");
+                anyhow::bail!("step_progress_active_out_of_range");
             }
             Ok(())
         }
@@ -598,19 +599,19 @@ pub fn validate_and_normalize(
             ..
         } => {
             if addon_label.is_empty() {
-                return Err("req_card_label_empty");
+                anyhow::bail!("req_card_label_empty");
             }
             if permission.is_empty() {
-                return Err("req_card_permission_empty");
+                anyhow::bail!("req_card_permission_empty");
             }
             Ok(())
         }
         DecisionRow { id, label, .. } => {
             if id.is_empty() {
-                return Err("decision_row_id_empty");
+                anyhow::bail!("decision_row_id_empty");
             }
             if label.is_empty() {
-                return Err("decision_row_label_empty");
+                anyhow::bail!("decision_row_label_empty");
             }
             Ok(())
         }
@@ -621,32 +622,32 @@ pub fn validate_and_normalize(
             ..
         } => {
             if !is_valid_stream_id(stream_id) {
-                return Err("alarm_feed_invalid_stream_id");
+                anyhow::bail!("alarm_feed_invalid_stream_id");
             }
             if *max_items < ALARM_FEED_MIN_ITEMS || *max_items > ALARM_FEED_MAX_ITEMS {
-                return Err("alarm_feed_max_items_out_of_range");
+                anyhow::bail!("alarm_feed_max_items_out_of_range");
             }
             if let Some(h) = height_px {
                 if *h < ALARM_FEED_MIN_HEIGHT || *h > ALARM_FEED_MAX_HEIGHT {
-                    return Err("alarm_feed_invalid_height");
+                    anyhow::bail!("alarm_feed_invalid_height");
                 }
             }
             Ok(())
         }
         FpsCounter { stream_id, .. } => {
             if !is_valid_stream_id(stream_id) {
-                return Err("fps_counter_invalid_stream_id");
+                anyhow::bail!("fps_counter_invalid_stream_id");
             }
             Ok(())
         }
     }
 }
 
-fn validate_draw_command(cmd: &DrawCommand) -> Result<(), &'static str> {
+fn validate_draw_command(cmd: &DrawCommand) -> anyhow::Result<()> {
     match cmd {
         DrawCommand::Line { width, .. } => {
             if *width <= 0.0 || !width.is_finite() {
-                return Err("stroke_invalid_width");
+                anyhow::bail!("stroke_invalid_width");
             }
             Ok(())
         }
@@ -656,10 +657,10 @@ fn validate_draw_command(cmd: &DrawCommand) -> Result<(), &'static str> {
             ..
         } => {
             if points.len() < POLYGON_MIN_POINTS {
-                return Err("polygon_too_few_points");
+                anyhow::bail!("polygon_too_few_points");
             }
             if points.len() > POLYGON_MAX_POINTS {
-                return Err("polygon_too_many_points");
+                anyhow::bail!("polygon_too_many_points");
             }
             if let Some(s) = stroke {
                 validate_stroke_spec(s)?;
@@ -674,10 +675,10 @@ fn validate_draw_command(cmd: &DrawCommand) -> Result<(), &'static str> {
             ..
         } => {
             if !(*width > 0.0 && width.is_finite() && *height > 0.0 && height.is_finite()) {
-                return Err("rect_invalid_dimensions");
+                anyhow::bail!("rect_invalid_dimensions");
             }
             if *corner_radius < 0.0 || !corner_radius.is_finite() {
-                return Err("rect_negative_corner_radius");
+                anyhow::bail!("rect_negative_corner_radius");
             }
             if let Some(s) = stroke {
                 validate_stroke_spec(s)?;
@@ -686,7 +687,7 @@ fn validate_draw_command(cmd: &DrawCommand) -> Result<(), &'static str> {
         }
         DrawCommand::Circle { radius, stroke, .. } => {
             if !(*radius > 0.0 && radius.is_finite()) {
-                return Err("circle_invalid_radius");
+                anyhow::bail!("circle_invalid_radius");
             }
             if let Some(s) = stroke {
                 validate_stroke_spec(s)?;
@@ -695,7 +696,7 @@ fn validate_draw_command(cmd: &DrawCommand) -> Result<(), &'static str> {
         }
         DrawCommand::Text { size_px, .. } => {
             if !(*size_px > 0.0 && size_px.is_finite()) {
-                return Err("text_invalid_size");
+                anyhow::bail!("text_invalid_size");
             }
             Ok(())
         }
@@ -705,21 +706,21 @@ fn validate_draw_command(cmd: &DrawCommand) -> Result<(), &'static str> {
                 && rect.width.is_finite()
                 && rect.height.is_finite())
             {
-                return Err("image_invalid_rect");
+                anyhow::bail!("image_invalid_rect");
             }
             Ok(())
         }
     }
 }
 
-fn validate_stroke_spec(spec: &StrokeSpec) -> Result<(), &'static str> {
+fn validate_stroke_spec(spec: &StrokeSpec) -> anyhow::Result<()> {
     if !(spec.width > 0.0 && spec.width.is_finite()) {
-        return Err("stroke_invalid_width");
+        anyhow::bail!("stroke_invalid_width");
     }
     if let Some(dash) = &spec.dash {
         for v in dash.iter() {
             if !(*v > 0.0 && v.is_finite()) {
-                return Err("stroke_dash_invalid");
+                anyhow::bail!("stroke_dash_invalid");
             }
         }
     }
@@ -917,10 +918,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "canvas_too_many_commands"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("canvas_too_many_commands"));
     }
 
     #[test]
@@ -939,10 +937,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "polygon_too_few_points"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("polygon_too_few_points"));
     }
 
     #[test]
@@ -965,10 +960,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "polygon_too_many_points"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("polygon_too_many_points"));
     }
 
     #[test]
@@ -990,10 +982,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "rect_invalid_dimensions"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("rect_invalid_dimensions"));
     }
 
     #[test]
@@ -1015,10 +1004,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "rect_negative_corner_radius"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("rect_negative_corner_radius"));
     }
 
     #[test]
@@ -1037,10 +1023,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "circle_invalid_radius"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("circle_invalid_radius"));
     }
 
     #[test]
@@ -1059,10 +1042,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "stroke_invalid_width"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("stroke_invalid_width"));
     }
 
     #[test]
@@ -1089,10 +1069,7 @@ mod tests {
             on_pointer: None,
             on_pointer_throttle_ms: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut c).unwrap_err(),
-            "stroke_dash_invalid"
-        );
+        assert!(validate_and_normalize(&mut c).unwrap_err().to_string().contains("stroke_dash_invalid"));
     }
 
     // ---- Sparkline ----
@@ -1120,10 +1097,7 @@ mod tests {
             fill: false,
             show_dots: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut s).unwrap_err(),
-            "sparkline_too_few_points"
-        );
+        assert!(validate_and_normalize(&mut s).unwrap_err().to_string().contains("sparkline_too_few_points"));
     }
 
     #[test]
@@ -1135,10 +1109,7 @@ mod tests {
             fill: false,
             show_dots: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut s).unwrap_err(),
-            "sparkline_too_many_points"
-        );
+        assert!(validate_and_normalize(&mut s).unwrap_err().to_string().contains("sparkline_too_many_points"));
     }
 
     // ---- StackedBar ----
@@ -1177,10 +1148,7 @@ mod tests {
             show_legend: false,
             show_values: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut sb).unwrap_err(),
-            "stacked_bar_no_data"
-        );
+        assert!(validate_and_normalize(&mut sb).unwrap_err().to_string().contains("stacked_bar_no_data"));
     }
 
     #[test]
@@ -1203,10 +1171,7 @@ mod tests {
             show_legend: false,
             show_values: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut sb).unwrap_err(),
-            "stacked_bar_inconsistent_series"
-        );
+        assert!(validate_and_normalize(&mut sb).unwrap_err().to_string().contains("stacked_bar_inconsistent_series"));
     }
 
     #[test]
@@ -1222,10 +1187,7 @@ mod tests {
             show_legend: false,
             show_values: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut sb).unwrap_err(),
-            "stacked_bar_colors_too_few"
-        );
+        assert!(validate_and_normalize(&mut sb).unwrap_err().to_string().contains("stacked_bar_colors_too_few"));
     }
 
     // ---- Heatmap ----
@@ -1259,10 +1221,7 @@ mod tests {
             on_cell_click: None,
             show_legend: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut h).unwrap_err(),
-            "heatmap_invalid_dimensions"
-        );
+        assert!(validate_and_normalize(&mut h).unwrap_err().to_string().contains("heatmap_invalid_dimensions"));
     }
 
     #[test]
@@ -1277,10 +1236,7 @@ mod tests {
             on_cell_click: None,
             show_legend: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut h).unwrap_err(),
-            "heatmap_row_count_mismatch"
-        );
+        assert!(validate_and_normalize(&mut h).unwrap_err().to_string().contains("heatmap_row_count_mismatch"));
     }
 
     #[test]
@@ -1295,10 +1251,7 @@ mod tests {
             on_cell_click: None,
             show_legend: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut h).unwrap_err(),
-            "heatmap_col_count_mismatch"
-        );
+        assert!(validate_and_normalize(&mut h).unwrap_err().to_string().contains("heatmap_col_count_mismatch"));
     }
 
     // ---- AccessMatrix ----
@@ -1339,10 +1292,7 @@ mod tests {
             on_toggle: None,
             readonly: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut am).unwrap_err(),
-            "access_matrix_no_roles"
-        );
+        assert!(validate_and_normalize(&mut am).unwrap_err().to_string().contains("access_matrix_no_roles"));
     }
 
     #[test]
@@ -1364,10 +1314,7 @@ mod tests {
             on_toggle: None,
             readonly: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut am).unwrap_err(),
-            "access_matrix_duplicate_resource_id"
-        );
+        assert!(validate_and_normalize(&mut am).unwrap_err().to_string().contains("access_matrix_duplicate_resource_id"));
     }
 
     #[test]
@@ -1386,10 +1333,7 @@ mod tests {
             on_toggle: None,
             readonly: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut am).unwrap_err(),
-            "access_matrix_unknown_role"
-        );
+        assert!(validate_and_normalize(&mut am).unwrap_err().to_string().contains("access_matrix_unknown_role"));
     }
 
     // ---- WeeklyScheduleGrid ----
@@ -1418,10 +1362,10 @@ mod tests {
             on_cell_click: None,
             readonly: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut g).unwrap_err(),
-            "schedule_must_have_7_days"
-        );
+        assert!(validate_and_normalize(&mut g)
+            .unwrap_err()
+            .to_string()
+            .contains("schedule_must_have_7_days"));
     }
 
     #[test]
@@ -1435,10 +1379,10 @@ mod tests {
             on_cell_click: None,
             readonly: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut g).unwrap_err(),
-            "schedule_must_have_24_hours"
-        );
+        assert!(validate_and_normalize(&mut g)
+            .unwrap_err()
+            .to_string()
+            .contains("schedule_must_have_24_hours"));
     }
 
     // ---- VideoTile ----
@@ -1481,10 +1425,7 @@ mod tests {
             on_click: None,
             show_stats: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut v).unwrap_err(),
-            "video_tile_invalid_stream_id"
-        );
+        assert!(validate_and_normalize(&mut v).unwrap_err().to_string().contains("video_tile_invalid_stream_id"));
     }
 
     #[test]
@@ -1498,10 +1439,9 @@ mod tests {
             on_click: None,
             show_stats: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut v).unwrap_err(),
-            "video_tile_invalid_camera_id"
-        );
+        let err = validate_and_normalize(&mut v).unwrap_err().to_string();
+        assert!(err.contains("video_tile_camera_id"));
+        assert!(err.contains("invalid format"));
     }
 
     #[test]
@@ -1515,10 +1455,7 @@ mod tests {
             on_click: None,
             show_stats: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut v).unwrap_err(),
-            "video_tile_invalid_height"
-        );
+        assert!(validate_and_normalize(&mut v).unwrap_err().to_string().contains("video_tile_invalid_height"));
     }
 
     // ---- WelcomeHero ----
@@ -1561,10 +1498,7 @@ mod tests {
             accent: None,
             actions: vec![],
         };
-        assert_eq!(
-            validate_and_normalize(&mut h).unwrap_err(),
-            "welcome_hero_title_empty"
-        );
+        assert!(validate_and_normalize(&mut h).unwrap_err().to_string().contains("welcome_hero_title_empty"));
     }
 
     #[test]
@@ -1588,10 +1522,9 @@ mod tests {
                 tooltip: None,
             })],
         };
-        assert_eq!(
-            validate_and_normalize(&mut h).unwrap_err(),
-            "welcome_hero_action_invalid"
-        );
+        let err = validate_and_normalize(&mut h).unwrap_err().to_string();
+        assert!(err.contains("welcome_hero_action"));
+        assert!(err.contains("button_label_empty"));
     }
 
     // ---- StepProgress ----
@@ -1626,10 +1559,7 @@ mod tests {
             active_index: 0,
             orientation: StepOrientation::default(),
         };
-        assert_eq!(
-            validate_and_normalize(&mut s).unwrap_err(),
-            "step_progress_empty"
-        );
+        assert!(validate_and_normalize(&mut s).unwrap_err().to_string().contains("step_progress_empty"));
     }
 
     #[test]
@@ -1643,10 +1573,7 @@ mod tests {
             active_index: 5,
             orientation: StepOrientation::default(),
         };
-        assert_eq!(
-            validate_and_normalize(&mut s).unwrap_err(),
-            "step_progress_active_out_of_range"
-        );
+        assert!(validate_and_normalize(&mut s).unwrap_err().to_string().contains("step_progress_active_out_of_range"));
     }
 
     // ---- ReqCard ----
@@ -1682,10 +1609,7 @@ mod tests {
             on_accept: None,
             on_reject: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut r).unwrap_err(),
-            "req_card_label_empty"
-        );
+        assert!(validate_and_normalize(&mut r).unwrap_err().to_string().contains("req_card_label_empty"));
     }
 
     #[test]
@@ -1701,10 +1625,7 @@ mod tests {
             on_accept: None,
             on_reject: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut r).unwrap_err(),
-            "req_card_permission_empty"
-        );
+        assert!(validate_and_normalize(&mut r).unwrap_err().to_string().contains("req_card_permission_empty"));
     }
 
     // ---- DecisionRow ----
@@ -1736,10 +1657,7 @@ mod tests {
             on_reject: None,
             accent: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut d).unwrap_err(),
-            "decision_row_id_empty"
-        );
+        assert!(validate_and_normalize(&mut d).unwrap_err().to_string().contains("decision_row_id_empty"));
         let mut d2 = SpecializedComponent::DecisionRow {
             id: "ok".into(),
             label: "".into(),
@@ -1749,10 +1667,7 @@ mod tests {
             on_reject: None,
             accent: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut d2).unwrap_err(),
-            "decision_row_label_empty"
-        );
+        assert!(validate_and_normalize(&mut d2).unwrap_err().to_string().contains("decision_row_label_empty"));
     }
 
     // ---- AlarmFeed ----
@@ -1791,10 +1706,7 @@ mod tests {
             on_item_click: None,
             height_px: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut a).unwrap_err(),
-            "alarm_feed_invalid_stream_id"
-        );
+        assert!(validate_and_normalize(&mut a).unwrap_err().to_string().contains("alarm_feed_invalid_stream_id"));
     }
 
     #[test]
@@ -1805,10 +1717,7 @@ mod tests {
             on_item_click: None,
             height_px: None,
         };
-        assert_eq!(
-            validate_and_normalize(&mut a).unwrap_err(),
-            "alarm_feed_max_items_out_of_range"
-        );
+        assert!(validate_and_normalize(&mut a).unwrap_err().to_string().contains("alarm_feed_max_items_out_of_range"));
     }
 
     #[test]
@@ -1819,10 +1728,7 @@ mod tests {
             on_item_click: None,
             height_px: Some(50),
         };
-        assert_eq!(
-            validate_and_normalize(&mut a).unwrap_err(),
-            "alarm_feed_invalid_height"
-        );
+        assert!(validate_and_normalize(&mut a).unwrap_err().to_string().contains("alarm_feed_invalid_height"));
     }
 
     // ---- FpsCounter ----
@@ -1848,10 +1754,7 @@ mod tests {
             format: None,
             show_sparkline: false,
         };
-        assert_eq!(
-            validate_and_normalize(&mut f).unwrap_err(),
-            "fps_counter_invalid_stream_id"
-        );
+        assert!(validate_and_normalize(&mut f).unwrap_err().to_string().contains("fps_counter_invalid_stream_id"));
     }
 
     // ---- Stream id helper ----

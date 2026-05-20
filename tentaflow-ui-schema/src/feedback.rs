@@ -217,23 +217,24 @@ const SKELETON_WIDTH_MIN: u8 = 1;
 const SKELETON_WIDTH_MAX: u8 = 100;
 
 /// Validate a single feedback component, recursing into embedded
-/// `UiComponent` children. Error strings are static and never echo
-/// addon-controlled input.
-pub fn validate_and_normalize(component: &mut FeedbackComponent) -> Result<(), &'static str> {
+/// `UiComponent` children. Leaf errors are static reason codes; container
+/// errors propagate the child's chain so the addon log shows the deepest
+/// failure instead of a generic `*_invalid`.
+pub fn validate_and_normalize(component: &mut FeedbackComponent) -> anyhow::Result<()> {
     use FeedbackComponent::*;
     match component {
         Alert { actions, .. } => {
-            validate_children(actions, "alert_actions_invalid")?;
+            validate_children(actions, "alert_actions")?;
             Ok(())
         }
         Banner { .. } => Ok(()),
         Callout { children, .. } => {
-            validate_children(children, "callout_children_invalid")?;
+            validate_children(children, "callout_children")?;
             Ok(())
         }
         Toast { duration_ms, .. } => {
             if *duration_ms < TOAST_DURATION_MIN_MS || *duration_ms > TOAST_DURATION_MAX_MS {
-                return Err("toast_duration_out_of_range");
+                anyhow::bail!("toast_duration_out_of_range");
             }
             Ok(())
         }
@@ -245,10 +246,10 @@ pub fn validate_and_normalize(component: &mut FeedbackComponent) -> Result<(), &
             ..
         } => {
             if !(*max > 0.0) {
-                return Err("progress_max_must_be_positive");
+                anyhow::bail!("progress_max_must_be_positive");
             }
             if !*indeterminate && (*value < 0.0 || *value > *max) {
-                return Err("progress_value_out_of_range");
+                anyhow::bail!("progress_value_out_of_range");
             }
             Ok(())
         }
@@ -258,17 +259,17 @@ pub fn validate_and_normalize(component: &mut FeedbackComponent) -> Result<(), &
             ..
         } => {
             if !(SKELETON_LINES_MIN..=SKELETON_LINES_MAX).contains(lines) {
-                return Err("skeleton_lines_out_of_range");
+                anyhow::bail!("skeleton_lines_out_of_range");
             }
             if let Some(w) = width_percent {
                 if !(SKELETON_WIDTH_MIN..=SKELETON_WIDTH_MAX).contains(w) {
-                    return Err("skeleton_width_out_of_range");
+                    anyhow::bail!("skeleton_width_out_of_range");
                 }
             }
             Ok(())
         }
         GateScreen { actions, .. } => {
-            validate_children(actions, "gate_screen_actions_invalid")?;
+            validate_children(actions, "gate_screen_actions")?;
             Ok(())
         }
     }
@@ -276,11 +277,13 @@ pub fn validate_and_normalize(component: &mut FeedbackComponent) -> Result<(), &
 
 fn validate_children(
     children: &mut [UiComponent],
-    err_tag: &'static str,
-) -> Result<(), &'static str> {
+    label: &'static str,
+) -> anyhow::Result<()> {
     for c in children.iter_mut() {
-        super::reject_overlay_kind_in_root(c).map_err(|_| err_tag)?;
-        super::validate_and_normalize_component(c).map_err(|_| err_tag)?;
+        super::reject_overlay_kind_in_root(c)
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        super::validate_and_normalize_component(c)
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
     }
     Ok(())
 }
@@ -476,7 +479,7 @@ mod tests {
             on_action: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "toast_duration_out_of_range");
+        assert!(err.to_string().contains("toast_duration_out_of_range"));
     }
 
     #[test]
@@ -492,7 +495,7 @@ mod tests {
             on_action: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "toast_duration_out_of_range");
+        assert!(err.to_string().contains("toast_duration_out_of_range"));
     }
 
     #[test]
@@ -507,7 +510,7 @@ mod tests {
             show_percent: false,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "progress_value_out_of_range");
+        assert!(err.to_string().contains("progress_value_out_of_range"));
     }
 
     #[test]
@@ -522,7 +525,7 @@ mod tests {
             show_percent: false,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "progress_value_out_of_range");
+        assert!(err.to_string().contains("progress_value_out_of_range"));
     }
 
     #[test]
@@ -551,7 +554,7 @@ mod tests {
             show_percent: false,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "progress_max_must_be_positive");
+        assert!(err.to_string().contains("progress_max_must_be_positive"));
     }
 
     #[test]
@@ -562,7 +565,7 @@ mod tests {
             shape: SkeletonShape::Block,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "skeleton_lines_out_of_range");
+        assert!(err.to_string().contains("skeleton_lines_out_of_range"));
     }
 
     #[test]
@@ -573,7 +576,7 @@ mod tests {
             shape: SkeletonShape::Block,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "skeleton_lines_out_of_range");
+        assert!(err.to_string().contains("skeleton_lines_out_of_range"));
     }
 
     #[test]
@@ -584,7 +587,7 @@ mod tests {
             shape: SkeletonShape::Block,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "skeleton_width_out_of_range");
+        assert!(err.to_string().contains("skeleton_width_out_of_range"));
     }
 
     #[test]
@@ -595,7 +598,7 @@ mod tests {
             shape: SkeletonShape::Block,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "skeleton_width_out_of_range");
+        assert!(err.to_string().contains("skeleton_width_out_of_range"));
     }
 
     #[test]
@@ -610,7 +613,8 @@ mod tests {
             on_dismiss: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "alert_actions_invalid");
+        assert!(err.to_string().contains("alert_actions"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -622,7 +626,8 @@ mod tests {
             children: vec![window_overlay()],
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "callout_children_invalid");
+        assert!(err.to_string().contains("callout_children"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -635,6 +640,7 @@ mod tests {
             actions: vec![window_overlay()],
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "gate_screen_actions_invalid");
+        assert!(err.to_string().contains("gate_screen_actions"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 }
