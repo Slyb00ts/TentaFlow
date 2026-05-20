@@ -238,14 +238,15 @@ pub struct FilterChip {
 // =============================================================================
 
 /// Validate a single action component, recursing into embedded
-/// `UiComponent` children. Error strings are static and never echo
-/// addon-controlled input.
-pub fn validate_and_normalize(component: &mut ActionComponent) -> Result<(), &'static str> {
+/// `UiComponent` children. Leaf errors are static reason codes; container
+/// errors propagate the child's chain so the addon log shows the deepest
+/// failure instead of a generic `*_children_invalid`.
+pub fn validate_and_normalize(component: &mut ActionComponent) -> anyhow::Result<()> {
     use ActionComponent::*;
     match component {
         Button { label, .. } => {
             if label.is_empty() {
-                return Err("button_label_empty");
+                anyhow::bail!("button_label_empty");
             }
             Ok(())
         }
@@ -255,12 +256,12 @@ pub fn validate_and_normalize(component: &mut ActionComponent) -> Result<(), &'s
             ..
         } => {
             if tooltip.is_none() && aria_label.is_none() {
-                return Err("icon_button_missing_accessibility_label");
+                anyhow::bail!("icon_button_missing_accessibility_label");
             }
             Ok(())
         }
         ButtonGroup { buttons, .. } => {
-            validate_children(buttons, "button_group_children_invalid")?;
+            validate_children(buttons, "button_group")?;
             Ok(())
         }
         Link {
@@ -274,19 +275,19 @@ pub fn validate_and_normalize(component: &mut ActionComponent) -> Result<(), &'s
                 .filter(|b| **b)
                 .count();
             if set != 1 {
-                return Err("link_must_have_one_target");
+                anyhow::bail!("link_must_have_one_target");
             }
             Ok(())
         }
         Menu { trigger, items, .. } => {
             super::reject_overlay_kind_in_root(trigger)
-                .map_err(|_| "menu_trigger_invalid")?;
+                .map_err(|e| anyhow::anyhow!("menu_trigger: {e}"))?;
             super::validate_and_normalize_component(trigger)
-                .map_err(|_| "menu_trigger_invalid")?;
+                .map_err(|e| anyhow::anyhow!("menu_trigger: {e}"))?;
             let mut seen: Vec<&str> = Vec::with_capacity(items.len());
             for item in items.iter() {
                 if seen.iter().any(|s| *s == item.id.as_str()) {
-                    return Err("menu_duplicate_item_id");
+                    anyhow::bail!("menu_duplicate_item_id");
                 }
                 seen.push(item.id.as_str());
             }
@@ -295,15 +296,15 @@ pub fn validate_and_normalize(component: &mut ActionComponent) -> Result<(), &'s
         ActionBar {
             primary, secondary, ..
         } => {
-            validate_children(primary, "action_bar_children_invalid")?;
-            validate_children(secondary, "action_bar_children_invalid")?;
+            validate_children(primary, "action_bar_primary")?;
+            validate_children(secondary, "action_bar_secondary")?;
             Ok(())
         }
         FilterChips { chips, .. } => {
             let mut seen: Vec<&str> = Vec::with_capacity(chips.len());
             for chip in chips.iter() {
                 if seen.iter().any(|s| *s == chip.id.as_str()) {
-                    return Err("filter_chips_duplicate_id");
+                    anyhow::bail!("filter_chips_duplicate_id");
                 }
                 seen.push(chip.id.as_str());
             }
@@ -316,7 +317,7 @@ pub fn validate_and_normalize(component: &mut ActionComponent) -> Result<(), &'s
             ..
         } => {
             if on_back.is_none() && on_next.is_none() && on_cancel.is_none() {
-                return Err("wizard_footer_no_actions");
+                anyhow::bail!("wizard_footer_no_actions");
             }
             Ok(())
         }
@@ -325,11 +326,13 @@ pub fn validate_and_normalize(component: &mut ActionComponent) -> Result<(), &'s
 
 fn validate_children(
     children: &mut [UiComponent],
-    err_tag: &'static str,
-) -> Result<(), &'static str> {
+    label: &'static str,
+) -> anyhow::Result<()> {
     for c in children.iter_mut() {
-        super::reject_overlay_kind_in_root(c).map_err(|_| err_tag)?;
-        super::validate_and_normalize_component(c).map_err(|_| err_tag)?;
+        super::reject_overlay_kind_in_root(c)
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        super::validate_and_normalize_component(c)
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
     }
     Ok(())
 }
@@ -578,7 +581,7 @@ mod tests {
     fn button_empty_label_is_rejected() {
         let mut c = make_button_action("");
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "button_label_empty");
+        assert!(err.to_string().contains("button_label_empty"));
     }
 
     #[test]
@@ -595,7 +598,7 @@ mod tests {
             aria_label: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "icon_button_missing_accessibility_label");
+        assert!(err.to_string().contains("icon_button_missing_accessibility_label"));
     }
 
     #[test]
@@ -622,7 +625,8 @@ mod tests {
             size: ButtonSize::Md,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "button_group_children_invalid");
+        assert!(err.to_string().contains("button_group"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -636,7 +640,7 @@ mod tests {
             on_click: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "link_must_have_one_target");
+        assert!(err.to_string().contains("link_must_have_one_target"));
     }
 
     #[test]
@@ -650,7 +654,7 @@ mod tests {
             on_click: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "link_must_have_one_target");
+        assert!(err.to_string().contains("link_must_have_one_target"));
     }
 
     #[test]
@@ -664,7 +668,7 @@ mod tests {
             on_click: Some("c".into()),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "link_must_have_one_target");
+        assert!(err.to_string().contains("link_must_have_one_target"));
     }
 
     #[test]
@@ -696,7 +700,7 @@ mod tests {
             placement: MenuPlacement::BottomStart,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "menu_duplicate_item_id");
+        assert!(err.to_string().contains("menu_duplicate_item_id"));
     }
 
     #[test]
@@ -707,7 +711,8 @@ mod tests {
             placement: MenuPlacement::BottomStart,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "menu_trigger_invalid");
+        assert!(err.to_string().contains("menu_trigger"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -718,7 +723,8 @@ mod tests {
             align: ActionBarAlign::SpaceBetween,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "action_bar_children_invalid");
+        assert!(err.to_string().contains("action_bar_primary"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -729,7 +735,8 @@ mod tests {
             align: ActionBarAlign::End,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "action_bar_children_invalid");
+        assert!(err.to_string().contains("action_bar_secondary"));
+        assert!(err.to_string().contains("overlay_kind_outside_overlays"));
     }
 
     #[test]
@@ -756,7 +763,7 @@ mod tests {
             on_clear_all: None,
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "filter_chips_duplicate_id");
+        assert!(err.to_string().contains("filter_chips_duplicate_id"));
     }
 
     #[test]
@@ -772,7 +779,7 @@ mod tests {
             step_label: Some("Krok 1 z 3".into()),
         };
         let err = validate_and_normalize(&mut c).expect_err("must reject");
-        assert_eq!(err, "wizard_footer_no_actions");
+        assert!(err.to_string().contains("wizard_footer_no_actions"));
     }
 
     #[test]

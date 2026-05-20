@@ -216,15 +216,15 @@ pub fn validate_and_normalize_component(component: &mut UiComponent) -> anyhow::
         UiComponent::Container(c) => container::validate_and_normalize(c)
             .map_err(|e| anyhow::anyhow!("container validation failed: {e}")),
         UiComponent::DataDisplay(d) => data_display::validate_and_normalize(d)
-            .map_err(|e| anyhow::anyhow!("data_display validation failed: {}", e)),
+            .map_err(|e| anyhow::anyhow!("data_display validation failed: {e}")),
         UiComponent::Form(f) => form::validate_and_normalize(f)
-            .map_err(|e| anyhow::anyhow!("form validation failed: {}", e)),
+            .map_err(|e| anyhow::anyhow!("form validation failed: {e}")),
         UiComponent::Feedback(fb) => feedback::validate_and_normalize(fb)
-            .map_err(|e| anyhow::anyhow!("feedback validation failed: {}", e)),
+            .map_err(|e| anyhow::anyhow!("feedback validation failed: {e}")),
         UiComponent::Action(a) => action::validate_and_normalize(a)
-            .map_err(|e| anyhow::anyhow!("action validation failed: {}", e)),
+            .map_err(|e| anyhow::anyhow!("action validation failed: {e}")),
         UiComponent::Specialized(s) => specialized::validate_and_normalize(s)
-            .map_err(|e| anyhow::anyhow!("specialized validation failed: {}", e)),
+            .map_err(|e| anyhow::anyhow!("specialized validation failed: {e}")),
         UiComponent::Legacy(legacy) => legacy::validate_and_normalize(legacy),
     }
 }
