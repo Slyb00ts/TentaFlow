@@ -1718,7 +1718,7 @@ function renderInputV2(c, ctx) {
   if (c.autocomplete) input.autocomplete = c.autocomplete;
   if (c.icon) {
     const ic = renderIcon(c.icon);
-    ic.className = 'sdk-input-icon';
+    if (ic) ic.setAttribute('class', `${ic.getAttribute('class') || ''} sdk-input-icon`.trim());
     wrapIcon.appendChild(ic);
   }
   wrapIcon.appendChild(input);
@@ -2808,10 +2808,13 @@ function renderStackedBar(c) {
 
 function renderHeatmapSpecialized(c, ctx) {
   const el = document.createElement('tf-heatmap');
+  if (c.rows != null) el.rows = c.rows;
+  if (c.cols != null) el.cols = c.cols;
   el.values = c.values || [];
   if (c.row_labels) el.rowLabels = c.row_labels;
   if (c.col_labels) el.colLabels = c.col_labels;
   if (c.color_scale) el.colorScale = c.color_scale;
+  el.showLegend = Boolean(c.show_legend);
   if (c.on_cell_click) {
     el.onCellClick = (evt) => dispatchAction(ctx, null, c.on_cell_click, evt);
   }
