@@ -23,6 +23,12 @@ import {
 } from '/js/modules/motion.js';
 import { renderIcon } from '/js/modules/sdk-icons.js';
 import { resolveImageSource } from '/js/utils/signed-frame.js';
+import { attachPopover } from '/js/utils/anchor-position.js';
+import {
+  debouncedValidate,
+  hasAsyncRule,
+  customDebounceMs,
+} from '/js/utils/validation.js';
 import '/js/components/tf-canvas.js';
 import '/js/components/tf-sparkline.js';
 import '/js/components/tf-heatmap.js';
@@ -52,7 +58,12 @@ const AddonAppScreen = {
   },
   unmount() {
     // Czyscimy overlay portale ktore moglyby przeciekac do innego widoku
-    document.querySelectorAll('[data-sdk-overlay-portal]').forEach((n) => n.remove());
+    document.querySelectorAll('[data-sdk-overlay-portal]').forEach((n) => {
+    if (typeof n.__popoverCleanup === 'function') {
+      try { n.__popoverCleanup(); } catch (e) { console.warn('[overlay] cleanup:', e); }
+    }
+    n.remove();
+  });
   },
 };
 
@@ -112,7 +123,12 @@ async function fetchAndBuildContent(addonId, panelId) {
 
 function renderPanelInto(root, panel, ctx) {
   // Usun stare overlay portale przed nowym renderingiem panelu
-  document.querySelectorAll('[data-sdk-overlay-portal]').forEach((n) => n.remove());
+  document.querySelectorAll('[data-sdk-overlay-portal]').forEach((n) => {
+    if (typeof n.__popoverCleanup === 'function') {
+      try { n.__popoverCleanup(); } catch (e) { console.warn('[overlay] cleanup:', e); }
+    }
+    n.remove();
+  });
 
   const title = panel?.title ?? '';
   // PanelTree v2 ma `root: [...]`; legacy ma `components: [...]`.
@@ -533,26 +549,46 @@ function renderTabs(c, ctx) {
   wrap.className = 'sdk-tabs';
   const bar = document.createElement('div');
   bar.className = 'sdk-tabs-bar';
+  bar.setAttribute('role', 'tablist');
   const panes = document.createElement('div');
   panes.className = 'sdk-tabs-panes';
   const activeId = c.active_id || (c.tabs && c.tabs[0] && c.tabs[0].id);
+  const activate = (btn) => {
+    const tabId = btn.dataset.tabId;
+    bar.querySelectorAll('.sdk-tab').forEach((t) => {
+      const on = t === btn;
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.tabIndex = on ? 0 : -1;
+    });
+    panes.querySelectorAll('[data-tab-pane]').forEach((p) => {
+      p.hidden = p.dataset.tabPane !== tabId;
+    });
+    btn.focus();
+  };
   for (const tab of c.tabs || []) {
+    const tabBtnId = `sdk-tab-${tab.id}`;
+    const paneId = `sdk-tabpanel-${tab.id}`;
     const btn = document.createElement('button');
     btn.type = 'button';
+    btn.id = tabBtnId;
+    btn.dataset.tabId = tab.id;
     btn.className = `sdk-tab${tab.id === activeId ? ' active' : ''}`;
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-controls', paneId);
+    btn.setAttribute('aria-selected', tab.id === activeId ? 'true' : 'false');
+    btn.tabIndex = tab.id === activeId ? 0 : -1;
     if (tab.icon) btn.appendChild(renderIcon(tab.icon));
     btn.appendChild(document.createTextNode(' ' + (tab.label ?? '')));
-    btn.addEventListener('click', () => {
-      bar.querySelectorAll('.sdk-tab').forEach((t) => t.classList.remove('active'));
-      btn.classList.add('active');
-      panes.querySelectorAll('[data-tab-pane]').forEach((p) => {
-        p.hidden = p.dataset.tabPane !== tab.id;
-      });
-    });
+    btn.addEventListener('click', () => activate(btn));
     bar.appendChild(btn);
     const pane = document.createElement('div');
     pane.className = 'sdk-tab-pane';
+    pane.id = paneId;
     pane.dataset.tabPane = tab.id;
+    pane.setAttribute('role', 'tabpanel');
+    pane.setAttribute('aria-labelledby', tabBtnId);
+    pane.tabIndex = 0;
     if (tab.id !== activeId) pane.hidden = true;
     for (const child of tab.children || []) {
       const node = renderComponent(child, ctx);
@@ -560,6 +596,10 @@ function renderTabs(c, ctx) {
     }
     panes.appendChild(pane);
   }
+  attachKeyboardNav(bar, '.sdk-tab', {
+    direction: 'horizontal',
+    onActivate: (el) => activate(el),
+  });
   wrap.appendChild(bar);
   wrap.appendChild(panes);
   return wrap;
@@ -568,15 +608,24 @@ function renderTabs(c, ctx) {
 function renderNavTabs(c, ctx) {
   const el = document.createElement('nav');
   el.className = 'sdk-nav-tabs';
+  el.setAttribute('role', 'tablist');
   for (const item of c.items || []) {
     const tab = document.createElement('button');
     tab.type = 'button';
-    tab.className = `sdk-nav-tab${item.id === c.active_id ? ' active' : ''}`;
+    const active = item.id === c.active_id;
+    tab.className = `sdk-nav-tab${active ? ' active' : ''}`;
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    tab.tabIndex = active ? 0 : -1;
     if (item.icon) tab.appendChild(renderIcon(item.icon));
     tab.appendChild(document.createTextNode(' ' + (item.label ?? '')));
     tab.addEventListener('click', () => navigateToPanel(ctx, item.panel_id));
     el.appendChild(tab);
   }
+  attachKeyboardNav(el, '.sdk-nav-tab', {
+    direction: 'horizontal',
+    onActivate: (focused) => focused.click(),
+  });
   return el;
 }
 
@@ -788,7 +837,28 @@ function createOverlayPortal(overlay, ctx) {
       });
     }
   } else if (c.type === 'popover') {
-    portal.appendChild(buildPopover(c, ctx, overlay));
+    // Popover nie ma backdropa - sam wraps swojego content przy anchorze.
+    portal.style.position = 'fixed';
+    portal.style.inset = '0';
+    portal.style.pointerEvents = 'none';
+    const pop = buildPopover(c, ctx, overlay);
+    pop.style.pointerEvents = 'auto';
+    portal.appendChild(pop);
+    // Anchoring odbywa sie po wstawieniu do DOM (popover potrzebuje wymiarow).
+    const placement = c.placement || 'bottom-start';
+    queueMicrotask(() => {
+      const cleanup = attachPopover(pop, c.target_id, placement);
+      portal.__popoverCleanup = cleanup;
+    });
+    // Esc na document zamyka popover (klik poza nie blokujemy underlying UI,
+    // wiec uzywamy keyboarda i jawnego close action z addona).
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        closeOverlay(portal, c.on_close, ctx);
+        document.removeEventListener('keydown', onKey);
+      }
+    };
+    document.addEventListener('keydown', onKey);
   } else {
     return null;
   }
@@ -874,6 +944,11 @@ function buildPopover(c, ctx, overlay) {
 
 function closeOverlay(portalEl, onClose, ctx) {
   if (portalEl) {
+    // Popover odpina swoje scroll/resize listenery przed usunieciem z DOM.
+    if (typeof portalEl.__popoverCleanup === 'function') {
+      try { portalEl.__popoverCleanup(); } catch (e) { console.warn('[overlay] popover cleanup failed:', e); }
+      portalEl.__popoverCleanup = null;
+    }
     // Animowane zamkniecie — backdrop fade-out, content (jesli wewnatrz) jedzie razem.
     animatedRemove(portalEl, 'leaving', 150);
   }
@@ -1448,12 +1523,120 @@ function buildFieldShell(c, controlEl, ctx) {
   return wrap;
 }
 
+// Helper a11y: keyboard navigation w listach (tabs, menu, nav). Strzalki
+// przeskakuja, Home/End teleportuja, Enter/Space aktywuja, Esc opcjonalnie
+// dispatchuje onEscape.
+function attachKeyboardNav(container, itemSelector, options = {}) {
+  const { onActivate, onEscape, direction = 'horizontal' } = options;
+  const nextKey = direction === 'horizontal' ? 'ArrowRight' : 'ArrowDown';
+  const prevKey = direction === 'horizontal' ? 'ArrowLeft' : 'ArrowUp';
+
+  container.addEventListener('keydown', (e) => {
+    const list = Array.from(container.querySelectorAll(itemSelector))
+      .filter((n) => !n.disabled && n.offsetParent !== null);
+    if (list.length === 0) return;
+    const idx = list.indexOf(document.activeElement);
+
+    if (e.key === nextKey) {
+      e.preventDefault();
+      const target = list[idx >= 0 ? (idx + 1) % list.length : 0];
+      target.focus();
+    } else if (e.key === prevKey) {
+      e.preventDefault();
+      const target = list[idx >= 0 ? (idx - 1 + list.length) % list.length : list.length - 1];
+      target.focus();
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      list[0].focus();
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      list[list.length - 1].focus();
+    } else if ((e.key === 'Enter' || e.key === ' ') && idx >= 0 && onActivate) {
+      e.preventDefault();
+      onActivate(list[idx], idx);
+    } else if (e.key === 'Escape' && onEscape) {
+      e.preventDefault();
+      onEscape();
+    }
+  });
+}
+
 function attachChange(el, handler, ctx, params) {
   if (!handler) return;
   el.addEventListener('change', (ev) => {
     const value = 'value' in ev.target ? ev.target.value : ev.target.checked;
     dispatchAction(ctx, null, handler, { ...(params || {}), value });
   });
+}
+
+// Podpina walidacje do pola formularza. Po insercie buduje slot na status
+// (sdk-field-validating / sdk-field-error) i waliduje debounced przy `input`
+// oraz natychmiast przy `blur`. Wymaga `fieldShell` zwrocony przez
+// buildFieldShell - tam wstawiamy komunikat bledu na koncu.
+function attachValidation(inputEl, fieldShell, c, ctx) {
+  const validations = c.validations;
+  if (!Array.isArray(validations) || validations.length === 0) return;
+
+  const statusEl = document.createElement('span');
+  statusEl.className = 'sdk-field-error';
+  statusEl.setAttribute('role', 'status');
+  statusEl.setAttribute('aria-live', 'polite');
+  statusEl.hidden = true;
+  fieldShell.appendChild(statusEl);
+
+  const pendingEl = document.createElement('span');
+  pendingEl.className = 'sdk-field-validating';
+  pendingEl.hidden = true;
+  pendingEl.innerHTML = '<span class="sdk-spinner sm"></span><span>Sprawdzanie…</span>';
+  fieldShell.appendChild(pendingEl);
+
+  const async = hasAsyncRule(validations);
+  const debounceMs = async ? customDebounceMs(validations) : 150;
+
+  const readValue = () => {
+    if (inputEl.type === 'checkbox' || inputEl.type === 'radio') return inputEl.checked;
+    if (inputEl.type === 'number') {
+      const n = Number(inputEl.value);
+      return inputEl.value === '' ? '' : (Number.isNaN(n) ? inputEl.value : n);
+    }
+    return inputEl.value;
+  };
+
+  const applyResult = (result) => {
+    if (result.pending) {
+      pendingEl.hidden = false;
+      return;
+    }
+    pendingEl.hidden = true;
+    if (result.valid) {
+      fieldShell.classList.remove('sdk-input-error');
+      statusEl.hidden = true;
+      statusEl.textContent = '';
+      inputEl.removeAttribute('aria-invalid');
+      inputEl.removeAttribute('aria-errormessage');
+    } else {
+      fieldShell.classList.add('sdk-input-error');
+      statusEl.textContent = result.error || 'Nieprawidłowa wartość.';
+      statusEl.hidden = false;
+      inputEl.setAttribute('aria-invalid', 'true');
+    }
+  };
+
+  const run = async () => {
+    if (async) pendingEl.hidden = false;
+    const result = await debouncedValidate(
+      ctx.addonId,
+      c.id || '',
+      readValue(),
+      validations,
+      debounceMs,
+    );
+    applyResult(result);
+  };
+
+  inputEl.addEventListener('input', run);
+  inputEl.addEventListener('change', run);
+  inputEl.addEventListener('blur', run);
 }
 
 function renderInputV2(c, ctx) {
@@ -1491,7 +1674,9 @@ function renderInputV2(c, ctx) {
       }
     });
   }
-  return buildFieldShell(c, wrapIcon, ctx);
+  const shell = buildFieldShell(c, wrapIcon, ctx);
+  attachValidation(input, shell, c, ctx);
+  return shell;
 }
 
 function mapInputKind(k) {
@@ -1519,7 +1704,9 @@ function renderTextarea(c, ctx) {
   if (c.readonly) ta.readOnly = true;
   if (c.required) ta.required = true;
   attachChange(ta, c.on_change, ctx, { id: c.id });
-  return buildFieldShell(c, ta, ctx);
+  const shell = buildFieldShell(c, ta, ctx);
+  attachValidation(ta, shell, c, ctx);
+  return shell;
 }
 
 function renderSelectV2(c, ctx) {
@@ -1555,7 +1742,9 @@ function renderSelectV2(c, ctx) {
     (optgroup || sel).appendChild(o);
   }
   attachChange(sel, c.on_change, ctx, { id: c.id });
-  return buildFieldShell(c, sel, ctx);
+  const shell = buildFieldShell(c, sel, ctx);
+  attachValidation(sel, shell, c, ctx);
+  return shell;
 }
 
 function renderMultiSelect(c, ctx) {
@@ -2063,6 +2252,10 @@ function renderAlert(c, ctx) {
 function renderBanner(c, ctx) {
   const el = document.createElement('div');
   el.className = `sdk-banner tone-${c.tone || 'info'}`;
+  // Banner ogłasza zmiane stanu - screen reader przeczyta po pauzie.
+  // Dla tonu danger uzywamy assertive, zeby przerwac biezacy komunikat.
+  el.setAttribute('role', c.tone === 'danger' ? 'alert' : 'status');
+  el.setAttribute('aria-live', c.tone === 'danger' ? 'assertive' : 'polite');
   if (c.icon) el.appendChild(renderIcon(c.icon));
   const body = document.createElement('div');
   body.className = 'sdk-banner-body';
@@ -2116,6 +2309,8 @@ function renderToastInline(c, ctx) {
   const el = document.createElement('div');
   el.className = `sdk-toast tone-${c.tone || 'info'}`;
   el.dataset.toastId = c.id || '';
+  el.setAttribute('role', c.tone === 'danger' ? 'alert' : 'status');
+  el.setAttribute('aria-live', c.tone === 'danger' ? 'assertive' : 'polite');
   if (c.icon) el.appendChild(renderIcon(c.icon));
   const body = document.createElement('div');
   if (c.title) {
@@ -2304,23 +2499,38 @@ function renderLink(c, ctx) {
 function renderMenu(c, ctx) {
   const wrap = document.createElement('div');
   wrap.className = 'sdk-menu-wrap';
-  const trigger = renderComponent(c.trigger, ctx);
-  if (trigger) {
-    trigger.addEventListener('click', (ev) => { ev.stopPropagation(); toggleMenu(menu); });
-    wrap.appendChild(trigger);
-  }
   const menu = document.createElement('div');
   menu.className = 'sdk-menu';
+  menu.setAttribute('role', 'menu');
   menu.hidden = true;
+  const trigger = renderComponent(c.trigger, ctx);
+  if (trigger) {
+    trigger.setAttribute('aria-haspopup', 'menu');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const willOpen = menu.hidden;
+      menu.hidden = !menu.hidden;
+      trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+      if (willOpen) {
+        const first = menu.querySelector('.sdk-menu-item:not([disabled])');
+        if (first) first.focus();
+      }
+    });
+    wrap.appendChild(trigger);
+  }
   for (const item of c.items || []) {
     if (item.divider_before) {
       const sep = document.createElement('div');
       sep.className = 'sdk-menu-divider';
+      sep.setAttribute('role', 'separator');
       menu.appendChild(sep);
     }
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = `sdk-menu-item${item.destructive ? ' destructive' : ''}${item.disabled ? ' disabled' : ''}`;
+    btn.setAttribute('role', 'menuitem');
+    btn.tabIndex = -1;
     if (item.disabled) btn.disabled = true;
     if (item.icon) btn.appendChild(renderIcon(item.icon));
     btn.appendChild(document.createTextNode(' ' + (item.label || '')));
@@ -2331,16 +2541,35 @@ function renderMenu(c, ctx) {
       btn.appendChild(s);
     }
     if (item.on_click) {
-      btn.addEventListener('click', () => { menu.hidden = true; dispatchAction(ctx, null, item.on_click, { itemId: item.id }); });
+      btn.addEventListener('click', () => {
+        menu.hidden = true;
+        if (trigger) trigger.setAttribute('aria-expanded', 'false');
+        dispatchAction(ctx, null, item.on_click, { itemId: item.id });
+      });
     }
     menu.appendChild(btn);
   }
+  attachKeyboardNav(menu, '.sdk-menu-item:not([disabled])', {
+    direction: 'vertical',
+    onActivate: (el) => el.click(),
+    onEscape: () => {
+      menu.hidden = true;
+      if (trigger) {
+        trigger.setAttribute('aria-expanded', 'false');
+        if (typeof trigger.focus === 'function') trigger.focus();
+      }
+    },
+  });
   wrap.appendChild(menu);
-  document.addEventListener('click', () => { menu.hidden = true; });
+  // Klik poza zamyka menu (poprzednia logika zachowana).
+  document.addEventListener('click', (e) => {
+    if (!wrap.contains(e.target)) {
+      menu.hidden = true;
+      if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    }
+  });
   return wrap;
 }
-
-function toggleMenu(menuEl) { menuEl.hidden = !menuEl.hidden; }
 
 function renderActionBar(c, ctx) {
   const el = document.createElement('div');
