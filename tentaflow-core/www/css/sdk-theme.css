@@ -189,6 +189,25 @@
   color: var(--sdk-color-text);
   border-bottom-color: var(--sdk-color-primary);
 }
+.sdk-nav-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  margin-left: 4px;
+  border-radius: 9px;
+  background: var(--sdk-color-bg-elevated);
+  color: var(--sdk-color-text-muted);
+  font-size: 11px;
+  font-weight: var(--sdk-fw-semibold, 600);
+  line-height: 1;
+}
+.sdk-nav-tab.active .sdk-nav-tab-badge {
+  background: var(--sdk-color-primary);
+  color: var(--sdk-color-text-inverse, #fff);
+}
 
 .sdk-toolbar {
   display: flex;
