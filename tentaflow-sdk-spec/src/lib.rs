@@ -54,11 +54,15 @@ pub use protocol::{
             DecisionOption, DefItem, DimensionToken, FeatureItem, FileMeta, FilterChipDef,
             Footnote, GaugeThreshold, GraphEdge, GraphNode, GridChild, HeatmapBucket,
             HeatmapColumn, HeatmapRow, HeatmapScale, IconRef, InboxItem, InlineBadge,
-            KvItem, MapMarker, MenuItem, NavTab, PermissionDef, RadioCardOption,
+            InlineChip, KvItem, MapMarker, MenuItem, NavTab, PermissionDef, RadioCardOption,
             RadioOption, RangePreset, RangePresetRange, RoleDef, SegmentOption,
             SelectGroup, SelectOption, SelectValue, SidebarItem, SliderMark, StackSegment,
             StepDef, TabItem, TableColumn, TableColumnWidth, TablePagination, TableSort,
             TimelineItem, Trend, TrendDirection,
+        },
+        molecules::{
+            AppShell, EmptyState, ErrorBoundary, Header, Inspector, LoginShell, PageHeader,
+            SectionHeader, StatGroup, Toolbar, WelcomeHero, WizardShell,
         },
         panel::{
             CloseReason, PanelClose, PanelError, PanelOpen, PanelOpenContext, PanelReady,
@@ -73,11 +77,12 @@ pub use protocol::{
         tokens::{
             BackgroundToken, BadgeVariant, Breakpoint, ButtonVariant, ChartAxisScale,
             ChartLegendAlign, ChartLegendPosition, ChartSeriesStyle, ChipVariant, ColorToken,
-            ColumnRender, CursorToken, Density, DrawerSide, FileUploadStatus, FlexAlign,
-            FlexJustify, IconSize, LiveRegion, NavigateTarget, RadiusToken, ScrollBehavior,
-            ShadowToken, SheetDetent, SortDirection, Spacing, StepStatus, TextAlign,
-            TextStyle, TextWrap, Tone,
+            ColumnRender, CursorToken, Density, DrawerSide, EmptyStateVariant,
+            FileUploadStatus, FlexAlign, FlexJustify, IconSize, LiveRegion, NavigateTarget,
+            RadiusToken, ScrollBehavior, ShadowToken, SheetDetent, SortDirection, Spacing,
+            StepStatus, TextAlign, TextStyle, TextWrap, Tone,
         },
+        typed_field::{decode_from_value, encode_to_value},
         ui_payload::{Batch, BatchMember, UiPayload, UiTag, BATCH_MAX_MEMBERS},
         validation::{StateCondition, ValidationRule},
         value_format::{
