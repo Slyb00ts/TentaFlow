@@ -1309,12 +1309,13 @@ pub struct HeatmapBucket {
     pub label: Option<BindRef>,
 }
 
-/// Threshold tick on a `Gauge`.
+/// Threshold tick on a `Gauge`. `value` is f64 (catalog Gauge) — naked
+/// numeric fields use f64 to survive the `Value`-roundtrip pathway.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 #[cbor(map)]
 pub struct GaugeThreshold {
     #[n(0)]
-    pub value: f32,
+    pub value: f64,
     #[n(1)]
     pub tone: Tone,
     #[n(2)]

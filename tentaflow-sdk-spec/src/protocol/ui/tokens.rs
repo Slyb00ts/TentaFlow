@@ -667,3 +667,113 @@ string_enum! {
         Horizontal = "horizontal",
     }
 }
+
+string_enum! {
+    /// `Table` visual variant (catalog §4 0x0211).
+    pub enum TableVariant {
+        Default = "default",
+        Striped = "striped",
+        Borderless = "borderless",
+        Compact = "compact",
+    }
+}
+
+string_enum! {
+    /// `Table` row-selection mode (catalog §4 0x0211).
+    pub enum TableSelectMode {
+        None = "none",
+        Single = "single",
+        Multi = "multi",
+    }
+}
+
+string_enum! {
+    /// `Tree` visual variant (catalog §4 0x0213).
+    pub enum TreeVariant {
+        Default = "default",
+        Compact = "compact",
+        WithIcons = "with_icons",
+    }
+}
+
+string_enum! {
+    /// `EmptyCell` rendering style (catalog §4 0x0214).
+    pub enum EmptyCellVariant {
+        Dash = "dash",
+        EmDash = "em_dash",
+        NA = "n_a",
+        None = "none",
+        Loading = "loading",
+    }
+}
+
+string_enum! {
+    /// `Sparkline` visual variant (catalog §4 0x0215).
+    pub enum SparklineVariant {
+        Line = "line",
+        Area = "area",
+        Bar = "bar",
+    }
+}
+
+string_enum! {
+    /// Chart zoom mode (catalog §4 LineChart/AreaChart).
+    pub enum ChartZoomMode {
+        None = "none",
+        X = "x",
+        Y = "y",
+        Both = "both",
+    }
+}
+
+string_enum! {
+    /// `BarChart` orientation (catalog §4 0x0217).
+    pub enum ChartOrientation {
+        Vertical = "vertical",
+        Horizontal = "horizontal",
+    }
+}
+
+string_enum! {
+    /// `BarChart` stacking mode (catalog §4 0x0217).
+    pub enum BarStacking {
+        None = "none",
+        Stacked = "stacked",
+        Percent = "percent",
+    }
+}
+
+string_enum! {
+    /// `AreaChart` stacking mode (catalog §4 0x0218).
+    pub enum AreaStacking {
+        None = "none",
+        Stacked = "stacked",
+        Percent = "percent",
+    }
+}
+
+string_enum! {
+    /// `PieChart` variant (catalog §4 0x0219).
+    pub enum PieVariant {
+        Pie = "pie",
+        Donut = "donut",
+    }
+}
+
+string_enum! {
+    /// `Heatmap` legend placement (catalog §4 0x021B).
+    pub enum HeatmapLegendPosition {
+        TopRight = "top_right",
+        Bottom = "bottom",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// `Gauge` shape variant (catalog §4 0x021C).
+    pub enum GaugeVariant {
+        Circular = "circular",
+        Arc = "arc",
+        Semi = "semi",
+    }
+}

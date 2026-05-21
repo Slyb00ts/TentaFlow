@@ -532,7 +532,7 @@ HeatmapBucket:
   label: BindRef<tstr> or null
 
 GaugeThreshold:
-  value: f32
+  value: f64                                                                // straight numeric field — f64 dla Value-roundtrip compatibility
   tone: Tone
   label: BindRef<tstr> or null
 
@@ -1687,7 +1687,7 @@ Fields:
   6: brush           bool
   7: height_px       u16
   8: stacking        AreaStacking                      // "none" | "stacked" | "percent"
-  9: opacity         f32                              // 0..1 fill opacity, default 0.4
+  9: opacity         f64                              // 0.0..=1.0 fill opacity, default 0.4 (naked f64 dla Value-roundtrip)
 Handlers:
   "point_hover":     Handler
   "range_select":    Handler
@@ -1742,10 +1742,10 @@ Circular/arc gauge.
 
 ```
 Fields:
-  0: value           BindRef<f32>
-  1: min             f32
-  2: max             f32
-  3: thresholds      array<GaugeThreshold>            // { value, tone, label? }
+  0: value           BindRef<f64>
+  1: min             f64                              // naked numeric — f64 dla Value-roundtrip
+  2: max             f64                              // naked numeric — f64
+  3: thresholds      array<GaugeThreshold>            // { value: f64, tone, label? }
   4: variant         GaugeVariant                     // "circular" | "arc" | "semi"
   5: label           BindRef<tstr> or null
   6: format          ValueFormat or null
