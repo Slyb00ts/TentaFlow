@@ -2,9 +2,11 @@
 <!--
   Plik: www/img/icons.svg
   Opis: SVG sprite z ikonami outline (24x24, stroke=1.5, currentColor).
-        Każda IconName z theme.rs ma odpowiadający <symbol id="icon-<snake>">.
-        Style ikon inspirowane Heroicons (MIT) i Lucide (ISC) — outline 24px.
-        Renderer (sdk-icons.js) wstawia <svg><use href="/img/icons.svg#icon-X"/>.
+        Autorytatywna lista nazw zyje w tentaflow-sdk-spec/src/protocol/ui/icon_name.rs
+        (IconName enum, wire form snake_case). Kazda nazwa N odpowiada <symbol id="icon-K">
+        gdzie K to N z `_` zamienionym na `-` (np. IconName::ArrowDown="arrow_down" -> "icon-arrow-down").
+        Style ikon inspirowane Heroicons (MIT) i Lucide (ISC) - outline 24px.
+        Renderer wstawia <svg><use href="/img/icons.svg#icon-K"/>.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
 

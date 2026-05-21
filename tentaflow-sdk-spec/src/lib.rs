@@ -47,6 +47,12 @@ pub use protocol::{
             FailurePolicy, Handler, HandlerValidationError, LocalAction, DEBOUNCE_MAX_MS,
             HANDLER_MAX_RECURSION_DEPTH, HANDLER_MAX_TOTAL_STEPS, SEQUENCE_MAX_ITEMS,
         },
+        icon_name::IconName,
+        inline::{
+            AvatarRef, BreadcrumbItem, Footnote, IconRef, InlineBadge, MenuItem, NavTab,
+            SelectGroup, SelectOption, SelectValue, SidebarItem, TabItem, Trend,
+            TrendDirection,
+        },
         panel::{
             CloseReason, PanelClose, PanelError, PanelOpen, PanelOpenContext, PanelReady,
             PanelReset, PanelShell, Viewport,
