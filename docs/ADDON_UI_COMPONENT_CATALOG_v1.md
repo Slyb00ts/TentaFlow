@@ -1758,8 +1758,8 @@ Linear progress (different from Gauge).
 
 ```
 Fields:
-  0: value           BindRef<f32>                     // 0..1 or 0..max
-  1: max             f32                              // default 1.0
+  0: value           BindRef<f64>                     // 0..1 or 0..max
+  1: max             f64                              // default 1.0 (naked numeric — f64 dla Value-roundtrip)
   2: variant         ProgressVariant                   // "default" | "striped" | "indeterminate"
   3: tone            Tone
   4: show_label      bool
@@ -1802,6 +1802,10 @@ Trusted markdown source render (różni się od Paragraph że pozwala na heading
 Fields:
   0: content         BindRef<tstr>                    // markdown source
   1: allowed_features array<MarkdownFeature>          // controlled subset (no raw HTML)
+                                                       // MarkdownFeature: "heading" | "list" | "code_block" |
+                                                       //                  "blockquote" | "table" | "link" |
+                                                       //                  "image" | "emphasis" | "strong" |
+                                                       //                  "code_inline"
   2: max_height_px   u16 or null
   3: link_target     LinkTarget                       // "self" | "blank_via_command"
 ```
@@ -1853,9 +1857,9 @@ Fields:
 Handlers: none
 ```
 
-### 0x0226 — `LiveRegion`
+### 0x0226 — `LiveRegion` (Rust type: `LiveRegionComponent`)
 
-Stand-alone live region dla status announcements (różni się od inline ARIA live na komponencie).
+Stand-alone live region dla status announcements (różni się od inline ARIA live na komponencie). Typed Rust struct nazwany `LiveRegionComponent` żeby uniknąć kolizji z `LiveRegion` token enum (§1.1).
 
 ```
 Fields:
