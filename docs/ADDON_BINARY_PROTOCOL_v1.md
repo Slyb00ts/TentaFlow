@@ -772,7 +772,7 @@ Dla long-running operations: LLM token streaming, file uploads, video frame stre
 | Tag | Name | Direction | Description |
 |-----|------|-----------|-------------|
 | 0x0301 | `StreamOpen` | initiator → peer | Otwiera stream, deklaruje kind |
-| 0x0302 | `StreamAccepted` | peer → initiator | Stream id przydzielony |
+| 0x0302 | `StreamAccepted` | peer → initiator | Echo `stream_id` z `StreamOpen` (peer akceptuje negocjację — brak remappingu id) |
 | 0x0303 | `StreamRejected` | peer → initiator | Z error code |
 | 0x0310 | `StreamChunk` | bidirectional | Payload chunk |
 | 0x0311 | `StreamProgress` | producer → consumer | Optional progress hint (bytes/items/percentage) |
@@ -781,18 +781,49 @@ Dla long-running operations: LLM token streaming, file uploads, video frame stre
 | 0x0322 | `StreamError` | producer → consumer | Fatal stream error |
 
 ```
+StreamKind (enum, tstr):
+  "llm_token_stream" | "file_upload" | "file_download"
+  | "video_frame_preview" | "search_results" | "custom"
+
 StreamOpen:
   stream_id: u32                 (initiator-side unique)
-  kind: StreamKind               (enum: LlmTokenStream | FileUpload | FileDownload | VideoFramePreview | SearchResults | Custom)
-  metadata: map<tstr, Value>     (kind-specific)
+  kind: StreamKind
+  metadata: map<tstr, Value>     (kind-specific; for "custom" the addon-defined name lives here, e.g. metadata.custom_name)
   expected_total_bytes: u64 or null
   reliable: bool                 (default true; false → datagram-mode if supported)
 
+StreamAccepted:
+  stream_id: u32                 (echoes StreamOpen.stream_id — peer confirms negotiation; no remapping)
+
+StreamRejected:
+  stream_id: u32
+  code: ErrorCode                (§16 whitelist)
+  message: tstr                  (developer-facing, ≤ 256 chars)
+
 StreamChunk:
   stream_id: u32
-  sequence: u32                  (chunk index, monotonic)
-  data: bstr                     (binary payload OR text for token streams)
+  sequence: u32                  (chunk index, monotonic, starts at 0)
+  data: bstr                     (binary payload OR UTF-8 text for token streams encoded as bstr)
   end_of_stream: bool            (terminal chunk — equivalent to StreamEnd inline)
+
+StreamProgress:
+  stream_id: u32
+  bytes_processed: u64 or absent (producer hint; absent when N/A)
+  items_processed: u64 or absent (producer hint for item-oriented streams)
+  percent: u8 or absent          (0..=100; producer hint when total known)
+  message: tstr or absent        (≤ 256 chars; e.g. "indexing 2/5")
+
+StreamEnd:
+  stream_id: u32                 (terminal; no payload after this for the stream)
+
+StreamCancel:
+  stream_id: u32
+  reason: tstr                   (developer-facing, ≤ 256 chars; localised UI rendered by addon)
+
+StreamError:
+  stream_id: u32
+  code: ErrorCode                (§16 whitelist — typically Resource-class or Internal-class)
+  message: tstr                  (developer-facing, ≤ 256 chars)
 ```
 
 Streams są reliable by default. Datagram mode tylko jeśli capability `webtransport_datagrams` negotiated + sender explicit opt-in.
