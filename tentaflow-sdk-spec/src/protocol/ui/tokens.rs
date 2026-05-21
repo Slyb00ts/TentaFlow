@@ -874,3 +874,160 @@ string_enum! {
         None = "none",
     }
 }
+
+string_enum! {
+    /// `Input.type` (catalog §5 0x0301).
+    pub enum InputType {
+        Text = "text",
+        Email = "email",
+        Password = "password",
+        Url = "url",
+        Phone = "phone",
+        Number = "number",
+        Search = "search",
+    }
+}
+
+string_enum! {
+    /// HTML `autocomplete` hint (catalog §5 0x0301).
+    pub enum AutocompleteHint {
+        Off = "off",
+        On = "on",
+        Name = "name",
+        Email = "email",
+        Username = "username",
+        CurrentPassword = "current_password",
+        NewPassword = "new_password",
+        OneTimeCode = "one_time_code",
+        Tel = "tel",
+        Url = "url",
+        StreetAddress = "street_address",
+        PostalCode = "postal_code",
+    }
+}
+
+string_enum! {
+    /// Mobile virtual-keyboard hint (catalog §5 0x0301).
+    pub enum InputMode {
+        None = "none",
+        Text = "text",
+        Tel = "tel",
+        Url = "url",
+        Email = "email",
+        Numeric = "numeric",
+        Decimal = "decimal",
+        Search = "search",
+    }
+}
+
+string_enum! {
+    /// Common input size token (catalog §5 multiple components).
+    pub enum InputSize {
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `SearchBox` visual variant (catalog §5 0x0307).
+    pub enum SearchVariant {
+        Default = "default",
+        Subtle = "subtle",
+        Prominent = "prominent",
+    }
+}
+
+string_enum! {
+    /// `Toggle` size token (catalog §5 0x030A).
+    pub enum ToggleSize {
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `Toggle.label_position` (catalog §5 0x030A).
+    pub enum TogglePosition {
+        Leading = "leading",
+        Trailing = "trailing",
+    }
+}
+
+string_enum! {
+    /// `Checkbox` size token (catalog §5 0x030B).
+    pub enum CheckboxSize {
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `RadioGroup` axis (catalog §5 0x030D).
+    pub enum RadioGroupOrientation {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+    }
+}
+
+string_enum! {
+    /// `RadioCardGroup` visual variant (catalog §5 0x030E).
+    pub enum RadioCardVariant {
+        Default = "default",
+        Compact = "compact",
+        Feature = "feature",
+    }
+}
+
+string_enum! {
+    /// `SliderRow.layout` (catalog §5 0x0311).
+    pub enum SliderRowLayout {
+        Horizontal = "horizontal",
+        Compact = "compact",
+    }
+}
+
+string_enum! {
+    /// `TimePicker.precision` (catalog §5 0x0316/0x0317).
+    pub enum TimePrecision {
+        Minute = "minute",
+        Second = "second",
+    }
+}
+
+string_enum! {
+    /// Mobile camera-capture hint for `FileInput` (catalog §5 0x0318).
+    pub enum FileCapture {
+        User = "user",
+        Environment = "environment",
+    }
+}
+
+string_enum! {
+    /// `ColorPicker` variant (catalog §5 0x0319).
+    pub enum ColorPickerVariant {
+        Swatch = "swatch",
+        Wheel = "wheel",
+        Compact = "compact",
+        TokensOnly = "tokens_only",
+    }
+}
+
+string_enum! {
+    /// `FormField.layout` (catalog §5 0x031A).
+    pub enum FormFieldLayout {
+        Stacked = "stacked",
+        Horizontal = "horizontal",
+    }
+}
+
+string_enum! {
+    /// `Form.layout` (catalog §5 0x031D).
+    pub enum FormLayout {
+        Stacked = "stacked",
+        Horizontal = "horizontal",
+        Compact = "compact",
+    }
+}

@@ -14,6 +14,7 @@ pub mod component;
 pub mod data;
 pub mod error_code;
 pub mod event;
+pub mod form;
 pub mod handler;
 pub mod icon_name;
 pub mod inline;
