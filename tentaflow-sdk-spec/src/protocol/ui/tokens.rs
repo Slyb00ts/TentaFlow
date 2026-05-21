@@ -435,3 +435,12 @@ string_enum! {
         CustomTemplate = "custom_template",
     }
 }
+
+string_enum! {
+    /// Variant token used by `EmptyState` component (catalog §2 0x0003).
+    pub enum EmptyStateVariant {
+        Default = "default",
+        Compact = "compact",
+        Illustrated = "illustrated",
+    }
+}

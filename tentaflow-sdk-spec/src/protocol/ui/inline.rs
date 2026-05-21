@@ -2594,3 +2594,30 @@ mod tests_accordion_nontrivial {
         assert_eq!(b1, b2);
     }
 }
+
+// -----------------------------------------------------------------------------
+// InlineChip — non-interactive Chip form used in fields like Header.meta_chips
+// -----------------------------------------------------------------------------
+
+/// Inline Chip structure used as a field in other inline struct types
+/// (e.g. `Header.meta_chips`). Pure data — NO tag/id/handlers. For an
+/// interactive Chip with click/remove handlers use the Component-form
+/// (tag `0x020B`).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct InlineChip {
+    #[n(0)]
+    pub variant: super::tokens::ChipVariant,
+    #[n(1)]
+    pub tone: Tone,
+    #[n(2)]
+    pub label: BindRef,
+    #[n(3)]
+    pub icon: Option<IconRef>,
+    #[n(4)]
+    pub avatar: Option<AvatarRef>,
+    #[n(5)]
+    pub selected: Option<BindRef>,
+    #[n(6)]
+    pub removable: bool,
+}
