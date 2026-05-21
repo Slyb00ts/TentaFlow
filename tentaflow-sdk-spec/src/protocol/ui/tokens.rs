@@ -562,3 +562,108 @@ string_enum! {
         Both = "both",
     }
 }
+
+string_enum! {
+    /// Markdown inline mark allowed in Paragraph/RichText (catalog §4 0x0203/0x0204).
+    pub enum MarkdownMark {
+        Bold = "bold",
+        Italic = "italic",
+        Code = "code",
+        Link = "link",
+    }
+}
+
+string_enum! {
+    /// Markdown block element allowed in RichText/Markdown (catalog §4 0x0204/0x0220).
+    pub enum MarkdownBlock {
+        Heading = "heading",
+        List = "list",
+        CodeBlock = "code_block",
+        Blockquote = "blockquote",
+        Table = "table",
+    }
+}
+
+string_enum! {
+    /// `KeyValue` layout style (catalog §4 0x0207).
+    pub enum KvLayout {
+        Stacked = "stacked",
+        Horizontal = "horizontal",
+        Grid = "grid",
+    }
+}
+
+string_enum! {
+    /// `Stat` size token (catalog §4 0x0209).
+    pub enum StatSize {
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `Tag` size token (catalog §4 0x020C).
+    pub enum TagSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+    }
+}
+
+string_enum! {
+    /// `Avatar` size token (catalog §4 0x020D).
+    pub enum AvatarSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+        Xl = "xl",
+    }
+}
+
+string_enum! {
+    /// `Avatar` outline shape (catalog §4 0x020D).
+    pub enum AvatarShape {
+        Circle = "circle",
+        Rounded = "rounded",
+        Square = "square",
+    }
+}
+
+string_enum! {
+    /// Online/presence indicator for `Avatar` (catalog §4 0x020D).
+    pub enum AvatarStatus {
+        Online = "online",
+        Offline = "offline",
+        Busy = "busy",
+        Away = "away",
+    }
+}
+
+string_enum! {
+    /// Visual spacing between stacked avatars in `AvatarGroup` (catalog §4 0x020E).
+    pub enum AvatarOverlap {
+        Tight = "tight",
+        Default = "default",
+        Loose = "loose",
+    }
+}
+
+string_enum! {
+    /// `BulletList` bullet style (catalog §4 0x020F).
+    pub enum BulletListVariant {
+        Bullet = "bullet",
+        Numbered = "numbered",
+        Check = "check",
+        Icon = "icon",
+    }
+}
+
+string_enum! {
+    /// `Timeline` orientation (catalog §4 0x0210).
+    pub enum TimelineOrientation {
+        Vertical = "vertical",
+        Horizontal = "horizontal",
+    }
+}

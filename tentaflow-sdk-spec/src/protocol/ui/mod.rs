@@ -11,6 +11,7 @@ pub mod action;
 pub mod bind;
 pub mod command;
 pub mod component;
+pub mod data;
 pub mod error_code;
 pub mod event;
 pub mod handler;
