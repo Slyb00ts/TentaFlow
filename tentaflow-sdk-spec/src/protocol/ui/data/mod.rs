@@ -14,6 +14,9 @@ pub mod charts;
 pub mod gauge;
 pub mod labels;
 pub mod lists;
+pub mod markdown;
+pub mod progress;
+pub mod specialised;
 pub mod stat;
 pub mod tables;
 pub mod text;
@@ -23,6 +26,9 @@ pub use charts::{AreaChart, BarChart, LineChart, PieChart, Sparkline, StackedBar
 pub use gauge::{Gauge, Heatmap};
 pub use labels::{Badge, Chip, Tag};
 pub use lists::{BulletList, Timeline};
+pub use markdown::{DataDefinitionList, JsonViewer, Markdown};
+pub use progress::{Diff, ProgressBar, RatingDisplay};
+pub use specialised::{CalendarMonth, Image, LiveRegionComponent, VisuallyHidden};
 pub use stat::{KeyValue, Stat, StatCard};
 pub use tables::{EmptyCell, List, Table, Tree};
 pub use text::{CodeBlock, Heading, MonoBlock, Paragraph, RichText, Text};
@@ -443,5 +449,192 @@ mod tests {
         };
         let c = g.clone().into_component("gg").unwrap();
         assert_eq!(Gauge::try_from_component(&c).unwrap(), g);
+    }
+
+    // --- 1.8c3: Progress / Markdown / Specialised ------------------------
+
+    #[test]
+    fn progress_bar_full_roundtrip() {
+        use crate::protocol::ui::tokens::{ProgressSize, ProgressVariant};
+        let p = ProgressBar {
+            value: BindRef::Literal(Value::U64(50)),
+            max: 200.0,
+            variant: ProgressVariant::Striped,
+            tone: Tone::Warning,
+            show_label: true,
+            label: Some(lit("50%")),
+            size: ProgressSize::Lg,
+        };
+        let c = p.clone().into_component("pb").unwrap();
+        assert_eq!(ProgressBar::try_from_component(&c).unwrap(), p);
+    }
+
+    #[test]
+    fn progress_bar_default_max_on_absent() {
+        use crate::protocol::ui::tokens::{ProgressSize, ProgressVariant};
+        let p = ProgressBar {
+            value: BindRef::Literal(Value::U64(50)),
+            max: 1.0,
+            variant: ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: true, label: None,
+            size: ProgressSize::Md,
+        };
+        let mut c = p.into_component("pb").unwrap();
+        c.fields.0.retain(|(k, _)| *k != 1);
+        let back = ProgressBar::try_from_component(&c).unwrap();
+        assert_eq!(back.max, 1.0);
+    }
+
+    #[test]
+    fn rating_display_full_roundtrip() {
+        use crate::protocol::ui::tokens::{RatingPrecision, RatingVariant};
+        let r = RatingDisplay {
+            value: BindRef::Literal(Value::U64(7)),
+            max: 10,
+            variant: RatingVariant::Hearts,
+            show_value: true, precision: RatingPrecision::Decimal,
+        };
+        let c = r.clone().into_component("rd").unwrap();
+        assert_eq!(RatingDisplay::try_from_component(&c).unwrap(), r);
+    }
+
+    #[test]
+    fn rating_display_default_max_on_absent() {
+        use crate::protocol::ui::tokens::{RatingPrecision, RatingVariant};
+        let r = RatingDisplay {
+            value: BindRef::Literal(Value::U64(4)),
+            max: 5,
+            variant: RatingVariant::Stars,
+            show_value: true, precision: RatingPrecision::Half,
+        };
+        let mut c = r.into_component("rd").unwrap();
+        c.fields.0.retain(|(k, _)| *k != 1);
+        let back = RatingDisplay::try_from_component(&c).unwrap();
+        assert_eq!(back.max, 5);
+    }
+
+    #[test]
+    fn diff_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::DiffVariant;
+        let d = Diff {
+            before_path: StatePath::new(vec![PathSegment::Key("before".into())]),
+            after_path: StatePath::new(vec![PathSegment::Key("after".into())]),
+            variant: DiffVariant::Split,
+            language: Some("rust".into()),
+            word_wrap: false, show_line_numbers: true,
+        };
+        let c = d.clone().into_component("diff").unwrap();
+        assert_eq!(Diff::try_from_component(&c).unwrap(), d);
+    }
+
+    #[test]
+    fn markdown_roundtrip() {
+        use crate::protocol::ui::tokens::{LinkTarget, MarkdownFeature};
+        let m = Markdown {
+            content: lit("# Hello\n\n- item"),
+            allowed_features: vec![MarkdownFeature::Heading, MarkdownFeature::List],
+            max_height_px: Some(800),
+            link_target: LinkTarget::BlankViaCommand,
+        };
+        let c = m.clone().into_component("md").unwrap();
+        assert_eq!(Markdown::try_from_component(&c).unwrap(), m);
+    }
+
+    #[test]
+    fn data_definition_list_roundtrip() {
+        use crate::protocol::ui::inline::DefItem;
+        use crate::protocol::ui::tokens::DlLayout;
+        let dl = DataDefinitionList {
+            items: vec![DefItem {
+                term: lit("Term"), definition: lit("Definition"),
+            }],
+            layout: DlLayout::TwoColumn,
+        };
+        let c = dl.clone().into_component("dl").unwrap();
+        assert_eq!(DataDefinitionList::try_from_component(&c).unwrap(), dl);
+    }
+
+    #[test]
+    fn json_viewer_full_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        let j = JsonViewer {
+            value_path: StatePath::new(vec![PathSegment::Key("data".into())]),
+            collapsed_depth: 4,
+            max_height_px: 600, searchable: false,
+        };
+        let c = j.clone().into_component("jv").unwrap();
+        assert_eq!(JsonViewer::try_from_component(&c).unwrap(), j);
+    }
+
+    #[test]
+    fn json_viewer_default_collapsed_depth_on_absent() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        let j = JsonViewer {
+            value_path: StatePath::new(vec![PathSegment::Key("data".into())]),
+            collapsed_depth: 2,
+            max_height_px: 400, searchable: true,
+        };
+        let mut c = j.into_component("jv").unwrap();
+        c.fields.0.retain(|(k, _)| *k != 1);
+        let back = JsonViewer::try_from_component(&c).unwrap();
+        assert_eq!(back.collapsed_depth, 2);
+    }
+
+    #[test]
+    fn calendar_month_roundtrip() {
+        use crate::protocol::ui::tokens::DayOfWeek;
+        let cm = CalendarMonth {
+            month: lit("2026-05"),
+            events_path: None,
+            show_week_numbers: false,
+            first_day_of_week: DayOfWeek::Monday,
+        };
+        let c = cm.clone().into_component("cm").unwrap();
+        assert_eq!(CalendarMonth::try_from_component(&c).unwrap(), cm);
+    }
+
+    #[test]
+    fn image_roundtrip() {
+        use crate::protocol::ui::inline::DimensionToken;
+        use crate::protocol::ui::tokens::{ImageFit, RadiusToken};
+        let im = Image {
+            src_ref: lit("ref-1"),
+            alt: "Test".into(),
+            width: Some(DimensionToken::Px { value: 200 }),
+            height: None,
+            fit: ImageFit::Cover,
+            aspect_ratio: None,
+            radius: Some(RadiusToken::Md),
+            clickable: false, lazy_load: true,
+        };
+        let c = im.clone().into_component("im").unwrap();
+        assert_eq!(Image::try_from_component(&c).unwrap(), im);
+    }
+
+    #[test]
+    fn visually_hidden_roundtrip() {
+        use crate::protocol::ui::tokens::LiveRegion as Pol;
+        let vh = VisuallyHidden {
+            content: lit("Loading"),
+            as_live: Some(Pol::Polite),
+        };
+        let c = vh.clone().into_component("vh").unwrap();
+        assert_eq!(VisuallyHidden::try_from_component(&c).unwrap(), vh);
+    }
+
+    #[test]
+    fn live_region_component_roundtrip() {
+        use crate::protocol::ui::tokens::LiveRegion as Pol;
+        let lr = LiveRegionComponent {
+            politeness: Pol::Assertive,
+            content: lit("Saved camera C-25"),
+            visible: false,
+            tone: None, icon: None,
+            clear_after_ms: Some(3000),
+        };
+        let c = lr.clone().into_component("lr").unwrap();
+        assert_eq!(LiveRegionComponent::try_from_component(&c).unwrap(), lr);
     }
 }
