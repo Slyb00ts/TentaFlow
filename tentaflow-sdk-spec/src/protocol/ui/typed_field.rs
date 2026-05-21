@@ -19,6 +19,49 @@ use minicbor::{Decode, Encode};
 
 use crate::protocol::value::Value;
 
+/// Tag-mismatch validator used by every per-tag typed component's
+/// `try_from_component` (catalog §2-§7).
+pub fn ensure_tag(actual: u16, expected: u16, name: &'static str) -> Result<(), minicbor::decode::Error> {
+    if actual != expected {
+        return Err(minicbor::decode::Error::message(format!(
+            "{name}: Component.tag = 0x{actual:04X}, expected 0x{expected:04X}"
+        )));
+    }
+    Ok(())
+}
+
+/// Standard "missing required field" error.
+pub fn missing_field(comp: &'static str, field: &'static str) -> minicbor::decode::Error {
+    minicbor::decode::Error::message(format!("{comp}: missing required field `{field}`"))
+}
+
+/// Standard "unknown field key" error.
+pub fn unknown_field(comp: &'static str, key: u8) -> minicbor::decode::Error {
+    minicbor::decode::Error::message(format!("{comp}: unknown field key {key}"))
+}
+
+/// Reject `FieldMap` payloads with duplicate u8 keys (catalog schema —
+/// each field index MUST appear at most once). Called at the top of every
+/// `try_from_component` decoder.
+pub fn ensure_no_duplicate_keys(
+    comp: &'static str,
+    entries: &[(u8, Value)],
+) -> Result<(), minicbor::decode::Error> {
+    let mut lo: u128 = 0;
+    let mut hi: u128 = 0;
+    for (k, _) in entries {
+        let bit = 1u128 << (*k & 0x7f);
+        let target = if *k < 128 { &mut lo } else { &mut hi };
+        if *target & bit != 0 {
+            return Err(minicbor::decode::Error::message(format!(
+                "{comp}: duplicate FieldMap key {k}"
+            )));
+        }
+        *target |= bit;
+    }
+    Ok(())
+}
+
 /// Encode any `Encode<()>` type to a CBOR `Value`. Used by typed component
 /// builders to populate `FieldMap` entries.
 ///

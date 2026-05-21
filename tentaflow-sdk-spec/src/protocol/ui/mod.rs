@@ -16,6 +16,7 @@ pub mod event;
 pub mod handler;
 pub mod icon_name;
 pub mod inline;
+pub mod layout;
 pub mod molecules;
 pub mod panel;
 pub mod typed_field;

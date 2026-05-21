@@ -2621,3 +2621,493 @@ pub struct InlineChip {
     #[n(6)]
     pub removable: bool,
 }
+
+// -----------------------------------------------------------------------------
+// BorderToken — discriminated union (catalog §1.5).
+// -----------------------------------------------------------------------------
+
+/// Border style token (catalog §1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderToken {
+    None,
+    Hairline,
+    Thin,
+    Strong,
+    Accent { tone: Tone },
+}
+
+impl<C> Encode<C> for BorderToken {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            BorderToken::None => {
+                e.map(1)?;
+                e.str("kind")?.str("none")?;
+            }
+            BorderToken::Hairline => {
+                e.map(1)?;
+                e.str("kind")?.str("hairline")?;
+            }
+            BorderToken::Thin => {
+                e.map(1)?;
+                e.str("kind")?.str("thin")?;
+            }
+            BorderToken::Strong => {
+                e.map(1)?;
+                e.str("kind")?.str("strong")?;
+            }
+            BorderToken::Accent { tone } => {
+                e.map(2)?;
+                e.str("kind")?.str("accent")?;
+                e.str("tone")?;
+                tone.encode(e, ctx)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for BorderToken {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut tone: Option<Tone> = None;
+        let mut seen_kind = false;
+        let mut seen_tone = false;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    if seen_kind {
+                        return Err(minicbor::decode::Error::message("BorderToken: duplicate `kind` key"));
+                    }
+                    seen_kind = true;
+                    kind = Some(d.str()?.to_string());
+                }
+                "tone" => {
+                    if seen_tone {
+                        return Err(minicbor::decode::Error::message("BorderToken: duplicate `tone` key"));
+                    }
+                    seen_tone = true;
+                    tone = Some(Tone::decode(d, ctx)?);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown BorderToken key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("BorderToken missing kind"))?;
+        let no_tone = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+            if has {
+                return Err(minicbor::decode::Error::message(format!(
+                    "BorderToken.{k} must not carry tone"
+                )));
+            }
+            Ok(())
+        };
+        match kind.as_str() {
+            "none" => { no_tone(tone.is_some(), "none")?; Ok(BorderToken::None) }
+            "hairline" => { no_tone(tone.is_some(), "hairline")?; Ok(BorderToken::Hairline) }
+            "thin" => { no_tone(tone.is_some(), "thin")?; Ok(BorderToken::Thin) }
+            "strong" => { no_tone(tone.is_some(), "strong")?; Ok(BorderToken::Strong) }
+            "accent" => Ok(BorderToken::Accent {
+                tone: tone.ok_or_else(|| {
+                    minicbor::decode::Error::message("BorderToken.accent missing tone")
+                })?,
+            }),
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown BorderToken.kind: {other}"
+            ))),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SplitSize — discriminated union (catalog §3 0x0105 Split).
+// -----------------------------------------------------------------------------
+
+/// Primary-pane size for `Split` layout (catalog §3 0x0105).
+///
+/// `Percent.value` MUST be finite (no NaN/Inf) and within `0.0..=100.0`.
+/// Both encode and decode enforce this.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplitSize {
+    Auto,
+    Px { value: u32 },
+    Percent { value: f64 },
+}
+
+fn validate_split_percent(value: f64) -> Result<(), &'static str> {
+    if !value.is_finite() {
+        return Err("SplitSize.percent value must be finite (no NaN/Inf)");
+    }
+    if !(0.0..=100.0).contains(&value) {
+        return Err("SplitSize.percent value out of range 0.0..=100.0");
+    }
+    Ok(())
+}
+
+impl<C> Encode<C> for SplitSize {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            SplitSize::Auto => {
+                e.map(1)?;
+                e.str("kind")?.str("auto")?;
+            }
+            SplitSize::Px { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u32(*value)?;
+            }
+            SplitSize::Percent { value } => {
+                validate_split_percent(*value).map_err(minicbor::encode::Error::message)?;
+                e.map(2)?;
+                e.str("kind")?.str("percent")?;
+                e.str("value")?.f64(*value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for SplitSize {
+    fn decode(
+        d: &mut Decoder<'b>,
+        _ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut value_u: Option<u32> = None;
+        let mut value_f: Option<f64> = None;
+        let mut seen_kind = false;
+        let mut seen_value = false;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    if seen_kind {
+                        return Err(minicbor::decode::Error::message("SplitSize: duplicate `kind` key"));
+                    }
+                    seen_kind = true;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    if seen_value {
+                        return Err(minicbor::decode::Error::message("SplitSize: duplicate `value` key"));
+                    }
+                    seen_value = true;
+                    match kind.as_deref() {
+                        Some("percent") => {
+                            // Accept f16/f32/f64 wire form; widen to f64.
+                            let v = match d.datatype()? {
+                                minicbor::data::Type::F16 | minicbor::data::Type::F32 => d.f32()? as f64,
+                                _ => d.f64()?,
+                            };
+                            value_f = Some(v);
+                        }
+                        _ => value_u = Some(d.u32()?),
+                    }
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown SplitSize key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("SplitSize missing kind"))?;
+        match kind.as_str() {
+            "auto" => {
+                if value_u.is_some() || value_f.is_some() {
+                    return Err(minicbor::decode::Error::message(
+                        "SplitSize.auto must not carry value",
+                    ));
+                }
+                Ok(SplitSize::Auto)
+            }
+            "px" => Ok(SplitSize::Px {
+                value: value_u
+                    .ok_or_else(|| minicbor::decode::Error::message("SplitSize.px missing value"))?,
+            }),
+            "percent" => {
+                let v = value_f.ok_or_else(|| {
+                    minicbor::decode::Error::message("SplitSize.percent missing value")
+                })?;
+                validate_split_percent(v).map_err(minicbor::decode::Error::message)?;
+                Ok(SplitSize::Percent { value: v })
+            }
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown SplitSize.kind: {other}"
+            ))),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GridCol — discriminated union (catalog §3 0x0102 Grid).
+// -----------------------------------------------------------------------------
+
+/// Single-column track sizing (catalog §3 0x0102 Grid GridCol).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridCol {
+    Auto,
+    Fill,
+    MinContent,
+    MaxContent,
+    Fr { value: u8 },
+    Px { value: u32 },
+}
+
+impl<C> Encode<C> for GridCol {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            GridCol::Auto => {
+                e.map(1)?;
+                e.str("kind")?.str("auto")?;
+            }
+            GridCol::Fill => {
+                e.map(1)?;
+                e.str("kind")?.str("fill")?;
+            }
+            GridCol::MinContent => {
+                e.map(1)?;
+                e.str("kind")?.str("min_content")?;
+            }
+            GridCol::MaxContent => {
+                e.map(1)?;
+                e.str("kind")?.str("max_content")?;
+            }
+            GridCol::Fr { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("fr")?;
+                e.str("value")?.u8(*value)?;
+            }
+            GridCol::Px { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u32(*value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for GridCol {
+    fn decode(
+        d: &mut Decoder<'b>,
+        _ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut value: Option<u64> = None;
+        let mut seen_kind = false;
+        let mut seen_value = false;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    if seen_kind {
+                        return Err(minicbor::decode::Error::message("GridCol: duplicate `kind` key"));
+                    }
+                    seen_kind = true;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    if seen_value {
+                        return Err(minicbor::decode::Error::message("GridCol: duplicate `value` key"));
+                    }
+                    seen_value = true;
+                    value = Some(d.u64()?);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown GridCol key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("GridCol missing kind"))?;
+        let no_val = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+            if has {
+                return Err(minicbor::decode::Error::message(format!(
+                    "GridCol.{k} must not carry value"
+                )));
+            }
+            Ok(())
+        };
+        match kind.as_str() {
+            "auto" => { no_val(value.is_some(), "auto")?; Ok(GridCol::Auto) }
+            "fill" => { no_val(value.is_some(), "fill")?; Ok(GridCol::Fill) }
+            "min_content" => { no_val(value.is_some(), "min_content")?; Ok(GridCol::MinContent) }
+            "max_content" => { no_val(value.is_some(), "max_content")?; Ok(GridCol::MaxContent) }
+            "fr" => Ok(GridCol::Fr {
+                value: value.ok_or_else(|| {
+                    minicbor::decode::Error::message("GridCol.fr missing value")
+                })?
+                .try_into()
+                .map_err(|_| {
+                    minicbor::decode::Error::message("GridCol.fr value out of u8 range")
+                })?,
+            }),
+            "px" => Ok(GridCol::Px {
+                value: value.ok_or_else(|| {
+                    minicbor::decode::Error::message("GridCol.px missing value")
+                })?
+                .try_into()
+                .map_err(|_| {
+                    minicbor::decode::Error::message("GridCol.px value out of u32 range")
+                })?,
+            }),
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown GridCol.kind: {other}"
+            ))),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GridTrack — discriminated union (catalog §3 0x0102 Grid).
+// -----------------------------------------------------------------------------
+
+/// Column-track spec for `Grid` (catalog §3 0x0102).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridTrack {
+    Equal { count: u8 },
+    Explicit { cols: Vec<GridCol> },
+}
+
+impl<C> Encode<C> for GridTrack {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            GridTrack::Equal { count } => {
+                // Keys: "count"(0x65..), "kind"(0x64..). Sort: kind < count.
+                e.map(2)?;
+                e.str("kind")?.str("equal")?;
+                e.str("count")?.u8(*count)?;
+            }
+            GridTrack::Explicit { cols } => {
+                // Keys: "cols"(0x64..), "kind"(0x64..). 
+                //   "cols" = 0x64 63.., "kind" = 0x64 6b.. → cols < kind.
+                e.map(2)?;
+                e.str("cols")?;
+                e.array(cols.len() as u64)?;
+                for col in cols {
+                    col.encode(e, ctx)?;
+                }
+                e.str("kind")?.str("explicit")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for GridTrack {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut count: Option<u8> = None;
+        let mut cols: Option<Vec<GridCol>> = None;
+        let mut seen_kind = false;
+        let mut seen_count = false;
+        let mut seen_cols = false;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    if seen_kind {
+                        return Err(minicbor::decode::Error::message("GridTrack: duplicate `kind` key"));
+                    }
+                    seen_kind = true;
+                    kind = Some(d.str()?.to_string());
+                }
+                "count" => {
+                    if seen_count {
+                        return Err(minicbor::decode::Error::message("GridTrack: duplicate `count` key"));
+                    }
+                    seen_count = true;
+                    count = Some(d.u8()?);
+                }
+                "cols" => {
+                    if seen_cols {
+                        return Err(minicbor::decode::Error::message("GridTrack: duplicate `cols` key"));
+                    }
+                    seen_cols = true;
+                    let n = d.array()?.ok_or_else(|| {
+                        minicbor::decode::Error::message("indefinite-length array forbidden")
+                    })?;
+                    let mut v = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        v.push(GridCol::decode(d, ctx)?);
+                    }
+                    cols = Some(v);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown GridTrack key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("GridTrack missing kind"))?;
+        match kind.as_str() {
+            "equal" => {
+                if cols.is_some() {
+                    return Err(minicbor::decode::Error::message(
+                        "GridTrack.equal must not carry cols",
+                    ));
+                }
+                Ok(GridTrack::Equal {
+                    count: count.ok_or_else(|| {
+                        minicbor::decode::Error::message("GridTrack.equal missing count")
+                    })?,
+                })
+            }
+            "explicit" => {
+                if count.is_some() {
+                    return Err(minicbor::decode::Error::message(
+                        "GridTrack.explicit must not carry count",
+                    ));
+                }
+                Ok(GridTrack::Explicit {
+                    cols: cols.ok_or_else(|| {
+                        minicbor::decode::Error::message("GridTrack.explicit missing cols")
+                    })?,
+                })
+            }
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown GridTrack.kind: {other}"
+            ))),
+        }
+    }
+}
