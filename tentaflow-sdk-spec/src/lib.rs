@@ -32,11 +32,20 @@ pub use protocol::{
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
         bind::{BindRef, BindSpec, PathSegment, StatePath, MAX_STATE_PATH_SEGMENTS},
+        component::{
+            Component, FieldMap, HandlerMap, TestId, TestIdError, TEST_ID_MAX_LEN,
+        },
+        handler::{
+            FailurePolicy, Handler, HandlerValidationError, LocalAction, DEBOUNCE_MAX_MS,
+            HANDLER_MAX_RECURSION_DEPTH, HANDLER_MAX_TOTAL_STEPS, SEQUENCE_MAX_ITEMS,
+        },
+        patch::{PatchOp, PatchOpKind},
         tokens::{
             BadgeVariant, Breakpoint, ButtonVariant, ChipVariant, CursorToken, Density,
             DrawerSide, IconSize, LiveRegion, NavigateTarget, RadiusToken, ScrollBehavior,
             ShadowToken, Spacing, TextAlign, TextStyle, TextWrap, Tone,
         },
+        validation::{StateCondition, ValidationRule},
         value_format::{
             BytesBase, DateStyle, DateTimeStyle, DurationStyle, TimeStyle, ValueFormat,
         },
