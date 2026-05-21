@@ -1,0 +1,14 @@
+[package]
+name = "tentaflow-sdk-spec"
+version = "0.1.0"
+edition = "2021"
+description = "TentaFlow addon SDK — single source of truth for protocol types, UI catalog and codegen annotations."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "tentaflow_sdk_spec"
+path = "src/lib.rs"
+
+[dependencies]
+minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
