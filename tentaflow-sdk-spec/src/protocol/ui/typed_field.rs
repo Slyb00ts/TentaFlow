@@ -19,6 +19,12 @@ use minicbor::{Decode, Encode};
 
 use crate::protocol::value::Value;
 
+/// Error type returned from per-component `into_component` builders. Wraps
+/// `minicbor::encode::Error<core::convert::Infallible>` from
+/// [`encode_to_value`] (Vec writer infallible — only inner Encode validation
+/// can produce errors).
+pub type IntoComponentError = minicbor::encode::Error<core::convert::Infallible>;
+
 /// Tag-mismatch validator used by every per-tag typed component's
 /// `try_from_component` (catalog §2-§7).
 pub fn ensure_tag(actual: u16, expected: u16, name: &'static str) -> Result<(), minicbor::decode::Error> {
