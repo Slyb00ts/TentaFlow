@@ -315,14 +315,16 @@ string_enum! {
     }
 }
 
-/// Numeric trend indicator shown alongside `StatCard` / `Stat`.
+/// Numeric trend indicator shown alongside `StatCard` / `Stat`. `percent`
+/// is `f64` (catalog Trend) — straight numeric fields use f64 to survive the
+/// `Value`-roundtrip pathway typed components use when populating `FieldMap`.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 #[cbor(map)]
 pub struct Trend {
     #[n(0)]
     pub direction: TrendDirection,
     #[n(1)]
-    pub percent: f32,
+    pub percent: f64,
     #[n(2)]
     pub label: Option<BindRef>,
     #[n(3)]

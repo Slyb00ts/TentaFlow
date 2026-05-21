@@ -252,7 +252,7 @@ AspectRatio (discriminated union, always CBOR map z `kind` keyem):
 
 Trend:
   direction: TrendDirection                                                 // "up" | "down" | "flat"
-  percent: f32                                                              // -100..+inf
+  percent: f64                                                              // -100..+inf (finite; Value-roundtrip path requires f64)
   label: BindRef<tstr> or null
   tone: Tone or null                                                        // explicit override; default mapped from direction
 
@@ -1425,7 +1425,7 @@ Fields:
   2: value           BindRef<Value>                  // typowo number albo string
   3: value_suffix    BindRef<tstr> or null           // np. "/ 24"
   4: format          ValueFormat or null
-  5: trend           Trend or null                   // { direction: "up"|"down"|"flat", percent: f32, label?: tstr }
+  5: trend           Trend or null                   // schema w §1.5 (percent: f64)
   6: footnote        Footnote or null                // { tone: Tone, content: BindRef<tstr> }
   7: accent          Tone or null                    // left-edge bar
   8: clickable       bool
