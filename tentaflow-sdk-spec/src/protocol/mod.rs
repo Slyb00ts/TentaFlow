@@ -5,7 +5,11 @@
 // chunks. See docs/ADDON_BINARY_PROTOCOL_v1.md.
 // =============================================================================
 
+#[macro_use]
+pub mod macros;
+
 pub mod control;
 pub mod envelope;
 pub mod ids;
+pub mod ui;
 pub mod value;

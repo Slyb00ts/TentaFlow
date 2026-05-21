@@ -131,6 +131,8 @@ Każda wiadomość ma envelope. Reprezentacja CBOR: **map z integer keys** (zwar
 
 **Konwencja struktur:** wszystkie struktury CBOR w tym dokumencie (Envelope, Capability, ProtocolHello, ProtocolWelcome, SessionEnd, …) są encodowane jako CBOR maps z **integer keys** (nie tstr). Mapowanie nazwa-pola → integer key jest **źródłowo zdefiniowane w `tentaflow-sdk-spec`** (Rust crate) i automatycznie propagowane do generated SDK przez `tentaflow-sdk-gen`. Doc używa nazw pól dla czytelności; concrete integer assignments są w `src/protocol/*.rs`. Wyjątek: free-form `map<tstr, Value>` (np. `Capability.params`, `Event.payload`) — używa tstr keys, sortowanych bytewise canonical (§2.1).
 
+**Konwencja opcjonalnych pól:** napis "or null" / "or absent" w schematach pól (`foo: Tstr or null`, `bar: BindRef or null` itd.) oznacza **opcjonalne pole encodowane jako klucz nieobecny w CBOR mapie gdy wartość = None**. **CBOR `null` (major type 7, simple value 22, `0xf6`) NIE jest emitowany** dla optional-absent. Decoder odrzuca explicit `null` w polach mapy. Powód: canonical encoding minimal-size (§2.1 — preferred serialization) + brak dwóch reprezentacji "brak wartości". Wybór binarny: jest klucz / nie ma klucza. Ta sama reguła obowiązuje katalog komponentów (`ADDON_UI_COMPONENT_CATALOG_v1.md`).
+
 ```
 Envelope (CBOR map):
   0: protocol_version (u16, MUST = 1)
@@ -1060,16 +1062,17 @@ ScrollBehavior (enum):            Auto | Smooth | Instant
 DrawerSide (enum):                Left | Right | Top | Bottom
 NavigateTarget (enum):            NewTab | SameTab | SystemBrowser                (mobile mapping)
 LiveRegion (enum):                Off | Polite | Assertive
-ValueFormat (enum, mapuje na localized format):
-  - Number { decimals: u8, thousands_sep: bool }
-  - Currency { code: tstr }                                                      (ISO 4217)
-  - Percent { decimals: u8 }
-  - Bytes
-  - Duration { kind: enum (Short | Long | Stopwatch) }
-  - Date { kind: enum (Short | Medium | Long | Full) }
-  - Time { kind: enum (Short | Medium | Long) }
-  - DateTime { kind: enum (Short | Medium | Long | Full) }
-  - Relative                                                                     ("2 minutes ago")
+ValueFormat (discriminated union; authoritative schema in catalog §1.3):
+  - { kind: "number",   decimals: u8, thousands_sep: bool }
+  - { kind: "currency", code: tstr }                                             (ISO 4217)
+  - { kind: "percent",  decimals: u8 }
+  - { kind: "bytes",    base: BytesBase }                                        (BytesBase: "1000" | "1024")
+  - { kind: "duration", style: DurationStyle }                                   ("short" | "long" | "stopwatch")
+  - { kind: "date",     style: DateStyle }                                       ("short" | "medium" | "long" | "full")
+  - { kind: "time",     style: TimeStyle }                                       ("short" | "medium" | "long")
+  - { kind: "datetime", style: DateTimeStyle }                                   ("short" | "medium" | "long" | "full")
+  - { kind: "relative" }                                                         ("2 minutes ago")
+  - { kind: "plain" }                                                            (no format)
 ```
 
 ## 11. Action flow — pełny round-trip przykład
