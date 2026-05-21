@@ -777,3 +777,100 @@ string_enum! {
         Semi = "semi",
     }
 }
+
+string_enum! {
+    /// `ProgressBar` visual variant (catalog §4 0x021D).
+    pub enum ProgressVariant {
+        Default = "default",
+        Striped = "striped",
+        Indeterminate = "indeterminate",
+    }
+}
+
+string_enum! {
+    /// `ProgressBar` size token (catalog §4 0x021D).
+    pub enum ProgressSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `RatingDisplay` visual variant (catalog §4 0x021E).
+    pub enum RatingVariant {
+        Stars = "stars",
+        Hearts = "hearts",
+        Circles = "circles",
+        Numeric = "numeric",
+    }
+}
+
+string_enum! {
+    /// `RatingDisplay` precision token (catalog §4 0x021E).
+    pub enum RatingPrecision {
+        Full = "full",
+        Half = "half",
+        Decimal = "decimal",
+    }
+}
+
+string_enum! {
+    /// `Diff` rendering variant (catalog §4 0x021F).
+    pub enum DiffVariant {
+        Split = "split",
+        Inline = "inline",
+        Unified = "unified",
+    }
+}
+
+string_enum! {
+    /// `Markdown` allowed-feature token (catalog §4 0x0220).
+    pub enum MarkdownFeature {
+        Heading = "heading",
+        List = "list",
+        CodeBlock = "code_block",
+        Blockquote = "blockquote",
+        Table = "table",
+        Link = "link",
+        Image = "image",
+        Emphasis = "emphasis",
+        Strong = "strong",
+        CodeInline = "code_inline",
+    }
+}
+
+string_enum! {
+    /// `Markdown.link_target` policy (catalog §4 0x0220).
+    pub enum LinkTarget {
+        SelfTarget = "self",
+        BlankViaCommand = "blank_via_command",
+    }
+}
+
+string_enum! {
+    /// `DataDefinitionList` layout (catalog §4 0x0221).
+    pub enum DlLayout {
+        Stacked = "stacked",
+        TwoColumn = "two_column",
+    }
+}
+
+string_enum! {
+    /// `CalendarMonth.first_day_of_week` (catalog §4 0x0223).
+    pub enum DayOfWeek {
+        Sunday = "sunday",
+        Monday = "monday",
+    }
+}
+
+string_enum! {
+    /// `Image.fit` mode (catalog §4 0x0224).
+    pub enum ImageFit {
+        Cover = "cover",
+        Contain = "contain",
+        Fill = "fill",
+        None = "none",
+    }
+}
