@@ -31,12 +31,14 @@ pub use protocol::{
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
+        action::{Action, ActionAck, ActionStatus, FieldError, FormFieldMap, FormFieldValue, ParamEntry},
         bind::{BindRef, BindSpec, PathSegment, StatePath, MAX_STATE_PATH_SEGMENTS},
         command::Command,
         component::{
             Component, FieldMap, HandlerMap, TestId, TestIdError, TEST_ID_MAX_LEN,
         },
         error_code::ErrorCode,
+        event::{Event, Topic, TopicSegment},
         handler::{
             FailurePolicy, Handler, HandlerValidationError, LocalAction, DEBOUNCE_MAX_MS,
             HANDLER_MAX_RECURSION_DEPTH, HANDLER_MAX_TOTAL_STEPS, SEQUENCE_MAX_ITEMS,
@@ -50,11 +52,13 @@ pub use protocol::{
             CachePolicy, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility, StateEntry,
         },
         slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow},
+        state::{PatchRejectReason, PatchRejected, StatePatch, StateReset, StateSnapshot},
         tokens::{
             BadgeVariant, Breakpoint, ButtonVariant, ChipVariant, CursorToken, Density,
             DrawerSide, IconSize, LiveRegion, NavigateTarget, RadiusToken, ScrollBehavior,
             ShadowToken, Spacing, TextAlign, TextStyle, TextWrap, Tone,
         },
+        ui_payload::{Batch, BatchMember, UiPayload, UiTag, BATCH_MAX_MEMBERS},
         validation::{StateCondition, ValidationRule},
         value_format::{
             BytesBase, DateStyle, DateTimeStyle, DurationStyle, TimeStyle, ValueFormat,
