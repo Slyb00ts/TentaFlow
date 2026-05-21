@@ -29,6 +29,10 @@ pub use protocol::{
     },
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
+    stream::{
+        StreamAccepted, StreamCancel, StreamChunk, StreamEnd, StreamError, StreamKind,
+        StreamOpen, StreamPayload, StreamProgress, StreamRejected, StreamTag,
+    },
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
         action::{Action, ActionAck, ActionStatus, FieldError, FormFieldMap, FormFieldValue, ParamEntry},
