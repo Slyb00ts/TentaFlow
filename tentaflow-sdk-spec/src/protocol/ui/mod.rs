@@ -8,5 +8,9 @@
 
 pub mod a11y;
 pub mod bind;
+pub mod component;
+pub mod handler;
+pub mod patch;
 pub mod tokens;
+pub mod validation;
 pub mod value_format;
