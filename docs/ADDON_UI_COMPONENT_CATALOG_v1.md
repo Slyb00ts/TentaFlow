@@ -81,8 +81,9 @@ RadiusToken (enum, tstr):
 ShadowToken (enum, tstr):
   "none" | "subtle" | "medium" | "elevated" | "floating"
 
-BorderToken (variant):
-  "none" | "hairline" | "thin" | "strong" | { "accent": Tone }
+BorderToken (discriminated union, always CBOR map z `kind`):
+  - { kind: "none" } | { kind: "hairline" } | { kind: "thin" } | { kind: "strong" }
+  - { kind: "accent", tone: Tone }
 
 Breakpoint (enum, tstr):                       // 640 / 768 / 1024 / 1280 / 1536 / 1920 px
   "xs" | "sm" | "md" | "lg" | "xl" | "xxl"
@@ -1068,7 +1069,7 @@ CSS Grid container.
 
 ```
 Fields:
-  0: columns         GridTrack                      // GridTrack: u8 (equal cols) or array<GridCol>
+  0: columns         GridTrack                      // schema below
   1: gap             Spacing
   2: row_gap         Spacing or null                // default = gap
   3: column_gap      Spacing or null                // default = gap
@@ -1076,8 +1077,14 @@ Fields:
   5: padding         Spacing or null
   6: align_items     FlexAlign or null
 
-GridCol (enum):
-  "auto" | "fill" | { "fr": u8 } | { "px": u32 } | { "min_content" } | { "max_content" }
+GridTrack (discriminated union, always CBOR map z `kind`):
+  - { kind: "equal",    count: u8 }                                 // N equal-width columns
+  - { kind: "explicit", cols: array<GridCol> }                      // per-column track sizing
+
+GridCol (discriminated union, always CBOR map z `kind`):
+  - { kind: "auto" } | { kind: "fill" } | { kind: "min_content" } | { kind: "max_content" }
+  - { kind: "fr", value: u8 }
+  - { kind: "px", value: u32 }
 ```
 
 ### 0x0103 — `Stack`
@@ -1111,12 +1118,17 @@ Fields:
 ```
 Fields:
   0: orientation     SplitOrientation               // "horizontal" | "vertical"
-  1: primary_size    SplitSize                      // { "px": u32 } | { "percent": f32 } | "auto"
+  1: primary_size    SplitSize                      // discriminated union (schema below)
   2: min_primary     u32                            // px
   3: max_primary     u32                            // px
   4: resizable       bool
   5: primary_slot    tstr
   6: secondary_slot  tstr
+
+SplitSize (discriminated union, always CBOR map z `kind`):
+  - { kind: "auto" }
+  - { kind: "px",      value: u32 }
+  - { kind: "percent", value: f64 }                                  // 0.0..=100.0 (finite, non-NaN)
 ```
 
 ### 0x0106 — `Card`
@@ -1221,7 +1233,7 @@ Page-level navigation tabs (różni się od Tabs że pełni rolę routingu, nie 
 Fields:
   0: items           array<NavTab>                  // { id, label, icon?, badge?, panel_id, locked? }
   1: active_id       BindRef<tstr>
-  2: variant         NavTabsVariant
+  2: variant         NavTabsVariant                 // "default" | "underlined" | "pills"
   3: scroll_overflow bool
 Handlers:
   "select":          Handler                         // emitted z params { id, panel_id }
