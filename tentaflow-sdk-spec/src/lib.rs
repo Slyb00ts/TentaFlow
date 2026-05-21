@@ -29,5 +29,17 @@ pub use protocol::{
     },
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
+    ui::{
+        a11y::{Accessibility, EventKind, Visibility},
+        bind::{BindRef, BindSpec, PathSegment, StatePath, MAX_STATE_PATH_SEGMENTS},
+        tokens::{
+            BadgeVariant, Breakpoint, ButtonVariant, ChipVariant, CursorToken, Density,
+            DrawerSide, IconSize, LiveRegion, NavigateTarget, RadiusToken, ScrollBehavior,
+            ShadowToken, Spacing, TextAlign, TextStyle, TextWrap, Tone,
+        },
+        value_format::{
+            BytesBase, DateStyle, DateTimeStyle, DurationStyle, TimeStyle, ValueFormat,
+        },
+    },
     value::Value,
 };

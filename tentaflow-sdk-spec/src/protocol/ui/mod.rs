@@ -1,0 +1,12 @@
+// =============================================================================
+// File: protocol/ui/mod.rs — UI channel typed primitives (catalog §1)
+// Purpose: semantic tokens, ValueFormat, StatePath/BindRef/BindSpec,
+// Accessibility, Visibility and EventKind. Concrete components (§2–§7) and
+// Handler/LocalAction recursion land in later chunks.
+// See docs/ADDON_UI_COMPONENT_CATALOG_v1.md.
+// =============================================================================
+
+pub mod a11y;
+pub mod bind;
+pub mod tokens;
+pub mod value_format;
