@@ -960,15 +960,26 @@ Handler (discriminated union):
   - Backend {
       action_id: tstr,
       params: map<tstr, Value>,
-      optimistic: StatePatch or null,
-      on_failure: FailurePolicy                                  (enum: Toast | RevertOptimistic | Custom(LocalAction))
+      optimistic: array<PatchOp> or absent,                      (subset of §6.4 StatePatch.ops; addon_id/panel_id/panel_epoch are implicit from the panel hosting the Component, not re-embedded)
+      on_failure: FailurePolicy
     }
   - Both {
       action_id: tstr,
       params: map<tstr, Value>,
-      optimistic: StatePatch,                                    (required)
+      optimistic: array<PatchOp>,                                (required; same shape as Backend.optimistic)
       on_failure: FailurePolicy                                  (default RevertOptimistic)
     }
+
+FailurePolicy (discriminated union):
+  - { kind: "toast" }                                            (renderer shows Critical toast, addon-supplied default copy)
+  - { kind: "revert_optimistic" }                                (rollback the optimistic patch)
+  - { kind: "custom", action: LocalAction }                      (run a local action on failure)
+
+StateCondition (discriminated union, non-recursive — keep simple so renderer evaluation stays branchless):
+  - { kind: "is_truthy", path: StatePath }                       (non-null, non-zero, non-empty-string, non-empty-array)
+  - { kind: "is_falsy",  path: StatePath }                       (null, 0, "", [], false)
+  - { kind: "equals",     path: StatePath, value: Value }
+  - { kind: "not_equals", path: StatePath, value: Value }
 
 LocalAction (discriminated union, capability-gated):
   - ShowModal(tstr)                                              (slot_id of Modal owned by this addon)
@@ -1007,8 +1018,8 @@ LocalAction (discriminated union, capability-gated):
 - Total recursion depth ≤ 8 (Sequence/Confirm/Conditional/Debounce nesting)
 - Total steps in tree ≤ 16
 - `Copy` wymaga `user_gesture: true` at outermost handler invocation. Local handlers nie zawierają `NavigateExternal` — external navigation jest zawsze backend `Command::NavigateExternal` (security check w core).
-- `Sequence` max 8 items; recursive Sequence prohibited (linear chains only)
-- No cycles (validator walks tree and detects)
+- `Sequence` max 8 items; recursive Sequence prohibited (linear chains only — sticky check: a Sequence anywhere in the subtree of an outer Sequence is rejected, including across Confirm/Debounce/Conditional then/else)
+- Cycles are structurally impossible (Handler is an owned tree of `Box` nodes, no shared references), so no runtime cycle detection is needed
 
 #### 10.3.1 Local handler capability matrix
 
