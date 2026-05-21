@@ -10,15 +10,21 @@
 // =============================================================================
 
 pub mod avatar;
+pub mod charts;
+pub mod gauge;
 pub mod labels;
 pub mod lists;
 pub mod stat;
+pub mod tables;
 pub mod text;
 
 pub use avatar::{Avatar, AvatarGroup};
+pub use charts::{AreaChart, BarChart, LineChart, PieChart, Sparkline, StackedBar};
+pub use gauge::{Gauge, Heatmap};
 pub use labels::{Badge, Chip, Tag};
 pub use lists::{BulletList, Timeline};
 pub use stat::{KeyValue, Stat, StatCard};
+pub use tables::{EmptyCell, List, Table, Tree};
 pub use text::{CodeBlock, Heading, MonoBlock, Paragraph, RichText, Text};
 
 #[cfg(test)]
@@ -223,5 +229,219 @@ mod tests {
     #[test]
     fn _unused_iconname_smoke() {
         let _ = IconName::Brain;
+    }
+
+    // --- 1.8c2: Tables / Charts / Gauge -----------------------------------
+
+    #[test]
+    fn table_roundtrip_minimal() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::{TableSelectMode, TableVariant};
+        let t = Table {
+            columns: vec![],
+            rows_path: StatePath::new(vec![PathSegment::Key("rows".into())]),
+            row_key_field: "id".into(),
+            variant: TableVariant::Default,
+            density: Density::Default,
+            sortable: false,
+            sort_by: None,
+            selectable: TableSelectMode::None,
+            selected_ids: None,
+            sticky_header: true,
+            sticky_columns: 0,
+            pagination: None,
+            empty_state: None,
+            row_actions: vec![],
+            bulk_actions: vec![],
+            virtualize: false,
+            row_expandable: false,
+            expanded_row_template_id: None,
+        };
+        let c = t.clone().into_component("tbl").unwrap();
+        assert_eq!(c.tag, Table::TAG);
+        assert_eq!(Table::try_from_component(&c).unwrap(), t);
+    }
+
+    #[test]
+    fn list_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        let l = List {
+            items_path: StatePath::new(vec![PathSegment::Key("items".into())]),
+            item_template_id: "row".into(),
+            divider: true,
+            density: Density::Compact,
+            virtualize: false,
+            empty_state: None,
+            max_visible: Some(50),
+        };
+        let c = l.clone().into_component("list").unwrap();
+        assert_eq!(List::try_from_component(&c).unwrap(), l);
+    }
+
+    #[test]
+    fn tree_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::TreeVariant;
+        let t = Tree {
+            nodes_path: StatePath::new(vec![PathSegment::Key("nodes".into())]),
+            expanded_ids: lit("expanded"),
+            selected_id: None,
+            variant: TreeVariant::WithIcons,
+            lazy_load: false,
+        };
+        let c = t.clone().into_component("tree").unwrap();
+        assert_eq!(Tree::try_from_component(&c).unwrap(), t);
+    }
+
+    #[test]
+    fn empty_cell_roundtrip() {
+        use crate::protocol::ui::tokens::EmptyCellVariant;
+        let ec = EmptyCell { variant: EmptyCellVariant::EmDash };
+        let c = ec.into_component("ec").unwrap();
+        assert_eq!(EmptyCell::try_from_component(&c).unwrap(), ec);
+    }
+
+    #[test]
+    fn sparkline_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::SparklineVariant;
+        let s = Sparkline {
+            data_path: StatePath::new(vec![PathSegment::Key("data".into())]),
+            variant: SparklineVariant::Area,
+            tone: Tone::Primary,
+            width_px: 200,
+            height_px: 40,
+            show_min_max: true,
+        };
+        let c = s.clone().into_component("sp").unwrap();
+        assert_eq!(Sparkline::try_from_component(&c).unwrap(), s);
+    }
+
+    fn axis() -> crate::protocol::ui::inline::ChartAxis {
+        use crate::protocol::ui::tokens::ChartAxisScale;
+        crate::protocol::ui::inline::ChartAxis {
+            label: None, format: None, min: None, max: None, ticks: None,
+            scale: ChartAxisScale::Linear,
+        }
+    }
+
+    fn legend() -> crate::protocol::ui::inline::ChartLegend {
+        use crate::protocol::ui::tokens::{ChartLegendAlign, ChartLegendPosition};
+        crate::protocol::ui::inline::ChartLegend {
+            position: ChartLegendPosition::Bottom,
+            alignment: ChartLegendAlign::Center,
+        }
+    }
+
+    fn tooltip() -> crate::protocol::ui::inline::ChartTooltip {
+        crate::protocol::ui::inline::ChartTooltip { enabled: true, format: None }
+    }
+
+    #[test]
+    fn line_chart_roundtrip() {
+        use crate::protocol::ui::tokens::ChartZoomMode;
+        let lc = LineChart {
+            series: vec![], x_axis: axis(), y_axis: axis(),
+            legend: legend(), tooltip: tooltip(),
+            zoom: ChartZoomMode::X, brush: false, height_px: 200,
+        };
+        let c = lc.clone().into_component("lc").unwrap();
+        assert_eq!(LineChart::try_from_component(&c).unwrap(), lc);
+    }
+
+    #[test]
+    fn bar_chart_roundtrip() {
+        use crate::protocol::ui::tokens::{BarStacking, ChartOrientation};
+        let bc = BarChart {
+            series: vec![], x_axis: axis(), y_axis: axis(),
+            orientation: ChartOrientation::Vertical,
+            stacking: BarStacking::Stacked,
+            legend: legend(), height_px: 200,
+        };
+        let c = bc.clone().into_component("bc").unwrap();
+        assert_eq!(BarChart::try_from_component(&c).unwrap(), bc);
+    }
+
+    #[test]
+    fn area_chart_full_roundtrip_non_default_opacity() {
+        use crate::protocol::ui::tokens::{AreaStacking, ChartZoomMode};
+        let ac = AreaChart {
+            series: vec![], x_axis: axis(), y_axis: axis(),
+            legend: legend(), tooltip: tooltip(),
+            zoom: ChartZoomMode::Both, brush: true, height_px: 400,
+            stacking: AreaStacking::Percent, opacity: 0.75,
+        };
+        let c = ac.clone().into_component("ac").unwrap();
+        assert_eq!(c.tag, AreaChart::TAG);
+        assert_eq!(AreaChart::try_from_component(&c).unwrap(), ac);
+    }
+
+    #[test]
+    fn area_chart_default_opacity_on_absent() {
+        use crate::protocol::ui::tokens::{AreaStacking, ChartZoomMode};
+        let ac = AreaChart {
+            series: vec![], x_axis: axis(), y_axis: axis(),
+            legend: legend(), tooltip: tooltip(),
+            zoom: ChartZoomMode::None, brush: false, height_px: 200,
+            stacking: AreaStacking::None, opacity: 0.4,
+        };
+        let mut c = ac.into_component("ac").unwrap();
+        c.fields.0.retain(|(k, _)| *k != 9);
+        let back = AreaChart::try_from_component(&c).unwrap();
+        assert_eq!(back.opacity, 0.4);
+    }
+
+    #[test]
+    fn pie_chart_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::PieVariant;
+        let p = PieChart {
+            data_path: StatePath::new(vec![PathSegment::Key("data".into())]),
+            variant: PieVariant::Donut,
+            show_labels: true, show_legend: true, max_segments: 5, height_px: 240,
+        };
+        let c = p.clone().into_component("pc").unwrap();
+        assert_eq!(PieChart::try_from_component(&c).unwrap(), p);
+    }
+
+    #[test]
+    fn stacked_bar_roundtrip() {
+        let sb = StackedBar {
+            segments: vec![],
+            total: BindRef::Literal(Value::U64(100)),
+            show_legend: false, show_percentages: true, height_px: 30,
+        };
+        let c = sb.clone().into_component("sb").unwrap();
+        assert_eq!(StackedBar::try_from_component(&c).unwrap(), sb);
+    }
+
+    #[test]
+    fn heatmap_roundtrip() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::inline::HeatmapScale;
+        use crate::protocol::ui::tokens::HeatmapLegendPosition;
+        let h = Heatmap {
+            rows: vec![], columns: vec![],
+            cells_path: StatePath::new(vec![PathSegment::Key("cells".into())]),
+            scale: HeatmapScale::Linear { min: 0.0, max: 100.0, color_from: Tone::Info, color_to: Tone::Critical },
+            legend_position: HeatmapLegendPosition::Bottom,
+            cell_size_px: 24, tooltip: true,
+        };
+        let c = h.clone().into_component("hm").unwrap();
+        assert_eq!(Heatmap::try_from_component(&c).unwrap(), h);
+    }
+
+    #[test]
+    fn gauge_roundtrip() {
+        use crate::protocol::ui::tokens::GaugeVariant;
+        let g = Gauge {
+            value: BindRef::Literal(Value::U64(42)),
+            min: 0.0, max: 100.0,
+            thresholds: vec![],
+            variant: GaugeVariant::Arc,
+            label: None, format: None, size_px: 120,
+        };
+        let c = g.clone().into_component("gg").unwrap();
+        assert_eq!(Gauge::try_from_component(&c).unwrap(), g);
     }
 }
