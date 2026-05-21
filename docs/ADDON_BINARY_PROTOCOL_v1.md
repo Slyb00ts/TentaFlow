@@ -446,6 +446,16 @@ SlotDecl:
   max_payload_bytes: u32 or null (per-slot limit, default = server_limits.max_message_bytes)
 ```
 
+**`PanelError`** (0x0104, Core→Frontend):
+
+```
+PanelError:
+  addon_id: tstr
+  panel_id: tstr
+  code: ErrorCode                (u16; whitelist from §16)
+  message: tstr                  (developer-facing, ≤ 256 chars; not localised — UI renders i18n by code)
+```
+
 **`PanelReady`** (0x0103, Frontend→Core):
 
 ```

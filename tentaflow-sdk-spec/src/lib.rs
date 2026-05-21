@@ -32,14 +32,24 @@ pub use protocol::{
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
         bind::{BindRef, BindSpec, PathSegment, StatePath, MAX_STATE_PATH_SEGMENTS},
+        command::Command,
         component::{
             Component, FieldMap, HandlerMap, TestId, TestIdError, TEST_ID_MAX_LEN,
         },
+        error_code::ErrorCode,
         handler::{
             FailurePolicy, Handler, HandlerValidationError, LocalAction, DEBOUNCE_MAX_MS,
             HANDLER_MAX_RECURSION_DEPTH, HANDLER_MAX_TOTAL_STEPS, SEQUENCE_MAX_ITEMS,
         },
+        panel::{
+            CloseReason, PanelClose, PanelError, PanelOpen, PanelOpenContext, PanelReady,
+            PanelReset, PanelShell, Viewport,
+        },
         patch::{PatchOp, PatchOpKind},
+        slot::{
+            CachePolicy, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility, StateEntry,
+        },
+        slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow},
         tokens::{
             BadgeVariant, Breakpoint, ButtonVariant, ChipVariant, CursorToken, Density,
             DrawerSide, IconSize, LiveRegion, NavigateTarget, RadiusToken, ScrollBehavior,
