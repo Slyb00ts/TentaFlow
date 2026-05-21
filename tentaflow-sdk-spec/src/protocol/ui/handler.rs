@@ -210,11 +210,9 @@ impl<C> Encode<C> for LocalAction {
                 path.encode(e, ctx)?;
             }
             LocalAction::Increment { path, delta } => {
-                // Canonical: delta(0x65..) < kind(0x64..)? No: 0x65 > 0x64.
-                // So kind < delta < path. Recheck:
-                //   "delta"=0x65 64..; "kind"=0x64 6b..; "path"=0x64 70..
-                // 0x64 < 0x65 so kind/path < delta. And kind < path.
-                // → kind, path, delta.
+                // Encoded keys with full byte prefix:
+                //   "kind"=0x64 6b.., "path"=0x64 70.., "delta"=0x65 64..
+                // Canonical sort: kind < path < delta.
                 e.map(3)?;
                 e.str("kind")?.str("increment")?;
                 e.str("path")?;
