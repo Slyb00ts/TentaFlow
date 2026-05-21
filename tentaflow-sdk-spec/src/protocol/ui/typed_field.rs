@@ -36,6 +36,39 @@ pub fn ensure_tag(actual: u16, expected: u16, name: &'static str) -> Result<(), 
     Ok(())
 }
 
+/// Validate that a `ComponentRef<X>` carries the exact catalog tag of `X`.
+/// Used on the encode path before pushing a nested-component field into a
+/// parent's FieldMap (catalog §6/§7 `ComponentRef<Button>` references).
+pub fn ensure_ref_tag_encode(
+    actual: u16,
+    expected: u16,
+    parent: &'static str,
+    field: &'static str,
+) -> Result<(), IntoComponentError> {
+    if actual != expected {
+        return Err(minicbor::encode::Error::message(format!(
+            "{parent}.{field}: ComponentRef tag mismatch (expected 0x{expected:04X}, got 0x{actual:04X})"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode-side counterpart of [`ensure_ref_tag_encode`] — verifies that a
+/// nested `Component` carries the catalog tag required for the parent field.
+pub fn ensure_ref_tag_decode(
+    actual: u16,
+    expected: u16,
+    parent: &'static str,
+    field: &'static str,
+) -> Result<(), minicbor::decode::Error> {
+    if actual != expected {
+        return Err(minicbor::decode::Error::message(format!(
+            "{parent}.{field}: ComponentRef tag mismatch (expected 0x{expected:04X}, got 0x{actual:04X})"
+        )));
+    }
+    Ok(())
+}
+
 /// Standard "missing required field" error.
 pub fn missing_field(comp: &'static str, field: &'static str) -> minicbor::decode::Error {
     minicbor::decode::Error::message(format!("{comp}: missing required field `{field}`"))
