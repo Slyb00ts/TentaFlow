@@ -36,6 +36,10 @@ pub use protocol::{
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
         action::{Action, ActionAck, ActionStatus, FieldError, FormFieldMap, FormFieldValue, ParamEntry},
+        actions::{
+            ActionBar, Button, ButtonGroup, Fab, FilterChips, IconButton, Link, LinkButton,
+            Menu, MenuButton, SegmentedControl, WizardFooter,
+        },
         bind::{BindRef, BindSpec, PathSegment, StatePath, MAX_STATE_PATH_SEGMENTS},
         command::Command,
         component::{
@@ -96,10 +100,12 @@ pub use protocol::{
         tokens::{
             AccordionMode, AreaStacking, AutocompleteHint, AvatarOverlap, AvatarShape, AvatarSize,
             AvatarStatus, BackgroundToken, BadgeVariant, BarStacking, BreadcrumbSeparator,
-            Breakpoint, BulletListVariant, ButtonVariant, CardVariant, CheckboxSize,
-            ChartAxisScale, ColorPickerVariant, FileCapture, FormFieldLayout, FormLayout,
-            InputMode, InputSize, InputType, RadioCardVariant, RadioGroupOrientation,
-            SearchVariant, SliderRowLayout, TimePrecision, ToggleSize, TogglePosition,
+            Breakpoint, BulletListVariant, ButtonGroupOrientation, ButtonSize, ButtonVariant,
+            CardVariant, CheckboxSize, ChartAxisScale, ColorPickerVariant, FabPosition, FabSize,
+            FileCapture, FilterChipsMode, FormFieldLayout, FormLayout,
+            InputMode, InputSize, InputType, LinkUnderline, MenuPlacement, RadioCardVariant,
+            RadioGroupOrientation, SearchVariant, SegmentSize, SliderRowLayout, TimePrecision,
+            ToggleSize, TogglePosition,
             ChartLegendAlign, ChartLegendPosition, ChartOrientation, ChartSeriesStyle,
             ChartZoomMode, ChipVariant, ColorToken, ColumnRender, CursorToken, DayOfWeek,
             Density, DiffVariant, DividerOrientation, DividerVariant, DlLayout, DrawerSide,
