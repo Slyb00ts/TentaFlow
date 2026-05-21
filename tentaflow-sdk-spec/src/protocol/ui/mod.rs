@@ -14,6 +14,8 @@ pub mod component;
 pub mod error_code;
 pub mod event;
 pub mod handler;
+pub mod icon_name;
+pub mod inline;
 pub mod panel;
 pub mod patch;
 pub mod slot;
