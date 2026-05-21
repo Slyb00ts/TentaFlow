@@ -269,3 +269,169 @@ mod tests {
         assert_eq!(NavigateTarget::SystemBrowser.as_str(), "system_browser");
     }
 }
+
+string_enum! {
+    /// Semantic color token (catalog §1.5).
+    pub enum ColorToken {
+        BackgroundDefault = "background_default",
+        BackgroundSubtle = "background_subtle",
+        BackgroundMuted = "background_muted",
+        SurfaceDefault = "surface_default",
+        SurfaceRaised = "surface_raised",
+        SurfaceOverlay = "surface_overlay",
+        BorderDefault = "border_default",
+        BorderStrong = "border_strong",
+        BorderSubtle = "border_subtle",
+        TextDefault = "text_default",
+        TextMuted = "text_muted",
+        TextInverse = "text_inverse",
+        AccentPrimary = "accent_primary",
+        AccentSecondary = "accent_secondary",
+        ToneNeutral = "tone_neutral",
+        ToneSuccess = "tone_success",
+        ToneWarning = "tone_warning",
+        ToneCritical = "tone_critical",
+        ToneInfo = "tone_info",
+    }
+}
+
+string_enum! {
+    /// Background fill token (catalog §1.5).
+    pub enum BackgroundToken {
+        None = "none",
+        Subtle = "subtle",
+        Muted = "muted",
+        Accent = "accent",
+        Inverse = "inverse",
+    }
+}
+
+string_enum! {
+    /// Flexbox cross-axis alignment (catalog §1.5 / §3).
+    pub enum FlexAlign {
+        Start = "start",
+        End = "end",
+        Center = "center",
+        Baseline = "baseline",
+        Stretch = "stretch",
+    }
+}
+
+string_enum! {
+    /// Flexbox main-axis distribution (catalog §1.5 / §3).
+    pub enum FlexJustify {
+        Start = "start",
+        End = "end",
+        Center = "center",
+        SpaceBetween = "space_between",
+        SpaceAround = "space_around",
+        SpaceEvenly = "space_evenly",
+    }
+}
+
+string_enum! {
+    /// Sort direction for Table columns (catalog §1.5 TableSort).
+    pub enum SortDirection {
+        Asc = "asc",
+        Desc = "desc",
+    }
+}
+
+string_enum! {
+    /// File upload lifecycle (catalog §1.5 FileMeta).
+    pub enum FileUploadStatus {
+        Queued = "queued",
+        Uploading = "uploading",
+        Complete = "complete",
+        Error = "error",
+    }
+}
+
+string_enum! {
+    /// Step status in WizardShell / StepDef (catalog §1.5).
+    pub enum StepStatus {
+        Pending = "pending",
+        Current = "current",
+        Complete = "complete",
+        Error = "error",
+        Skipped = "skipped",
+    }
+}
+
+string_enum! {
+    /// BottomSheet detent (catalog §1.5 SheetDetent).
+    pub enum SheetDetent {
+        Small = "small",
+        Medium = "medium",
+        Large = "large",
+        Full = "full",
+    }
+}
+
+string_enum! {
+    /// Chart series line style (catalog §1.5 ChartSeriesStyle).
+    pub enum ChartSeriesStyle {
+        Solid = "solid",
+        Dashed = "dashed",
+        Dotted = "dotted",
+    }
+}
+
+string_enum! {
+    /// Chart axis scale (catalog §1.5 ChartAxisScale).
+    pub enum ChartAxisScale {
+        Linear = "linear",
+        Log = "log",
+        Time = "time",
+        Category = "category",
+    }
+}
+
+string_enum! {
+    /// Chart legend position (catalog §1.5 ChartLegend).
+    pub enum ChartLegendPosition {
+        Top = "top",
+        Bottom = "bottom",
+        Left = "left",
+        Right = "right",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// Chart legend item alignment (catalog §1.5 ChartLegend).
+    pub enum ChartLegendAlign {
+        Start = "start",
+        Center = "center",
+        End = "end",
+    }
+}
+
+string_enum! {
+    /// Table column rendering hint (catalog §1.5 ColumnRender).
+    pub enum ColumnRender {
+        Text = "text",
+        Number = "number",
+        Currency = "currency",
+        Percent = "percent",
+        Bytes = "bytes",
+        Date = "date",
+        Time = "time",
+        Datetime = "datetime",
+        Relative = "relative",
+        Badge = "badge",
+        Chip = "chip",
+        Tag = "tag",
+        Avatar = "avatar",
+        AvatarGroup = "avatar_group",
+        Icon = "icon",
+        Stat = "stat",
+        Trend = "trend",
+        Progress = "progress",
+        Rating = "rating",
+        Actions = "actions",
+        Checkbox = "checkbox",
+        Boolean = "boolean",
+        CustomTemplate = "custom_template",
+    }
+}

@@ -235,8 +235,8 @@ ColorToken (enum, tstr):
 BackgroundToken (enum, tstr):
   "none" | "subtle" | "muted" | "accent" | "inverse"
 
-DimensionToken (discriminated union):
-  - "auto" | "full" | "fit_content"
+DimensionToken (discriminated union, always CBOR map z `kind` keyem):
+  - { kind: "auto" } | { kind: "full" } | { kind: "fit_content" }
   - { kind: "px", value: u32 }
   - { kind: "vh", value: u8 }                                               // viewport height %
   - { kind: "vw", value: u8 }                                               // viewport width %
@@ -244,8 +244,9 @@ DimensionToken (discriminated union):
   - { kind: "percent", value: u8 }
   - { kind: "spacing", value: Spacing }
 
-AspectRatio (discriminated union):
-  - "1:1" | "16:9" | "4:3" | "21:9" | "3:2" | "2:1" | "9:16" | "3:4"
+AspectRatio (discriminated union, always CBOR map z `kind` keyem):
+  - { kind: "1:1" } | { kind: "16:9" } | { kind: "4:3" } | { kind: "21:9" }
+  - { kind: "3:2" } | { kind: "2:1" } | { kind: "9:16" } | { kind: "3:4" }
   - { kind: "custom", ratio: f32 }                                          // width/height
 
 Trend:
@@ -476,8 +477,8 @@ TableColumn:
   hidden_by_default: bool
   sticky_left: bool                                                         // pinned-left
 
-TableColumnWidth (discriminated union):
-  - "auto" | "min_content" | "max_content"
+TableColumnWidth (discriminated union, always CBOR map z `kind`):
+  - { kind: "auto" } | { kind: "min_content" } | { kind: "max_content" }
   - { kind: "px", value: u32 }
   - { kind: "fr", value: u8 }
 
@@ -547,7 +548,7 @@ DefItem:
 DatePreset:
   id: tstr
   label: BindRef<tstr>
-  resolve: DatePresetResolve                                                // "today" | "yesterday" | "last_7_days" | "last_30_days" | "this_month" | "last_month" | { kind: "custom", offset_days: i32 }
+  resolve: DatePresetResolve                                                // discriminated union, always CBOR map z `kind`: {kind:"today"} | {kind:"yesterday"} | {kind:"last_7_days"} | {kind:"last_30_days"} | {kind:"this_month"} | {kind:"last_month"} | {kind:"custom", offset_days: i32}
 
 RangePreset:
   id: tstr
@@ -1296,7 +1297,7 @@ Scrollable area z opcjonalnymi sticky headers.
 ```
 Fields:
   0: orientation     ScrollOrientation              // "vertical" | "horizontal" | "both"
-  1: height          DimensionToken                 // "auto" | "full" | { "px": u32 } | { "vh": u8 }
+  1: height          DimensionToken                 // schema in §1.5 — always CBOR map z `kind`
   2: max_height      DimensionToken or null
   3: children        array<Component>
   4: sticky_header_slot tstr or null
@@ -1562,7 +1563,7 @@ TableColumn:
   id: tstr
   header: BindRef<tstr>
   field_path: array<PathSegment>                       // relative to row
-  width: TableColumnWidth                              // "auto" | { "px": u32 } | { "fr": u8 } | "min_content" | "max_content"
+  width: TableColumnWidth                              // schema w §1.5 — always CBOR map z `kind`
   render: ColumnRender                                 // "text" | "number" | "currency" | "badge" | "chip" | "avatar" | "icon" | "stat" | "actions" | "custom_component"
   format: ValueFormat or null
   align: TextAlign or null
@@ -1714,7 +1715,7 @@ Fields:
   0: rows            array<HeatmapRow>                // { id, label }
   1: columns         array<HeatmapColumn>             // { id, label }
   2: cells_path      StatePath                        // array<{ row_id, col_id, value, tone? }>
-  3: scale           HeatmapScale                     // { kind: "linear", min: f64, max: f64 } | { kind: "logarithmic" } | { kind: "categorical", buckets: array<{value, tone, label}> }
+  3: scale           HeatmapScale                     // schema w §1.5 — linear { min, max, color_from, color_to } | logarithmic { min, max, base } | categorical { buckets: array<HeatmapBucket{threshold, tone, label?}> }
   4: legend_position HeatmapLegendPosition            // "top_right" | "bottom" | "none"
   5: cell_size_px    u16
   6: tooltip         bool
@@ -1868,7 +1869,7 @@ Fields:
   2: width           DimensionToken or null
   3: height          DimensionToken or null
   4: fit             ImageFit                         // "cover" | "contain" | "fill" | "none"
-  5: aspect_ratio    AspectRatio or null              // "1:1" | "16:9" | "4:3" | "21:9" | { ratio: f32 }
+  5: aspect_ratio    AspectRatio or null              // schema in §1.5 — always CBOR map z `kind`
   6: radius          RadiusToken or null
   7: clickable       bool
   8: lazy_load       bool
@@ -3157,7 +3158,7 @@ Fields:
   6: show_timestamps bool
   7: show_source     bool                              // origin column
   8: copyable        bool                              // line copy
-  9: height          DimensionToken                    // default "full"
+  9: height          DimensionToken                    // schema w §1.5; default {kind:"full"}
   10: max_height     DimensionToken or null
   11: density        Density
 Handlers:

@@ -938,3 +938,1659 @@ mod tests {
         });
     }
 }
+
+// -----------------------------------------------------------------------------
+// Form items: RadioOption, RadioCardOption, SliderMark
+// -----------------------------------------------------------------------------
+
+/// Option inside a `RadioGroup` (catalog §1.5).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RadioOption {
+    #[n(0)]
+    pub value: SelectValue,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub hint: Option<BindRef>,
+    #[n(3)]
+    pub disabled: bool,
+}
+
+/// Card-style radio option for `RadioCardGroup`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RadioCardOption {
+    #[n(0)]
+    pub value: SelectValue,
+    #[n(1)]
+    pub icon: IconRef,
+    #[n(2)]
+    pub title: BindRef,
+    #[n(3)]
+    pub description: Option<BindRef>,
+    #[n(4)]
+    pub badge: Option<InlineBadge>,
+    #[n(5)]
+    pub disabled: bool,
+}
+
+/// Visible mark on a Slider track.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct SliderMark {
+    #[n(0)]
+    pub value: f64,
+    #[n(1)]
+    pub label: Option<BindRef>,
+}
+
+// -----------------------------------------------------------------------------
+// Layout: GridChild (uses Component — handled inline)
+// -----------------------------------------------------------------------------
+
+/// Cell in a `Grid` layout — wraps a child Component with span/positioning.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct GridChild {
+    #[n(0)]
+    pub component: super::component::Component,
+    #[n(1)]
+    pub col_span: u8,
+    #[n(2)]
+    pub row_span: u8,
+    #[n(3)]
+    pub col_start: Option<u8>,
+    #[n(4)]
+    pub row_start: Option<u8>,
+    #[n(5)]
+    pub align_self: Option<super::tokens::FlexAlign>,
+    #[n(6)]
+    pub justify_self: Option<super::tokens::FlexJustify>,
+}
+
+// -----------------------------------------------------------------------------
+// Data: KvItem
+// -----------------------------------------------------------------------------
+
+/// Item in a `KeyValue` list.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct KvItem {
+    #[n(0)]
+    pub label: BindRef,
+    #[n(1)]
+    pub value: BindRef,
+    #[n(2)]
+    pub hint: Option<BindRef>,
+    #[n(3)]
+    pub icon: Option<IconRef>,
+    #[n(4)]
+    pub action_id: Option<String>,
+    #[n(5)]
+    pub format: Option<super::value_format::ValueFormat>,
+}
+
+// -----------------------------------------------------------------------------
+// Wizard / Feature / Timeline / Accordion / Alarm / Inbox / Decision
+// -----------------------------------------------------------------------------
+
+/// Step descriptor for `WizardShell`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct StepDef {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub optional: bool,
+    #[n(3)]
+    pub status: Option<BindRef>,
+    #[n(4)]
+    pub description: Option<BindRef>,
+}
+
+/// Item in a `FeatureList`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct FeatureItem {
+    #[n(0)]
+    pub icon: IconRef,
+    #[n(1)]
+    pub title: BindRef,
+    #[n(2)]
+    pub description: Option<BindRef>,
+}
+
+/// Item in a `Timeline` component.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct TimelineItem {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub ts_ms: i64,
+    #[n(2)]
+    pub title: BindRef,
+    #[n(3)]
+    pub description: Option<BindRef>,
+    #[n(4)]
+    pub icon: Option<IconRef>,
+    #[n(5)]
+    pub tone: Option<Tone>,
+    #[n(6)]
+    pub action_id: Option<String>,
+}
+
+/// Item in an `Accordion`. Body is a `Vec<Component>` of arbitrary children.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct AccordionItem {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub header: super::component::Component,
+    #[n(2)]
+    pub body: Vec<super::component::Component>,
+    #[n(3)]
+    pub default_expanded: bool,
+}
+
+/// Item in an `AlarmList`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct AlarmItem {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub ts_ms: i64,
+    #[n(2)]
+    pub tone: Tone,
+    #[n(3)]
+    pub title: BindRef,
+    #[n(4)]
+    pub description: Option<BindRef>,
+    #[n(5)]
+    pub icon: Option<IconRef>,
+    #[n(6)]
+    pub action_id: Option<String>,
+    #[n(7)]
+    pub acknowledged: bool,
+}
+
+/// Item in an `Inbox` list.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct InboxItem {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub ts_ms: i64,
+    #[n(2)]
+    pub read: bool,
+    #[n(3)]
+    pub title: BindRef,
+    #[n(4)]
+    pub preview: Option<BindRef>,
+    #[n(5)]
+    pub avatar: Option<AvatarRef>,
+    #[n(6)]
+    pub badge: Option<InlineBadge>,
+    #[n(7)]
+    pub action_id: String,
+}
+
+/// Option presented to the user in a decision dialog (multi-card chooser).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct DecisionOption {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub icon: IconRef,
+    #[n(2)]
+    pub title: BindRef,
+    #[n(3)]
+    pub description: Option<BindRef>,
+    #[n(4)]
+    pub tone: Option<Tone>,
+    #[n(5)]
+    pub disabled: bool,
+}
+
+// -----------------------------------------------------------------------------
+// Permission / Role / Map / Graph / Segment / FilterChip / Heatmap / Gauge / Stack
+// -----------------------------------------------------------------------------
+
+/// Permission catalog entry (used in `PermissionMatrix`).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct PermissionDef {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub description: Option<BindRef>,
+    #[n(3)]
+    pub category: Option<String>,
+}
+
+/// Role catalog entry (used in `PermissionMatrix`).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RoleDef {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub color: Option<Tone>,
+    #[n(3)]
+    pub description: Option<BindRef>,
+}
+
+/// Pin on a `MapView`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct MapMarker {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub lat: f64,
+    #[n(2)]
+    pub lng: f64,
+    #[n(3)]
+    pub icon: Option<IconRef>,
+    #[n(4)]
+    pub label: Option<BindRef>,
+    #[n(5)]
+    pub tone: Option<Tone>,
+    #[n(6)]
+    pub popup_content: Option<BindRef>,
+}
+
+/// Node in a `RelationGraph`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct GraphNode {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub node_type: String,
+    #[n(3)]
+    pub icon: Option<IconRef>,
+    #[n(4)]
+    pub tone: Option<Tone>,
+}
+
+/// Edge in a `RelationGraph`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct GraphEdge {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub source_id: String,
+    #[n(2)]
+    pub target_id: String,
+    #[n(3)]
+    pub label: Option<BindRef>,
+    #[n(4)]
+    pub weight: Option<f32>,
+    #[n(5)]
+    pub tone: Option<Tone>,
+}
+
+/// Option in a `SegmentedControl`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct SegmentOption {
+    #[n(0)]
+    pub value: SelectValue,
+    #[n(1)]
+    pub label: Option<BindRef>,
+    #[n(2)]
+    pub icon: Option<IconRef>,
+    #[n(3)]
+    pub badge: Option<InlineBadge>,
+}
+
+/// Definition of a chip in a `FilterChipBar`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct FilterChipDef {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub icon: Option<IconRef>,
+    #[n(3)]
+    pub badge: Option<InlineBadge>,
+    #[n(4)]
+    pub count_path: Option<StatePath>,
+}
+
+/// Row label in a `Heatmap`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct HeatmapRow {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+}
+
+/// Column label in a `Heatmap`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct HeatmapColumn {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+}
+
+/// Bucket in a categorical Heatmap scale.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct HeatmapBucket {
+    #[n(0)]
+    pub threshold: f64,
+    #[n(1)]
+    pub tone: Tone,
+    #[n(2)]
+    pub label: Option<BindRef>,
+}
+
+/// Threshold tick on a `Gauge`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct GaugeThreshold {
+    #[n(0)]
+    pub value: f32,
+    #[n(1)]
+    pub tone: Tone,
+    #[n(2)]
+    pub label: Option<BindRef>,
+}
+
+/// Segment in a `StackedBar`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct StackSegment {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub value: BindRef,
+    #[n(2)]
+    pub label: Option<BindRef>,
+    #[n(3)]
+    pub tone: Tone,
+}
+
+/// Entry in a `DataDefinitionList`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct DefItem {
+    #[n(0)]
+    pub term: BindRef,
+    #[n(1)]
+    pub definition: BindRef,
+}
+
+// -----------------------------------------------------------------------------
+// File / Date / Range
+// -----------------------------------------------------------------------------
+
+/// FileInput row state (catalog §1.5 FileMeta).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct FileMeta {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub name: String,
+    #[n(2)]
+    pub size_bytes: u64,
+    #[n(3)]
+    pub mime: String,
+    #[n(4)]
+    pub ts_ms: i64,
+    /// Upload progress 0.0..=1.0.
+    #[n(5)]
+    pub upload_progress: f32,
+    #[n(6)]
+    pub status: super::tokens::FileUploadStatus,
+    #[n(7)]
+    pub signed_url_ref: Option<String>,
+    #[n(8)]
+    pub error_message: Option<String>,
+}
+
+/// Calendar range preset's inline range descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct RangePresetRange {
+    #[n(0)]
+    pub from_offset_days: i32,
+    #[n(1)]
+    pub to_offset_days: i32,
+}
+
+/// Preset entry for a Range/`DateRangePicker`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RangePreset {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub range: RangePresetRange,
+}
+
+// -----------------------------------------------------------------------------
+// Chart family — leaf structs (sub-enums already declared in tokens.rs)
+// -----------------------------------------------------------------------------
+
+/// One data series in a chart.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct ChartSeries {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub name: BindRef,
+    #[n(2)]
+    pub data_path: StatePath,
+    #[n(3)]
+    pub tone: Option<Tone>,
+    #[n(4)]
+    pub style: super::tokens::ChartSeriesStyle,
+    #[n(5)]
+    pub show_in_legend: bool,
+}
+
+/// Chart axis descriptor.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct ChartAxis {
+    #[n(0)]
+    pub label: Option<BindRef>,
+    #[n(1)]
+    pub format: Option<super::value_format::ValueFormat>,
+    #[n(2)]
+    pub min: Option<f64>,
+    #[n(3)]
+    pub max: Option<f64>,
+    /// Suggested tick count (renderer hint).
+    #[n(4)]
+    pub ticks: Option<u8>,
+    #[n(5)]
+    pub scale: super::tokens::ChartAxisScale,
+}
+
+/// Chart legend configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct ChartLegend {
+    #[n(0)]
+    pub position: super::tokens::ChartLegendPosition,
+    #[n(1)]
+    pub alignment: super::tokens::ChartLegendAlign,
+}
+
+/// Chart tooltip configuration.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct ChartTooltip {
+    #[n(0)]
+    pub enabled: bool,
+    #[n(1)]
+    pub format: Option<super::value_format::ValueFormat>,
+}
+
+// -----------------------------------------------------------------------------
+// Table family — TablePagination, TableSort, TableColumn
+// -----------------------------------------------------------------------------
+
+/// Pagination config for a Table.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct TablePagination {
+    #[n(0)]
+    pub page_size: u32,
+    /// Bound u32 (current 1-based page index).
+    #[n(1)]
+    pub current_page_path: StatePath,
+    #[n(2)]
+    pub show_size_picker: bool,
+}
+
+/// Active sort hint for a Table.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct TableSort {
+    #[n(0)]
+    pub column_id: String,
+    #[n(1)]
+    pub direction: super::tokens::SortDirection,
+}
+
+/// Column descriptor for a Table.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct TableColumn {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub header: BindRef,
+    /// Path relative to a row; segments-array (not StatePath because rooted at row).
+    #[n(2)]
+    pub field_path: Vec<super::bind::PathSegment>,
+    #[n(3)]
+    pub width: TableColumnWidth,
+    #[n(4)]
+    pub render: super::tokens::ColumnRender,
+    #[n(5)]
+    pub format: Option<super::value_format::ValueFormat>,
+    #[n(6)]
+    pub align: Option<super::tokens::TextAlign>,
+    #[n(7)]
+    pub sortable: bool,
+    #[n(8)]
+    pub hidden_by_default: bool,
+    #[n(9)]
+    pub sticky_left: bool,
+}
+
+// -----------------------------------------------------------------------------
+// DimensionToken — discriminated union, always CBOR map z `kind`.
+// -----------------------------------------------------------------------------
+
+/// CSS dimension token (catalog §1.5). Always wire-encoded as a CBOR map with
+/// `kind` key — even for unit variants (`{kind:"auto"}`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DimensionToken {
+    Auto,
+    Full,
+    FitContent,
+    Px { value: u32 },
+    Vh { value: u8 },
+    Vw { value: u8 },
+    Fr { value: u8 },
+    Percent { value: u8 },
+    Spacing { value: super::tokens::Spacing },
+}
+
+impl<C> Encode<C> for DimensionToken {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        // Canonical key order: kind(0x64..) < value(0x65..).
+        match self {
+            DimensionToken::Auto => {
+                e.map(1)?;
+                e.str("kind")?.str("auto")?;
+            }
+            DimensionToken::Full => {
+                e.map(1)?;
+                e.str("kind")?.str("full")?;
+            }
+            DimensionToken::FitContent => {
+                e.map(1)?;
+                e.str("kind")?.str("fit_content")?;
+            }
+            DimensionToken::Px { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u32(*value)?;
+            }
+            DimensionToken::Vh { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("vh")?;
+                e.str("value")?.u8(*value)?;
+            }
+            DimensionToken::Vw { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("vw")?;
+                e.str("value")?.u8(*value)?;
+            }
+            DimensionToken::Fr { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("fr")?;
+                e.str("value")?.u8(*value)?;
+            }
+            DimensionToken::Percent { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("percent")?;
+                e.str("value")?.u8(*value)?;
+            }
+            DimensionToken::Spacing { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("spacing")?;
+                e.str("value")?;
+                value.encode(e, ctx)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for DimensionToken {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut value_raw: Option<Value> = None;
+        let mut spacing_value: Option<super::tokens::Spacing> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => kind = Some(d.str()?.to_string()),
+                "value" => match kind.as_deref() {
+                    Some("spacing") => {
+                        spacing_value = Some(super::tokens::Spacing::decode(d, ctx)?);
+                    }
+                    _ => value_raw = Some(Value::decode(d, ctx)?),
+                },
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown DimensionToken key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind
+            .ok_or_else(|| minicbor::decode::Error::message("DimensionToken missing kind"))?;
+        let need_no_value =
+            |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+                if has {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "DimensionToken.{k} must not carry value"
+                    )));
+                }
+                Ok(())
+            };
+        match kind.as_str() {
+            "auto" => {
+                need_no_value(value_raw.is_some() || spacing_value.is_some(), "auto")?;
+                Ok(DimensionToken::Auto)
+            }
+            "full" => {
+                need_no_value(value_raw.is_some() || spacing_value.is_some(), "full")?;
+                Ok(DimensionToken::Full)
+            }
+            "fit_content" => {
+                need_no_value(
+                    value_raw.is_some() || spacing_value.is_some(),
+                    "fit_content",
+                )?;
+                Ok(DimensionToken::FitContent)
+            }
+            other => {
+                let take_u = || -> Result<u64, minicbor::decode::Error> {
+                    match value_raw {
+                        Some(Value::U64(n)) => Ok(n),
+                        _ => Err(minicbor::decode::Error::message(
+                            "DimensionToken numeric variant requires u-integer value",
+                        )),
+                    }
+                };
+                match other {
+                    "px" => Ok(DimensionToken::Px {
+                        value: take_u()?.try_into().map_err(|_| {
+                            minicbor::decode::Error::message("DimensionToken.px value out of u32 range")
+                        })?,
+                    }),
+                    "vh" => Ok(DimensionToken::Vh {
+                        value: take_u()?.try_into().map_err(|_| {
+                            minicbor::decode::Error::message("DimensionToken.vh value out of u8 range")
+                        })?,
+                    }),
+                    "vw" => Ok(DimensionToken::Vw {
+                        value: take_u()?.try_into().map_err(|_| {
+                            minicbor::decode::Error::message("DimensionToken.vw value out of u8 range")
+                        })?,
+                    }),
+                    "fr" => Ok(DimensionToken::Fr {
+                        value: take_u()?.try_into().map_err(|_| {
+                            minicbor::decode::Error::message("DimensionToken.fr value out of u8 range")
+                        })?,
+                    }),
+                    "percent" => Ok(DimensionToken::Percent {
+                        value: take_u()?.try_into().map_err(|_| {
+                            minicbor::decode::Error::message("DimensionToken.percent value out of u8 range")
+                        })?,
+                    }),
+                    "spacing" => Ok(DimensionToken::Spacing {
+                        value: spacing_value.ok_or_else(|| {
+                            minicbor::decode::Error::message(
+                                "DimensionToken.spacing missing value",
+                            )
+                        })?,
+                    }),
+                    other => Err(minicbor::decode::Error::message(format!(
+                        "unknown DimensionToken.kind: {other}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AspectRatio — discriminated union, always CBOR map z `kind`.
+// -----------------------------------------------------------------------------
+
+/// Aspect-ratio token (catalog §1.5). Always wire-encoded as `{kind: "1:1"|"16:9"|...}`
+/// or `{kind: "custom", ratio: f32}`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AspectRatio {
+    R1To1,
+    R16To9,
+    R4To3,
+    R21To9,
+    R3To2,
+    R2To1,
+    R9To16,
+    R3To4,
+    Custom { ratio: f32 },
+}
+
+impl AspectRatio {
+    const fn wire_kind(self) -> &'static str {
+        match self {
+            Self::R1To1 => "1:1",
+            Self::R16To9 => "16:9",
+            Self::R4To3 => "4:3",
+            Self::R21To9 => "21:9",
+            Self::R3To2 => "3:2",
+            Self::R2To1 => "2:1",
+            Self::R9To16 => "9:16",
+            Self::R3To4 => "3:4",
+            Self::Custom { .. } => "custom",
+        }
+    }
+}
+
+impl<C> Encode<C> for AspectRatio {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            AspectRatio::Custom { ratio } => {
+                e.map(2)?;
+                e.str("kind")?.str("custom")?;
+                e.str("ratio")?.f32(*ratio)?;
+            }
+            other => {
+                e.map(1)?;
+                e.str("kind")?.str(other.wire_kind())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for AspectRatio {
+    fn decode(
+        d: &mut Decoder<'b>,
+        _ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut ratio: Option<f32> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => kind = Some(d.str()?.to_string()),
+                "ratio" => ratio = Some(d.f32()?),
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown AspectRatio key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("AspectRatio missing kind"))?;
+        let no_ratio = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+            if has {
+                return Err(minicbor::decode::Error::message(format!(
+                    "AspectRatio.{k} must not carry ratio"
+                )));
+            }
+            Ok(())
+        };
+        match kind.as_str() {
+            "1:1" => {
+                no_ratio(ratio.is_some(), "1:1")?;
+                Ok(AspectRatio::R1To1)
+            }
+            "16:9" => {
+                no_ratio(ratio.is_some(), "16:9")?;
+                Ok(AspectRatio::R16To9)
+            }
+            "4:3" => {
+                no_ratio(ratio.is_some(), "4:3")?;
+                Ok(AspectRatio::R4To3)
+            }
+            "21:9" => {
+                no_ratio(ratio.is_some(), "21:9")?;
+                Ok(AspectRatio::R21To9)
+            }
+            "3:2" => {
+                no_ratio(ratio.is_some(), "3:2")?;
+                Ok(AspectRatio::R3To2)
+            }
+            "2:1" => {
+                no_ratio(ratio.is_some(), "2:1")?;
+                Ok(AspectRatio::R2To1)
+            }
+            "9:16" => {
+                no_ratio(ratio.is_some(), "9:16")?;
+                Ok(AspectRatio::R9To16)
+            }
+            "3:4" => {
+                no_ratio(ratio.is_some(), "3:4")?;
+                Ok(AspectRatio::R3To4)
+            }
+            "custom" => Ok(AspectRatio::Custom {
+                ratio: ratio.ok_or_else(|| {
+                    minicbor::decode::Error::message("AspectRatio.custom missing ratio")
+                })?,
+            }),
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown AspectRatio.kind: {other}"
+            ))),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TableColumnWidth — discriminated union.
+// -----------------------------------------------------------------------------
+
+/// Width spec for a TableColumn (catalog §1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableColumnWidth {
+    Auto,
+    MinContent,
+    MaxContent,
+    Px { value: u32 },
+    Fr { value: u8 },
+}
+
+impl<C> Encode<C> for TableColumnWidth {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            TableColumnWidth::Auto => {
+                e.map(1)?;
+                e.str("kind")?.str("auto")?;
+            }
+            TableColumnWidth::MinContent => {
+                e.map(1)?;
+                e.str("kind")?.str("min_content")?;
+            }
+            TableColumnWidth::MaxContent => {
+                e.map(1)?;
+                e.str("kind")?.str("max_content")?;
+            }
+            TableColumnWidth::Px { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u32(*value)?;
+            }
+            TableColumnWidth::Fr { value } => {
+                e.map(2)?;
+                e.str("kind")?.str("fr")?;
+                e.str("value")?.u8(*value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for TableColumnWidth {
+    fn decode(
+        d: &mut Decoder<'b>,
+        _ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut value: Option<u64> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => kind = Some(d.str()?.to_string()),
+                "value" => value = Some(d.u64()?),
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown TableColumnWidth key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind
+            .ok_or_else(|| minicbor::decode::Error::message("TableColumnWidth missing kind"))?;
+        let no_val = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+            if has {
+                return Err(minicbor::decode::Error::message(format!(
+                    "TableColumnWidth.{k} must not carry value"
+                )));
+            }
+            Ok(())
+        };
+        match kind.as_str() {
+            "auto" => {
+                no_val(value.is_some(), "auto")?;
+                Ok(TableColumnWidth::Auto)
+            }
+            "min_content" => {
+                no_val(value.is_some(), "min_content")?;
+                Ok(TableColumnWidth::MinContent)
+            }
+            "max_content" => {
+                no_val(value.is_some(), "max_content")?;
+                Ok(TableColumnWidth::MaxContent)
+            }
+            "px" => Ok(TableColumnWidth::Px {
+                value: value
+                    .ok_or_else(|| {
+                        minicbor::decode::Error::message("TableColumnWidth.px missing value")
+                    })?
+                    .try_into()
+                    .map_err(|_| {
+                        minicbor::decode::Error::message(
+                            "TableColumnWidth.px value out of u32 range",
+                        )
+                    })?,
+            }),
+            "fr" => Ok(TableColumnWidth::Fr {
+                value: value
+                    .ok_or_else(|| {
+                        minicbor::decode::Error::message("TableColumnWidth.fr missing value")
+                    })?
+                    .try_into()
+                    .map_err(|_| {
+                        minicbor::decode::Error::message(
+                            "TableColumnWidth.fr value out of u8 range",
+                        )
+                    })?,
+            }),
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown TableColumnWidth.kind: {other}"
+            ))),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// HeatmapScale — discriminated union.
+// -----------------------------------------------------------------------------
+
+/// Color-mapping scale for a `Heatmap`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeatmapScale {
+    Linear {
+        min: f64,
+        max: f64,
+        color_from: Tone,
+        color_to: Tone,
+    },
+    Logarithmic {
+        min: f64,
+        max: f64,
+        base: f64,
+    },
+    Categorical {
+        buckets: Vec<HeatmapBucket>,
+    },
+}
+
+impl<C> Encode<C> for HeatmapScale {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            HeatmapScale::Linear {
+                min,
+                max,
+                color_from,
+                color_to,
+            } => {
+                // Keys with full encoded prefix:
+                //   "max"=0x63 6d 61.., "min"=0x63 6d 69..,
+                //   "kind"=0x64 6b.., "color_to"=0x68 63.., "color_from"=0x6a 63..
+                // Canonical sort: max < min < kind < color_to < color_from.
+                e.map(5)?;
+                e.str("max")?.f64(*max)?;
+                e.str("min")?.f64(*min)?;
+                e.str("kind")?.str("linear")?;
+                e.str("color_to")?;
+                color_to.encode(e, ctx)?;
+                e.str("color_from")?;
+                color_from.encode(e, ctx)?;
+            }
+            HeatmapScale::Logarithmic { min, max, base } => {
+                // Keys: base(0x64..), kind(0x64..), max(0x63..), min(0x63..).
+                // Sort: max(0x63 6d 61) < min(0x63 6d 69) < base(0x64 62) < kind(0x64 6b).
+                e.map(4)?;
+                e.str("max")?.f64(*max)?;
+                e.str("min")?.f64(*min)?;
+                e.str("base")?.f64(*base)?;
+                e.str("kind")?.str("logarithmic")?;
+            }
+            HeatmapScale::Categorical { buckets } => {
+                // Keys: buckets(0x67..), kind(0x64..). Sort: kind < buckets.
+                e.map(2)?;
+                e.str("kind")?.str("categorical")?;
+                e.str("buckets")?;
+                e.array(buckets.len() as u64)?;
+                for b in buckets {
+                    b.encode(e, ctx)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for HeatmapScale {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut min: Option<f64> = None;
+        let mut max: Option<f64> = None;
+        let mut color_from: Option<Tone> = None;
+        let mut color_to: Option<Tone> = None;
+        let mut base: Option<f64> = None;
+        let mut buckets: Option<Vec<HeatmapBucket>> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => kind = Some(d.str()?.to_string()),
+                "min" => min = Some(d.f64()?),
+                "max" => max = Some(d.f64()?),
+                "color_from" => color_from = Some(Tone::decode(d, ctx)?),
+                "color_to" => color_to = Some(Tone::decode(d, ctx)?),
+                "base" => base = Some(d.f64()?),
+                "buckets" => {
+                    let n = d.array()?.ok_or_else(|| {
+                        minicbor::decode::Error::message("indefinite-length array forbidden")
+                    })?;
+                    let mut v = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        v.push(HeatmapBucket::decode(d, ctx)?);
+                    }
+                    buckets = Some(v);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown HeatmapScale key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind
+            .ok_or_else(|| minicbor::decode::Error::message("HeatmapScale missing kind"))?;
+        match kind.as_str() {
+            "linear" => {
+                if base.is_some() || buckets.is_some() {
+                    return Err(minicbor::decode::Error::message(
+                        "HeatmapScale.linear must not carry base/buckets",
+                    ));
+                }
+                Ok(HeatmapScale::Linear {
+                    min: min.ok_or_else(|| {
+                        minicbor::decode::Error::message("HeatmapScale.linear missing min")
+                    })?,
+                    max: max.ok_or_else(|| {
+                        minicbor::decode::Error::message("HeatmapScale.linear missing max")
+                    })?,
+                    color_from: color_from.ok_or_else(|| {
+                        minicbor::decode::Error::message(
+                            "HeatmapScale.linear missing color_from",
+                        )
+                    })?,
+                    color_to: color_to.ok_or_else(|| {
+                        minicbor::decode::Error::message("HeatmapScale.linear missing color_to")
+                    })?,
+                })
+            }
+            "logarithmic" => {
+                if color_from.is_some() || color_to.is_some() || buckets.is_some() {
+                    return Err(minicbor::decode::Error::message(
+                        "HeatmapScale.logarithmic must not carry color_from/color_to/buckets",
+                    ));
+                }
+                Ok(HeatmapScale::Logarithmic {
+                    min: min.ok_or_else(|| {
+                        minicbor::decode::Error::message("HeatmapScale.logarithmic missing min")
+                    })?,
+                    max: max.ok_or_else(|| {
+                        minicbor::decode::Error::message("HeatmapScale.logarithmic missing max")
+                    })?,
+                    base: base.ok_or_else(|| {
+                        minicbor::decode::Error::message(
+                            "HeatmapScale.logarithmic missing base",
+                        )
+                    })?,
+                })
+            }
+            "categorical" => {
+                if min.is_some() || max.is_some() || color_from.is_some() || color_to.is_some() || base.is_some() {
+                    return Err(minicbor::decode::Error::message(
+                        "HeatmapScale.categorical must only carry buckets",
+                    ));
+                }
+                Ok(HeatmapScale::Categorical {
+                    buckets: buckets.ok_or_else(|| {
+                        minicbor::decode::Error::message(
+                            "HeatmapScale.categorical missing buckets",
+                        )
+                    })?,
+                })
+            }
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown HeatmapScale.kind: {other}"
+            ))),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// DatePresetResolve + DatePreset
+// -----------------------------------------------------------------------------
+
+/// How a `DatePreset` resolves to an actual date (catalog §1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePresetResolve {
+    Today,
+    Yesterday,
+    Last7Days,
+    Last30Days,
+    ThisMonth,
+    LastMonth,
+    Custom { offset_days: i32 },
+}
+
+impl<C> Encode<C> for DatePresetResolve {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        match self {
+            DatePresetResolve::Today => {
+                e.map(1)?;
+                e.str("kind")?.str("today")?;
+            }
+            DatePresetResolve::Yesterday => {
+                e.map(1)?;
+                e.str("kind")?.str("yesterday")?;
+            }
+            DatePresetResolve::Last7Days => {
+                e.map(1)?;
+                e.str("kind")?.str("last_7_days")?;
+            }
+            DatePresetResolve::Last30Days => {
+                e.map(1)?;
+                e.str("kind")?.str("last_30_days")?;
+            }
+            DatePresetResolve::ThisMonth => {
+                e.map(1)?;
+                e.str("kind")?.str("this_month")?;
+            }
+            DatePresetResolve::LastMonth => {
+                e.map(1)?;
+                e.str("kind")?.str("last_month")?;
+            }
+            DatePresetResolve::Custom { offset_days } => {
+                // Keys: kind(0x64..), offset_days(0x6b..). Sort: kind < offset_days.
+                e.map(2)?;
+                e.str("kind")?.str("custom")?;
+                e.str("offset_days")?.i32(*offset_days)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for DatePresetResolve {
+    fn decode(
+        d: &mut Decoder<'b>,
+        _ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut offset_days: Option<i32> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => kind = Some(d.str()?.to_string()),
+                "offset_days" => offset_days = Some(d.i32()?),
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown DatePresetResolve key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| {
+            minicbor::decode::Error::message("DatePresetResolve missing kind")
+        })?;
+        let no_offset = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+            if has {
+                return Err(minicbor::decode::Error::message(format!(
+                    "DatePresetResolve.{k} must not carry offset_days"
+                )));
+            }
+            Ok(())
+        };
+        match kind.as_str() {
+            "today" => {
+                no_offset(offset_days.is_some(), "today")?;
+                Ok(DatePresetResolve::Today)
+            }
+            "yesterday" => {
+                no_offset(offset_days.is_some(), "yesterday")?;
+                Ok(DatePresetResolve::Yesterday)
+            }
+            "last_7_days" => {
+                no_offset(offset_days.is_some(), "last_7_days")?;
+                Ok(DatePresetResolve::Last7Days)
+            }
+            "last_30_days" => {
+                no_offset(offset_days.is_some(), "last_30_days")?;
+                Ok(DatePresetResolve::Last30Days)
+            }
+            "this_month" => {
+                no_offset(offset_days.is_some(), "this_month")?;
+                Ok(DatePresetResolve::ThisMonth)
+            }
+            "last_month" => {
+                no_offset(offset_days.is_some(), "last_month")?;
+                Ok(DatePresetResolve::LastMonth)
+            }
+            "custom" => Ok(DatePresetResolve::Custom {
+                offset_days: offset_days.ok_or_else(|| {
+                    minicbor::decode::Error::message(
+                        "DatePresetResolve.custom missing offset_days",
+                    )
+                })?,
+            }),
+            other => Err(minicbor::decode::Error::message(format!(
+                "unknown DatePresetResolve.kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// Preset entry for a Date picker.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct DatePreset {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub label: BindRef,
+    #[n(2)]
+    pub resolve: DatePresetResolve,
+}
+
+#[cfg(test)]
+mod tests_chunk_1_7b {
+    use super::*;
+    use crate::protocol::ui::component::{Component, FieldMap};
+    use crate::protocol::ui::tokens::{
+        ChartAxisScale, ChartLegendAlign, ChartLegendPosition, ChartSeriesStyle, ColumnRender,
+        FileUploadStatus, FlexAlign, FlexJustify, SortDirection, Spacing, TextAlign,
+    };
+
+    fn rt<T>(v: T)
+    where
+        T: minicbor::Encode<()>
+            + for<'b> minicbor::Decode<'b, ()>
+            + PartialEq
+            + core::fmt::Debug,
+    {
+        let mut b1 = Vec::new();
+        minicbor::encode(&v, &mut b1).unwrap();
+        let d: T = minicbor::decode(&b1).unwrap();
+        assert_eq!(d, v);
+        let mut b2 = Vec::new();
+        minicbor::encode(&d, &mut b2).unwrap();
+        assert_eq!(b1, b2);
+    }
+
+    fn empty_comp() -> Component {
+        Component {
+            tag: 0x0001,
+            id: "r".into(),
+            fields: FieldMap::default(),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
+        }
+    }
+
+    #[test]
+    fn dimension_token_all_variants_roundtrip() {
+        rt(DimensionToken::Auto);
+        rt(DimensionToken::Full);
+        rt(DimensionToken::FitContent);
+        rt(DimensionToken::Px { value: 42 });
+        rt(DimensionToken::Vh { value: 80 });
+        rt(DimensionToken::Vw { value: 50 });
+        rt(DimensionToken::Fr { value: 2 });
+        rt(DimensionToken::Percent { value: 75 });
+        rt(DimensionToken::Spacing { value: Spacing::Md });
+    }
+
+    #[test]
+    fn dimension_token_auto_with_value_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap();
+        enc.str("kind").unwrap().str("auto").unwrap();
+        enc.str("value").unwrap().u32(1).unwrap();
+        let res: Result<DimensionToken, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn aspect_ratio_all_variants_roundtrip() {
+        for r in [
+            AspectRatio::R1To1,
+            AspectRatio::R16To9,
+            AspectRatio::R4To3,
+            AspectRatio::R21To9,
+            AspectRatio::R3To2,
+            AspectRatio::R2To1,
+            AspectRatio::R9To16,
+            AspectRatio::R3To4,
+        ] {
+            rt(r);
+        }
+        rt(AspectRatio::Custom { ratio: 1.618 });
+    }
+
+    #[test]
+    fn aspect_ratio_unit_with_ratio_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap();
+        enc.str("kind").unwrap().str("1:1").unwrap();
+        enc.str("ratio").unwrap().f32(2.0).unwrap();
+        let res: Result<AspectRatio, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn table_column_width_variants_roundtrip() {
+        rt(TableColumnWidth::Auto);
+        rt(TableColumnWidth::MinContent);
+        rt(TableColumnWidth::MaxContent);
+        rt(TableColumnWidth::Px { value: 200 });
+        rt(TableColumnWidth::Fr { value: 1 });
+    }
+
+    #[test]
+    fn heatmap_scale_variants_roundtrip() {
+        rt(HeatmapScale::Linear {
+            min: 0.0,
+            max: 100.0,
+            color_from: Tone::Info,
+            color_to: Tone::Critical,
+        });
+        rt(HeatmapScale::Logarithmic {
+            min: 1.0,
+            max: 1000.0,
+            base: 10.0,
+        });
+        rt(HeatmapScale::Categorical {
+            buckets: vec![HeatmapBucket {
+                threshold: 50.0,
+                tone: Tone::Warning,
+                label: None,
+            }],
+        });
+    }
+
+    #[test]
+    fn date_preset_resolve_variants_roundtrip() {
+        for r in [
+            DatePresetResolve::Today,
+            DatePresetResolve::Yesterday,
+            DatePresetResolve::Last7Days,
+            DatePresetResolve::Last30Days,
+            DatePresetResolve::ThisMonth,
+            DatePresetResolve::LastMonth,
+        ] {
+            rt(r);
+        }
+        rt(DatePresetResolve::Custom { offset_days: -7 });
+    }
+
+    #[test]
+    fn simple_struct_smoke_roundtrips() {
+        use crate::protocol::ui::bind::PathSegment;
+        use crate::protocol::value::Value;
+
+        rt(RadioOption {
+            value: SelectValue::Text("a".into()),
+            label: BindRef::Literal(Value::Text("A".into())),
+            hint: None,
+            disabled: false,
+        });
+        rt(SliderMark {
+            value: 50.0,
+            label: None,
+        });
+        rt(KvItem {
+            label: BindRef::Literal(Value::Text("L".into())),
+            value: BindRef::Literal(Value::U64(1)),
+            hint: None,
+            icon: None,
+            action_id: None,
+            format: None,
+        });
+        rt(StepDef {
+            id: "s1".into(),
+            label: BindRef::Literal(Value::Text("Step".into())),
+            optional: false,
+            status: None,
+            description: None,
+        });
+        rt(AccordionItem {
+            id: "a".into(),
+            header: empty_comp(),
+            body: vec![empty_comp()],
+            default_expanded: true,
+        });
+        rt(InboxItem {
+            id: "i".into(),
+            ts_ms: 1,
+            read: false,
+            title: BindRef::Literal(Value::Text("T".into())),
+            preview: None,
+            avatar: None,
+            badge: None,
+            action_id: "open".into(),
+        });
+        rt(MapMarker {
+            id: "m".into(),
+            lat: 52.0,
+            lng: 21.0,
+            icon: None,
+            label: None,
+            tone: None,
+            popup_content: None,
+        });
+        rt(TableColumn {
+            id: "c1".into(),
+            header: BindRef::Literal(Value::Text("Name".into())),
+            field_path: vec![PathSegment::Key("name".into())],
+            width: TableColumnWidth::Auto,
+            render: ColumnRender::Text,
+            format: None,
+            align: Some(TextAlign::Start),
+            sortable: true,
+            hidden_by_default: false,
+            sticky_left: true,
+        });
+        rt(ChartSeries {
+            id: "s".into(),
+            name: BindRef::Literal(Value::Text("X".into())),
+            data_path: StatePath::default(),
+            tone: None,
+            style: ChartSeriesStyle::Solid,
+            show_in_legend: true,
+        });
+        rt(ChartAxis {
+            label: None,
+            format: None,
+            min: None,
+            max: None,
+            ticks: None,
+            scale: ChartAxisScale::Linear,
+        });
+        rt(ChartLegend {
+            position: ChartLegendPosition::Bottom,
+            alignment: ChartLegendAlign::Center,
+        });
+        rt(ChartTooltip {
+            enabled: true,
+            format: None,
+        });
+        rt(GridChild {
+            component: empty_comp(),
+            col_span: 1,
+            row_span: 1,
+            col_start: None,
+            row_start: None,
+            align_self: Some(FlexAlign::Center),
+            justify_self: Some(FlexJustify::SpaceBetween),
+        });
+        rt(FileMeta {
+            id: "f".into(),
+            name: "x.txt".into(),
+            size_bytes: 100,
+            mime: "text/plain".into(),
+            ts_ms: 0,
+            upload_progress: 0.5,
+            status: FileUploadStatus::Uploading,
+            signed_url_ref: None,
+            error_message: None,
+        });
+        rt(DatePreset {
+            id: "today".into(),
+            label: BindRef::Literal(Value::Text("Today".into())),
+            resolve: DatePresetResolve::Today,
+        });
+        rt(RangePreset {
+            id: "wk".into(),
+            label: BindRef::Literal(Value::Text("Week".into())),
+            range: RangePresetRange {
+                from_offset_days: -7,
+                to_offset_days: 0,
+            },
+        });
+        rt(TableSort {
+            column_id: "name".into(),
+            direction: SortDirection::Asc,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests_accordion_nontrivial {
+    use super::*;
+    use crate::protocol::ui::a11y::{Accessibility, EventKind};
+    use crate::protocol::ui::bind::{BindSpec, PathSegment, StatePath};
+    use crate::protocol::ui::component::{Component, FieldMap, HandlerMap, TestId};
+    use crate::protocol::ui::handler::{Handler, LocalAction};
+    use crate::protocol::value::Value;
+
+    #[test]
+    fn accordion_item_with_populated_component_roundtrip() {
+        let header = Component {
+            tag: 0x0002, // SectionHeader
+            id: "h1".into(),
+            fields: FieldMap(vec![(0, Value::Text("Settings".into()))]),
+            handlers: Some(HandlerMap(vec![(
+                EventKind::Click,
+                Handler::Local(LocalAction::Focus {
+                    component_id: "input1".into(),
+                }),
+            )])),
+            bind: Some(BindSpec::Show {
+                path: StatePath::new(vec![PathSegment::Key("expanded".into())]),
+                negate: false,
+            }),
+            a11y: Some(Accessibility {
+                role: Some("region".into()),
+                ..Default::default()
+            }),
+            visibility: None,
+            test_id: Some(TestId::new("section-1").unwrap()),
+        };
+        let body_child = Component {
+            tag: 0x0203, // Paragraph
+            id: "b1".into(),
+            fields: FieldMap(vec![(0, Value::Text("body line".into()))]),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
+        };
+        let item = AccordionItem {
+            id: "acc1".into(),
+            header,
+            body: vec![body_child],
+            default_expanded: true,
+        };
+        let mut b1 = Vec::new();
+        minicbor::encode(&item, &mut b1).unwrap();
+        let d: AccordionItem = minicbor::decode(&b1).unwrap();
+        assert_eq!(d, item);
+        let mut b2 = Vec::new();
+        minicbor::encode(&d, &mut b2).unwrap();
+        assert_eq!(b1, b2);
+    }
+}
