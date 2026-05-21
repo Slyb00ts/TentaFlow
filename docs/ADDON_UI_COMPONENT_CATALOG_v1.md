@@ -933,7 +933,7 @@ Bar z search + filters + segmented + actions.
 ```
 Fields:
   0: search          ComponentRef<SearchBox> or null              // referencja do form Input (0x0307)
-  1: filters         array<FilterChip>              // max 12
+  1: filters         array<FilterChipDef>           // max 12
   2: view_mode       ComponentRef<SegmentedControl> or null
   3: sort_control    ComponentRef<Select> or null
   4: trailing_actions array<ComponentRef<Button>>                 // max 4
@@ -993,7 +993,7 @@ Fields:
   1: title           BindRef<tstr>
   2: subtitle        BindRef<tstr>
   3: features        array<FeatureItem>             // max 5 — { icon, title, description }
-  4: primary_action  Button
+  4: primary_action  ComponentRef<Button>
   5: secondary_action ComponentRef<Button> or null
 ```
 
