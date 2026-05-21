@@ -1031,3 +1031,79 @@ string_enum! {
         Compact = "compact",
     }
 }
+
+string_enum! {
+    /// `Button.size` (catalog §6 0x0401).
+    pub enum ButtonSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `ButtonGroup.orientation` (catalog §6 0x0403).
+    pub enum ButtonGroupOrientation {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+    }
+}
+
+string_enum! {
+    /// `Link.underline` / `LinkButton.underline` (catalog §6 0x0404/0x0405).
+    pub enum LinkUnderline {
+        Always = "always",
+        Hover = "hover",
+        Never = "never",
+    }
+}
+
+string_enum! {
+    /// `MenuButton.placement` (catalog §6 0x0406).
+    pub enum MenuPlacement {
+        BottomStart = "bottom_start",
+        BottomEnd = "bottom_end",
+        TopStart = "top_start",
+        TopEnd = "top_end",
+        LeftStart = "left_start",
+        LeftEnd = "left_end",
+        RightStart = "right_start",
+        RightEnd = "right_end",
+    }
+}
+
+string_enum! {
+    /// `SegmentedControl.size` (catalog §6 0x0409).
+    pub enum SegmentSize {
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `FilterChips.mode` (catalog §6 0x040A).
+    pub enum FilterChipsMode {
+        Single = "single",
+        Multi = "multi",
+    }
+}
+
+string_enum! {
+    /// `Fab.size` (catalog §6 0x040C).
+    pub enum FabSize {
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+    }
+}
+
+string_enum! {
+    /// `Fab.position` (catalog §6 0x040C).
+    pub enum FabPosition {
+        BottomRight = "bottom_right",
+        BottomLeft = "bottom_left",
+        Inline = "inline",
+    }
+}

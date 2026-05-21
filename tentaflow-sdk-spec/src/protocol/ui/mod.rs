@@ -8,6 +8,7 @@
 
 pub mod a11y;
 pub mod action;
+pub mod actions;
 pub mod bind;
 pub mod command;
 pub mod component;
