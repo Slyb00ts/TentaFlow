@@ -16,7 +16,7 @@ use super::inline::{
     BreadcrumbItem, FeatureItem, FilterChipDef, InlineBadge, InlineChip, NavTab, StepDef,
 };
 use super::tokens::{Density, EmptyStateVariant, Spacing};
-use super::typed_field::{decode_from_value, encode_to_value};
+use super::typed_field::{decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field, unknown_field};
 
 use super::super::value::Value;
 
@@ -872,47 +872,6 @@ impl Inspector {
 // -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
-
-fn ensure_tag(actual: u16, expected: u16, name: &'static str) -> Result<(), minicbor::decode::Error> {
-    if actual != expected {
-        return Err(minicbor::decode::Error::message(format!(
-            "{name}: Component.tag = 0x{actual:04X}, expected 0x{expected:04X}"
-        )));
-    }
-    Ok(())
-}
-
-fn missing_field(comp: &'static str, field: &'static str) -> minicbor::decode::Error {
-    minicbor::decode::Error::message(format!("{comp}: missing required field `{field}`"))
-}
-
-fn unknown_field(comp: &'static str, key: u8) -> minicbor::decode::Error {
-    minicbor::decode::Error::message(format!("{comp}: unknown field key {key}"))
-}
-
-/// Reject `FieldMap` payloads with duplicate u8 keys (catalog §2 schema —
-/// each field index MUST appear at most once). Called at the top of every
-/// `try_from_component` decoder.
-fn ensure_no_duplicate_keys(
-    comp: &'static str,
-    entries: &[(u8, Value)],
-) -> Result<(), minicbor::decode::Error> {
-    // Use a 2 × u128 bitset (256 bits = full u8 range) so any duplicate key
-    // — even k >= 128 — is detected without allocating.
-    let mut lo: u128 = 0;
-    let mut hi: u128 = 0;
-    for (k, _) in entries {
-        let bit = 1u128 << (*k & 0x7f);
-        let target = if *k < 128 { &mut lo } else { &mut hi };
-        if *target & bit != 0 {
-            return Err(minicbor::decode::Error::message(format!(
-                "{comp}: duplicate FieldMap key {k}"
-            )));
-        }
-        *target |= bit;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

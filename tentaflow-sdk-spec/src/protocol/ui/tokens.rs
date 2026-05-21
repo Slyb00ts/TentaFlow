@@ -444,3 +444,121 @@ string_enum! {
         Illustrated = "illustrated",
     }
 }
+
+string_enum! {
+    /// Flex container direction (catalog §3 0x0101 Flex).
+    pub enum FlexDirection {
+        Row = "row",
+        RowReverse = "row_reverse",
+        Column = "column",
+        ColumnReverse = "column_reverse",
+    }
+}
+
+string_enum! {
+    /// Flex wrap mode (catalog §3 0x0101 Flex).
+    pub enum FlexWrap {
+        NoWrap = "no_wrap",
+        Wrap = "wrap",
+        WrapReverse = "wrap_reverse",
+    }
+}
+
+string_enum! {
+    /// Split orientation (catalog §3 0x0105 Split).
+    pub enum SplitOrientation {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+    }
+}
+
+string_enum! {
+    /// Card variant (catalog §3 0x0106 Card / 0x0107 SectionCard).
+    pub enum CardVariant {
+        Filled = "filled",
+        Outlined = "outlined",
+        Elevated = "elevated",
+        Ghost = "ghost",
+    }
+}
+
+string_enum! {
+    /// Divider orientation (catalog §3 0x0108 Divider).
+    pub enum DividerOrientation {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+    }
+}
+
+string_enum! {
+    /// Divider variant (catalog §3 0x0108 Divider).
+    pub enum DividerVariant {
+        Default = "default",
+        Subtle = "subtle",
+        Strong = "strong",
+        Dashed = "dashed",
+    }
+}
+
+string_enum! {
+    /// Spacer axis (catalog §3 0x0109 Spacer).
+    pub enum SpacerAxis {
+        X = "x",
+        Y = "y",
+        Both = "both",
+    }
+}
+
+string_enum! {
+    /// Tabs visual variant (catalog §3 0x010B Tabs).
+    pub enum TabsVariant {
+        Default = "default",
+        Pills = "pills",
+        Underlined = "underlined",
+        Boxed = "boxed",
+    }
+}
+
+string_enum! {
+    /// NavTabs visual variant (catalog §3 0x010C NavTabs).
+    pub enum NavTabsVariant {
+        Default = "default",
+        Underlined = "underlined",
+        Pills = "pills",
+    }
+}
+
+string_enum! {
+    /// Accordion mutex mode (catalog §3 0x010E Accordion).
+    pub enum AccordionMode {
+        Single = "single",
+        Multiple = "multiple",
+    }
+}
+
+string_enum! {
+    /// Breadcrumb separator style (catalog §3 0x0110 Breadcrumb).
+    pub enum BreadcrumbSeparator {
+        Chevron = "chevron",
+        Slash = "slash",
+        Dot = "dot",
+    }
+}
+
+string_enum! {
+    /// Pagination presentation style (catalog §3 0x0111 Pagination).
+    pub enum PaginationVariant {
+        Compact = "compact",
+        Full = "full",
+        Input = "input",
+    }
+}
+
+string_enum! {
+    /// ScrollContainer orientation (catalog §3 0x0112 ScrollContainer).
+    pub enum ScrollOrientation {
+        Vertical = "vertical",
+        Horizontal = "horizontal",
+        Both = "both",
+    }
+}
