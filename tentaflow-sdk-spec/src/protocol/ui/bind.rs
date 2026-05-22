@@ -69,7 +69,12 @@ impl<'b, C> Decode<'b, C> for PathSegment {
                     kind = Some(d.str()?.to_string());
                 }
                 "value" => {
-                    assert_no_dup_tstr(&key_value, "PathSegment", "value")?;
+                    // Either slot already populated → duplicate `value` key.
+                    if key_value.is_some() || index_value.is_some() {
+                        return Err(minicbor::decode::Error::message(
+                            "PathSegment: duplicate key 'value'",
+                        ));
+                    }
                     // Value type depends on already-known kind. If kind not yet
                     // seen we decode as either tstr or u32 by peeking datatype.
                     match kind.as_deref() {
