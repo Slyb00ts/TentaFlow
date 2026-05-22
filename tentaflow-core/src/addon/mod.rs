@@ -448,7 +448,8 @@ pub struct AddonState {
     /// Shared cache UI panel state — host function `ui_render` zapisuje tu
     /// drzewo komponentow, MessageBody handler `AddonUiPanelGetRequest`
     /// odczytuje. `None` w testach event_bus w izolacji.
-    pub ui_panels: Option<Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>>>,
+    pub ui_panels:
+        Option<Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,

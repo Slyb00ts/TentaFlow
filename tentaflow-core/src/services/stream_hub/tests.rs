@@ -99,7 +99,11 @@ async fn subscribe_calls_factory_once_then_reuses_active() {
     let h2 = hub.subscribe(id).await.unwrap();
     let h3 = hub.subscribe(id).await.unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "factory must run only once");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "factory must run only once"
+    );
     assert_eq!(h1.init_segment.as_deref(), Some(&b"INIT"[..]));
     assert_eq!(h2.init_segment.as_deref(), Some(&b"INIT"[..]));
     assert_eq!(h3.init_segment.as_deref(), Some(&b"INIT"[..]));
@@ -133,7 +137,10 @@ async fn last_unsubscribe_drops_source() {
     assert_eq!(hub.subscriber_count(id), 1);
 
     drop(h2);
-    assert!(!hub.is_active(id), "source must be removed when count hits 0");
+    assert!(
+        !hub.is_active(id),
+        "source must be removed when count hits 0"
+    );
     assert_eq!(hub.subscriber_count(id), 0);
 
     hub.unregister_factory(id);

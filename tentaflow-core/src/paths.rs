@@ -103,8 +103,7 @@ fn detect_repo_runtime() -> Option<PathBuf> {
 
 /// `~/.tentaflow/` for installed binaries running outside a source tree.
 fn dirs_home_tentaflow() -> Option<PathBuf> {
-    let raw = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))?;
+    let raw = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     let p = PathBuf::from(raw);
     if p.as_os_str().is_empty() {
         return None;

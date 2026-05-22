@@ -787,6 +787,7 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
             .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
     }
 
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let params = db::models::FlowParams {
         name: &payload.name,
         description: payload.description.as_deref(),
@@ -795,11 +796,11 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_json: &payload.graph_json,
         status: "active",
         published_model_name: payload.published_model_name.as_deref(),
+        actor_user_id: user_id,
     };
     let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
     ctx.state.router.rebuild_catalog();
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
         user_id,
@@ -964,6 +965,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_json: &new_flow_json,
         status: &new_status,
         published_model_name: new_published.as_deref(),
+        actor_user_id: user_id_opt,
     };
 
     match repository::update_flow_with_snapshot(
@@ -1223,6 +1225,8 @@ pub fn flow_version_restore(
 
     let flow_json = version.flow_json.as_deref().unwrap_or("");
     validate_flow_json_str(ctx, flow_json)?;
+    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let created_by = user_id_opt.map(|u| u.to_string());
     // Restoring an old version keeps whatever publish name the live flow
     // currently advertises — old versions never tracked the catalog field.
     let params = db::models::FlowParams {
@@ -1233,10 +1237,8 @@ pub fn flow_version_restore(
         flow_json,
         status: version.status.as_deref().unwrap_or("draft"),
         published_model_name: existing.published_model_name.as_deref(),
+        actor_user_id: user_id_opt,
     };
-
-    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let created_by = user_id_opt.map(|u| u.to_string());
 
     match repository::update_flow_with_snapshot(
         &ctx.state.db,
@@ -3622,7 +3624,7 @@ pub async fn service_manifest_deploy(
                             };
                             if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                                 let _ = qm
-                                    .broadcast_to_trusted(
+                                    .broadcast_ufp2_to_trusted(
                                         tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
                                         &bytes,
                                         None,
@@ -5264,6 +5266,158 @@ register_addon_ui_variant!(
     crate::dispatch::SessionAuthKind::UserSession
 );
 
+fn sync_conflict_limit(limit: u32) -> usize {
+    if limit == 0 {
+        100
+    } else {
+        (limit as usize).min(500)
+    }
+}
+
+fn sync_conflict_row_to_wire(
+    row: crate::addon::storage_sql_exec::SyncConflictRow,
+) -> tentaflow_protocol::SyncConflictRow {
+    tentaflow_protocol::SyncConflictRow {
+        operation_id: row.operation_id,
+        org_id: row.org_id,
+        addon_id: row.addon_id,
+        table_name: row.table_name,
+        resource_type: row.resource_type,
+        resource_id: row.resource_id,
+        action: row.action,
+        source_node_id: row.source_node_id,
+        error_kind: row.error_kind,
+        error_message: row.error_message,
+        status: row.status,
+        created_at_ms: row.created_at_ms,
+        resolved_at_ms: row.resolved_at_ms,
+        resolution: row.resolution,
+    }
+}
+
+fn sync_conflict_resolution_to_storage(
+    resolution: &tentaflow_protocol::SyncConflictResolution,
+) -> crate::addon::storage_sql_exec::SyncConflictResolution {
+    match resolution {
+        tentaflow_protocol::SyncConflictResolution::KeepLocal => {
+            crate::addon::storage_sql_exec::SyncConflictResolution::KeepLocal
+        }
+        tentaflow_protocol::SyncConflictResolution::Ignore => {
+            crate::addon::storage_sql_exec::SyncConflictResolution::Ignore
+        }
+        tentaflow_protocol::SyncConflictResolution::AcceptRemote => {
+            crate::addon::storage_sql_exec::SyncConflictResolution::AcceptRemote
+        }
+    }
+}
+
+#[handler(variant = "SyncConflictBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sync_conflict_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::SyncConflictPayload as P;
+    let payload = match req {
+        MessageBody::SyncConflictBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected SyncConflictBody")),
+    };
+
+    let res = match payload {
+        P::ListRequest(request) => {
+            if request.addon_id.trim().is_empty() {
+                return Err(ProtocolError::bad_request("addon_id is required"));
+            }
+            let org_id = if request.org_id.trim().is_empty() {
+                "org-default"
+            } else {
+                request.org_id.as_str()
+            };
+            let status = if request.status.trim().is_empty() {
+                "open"
+            } else {
+                request.status.as_str()
+            };
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                org_id,
+                &request.addon_id,
+                Some(status),
+                sync_conflict_limit(request.limit),
+            )
+            .map_err(|e| ProtocolError::internal(format!("sync conflict list failed: {}", e)))?
+            .into_iter()
+            .map(sync_conflict_row_to_wire)
+            .collect();
+            P::ListResponse(tentaflow_protocol::SyncConflictsListResponse { conflicts })
+        }
+        P::ResolveRequest(request) => {
+            if request.addon_id.trim().is_empty() {
+                return Err(ProtocolError::bad_request("addon_id is required"));
+            }
+            let org_id = if request.org_id.trim().is_empty() {
+                "org-default"
+            } else {
+                request.org_id.as_str()
+            };
+            let operation_id = crate::sync::ledger::OperationId::from_hex(&request.operation_id)
+                .map_err(|_| ProtocolError::bad_request("invalid operation_id"))?;
+            let resolution = sync_conflict_resolution_to_storage(&request.resolution);
+            let result = crate::sync::runtime::resolve_addon_sync_conflict(
+                org_id,
+                &request.addon_id,
+                operation_id,
+                resolution,
+            )
+            .map_err(|e| ProtocolError::internal(format!("sync conflict resolve failed: {}", e)))?
+            .ok_or_else(|| ProtocolError::internal("sync runtime unavailable"))?;
+            let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+            audit(
+                ctx,
+                user_id,
+                "sync.conflict.resolve",
+                Some(&request.operation_id),
+                Some(&result.resolution),
+            );
+            P::ResolveResponse(tentaflow_protocol::SyncConflictResolveResponse {
+                operation_id: result.operation_id,
+                status: result.status,
+                resolution: result.resolution,
+                rows_affected: result.rows_affected,
+            })
+        }
+        P::ListResponse(_) | P::ResolveResponse(_) => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::SyncConflictBody(res))
+}
+
+macro_rules! register_sync_conflict_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_sync_conflict_dispatch,
+            }
+        }
+    };
+}
+
+register_sync_conflict_variant!(
+    "SyncConflictsListRequest",
+    "tentaflow_ws_handler_sync_conflicts_list"
+);
+register_sync_conflict_variant!(
+    "SyncConflictResolveRequest",
+    "tentaflow_ws_handler_sync_conflict_resolve"
+);
+
 // =============================================================================
 // Mesh & Network settings (enumeracja IPv4 NIC + bind/advertise rules)
 // =============================================================================
@@ -5588,7 +5742,7 @@ fn broadcast_service_change(ctx: &HandlerContext, change: tentaflow_protocol::Se
     };
     tokio::spawn(async move {
         let _ = qm
-            .broadcast_to_trusted(
+            .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
                 &bytes,
                 None,

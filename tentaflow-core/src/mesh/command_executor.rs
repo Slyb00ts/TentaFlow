@@ -891,7 +891,7 @@ impl MeshCommandExecutor {
                         };
                         if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                             let _ = iroh_task
-                                .broadcast_to_trusted(
+                                .broadcast_ufp2_to_trusted(
                                     tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
                                     &bytes,
                                     None,
@@ -1464,7 +1464,7 @@ async fn push_service_change_after_action(
     if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
         let _ = actions
             .iroh
-            .broadcast_to_trusted(
+            .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
                 &bytes,
                 None,

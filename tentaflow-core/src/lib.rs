@@ -27,6 +27,7 @@ pub mod scheduler;
 pub mod services;
 pub mod services_repo;
 pub mod stt;
+pub mod sync;
 pub mod tts;
 pub mod vision;
 pub mod vision_models;

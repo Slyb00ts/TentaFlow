@@ -1565,12 +1565,20 @@ impl IrohMeshManager {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_waiters.insert(command_id.clone(), tx);
 
-        self.send_to_peer(
-            target_node_id,
-            tentaflow_protocol::mesh::MESH_MSG_COMMAND,
-            &data,
-        )
-        .await?;
+        // If the send fails the waiter would otherwise leak until the
+        // explicit removals below in the timeout/drop arms — but those
+        // only run after the `?` returns. Clear the waiter on send error.
+        if let Err(e) = self
+            .send_ufp2_to_peer(
+                target_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_COMMAND,
+                &data,
+            )
+            .await
+        {
+            self.command_waiters.remove(&command_id);
+            return Err(e);
+        }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
@@ -1658,7 +1666,7 @@ impl IrohMeshManager {
                 };
                 if let Ok(bytes) = serde_json::to_vec(&resp) {
                     let _ = self
-                        .send_to_peer(
+                        .send_ufp2_to_peer(
                             from_node_id,
                             tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
                             &bytes,
@@ -1679,7 +1687,7 @@ impl IrohMeshManager {
         match serde_json::to_vec(&resp_envelope) {
             Ok(bytes) => {
                 if let Err(e) = self
-                    .send_to_peer(
+                    .send_ufp2_to_peer(
                         from_node_id,
                         tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
                         &bytes,

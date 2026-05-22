@@ -179,29 +179,29 @@ pub fn ui_render_binary(
 
     // Single-pass: msgpack → PanelTree → validate. No JSON parsing.
     let addon_id_for_log = caller.data().addon_id.clone();
-    let mut panel_tree: tentaflow_ui_schema::PanelTree =
-        match rmp_serde::from_slice(&binary_bytes) {
-            Ok(t) => t,
-            Err(err) => {
-                tracing::warn!(
-                    addon = %addon_id_for_log,
-                    panel = %panel_id,
-                    bytes = binary_bytes.len(),
-                    error = %err,
-                    "ui_render_binary: msgpack decode failed"
-                );
-                let detail = format!("msgpack decode failed: {err}");
-                audit_log(
-                    caller.data(),
-                    "ui.render_binary",
-                    Some("ui"),
-                    Some(&panel_id),
-                    "denied",
-                    Some(&detail),
-                );
-                return ABI_ERR_OPERATION;
-            }
-        };
+    let mut panel_tree: tentaflow_ui_schema::PanelTree = match rmp_serde::from_slice(&binary_bytes)
+    {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(
+                addon = %addon_id_for_log,
+                panel = %panel_id,
+                bytes = binary_bytes.len(),
+                error = %err,
+                "ui_render_binary: msgpack decode failed"
+            );
+            let detail = format!("msgpack decode failed: {err}");
+            audit_log(
+                caller.data(),
+                "ui.render_binary",
+                Some("ui"),
+                Some(&panel_id),
+                "denied",
+                Some(&detail),
+            );
+            return ABI_ERR_OPERATION;
+        }
+    };
 
     if let Err(err) = tentaflow_ui_schema::validate_panel_tree(&mut panel_tree) {
         tracing::warn!(

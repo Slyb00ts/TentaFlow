@@ -113,6 +113,66 @@ pub fn open_addon_db(org_id: &str, addon_id: &str) -> Result<AddonDbPool, AbiErr
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.pragma_update(None, "temp_store", "MEMORY")?;
             conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS __tentaflow_sync_captures (
+                    capture_id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    addon_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
+                    resource_type TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    params_json TEXT NOT NULL,
+                    rows_affected INTEGER NOT NULL,
+                    last_insert_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+                    operation_id TEXT NULL,
+                    error_message TEXT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    ledgered_at_ms INTEGER NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_captures_status
+                    ON __tentaflow_sync_captures(status, created_at_ms);
+                CREATE TABLE IF NOT EXISTS __tentaflow_sync_applied (
+                    operation_id TEXT PRIMARY KEY,
+                    applied_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS __tentaflow_sync_conflicts (
+                    operation_id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    addon_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    resource_type TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    source_node_id TEXT NOT NULL,
+                    error_kind TEXT NOT NULL,
+                    error_message TEXT NOT NULL,
+                    capture_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved','ignored','superseded')),
+                    created_at_ms INTEGER NOT NULL,
+                    resolved_at_ms INTEGER NULL,
+                    resolution TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_conflicts_status
+                    ON __tentaflow_sync_conflicts(status, created_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_conflicts_resource
+                    ON __tentaflow_sync_conflicts(resource_type, resource_id);",
+            )?;
+            let has_operation_id = conn
+                .prepare("PRAGMA table_info(__tentaflow_sync_captures)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "operation_id");
+            if !has_operation_id {
+                conn.execute(
+                    "ALTER TABLE __tentaflow_sync_captures ADD COLUMN operation_id TEXT NULL",
+                    [],
+                )?;
+            }
             Ok(())
         });
 

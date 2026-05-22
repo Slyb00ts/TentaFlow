@@ -314,6 +314,22 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     Ok(manifest)
 }
 
+pub fn ensure_sql_storage(addon_dir: &Path, db: &DbPool) -> Result<()> {
+    let manifest_path = addon_dir.join("manifest.toml");
+    if !manifest_path.exists() {
+        bail!("Brak pliku manifest.toml w {:?}", addon_dir);
+    }
+    let manifest_content = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac manifest.toml: {e}"))?;
+    let manifest = parse_manifest_toml(&manifest_content)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac manifest.toml: {e}"))?;
+    validate_manifest(&manifest)?;
+    if matches!(manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(&manifest, addon_dir, db)?;
+    }
+    Ok(())
+}
+
 /// Otwiera per-addon SQLite i aplikuje migracje z `<bundle>/<migrations_dir>/`.
 /// Wywolywane tylko gdy `manifest.storage.sql == true`. Migration fail =
 /// install fail z rollbackiem: czyscimy zarejestrowanego addona z core DB
@@ -699,17 +715,22 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     let license = new_manifest.license.as_deref().unwrap_or("");
     let show_in_catalog = new_manifest.show_in_catalog.unwrap_or(true) as i64;
 
-    let conn = db.lock().unwrap();
-    conn.execute("BEGIN TRANSACTION", [])?;
-
-    // Pobierz stara wersje
-    let old_version: String = conn
-        .query_row(
+    let old_version: String = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
             "SELECT version FROM addons WHERE addon_id = ?1",
             rusqlite::params![addon_id],
             |row| row.get(0),
         )
-        .map_err(|e| anyhow::anyhow!("Addon nie znaleziony: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Addon nie znaleziony: {e}"))?
+    };
+
+    if matches!(new_manifest.storage.as_ref(), Some(s) if s.sql) {
+        apply_addon_sql_migrations(&new_manifest, new_dir, db)?;
+    }
+
+    let conn = db.lock().unwrap();
+    conn.execute("BEGIN TRANSACTION", [])?;
 
     info!(
         "Upgrade addonu '{}': {} -> {}",

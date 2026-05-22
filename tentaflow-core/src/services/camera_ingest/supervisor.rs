@@ -296,10 +296,7 @@ pub async fn start_supervisor() -> Result<CameraIngestSupervisor> {
 /// as a `BinaryStreamSource` for the hub to cache. When the hub drops its
 /// last strong reference (final unsubscribe) the publisher's `Drop` impl
 /// posts `DetachMp4Branch` and the session's mux branch is torn down.
-fn register_stream_factory(
-    camera_id: String,
-    cmd_tx: tokio::sync::mpsc::Sender<SessionCommand>,
-) {
+fn register_stream_factory(camera_id: String, cmd_tx: tokio::sync::mpsc::Sender<SessionCommand>) {
     let stream_id = format!("camera:{}", camera_id);
     let camera_id_factory = camera_id.clone();
     let factory = Box::new(move || {

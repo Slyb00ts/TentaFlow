@@ -48,6 +48,8 @@ pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
 /// - 4c2.1: HEARTBEAT
 /// - 4c2.2: PAIRING_REQUEST, PAIRING_CONFIRM, PAIRING_REJECT,
 ///   TRUST_REVOKED, TRUSTED_KEYS_SYNC
+/// - 4c2.3: COMMAND, COMMAND_RESPONSE, DEPLOY_PROGRESS, LOG_CHUNK,
+///   SERVICES_GET, SERVICES_GET_RESPONSE, SERVICES_ANNOUNCE, SERVICES_UPDATE
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
         disc,
@@ -57,6 +59,14 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_PAIRING_REJECT
             | legacy::MESH_MSG_TRUST_REVOKED
             | legacy::MESH_MSG_TRUSTED_KEYS_SYNC
+            | legacy::MESH_MSG_COMMAND
+            | legacy::MESH_MSG_COMMAND_RESPONSE
+            | legacy::MESH_MSG_DEPLOY_PROGRESS
+            | legacy::MESH_MSG_LOG_CHUNK
+            | legacy::MESH_MSG_SERVICES_GET
+            | legacy::MESH_MSG_SERVICES_GET_RESPONSE
+            | legacy::MESH_MSG_SERVICES_ANNOUNCE
+            | legacy::MESH_MSG_SERVICES_UPDATE
     )
 }
 
@@ -119,12 +129,13 @@ mod tests {
     #[test]
     fn legacy_from_kind_rejects_unmigrated_discriminators() {
         // Discriminators that ARE allocated MESH_MSG_* but have not yet
-        // been migrated to UFP/2 (4c2.3+) — sender claiming them through
-        // UFP/2 MUST be rejected so the legacy wire stays the only valid
-        // path until migration.
+        // been migrated to UFP/2 — sender claiming them through UFP/2 MUST
+        // be rejected so the legacy wire stays the only valid path until
+        // migration.
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HELLO as u16)).is_none());
-        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_COMMAND as u16)).is_none());
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_NODE_INFO as u16)).is_none());
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_SYNC_PUSH as u16)).is_none());
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16)).is_none());
         // Holes in the 0x10..=0x4C range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
         assert!(legacy_from_kind(Kind(0x0034)).is_none());
@@ -132,8 +143,9 @@ mod tests {
 
     #[test]
     fn migrated_discriminator_allowlist_matches_chunks() {
-        // 4c2.1 + 4c2.2 = 6 migrated types. When a new 4c2.x chunk lands,
-        // add its types here AND to `is_migrated_to_ufp2_discriminator`.
+        // 4c2.1 + 4c2.2 + 4c2.3 = 14 migrated types. When a new 4c2.x
+        // chunk lands, add its types here AND to
+        // `is_migrated_to_ufp2_discriminator`.
         let migrated = [
             legacy::MESH_MSG_HEARTBEAT,
             legacy::MESH_MSG_PAIRING_REQUEST,
@@ -141,6 +153,14 @@ mod tests {
             legacy::MESH_MSG_PAIRING_REJECT,
             legacy::MESH_MSG_TRUST_REVOKED,
             legacy::MESH_MSG_TRUSTED_KEYS_SYNC,
+            legacy::MESH_MSG_COMMAND,
+            legacy::MESH_MSG_COMMAND_RESPONSE,
+            legacy::MESH_MSG_DEPLOY_PROGRESS,
+            legacy::MESH_MSG_LOG_CHUNK,
+            legacy::MESH_MSG_SERVICES_GET,
+            legacy::MESH_MSG_SERVICES_GET_RESPONSE,
+            legacy::MESH_MSG_SERVICES_ANNOUNCE,
+            legacy::MESH_MSG_SERVICES_UPDATE,
         ];
         for d in migrated {
             assert!(
@@ -151,9 +171,15 @@ mod tests {
         }
         // Future-chunk types: explicitly NOT migrated yet.
         assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_NODE_INFO));
-        assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_COMMAND));
+        assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_HELLO));
         assert!(!is_migrated_to_ufp2_discriminator(
             legacy::MESH_MSG_SYNC_PUSH
+        ));
+        assert!(!is_migrated_to_ufp2_discriminator(
+            legacy::MESH_MSG_HMAC_KEYS_SYNC
+        ));
+        assert!(!is_migrated_to_ufp2_discriminator(
+            legacy::MESH_MSG_FRAME_PROXY_REQUEST
         ));
     }
 

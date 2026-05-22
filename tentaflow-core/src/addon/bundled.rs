@@ -84,6 +84,8 @@ fn install_single_bundled_addon(
     let existing = crate::db::repository::get_addon(db, &addon_id)?;
     let stored_bundle_hash =
         crate::db::repository::get_setting(db, &bundle_hash_setting_key(&addon_id))?;
+    let addon_dir = data_dir.join(&addon_id);
+    write_bundled_addon_files(&addon_dir, addon)?;
 
     match existing {
         Some(ref existing_addon)
@@ -91,6 +93,7 @@ fn install_single_bundled_addon(
                 && existing_addon.manifest_json == addon.manifest_toml
                 && stored_bundle_hash.as_deref() == Some(bundle_hash.as_str()) =>
         {
+            super::lifecycle::ensure_sql_storage(&addon_dir, db)?;
             info!(
                 "Wbudowany addon '{}' v{} jest aktualny — pomijam",
                 addon_id, bundled_version
@@ -124,27 +127,6 @@ fn install_single_bundled_addon(
         }
     }
 
-    // Rozpakuj addon do katalogu tymczasowego
-    let addon_dir = data_dir.join(&addon_id);
-    std::fs::create_dir_all(&addon_dir)?;
-
-    // Zapisz pliki
-    std::fs::write(addon_dir.join("addon.wasm"), addon.wasm_bytes)
-        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac pliku WASM: {e}"))?;
-
-    std::fs::write(addon_dir.join("manifest.toml"), addon.manifest_toml)
-        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac manifest.toml: {e}"))?;
-
-    if !addon.skill_md.is_empty() {
-        std::fs::write(addon_dir.join("SKILL.md"), addon.skill_md).ok();
-    }
-    if !addon.description_md.is_empty() {
-        std::fs::write(addon_dir.join("DESCRIPTION.md"), addon.description_md).ok();
-    }
-    if !addon.blocks_json.is_empty() {
-        std::fs::write(addon_dir.join("blocks.json"), addon.blocks_json).ok();
-    }
-
     // Zainstaluj lub upgrade przez lifecycle
     if existing.is_some() {
         super::lifecycle::upgrade(&addon_id, &addon_dir, db)?;
@@ -162,6 +144,28 @@ fn install_single_bundled_addon(
         );
     }
 
+    Ok(())
+}
+
+fn write_bundled_addon_files(addon_dir: &std::path::Path, addon: &BundledAddon) -> Result<()> {
+    std::fs::create_dir_all(&addon_dir)?;
+
+    std::fs::write(addon_dir.join("addon.wasm"), addon.wasm_bytes)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac pliku WASM: {e}"))?;
+
+    std::fs::write(addon_dir.join("manifest.toml"), addon.manifest_toml)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac manifest.toml: {e}"))?;
+
+    if !addon.skill_md.is_empty() {
+        std::fs::write(addon_dir.join("SKILL.md"), addon.skill_md).ok();
+    }
+    if !addon.description_md.is_empty() {
+        std::fs::write(addon_dir.join("DESCRIPTION.md"), addon.description_md).ok();
+    }
+    if !addon.blocks_json.is_empty() {
+        std::fs::write(addon_dir.join("blocks.json"), addon.blocks_json).ok();
+    }
+    write_bundled_migrations(addon_dir, addon)?;
     Ok(())
 }
 
@@ -225,7 +229,24 @@ fn compute_bundle_hash(addon: &BundledAddon) -> String {
         addon.description_md.as_bytes(),
     );
     hash_chunk(&mut hasher, b"blocks.json", addon.blocks_json.as_bytes());
+    for (name, sql) in addon.migrations {
+        hash_chunk(&mut hasher, name.as_bytes(), sql.as_bytes());
+    }
     format!("{:x}", hasher.finalize())
+}
+
+fn write_bundled_migrations(addon_dir: &std::path::Path, addon: &BundledAddon) -> Result<()> {
+    if addon.migrations.is_empty() {
+        return Ok(());
+    }
+    let migrations_dir = addon_dir.join("migrations");
+    std::fs::create_dir_all(&migrations_dir)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu migracji addonu: {e}"))?;
+    for (name, sql) in addon.migrations {
+        std::fs::write(migrations_dir.join(name), sql)
+            .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac migracji addonu '{name}': {e}"))?;
+    }
+    Ok(())
 }
 
 fn hash_chunk(hasher: &mut Sha256, name: &[u8], bytes: &[u8]) {
@@ -295,6 +316,7 @@ display_name = "Old Addon"
             skill_md: "",
             description_md: "",
             blocks_json: "",
+            migrations: &[],
         };
         let addon_b = BundledAddon {
             name: "outlook",
@@ -303,6 +325,7 @@ display_name = "Old Addon"
             skill_md: "",
             description_md: "",
             blocks_json: "",
+            migrations: &[],
         };
 
         assert_ne!(compute_bundle_hash(&addon_a), compute_bundle_hash(&addon_b));
@@ -317,6 +340,7 @@ display_name = "Old Addon"
             skill_md: "",
             description_md: "",
             blocks_json: "",
+            migrations: &[],
         };
         let addon_b = BundledAddon {
             name: "outlook",
@@ -325,9 +349,55 @@ display_name = "Old Addon"
             skill_md: "",
             description_md: "",
             blocks_json: "",
+            migrations: &[],
         };
 
         assert_ne!(compute_bundle_hash(&addon_a), compute_bundle_hash(&addon_b));
+    }
+
+    #[test]
+    fn test_bundle_hash_changes_when_migration_changes() {
+        let addon_a = BundledAddon {
+            name: "eureka",
+            wasm_bytes: &[1, 2, 3],
+            manifest_toml: "[addon]\nid=\"eureka\"\nversion=\"1.0.0\"\n",
+            skill_md: "",
+            description_md: "",
+            blocks_json: "",
+            migrations: &[("001_init.sql", "CREATE TABLE eureka_entries (id INTEGER);")],
+        };
+        let addon_b = BundledAddon {
+            name: "eureka",
+            wasm_bytes: &[1, 2, 3],
+            manifest_toml: "[addon]\nid=\"eureka\"\nversion=\"1.0.0\"\n",
+            skill_md: "",
+            description_md: "",
+            blocks_json: "",
+            migrations: &[(
+                "001_init.sql",
+                "CREATE TABLE eureka_entries (id INTEGER PRIMARY KEY);",
+            )],
+        };
+
+        assert_ne!(compute_bundle_hash(&addon_a), compute_bundle_hash(&addon_b));
+    }
+
+    #[test]
+    fn test_eureka_bundle_contains_sql_migrations() {
+        let eureka = BUNDLED_ADDONS
+            .iter()
+            .find(|addon| addon.name == "eureka")
+            .expect("eureka bundled addon");
+
+        assert!(eureka
+            .migrations
+            .iter()
+            .any(|(name, sql)| *name == "001_init.sql" && sql.contains("eureka_sync_state")));
+        assert!(eureka
+            .migrations
+            .iter()
+            .any(|(name, sql)| *name == "002_fetch_status.sql"
+                && sql.contains("eureka_fetch_status")));
     }
 
     #[test]
