@@ -9,10 +9,27 @@ use super::super::inline::{
 };
 use super::super::tokens::Density;
 use super::super::typed_field::{
-    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
-    unknown_field, IntoComponentError,
+    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
+    ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
+use super::super::actions::Button;
+
+#[inline]
+fn validate_button_refs_encode(
+    items: &[Component], parent: &'static str, field: &'static str,
+) -> Result<(), IntoComponentError> {
+    for b in items { ensure_ref_tag_encode(b.tag, Button::TAG, parent, field)?; }
+    Ok(())
+}
+
+#[inline]
+fn validate_button_refs_decode(
+    items: &[Component], parent: &'static str, field: &'static str,
+) -> Result<(), minicbor::decode::Error> {
+    for b in items { ensure_ref_tag_decode(b.tag, Button::TAG, parent, field)?; }
+    Ok(())
+}
 
 
 // -----------------------------------------------------------------------------
@@ -36,6 +53,7 @@ impl Header {
     pub const TAG: u16 = 0x0001;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        validate_button_refs_encode(&self.actions, "Header", "actions")?;
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
         entries.push((0, encode_to_value(&self.icon)?));
         entries.push((1, encode_to_value(&self.title)?));
@@ -82,13 +100,15 @@ impl Header {
                 other => return Err(unknown_field("Header", *other)),
             }
         }
+        let actions: Vec<Component> = actions.unwrap_or_default();
+        validate_button_refs_decode(&actions, "Header", "actions")?;
         Ok(Header {
             icon: icon.ok_or_else(|| missing_field("Header", "icon"))?,
             title: title.ok_or_else(|| missing_field("Header", "title"))?,
             status_badge,
             subtitle,
             meta_chips: meta_chips.unwrap_or_default(),
-            actions: actions.unwrap_or_default(),
+            actions,
             density: density.unwrap_or(Density::Default),
         })
     }
@@ -111,6 +131,7 @@ impl PageHeader {
     pub const TAG: u16 = 0x0002;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        validate_button_refs_encode(&self.actions, "PageHeader", "actions")?;
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
         entries.push((0, encode_to_value(&self.title)?));
         if let Some(s) = &self.subtitle {
@@ -153,11 +174,13 @@ impl PageHeader {
                 other => return Err(unknown_field("PageHeader", *other)),
             }
         }
+        let actions: Vec<Component> = actions.unwrap_or_default();
+        validate_button_refs_decode(&actions, "PageHeader", "actions")?;
         Ok(PageHeader {
             title: title.ok_or_else(|| missing_field("PageHeader", "title"))?,
             subtitle,
             breadcrumbs,
-            actions: actions.unwrap_or_default(),
+            actions,
             tabs,
         })
     }
@@ -179,6 +202,7 @@ impl SectionHeader {
     pub const TAG: u16 = 0x0004;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        validate_button_refs_encode(&self.actions, "SectionHeader", "actions")?;
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
         entries.push((0, encode_to_value(&self.title)?));
         if let Some(s) = &self.subtitle {
@@ -214,10 +238,12 @@ impl SectionHeader {
                 other => return Err(unknown_field("SectionHeader", *other)),
             }
         }
+        let actions: Vec<Component> = actions.unwrap_or_default();
+        validate_button_refs_decode(&actions, "SectionHeader", "actions")?;
         Ok(SectionHeader {
             title: title.ok_or_else(|| missing_field("SectionHeader", "title"))?,
             subtitle,
-            actions: actions.unwrap_or_default(),
+            actions,
             divider: divider.ok_or_else(|| missing_field("SectionHeader", "divider"))?,
         })
     }

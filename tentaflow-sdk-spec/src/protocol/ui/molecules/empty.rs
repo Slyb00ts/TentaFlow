@@ -9,10 +9,11 @@ use super::super::inline::{
 };
 use super::super::tokens::EmptyStateVariant;
 use super::super::typed_field::{
-    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
-    unknown_field, IntoComponentError,
+    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
+    ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
+use super::super::actions::Button;
 
 
 // -----------------------------------------------------------------------------
@@ -33,6 +34,12 @@ impl EmptyState {
     pub const TAG: u16 = 0x0003;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        if let Some(p) = &self.primary_action {
+            ensure_ref_tag_encode(p.tag, Button::TAG, "EmptyState", "primary_action")?;
+        }
+        if let Some(s) = &self.secondary_action {
+            ensure_ref_tag_encode(s.tag, Button::TAG, "EmptyState", "secondary_action")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
         entries.push((0, encode_to_value(&self.icon)?));
         entries.push((1, encode_to_value(&self.heading)?));
@@ -78,6 +85,14 @@ impl EmptyState {
                 other => return Err(unknown_field("EmptyState", *other)),
             }
         }
+        let primary_action: Option<Component> = primary_action;
+        let secondary_action: Option<Component> = secondary_action;
+        if let Some(p) = &primary_action {
+            ensure_ref_tag_decode(p.tag, Button::TAG, "EmptyState", "primary_action")?;
+        }
+        if let Some(s) = &secondary_action {
+            ensure_ref_tag_decode(s.tag, Button::TAG, "EmptyState", "secondary_action")?;
+        }
         Ok(EmptyState {
             icon: icon.ok_or_else(|| missing_field("EmptyState", "icon"))?,
             heading: heading.ok_or_else(|| missing_field("EmptyState", "heading"))?,
@@ -106,6 +121,9 @@ impl ErrorBoundary {
     pub const TAG: u16 = 0x0008;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for b in &self.actions {
+            ensure_ref_tag_encode(b.tag, Button::TAG, "ErrorBoundary", "actions")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
         if let Some(c) = &self.error_code {
             entries.push((0, encode_to_value(c)?));
@@ -148,11 +166,15 @@ impl ErrorBoundary {
                 other => return Err(unknown_field("ErrorBoundary", *other)),
             }
         }
+        let actions: Vec<Component> = actions.unwrap_or_default();
+        for b in &actions {
+            ensure_ref_tag_decode(b.tag, Button::TAG, "ErrorBoundary", "actions")?;
+        }
         Ok(ErrorBoundary {
             error_code,
             title: title.ok_or_else(|| missing_field("ErrorBoundary", "title"))?,
             message,
-            actions: actions.unwrap_or_default(),
+            actions,
             technical_details,
         })
     }
@@ -178,6 +200,10 @@ impl WelcomeHero {
     pub const TAG: u16 = 0x0009;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        ensure_ref_tag_encode(self.primary_action.tag, Button::TAG, "WelcomeHero", "primary_action")?;
+        if let Some(s) = &self.secondary_action {
+            ensure_ref_tag_encode(s.tag, Button::TAG, "WelcomeHero", "secondary_action")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
         entries.push((0, encode_to_value(&self.illustration)?));
         entries.push((1, encode_to_value(&self.title)?));
@@ -219,14 +245,20 @@ impl WelcomeHero {
                 other => return Err(unknown_field("WelcomeHero", *other)),
             }
         }
+        let primary_action: Component = primary_action
+            .ok_or_else(|| missing_field("WelcomeHero", "primary_action"))?;
+        let secondary_action: Option<Component> = secondary_action;
+        ensure_ref_tag_decode(primary_action.tag, Button::TAG, "WelcomeHero", "primary_action")?;
+        if let Some(s) = &secondary_action {
+            ensure_ref_tag_decode(s.tag, Button::TAG, "WelcomeHero", "secondary_action")?;
+        }
         Ok(WelcomeHero {
             illustration: illustration
                 .ok_or_else(|| missing_field("WelcomeHero", "illustration"))?,
             title: title.ok_or_else(|| missing_field("WelcomeHero", "title"))?,
             subtitle: subtitle.ok_or_else(|| missing_field("WelcomeHero", "subtitle"))?,
             features: features.unwrap_or_default(),
-            primary_action: primary_action
-                .ok_or_else(|| missing_field("WelcomeHero", "primary_action"))?,
+            primary_action,
             secondary_action,
         })
     }
