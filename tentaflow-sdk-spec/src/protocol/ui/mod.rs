@@ -23,6 +23,7 @@ pub mod inline;
 pub mod layout;
 pub mod molecules;
 pub mod panel;
+pub mod schema;
 pub mod typed_field;
 pub mod patch;
 pub mod slot;
