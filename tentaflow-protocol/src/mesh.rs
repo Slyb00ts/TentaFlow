@@ -670,11 +670,8 @@ impl std::fmt::Debug for MeshCommandType {
 
 pub const MESH_MSG_HEARTBEAT: u8 = 0x10;
 pub const MESH_MSG_CRDT_DELTA: u8 = 0x11;
-pub const MESH_MSG_FULL_STATE: u8 = 0x12;
 pub const MESH_MSG_FORWARD_REQ: u8 = 0x13;
-pub const MESH_MSG_FORWARD_RES: u8 = 0x14;
 pub const MESH_MSG_MODEL_LIST: u8 = 0x15;
-pub const MESH_MSG_CONTAINER_LIST: u8 = 0x16;
 pub const MESH_MSG_NODE_INFO: u8 = 0x18;
 /// Minimal hello — hostname + platform. Wysylany przy kazdym PeerConnected
 /// (trusted LUB discovered), zeby GUI mogl pokazac ludzka nazwe (spark-002)
@@ -700,11 +697,7 @@ pub const MESH_MSG_COMMAND: u8 = 0x30;
 pub const MESH_MSG_COMMAND_RESPONSE: u8 = 0x31;
 pub const MESH_MSG_DEPLOY_PROGRESS: u8 = 0x32;
 pub const MESH_MSG_LOG_CHUNK: u8 = 0x33;
-pub const MESH_MSG_CLUSTER_INFO: u8 = 0x36;
-pub const MESH_MSG_KEY_ROTATION: u8 = 0x25;
-pub const MESH_MSG_KEY_ROTATION_RESPONSE: u8 = 0x26;
 pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
-pub const MESH_MSG_RELAY_FRAME: u8 = 0x37;
 pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
 pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
 /// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
@@ -733,6 +726,18 @@ pub const MESH_MSG_FRAME_PROXY_REQUEST: u8 = 0x45;
 /// wire-stable metadata mirror, or a typed miss (NotFound / Unavailable).
 /// Trusted-peer only.
 pub const MESH_MSG_FRAME_PROXY_RESPONSE: u8 = 0x46;
+/// Sync Ledger push — paczka podpisanych operacji dla zaufanego peera.
+pub const MESH_MSG_SYNC_PUSH: u8 = 0x47;
+/// Sync Ledger ACK — potwierdzenie operacji zapisanych przez odbiorce.
+pub const MESH_MSG_SYNC_ACK: u8 = 0x48;
+/// Sync Ledger pull — prosba o zakres operacji z partycji.
+pub const MESH_MSG_SYNC_PULL: u8 = 0x49;
+/// Sync Ledger pull response — zakres operacji z partycji.
+pub const MESH_MSG_SYNC_PULL_RESPONSE: u8 = 0x4A;
+/// Sync Ledger snapshot pull — prosba o pakiet snapshotu partycji.
+pub const MESH_MSG_SYNC_SNAPSHOT_PULL: u8 = 0x4B;
+/// Sync Ledger snapshot response — metadane snapshotu, blob i tail operacji.
+pub const MESH_MSG_SYNC_SNAPSHOT_RESPONSE: u8 = 0x4C;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
@@ -972,19 +977,6 @@ pub struct TopologyAnnouncePayload {
     pub entries: Vec<TopologyEntry>,
 }
 
-/// Ramka relay do multi-hop routingu — payload zaszyfrowany end-to-end kluczem docelowego noda.
-/// `discriminant` informuje odbiorce jaki typ wiadomosci jest w srodku.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
-#[rkyv(derive(Debug))]
-pub struct MeshRelayFrame {
-    pub request_id: String,
-    pub source_node_id: String,
-    pub destination_node_id: String,
-    pub ttl: u8,
-    pub discriminant: u8,
-    pub payload: Vec<u8>,
-}
-
 // =============================================================================
 // Mesh services registry — wire payloads (krok N3a)
 // =============================================================================
@@ -1025,6 +1017,74 @@ pub struct MeshServicesAnnouncePayload {
 pub struct MeshServicesUpdatePayload {
     pub from_node_id: String,
     pub change: crate::message_body::ServiceChange,
+}
+
+// =============================================================================
+// Sync Ledger — wire payloads
+// =============================================================================
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncOperationWire {
+    pub op_id: Vec<u8>,
+    pub partition_id: String,
+    pub partition_sequence: u64,
+    pub operation: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncPushPayload {
+    pub from_node_id: String,
+    pub operations: Vec<MeshSyncOperationWire>,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncAckPayload {
+    pub from_node_id: String,
+    pub operation_ids: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncPullPayload {
+    pub from_node_id: String,
+    pub partition_id: String,
+    pub from_sequence: u64,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncPullResponsePayload {
+    pub from_node_id: String,
+    pub partition_id: String,
+    pub from_sequence: u64,
+    pub operations: Vec<MeshSyncOperationWire>,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncSnapshotPullPayload {
+    pub from_node_id: String,
+    pub partition_id: String,
+    pub up_to_sequence: u64,
+    pub snapshot_id: String,
+    pub include_tail: bool,
+    pub tail_limit: u32,
+}
+
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshSyncSnapshotResponsePayload {
+    pub from_node_id: String,
+    pub partition_id: String,
+    pub up_to_sequence: u64,
+    pub snapshot_id: String,
+    pub snapshot_bytes: Vec<u8>,
+    pub blob_bytes: Vec<u8>,
+    pub operations_after_snapshot: Vec<MeshSyncOperationWire>,
 }
 
 // =============================================================================
@@ -1717,6 +1777,93 @@ mod tests {
             rkyv::from_bytes::<MeshCommandResponsePayload, rkyv::rancor::Error>(&bytes)
                 .expect("decode");
         }
+    }
+
+    #[test]
+    fn sync_ledger_payloads_roundtrip_rkyv() {
+        let op = MeshSyncOperationWire {
+            op_id: vec![7; 32],
+            partition_id: "addon/contacts/persons/1".to_string(),
+            partition_sequence: 4,
+            operation: vec![1, 2, 3, 4],
+        };
+        let push = MeshSyncPushPayload {
+            from_node_id: "node-a".to_string(),
+            operations: vec![op.clone()],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push).expect("encode push");
+        let decoded = rkyv::from_bytes::<MeshSyncPushPayload, rkyv::rancor::Error>(&bytes)
+            .expect("decode push");
+        assert_eq!(decoded.operations[0].op_id, op.op_id);
+        assert_eq!(decoded.operations[0].partition_sequence, 4);
+
+        let ack = MeshSyncAckPayload {
+            from_node_id: "node-b".to_string(),
+            operation_ids: vec![vec![7; 32]],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack).expect("encode ack");
+        let decoded = rkyv::from_bytes::<MeshSyncAckPayload, rkyv::rancor::Error>(&bytes)
+            .expect("decode ack");
+        assert_eq!(decoded.operation_ids.len(), 1);
+
+        let pull = MeshSyncPullPayload {
+            from_node_id: "node-a".to_string(),
+            partition_id: "addon/contacts/persons/1".to_string(),
+            from_sequence: 2,
+            limit: 128,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&pull).expect("encode pull");
+        let decoded = rkyv::from_bytes::<MeshSyncPullPayload, rkyv::rancor::Error>(&bytes)
+            .expect("decode pull");
+        assert_eq!(decoded.from_sequence, 2);
+
+        let response = MeshSyncPullResponsePayload {
+            from_node_id: "node-b".to_string(),
+            partition_id: "addon/contacts/persons/1".to_string(),
+            from_sequence: 2,
+            operations: vec![op],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response).expect("encode response");
+        let decoded = rkyv::from_bytes::<MeshSyncPullResponsePayload, rkyv::rancor::Error>(&bytes)
+            .expect("decode response");
+        assert_eq!(decoded.operations.len(), 1);
+
+        let snapshot_pull = MeshSyncSnapshotPullPayload {
+            from_node_id: "node-a".to_string(),
+            partition_id: "addon/contacts/persons/1".to_string(),
+            up_to_sequence: 10,
+            snapshot_id: "snapshot-a".to_string(),
+            include_tail: true,
+            tail_limit: 64,
+        };
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot_pull).expect("encode snapshot pull");
+        let decoded = rkyv::from_bytes::<MeshSyncSnapshotPullPayload, rkyv::rancor::Error>(&bytes)
+            .expect("decode snapshot pull");
+        assert_eq!(decoded.snapshot_id, "snapshot-a");
+        assert!(decoded.include_tail);
+
+        let snapshot_response = MeshSyncSnapshotResponsePayload {
+            from_node_id: "node-b".to_string(),
+            partition_id: "addon/contacts/persons/1".to_string(),
+            up_to_sequence: 10,
+            snapshot_id: "snapshot-a".to_string(),
+            snapshot_bytes: vec![1, 2, 3],
+            blob_bytes: vec![4, 5, 6],
+            operations_after_snapshot: vec![MeshSyncOperationWire {
+                op_id: vec![9; 32],
+                partition_id: "addon/contacts/persons/1".to_string(),
+                partition_sequence: 11,
+                operation: vec![7, 8],
+            }],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot_response)
+            .expect("encode snapshot response");
+        let decoded =
+            rkyv::from_bytes::<MeshSyncSnapshotResponsePayload, rkyv::rancor::Error>(&bytes)
+                .expect("decode snapshot response");
+        assert_eq!(decoded.blob_bytes, vec![4, 5, 6]);
+        assert_eq!(decoded.operations_after_snapshot.len(), 1);
     }
 
     // =========================================================================
