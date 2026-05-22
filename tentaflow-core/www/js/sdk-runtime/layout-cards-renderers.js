@@ -233,11 +233,11 @@ function renderCard(component, ctx) {
 // =============================================================================
 
 export const SECTION_CARD_TAG = 0x0107;
-/// Spec §4 0x0200 Button. Walidujemy tag w SectionCard.header_actions bez
-/// importu renderer'a Button (chunk 3.3b doda jego implementację) —
-/// constraint jest egzekwowany na poziomie tag-u, niezależnie od tego,
-/// czy renderer Button-a jest jeszcze zarejestrowany.
-const BUTTON_TAG = 0x0200;
+/// Spec §6 0x0401 Button. Walidujemy tag w SectionCard.header_actions
+/// bez importu renderer'a Button — constraint jest egzekwowany na
+/// poziomie tag-u, niezależnie od tego, czy renderer Button-a jest
+/// załadowany (chunk 3.3b-1 dodał realny renderer).
+const BUTTON_TAG = 0x0401;
 const SECTION_CARD_FIELD_KEYS = new Set([
   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 ]);
@@ -342,11 +342,11 @@ function renderSectionCard(component, ctx) {
     actions.classList.add('tf-section-card__actions');
     for (const action of headerActions) {
       // Spec §3 0x0107: header_actions to `Vec<ComponentRef<Button>>` —
-      // tylko komponenty z tag-em 0x0200 (Button) są dozwolone. Mirror
+      // tylko komponenty z tag-em 0x0401 (Button) są dozwolone. Mirror
       // Rust `ensure_ref_tag_encode/decode(Button::TAG)`.
       if (!action || typeof action !== 'object' || action.tag !== BUTTON_TAG) {
         throw new TypeError(
-          `SectionCard.header_actions entry must be Button (tag 0x0200), got 0x${
+          `SectionCard.header_actions entry must be Button (tag 0x0401), got 0x${
             (action && action.tag != null ? action.tag : 0).toString(16).padStart(4, '0')
           }`
         );
