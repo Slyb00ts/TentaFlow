@@ -99,7 +99,7 @@ pub fn sql_exec_v1(
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
 
-    let result = exec_for_addon(&org_id, &addon_id, &query, &params);
+    let result = exec_for_addon(&org_id, &addon_id, &query, &params, caller.data().user_id);
     match result {
         Ok((rows_affected, last_insert_id)) => {
             audit_log_with_risk(
@@ -435,7 +435,7 @@ pub fn sql_transaction_v1(
         .org_id
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
-    match transaction_for_addon(&org_id, &addon_id, &prepared) {
+    match transaction_for_addon(&org_id, &addon_id, &prepared, caller.data().user_id) {
         Ok(total) => {
             audit_log_with_risk(
                 caller.data(),

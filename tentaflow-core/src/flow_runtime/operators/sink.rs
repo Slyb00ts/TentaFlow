@@ -161,7 +161,7 @@ pub async fn run(
                         // return on cancel while the SQL completes in the
                         // background (its own watchdog still applies).
                         let handle = tokio::task::spawn_blocking(move || {
-                            exec_for_addon(&org_id, &addon_id, &sql, &params_vec)
+                            exec_for_addon(&org_id, &addon_id, &sql, &params_vec, None)
                         });
                         tokio::select! {
                             res = handle => match res {

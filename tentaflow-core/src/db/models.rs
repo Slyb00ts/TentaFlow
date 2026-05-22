@@ -284,6 +284,7 @@ pub struct FlowParams<'a> {
     /// `Some` advertises it as a model (validated against alias / flow
     /// collisions in the handler before this struct is built).
     pub published_model_name: Option<&'a str>,
+    pub actor_user_id: Option<i64>,
 }
 
 /// Parametry tworzenia/aktualizacji szablonu wezla flow
@@ -522,6 +523,105 @@ pub struct PendingPairing {
     pub pin_code: String,
     pub direction: String,
     pub expires_at: String,
+}
+
+/// Techniczna tozsamosc node/device uzywana przez Sync Ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNodeIdentity {
+    pub node_id: String,
+    pub public_key: String,
+    pub public_key_type: String,
+    pub display_name: String,
+    pub node_kind: String,
+    pub trust_status: String,
+    pub owner_user_id: Option<i64>,
+    pub sync_profile: String,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Kryptograficzny klucz uzytkownika, niezalezny od klucza node/device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserIdentityKey {
+    pub key_id: String,
+    pub user_id: i64,
+    pub key_type: String,
+    pub public_key: String,
+    pub purpose: String,
+    pub status: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+/// Relacja okreslajaca, ktorzy uzytkownicy moga korzystac z danego noda.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeUserAssignment {
+    pub node_id: String,
+    pub user_id: i64,
+    pub assignment_mode: String,
+    pub valid_from: String,
+    pub valid_until: Option<String>,
+    pub created_by: Option<i64>,
+    pub created_at: String,
+}
+
+/// Profil organizacyjny usera uzywany przez Permission Engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncUserOrgProfile {
+    pub org_id: String,
+    pub user_id: i64,
+    pub department_id: Option<String>,
+    pub manager_user_id: Option<i64>,
+    pub is_department_manager: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Metadata dostepu do zasobu synchronizowanego przez Sync Ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncResourceAcl {
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub owner_user_id: Option<i64>,
+    pub assigned_user_id: Option<i64>,
+    pub department_id: Option<String>,
+    pub manager_user_id: Option<i64>,
+    pub visibility_scope: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Wynik decyzji Permission Engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncAccessDecision {
+    pub allowed: bool,
+    pub reason: String,
+}
+
+/// Konfiguracja trybu synchronizacji dla addonu/typu zasobu/zasobu.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPolicy {
+    pub policy_id: String,
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub mode: String,
+    pub authority_node_id: Option<String>,
+    pub retention_days: Option<i64>,
+    pub is_enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Odbiorca wybrany przez Sync Policy i Permission Engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPolicyTarget {
+    pub node_id: String,
+    pub reason: String,
 }
 
 /// Filtry do przeszukiwania logu audytowego

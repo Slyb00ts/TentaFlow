@@ -36,6 +36,7 @@ pub mod ports;
 pub mod rbac;
 pub mod recording;
 pub mod registry;
+pub mod role_catalog;
 pub mod runtime;
 pub mod service_call;
 pub mod service_call_rate_limit;

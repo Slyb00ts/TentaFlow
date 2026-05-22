@@ -48,6 +48,5 @@ pub trait BinaryStreamSource: Send + Sync {
 
 /// Factory invoked the first time a stream is subscribed to. The hub caches
 /// the resulting `Arc` until the subscriber count drops to zero.
-pub type StreamSourceFactory = Box<
-    dyn Fn() -> Result<Arc<dyn BinaryStreamSource>, StreamHubError> + Send + Sync + 'static,
->;
+pub type StreamSourceFactory =
+    Box<dyn Fn() -> Result<Arc<dyn BinaryStreamSource>, StreamHubError> + Send + Sync + 'static>;

@@ -114,6 +114,7 @@ fn ensure_teams_flow(pool: &DbPool) -> Result<()> {
         flow_json: &flow_json,
         status: "active",
         published_model_name: None,
+        actor_user_id: None,
     };
     repository::create_flow(pool, &params)?;
     Ok(())

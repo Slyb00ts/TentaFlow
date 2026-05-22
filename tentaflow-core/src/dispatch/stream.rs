@@ -419,19 +419,18 @@ mod tests {
 
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(101, None);
-        let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
-            },
-        ));
+            }));
         let h = find_stream_handler("StreamSubscribeRequest").expect("registered");
         (h.handler_fn)(req, ctx_with_camera_read(101), sub);
 
         // 1) SubscribeResponse.
         match rx.recv().await.unwrap() {
-            SubscriptionEvent::Chunk(MessageBody::StreamBody(StreamPayload::SubscribeResponse(
-                resp,
-            ))) => {
+            SubscriptionEvent::Chunk(MessageBody::StreamBody(
+                StreamPayload::SubscribeResponse(resp),
+            )) => {
                 assert_eq!(resp.stream_id, stream_id);
                 assert!(resp.has_init_segment);
                 assert!(resp.mime_type.starts_with("video/mp4"));
@@ -475,11 +474,10 @@ mod tests {
 
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(606, None);
-        let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
-            },
-        ));
+            }));
         let mut ctx = ctx_with_camera_read(606);
         ctx.org_context = Some(test_org_context("lag-user", PERM_CAMERA_READ));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
@@ -489,9 +487,9 @@ mod tests {
         // recv-loop. Then publish far more than the broadcast cap (8) before
         // we drain further events; the receiver must observe `Lagged`.
         match rx.recv().await.unwrap() {
-            SubscriptionEvent::Chunk(MessageBody::StreamBody(StreamPayload::SubscribeResponse(
-                _,
-            ))) => {}
+            SubscriptionEvent::Chunk(MessageBody::StreamBody(
+                StreamPayload::SubscribeResponse(_),
+            )) => {}
             other => panic!("expected SubscribeResponse, got {:?}", other),
         }
 
@@ -527,11 +525,10 @@ mod tests {
     async fn subscribe_rejects_unregistered_stream() {
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(202, None);
-        let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:does-not-exist-xyz".to_string(),
-            },
-        ));
+            }));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx_with_camera_read(202), sub);
 
@@ -548,11 +545,10 @@ mod tests {
     async fn subscribe_rejects_unsupported_prefix() {
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(303, None);
-        let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "audio:doorbell".to_string(),
-            },
-        ));
+            }));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx_with_camera_read(303), sub);
 
@@ -572,11 +568,10 @@ mod tests {
 
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(404, None);
-        let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
-            },
-        ));
+            }));
         let mut ctx = ctx_with_camera_read(404);
         // Strip the permission to exercise the deny path.
         ctx.org_context = Some(test_org_context("user-no-perm", "some.other.perm"));
@@ -617,11 +612,10 @@ mod tests {
             let (sub, rx) = reg.create(900 + i as u64, None);
             let mut ctx = ctx_with_camera_read(900 + i as u64);
             ctx.org_context = Some(test_org_context(user_key, PERM_CAMERA_READ));
-            let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-                StreamSubscribeRequest {
+            let req =
+                MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                     stream_id: stream_id.to_string(),
-                },
-            ));
+                }));
             let h = find_stream_handler("StreamSubscribeRequest").unwrap();
             (h.handler_fn)(req, ctx, sub);
             handles.push(rx);
@@ -639,11 +633,10 @@ mod tests {
         let (sub, mut rx_over) = reg.create(999, None);
         let mut ctx = ctx_with_camera_read(999);
         ctx.org_context = Some(test_org_context(user_key, PERM_CAMERA_READ));
-        let req = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
-            },
-        ));
+            }));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx, sub);
 
