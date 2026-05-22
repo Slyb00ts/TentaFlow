@@ -412,3 +412,55 @@
 }
 .tf-accordion__item--expanded .tf-accordion__header::after { transform: rotate(180deg); }
 .tf-accordion__body { padding: 0 var(--tf-space-md) var(--tf-space-md); }
+
+/* =============================================================================
+   tf-nav-tabs (0x010C) — chunk 3.3a-4
+   ============================================================================= */
+.tf-nav-tabs {
+  display: flex;
+  gap: var(--tf-space-xs);
+  align-items: stretch;
+  min-width: 0;
+}
+.tf-nav-tabs--scroll {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.tf-nav-tabs__tab {
+  background: transparent;
+  border: 0;
+  padding: var(--tf-space-sm) var(--tf-space-md);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  border-radius: var(--tf-radius-sm);
+  white-space: nowrap;
+}
+.tf-nav-tabs__tab:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-nav-tabs__tab--locked {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tf-nav-tabs__tab--active {
+  font-weight: 600;
+}
+/* Underlined variant */
+.tf-nav-tabs--variant-underlined .tf-nav-tabs__tab {
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding-bottom: calc(var(--tf-space-sm) - 2px);
+}
+.tf-nav-tabs--variant-underlined .tf-nav-tabs__tab--active {
+  border-bottom-color: var(--accent-bg, #1e40af);
+}
+/* Pills variant */
+.tf-nav-tabs--variant-pills .tf-nav-tabs__tab {
+  border-radius: var(--tf-radius-pill);
+}
+.tf-nav-tabs--variant-pills .tf-nav-tabs__tab--active {
+  background: var(--tf-bg-accent);
+  color: var(--text-inverse, #fff);
+}
