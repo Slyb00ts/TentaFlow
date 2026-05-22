@@ -4,7 +4,7 @@
 // DO NOT EDIT BY HAND — re-run the generator after struct edits.
 // =============================================================================
 
-use super::types::{ComponentMeta, FieldMeta, section};
+use super::types::{ComponentMeta, EnumMeta, FieldMeta, InlineMeta, section};
 
 pub const EMPTYSTATE_SCHEMA: ComponentMeta = ComponentMeta {
     tag: 0x0003,
@@ -783,7 +783,7 @@ pub const VISUALLYHIDDEN_SCHEMA: ComponentMeta = ComponentMeta {
     section: section::DATA,
     fields: &[
         FieldMeta { key: 0, name: "content", wire: "BindRef", required: true, default: None },
-        FieldMeta { key: 1, name: "as_live", wire: "Option<Inline<LiveRegionPoliteness>>", required: false, default: None },
+        FieldMeta { key: 1, name: "as_live", wire: "Option<Enum<LiveRegion>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -793,7 +793,7 @@ pub const LIVEREGIONCOMPONENT_SCHEMA: ComponentMeta = ComponentMeta {
     name: "LiveRegionComponent",
     section: section::DATA,
     fields: &[
-        FieldMeta { key: 0, name: "politeness", wire: "Inline<LiveRegionPoliteness>", required: true, default: None },
+        FieldMeta { key: 0, name: "politeness", wire: "Enum<LiveRegion>", required: true, default: None },
         FieldMeta { key: 1, name: "content", wire: "BindRef", required: true, default: None },
         FieldMeta { key: 2, name: "visible", wire: "bool", required: true, default: None },
         FieldMeta { key: 3, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
@@ -1054,7 +1054,7 @@ pub const DATEPICKER_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 2, name: "min_date", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 3, name: "max_date", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 4, name: "locale", wire: "Option<tstr>", required: false, default: None },
-        FieldMeta { key: 5, name: "format", wire: "Inline<DateStyle>", required: true, default: None },
+        FieldMeta { key: 5, name: "format", wire: "Enum<DateStyle>", required: true, default: None },
         FieldMeta { key: 6, name: "first_day_of_week", wire: "Enum<DayOfWeek>", required: true, default: None },
         FieldMeta { key: 7, name: "disabled_dates", wire: "Option<Array<tstr>>", required: false, default: None },
         FieldMeta { key: 8, name: "presets", wire: "Option<Array<Inline<DatePreset>>>", required: false, default: None },
@@ -1074,7 +1074,7 @@ pub const DATERANGEPICKER_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 3, name: "min_date", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 4, name: "max_date", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 5, name: "locale", wire: "Option<tstr>", required: false, default: None },
-        FieldMeta { key: 6, name: "format", wire: "Inline<DateStyle>", required: true, default: None },
+        FieldMeta { key: 6, name: "format", wire: "Enum<DateStyle>", required: true, default: None },
         FieldMeta { key: 7, name: "first_day_of_week", wire: "Enum<DayOfWeek>", required: true, default: None },
         FieldMeta { key: 8, name: "disabled_dates", wire: "Option<Array<tstr>>", required: false, default: None },
         FieldMeta { key: 9, name: "presets", wire: "Option<Array<Inline<RangePreset>>>", required: false, default: None },
@@ -1092,7 +1092,7 @@ pub const TIMEPICKER_SCHEMA: ComponentMeta = ComponentMeta {
     fields: &[
         FieldMeta { key: 0, name: "bind_path", wire: "StatePath", required: true, default: None },
         FieldMeta { key: 1, name: "precision", wire: "Enum<TimePrecision>", required: true, default: None },
-        FieldMeta { key: 2, name: "format", wire: "Inline<TimeStyle>", required: true, default: None },
+        FieldMeta { key: 2, name: "format", wire: "Enum<TimeStyle>", required: true, default: None },
         FieldMeta { key: 3, name: "step_minutes", wire: "u16", required: true, default: None },
         FieldMeta { key: 4, name: "label", wire: "Option<BindRef>", required: false, default: None },
     ],
@@ -1108,8 +1108,8 @@ pub const DATETIMEPICKER_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 1, name: "label", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 2, name: "min_datetime", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 3, name: "max_datetime", wire: "Option<tstr>", required: false, default: None },
-        FieldMeta { key: 4, name: "date_format", wire: "Inline<DateStyle>", required: true, default: None },
-        FieldMeta { key: 5, name: "time_format", wire: "Inline<TimeStyle>", required: true, default: None },
+        FieldMeta { key: 4, name: "date_format", wire: "Enum<DateStyle>", required: true, default: None },
+        FieldMeta { key: 5, name: "time_format", wire: "Enum<TimeStyle>", required: true, default: None },
         FieldMeta { key: 6, name: "time_precision", wire: "Enum<TimePrecision>", required: true, default: None },
         FieldMeta { key: 7, name: "step_minutes", wire: "u16", required: true, default: None },
         FieldMeta { key: 8, name: "locale", wire: "Option<tstr>", required: false, default: None },
@@ -2252,4 +2252,2078 @@ pub const ALL_COMPONENTS: &[&ComponentMeta] = &[
     &CODEEDITOR_SCHEMA,
     &TERMINAL_SCHEMA,
     &STEPPROGRESS_SCHEMA,
+];
+
+pub const TONE_ENUM: EnumMeta = EnumMeta {
+    name: "Tone",
+    variants: &[
+        ("Neutral", "neutral"),
+        ("Primary", "primary"),
+        ("Success", "success"),
+        ("Warning", "warning"),
+        ("Critical", "critical"),
+        ("Info", "info"),
+        ("Muted", "muted"),
+    ],
+};
+
+pub const BUTTONVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "ButtonVariant",
+    variants: &[
+        ("Primary", "primary"),
+        ("Secondary", "secondary"),
+        ("Tertiary", "tertiary"),
+        ("Ghost", "ghost"),
+        ("Destructive", "destructive"),
+        ("Link", "link"),
+    ],
+};
+
+pub const BADGEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "BadgeVariant",
+    variants: &[
+        ("Solid", "solid"),
+        ("Soft", "soft"),
+        ("Outline", "outline"),
+        ("Pulse", "pulse"),
+        ("Dot", "dot"),
+    ],
+};
+
+pub const CHIPVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "ChipVariant",
+    variants: &[
+        ("Solid", "solid"),
+        ("Soft", "soft"),
+        ("Outline", "outline"),
+        ("Removable", "removable"),
+        ("Selectable", "selectable"),
+        ("Toggle", "toggle"),
+    ],
+};
+
+pub const DENSITY_ENUM: EnumMeta = EnumMeta {
+    name: "Density",
+    variants: &[
+        ("Compact", "compact"),
+        ("Default", "default"),
+        ("Comfortable", "comfortable"),
+    ],
+};
+
+pub const SPACING_ENUM: EnumMeta = EnumMeta {
+    name: "Spacing",
+    variants: &[
+        ("Zero", "zero"),
+        ("Xxs", "xxs"),
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+        ("Xxl", "xxl"),
+    ],
+};
+
+pub const TEXTSTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "TextStyle",
+    variants: &[
+        ("Display", "display"),
+        ("Title", "title"),
+        ("H1", "h1"),
+        ("H2", "h2"),
+        ("H3", "h3"),
+        ("H4", "h4"),
+        ("BodyLg", "body_lg"),
+        ("Body", "body"),
+        ("BodyStrong", "body_strong"),
+        ("Caption", "caption"),
+        ("Overline", "overline"),
+        ("Code", "code"),
+        ("Mono", "mono"),
+        ("Quote", "quote"),
+    ],
+};
+
+pub const TEXTALIGN_ENUM: EnumMeta = EnumMeta {
+    name: "TextAlign",
+    variants: &[
+        ("Start", "start"),
+        ("Center", "center"),
+        ("End", "end"),
+        ("Justify", "justify"),
+    ],
+};
+
+pub const TEXTWRAP_ENUM: EnumMeta = EnumMeta {
+    name: "TextWrap",
+    variants: &[
+        ("Wrap", "wrap"),
+        ("Nowrap", "nowrap"),
+        ("Balance", "balance"),
+        ("Pretty", "pretty"),
+    ],
+};
+
+pub const RADIUSTOKEN_ENUM: EnumMeta = EnumMeta {
+    name: "RadiusToken",
+    variants: &[
+        ("None", "none"),
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+        ("Pill", "pill"),
+        ("Circle", "circle"),
+    ],
+};
+
+pub const SHADOWTOKEN_ENUM: EnumMeta = EnumMeta {
+    name: "ShadowToken",
+    variants: &[
+        ("None", "none"),
+        ("Subtle", "subtle"),
+        ("Medium", "medium"),
+        ("Elevated", "elevated"),
+        ("Floating", "floating"),
+    ],
+};
+
+pub const BREAKPOINT_ENUM: EnumMeta = EnumMeta {
+    name: "Breakpoint",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+        ("Xxl", "xxl"),
+    ],
+};
+
+pub const ICONSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "IconSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+    ],
+};
+
+pub const SCROLLBEHAVIOR_ENUM: EnumMeta = EnumMeta {
+    name: "ScrollBehavior",
+    variants: &[
+        ("Auto", "auto"),
+        ("Smooth", "smooth"),
+        ("Instant", "instant"),
+    ],
+};
+
+pub const DRAWERSIDE_ENUM: EnumMeta = EnumMeta {
+    name: "DrawerSide",
+    variants: &[
+        ("Left", "left"),
+        ("Right", "right"),
+        ("Top", "top"),
+        ("Bottom", "bottom"),
+    ],
+};
+
+pub const NAVIGATETARGET_ENUM: EnumMeta = EnumMeta {
+    name: "NavigateTarget",
+    variants: &[
+        ("NewTab", "new_tab"),
+        ("SameTab", "same_tab"),
+        ("SystemBrowser", "system_browser"),
+    ],
+};
+
+pub const LIVEREGION_ENUM: EnumMeta = EnumMeta {
+    name: "LiveRegion",
+    variants: &[
+        ("Off", "off"),
+        ("Polite", "polite"),
+        ("Assertive", "assertive"),
+    ],
+};
+
+pub const CURSORTOKEN_ENUM: EnumMeta = EnumMeta {
+    name: "CursorToken",
+    variants: &[
+        ("Default", "default"),
+        ("Pointer", "pointer"),
+        ("Text", "text"),
+        ("Move", "move"),
+        ("Grab", "grab"),
+        ("Grabbing", "grabbing"),
+        ("NotAllowed", "not_allowed"),
+        ("Crosshair", "crosshair"),
+        ("ColResize", "col_resize"),
+        ("RowResize", "row_resize"),
+    ],
+};
+
+pub const COLORTOKEN_ENUM: EnumMeta = EnumMeta {
+    name: "ColorToken",
+    variants: &[
+        ("BackgroundDefault", "background_default"),
+        ("BackgroundSubtle", "background_subtle"),
+        ("BackgroundMuted", "background_muted"),
+        ("SurfaceDefault", "surface_default"),
+        ("SurfaceRaised", "surface_raised"),
+        ("SurfaceOverlay", "surface_overlay"),
+        ("BorderDefault", "border_default"),
+        ("BorderStrong", "border_strong"),
+        ("BorderSubtle", "border_subtle"),
+        ("TextDefault", "text_default"),
+        ("TextMuted", "text_muted"),
+        ("TextInverse", "text_inverse"),
+        ("AccentPrimary", "accent_primary"),
+        ("AccentSecondary", "accent_secondary"),
+        ("ToneNeutral", "tone_neutral"),
+        ("ToneSuccess", "tone_success"),
+        ("ToneWarning", "tone_warning"),
+        ("ToneCritical", "tone_critical"),
+        ("ToneInfo", "tone_info"),
+    ],
+};
+
+pub const BACKGROUNDTOKEN_ENUM: EnumMeta = EnumMeta {
+    name: "BackgroundToken",
+    variants: &[
+        ("None", "none"),
+        ("Subtle", "subtle"),
+        ("Muted", "muted"),
+        ("Accent", "accent"),
+        ("Inverse", "inverse"),
+    ],
+};
+
+pub const FLEXALIGN_ENUM: EnumMeta = EnumMeta {
+    name: "FlexAlign",
+    variants: &[
+        ("Start", "start"),
+        ("End", "end"),
+        ("Center", "center"),
+        ("Baseline", "baseline"),
+        ("Stretch", "stretch"),
+    ],
+};
+
+pub const FLEXJUSTIFY_ENUM: EnumMeta = EnumMeta {
+    name: "FlexJustify",
+    variants: &[
+        ("Start", "start"),
+        ("End", "end"),
+        ("Center", "center"),
+        ("SpaceBetween", "space_between"),
+        ("SpaceAround", "space_around"),
+        ("SpaceEvenly", "space_evenly"),
+    ],
+};
+
+pub const SORTDIRECTION_ENUM: EnumMeta = EnumMeta {
+    name: "SortDirection",
+    variants: &[
+        ("Asc", "asc"),
+        ("Desc", "desc"),
+    ],
+};
+
+pub const FILEUPLOADSTATUS_ENUM: EnumMeta = EnumMeta {
+    name: "FileUploadStatus",
+    variants: &[
+        ("Queued", "queued"),
+        ("Uploading", "uploading"),
+        ("Complete", "complete"),
+        ("Error", "error"),
+    ],
+};
+
+pub const STEPSTATUS_ENUM: EnumMeta = EnumMeta {
+    name: "StepStatus",
+    variants: &[
+        ("Pending", "pending"),
+        ("Current", "current"),
+        ("Complete", "complete"),
+        ("Error", "error"),
+        ("Skipped", "skipped"),
+    ],
+};
+
+pub const SHEETDETENT_ENUM: EnumMeta = EnumMeta {
+    name: "SheetDetent",
+    variants: &[
+        ("Small", "small"),
+        ("Medium", "medium"),
+        ("Large", "large"),
+        ("Full", "full"),
+    ],
+};
+
+pub const CHARTSERIESSTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "ChartSeriesStyle",
+    variants: &[
+        ("Solid", "solid"),
+        ("Dashed", "dashed"),
+        ("Dotted", "dotted"),
+    ],
+};
+
+pub const CHARTAXISSCALE_ENUM: EnumMeta = EnumMeta {
+    name: "ChartAxisScale",
+    variants: &[
+        ("Linear", "linear"),
+        ("Log", "log"),
+        ("Time", "time"),
+        ("Category", "category"),
+    ],
+};
+
+pub const CHARTLEGENDPOSITION_ENUM: EnumMeta = EnumMeta {
+    name: "ChartLegendPosition",
+    variants: &[
+        ("Top", "top"),
+        ("Bottom", "bottom"),
+        ("Left", "left"),
+        ("Right", "right"),
+        ("None", "none"),
+    ],
+};
+
+pub const CHARTLEGENDALIGN_ENUM: EnumMeta = EnumMeta {
+    name: "ChartLegendAlign",
+    variants: &[
+        ("Start", "start"),
+        ("Center", "center"),
+        ("End", "end"),
+    ],
+};
+
+pub const COLUMNRENDER_ENUM: EnumMeta = EnumMeta {
+    name: "ColumnRender",
+    variants: &[
+        ("Text", "text"),
+        ("Number", "number"),
+        ("Currency", "currency"),
+        ("Percent", "percent"),
+        ("Bytes", "bytes"),
+        ("Date", "date"),
+        ("Time", "time"),
+        ("Datetime", "datetime"),
+        ("Relative", "relative"),
+        ("Badge", "badge"),
+        ("Chip", "chip"),
+        ("Tag", "tag"),
+        ("Avatar", "avatar"),
+        ("AvatarGroup", "avatar_group"),
+        ("Icon", "icon"),
+        ("Stat", "stat"),
+        ("Trend", "trend"),
+        ("Progress", "progress"),
+        ("Rating", "rating"),
+        ("Actions", "actions"),
+        ("Checkbox", "checkbox"),
+        ("Boolean", "boolean"),
+        ("CustomTemplate", "custom_template"),
+    ],
+};
+
+pub const EMPTYSTATEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "EmptyStateVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Compact", "compact"),
+        ("Illustrated", "illustrated"),
+    ],
+};
+
+pub const FLEXDIRECTION_ENUM: EnumMeta = EnumMeta {
+    name: "FlexDirection",
+    variants: &[
+        ("Row", "row"),
+        ("RowReverse", "row_reverse"),
+        ("Column", "column"),
+        ("ColumnReverse", "column_reverse"),
+    ],
+};
+
+pub const FLEXWRAP_ENUM: EnumMeta = EnumMeta {
+    name: "FlexWrap",
+    variants: &[
+        ("NoWrap", "no_wrap"),
+        ("Wrap", "wrap"),
+        ("WrapReverse", "wrap_reverse"),
+    ],
+};
+
+pub const SPLITORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "SplitOrientation",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+    ],
+};
+
+pub const CARDVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "CardVariant",
+    variants: &[
+        ("Filled", "filled"),
+        ("Outlined", "outlined"),
+        ("Elevated", "elevated"),
+        ("Ghost", "ghost"),
+    ],
+};
+
+pub const DIVIDERORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "DividerOrientation",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+    ],
+};
+
+pub const DIVIDERVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "DividerVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Subtle", "subtle"),
+        ("Strong", "strong"),
+        ("Dashed", "dashed"),
+    ],
+};
+
+pub const SPACERAXIS_ENUM: EnumMeta = EnumMeta {
+    name: "SpacerAxis",
+    variants: &[
+        ("X", "x"),
+        ("Y", "y"),
+        ("Both", "both"),
+    ],
+};
+
+pub const TABSVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "TabsVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Pills", "pills"),
+        ("Underlined", "underlined"),
+        ("Boxed", "boxed"),
+    ],
+};
+
+pub const NAVTABSVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "NavTabsVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Underlined", "underlined"),
+        ("Pills", "pills"),
+    ],
+};
+
+pub const ACCORDIONMODE_ENUM: EnumMeta = EnumMeta {
+    name: "AccordionMode",
+    variants: &[
+        ("Single", "single"),
+        ("Multiple", "multiple"),
+    ],
+};
+
+pub const BREADCRUMBSEPARATOR_ENUM: EnumMeta = EnumMeta {
+    name: "BreadcrumbSeparator",
+    variants: &[
+        ("Chevron", "chevron"),
+        ("Slash", "slash"),
+        ("Dot", "dot"),
+    ],
+};
+
+pub const PAGINATIONVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "PaginationVariant",
+    variants: &[
+        ("Compact", "compact"),
+        ("Full", "full"),
+        ("Input", "input"),
+    ],
+};
+
+pub const SCROLLORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "ScrollOrientation",
+    variants: &[
+        ("Vertical", "vertical"),
+        ("Horizontal", "horizontal"),
+        ("Both", "both"),
+    ],
+};
+
+pub const MARKDOWNMARK_ENUM: EnumMeta = EnumMeta {
+    name: "MarkdownMark",
+    variants: &[
+        ("Bold", "bold"),
+        ("Italic", "italic"),
+        ("Code", "code"),
+        ("Link", "link"),
+    ],
+};
+
+pub const MARKDOWNBLOCK_ENUM: EnumMeta = EnumMeta {
+    name: "MarkdownBlock",
+    variants: &[
+        ("Heading", "heading"),
+        ("List", "list"),
+        ("CodeBlock", "code_block"),
+        ("Blockquote", "blockquote"),
+        ("Table", "table"),
+    ],
+};
+
+pub const KVLAYOUT_ENUM: EnumMeta = EnumMeta {
+    name: "KvLayout",
+    variants: &[
+        ("Stacked", "stacked"),
+        ("Horizontal", "horizontal"),
+        ("Grid", "grid"),
+    ],
+};
+
+pub const STATSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "StatSize",
+    variants: &[
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const TAGSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "TagSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+    ],
+};
+
+pub const AVATARSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "AvatarSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+    ],
+};
+
+pub const AVATARSHAPE_ENUM: EnumMeta = EnumMeta {
+    name: "AvatarShape",
+    variants: &[
+        ("Circle", "circle"),
+        ("Rounded", "rounded"),
+        ("Square", "square"),
+    ],
+};
+
+pub const AVATARSTATUS_ENUM: EnumMeta = EnumMeta {
+    name: "AvatarStatus",
+    variants: &[
+        ("Online", "online"),
+        ("Offline", "offline"),
+        ("Busy", "busy"),
+        ("Away", "away"),
+    ],
+};
+
+pub const AVATAROVERLAP_ENUM: EnumMeta = EnumMeta {
+    name: "AvatarOverlap",
+    variants: &[
+        ("Tight", "tight"),
+        ("Default", "default"),
+        ("Loose", "loose"),
+    ],
+};
+
+pub const BULLETLISTVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "BulletListVariant",
+    variants: &[
+        ("Bullet", "bullet"),
+        ("Numbered", "numbered"),
+        ("Check", "check"),
+        ("Icon", "icon"),
+    ],
+};
+
+pub const TIMELINEORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "TimelineOrientation",
+    variants: &[
+        ("Vertical", "vertical"),
+        ("Horizontal", "horizontal"),
+    ],
+};
+
+pub const TABLEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "TableVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Striped", "striped"),
+        ("Borderless", "borderless"),
+        ("Compact", "compact"),
+    ],
+};
+
+pub const TABLESELECTMODE_ENUM: EnumMeta = EnumMeta {
+    name: "TableSelectMode",
+    variants: &[
+        ("None", "none"),
+        ("Single", "single"),
+        ("Multi", "multi"),
+    ],
+};
+
+pub const TREEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "TreeVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Compact", "compact"),
+        ("WithIcons", "with_icons"),
+    ],
+};
+
+pub const EMPTYCELLVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "EmptyCellVariant",
+    variants: &[
+        ("Dash", "dash"),
+        ("EmDash", "em_dash"),
+        ("NA", "n_a"),
+        ("None", "none"),
+        ("Loading", "loading"),
+    ],
+};
+
+pub const SPARKLINEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "SparklineVariant",
+    variants: &[
+        ("Line", "line"),
+        ("Area", "area"),
+        ("Bar", "bar"),
+    ],
+};
+
+pub const CHARTZOOMMODE_ENUM: EnumMeta = EnumMeta {
+    name: "ChartZoomMode",
+    variants: &[
+        ("None", "none"),
+        ("X", "x"),
+        ("Y", "y"),
+        ("Both", "both"),
+    ],
+};
+
+pub const CHARTORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "ChartOrientation",
+    variants: &[
+        ("Vertical", "vertical"),
+        ("Horizontal", "horizontal"),
+    ],
+};
+
+pub const BARSTACKING_ENUM: EnumMeta = EnumMeta {
+    name: "BarStacking",
+    variants: &[
+        ("None", "none"),
+        ("Stacked", "stacked"),
+        ("Percent", "percent"),
+    ],
+};
+
+pub const AREASTACKING_ENUM: EnumMeta = EnumMeta {
+    name: "AreaStacking",
+    variants: &[
+        ("None", "none"),
+        ("Stacked", "stacked"),
+        ("Percent", "percent"),
+    ],
+};
+
+pub const PIEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "PieVariant",
+    variants: &[
+        ("Pie", "pie"),
+        ("Donut", "donut"),
+    ],
+};
+
+pub const HEATMAPLEGENDPOSITION_ENUM: EnumMeta = EnumMeta {
+    name: "HeatmapLegendPosition",
+    variants: &[
+        ("TopRight", "top_right"),
+        ("Bottom", "bottom"),
+        ("None", "none"),
+    ],
+};
+
+pub const GAUGEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "GaugeVariant",
+    variants: &[
+        ("Circular", "circular"),
+        ("Arc", "arc"),
+        ("Semi", "semi"),
+    ],
+};
+
+pub const PROGRESSVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "ProgressVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Striped", "striped"),
+        ("Indeterminate", "indeterminate"),
+    ],
+};
+
+pub const PROGRESSSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "ProgressSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const RATINGVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "RatingVariant",
+    variants: &[
+        ("Stars", "stars"),
+        ("Hearts", "hearts"),
+        ("Circles", "circles"),
+        ("Numeric", "numeric"),
+    ],
+};
+
+pub const RATINGPRECISION_ENUM: EnumMeta = EnumMeta {
+    name: "RatingPrecision",
+    variants: &[
+        ("Full", "full"),
+        ("Half", "half"),
+        ("Decimal", "decimal"),
+    ],
+};
+
+pub const DIFFVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "DiffVariant",
+    variants: &[
+        ("Split", "split"),
+        ("Inline", "inline"),
+        ("Unified", "unified"),
+    ],
+};
+
+pub const MARKDOWNFEATURE_ENUM: EnumMeta = EnumMeta {
+    name: "MarkdownFeature",
+    variants: &[
+        ("Heading", "heading"),
+        ("List", "list"),
+        ("CodeBlock", "code_block"),
+        ("Blockquote", "blockquote"),
+        ("Table", "table"),
+        ("Link", "link"),
+        ("Image", "image"),
+        ("Emphasis", "emphasis"),
+        ("Strong", "strong"),
+        ("CodeInline", "code_inline"),
+    ],
+};
+
+pub const LINKTARGET_ENUM: EnumMeta = EnumMeta {
+    name: "LinkTarget",
+    variants: &[
+        ("SelfTarget", "self"),
+        ("BlankViaCommand", "blank_via_command"),
+    ],
+};
+
+pub const DLLAYOUT_ENUM: EnumMeta = EnumMeta {
+    name: "DlLayout",
+    variants: &[
+        ("Stacked", "stacked"),
+        ("TwoColumn", "two_column"),
+    ],
+};
+
+pub const DAYOFWEEK_ENUM: EnumMeta = EnumMeta {
+    name: "DayOfWeek",
+    variants: &[
+        ("Sunday", "sunday"),
+        ("Monday", "monday"),
+    ],
+};
+
+pub const IMAGEFIT_ENUM: EnumMeta = EnumMeta {
+    name: "ImageFit",
+    variants: &[
+        ("Cover", "cover"),
+        ("Contain", "contain"),
+        ("Fill", "fill"),
+        ("None", "none"),
+    ],
+};
+
+pub const INPUTTYPE_ENUM: EnumMeta = EnumMeta {
+    name: "InputType",
+    variants: &[
+        ("Text", "text"),
+        ("Email", "email"),
+        ("Password", "password"),
+        ("Url", "url"),
+        ("Phone", "phone"),
+        ("Number", "number"),
+        ("Search", "search"),
+    ],
+};
+
+pub const AUTOCOMPLETEHINT_ENUM: EnumMeta = EnumMeta {
+    name: "AutocompleteHint",
+    variants: &[
+        ("Off", "off"),
+        ("On", "on"),
+        ("Name", "name"),
+        ("Email", "email"),
+        ("Username", "username"),
+        ("CurrentPassword", "current_password"),
+        ("NewPassword", "new_password"),
+        ("OneTimeCode", "one_time_code"),
+        ("Tel", "tel"),
+        ("Url", "url"),
+        ("StreetAddress", "street_address"),
+        ("PostalCode", "postal_code"),
+    ],
+};
+
+pub const INPUTMODE_ENUM: EnumMeta = EnumMeta {
+    name: "InputMode",
+    variants: &[
+        ("None", "none"),
+        ("Text", "text"),
+        ("Tel", "tel"),
+        ("Url", "url"),
+        ("Email", "email"),
+        ("Numeric", "numeric"),
+        ("Decimal", "decimal"),
+        ("Search", "search"),
+    ],
+};
+
+pub const INPUTSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "InputSize",
+    variants: &[
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const SEARCHVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "SearchVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Subtle", "subtle"),
+        ("Prominent", "prominent"),
+    ],
+};
+
+pub const TOGGLESIZE_ENUM: EnumMeta = EnumMeta {
+    name: "ToggleSize",
+    variants: &[
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const TOGGLEPOSITION_ENUM: EnumMeta = EnumMeta {
+    name: "TogglePosition",
+    variants: &[
+        ("Leading", "leading"),
+        ("Trailing", "trailing"),
+    ],
+};
+
+pub const CHECKBOXSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "CheckboxSize",
+    variants: &[
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const RADIOGROUPORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "RadioGroupOrientation",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+    ],
+};
+
+pub const RADIOCARDVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "RadioCardVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Compact", "compact"),
+        ("Feature", "feature"),
+    ],
+};
+
+pub const SLIDERROWLAYOUT_ENUM: EnumMeta = EnumMeta {
+    name: "SliderRowLayout",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Compact", "compact"),
+    ],
+};
+
+pub const TIMEPRECISION_ENUM: EnumMeta = EnumMeta {
+    name: "TimePrecision",
+    variants: &[
+        ("Minute", "minute"),
+        ("Second", "second"),
+    ],
+};
+
+pub const FILECAPTURE_ENUM: EnumMeta = EnumMeta {
+    name: "FileCapture",
+    variants: &[
+        ("User", "user"),
+        ("Environment", "environment"),
+    ],
+};
+
+pub const COLORPICKERVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "ColorPickerVariant",
+    variants: &[
+        ("Swatch", "swatch"),
+        ("Wheel", "wheel"),
+        ("Compact", "compact"),
+        ("TokensOnly", "tokens_only"),
+    ],
+};
+
+pub const FORMFIELDLAYOUT_ENUM: EnumMeta = EnumMeta {
+    name: "FormFieldLayout",
+    variants: &[
+        ("Stacked", "stacked"),
+        ("Horizontal", "horizontal"),
+    ],
+};
+
+pub const FORMLAYOUT_ENUM: EnumMeta = EnumMeta {
+    name: "FormLayout",
+    variants: &[
+        ("Stacked", "stacked"),
+        ("Horizontal", "horizontal"),
+        ("Compact", "compact"),
+    ],
+};
+
+pub const BUTTONSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "ButtonSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const BUTTONGROUPORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "ButtonGroupOrientation",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+    ],
+};
+
+pub const LINKUNDERLINE_ENUM: EnumMeta = EnumMeta {
+    name: "LinkUnderline",
+    variants: &[
+        ("Always", "always"),
+        ("Hover", "hover"),
+        ("Never", "never"),
+    ],
+};
+
+pub const MENUPLACEMENT_ENUM: EnumMeta = EnumMeta {
+    name: "MenuPlacement",
+    variants: &[
+        ("BottomStart", "bottom_start"),
+        ("BottomEnd", "bottom_end"),
+        ("TopStart", "top_start"),
+        ("TopEnd", "top_end"),
+        ("LeftStart", "left_start"),
+        ("LeftEnd", "left_end"),
+        ("RightStart", "right_start"),
+        ("RightEnd", "right_end"),
+    ],
+};
+
+pub const SEGMENTSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "SegmentSize",
+    variants: &[
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const FILTERCHIPSMODE_ENUM: EnumMeta = EnumMeta {
+    name: "FilterChipsMode",
+    variants: &[
+        ("Single", "single"),
+        ("Multi", "multi"),
+    ],
+};
+
+pub const FABSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "FabSize",
+    variants: &[
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+    ],
+};
+
+pub const FABPOSITION_ENUM: EnumMeta = EnumMeta {
+    name: "FabPosition",
+    variants: &[
+        ("BottomRight", "bottom_right"),
+        ("BottomLeft", "bottom_left"),
+        ("Inline", "inline"),
+    ],
+};
+
+pub const ALERTVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "AlertVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Filled", "filled"),
+        ("Outlined", "outlined"),
+        ("Soft", "soft"),
+    ],
+};
+
+pub const BANNERPOSITION_ENUM: EnumMeta = EnumMeta {
+    name: "BannerPosition",
+    variants: &[
+        ("Top", "top"),
+        ("Inline", "inline"),
+    ],
+};
+
+pub const SKELETONVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "SkeletonVariant",
+    variants: &[
+        ("Text", "text"),
+        ("Circle", "circle"),
+        ("Rectangle", "rectangle"),
+        ("Card", "card"),
+        ("TableRow", "table_row"),
+    ],
+};
+
+pub const SPINNERSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "SpinnerSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+    ],
+};
+
+pub const SPINNERVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "SpinnerVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Ring", "ring"),
+        ("Dots", "dots"),
+        ("Bars", "bars"),
+    ],
+};
+
+pub const MODALSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "ModalSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+        ("Fullscreen", "fullscreen"),
+    ],
+};
+
+pub const DRAWERSIZE_ENUM: EnumMeta = EnumMeta {
+    name: "DrawerSize",
+    variants: &[
+        ("Xs", "xs"),
+        ("Sm", "sm"),
+        ("Md", "md"),
+        ("Lg", "lg"),
+        ("Xl", "xl"),
+    ],
+};
+
+pub const POPOVERPLACEMENT_ENUM: EnumMeta = EnumMeta {
+    name: "PopoverPlacement",
+    variants: &[
+        ("Top", "top"),
+        ("TopStart", "top_start"),
+        ("TopEnd", "top_end"),
+        ("Bottom", "bottom"),
+        ("BottomStart", "bottom_start"),
+        ("BottomEnd", "bottom_end"),
+        ("Left", "left"),
+        ("LeftStart", "left_start"),
+        ("LeftEnd", "left_end"),
+        ("Right", "right"),
+        ("RightStart", "right_start"),
+        ("RightEnd", "right_end"),
+    ],
+};
+
+pub const GATEVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "GateVariant",
+    variants: &[
+        ("AuthRequired", "auth_required"),
+        ("PermissionDenied", "permission_denied"),
+        ("RateLimited", "rate_limited"),
+        ("Maintenance", "maintenance"),
+    ],
+};
+
+pub const VIDEOCONTROLS_ENUM: EnumMeta = EnumMeta {
+    name: "VideoControls",
+    variants: &[
+        ("None", "none"),
+        ("Minimal", "minimal"),
+        ("Full", "full"),
+    ],
+};
+
+pub const CAMERASTATUS_ENUM: EnumMeta = EnumMeta {
+    name: "CameraStatus",
+    variants: &[
+        ("Online", "online"),
+        ("Offline", "offline"),
+        ("Buffering", "buffering"),
+        ("Error", "error"),
+    ],
+};
+
+pub const TILEPROVIDER_ENUM: EnumMeta = EnumMeta {
+    name: "TileProvider",
+    variants: &[
+        ("Osm", "osm"),
+        ("Mapbox", "mapbox"),
+        ("TileServer", "tile_server"),
+    ],
+};
+
+pub const CODEEDITORTHEME_ENUM: EnumMeta = EnumMeta {
+    name: "CodeEditorTheme",
+    variants: &[
+        ("Auto", "auto"),
+        ("Light", "light"),
+        ("Dark", "dark"),
+    ],
+};
+
+pub const TERMINALTHEME_ENUM: EnumMeta = EnumMeta {
+    name: "TerminalTheme",
+    variants: &[
+        ("Default", "default"),
+        ("HighContrast", "high_contrast"),
+        ("Dim", "dim"),
+    ],
+};
+
+pub const AUDIOCONTROLS_ENUM: EnumMeta = EnumMeta {
+    name: "AudioControls",
+    variants: &[
+        ("None", "none"),
+        ("Minimal", "minimal"),
+        ("Full", "full"),
+    ],
+};
+
+pub const AUDIOVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "AudioVariant",
+    variants: &[
+        ("Default", "default"),
+        ("Compact", "compact"),
+        ("Waveform", "waveform"),
+    ],
+};
+
+pub const FPSVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "FpsVariant",
+    variants: &[
+        ("Minimal", "minimal"),
+        ("Detailed", "detailed"),
+    ],
+};
+
+pub const STOPWATCHVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "StopwatchVariant",
+    variants: &[
+        ("Seconds", "seconds"),
+        ("Minutes", "minutes"),
+        ("Hours", "hours"),
+        ("Full", "full"),
+    ],
+};
+
+pub const CAROUSELGESTURES_ENUM: EnumMeta = EnumMeta {
+    name: "CarouselGestures",
+    variants: &[
+        ("Swipe", "swipe"),
+        ("ArrowsOnly", "arrows_only"),
+        ("None", "none"),
+    ],
+};
+
+pub const PDFZOOMMODE_ENUM: EnumMeta = EnumMeta {
+    name: "PdfZoomMode",
+    variants: &[
+        ("FitWidth", "fit_width"),
+        ("FitHeight", "fit_height"),
+        ("Actual", "actual"),
+        ("Custom", "custom"),
+    ],
+};
+
+pub const STEPPROGRESSVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "StepProgressVariant",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+        ("Compact", "compact"),
+    ],
+};
+
+pub const IFRAMESANDBOX_ENUM: EnumMeta = EnumMeta {
+    name: "IFrameSandbox",
+    variants: &[
+        ("AllowScripts", "allow-scripts"),
+        ("AllowForms", "allow-forms"),
+        ("AllowPopups", "allow-popups"),
+        ("AllowModals", "allow-modals"),
+    ],
+};
+
+pub const IFRAMEREFERRERPOLICY_ENUM: EnumMeta = EnumMeta {
+    name: "IFrameReferrerPolicy",
+    variants: &[
+        ("NoReferrer", "no-referrer"),
+        ("NoReferrerWhenDowngrade", "no-referrer-when-downgrade"),
+        ("Origin", "origin"),
+        ("OriginWhenCrossOrigin", "origin-when-cross-origin"),
+        ("SameOrigin", "same-origin"),
+        ("StrictOrigin", "strict-origin"),
+        ("StrictOriginWhenCrossOrigin", "strict-origin-when-cross-origin"),
+        ("UnsafeUrl", "unsafe-url"),
+    ],
+};
+
+pub const LOGVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "LogVariant",
+    variants: &[
+        ("Compact", "compact"),
+        ("Default", "default"),
+        ("Expanded", "expanded"),
+    ],
+};
+
+pub const LOGLEVEL_ENUM: EnumMeta = EnumMeta {
+    name: "LogLevel",
+    variants: &[
+        ("Trace", "trace"),
+        ("Debug", "debug"),
+        ("Info", "info"),
+        ("Warn", "warn"),
+        ("Error", "error"),
+        ("Fatal", "fatal"),
+    ],
+};
+
+pub const BYTESBASE_ENUM: EnumMeta = EnumMeta {
+    name: "BytesBase",
+    variants: &[
+        ("Si", "1000"),
+        ("Binary", "1024"),
+    ],
+};
+
+pub const DURATIONSTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "DurationStyle",
+    variants: &[
+        ("Short", "short"),
+        ("Long", "long"),
+        ("Stopwatch", "stopwatch"),
+    ],
+};
+
+pub const DATESTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "DateStyle",
+    variants: &[
+        ("Short", "short"),
+        ("Medium", "medium"),
+        ("Long", "long"),
+        ("Full", "full"),
+    ],
+};
+
+pub const TIMESTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "TimeStyle",
+    variants: &[
+        ("Short", "short"),
+        ("Medium", "medium"),
+        ("Long", "long"),
+    ],
+};
+
+pub const DATETIMESTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "DateTimeStyle",
+    variants: &[
+        ("Short", "short"),
+        ("Medium", "medium"),
+        ("Long", "long"),
+        ("Full", "full"),
+    ],
+};
+
+pub const TRENDDIRECTION_ENUM: EnumMeta = EnumMeta {
+    name: "TrendDirection",
+    variants: &[
+        ("Up", "up"),
+        ("Down", "down"),
+        ("Flat", "flat"),
+    ],
+};
+
+/// All catalog string-enums (tokens.rs `string_enum!` blocks).
+pub const ALL_ENUMS: &[&EnumMeta] = &[
+    &TONE_ENUM,
+    &BUTTONVARIANT_ENUM,
+    &BADGEVARIANT_ENUM,
+    &CHIPVARIANT_ENUM,
+    &DENSITY_ENUM,
+    &SPACING_ENUM,
+    &TEXTSTYLE_ENUM,
+    &TEXTALIGN_ENUM,
+    &TEXTWRAP_ENUM,
+    &RADIUSTOKEN_ENUM,
+    &SHADOWTOKEN_ENUM,
+    &BREAKPOINT_ENUM,
+    &ICONSIZE_ENUM,
+    &SCROLLBEHAVIOR_ENUM,
+    &DRAWERSIDE_ENUM,
+    &NAVIGATETARGET_ENUM,
+    &LIVEREGION_ENUM,
+    &CURSORTOKEN_ENUM,
+    &COLORTOKEN_ENUM,
+    &BACKGROUNDTOKEN_ENUM,
+    &FLEXALIGN_ENUM,
+    &FLEXJUSTIFY_ENUM,
+    &SORTDIRECTION_ENUM,
+    &FILEUPLOADSTATUS_ENUM,
+    &STEPSTATUS_ENUM,
+    &SHEETDETENT_ENUM,
+    &CHARTSERIESSTYLE_ENUM,
+    &CHARTAXISSCALE_ENUM,
+    &CHARTLEGENDPOSITION_ENUM,
+    &CHARTLEGENDALIGN_ENUM,
+    &COLUMNRENDER_ENUM,
+    &EMPTYSTATEVARIANT_ENUM,
+    &FLEXDIRECTION_ENUM,
+    &FLEXWRAP_ENUM,
+    &SPLITORIENTATION_ENUM,
+    &CARDVARIANT_ENUM,
+    &DIVIDERORIENTATION_ENUM,
+    &DIVIDERVARIANT_ENUM,
+    &SPACERAXIS_ENUM,
+    &TABSVARIANT_ENUM,
+    &NAVTABSVARIANT_ENUM,
+    &ACCORDIONMODE_ENUM,
+    &BREADCRUMBSEPARATOR_ENUM,
+    &PAGINATIONVARIANT_ENUM,
+    &SCROLLORIENTATION_ENUM,
+    &MARKDOWNMARK_ENUM,
+    &MARKDOWNBLOCK_ENUM,
+    &KVLAYOUT_ENUM,
+    &STATSIZE_ENUM,
+    &TAGSIZE_ENUM,
+    &AVATARSIZE_ENUM,
+    &AVATARSHAPE_ENUM,
+    &AVATARSTATUS_ENUM,
+    &AVATAROVERLAP_ENUM,
+    &BULLETLISTVARIANT_ENUM,
+    &TIMELINEORIENTATION_ENUM,
+    &TABLEVARIANT_ENUM,
+    &TABLESELECTMODE_ENUM,
+    &TREEVARIANT_ENUM,
+    &EMPTYCELLVARIANT_ENUM,
+    &SPARKLINEVARIANT_ENUM,
+    &CHARTZOOMMODE_ENUM,
+    &CHARTORIENTATION_ENUM,
+    &BARSTACKING_ENUM,
+    &AREASTACKING_ENUM,
+    &PIEVARIANT_ENUM,
+    &HEATMAPLEGENDPOSITION_ENUM,
+    &GAUGEVARIANT_ENUM,
+    &PROGRESSVARIANT_ENUM,
+    &PROGRESSSIZE_ENUM,
+    &RATINGVARIANT_ENUM,
+    &RATINGPRECISION_ENUM,
+    &DIFFVARIANT_ENUM,
+    &MARKDOWNFEATURE_ENUM,
+    &LINKTARGET_ENUM,
+    &DLLAYOUT_ENUM,
+    &DAYOFWEEK_ENUM,
+    &IMAGEFIT_ENUM,
+    &INPUTTYPE_ENUM,
+    &AUTOCOMPLETEHINT_ENUM,
+    &INPUTMODE_ENUM,
+    &INPUTSIZE_ENUM,
+    &SEARCHVARIANT_ENUM,
+    &TOGGLESIZE_ENUM,
+    &TOGGLEPOSITION_ENUM,
+    &CHECKBOXSIZE_ENUM,
+    &RADIOGROUPORIENTATION_ENUM,
+    &RADIOCARDVARIANT_ENUM,
+    &SLIDERROWLAYOUT_ENUM,
+    &TIMEPRECISION_ENUM,
+    &FILECAPTURE_ENUM,
+    &COLORPICKERVARIANT_ENUM,
+    &FORMFIELDLAYOUT_ENUM,
+    &FORMLAYOUT_ENUM,
+    &BUTTONSIZE_ENUM,
+    &BUTTONGROUPORIENTATION_ENUM,
+    &LINKUNDERLINE_ENUM,
+    &MENUPLACEMENT_ENUM,
+    &SEGMENTSIZE_ENUM,
+    &FILTERCHIPSMODE_ENUM,
+    &FABSIZE_ENUM,
+    &FABPOSITION_ENUM,
+    &ALERTVARIANT_ENUM,
+    &BANNERPOSITION_ENUM,
+    &SKELETONVARIANT_ENUM,
+    &SPINNERSIZE_ENUM,
+    &SPINNERVARIANT_ENUM,
+    &MODALSIZE_ENUM,
+    &DRAWERSIZE_ENUM,
+    &POPOVERPLACEMENT_ENUM,
+    &GATEVARIANT_ENUM,
+    &VIDEOCONTROLS_ENUM,
+    &CAMERASTATUS_ENUM,
+    &TILEPROVIDER_ENUM,
+    &CODEEDITORTHEME_ENUM,
+    &TERMINALTHEME_ENUM,
+    &AUDIOCONTROLS_ENUM,
+    &AUDIOVARIANT_ENUM,
+    &FPSVARIANT_ENUM,
+    &STOPWATCHVARIANT_ENUM,
+    &CAROUSELGESTURES_ENUM,
+    &PDFZOOMMODE_ENUM,
+    &STEPPROGRESSVARIANT_ENUM,
+    &IFRAMESANDBOX_ENUM,
+    &IFRAMEREFERRERPOLICY_ENUM,
+    &LOGVARIANT_ENUM,
+    &LOGLEVEL_ENUM,
+    &BYTESBASE_ENUM,
+    &DURATIONSTYLE_ENUM,
+    &DATESTYLE_ENUM,
+    &TIMESTYLE_ENUM,
+    &DATETIMESTYLE_ENUM,
+    &TRENDDIRECTION_ENUM,
+];
+
+pub const INLINEBADGE_INLINE: InlineMeta = InlineMeta {
+    name: "InlineBadge",
+    fields: &[
+        FieldMeta { key: 0, name: "variant", wire: "Enum<BadgeVariant>", required: true, default: None },
+        FieldMeta { key: 1, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+        FieldMeta { key: 2, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 3, name: "count", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 4, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 5, name: "pulse", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const TREND_INLINE: InlineMeta = InlineMeta {
+    name: "Trend",
+    fields: &[
+        FieldMeta { key: 0, name: "direction", wire: "Enum<TrendDirection>", required: true, default: None },
+        FieldMeta { key: 1, name: "percent", wire: "f64", required: true, default: None },
+        FieldMeta { key: 2, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 3, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+    ],
+};
+
+pub const FOOTNOTE_INLINE: InlineMeta = InlineMeta {
+    name: "Footnote",
+    fields: &[
+        FieldMeta { key: 0, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+        FieldMeta { key: 1, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 2, name: "content", wire: "BindRef", required: true, default: None },
+    ],
+};
+
+pub const BREADCRUMBITEM_INLINE: InlineMeta = InlineMeta {
+    name: "BreadcrumbItem",
+    fields: &[
+        FieldMeta { key: 0, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 1, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 2, name: "action_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 3, name: "local_action", wire: "Option<Inline<LocalAction>>", required: false, default: None },
+        FieldMeta { key: 4, name: "is_current", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const NAVTAB_INLINE: InlineMeta = InlineMeta {
+    name: "NavTab",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 3, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 4, name: "panel_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 5, name: "locked", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const TABITEM_INLINE: InlineMeta = InlineMeta {
+    name: "TabItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 3, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 4, name: "locked", wire: "bool", required: true, default: None },
+        FieldMeta { key: 5, name: "content_template_id", wire: "Option<tstr>", required: false, default: None },
+    ],
+};
+
+pub const MENUITEM_INLINE: InlineMeta = InlineMeta {
+    name: "MenuItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 3, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 4, name: "shortcut", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 5, name: "danger", wire: "bool", required: true, default: None },
+        FieldMeta { key: 6, name: "disabled", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 7, name: "divider_after", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const SIDEBARITEM_INLINE: InlineMeta = InlineMeta {
+    name: "SidebarItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 2, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 3, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 4, name: "active_path", wire: "Option<StatePath>", required: false, default: None },
+        FieldMeta { key: 5, name: "action_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 6, name: "local_action", wire: "Option<Inline<LocalAction>>", required: false, default: None },
+        FieldMeta { key: 7, name: "children", wire: "Option<Array<Inline<SidebarItem>>>", required: false, default: None },
+    ],
+};
+
+pub const SELECTOPTION_INLINE: InlineMeta = InlineMeta {
+    name: "SelectOption",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "Inline<SelectValue>", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 3, name: "disabled", wire: "bool", required: true, default: None },
+        FieldMeta { key: 4, name: "group_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 5, name: "description", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const SELECTGROUP_INLINE: InlineMeta = InlineMeta {
+    name: "SelectGroup",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+    ],
+};
+
+pub const RADIOOPTION_INLINE: InlineMeta = InlineMeta {
+    name: "RadioOption",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "Inline<SelectValue>", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "hint", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 3, name: "disabled", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const RADIOCARDOPTION_INLINE: InlineMeta = InlineMeta {
+    name: "RadioCardOption",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "Inline<SelectValue>", required: true, default: None },
+        FieldMeta { key: 1, name: "icon", wire: "Inline<IconRef>", required: true, default: None },
+        FieldMeta { key: 2, name: "title", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 3, name: "description", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 4, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 5, name: "disabled", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const SLIDERMARK_INLINE: InlineMeta = InlineMeta {
+    name: "SliderMark",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "f64", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const GRIDCHILD_INLINE: InlineMeta = InlineMeta {
+    name: "GridChild",
+    fields: &[
+        FieldMeta { key: 0, name: "component", wire: "Component", required: true, default: None },
+        FieldMeta { key: 1, name: "col_span", wire: "u8", required: true, default: None },
+        FieldMeta { key: 2, name: "row_span", wire: "u8", required: true, default: None },
+        FieldMeta { key: 3, name: "col_start", wire: "Option<u8>", required: false, default: None },
+        FieldMeta { key: 4, name: "row_start", wire: "Option<u8>", required: false, default: None },
+        FieldMeta { key: 5, name: "align_self", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
+        FieldMeta { key: 6, name: "justify_self", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
+    ],
+};
+
+pub const KVITEM_INLINE: InlineMeta = InlineMeta {
+    name: "KvItem",
+    fields: &[
+        FieldMeta { key: 0, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 1, name: "value", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "hint", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 3, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 4, name: "action_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 5, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+    ],
+};
+
+pub const STEPDEF_INLINE: InlineMeta = InlineMeta {
+    name: "StepDef",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "optional", wire: "bool", required: true, default: None },
+        FieldMeta { key: 3, name: "status", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 4, name: "description", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const FEATUREITEM_INLINE: InlineMeta = InlineMeta {
+    name: "FeatureItem",
+    fields: &[
+        FieldMeta { key: 0, name: "icon", wire: "Inline<IconRef>", required: true, default: None },
+        FieldMeta { key: 1, name: "title", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "description", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const TIMELINEITEM_INLINE: InlineMeta = InlineMeta {
+    name: "TimelineItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "ts_ms", wire: "i64", required: true, default: None },
+        FieldMeta { key: 2, name: "title", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 3, name: "description", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 4, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 5, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+        FieldMeta { key: 6, name: "action_id", wire: "Option<tstr>", required: false, default: None },
+    ],
+};
+
+pub const ACCORDIONITEM_INLINE: InlineMeta = InlineMeta {
+    name: "AccordionItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "header", wire: "Component", required: true, default: None },
+        FieldMeta { key: 2, name: "body", wire: "Array<Component>", required: true, default: None },
+        FieldMeta { key: 3, name: "default_expanded", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const ALARMITEM_INLINE: InlineMeta = InlineMeta {
+    name: "AlarmItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "ts_ms", wire: "i64", required: true, default: None },
+        FieldMeta { key: 2, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+        FieldMeta { key: 3, name: "title", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 4, name: "description", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 5, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 6, name: "action_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 7, name: "acknowledged", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const INBOXITEM_INLINE: InlineMeta = InlineMeta {
+    name: "InboxItem",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "ts_ms", wire: "i64", required: true, default: None },
+        FieldMeta { key: 2, name: "read", wire: "bool", required: true, default: None },
+        FieldMeta { key: 3, name: "title", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 4, name: "preview", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 5, name: "avatar", wire: "Option<Inline<AvatarRef>>", required: false, default: None },
+        FieldMeta { key: 6, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 7, name: "action_id", wire: "tstr", required: true, default: None },
+    ],
+};
+
+pub const DECISIONOPTION_INLINE: InlineMeta = InlineMeta {
+    name: "DecisionOption",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "icon", wire: "Inline<IconRef>", required: true, default: None },
+        FieldMeta { key: 2, name: "title", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 3, name: "description", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 4, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+        FieldMeta { key: 5, name: "disabled", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const PERMISSIONDEF_INLINE: InlineMeta = InlineMeta {
+    name: "PermissionDef",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "description", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 3, name: "category", wire: "Option<tstr>", required: false, default: None },
+    ],
+};
+
+pub const ROLEDEF_INLINE: InlineMeta = InlineMeta {
+    name: "RoleDef",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "color", wire: "Option<Enum<Tone>>", required: false, default: None },
+        FieldMeta { key: 3, name: "description", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const MAPMARKER_INLINE: InlineMeta = InlineMeta {
+    name: "MapMarker",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "lat", wire: "f64", required: true, default: None },
+        FieldMeta { key: 2, name: "lng", wire: "f64", required: true, default: None },
+        FieldMeta { key: 3, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 4, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 5, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+        FieldMeta { key: 6, name: "popup_content", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const GRAPHNODE_INLINE: InlineMeta = InlineMeta {
+    name: "GraphNode",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "node_type", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 3, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 4, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+    ],
+};
+
+pub const GRAPHEDGE_INLINE: InlineMeta = InlineMeta {
+    name: "GraphEdge",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "source_id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 2, name: "target_id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 3, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 4, name: "weight", wire: "Option<f32>", required: false, default: None },
+        FieldMeta { key: 5, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+    ],
+};
+
+pub const SEGMENTOPTION_INLINE: InlineMeta = InlineMeta {
+    name: "SegmentOption",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "Inline<SelectValue>", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 2, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 3, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+    ],
+};
+
+pub const FILTERCHIPDEF_INLINE: InlineMeta = InlineMeta {
+    name: "FilterChipDef",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 3, name: "badge", wire: "Option<Inline<InlineBadge>>", required: false, default: None },
+        FieldMeta { key: 4, name: "count_path", wire: "Option<StatePath>", required: false, default: None },
+    ],
+};
+
+pub const HEATMAPROW_INLINE: InlineMeta = InlineMeta {
+    name: "HeatmapRow",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+    ],
+};
+
+pub const HEATMAPCOLUMN_INLINE: InlineMeta = InlineMeta {
+    name: "HeatmapColumn",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+    ],
+};
+
+pub const HEATMAPBUCKET_INLINE: InlineMeta = InlineMeta {
+    name: "HeatmapBucket",
+    fields: &[
+        FieldMeta { key: 0, name: "threshold", wire: "f64", required: true, default: None },
+        FieldMeta { key: 1, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+        FieldMeta { key: 2, name: "label", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const GAUGETHRESHOLD_INLINE: InlineMeta = InlineMeta {
+    name: "GaugeThreshold",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "f64", required: true, default: None },
+        FieldMeta { key: 1, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+        FieldMeta { key: 2, name: "label", wire: "Option<BindRef>", required: false, default: None },
+    ],
+};
+
+pub const STACKSEGMENT_INLINE: InlineMeta = InlineMeta {
+    name: "StackSegment",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "value", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 3, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+    ],
+};
+
+pub const DEFITEM_INLINE: InlineMeta = InlineMeta {
+    name: "DefItem",
+    fields: &[
+        FieldMeta { key: 0, name: "term", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 1, name: "definition", wire: "BindRef", required: true, default: None },
+    ],
+};
+
+pub const FILEMETA_INLINE: InlineMeta = InlineMeta {
+    name: "FileMeta",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "name", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 2, name: "size_bytes", wire: "u64", required: true, default: None },
+        FieldMeta { key: 3, name: "mime", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 4, name: "ts_ms", wire: "i64", required: true, default: None },
+        FieldMeta { key: 5, name: "upload_progress", wire: "f32", required: true, default: None },
+        FieldMeta { key: 6, name: "status", wire: "Enum<FileUploadStatus>", required: true, default: None },
+        FieldMeta { key: 7, name: "signed_url_ref", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 8, name: "error_message", wire: "Option<tstr>", required: false, default: None },
+    ],
+};
+
+pub const RANGEPRESETRANGE_INLINE: InlineMeta = InlineMeta {
+    name: "RangePresetRange",
+    fields: &[
+        FieldMeta { key: 0, name: "from_offset_days", wire: "i32", required: true, default: None },
+        FieldMeta { key: 1, name: "to_offset_days", wire: "i32", required: true, default: None },
+    ],
+};
+
+pub const RANGEPRESET_INLINE: InlineMeta = InlineMeta {
+    name: "RangePreset",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "range", wire: "Inline<RangePresetRange>", required: true, default: None },
+    ],
+};
+
+pub const CHARTSERIES_INLINE: InlineMeta = InlineMeta {
+    name: "ChartSeries",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "name", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "data_path", wire: "StatePath", required: true, default: None },
+        FieldMeta { key: 3, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+        FieldMeta { key: 4, name: "style", wire: "Enum<ChartSeriesStyle>", required: true, default: None },
+        FieldMeta { key: 5, name: "show_in_legend", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const CHARTAXIS_INLINE: InlineMeta = InlineMeta {
+    name: "ChartAxis",
+    fields: &[
+        FieldMeta { key: 0, name: "label", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 1, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+        FieldMeta { key: 2, name: "min", wire: "Option<f64>", required: false, default: None },
+        FieldMeta { key: 3, name: "max", wire: "Option<f64>", required: false, default: None },
+        FieldMeta { key: 4, name: "ticks", wire: "Option<u8>", required: false, default: None },
+        FieldMeta { key: 5, name: "scale", wire: "Enum<ChartAxisScale>", required: true, default: None },
+    ],
+};
+
+pub const CHARTLEGEND_INLINE: InlineMeta = InlineMeta {
+    name: "ChartLegend",
+    fields: &[
+        FieldMeta { key: 0, name: "position", wire: "Enum<ChartLegendPosition>", required: true, default: None },
+        FieldMeta { key: 1, name: "alignment", wire: "Enum<ChartLegendAlign>", required: true, default: None },
+    ],
+};
+
+pub const CHARTTOOLTIP_INLINE: InlineMeta = InlineMeta {
+    name: "ChartTooltip",
+    fields: &[
+        FieldMeta { key: 0, name: "enabled", wire: "bool", required: true, default: None },
+        FieldMeta { key: 1, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+    ],
+};
+
+pub const TABLEPAGINATION_INLINE: InlineMeta = InlineMeta {
+    name: "TablePagination",
+    fields: &[
+        FieldMeta { key: 0, name: "page_size", wire: "u32", required: true, default: None },
+        FieldMeta { key: 1, name: "current_page_path", wire: "StatePath", required: true, default: None },
+        FieldMeta { key: 2, name: "show_size_picker", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const TABLESORT_INLINE: InlineMeta = InlineMeta {
+    name: "TableSort",
+    fields: &[
+        FieldMeta { key: 0, name: "column_id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "direction", wire: "Enum<SortDirection>", required: true, default: None },
+    ],
+};
+
+pub const TABLECOLUMN_INLINE: InlineMeta = InlineMeta {
+    name: "TableColumn",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "header", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "field_path", wire: "Array<Inline<PathSegment>>", required: true, default: None },
+        FieldMeta { key: 3, name: "width", wire: "Inline<TableColumnWidth>", required: true, default: None },
+        FieldMeta { key: 4, name: "render", wire: "Enum<ColumnRender>", required: true, default: None },
+        FieldMeta { key: 5, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+        FieldMeta { key: 6, name: "align", wire: "Option<Enum<TextAlign>>", required: false, default: None },
+        FieldMeta { key: 7, name: "sortable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 8, name: "hidden_by_default", wire: "bool", required: true, default: None },
+        FieldMeta { key: 9, name: "sticky_left", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const DATEPRESET_INLINE: InlineMeta = InlineMeta {
+    name: "DatePreset",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 2, name: "resolve", wire: "Inline<DatePresetResolve>", required: true, default: None },
+    ],
+};
+
+pub const INLINECHIP_INLINE: InlineMeta = InlineMeta {
+    name: "InlineChip",
+    fields: &[
+        FieldMeta { key: 0, name: "variant", wire: "Enum<ChipVariant>", required: true, default: None },
+        FieldMeta { key: 1, name: "tone", wire: "Enum<Tone>", required: true, default: None },
+        FieldMeta { key: 2, name: "label", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 3, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
+        FieldMeta { key: 4, name: "avatar", wire: "Option<Inline<AvatarRef>>", required: false, default: None },
+        FieldMeta { key: 5, name: "selected", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 6, name: "removable", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const LOGEVENT_INLINE: InlineMeta = InlineMeta {
+    name: "LogEvent",
+    fields: &[
+        FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "ts_ms", wire: "i64", required: true, default: None },
+        FieldMeta { key: 2, name: "level", wire: "Enum<LogLevel>", required: true, default: None },
+        FieldMeta { key: 3, name: "source", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 4, name: "message", wire: "BindRef", required: true, default: None },
+        FieldMeta { key: 5, name: "details", wire: "Option<CborMap>", required: false, default: None },
+        FieldMeta { key: 6, name: "trace_id", wire: "Option<tstr>", required: false, default: None },
+    ],
+};
+
+/// All catalog inline structs (cbor(map)-derived structs in inline.rs).
+/// Tagged-union inline types (DimensionToken, SelectValue, BorderToken, …)
+/// have manual `Encode`/`Decode` and are not field-keyed maps; they are
+/// tracked separately when the union registry lands.
+pub const ALL_INLINE_STRUCTS: &[&InlineMeta] = &[
+    &INLINEBADGE_INLINE,
+    &TREND_INLINE,
+    &FOOTNOTE_INLINE,
+    &BREADCRUMBITEM_INLINE,
+    &NAVTAB_INLINE,
+    &TABITEM_INLINE,
+    &MENUITEM_INLINE,
+    &SIDEBARITEM_INLINE,
+    &SELECTOPTION_INLINE,
+    &SELECTGROUP_INLINE,
+    &RADIOOPTION_INLINE,
+    &RADIOCARDOPTION_INLINE,
+    &SLIDERMARK_INLINE,
+    &GRIDCHILD_INLINE,
+    &KVITEM_INLINE,
+    &STEPDEF_INLINE,
+    &FEATUREITEM_INLINE,
+    &TIMELINEITEM_INLINE,
+    &ACCORDIONITEM_INLINE,
+    &ALARMITEM_INLINE,
+    &INBOXITEM_INLINE,
+    &DECISIONOPTION_INLINE,
+    &PERMISSIONDEF_INLINE,
+    &ROLEDEF_INLINE,
+    &MAPMARKER_INLINE,
+    &GRAPHNODE_INLINE,
+    &GRAPHEDGE_INLINE,
+    &SEGMENTOPTION_INLINE,
+    &FILTERCHIPDEF_INLINE,
+    &HEATMAPROW_INLINE,
+    &HEATMAPCOLUMN_INLINE,
+    &HEATMAPBUCKET_INLINE,
+    &GAUGETHRESHOLD_INLINE,
+    &STACKSEGMENT_INLINE,
+    &DEFITEM_INLINE,
+    &FILEMETA_INLINE,
+    &RANGEPRESETRANGE_INLINE,
+    &RANGEPRESET_INLINE,
+    &CHARTSERIES_INLINE,
+    &CHARTAXIS_INLINE,
+    &CHARTLEGEND_INLINE,
+    &CHARTTOOLTIP_INLINE,
+    &TABLEPAGINATION_INLINE,
+    &TABLESORT_INLINE,
+    &TABLECOLUMN_INLINE,
+    &DATEPRESET_INLINE,
+    &INLINECHIP_INLINE,
+    &LOGEVENT_INLINE,
 ];

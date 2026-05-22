@@ -95,7 +95,10 @@ pub use protocol::{
             CloseReason, PanelClose, PanelError, PanelOpen, PanelOpenContext, PanelReady,
             PanelReset, PanelShell, Viewport,
         },
-        schema::{section as schema_section, ComponentMeta, EnumMeta, FieldMeta, InlineMeta, ALL_COMPONENTS},
+        schema::{
+            section as schema_section, ComponentMeta, EnumMeta, FieldMeta, InlineMeta,
+            ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS,
+        },
         patch::{PatchOp, PatchOpKind},
         slot::{
             CachePolicy, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility, StateEntry,
