@@ -86,6 +86,10 @@ pub mod channels {
     pub fn is_allocated(c: Channel) -> bool {
         valid_kind_range(c).is_some()
     }
+
+    /// `Control / Hello` kind — the only `(channel, kind)` pair where
+    /// `auth.kind = Anonymous` is permitted (§11.3 + §5 handshake bootstrap).
+    pub const KIND_CONTROL_HELLO: super::Kind = super::Kind(0x0001);
 }
 
 #[cfg(test)]
