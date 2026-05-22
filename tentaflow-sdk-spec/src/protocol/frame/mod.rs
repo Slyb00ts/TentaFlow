@@ -28,6 +28,7 @@ pub mod channel;
 pub mod envelope;
 pub mod error;
 pub mod flags;
+pub mod sign;
 
 pub use address::{NodeAddress, NodeAddressKind};
 pub use auth::{Auth, AuthKind};
@@ -38,3 +39,7 @@ pub use envelope::{
 };
 pub use error::{FrameError, FrameErrorCode};
 pub use flags::Flags;
+pub use sign::{
+    canonical_envelope_for_signing, public_key_bytes, sign_envelope, signing_key_from_bytes,
+    verify_envelope, SIGNATURE_PLACEHOLDER,
+};

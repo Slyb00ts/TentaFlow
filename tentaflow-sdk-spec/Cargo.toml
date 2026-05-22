@@ -12,3 +12,11 @@ path = "src/lib.rs"
 
 [dependencies]
 minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
+
+# UFP/2 crypto — Ed25519 sign/verify (RFC 8032). 4c1b only uses sign/verify;
+# AEAD + lz4 land in 4c1c/4c1d.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
+
+[dev-dependencies]
+# Deterministic CSPRNG for sign/verify tests.
+rand_core = { version = "0.6", features = ["getrandom"] }
