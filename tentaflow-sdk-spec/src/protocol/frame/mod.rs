@@ -26,9 +26,11 @@ pub mod address;
 pub mod aead;
 pub mod auth;
 pub mod channel;
+pub mod compress;
 pub mod envelope;
 pub mod error;
 pub mod flags;
+pub mod pipeline;
 pub mod sign;
 
 pub use address::{NodeAddress, NodeAddressKind};
@@ -49,3 +51,8 @@ pub use aead::{
     AeadKey, NonceCounter, PersistHint, AEAD_KEY_LEN, AEAD_NONCE_LEN, AEAD_TAG_LEN,
     COUNTER_ROTATION_THRESHOLD, MAX_KEY_AGE_MS, NONCE_COUNTER_LEN, NONCE_PREFIX_LEN,
 };
+pub use compress::{
+    compress_body, decompress_body, decompress_body_with_limit, should_compress,
+    COMPRESSION_THRESHOLD_BYTES, DEFAULT_MAX_DECOMPRESSED_BYTES,
+};
+pub use pipeline::{receive_envelope_pipeline, send_envelope_pipeline, ReceiveCrypto, SendCrypto};
