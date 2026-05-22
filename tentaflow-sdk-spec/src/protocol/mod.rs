@@ -12,6 +12,7 @@ pub mod macros;
 pub mod canonical;
 pub mod control;
 pub mod envelope;
+pub mod frame;
 pub mod ids;
 pub mod stream;
 pub mod ui;
