@@ -1,0 +1,299 @@
+/* =============================================================================
+   Plik: css/sdk-runtime-layout.css
+   Opis: Layout primitives dla SDK runtime (Faza 6 Krok 3.3a). Definiuje:
+     - tf-divider, tf-spacer, tf-tooltip (atomic — chunk 3.3a-1)
+     - tf-flex, tf-grid, tf-stack, tf-cluster (containers — chunk 3.3a-2)
+   Wartości tokenów (xs/sm/md/lg/xl) używają zmiennych z głównego motywu
+   (`--tf-space-*`, `--tf-radius-*`, `--tf-bg-*`). Addony nie ładują tej
+   stylesheety bezpośrednio — jest ładowana raz przez panel shell.
+   ============================================================================= */
+
+/* ---------- Spacing scale (semantic tokens) ---------- */
+:root {
+  --tf-space-zero: 0;
+  --tf-space-xxs: 2px;
+  --tf-space-xs: 4px;
+  --tf-space-sm: 8px;
+  --tf-space-md: 16px;
+  --tf-space-lg: 24px;
+  --tf-space-xl: 32px;
+  --tf-space-xxl: 48px;
+
+  --tf-radius-none: 0;
+  --tf-radius-xs: 2px;
+  --tf-radius-sm: 4px;
+  --tf-radius-md: 8px;
+  --tf-radius-lg: 12px;
+  --tf-radius-xl: 16px;
+  --tf-radius-pill: 9999px;
+  --tf-radius-circle: 50%;
+
+  --tf-bg-none: transparent;
+  --tf-bg-subtle: var(--surface-subtle, rgba(255, 255, 255, 0.04));
+  --tf-bg-muted: var(--surface-muted, rgba(255, 255, 255, 0.08));
+  --tf-bg-accent: var(--accent-bg, #1e40af);
+  --tf-bg-inverse: var(--surface-inverse, #111);
+}
+
+/* ---------- tf-divider (0x0108) ---------- */
+.tf-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  color: var(--text-muted, #888);
+}
+.tf-divider--horizontal { width: 100%; }
+.tf-divider--vertical {
+  flex-direction: column;
+  align-self: stretch;
+  width: auto;
+  height: 100%;
+}
+.tf-divider--horizontal::before,
+.tf-divider--horizontal::after,
+.tf-divider--vertical::before,
+.tf-divider--vertical::after {
+  content: '';
+  flex: 1;
+  background: currentColor;
+  opacity: 0.4;
+}
+.tf-divider--horizontal::before,
+.tf-divider--horizontal::after { height: 1px; }
+.tf-divider--vertical::before,
+.tf-divider--vertical::after { width: 1px; }
+
+.tf-divider--subtle { opacity: 0.5; }
+.tf-divider--strong::before,
+.tf-divider--strong::after { opacity: 0.8; }
+.tf-divider--dashed::before,
+.tf-divider--dashed::after {
+  background: repeating-linear-gradient(
+    to right, currentColor 0 4px, transparent 4px 8px
+  );
+}
+.tf-divider--spacing-zero { margin: 0; }
+.tf-divider--spacing-xxs { margin: var(--tf-space-xxs) 0; }
+.tf-divider--spacing-xs  { margin: var(--tf-space-xs) 0; }
+.tf-divider--spacing-sm  { margin: var(--tf-space-sm) 0; }
+.tf-divider--spacing-md  { margin: var(--tf-space-md) 0; }
+.tf-divider--spacing-lg  { margin: var(--tf-space-lg) 0; }
+.tf-divider--spacing-xl  { margin: var(--tf-space-xl) 0; }
+.tf-divider--spacing-xxl { margin: var(--tf-space-xxl) 0; }
+.tf-divider__label { white-space: nowrap; font-size: 0.85em; }
+
+/* ---------- tf-spacer (0x0109) ---------- */
+.tf-spacer { flex: 0 0 auto; }
+.tf-spacer--axis-x.tf-spacer--size-xxs { width: var(--tf-space-xxs); height: 1px; }
+.tf-spacer--axis-x.tf-spacer--size-xs  { width: var(--tf-space-xs);  height: 1px; }
+.tf-spacer--axis-x.tf-spacer--size-sm  { width: var(--tf-space-sm);  height: 1px; }
+.tf-spacer--axis-x.tf-spacer--size-md  { width: var(--tf-space-md);  height: 1px; }
+.tf-spacer--axis-x.tf-spacer--size-lg  { width: var(--tf-space-lg);  height: 1px; }
+.tf-spacer--axis-x.tf-spacer--size-xl  { width: var(--tf-space-xl);  height: 1px; }
+.tf-spacer--axis-x.tf-spacer--size-xxl { width: var(--tf-space-xxl); height: 1px; }
+
+.tf-spacer--axis-y.tf-spacer--size-xxs { height: var(--tf-space-xxs); width: 1px; }
+.tf-spacer--axis-y.tf-spacer--size-xs  { height: var(--tf-space-xs);  width: 1px; }
+.tf-spacer--axis-y.tf-spacer--size-sm  { height: var(--tf-space-sm);  width: 1px; }
+.tf-spacer--axis-y.tf-spacer--size-md  { height: var(--tf-space-md);  width: 1px; }
+.tf-spacer--axis-y.tf-spacer--size-lg  { height: var(--tf-space-lg);  width: 1px; }
+.tf-spacer--axis-y.tf-spacer--size-xl  { height: var(--tf-space-xl);  width: 1px; }
+.tf-spacer--axis-y.tf-spacer--size-xxl { height: var(--tf-space-xxl); width: 1px; }
+
+.tf-spacer--axis-both.tf-spacer--size-xxs { width: var(--tf-space-xxs); height: var(--tf-space-xxs); }
+.tf-spacer--axis-both.tf-spacer--size-xs  { width: var(--tf-space-xs);  height: var(--tf-space-xs); }
+.tf-spacer--axis-both.tf-spacer--size-sm  { width: var(--tf-space-sm);  height: var(--tf-space-sm); }
+.tf-spacer--axis-both.tf-spacer--size-md  { width: var(--tf-space-md);  height: var(--tf-space-md); }
+.tf-spacer--axis-both.tf-spacer--size-lg  { width: var(--tf-space-lg);  height: var(--tf-space-lg); }
+.tf-spacer--axis-both.tf-spacer--size-xl  { width: var(--tf-space-xl);  height: var(--tf-space-xl); }
+.tf-spacer--axis-both.tf-spacer--size-xxl { width: var(--tf-space-xxl); height: var(--tf-space-xxl); }
+
+/* ---------- tf-tooltip (0x010F) ---------- */
+.tf-tooltip-wrapper { position: relative; display: inline-block; }
+.tf-tooltip {
+  position: absolute;
+  background: var(--tf-bg-inverse);
+  color: var(--text-inverse, #fff);
+  padding: var(--tf-space-xs) var(--tf-space-sm);
+  border-radius: var(--tf-radius-sm);
+  font-size: 0.85em;
+  pointer-events: none;
+  z-index: 1000;
+}
+.tf-tooltip--side-top    { bottom: calc(100% + var(--tf-space-xs)); left: 50%; transform: translateX(-50%); }
+.tf-tooltip--side-bottom { top:    calc(100% + var(--tf-space-xs)); left: 50%; transform: translateX(-50%); }
+.tf-tooltip--side-left   { right:  calc(100% + var(--tf-space-xs)); top:  50%; transform: translateY(-50%); }
+.tf-tooltip--side-right  { left:   calc(100% + var(--tf-space-xs)); top:  50%; transform: translateY(-50%); }
+
+/* ---------- tf-flex (0x0101) ---------- */
+.tf-flex { display: flex; min-width: 0; }
+.tf-flex--direction-row             { flex-direction: row; }
+.tf-flex--direction-row_reverse     { flex-direction: row-reverse; }
+.tf-flex--direction-column          { flex-direction: column; }
+.tf-flex--direction-column_reverse  { flex-direction: column-reverse; }
+.tf-flex--justify-start         { justify-content: flex-start; }
+.tf-flex--justify-end           { justify-content: flex-end; }
+.tf-flex--justify-center        { justify-content: center; }
+.tf-flex--justify-space_between { justify-content: space-between; }
+.tf-flex--justify-space_around  { justify-content: space-around; }
+.tf-flex--justify-space_evenly  { justify-content: space-evenly; }
+.tf-flex--align-start    { align-items: flex-start; }
+.tf-flex--align-end      { align-items: flex-end; }
+.tf-flex--align-center   { align-items: center; }
+.tf-flex--align-baseline { align-items: baseline; }
+.tf-flex--align-stretch  { align-items: stretch; }
+.tf-flex--wrap-no_wrap      { flex-wrap: nowrap; }
+.tf-flex--wrap-wrap         { flex-wrap: wrap; }
+.tf-flex--wrap-wrap_reverse { flex-wrap: wrap-reverse; }
+.tf-flex--gap-zero { gap: var(--tf-space-zero); }
+.tf-flex--gap-xxs  { gap: var(--tf-space-xxs); }
+.tf-flex--gap-xs   { gap: var(--tf-space-xs); }
+.tf-flex--gap-sm   { gap: var(--tf-space-sm); }
+.tf-flex--gap-md   { gap: var(--tf-space-md); }
+.tf-flex--gap-lg   { gap: var(--tf-space-lg); }
+.tf-flex--gap-xl   { gap: var(--tf-space-xl); }
+.tf-flex--gap-xxl  { gap: var(--tf-space-xxl); }
+.tf-flex--padding-zero { padding: var(--tf-space-zero); }
+.tf-flex--padding-xxs  { padding: var(--tf-space-xxs); }
+.tf-flex--padding-xs   { padding: var(--tf-space-xs); }
+.tf-flex--padding-sm   { padding: var(--tf-space-sm); }
+.tf-flex--padding-md   { padding: var(--tf-space-md); }
+.tf-flex--padding-lg   { padding: var(--tf-space-lg); }
+.tf-flex--padding-xl   { padding: var(--tf-space-xl); }
+.tf-flex--padding-xxl  { padding: var(--tf-space-xxl); }
+.tf-flex--bg-none    { background: var(--tf-bg-none); }
+.tf-flex--bg-subtle  { background: var(--tf-bg-subtle); }
+.tf-flex--bg-muted   { background: var(--tf-bg-muted); }
+.tf-flex--bg-accent  { background: var(--tf-bg-accent); }
+.tf-flex--bg-inverse { background: var(--tf-bg-inverse); }
+.tf-flex--radius-none   { border-radius: var(--tf-radius-none); }
+.tf-flex--radius-xs     { border-radius: var(--tf-radius-xs); }
+.tf-flex--radius-sm     { border-radius: var(--tf-radius-sm); }
+.tf-flex--radius-md     { border-radius: var(--tf-radius-md); }
+.tf-flex--radius-lg     { border-radius: var(--tf-radius-lg); }
+.tf-flex--radius-xl     { border-radius: var(--tf-radius-xl); }
+.tf-flex--radius-pill   { border-radius: var(--tf-radius-pill); }
+.tf-flex--radius-circle { border-radius: var(--tf-radius-circle); }
+
+/* ---------- tf-grid (0x0102) ---------- */
+.tf-grid { display: grid; min-width: 0; }
+.tf-grid--gap-zero { gap: var(--tf-space-zero); }
+.tf-grid--gap-xxs  { gap: var(--tf-space-xxs); }
+.tf-grid--gap-xs   { gap: var(--tf-space-xs); }
+.tf-grid--gap-sm   { gap: var(--tf-space-sm); }
+.tf-grid--gap-md   { gap: var(--tf-space-md); }
+.tf-grid--gap-lg   { gap: var(--tf-space-lg); }
+.tf-grid--gap-xl   { gap: var(--tf-space-xl); }
+.tf-grid--gap-xxl  { gap: var(--tf-space-xxl); }
+.tf-grid--row-gap-zero { row-gap: var(--tf-space-zero); }
+.tf-grid--row-gap-xxs  { row-gap: var(--tf-space-xxs); }
+.tf-grid--row-gap-xs   { row-gap: var(--tf-space-xs); }
+.tf-grid--row-gap-sm   { row-gap: var(--tf-space-sm); }
+.tf-grid--row-gap-md   { row-gap: var(--tf-space-md); }
+.tf-grid--row-gap-lg   { row-gap: var(--tf-space-lg); }
+.tf-grid--row-gap-xl   { row-gap: var(--tf-space-xl); }
+.tf-grid--row-gap-xxl  { row-gap: var(--tf-space-xxl); }
+.tf-grid--col-gap-zero { column-gap: var(--tf-space-zero); }
+.tf-grid--col-gap-xxs  { column-gap: var(--tf-space-xxs); }
+.tf-grid--col-gap-xs   { column-gap: var(--tf-space-xs); }
+.tf-grid--col-gap-sm   { column-gap: var(--tf-space-sm); }
+.tf-grid--col-gap-md   { column-gap: var(--tf-space-md); }
+.tf-grid--col-gap-lg   { column-gap: var(--tf-space-lg); }
+.tf-grid--col-gap-xl   { column-gap: var(--tf-space-xl); }
+.tf-grid--col-gap-xxl  { column-gap: var(--tf-space-xxl); }
+.tf-grid--padding-zero { padding: var(--tf-space-zero); }
+.tf-grid--padding-xxs  { padding: var(--tf-space-xxs); }
+.tf-grid--padding-xs   { padding: var(--tf-space-xs); }
+.tf-grid--padding-sm   { padding: var(--tf-space-sm); }
+.tf-grid--padding-md   { padding: var(--tf-space-md); }
+.tf-grid--padding-lg   { padding: var(--tf-space-lg); }
+.tf-grid--padding-xl   { padding: var(--tf-space-xl); }
+.tf-grid--padding-xxl  { padding: var(--tf-space-xxl); }
+.tf-grid--align-start    { align-items: start; }
+.tf-grid--align-end      { align-items: end; }
+.tf-grid--align-center   { align-items: center; }
+.tf-grid--align-baseline { align-items: baseline; }
+.tf-grid--align-stretch  { align-items: stretch; }
+
+/* ---------- tf-stack (0x0103) ---------- */
+.tf-stack { display: flex; flex-direction: column; min-width: 0; }
+.tf-stack--gap-zero { gap: var(--tf-space-zero); }
+.tf-stack--gap-xxs  { gap: var(--tf-space-xxs); }
+.tf-stack--gap-xs   { gap: var(--tf-space-xs); }
+.tf-stack--gap-sm   { gap: var(--tf-space-sm); }
+.tf-stack--gap-md   { gap: var(--tf-space-md); }
+.tf-stack--gap-lg   { gap: var(--tf-space-lg); }
+.tf-stack--gap-xl   { gap: var(--tf-space-xl); }
+.tf-stack--gap-xxl  { gap: var(--tf-space-xxl); }
+.tf-stack--align-start    { align-items: flex-start; }
+.tf-stack--align-end      { align-items: flex-end; }
+.tf-stack--align-center   { align-items: center; }
+.tf-stack--align-baseline { align-items: baseline; }
+.tf-stack--align-stretch  { align-items: stretch; }
+.tf-stack--padding-zero { padding: var(--tf-space-zero); }
+.tf-stack--padding-xxs  { padding: var(--tf-space-xxs); }
+.tf-stack--padding-xs   { padding: var(--tf-space-xs); }
+.tf-stack--padding-sm   { padding: var(--tf-space-sm); }
+.tf-stack--padding-md   { padding: var(--tf-space-md); }
+.tf-stack--padding-lg   { padding: var(--tf-space-lg); }
+.tf-stack--padding-xl   { padding: var(--tf-space-xl); }
+.tf-stack--padding-xxl  { padding: var(--tf-space-xxl); }
+
+/* ---------- tf-cluster (0x0104) ---------- */
+.tf-cluster { display: flex; flex-wrap: wrap; min-width: 0; }
+.tf-cluster--gap-zero { gap: var(--tf-space-zero); }
+.tf-cluster--gap-xxs  { gap: var(--tf-space-xxs); }
+.tf-cluster--gap-xs   { gap: var(--tf-space-xs); }
+.tf-cluster--gap-sm   { gap: var(--tf-space-sm); }
+.tf-cluster--gap-md   { gap: var(--tf-space-md); }
+.tf-cluster--gap-lg   { gap: var(--tf-space-lg); }
+.tf-cluster--gap-xl   { gap: var(--tf-space-xl); }
+.tf-cluster--gap-xxl  { gap: var(--tf-space-xxl); }
+.tf-cluster--align-start    { align-items: flex-start; }
+.tf-cluster--align-end      { align-items: flex-end; }
+.tf-cluster--align-center   { align-items: center; }
+.tf-cluster--align-baseline { align-items: baseline; }
+.tf-cluster--align-stretch  { align-items: stretch; }
+.tf-cluster--justify-start         { justify-content: flex-start; }
+.tf-cluster--justify-end           { justify-content: flex-end; }
+.tf-cluster--justify-center        { justify-content: center; }
+.tf-cluster--justify-space_between { justify-content: space-between; }
+.tf-cluster--justify-space_around  { justify-content: space-around; }
+.tf-cluster--justify-space_evenly  { justify-content: space-evenly; }
+
+/* ---------- Responsive visibility — applied by engine via data attrs ---------- */
+[data-visibility-above="xs"]  { } /* always shown */
+[data-visibility-above="sm"]  { }
+[data-visibility-above="md"]  { }
+@media (max-width: 639px) {
+  [data-visibility-above="sm"]  { display: none !important; }
+  [data-visibility-above="md"]  { display: none !important; }
+  [data-visibility-above="lg"]  { display: none !important; }
+  [data-visibility-above="xl"]  { display: none !important; }
+  [data-visibility-above="xxl"] { display: none !important; }
+}
+@media (max-width: 767px) {
+  [data-visibility-above="md"]  { display: none !important; }
+  [data-visibility-above="lg"]  { display: none !important; }
+  [data-visibility-above="xl"]  { display: none !important; }
+  [data-visibility-above="xxl"] { display: none !important; }
+}
+@media (max-width: 1023px) {
+  [data-visibility-above="lg"]  { display: none !important; }
+  [data-visibility-above="xl"]  { display: none !important; }
+  [data-visibility-above="xxl"] { display: none !important; }
+}
+@media (max-width: 1279px) {
+  [data-visibility-above="xl"]  { display: none !important; }
+  [data-visibility-above="xxl"] { display: none !important; }
+}
+@media (max-width: 1535px) {
+  [data-visibility-above="xxl"] { display: none !important; }
+}
+
+@media (min-width: 640px)  { [data-visibility-below="xs"]  { display: none !important; } }
+@media (min-width: 768px)  { [data-visibility-below="sm"]  { display: none !important; } }
+@media (min-width: 1024px) { [data-visibility-below="md"]  { display: none !important; } }
+@media (min-width: 1280px) { [data-visibility-below="lg"]  { display: none !important; } }
+@media (min-width: 1536px) { [data-visibility-below="xl"]  { display: none !important; } }
+@media (min-width: 1920px) { [data-visibility-below="xxl"] { display: none !important; } }
