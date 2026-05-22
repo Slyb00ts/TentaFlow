@@ -5,10 +5,12 @@
 // =============================================================================
 
 pub mod data;
+pub mod data_unions;
 pub mod types;
 
 pub use data::{ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS};
-pub use types::{section, ComponentMeta, EnumMeta, FieldMeta, InlineMeta};
+pub use data_unions::ALL_TAGGED_UNIONS;
+pub use types::{section, ComponentMeta, EnumMeta, FieldMeta, InlineMeta, UnionMeta, VariantMeta};
 
 #[cfg(test)]
 mod tests {
@@ -251,22 +253,12 @@ mod tests {
         // via an allowlist, so that this test still catches typos.
         let inline_names: HashSet<&str> = ALL_INLINE_STRUCTS.iter().map(|s| s.name).collect();
         // Tagged-union inline types tracked manually until UnionMeta lands.
-        let tagged_unions: HashSet<&str> = [
-            "IconRef", "AvatarRef", "BreadcrumbItem", "SidebarItem", "SelectValue",
-            "DimensionToken", "AspectRatio", "TableColumnWidth", "HeatmapScale",
-            "DatePresetResolve", "BorderToken", "SplitSize", "GridCol", "GridTrack",
-            // Lives outside inline.rs but is referenced as `Inline<ValueFormat>`.
-            "ValueFormat",
-            // Tagged union in validation.rs, referenced from Input/Textarea/TagInput
-            // via `Inline<ValidationRule>`.
-            "ValidationRule",
-            // Tagged union in form/wrappers.rs, referenced from `Form.validators`.
-            "FormValidator",
-            // Tagged union in bind.rs, used inside StatePath array fields.
-            "PathSegment",
-            // Tagged union in handler.rs, referenced from BreadcrumbItem/SidebarItem.
-            "LocalAction",
-        ].into_iter().collect();
+        // Tagged unions now live in the dedicated `ALL_TAGGED_UNIONS` registry.
+        // Any `Inline<X>` reference must resolve to either an inline-struct
+        // entry OR a tagged-union entry. `BreadcrumbItem`/`SidebarItem` are
+        // captured in `ALL_INLINE_STRUCTS` since chunk 2a relaxed the matcher.
+        let tagged_unions: HashSet<&str> =
+            ALL_TAGGED_UNIONS.iter().map(|u| u.name).collect();
         let check = |wire: &'static str, ctx: String| {
             let mut w = wire;
             while let Some(inner) = w
@@ -322,6 +314,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn union_registry_has_no_duplicate_names() {
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        for u in ALL_TAGGED_UNIONS {
+            assert!(seen.insert(u.name), "duplicate union name '{}'", u.name);
+        }
+    }
+
+    #[test]
+    fn union_registry_variants_have_unique_wire_kinds() {
+        for u in ALL_TAGGED_UNIONS {
+            let mut seen: HashSet<&'static str> = HashSet::new();
+            for v in u.variants {
+                assert!(
+                    seen.insert(v.wire_kind),
+                    "{}: duplicate wire_kind '{}' (variant {})",
+                    u.name, v.wire_kind, v.rust_name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn union_registry_field_wire_strings_conform_to_grammar() {
+        for u in ALL_TAGGED_UNIONS {
+            for v in u.variants {
+                for f in v.fields {
+                    if let Err(e) = validate_wire(f.wire) {
+                        panic!(
+                            "{}::{} field '{}' wire '{}': {}",
+                            u.name, v.rust_name, f.name, f.wire, e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn union_registry_known_wire_kinds_match_catalog() {
+        // Spot-check unions whose wire_kinds came from manual overrides or
+        // computed helpers — guards against future regressions in the
+        // generator.
+        let by_name = |n: &str| ALL_TAGGED_UNIONS.iter().copied().find(|u| u.name == n).unwrap();
+        let select_value = by_name("SelectValue");
+        let aspect_ratio = by_name("AspectRatio");
+        let path_segment = by_name("PathSegment");
+        let resume_status = by_name("ResumeStatus");
+        let handler = by_name("Handler");
+        let bind_ref = by_name("BindRef");
+        let lookup = |u: &UnionMeta, v: &str| -> &VariantMeta {
+            u.variants.iter().find(|x| x.rust_name == v).unwrap()
+        };
+        assert_eq!(lookup(select_value, "Text").wire_kind, "tstr");
+        assert_eq!(lookup(select_value, "UInt").wire_kind, "u32");
+        assert_eq!(lookup(select_value, "Int").wire_kind, "i32");
+        assert_eq!(lookup(select_value, "Bool").wire_kind, "bool");
+        assert_eq!(lookup(aspect_ratio, "R1To1").wire_kind, "1:1");
+        assert_eq!(lookup(aspect_ratio, "R16To9").wire_kind, "16:9");
+        assert_eq!(lookup(aspect_ratio, "R3To4").wire_kind, "3:4");
+        assert_eq!(lookup(aspect_ratio, "Custom").wire_kind, "custom");
+        assert_eq!(lookup(path_segment, "Key").wire_kind, "key");
+        assert_eq!(lookup(path_segment, "Index").wire_kind, "index");
+        // Tuple field-name resolution.
+        let bind_bound = lookup(bind_ref, "Bound");
+        assert_eq!(bind_bound.fields.len(), 1);
+        assert_eq!(bind_bound.fields[0].name, "path");
+        assert_eq!(bind_bound.fields[0].wire, "StatePath");
+        let bind_literal = lookup(bind_ref, "Literal");
+        assert_eq!(bind_literal.fields[0].name, "value");
+        assert_eq!(bind_literal.fields[0].wire, "Value");
+        let handler_local = lookup(handler, "Local");
+        assert_eq!(handler_local.fields[0].name, "action");
+        assert_eq!(handler_local.fields[0].wire, "Inline<LocalAction>");
+        // ResumeStatus.mode must be Enum<ResumeMode>, not Inline<ResumeMode>.
+        let resumed = lookup(resume_status, "Resumed");
+        let mode = resumed.fields.iter().find(|f| f.name == "mode").unwrap();
+        assert_eq!(mode.wire, "Enum<ResumeMode>");
     }
 
     #[test]

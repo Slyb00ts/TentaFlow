@@ -75,6 +75,31 @@ pub struct InlineMeta {
     pub fields: &'static [FieldMeta],
 }
 
+/// One variant of a tagged-union schema (`UnionMeta.variants` entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantMeta {
+    /// Rust variant identifier (e.g. `Named`, `Asset`, `Required`).
+    pub rust_name: &'static str,
+    /// On-the-wire discriminator value (typically the `kind` tstr).
+    pub wire_kind: &'static str,
+    /// Per-variant payload fields. Empty for unit variants like
+    /// `ValidationRule::Required`.
+    pub fields: &'static [FieldMeta],
+}
+
+/// Tagged-union schema (tstr-discriminated CBOR map). Covers types with
+/// manual `Encode`/`Decode` impls such as `IconRef`, `DimensionToken`,
+/// `ValueFormat`, `ValidationRule`, `LocalAction` etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnionMeta {
+    /// Rust type name in `tentaflow-sdk-spec`.
+    pub name: &'static str,
+    /// Map-key carrying the discriminator (catalog convention: `"kind"`).
+    pub discriminator_key: &'static str,
+    /// All declared variants.
+    pub variants: &'static [VariantMeta],
+}
+
 /// Catalog section identifiers used by `ComponentMeta.section`.
 pub mod section {
     pub const MOLECULES: &str = "§2 Molecules";

@@ -33,11 +33,12 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
     eprintln!(
-        "emit_manifest: wrote {} bytes ({} components, {} enums, {} inline structs)",
+        "emit_manifest: wrote {} bytes ({} components, {} enums, {} inline structs, {} tagged unions)",
         bytes.len(),
         manifest.components.len(),
         manifest.enums.len(),
         manifest.inline_structs.len(),
+        manifest.tagged_unions.len(),
     );
     ExitCode::SUCCESS
 }

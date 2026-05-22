@@ -9,6 +9,15 @@
 //     1: components       (array<ComponentEntry>),
 //     2: enums            (array<EnumEntry>),
 //     3: inline_structs   (array<InlineEntry>),
+//     4: tagged_unions    (array<UnionEntry>),
+//   }
+//   UnionEntry = {
+//     0: name (tstr), 1: discriminator_key (tstr),
+//     2: variants (array<VariantEntry>),
+//   }
+//   VariantEntry = {
+//     0: rust_name (tstr), 1: wire_kind (tstr),
+//     2: fields (array<FieldEntry>),
 //   }
 //   ComponentEntry = {
 //     0: tag (u16), 1: name (tstr), 2: section (tstr),
@@ -35,5 +44,5 @@ pub mod manifest;
 
 pub use manifest::{
     build_manifest, ComponentEntry, EnumEntry, EnumVariant, FieldEntry, InlineEntry,
-    ManifestEnvelope, PROTOCOL_VERSION,
+    ManifestEnvelope, UnionEntry, VariantEntry, PROTOCOL_VERSION,
 };
