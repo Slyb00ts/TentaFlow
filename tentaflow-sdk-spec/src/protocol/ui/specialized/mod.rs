@@ -1,30 +1,38 @@
 // =============================================================================
-// File: protocol/ui/specialized/mod.rs — §8 Specialized components (Part A)
-// 8 typed: VideoStream/LiveCameraTile/Audio (media), MapView (map),
-// CodeEditor/Terminal (text_io), FpsCounter/Stopwatch (telemetry).
-// Parts B (gallery/carousel/pdf/step/iframe) and C (graphics surfaces +
-// DrawCommand + VirtualizedLog) land in chunks 1.8e2 / 1.8e3.
+// File: protocol/ui/specialized/mod.rs — §8 Specialized components (Parts A+B)
+// 13 typed: VideoStream/LiveCameraTile/Audio (media), MapView (map),
+// CodeEditor/Terminal (text_io), FpsCounter/Stopwatch (telemetry),
+// ImageGallery/Carousel/PdfViewer (gallery), StepProgress (wizard), IFrame (iframe).
+// Part C (graphics surfaces Canvas2D/WebGLSurface/WGPUSurface + DrawCommand
+// tagged union + VirtualizedLog) lands in chunk 1.8e3.
 // =============================================================================
 
+pub mod gallery;
+pub mod iframe;
 pub mod map;
 pub mod media;
 pub mod telemetry;
 pub mod text_io;
+pub mod wizard;
 
+pub use gallery::{Carousel, ImageGallery, PdfViewer};
+pub use iframe::IFrame;
 pub use map::MapView;
 pub use media::{Audio, LiveCameraTile, VideoStream};
 pub use telemetry::{FpsCounter, Stopwatch};
 pub use text_io::{CodeEditor, Terminal};
+pub use wizard::StepProgress;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::ui::bind::{BindRef, PathSegment, StatePath};
     use crate::protocol::ui::component::{Component, FieldMap};
-    use crate::protocol::ui::inline::{AspectRatio, DimensionToken};
+    use crate::protocol::ui::inline::{AspectRatio, DimensionToken, StepDef};
     use crate::protocol::ui::tokens::{
-        AudioControls, AudioVariant, CodeEditorTheme, FpsVariant, ImageFit, StopwatchVariant,
-        TerminalTheme, TileProvider, Tone, VideoControls,
+        AudioControls, AudioVariant, CarouselGestures, CodeEditorTheme, FpsVariant,
+        IFrameReferrerPolicy, IFrameSandbox, ImageFit, PdfZoomMode, Spacing, StepProgressVariant,
+        StopwatchVariant, TerminalTheme, TileProvider, Tone, VideoControls,
     };
     use crate::protocol::value::Value;
 
@@ -136,6 +144,65 @@ mod tests {
             tone: Tone::Primary,
         };
         rt(v, |m| m.into_component("sw").unwrap(), Stopwatch::try_from_component);
+    }
+
+    #[test]
+    fn image_gallery_roundtrip() {
+        let v = ImageGallery {
+            images_path: p("images"), columns: 3,
+            aspect_ratio: AspectRatio::R1To1, gap: Spacing::Md,
+            lightbox: true, lazy_load: true,
+        };
+        rt(v, |m| m.into_component("ig").unwrap(), ImageGallery::try_from_component);
+    }
+
+    #[test]
+    fn carousel_roundtrip() {
+        let v = Carousel {
+            items_path: p("items"), current_index_path: p("idx"),
+            autoplay: true, autoplay_ms: 3000, r#loop: true,
+            show_indicators: true, show_arrows: true,
+            gestures: CarouselGestures::Swipe,
+        };
+        rt(v, |m| m.into_component("car").unwrap(), Carousel::try_from_component);
+    }
+
+    #[test]
+    fn pdf_viewer_roundtrip() {
+        let v = PdfViewer {
+            src_ref: "ref123".into(),
+            page_path: Some(p("page")),
+            height: DimensionToken::Vh { value: 80 },
+            zoom_mode: PdfZoomMode::FitWidth, searchable: true,
+        };
+        rt(v, |m| m.into_component("pdf").unwrap(), PdfViewer::try_from_component);
+    }
+
+    #[test]
+    fn step_progress_roundtrip() {
+        let v = StepProgress {
+            steps: vec![StepDef {
+                id: "s1".into(), label: lit("Step 1"),
+                optional: false, status: None, description: None,
+            }],
+            current_id_path: p("current"),
+            variant: StepProgressVariant::Horizontal,
+            clickable_completed: true,
+        };
+        rt(v, |m| m.into_component("sp").unwrap(), StepProgress::try_from_component);
+    }
+
+    #[test]
+    fn iframe_roundtrip() {
+        let v = IFrame {
+            src: "https://example.com/embed".into(),
+            sandbox: vec![IFrameSandbox::AllowScripts, IFrameSandbox::AllowForms],
+            width: DimensionToken::Px { value: 800 },
+            height: DimensionToken::Px { value: 600 },
+            title: "Embedded chart".into(),
+            referrer_policy: IFrameReferrerPolicy::NoReferrer,
+        };
+        rt(v, |m| m.into_component("if").unwrap(), IFrame::try_from_component);
     }
 
     #[test]
