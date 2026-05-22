@@ -1072,47 +1072,27 @@ impl IrohMeshManager {
         // UFP/2 wire (4c2.1): the heartbeat body is the legacy rkyv-serialized
         // MeshHeartbeat blob, wrapped in a signed UFP/2 envelope. Receivers
         // detect UFP/2 vs legacy by the first byte (CBOR map header 0xAA..=0xB1
-        // vs MESH_MSG_* 0x10..=0x4C). Other mesh message types still travel
-        // the legacy `[disc][rkyv]` wire until their dedicated 4c2.x chunk.
-        let source_pubkey = self.security.verifying_key_bytes();
-        let signing_key = self.security.signing_key().clone();
+        // vs MESH_MSG_* 0x10..=0x4C). Other mesh message types travel the
+        // legacy wire until migrated in their dedicated 4c2.x chunk.
         let mut futs = Vec::with_capacity(self.connections.len());
         for entry in self.connections.iter() {
             let id = entry.key().clone();
-            let signing_key = signing_key.clone();
-            let data = data.to_vec();
             futs.push(async move {
-                let dest_pubkey = match parse_iroh_node_id_to_pubkey(&id) {
-                    Some(k) => k,
-                    None => {
-                        tracing::warn!(
-                            target: "mesh::ufp2",
-                            peer = %id,
-                            "send_heartbeat_data: cannot parse iroh node id as Ed25519 pubkey"
-                        );
-                        return;
-                    }
-                };
-                let wire = match crate::mesh::ufp2::build_signed_envelope_wire(
-                    &signing_key,
-                    source_pubkey,
-                    dest_pubkey,
-                    tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
-                    data,
-                    0, // policy_epoch placeholder; live epoch tracking lands in a later chunk
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "mesh::ufp2",
-                            peer = %id,
-                            error = %e,
-                            "send_heartbeat_data: UFP/2 envelope build failed"
-                        );
-                        return;
-                    }
-                };
-                let _ = self.send_raw_envelope_to_peer(&id, &wire).await;
+                if let Err(e) = self
+                    .send_ufp2_to_peer(
+                        &id,
+                        tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
+                        data,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        target: "mesh::ufp2",
+                        peer = %id,
+                        error = %e,
+                        "send_heartbeat_data: UFP/2 heartbeat send failed"
+                    );
+                }
             });
         }
         join_all(futs).await;
@@ -1143,6 +1123,77 @@ impl IrohMeshManager {
         send.finish()
             .map_err(|e| anyhow::anyhow!("finish ufp2 uni: {e}"))?;
         Ok(())
+    }
+
+    /// Build a signed UFP/2 envelope around `data` for a single peer and
+    /// dispatch it on a fresh uni-stream. Used by every send wrapper that
+    /// has been migrated off the legacy `[disc][rkyv]` wire (4c2.x). The
+    /// destination peer's Ed25519 pubkey is derived from its iroh node id
+    /// (which IS the pubkey in iroh's identity model).
+    pub(crate) async fn send_ufp2_to_peer(
+        &self,
+        target_node_id: &str,
+        legacy_discriminator: u8,
+        data: &[u8],
+    ) -> Result<()> {
+        if !crate::mesh::ufp2::is_migrated_to_ufp2_discriminator(legacy_discriminator) {
+            return Err(anyhow::anyhow!(
+                "send_ufp2_to_peer: discriminator 0x{:02X} has not been migrated to UFP/2 yet (use legacy send_to_peer until its 4c2.x chunk lands)",
+                legacy_discriminator
+            ));
+        }
+        let dest_pubkey = parse_iroh_node_id_to_pubkey(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "send_ufp2_to_peer: cannot parse iroh node id {} as Ed25519 pubkey",
+                target_node_id
+            )
+        })?;
+        let source_pubkey = self.security.verifying_key_bytes();
+        let wire = crate::mesh::ufp2::build_signed_envelope_wire(
+            self.security.signing_key(),
+            source_pubkey,
+            dest_pubkey,
+            legacy_discriminator,
+            data.to_vec(),
+            0, // policy_epoch placeholder — live tracking lands in a later chunk
+        )
+        .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))?;
+        self.send_raw_envelope_to_peer(target_node_id, &wire).await
+    }
+
+    /// UFP/2 broadcast helper: build a per-peer signed envelope (each
+    /// envelope's `destination.id` must match the receiver's pubkey, so
+    /// broadcast cannot share one wire blob the way the legacy
+    /// `[disc][rkyv]` path could) and send to every trusted peer except
+    /// `exclude`. Returns per-peer results so callers can log failures.
+    pub(crate) async fn broadcast_ufp2_to_trusted(
+        &self,
+        legacy_discriminator: u8,
+        data: &[u8],
+        exclude: Option<&str>,
+    ) -> Vec<(String, Result<()>)> {
+        use futures::future::join_all;
+        let trusted = self.security.trusted_node_ids_snapshot();
+        let mut futs = Vec::with_capacity(self.connections.len());
+        for entry in self.connections.iter() {
+            let id = entry.key();
+            if !trusted.contains(id) {
+                continue;
+            }
+            if let Some(e) = exclude {
+                if id.as_str() == e {
+                    continue;
+                }
+            }
+            let node_id = id.clone();
+            futs.push(async move {
+                let res = self
+                    .send_ufp2_to_peer(&node_id, legacy_discriminator, data)
+                    .await;
+                (node_id, res)
+            });
+        }
+        join_all(futs).await
     }
 
     /// Broadcast listy modeli do wszystkich polaczonych peerow. Wywolywane
@@ -1192,7 +1243,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_pairing_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST,
             data,
@@ -1201,7 +1252,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_pairing_confirm(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_PAIRING_CONFIRM,
             data,
@@ -1210,7 +1261,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_pairing_reject(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_PAIRING_REJECT,
             data,
@@ -1219,7 +1270,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_trust_revoked(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
             data,
@@ -1228,7 +1279,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_trusted_keys_sync(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
             data,

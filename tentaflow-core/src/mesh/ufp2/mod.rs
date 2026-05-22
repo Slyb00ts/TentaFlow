@@ -19,6 +19,8 @@ pub use codec::{
     build_envelope, decode_incoming, encode_envelope, looks_like_ufp2_envelope_first_byte,
     DecodedMeshEnvelope,
 };
-pub use discriminators::{kind_from_legacy, kinds, legacy_from_kind};
+pub use discriminators::{
+    is_migrated_to_ufp2_discriminator, kind_from_legacy, kinds, legacy_from_kind,
+};
 pub use receive::{classify_inbound, is_legacy_mesh_discriminator, InboundMeshFrame};
 pub use send::build_signed_envelope_wire;

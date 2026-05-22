@@ -718,7 +718,13 @@ impl PeerManager {
             | IrohMeshEvent::ServicesGetReceived { .. }
             | IrohMeshEvent::ServicesGetResponseReceived { .. }
             | IrohMeshEvent::ServicesAnnounceReceived { .. }
-            | IrohMeshEvent::ServicesUpdateReceived { .. } => {
+            | IrohMeshEvent::ServicesUpdateReceived { .. }
+            | IrohMeshEvent::SyncPushReceived { .. }
+            | IrohMeshEvent::SyncAckReceived { .. }
+            | IrohMeshEvent::SyncPullReceived { .. }
+            | IrohMeshEvent::SyncPullResponseReceived { .. }
+            | IrohMeshEvent::SyncSnapshotPullReceived { .. }
+            | IrohMeshEvent::SyncSnapshotResponseReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }
