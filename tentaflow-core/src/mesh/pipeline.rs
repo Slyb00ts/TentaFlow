@@ -632,7 +632,7 @@ async fn handle_peer_connected(
                 match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
                     Ok(bytes) => {
                         if let Err(e) = qm_events
-                            .send_to_peer(
+                            .send_ufp2_to_peer(
                                 &node_id,
                                 tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
                                 &bytes,
@@ -2054,7 +2054,7 @@ fn spawn_quic_event_handler(
                                     {
                                         Ok(bytes) => {
                                             if let Err(e) = qm_events
-                                                .send_to_peer(
+                                                .send_ufp2_to_peer(
                                                     &from_node_id,
                                                     tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
                                                     &bytes,
@@ -2127,7 +2127,7 @@ fn spawn_quic_event_handler(
                                 {
                                     Ok(bytes) => {
                                         if let Err(e) = qm_events
-                                            .send_to_peer(
+                                            .send_ufp2_to_peer(
                                                 &from_node_id,
                                                 tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
                                                 &bytes,
@@ -2148,7 +2148,7 @@ fn spawn_quic_event_handler(
                                     {
                                         Ok(bytes) => {
                                             if let Err(e) = qm_events
-                                                .send_to_peer(
+                                                .send_ufp2_to_peer(
                                                     &from_node_id,
                                                     tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
                                                     &bytes,
@@ -2196,7 +2196,7 @@ fn spawn_quic_event_handler(
                                 {
                                     Ok(bytes) => {
                                         if let Err(e) = qm_events
-                                            .send_to_peer(
+                                            .send_ufp2_to_peer(
                                                 &from_node_id,
                                                 tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
                                                 &bytes,
@@ -2246,7 +2246,7 @@ fn spawn_quic_event_handler(
                                     {
                                         Ok(bytes) => {
                                             if let Err(e) = qm_events
-                                                .send_to_peer(
+                                                .send_ufp2_to_peer(
                                                     &from_node_id,
                                                     tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
                                                     &bytes,
@@ -2297,7 +2297,7 @@ fn spawn_quic_event_handler(
                                     {
                                         Ok(bytes) => {
                                             if let Err(e) = qm_events
-                                                .send_to_peer(
+                                                .send_ufp2_to_peer(
                                                     &from_node_id,
                                                     tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
                                                     &bytes,
@@ -2744,7 +2744,7 @@ fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<Mesh
                         match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
                             Ok(bytes) => {
                                 if let Err(e) = qm
-                                    .send_to_peer(
+                                    .send_ufp2_to_peer(
                                         &peer_id,
                                         tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
                                         &bytes,
@@ -2769,7 +2769,7 @@ fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<Mesh
                             {
                                 Ok(bytes) => {
                                     if let Err(e) = qm
-                                        .send_to_peer(
+                                        .send_ufp2_to_peer(
                                             &peer_id,
                                             tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
                                             &bytes,

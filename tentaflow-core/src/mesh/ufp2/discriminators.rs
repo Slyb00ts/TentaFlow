@@ -51,6 +51,8 @@ pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
 /// - 4c2.3: COMMAND, COMMAND_RESPONSE, DEPLOY_PROGRESS, LOG_CHUNK,
 ///   SERVICES_GET, SERVICES_GET_RESPONSE, SERVICES_ANNOUNCE, SERVICES_UPDATE
 /// - 4c2.4: HMAC_KEYS_SYNC, FRAME_PROXY_REQUEST, FRAME_PROXY_RESPONSE
+/// - 4c2.5: SYNC_PUSH, SYNC_ACK, SYNC_PULL, SYNC_PULL_RESPONSE,
+///   SYNC_SNAPSHOT_PULL, SYNC_SNAPSHOT_RESPONSE
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
         disc,
@@ -71,6 +73,12 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_HMAC_KEYS_SYNC
             | legacy::MESH_MSG_FRAME_PROXY_REQUEST
             | legacy::MESH_MSG_FRAME_PROXY_RESPONSE
+            | legacy::MESH_MSG_SYNC_PUSH
+            | legacy::MESH_MSG_SYNC_ACK
+            | legacy::MESH_MSG_SYNC_PULL
+            | legacy::MESH_MSG_SYNC_PULL_RESPONSE
+            | legacy::MESH_MSG_SYNC_SNAPSHOT_PULL
+            | legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE
     )
 }
 
@@ -105,6 +113,12 @@ pub mod kinds {
     pub const HMAC_KEYS_SYNC: Kind = Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16);
     pub const FRAME_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_REQUEST as u16);
     pub const FRAME_PROXY_RESPONSE: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_RESPONSE as u16);
+    pub const SYNC_PUSH: Kind = Kind(legacy::MESH_MSG_SYNC_PUSH as u16);
+    pub const SYNC_ACK: Kind = Kind(legacy::MESH_MSG_SYNC_ACK as u16);
+    pub const SYNC_PULL: Kind = Kind(legacy::MESH_MSG_SYNC_PULL as u16);
+    pub const SYNC_PULL_RESPONSE: Kind = Kind(legacy::MESH_MSG_SYNC_PULL_RESPONSE as u16);
+    pub const SYNC_SNAPSHOT_PULL: Kind = Kind(legacy::MESH_MSG_SYNC_SNAPSHOT_PULL as u16);
+    pub const SYNC_SNAPSHOT_RESPONSE: Kind = Kind(legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE as u16);
 }
 
 #[cfg(test)]
@@ -141,7 +155,7 @@ mod tests {
         // migration.
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HELLO as u16)).is_none());
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_NODE_INFO as u16)).is_none());
-        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_SYNC_PUSH as u16)).is_none());
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_CRDT_DELTA as u16)).is_none());
         // Holes in the 0x10..=0x4C range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
         assert!(legacy_from_kind(Kind(0x0034)).is_none());
@@ -149,8 +163,8 @@ mod tests {
 
     #[test]
     fn migrated_discriminator_allowlist_matches_chunks() {
-        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 = 17 migrated types. When a new
-        // 4c2.x chunk lands, add its types here AND to
+        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 + 4c2.5 = 23 migrated types. When a
+        // new 4c2.x chunk lands, add its types here AND to
         // `is_migrated_to_ufp2_discriminator`.
         let migrated = [
             legacy::MESH_MSG_HEARTBEAT,
@@ -170,6 +184,12 @@ mod tests {
             legacy::MESH_MSG_HMAC_KEYS_SYNC,
             legacy::MESH_MSG_FRAME_PROXY_REQUEST,
             legacy::MESH_MSG_FRAME_PROXY_RESPONSE,
+            legacy::MESH_MSG_SYNC_PUSH,
+            legacy::MESH_MSG_SYNC_ACK,
+            legacy::MESH_MSG_SYNC_PULL,
+            legacy::MESH_MSG_SYNC_PULL_RESPONSE,
+            legacy::MESH_MSG_SYNC_SNAPSHOT_PULL,
+            legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
         ];
         for d in migrated {
             assert!(
@@ -178,14 +198,14 @@ mod tests {
                 d
             );
         }
-        // Future-chunk types: explicitly NOT migrated yet.
+        // Pre-migration mesh types still routed via legacy wire.
         assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_NODE_INFO));
         assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_HELLO));
         assert!(!is_migrated_to_ufp2_discriminator(
-            legacy::MESH_MSG_SYNC_PUSH
+            legacy::MESH_MSG_CRDT_DELTA
         ));
         assert!(!is_migrated_to_ufp2_discriminator(
-            legacy::MESH_MSG_SYNC_ACK
+            legacy::MESH_MSG_MODEL_LIST
         ));
     }
 
