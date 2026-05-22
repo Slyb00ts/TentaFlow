@@ -250,6 +250,30 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
+    SyncPushReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncAckReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncPullReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncPullResponseReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncSnapshotPullReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    SyncSnapshotResponseReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
 }
 
 /// Kierunek polaczenia QUIC z perspektywy lokalnego noda. Uzywany przez
@@ -1045,18 +1069,80 @@ impl IrohMeshManager {
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        // Single pass po DashMap — brak intermediate Vec<String> (2000 heartbeatow/s
-        // × 1000 peerow = potencjalnie 2M alokacji/s w wersji z Vec posrednim).
+        // UFP/2 wire (4c2.1): the heartbeat body is the legacy rkyv-serialized
+        // MeshHeartbeat blob, wrapped in a signed UFP/2 envelope. Receivers
+        // detect UFP/2 vs legacy by the first byte (CBOR map header 0xAA..=0xB1
+        // vs MESH_MSG_* 0x10..=0x4C). Other mesh message types still travel
+        // the legacy `[disc][rkyv]` wire until their dedicated 4c2.x chunk.
+        let source_pubkey = self.security.verifying_key_bytes();
+        let signing_key = self.security.signing_key().clone();
         let mut futs = Vec::with_capacity(self.connections.len());
         for entry in self.connections.iter() {
             let id = entry.key().clone();
+            let signing_key = signing_key.clone();
+            let data = data.to_vec();
             futs.push(async move {
-                let _ = self
-                    .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
-                    .await;
+                let dest_pubkey = match parse_iroh_node_id_to_pubkey(&id) {
+                    Some(k) => k,
+                    None => {
+                        tracing::warn!(
+                            target: "mesh::ufp2",
+                            peer = %id,
+                            "send_heartbeat_data: cannot parse iroh node id as Ed25519 pubkey"
+                        );
+                        return;
+                    }
+                };
+                let wire = match crate::mesh::ufp2::build_signed_envelope_wire(
+                    &signing_key,
+                    source_pubkey,
+                    dest_pubkey,
+                    tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
+                    data,
+                    0, // policy_epoch placeholder; live epoch tracking lands in a later chunk
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mesh::ufp2",
+                            peer = %id,
+                            error = %e,
+                            "send_heartbeat_data: UFP/2 envelope build failed"
+                        );
+                        return;
+                    }
+                };
+                let _ = self.send_raw_envelope_to_peer(&id, &wire).await;
             });
         }
         join_all(futs).await;
+    }
+
+    /// UFP/2 sender path: write the full envelope bytes to a fresh
+    /// uni-stream without any leading discriminator byte. The first byte
+    /// of `wire` is the CBOR map header — receivers detect UFP/2 vs
+    /// legacy by inspecting it (`mesh::ufp2::looks_like_ufp2_envelope_first_byte`).
+    async fn send_raw_envelope_to_peer(
+        &self,
+        target_node_id: &str,
+        wire: &[u8],
+    ) -> Result<()> {
+        let connection = self
+            .connections
+            .get(target_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
+        let mut send = connection
+            .open_uni()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
+        send.write_all(wire)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ufp2 envelope: {e}"))?;
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("finish ufp2 uni: {e}"))?;
+        Ok(())
     }
 
     /// Broadcast listy modeli do wszystkich polaczonych peerow. Wywolywane
@@ -1778,23 +1864,72 @@ impl IrohMeshManagerRef {
         remote_hex: String,
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), IrohStreamError> {
-        let mut disc = [0u8; 1];
-        recv.read_exact(&mut disc)
+        let mut first = [0u8; 1];
+        recv.read_exact(&mut first)
             .await
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
         // iroh RecvStream.read_to_end bierze limit bajtow, zwraca Vec<u8>.
-        let payload = recv
+        let tail = recv
             .read_to_end(MAX_MSG_BYTES)
             .await
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
-        if payload.len() > MAX_MSG_BYTES {
-            return Err(IrohStreamError::FrameTooLarge(payload.len()));
+        if tail.len() > MAX_MSG_BYTES {
+            return Err(IrohStreamError::FrameTooLarge(tail.len()));
         }
+
+        // UFP/2 dispatch (4c2.1): the first byte distinguishes legacy
+        // `[disc][rkyv]` wire from a complete UFP/2 envelope. UFP/2
+        // arrivals are signature-verified inside `classify_inbound` AND
+        // bound to the transport peer (envelope.source.id == remote peer
+        // pubkey, envelope.destination.id == local node pubkey) so a
+        // trusted peer cannot relay or replay another node's envelope.
+        // The legacy discriminator is then extracted from the envelope's
+        // `kind` field so the rest of this function can route via the
+        // existing `[disc, payload]` event flow without further branches.
+        //
+        // NOTE on replay/epoch: per-channel ReplayGuard + policy_epoch
+        // enforcement lands in 4c2.2-4c2.5 when state-changing frames
+        // migrate. Heartbeat is liveness-only and tolerates retransmits
+        // by design, so the foundation defers per-message replay state
+        // until it actually matters.
+        let local_pubkey = self.security.verifying_key_bytes();
+        let peer_pubkey_opt = parse_iroh_node_id_to_pubkey(&remote_hex);
+        let (frame_type, payload) = if let Some(peer_pubkey) = peer_pubkey_opt {
+            match crate::mesh::ufp2::classify_inbound(
+                first[0],
+                tail,
+                peer_pubkey,
+                local_pubkey,
+            ) {
+                Ok(crate::mesh::ufp2::InboundMeshFrame::Legacy {
+                    discriminator,
+                    payload,
+                }) => (discriminator, payload),
+                Ok(crate::mesh::ufp2::InboundMeshFrame::Ufp2(decoded)) => {
+                    (decoded.legacy_discriminator, decoded.body)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mesh::ufp2",
+                        peer = %remote_hex,
+                        error = %e,
+                        "handle_mesh_uni: UFP/2 dispatch rejected incoming frame"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            tracing::warn!(
+                target: "mesh::ufp2",
+                peer = %remote_hex,
+                "handle_mesh_uni: cannot parse iroh node id as Ed25519 pubkey, dropping frame"
+            );
+            return Ok(());
+        };
 
         // Pre-trust whitelist: untrusted peers may only send pairing handshake
         // frames. Every other mesh frame is dropped before any application
         // state (peer_store, registry, command executor, ...) is touched.
-        let frame_type = disc[0];
         let trusted_now = self.security.is_trusted(&remote_hex);
         tracing::debug!(
             target: "mesh::gate",
@@ -1828,7 +1963,7 @@ impl IrohMeshManagerRef {
         }
 
         use tentaflow_protocol::mesh::*;
-        let event = match disc[0] {
+        let event = match frame_type {
             x if x == MESH_MSG_HEARTBEAT => IrohMeshEvent::HeartbeatReceived {
                 node_id: remote_hex,
                 heartbeat: payload,
@@ -2009,6 +2144,32 @@ impl IrohMeshManagerRef {
                 from_node_id: remote_hex,
                 data: payload,
             },
+            x if x == MESH_MSG_SYNC_PUSH => IrohMeshEvent::SyncPushReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_ACK => IrohMeshEvent::SyncAckReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_PULL => IrohMeshEvent::SyncPullReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_PULL_RESPONSE => IrohMeshEvent::SyncPullResponseReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_SNAPSHOT_PULL => IrohMeshEvent::SyncSnapshotPullReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_SYNC_SNAPSHOT_RESPONSE => {
+                IrohMeshEvent::SyncSnapshotResponseReceived {
+                    from_node_id: remote_hex,
+                    data: payload,
+                }
+            }
             other => {
                 warn!(
                     peer = %remote_hex,
@@ -2059,6 +2220,20 @@ async fn handler_accept_connection(handler: &PairingHandler, connection: Connect
         .await
         .map_err(|e| anyhow::anyhow!("pairing accept: {e:?}"))?;
     Ok(())
+}
+
+/// Parse an iroh node id (hex-encoded 32-byte Ed25519 public key) into the
+/// raw byte form required by `NodeAddress::node` and UFP/2 signature scope.
+/// Returns `None` on any decoding failure so callers can log + skip
+/// without falling over.
+fn parse_iroh_node_id_to_pubkey(node_id_hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(node_id_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
 }
 
 fn build_secret_key_from_security(security: &MeshSecurity) -> Result<iroh::SecretKey> {
