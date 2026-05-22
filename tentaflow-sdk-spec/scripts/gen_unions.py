@@ -126,6 +126,7 @@ def _discover_known_types(repo: Path) -> None:
         "src/protocol/ui/tokens.rs",
         "src/protocol/ui/value_format.rs",
         "src/protocol/ui/inline.rs",
+        "src/protocol/ui/icon_name.rs",
         "src/protocol/control.rs",
     ]:
         for m in _string_enum_re.finditer((repo / src).read_text()):

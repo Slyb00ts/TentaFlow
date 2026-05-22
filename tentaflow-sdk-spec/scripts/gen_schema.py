@@ -185,6 +185,8 @@ def discover_enums(repo: Path) -> None:
         repo / "src/protocol/ui/tokens.rs",
         repo / "src/protocol/ui/value_format.rs",
         repo / "src/protocol/ui/inline.rs",
+        repo / "src/protocol/ui/icon_name.rs",
+        repo / "src/protocol/control.rs",
     ]:
         for m in _STRING_ENUM_RE.finditer(src.read_text()):
             ENUMS.add(m.group(1))
@@ -216,6 +218,8 @@ def parse_string_enums(repo: Path):
         repo / "src/protocol/ui/tokens.rs",
         repo / "src/protocol/ui/value_format.rs",
         repo / "src/protocol/ui/inline.rs",
+        repo / "src/protocol/ui/icon_name.rs",
+        repo / "src/protocol/control.rs",
     ]
     for src in sources:
         t = src.read_text()
@@ -249,21 +253,44 @@ INLINE_FIELD_RE = re.compile(
 
 def parse_inline_structs(repo: Path):
     """Yield (name, [(key, field_name, wire_string, required, default), ...])
-    for every `#[derive(Encode, Decode)] #[cbor(map)] pub struct X { ... }`
-    block in inline.rs."""
+    for every `#[cbor(map)] pub struct X { ... }` block in catalog files.
+
+    Sources scanned: inline.rs (bulk) + a small allowlist of additional
+    inline payload types referenced by typed components or tagged-union
+    variants (`FieldError`, `ParamEntry`, `FormFieldValue`). Top-level
+    UI messages (`Action`, `ActionAck`, `Event`, …) are NOT inline payload
+    types and live elsewhere in the manifest, so we don't pull them in.
+    """
+    # 1) Bulk: everything `#[cbor(map)]` in inline.rs is an inline payload.
     t = (repo / "src/protocol/ui/inline.rs").read_text()
     for m in INLINE_STRUCT_RE.finditer(t):
         name = m.group("name")
-        fields = []
-        for fm in INLINE_FIELD_RE.finditer(m.group("body")):
-            key = int(fm.group("key"))
-            fname = fm.group("name")
-            ftype = fm.group("type").strip()
-            optional = ftype.startswith("Option<")
-            wire = rust_type_to_wire(ftype)
-            # Inline structs don't have decoder bodies — required iff not Option.
-            fields.append((key, fname, wire, not optional, None))
-        yield (name, fields)
+        yield (name, _parse_inline_fields(m.group("body")))
+    # 2) Explicit additions for inline payloads declared next to the type
+    #    that owns them (kept narrow on purpose — see docstring).
+    extra = [
+        ("src/protocol/ui/action.rs", {"FieldError", "ParamEntry", "FormFieldValue"}),
+        ("src/protocol/ui/patch.rs", {"PatchOp"}),
+    ]
+    for (rel, allowed) in extra:
+        text = (repo / rel).read_text()
+        for m in INLINE_STRUCT_RE.finditer(text):
+            name = m.group("name")
+            if name not in allowed:
+                continue
+            yield (name, _parse_inline_fields(m.group("body")))
+
+
+def _parse_inline_fields(body: str):
+    fields = []
+    for fm in INLINE_FIELD_RE.finditer(body):
+        key = int(fm.group("key"))
+        fname = fm.group("name")
+        ftype = fm.group("type").strip()
+        optional = ftype.startswith("Option<")
+        wire = rust_type_to_wire(ftype)
+        fields.append((key, fname, wire, not optional, None))
+    return fields
 
 
 def apply_overrides(struct_name: str, field_name: str, wire: str) -> str:

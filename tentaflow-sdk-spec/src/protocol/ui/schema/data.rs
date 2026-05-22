@@ -3615,6 +3615,191 @@ pub const TRENDDIRECTION_ENUM: EnumMeta = EnumMeta {
     ],
 };
 
+pub const ICONNAME_ENUM: EnumMeta = EnumMeta {
+    name: "IconName",
+    variants: &[
+        ("Add", "add"),
+        ("Alarms", "alarms"),
+        ("Alert", "alert"),
+        ("Apps", "apps"),
+        ("Arrow", "arrow"),
+        ("ArrowDown", "arrow_down"),
+        ("ArrowLeft", "arrow_left"),
+        ("ArrowOut", "arrow_out"),
+        ("ArrowRight", "arrow_right"),
+        ("ArrowUp", "arrow_up"),
+        ("Audit", "audit"),
+        ("Ban", "ban"),
+        ("BarChart", "bar_chart"),
+        ("Bell", "bell"),
+        ("Bolt", "bolt"),
+        ("Brain", "brain"),
+        ("Branch", "branch"),
+        ("Cameras", "cameras"),
+        ("Cancel", "cancel"),
+        ("Catalog", "catalog"),
+        ("ChartLine", "chart_line"),
+        ("Chat", "chat"),
+        ("Check", "check"),
+        ("ChevronDown", "chevron_down"),
+        ("ChevronLeft", "chevron_left"),
+        ("ChevronRight", "chevron_right"),
+        ("ChevronUp", "chevron_up"),
+        ("Chip", "chip"),
+        ("Clock", "clock"),
+        ("ClockGlance", "clock_glance"),
+        ("Close", "close"),
+        ("Cloud", "cloud"),
+        ("Cluster", "cluster"),
+        ("Code", "code"),
+        ("Collapse", "collapse"),
+        ("Copy", "copy"),
+        ("Core", "core"),
+        ("Cpu", "cpu"),
+        ("Cylinder", "cylinder"),
+        ("Danger", "danger"),
+        ("Dashboard", "dashboard"),
+        ("Database", "database"),
+        ("Delete", "delete"),
+        ("Desktop", "desktop"),
+        ("Docker", "docker"),
+        ("Document", "document"),
+        ("Download", "download"),
+        ("Edit", "edit"),
+        ("Evidence", "evidence"),
+        ("ExternalLink", "external_link"),
+        ("Eye", "eye"),
+        ("EyeOff", "eye_off"),
+        ("Face", "face"),
+        ("File", "file"),
+        ("FileText", "file_text"),
+        ("Filter", "filter"),
+        ("Flow", "flow"),
+        ("Folder", "folder"),
+        ("Globe", "globe"),
+        ("GlobeGrid", "globe_grid"),
+        ("Gpu", "gpu"),
+        ("GridRows", "grid_rows"),
+        ("Grip", "grip"),
+        ("Help", "help"),
+        ("Home", "home"),
+        ("HomeSimple", "home_simple"),
+        ("Host", "host"),
+        ("IfaceLan", "iface_lan"),
+        ("IfaceLoop", "iface_loop"),
+        ("IfaceTb", "iface_tb"),
+        ("IfaceVirt", "iface_virt"),
+        ("IfaceVpn", "iface_vpn"),
+        ("IfaceWifi", "iface_wifi"),
+        ("Image", "image"),
+        ("Info", "info"),
+        ("Key", "key"),
+        ("LineChart", "line_chart"),
+        ("List", "list"),
+        ("Lock", "lock"),
+        ("Locked", "locked"),
+        ("Logout", "logout"),
+        ("Management", "management"),
+        ("Max", "max"),
+        ("Meeting", "meeting"),
+        ("Message", "message"),
+        ("Mic", "mic"),
+        ("Min", "min"),
+        ("Model", "model"),
+        ("Models", "models"),
+        ("More", "more"),
+        ("Network", "network"),
+        ("NetworkSvg", "network_svg"),
+        ("Os", "os"),
+        ("Paperclip", "paperclip"),
+        ("Pause", "pause"),
+        ("Person", "person"),
+        ("Pi", "pi"),
+        ("Pin", "pin"),
+        ("Play", "play"),
+        ("Plus", "plus"),
+        ("Power", "power"),
+        ("Profiles", "profiles"),
+        ("Prompt", "prompt"),
+        ("Puzzle", "puzzle"),
+        ("Question", "question"),
+        ("RagDb", "rag_db"),
+        ("Ram", "ram"),
+        ("Record", "record"),
+        ("RecordDot", "record_dot"),
+        ("Refresh", "refresh"),
+        ("Registry", "registry"),
+        ("Rotate", "rotate"),
+        ("Rules", "rules"),
+        ("Save", "save"),
+        ("Search", "search"),
+        ("Send", "send"),
+        ("Services", "services"),
+        ("Settings", "settings"),
+        ("Settings2", "settings2"),
+        ("Share", "share"),
+        ("Shield", "shield"),
+        ("Sparkle", "sparkle"),
+        ("Speaker", "speaker"),
+        ("SpeakerAlt", "speaker_alt"),
+        ("Star", "star"),
+        ("Stop", "stop"),
+        ("Success", "success"),
+        ("Transform", "transform"),
+        ("Trash", "trash"),
+        ("Trend", "trend"),
+        ("Unlock", "unlock"),
+        ("Unlocked", "unlocked"),
+        ("User", "user"),
+        ("Users", "users"),
+        ("Vehicle", "vehicle"),
+        ("Video", "video"),
+        ("Volume", "volume"),
+        ("Warning", "warning"),
+        ("WorkflowApp", "workflow_app"),
+        ("X", "x"),
+        ("Zap", "zap"),
+        ("Zones", "zones"),
+    ],
+};
+
+pub const RESUMEMODE_ENUM: EnumMeta = EnumMeta {
+    name: "ResumeMode",
+    variants: &[
+        ("Replay", "replay"),
+        ("Snapshot", "snapshot"),
+    ],
+};
+
+pub const SESSIONENDCODE_ENUM: EnumMeta = EnumMeta {
+    name: "SessionEndCode",
+    variants: &[
+        ("UserInitiated", "user_initiated"),
+        ("ServerShutdown", "server_shutdown"),
+        ("IdleTimeout", "idle_timeout"),
+        ("ProtocolError", "protocol_error"),
+        ("AuthExpired", "auth_expired"),
+        ("Replaced", "replaced"),
+    ],
+};
+
+pub const GRANTRATIONALE_ENUM: EnumMeta = EnumMeta {
+    name: "GrantRationale",
+    variants: &[
+        ("InitialAdvertise", "initial_advertise"),
+        ("Refill", "refill"),
+        ("Recovery", "recovery"),
+    ],
+};
+
+pub const BACKPRESSURESEVERITY_ENUM: EnumMeta = EnumMeta {
+    name: "BackpressureSeverity",
+    variants: &[
+        ("Warn", "warn"),
+        ("Critical", "critical"),
+    ],
+};
+
 /// All catalog string-enums (tokens.rs `string_enum!` blocks).
 pub const ALL_ENUMS: &[&EnumMeta] = &[
     &TONE_ENUM,
@@ -3750,6 +3935,11 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &TIMESTYLE_ENUM,
     &DATETIMESTYLE_ENUM,
     &TRENDDIRECTION_ENUM,
+    &ICONNAME_ENUM,
+    &RESUMEMODE_ENUM,
+    &SESSIONENDCODE_ENUM,
+    &GRANTRATIONALE_ENUM,
+    &BACKPRESSURESEVERITY_ENUM,
 ];
 
 pub const INLINEBADGE_INLINE: InlineMeta = InlineMeta {
@@ -4273,6 +4463,39 @@ pub const LOGEVENT_INLINE: InlineMeta = InlineMeta {
     ],
 };
 
+pub const FORMFIELDVALUE_INLINE: InlineMeta = InlineMeta {
+    name: "FormFieldValue",
+    fields: &[
+        FieldMeta { key: 0, name: "value", wire: "Value", required: true, default: None },
+        FieldMeta { key: 1, name: "validated_locally", wire: "bool", required: true, default: None },
+    ],
+};
+
+pub const FIELDERROR_INLINE: InlineMeta = InlineMeta {
+    name: "FieldError",
+    fields: &[
+        FieldMeta { key: 0, name: "field_id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "error_code", wire: "u16", required: true, default: None },
+        FieldMeta { key: 2, name: "message", wire: "tstr", required: true, default: None },
+    ],
+};
+
+pub const PARAMENTRY_INLINE: InlineMeta = InlineMeta {
+    name: "ParamEntry",
+    fields: &[
+        FieldMeta { key: 0, name: "key", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "value", wire: "Value", required: true, default: None },
+    ],
+};
+
+pub const PATCHOP_INLINE: InlineMeta = InlineMeta {
+    name: "PatchOp",
+    fields: &[
+        FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
+        FieldMeta { key: 1, name: "op", wire: "Inline<PatchOpKind>", required: true, default: None },
+    ],
+};
+
 /// All catalog inline structs (cbor(map)-derived structs in inline.rs).
 /// Tagged-union inline types (DimensionToken, SelectValue, BorderToken, …)
 /// have manual `Encode`/`Decode` and are not field-keyed maps; they are
@@ -4326,4 +4549,8 @@ pub const ALL_INLINE_STRUCTS: &[&InlineMeta] = &[
     &DATEPRESET_INLINE,
     &INLINECHIP_INLINE,
     &LOGEVENT_INLINE,
+    &FORMFIELDVALUE_INLINE,
+    &FIELDERROR_INLINE,
+    &PARAMENTRY_INLINE,
+    &PATCHOP_INLINE,
 ];
