@@ -3,7 +3,7 @@
 // =============================================================================
 
 use minicbor::{Decode, Decoder, Encode, Encoder};
-use tentaflow_sdk_spec::{ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS};
+use tentaflow_sdk_spec::{ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS, ALL_TAGGED_UNIONS};
 
 /// Manifest protocol version. Bump on breaking schema changes.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -20,6 +20,33 @@ pub struct ManifestEnvelope {
     pub enums: Vec<EnumEntry>,
     #[n(3)]
     pub inline_structs: Vec<InlineEntry>,
+    #[n(4)]
+    pub tagged_unions: Vec<UnionEntry>,
+}
+
+/// One tagged-union schema (catalog manual `Encode`/`Decode` enum like
+/// `IconRef`, `DimensionToken`, `ValueFormat`, `ValidationRule`, …).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct UnionEntry {
+    #[n(0)]
+    pub name: String,
+    #[n(1)]
+    pub discriminator_key: String,
+    #[n(2)]
+    pub variants: Vec<VariantEntry>,
+}
+
+/// One variant of a tagged-union (the actual payload schema per `kind` value).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct VariantEntry {
+    #[n(0)]
+    pub rust_name: String,
+    #[n(1)]
+    pub wire_kind: String,
+    #[n(2)]
+    pub fields: Vec<FieldEntry>,
 }
 
 /// One catalog component (a typed `0x????` UI tag).
@@ -205,11 +232,38 @@ pub fn build_manifest() -> ManifestEnvelope {
                 .collect(),
         })
         .collect();
+    let tagged_unions = ALL_TAGGED_UNIONS
+        .iter()
+        .map(|u| UnionEntry {
+            name: u.name.to_string(),
+            discriminator_key: u.discriminator_key.to_string(),
+            variants: u
+                .variants
+                .iter()
+                .map(|v| VariantEntry {
+                    rust_name: v.rust_name.to_string(),
+                    wire_kind: v.wire_kind.to_string(),
+                    fields: v
+                        .fields
+                        .iter()
+                        .map(|f| FieldEntry {
+                            key: f.key,
+                            name: f.name.to_string(),
+                            wire: f.wire.to_string(),
+                            required: f.required,
+                            default: f.default.map(|s| s.to_string()),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect();
     ManifestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         components,
         enums,
         inline_structs,
+        tagged_unions,
     }
 }
 
@@ -224,6 +278,7 @@ mod tests {
         assert_eq!(m.components.len(), ALL_COMPONENTS.len());
         assert_eq!(m.enums.len(), ALL_ENUMS.len());
         assert_eq!(m.inline_structs.len(), ALL_INLINE_STRUCTS.len());
+        assert_eq!(m.tagged_unions.len(), ALL_TAGGED_UNIONS.len());
     }
 
     #[test]
