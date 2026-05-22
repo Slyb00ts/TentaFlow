@@ -41,10 +41,12 @@
 #![deny(unused_must_use)]
 
 pub mod manifest;
+pub mod message;
 pub mod validation;
 
 pub use manifest::{
     build_manifest, ComponentEntry, EnumEntry, EnumVariant, FieldEntry, InlineEntry,
     ManifestEnvelope, UnionEntry, VariantEntry, PROTOCOL_VERSION,
 };
+pub use message::{validate_component, MessageError};
 pub use validation::{check_manifest, validate_manifest, ValidationError, ValidationReport};
