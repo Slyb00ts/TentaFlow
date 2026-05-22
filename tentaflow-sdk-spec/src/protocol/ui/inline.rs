@@ -1282,7 +1282,7 @@ pub struct GraphEdge {
     #[n(3)]
     pub label: Option<BindRef>,
     #[n(4)]
-    pub weight: Option<f32>,
+    pub weight: Option<f64>,
     #[n(5)]
     pub tone: Option<Tone>,
 }
@@ -1406,7 +1406,7 @@ pub struct FileMeta {
     pub ts_ms: i64,
     /// Upload progress 0.0..=1.0.
     #[n(5)]
-    pub upload_progress: f32,
+    pub upload_progress: f64,
     #[n(6)]
     pub status: super::tokens::FileUploadStatus,
     #[n(7)]
@@ -1748,7 +1748,7 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
 // -----------------------------------------------------------------------------
 
 /// Aspect-ratio token (catalog §1.5). Always wire-encoded as `{kind: "1:1"|"16:9"|...}`
-/// or `{kind: "custom", ratio: f32}`.
+/// or `{kind: "custom", ratio: f64}`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AspectRatio {
     R1To1,
@@ -1759,7 +1759,7 @@ pub enum AspectRatio {
     R2To1,
     R9To16,
     R3To4,
-    Custom { ratio: f32 },
+    Custom { ratio: f64 },
 }
 
 impl AspectRatio {
@@ -1788,7 +1788,7 @@ impl<C> Encode<C> for AspectRatio {
             AspectRatio::Custom { ratio } => {
                 e.map(2)?;
                 e.str("kind")?.str("custom")?;
-                e.str("ratio")?.f32(*ratio)?;
+                e.str("ratio")?.f64(*ratio)?;
             }
             other => {
                 e.map(1)?;
@@ -1808,7 +1808,7 @@ impl<'b, C> Decode<'b, C> for AspectRatio {
             minicbor::decode::Error::message("indefinite-length map forbidden")
         })?;
         let mut kind: Option<String> = None;
-        let mut ratio: Option<f32> = None;
+        let mut ratio: Option<f64> = None;
         for _ in 0..len {
             let k = d.str()?;
             match k {
@@ -1818,7 +1818,7 @@ impl<'b, C> Decode<'b, C> for AspectRatio {
                 }
                 "ratio" => {
                     assert_no_dup_tstr(&ratio, "AspectRatio", "ratio")?;
-                    ratio = Some(d.f32()?);
+                    ratio = Some(d.f64()?);
                 }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(

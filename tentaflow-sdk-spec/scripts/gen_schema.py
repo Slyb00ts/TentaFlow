@@ -149,7 +149,7 @@ COMPONENT_REF_OVERRIDES = {
 
 # Rust type → wire-string mapping. Order-sensitive (Vec/Option matched first).
 PRIMS = {
-    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64",
+    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f64",
 }
 
 # Aliases declared via `use ... as Alias` in component files — map alias back

@@ -65,7 +65,7 @@ const ALLOWED_SECTIONS: &[&str] = &[
 
 /// Wire primitives recognised by the grammar (`types.rs`).
 const PRIMITIVES: &[&str] = &[
-    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64", "tstr",
+    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f64", "tstr",
     "BindRef", "StatePath", "Component", "CborMap", "Value",
 ];
 
