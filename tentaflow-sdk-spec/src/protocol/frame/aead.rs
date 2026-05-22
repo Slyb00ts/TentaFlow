@@ -19,7 +19,6 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::address::NodeAddress;
 use super::auth::Auth;
-use super::channel::Kind;
 use super::envelope::Envelope;
 use super::error::{FrameError, FrameErrorCode};
 use super::flags::Flags;
@@ -331,7 +330,7 @@ pub fn decrypt_envelope_body(envelope: &mut Envelope, key: &AeadKey) -> Result<(
 #[allow(unused_imports)]
 mod tests {
     use super::*;
-    use crate::protocol::frame::channel::channels;
+    use crate::protocol::frame::channel::{channels, Kind};
     use crate::protocol::frame::envelope::{
         MessageId, Priority, TraceId, MESSAGE_ID_LEN, NODE_ID_LEN,
     };
