@@ -149,7 +149,15 @@ COMPONENT_REF_OVERRIDES = {
 
 # Rust type → wire-string mapping. Order-sensitive (Vec/Option matched first).
 PRIMS = {
-    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f64",
+    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64",
+}
+
+# Aliases declared via `use ... as Alias` in component files — map alias back
+# to its real type name so the wire descriptor uses the canonical reference.
+TYPE_ALIASES = {
+    # specialised.rs: `LiveRegion as LiveRegionPoliteness` (avoids name clash
+    # with the locally-defined wire component `LiveRegionComponent`).
+    "LiveRegionPoliteness": "LiveRegion",
 }
 
 # Known tstr-enum names: discover from tokens.rs.
@@ -163,10 +171,23 @@ INLINE_STRUCTS = set()
 COMPONENT_TAGS = {}  # name -> "0xNNNN"
 
 
+_STRING_ENUM_RE = re.compile(
+    r"string_enum!\s*\{(?:\s*///[^\n]*\n)*\s*pub enum (\w+) \{",
+    re.DOTALL,
+)
+
+
 def discover_enums(repo: Path) -> None:
-    t = (repo / "src/protocol/ui/tokens.rs").read_text()
-    for m in re.finditer(r"pub enum (\w+) \{", t):
-        ENUMS.add(m.group(1))
+    # Only `string_enum! { pub enum X { ... } }` blocks are pure tstr enums.
+    # Custom `pub enum X { ... }` declarations (e.g. ValueFormat, ValidationRule)
+    # are tagged unions with manual Encode/Decode and don't fit `Enum<X>`.
+    for src in [
+        repo / "src/protocol/ui/tokens.rs",
+        repo / "src/protocol/ui/value_format.rs",
+        repo / "src/protocol/ui/inline.rs",
+    ]:
+        for m in _STRING_ENUM_RE.finditer(src.read_text()):
+            ENUMS.add(m.group(1))
 
 
 def discover_inline_structs(repo: Path) -> None:
@@ -175,6 +196,74 @@ def discover_inline_structs(repo: Path) -> None:
         INLINE_STRUCTS.add(m.group(1))
     for m in re.finditer(r"pub enum (\w+) \{", t):
         INLINE_STRUCTS.add(m.group(1))
+
+
+ENUM_BLOCK_RE = re.compile(
+    r"string_enum!\s*\{(?P<doc>(?:\s*///[^\n]*\n)*)\s*pub enum (?P<name>\w+) \{(?P<body>[^}]*)\}",
+    re.DOTALL,
+)
+ENUM_VARIANT_RE = re.compile(
+    r"^[ \t]*(?P<variant>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"(?P<wire>[^\"]+)\",",
+    re.MULTILINE,
+)
+
+
+def parse_string_enums(repo: Path):
+    """Yield (name, [(variant_rust, variant_wire), ...]) for every
+    `string_enum! { pub enum X { Variant = \"wire\", ... } }` block in any
+    of the catalog source files."""
+    sources = [
+        repo / "src/protocol/ui/tokens.rs",
+        repo / "src/protocol/ui/value_format.rs",
+        repo / "src/protocol/ui/inline.rs",
+    ]
+    for src in sources:
+        t = src.read_text()
+        for m in ENUM_BLOCK_RE.finditer(t):
+            name = m.group("name")
+            variants = [
+                (v.group("variant"), v.group("wire"))
+                for v in ENUM_VARIANT_RE.finditer(m.group("body"))
+            ]
+            yield (name, variants)
+
+
+# Inline structs that use `#[cbor(map)]` wire encoding (field-keyed map).
+# Matches both fully-derived (`#[derive(Encode, Decode)]`) AND structs that
+# only derive `Encode` and provide a manual `Decode` (e.g. BreadcrumbItem,
+# SidebarItem for mutual-exclusion enforcement). The wire schema is
+# identical; only the decoder is bespoke.
+# Tagged-union inline types (manual Encode/Decode like DimensionToken,
+# SelectValue, BorderToken, ...) are NOT captured here — they get a
+# separate UnionMeta registry in a follow-up.
+INLINE_STRUCT_RE = re.compile(
+    r"#\[derive\([^)]*\bEncode\b[^)]*\)\]\s*"
+    r"#\[cbor\(map\)\]\s*"
+    r"pub struct (?P<name>\w+) \{(?P<body>[^}]*)\}",
+    re.DOTALL,
+)
+INLINE_FIELD_RE = re.compile(
+    r"#\[n\((?P<key>\d+)\)\]\s*pub (?P<name>\w+):\s*(?P<type>[^,\n]+),",
+)
+
+
+def parse_inline_structs(repo: Path):
+    """Yield (name, [(key, field_name, wire_string, required, default), ...])
+    for every `#[derive(Encode, Decode)] #[cbor(map)] pub struct X { ... }`
+    block in inline.rs."""
+    t = (repo / "src/protocol/ui/inline.rs").read_text()
+    for m in INLINE_STRUCT_RE.finditer(t):
+        name = m.group("name")
+        fields = []
+        for fm in INLINE_FIELD_RE.finditer(m.group("body")):
+            key = int(fm.group("key"))
+            fname = fm.group("name")
+            ftype = fm.group("type").strip()
+            optional = ftype.startswith("Option<")
+            wire = rust_type_to_wire(ftype)
+            # Inline structs don't have decoder bodies — required iff not Option.
+            fields.append((key, fname, wire, not optional, None))
+        yield (name, fields)
 
 
 def apply_overrides(struct_name: str, field_name: str, wire: str) -> str:
@@ -207,6 +296,9 @@ def rust_type_to_wire(rust: str, doc: str = "") -> str:
     # `super::*::` / `crate::*::` prefix so `super::super::tokens::Spacing`
     # becomes `Spacing` (also inside generics).
     rust = re.sub(r"(?:[A-Za-z_][A-Za-z0-9_]*::)+([A-Za-z_][A-Za-z0-9_]*)", r"\1", rust)
+    # Resolve type aliases (`use X as Y` declarations in source).
+    for alias, real in TYPE_ALIASES.items():
+        rust = re.sub(rf"\b{re.escape(alias)}\b", real, rust)
 
     if rust.startswith("Option<") and rust.endswith(">"):
         inner = rust[len("Option<"):-1]
@@ -410,10 +502,12 @@ def collect(repo: Path):
                     "handlers": handlers,
                 })
                 COMPONENT_TAGS[name] = tag
-    return components
+    enums = list(parse_string_enums(repo))
+    inline_structs = list(parse_inline_structs(repo))
+    return components, enums, inline_structs
 
 
-def emit(components, out_path: Path):
+def emit(components, enums, inline_structs, out_path: Path):
     lines = [
         "// =============================================================================",
         "// File: protocol/ui/schema/data.rs — codegen schema data (auto-generated)",
@@ -421,7 +515,7 @@ def emit(components, out_path: Path):
         "// DO NOT EDIT BY HAND — re-run the generator after struct edits.",
         "// =============================================================================",
         "",
-        "use super::types::{ComponentMeta, FieldMeta, section};",
+        "use super::types::{ComponentMeta, EnumMeta, FieldMeta, InlineMeta, section};",
         "",
     ]
     consts = []
@@ -463,11 +557,58 @@ def emit(components, out_path: Path):
         lines.append(f"    &{c['name'].upper()}_SCHEMA,")
     lines.append("];")
     lines.append("")
+    # --- string enums -------------------------------------------------------
+    for (name, variants) in enums:
+        const_name = f"{name.upper()}_ENUM"
+        lines.append(f"pub const {const_name}: EnumMeta = EnumMeta {{")
+        lines.append(f"    name: \"{name}\",")
+        lines.append(f"    variants: &[")
+        for (variant_rust, variant_wire) in variants:
+            lines.append(f"        (\"{variant_rust}\", \"{variant_wire}\"),")
+        lines.append(f"    ],")
+        lines.append(f"}};")
+        lines.append("")
+    lines.append("/// All catalog string-enums (tokens.rs `string_enum!` blocks).")
+    lines.append("pub const ALL_ENUMS: &[&EnumMeta] = &[")
+    for (name, _) in enums:
+        lines.append(f"    &{name.upper()}_ENUM,")
+    lines.append("];")
+    lines.append("")
+    # --- inline structs -----------------------------------------------------
+    for (name, fields) in inline_structs:
+        const_name = f"{name.upper()}_INLINE"
+        lines.append(f"pub const {const_name}: InlineMeta = InlineMeta {{")
+        lines.append(f"    name: \"{name}\",")
+        if not fields:
+            lines.append(f"    fields: &[],")
+        else:
+            lines.append(f"    fields: &[")
+            for (key, fname, wire, required, _default) in fields:
+                req = "true" if required else "false"
+                lines.append(
+                    f"        FieldMeta {{ key: {key}, name: \"{fname}\", wire: \"{wire}\", "
+                    f"required: {req}, default: None }},"
+                )
+            lines.append(f"    ],")
+        lines.append(f"}};")
+        lines.append("")
+    lines.append("/// All catalog inline structs (cbor(map)-derived structs in inline.rs).")
+    lines.append("/// Tagged-union inline types (DimensionToken, SelectValue, BorderToken, …)")
+    lines.append("/// have manual `Encode`/`Decode` and are not field-keyed maps; they are")
+    lines.append("/// tracked separately when the union registry lands.")
+    lines.append("pub const ALL_INLINE_STRUCTS: &[&InlineMeta] = &[")
+    for (name, _) in inline_structs:
+        lines.append(f"    &{name.upper()}_INLINE,")
+    lines.append("];")
+    lines.append("")
     out_path.write_text("\n".join(lines))
 
 
 if __name__ == "__main__":
     repo = Path(".")
-    components = collect(repo)
-    emit(components, repo / "src/protocol/ui/schema/data.rs")
-    print(f"Emitted {len(components)} component schemas")
+    components, enums, inline_structs = collect(repo)
+    emit(components, enums, inline_structs, repo / "src/protocol/ui/schema/data.rs")
+    print(
+        f"Emitted {len(components)} components, {len(enums)} enums, "
+        f"{len(inline_structs)} inline structs"
+    )
