@@ -1245,10 +1245,8 @@ pub async fn handle_request(
                     image::ExtendedColorType::Rgb8
                 };
                 use image::ImageEncoder;
-                let encoder =
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 75);
-                let encode_result =
-                    encoder.write_image(&bytes, width, height, color);
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 75);
+                let encode_result = encoder.write_image(&bytes, width, height, color);
                 let (content_type, body_bytes) = match encode_result {
                     Ok(()) => ("image/jpeg", jpeg_buf),
                     Err(e) => {

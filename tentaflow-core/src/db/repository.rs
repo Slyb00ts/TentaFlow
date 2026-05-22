@@ -7,11 +7,262 @@ use super::models::*;
 use super::DbPool;
 use anyhow::Result;
 use rusqlite::OptionalExtension;
+use std::collections::BTreeMap;
 
 /// Pozyskuje polaczenie z puli (lock na Mutex)
 fn acquire(pool: &DbPool) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
     pool.lock()
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))
+}
+
+#[cfg(test)]
+mod core_sync_repository_tests {
+    use super::*;
+    use crate::sync::core_capture::load_core_write_capture;
+    use crate::sync::ledger::FieldValue;
+    use crate::sync::runtime::SqlWriteAction;
+    use std::path::Path;
+
+    fn setup_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("test db")
+    }
+
+    fn flow_params<'a>(
+        name: &'a str,
+        flow_json: &'a str,
+        actor_user_id: Option<i64>,
+    ) -> FlowParams<'a> {
+        FlowParams {
+            name,
+            description: Some("opis"),
+            is_default: false,
+            service_type: Some("chat"),
+            flow_json,
+            status: "active",
+            published_model_name: None,
+            actor_user_id,
+        }
+    }
+
+    fn capture_id_for_resource(db: &DbPool, resource_type: &str, resource_id: i64) -> String {
+        capture_id_for_resource_str(db, resource_type, &resource_id.to_string())
+    }
+
+    fn capture_id_for_resource_str(db: &DbPool, resource_type: &str, resource_id: &str) -> String {
+        let conn = db.lock().expect("db lock");
+        conn.query_row(
+            "SELECT capture_id FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 \
+             ORDER BY created_at_ms DESC LIMIT 1",
+            rusqlite::params![resource_type, resource_id],
+            |row| row.get(0),
+        )
+        .expect("capture id")
+    }
+
+    fn capture_id_for_action(
+        db: &DbPool,
+        resource_type: &str,
+        resource_id: i64,
+        action: &str,
+    ) -> String {
+        let conn = db.lock().expect("db lock");
+        conn.query_row(
+            "SELECT capture_id FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 AND action = ?3 \
+             ORDER BY created_at_ms DESC LIMIT 1",
+            rusqlite::params![resource_type, resource_id.to_string(), action],
+            |row| row.get(0),
+        )
+        .expect("capture id")
+    }
+
+    fn create_actor(db: &DbPool) -> i64 {
+        create_user_account(
+            db,
+            "flow-owner",
+            "hash",
+            "Flow Owner",
+            "flow-owner@example.com",
+        )
+        .expect("create actor")
+    }
+
+    #[test]
+    fn create_flow_records_binary_core_capture() {
+        let db = setup_db();
+        let actor_id = create_actor(&db);
+        let id = create_flow(
+            &db,
+            &flow_params("Flow A", r#"{"nodes":[]}"#, Some(actor_id)),
+        )
+        .expect("create flow");
+        let capture_id = capture_id_for_resource(&db, "core.flow", id);
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(capture.actor_user_id, Some(actor_id));
+        assert_eq!(
+            capture.changed_fields.get("name"),
+            Some(&FieldValue::String("Flow A".to_string()))
+        );
+    }
+
+    #[test]
+    fn update_flow_with_snapshot_records_flow_and_version_captures() {
+        let db = setup_db();
+        let actor_id = create_actor(&db);
+        let id = create_flow(
+            &db,
+            &flow_params("Flow A", r#"{"nodes":[]}"#, Some(actor_id)),
+        )
+        .expect("create flow");
+        update_flow_with_snapshot(
+            &db,
+            id,
+            1,
+            &flow_params("Flow B", r#"{"nodes":[{"id":"n1"}]}"#, Some(actor_id)),
+            Some(&actor_id.to_string()),
+        )
+        .expect("update flow");
+        let conn = db.lock().expect("db lock");
+        let flow_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.flow' AND resource_id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("flow capture count");
+        let version_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.flow_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version capture count");
+
+        assert_eq!(flow_count, 2);
+        assert_eq!(version_count, 1);
+    }
+
+    #[test]
+    fn create_user_account_records_capture_without_password_hash() {
+        let db = setup_db();
+        let user_id = create_user_account(
+            &db,
+            "sales-user",
+            "secret-hash",
+            "Sales User",
+            "sales@example.com",
+        )
+        .expect("create user");
+        let capture_id = capture_id_for_resource(&db, "core.user_account", user_id);
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(
+            capture.changed_fields.get("username"),
+            Some(&FieldValue::String("sales-user".to_string()))
+        );
+        assert!(!capture.changed_fields.contains_key("password_hash"));
+    }
+
+    #[test]
+    fn password_update_records_only_redacted_capture() {
+        let db = setup_db();
+        let user_id = create_user_account(
+            &db,
+            "password-user",
+            "old-hash",
+            "Password User",
+            "password@example.com",
+        )
+        .expect("create user");
+        update_user_account_password(&db, user_id, "new-secret-hash").expect("update password");
+        let capture_id = capture_id_for_action(&db, "core.user_account", user_id, "update");
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Update);
+        assert_eq!(
+            capture.changed_fields.get("password_changed"),
+            Some(&FieldValue::Bool(true))
+        );
+        assert!(!capture.changed_fields.contains_key("password_hash"));
+    }
+
+    #[test]
+    fn group_membership_records_core_capture() {
+        let db = setup_db();
+        let user_id =
+            create_user_account(&db, "group-user", "hash", "Group User", "group@example.com")
+                .expect("create user");
+        let group_id = create_group(&db, "Sales", "CRM team").expect("create group");
+        add_user_to_group(&db, group_id, user_id).expect("add member");
+        let resource_id = group_member_resource_id(group_id, user_id);
+        let capture_id = capture_id_for_resource_str(&db, "core.group_member", &resource_id);
+        let conn = db.lock().expect("db lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(
+            capture.changed_fields.get("group_id"),
+            Some(&FieldValue::I64(group_id))
+        );
+        assert_eq!(
+            capture.changed_fields.get("user_id"),
+            Some(&FieldValue::I64(user_id))
+        );
+    }
+
+    #[test]
+    fn sync_permission_epoch_changes_for_acl_and_role_not_password() {
+        let db = setup_db();
+        let user_id =
+            create_user_account(&db, "epoch-user", "hash", "Epoch User", "epoch@example.com")
+                .expect("create user");
+        let initial =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+
+        update_user_account_password(&db, user_id, "new-hash").expect("password");
+        let after_password =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+        assert_eq!(after_password, initial);
+
+        set_user_role(&db, user_id, "admin").expect("role");
+        let after_role =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+        assert!(after_role > after_password);
+
+        upsert_sync_resource_acl(
+            &db,
+            crate::services::org::DEFAULT_ORG_ID,
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "flow-epoch",
+            Some(user_id),
+            Some(user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("acl");
+        let after_acl =
+            get_sync_permission_epoch(&db, crate::services::org::DEFAULT_ORG_ID).expect("epoch");
+        assert!(after_acl > after_role);
+    }
 }
 
 /// Mapowanie wiersza na DbPrompt
@@ -286,6 +537,47 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
         rusqlite::params![key, value],
     )?;
     Ok(())
+}
+
+fn sync_permission_epoch_key(org_id: &str) -> String {
+    format!("sync.permission_epoch:{org_id}")
+}
+
+fn bump_sync_permission_epoch_with_conn(conn: &rusqlite::Connection, org_id: &str) -> Result<u64> {
+    let key = sync_permission_epoch_key(org_id);
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, '1') \
+         ON CONFLICT(key) DO UPDATE SET \
+             value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), \
+             updated_at = datetime('now')",
+        rusqlite::params![key],
+    )?;
+    read_sync_permission_epoch_with_conn(conn, org_id)
+}
+
+fn read_sync_permission_epoch_with_conn(conn: &rusqlite::Connection, org_id: &str) -> Result<u64> {
+    let key = sync_permission_epoch_key(org_id);
+    let value = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "0".to_string());
+    value
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("Nieprawidlowa epoka permissions sync: {}", e))
+}
+
+pub fn bump_sync_permission_epoch(pool: &DbPool, org_id: &str) -> Result<u64> {
+    let conn = acquire(pool)?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)
+}
+
+pub fn get_sync_permission_epoch(pool: &DbPool, org_id: &str) -> Result<u64> {
+    let conn = acquire(pool)?;
+    read_sync_permission_epoch_with_conn(&conn, org_id)
 }
 
 /// Odczytuje setting z automatycznym deszyfrowaniem (jesli klucz jest wrazliwy)
@@ -2204,9 +2496,181 @@ pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFl
     Ok(result)
 }
 
+fn field_string(value: &str) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::String(value.to_string())
+}
+
+fn field_optional_string(value: Option<&str>) -> crate::sync::ledger::FieldValue {
+    value
+        .map(|v| crate::sync::ledger::FieldValue::String(v.to_string()))
+        .unwrap_or(crate::sync::ledger::FieldValue::Null)
+}
+
+fn flow_changed_fields(
+    params: &FlowParams<'_>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(params.name));
+    fields.insert(
+        "description".to_string(),
+        field_optional_string(params.description),
+    );
+    fields.insert(
+        "is_default".to_string(),
+        crate::sync::ledger::FieldValue::Bool(params.is_default),
+    );
+    fields.insert(
+        "service_type".to_string(),
+        field_optional_string(params.service_type),
+    );
+    fields.insert("flow_json".to_string(), field_string(params.flow_json));
+    fields.insert("status".to_string(), field_string(params.status));
+    fields.insert(
+        "published_model_name".to_string(),
+        field_optional_string(params.published_model_name),
+    );
+    fields
+}
+
+fn flow_version_changed_fields(
+    flow_id: i64,
+    version_num: i64,
+    flow_json: &str,
+    name: &str,
+    description: Option<&str>,
+    status: Option<&str>,
+    created_by: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "flow_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(flow_id),
+    );
+    fields.insert(
+        "version_num".to_string(),
+        crate::sync::ledger::FieldValue::I64(version_num),
+    );
+    fields.insert("flow_json".to_string(), field_string(flow_json));
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert(
+        "description".to_string(),
+        field_optional_string(description),
+    );
+    fields.insert("status".to_string(), field_optional_string(status));
+    fields.insert("created_by".to_string(), field_optional_string(created_by));
+    fields
+}
+
+fn flow_binding_changed_fields(
+    flow_id: i64,
+    model_pattern: &str,
+    priority: i64,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "flow_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(flow_id),
+    );
+    fields.insert("model_pattern".to_string(), field_string(model_pattern));
+    fields.insert(
+        "priority".to_string(),
+        crate::sync::ledger::FieldValue::I64(priority),
+    );
+    fields
+}
+
+fn record_core_capture_tx(
+    tx: &rusqlite::Transaction<'_>,
+    kind: crate::sync::core_registry::CoreSyncResourceKind,
+    resource_id: impl Into<String>,
+    action: crate::sync::runtime::SqlWriteAction,
+    changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
+    actor_user_id: Option<i64>,
+) -> Result<()> {
+    let capture = crate::sync::core_capture::CoreWriteCapture::new(
+        kind,
+        crate::services::org::DEFAULT_ORG_ID,
+        resource_id,
+        action,
+        changed_fields,
+        actor_user_id,
+    );
+    crate::sync::core_capture::record_core_write_capture(tx, &capture)?;
+    Ok(())
+}
+
+fn user_account_changed_fields(
+    username: Option<&str>,
+    display_name: Option<&str>,
+    email: Option<&str>,
+    is_active: Option<bool>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    if let Some(value) = username {
+        fields.insert("username".to_string(), field_string(value));
+    }
+    if let Some(value) = display_name {
+        fields.insert("display_name".to_string(), field_string(value));
+    }
+    if let Some(value) = email {
+        fields.insert("email".to_string(), field_string(value));
+    }
+    if let Some(value) = is_active {
+        fields.insert(
+            "is_active".to_string(),
+            crate::sync::ledger::FieldValue::Bool(value),
+        );
+    }
+    fields
+}
+
+fn password_changed_fields() -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "password_changed".to_string(),
+        crate::sync::ledger::FieldValue::Bool(true),
+    );
+    fields
+}
+
+fn group_changed_fields(
+    name: Option<&str>,
+    description: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    if let Some(value) = name {
+        fields.insert("name".to_string(), field_string(value));
+    }
+    if let Some(value) = description {
+        fields.insert("description".to_string(), field_string(value));
+    }
+    fields
+}
+
+fn group_member_resource_id(group_id: i64, user_id: i64) -> String {
+    format!("{}:{}", group_id, user_id)
+}
+
+fn group_member_changed_fields(
+    group_id: i64,
+    user_id: i64,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "group_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(group_id),
+    );
+    fields.insert(
+        "user_id".to_string(),
+        crate::sync::ledger::FieldValue::I64(user_id),
+    );
+    fields
+}
+
 pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO flows (name, description, is_default, service_type, flow_json, status, published_model_name) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
@@ -2219,7 +2683,17 @@ pub fn create_flow(pool: &DbPool, params: &FlowParams<'_>) -> Result<i64> {
             params.published_model_name,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        flow_changed_fields(params),
+        params.actor_user_id,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn update_flow(
@@ -2228,8 +2702,9 @@ pub fn update_flow(
     expected_version: i64,
     params: &FlowParams<'_>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    let rows_affected = conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE flows \
          SET name = ?2, description = ?3, is_default = ?4, service_type = ?5, \
              flow_json = ?6, status = ?7, published_model_name = ?8, \
@@ -2250,12 +2725,35 @@ pub fn update_flow(
     if rows_affected == 0 {
         return Err(anyhow::anyhow!("CONFLICT"));
     }
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Update,
+        flow_changed_fields(params),
+        params.actor_user_id,
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn delete_flow(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute("DELETE FROM flows WHERE id = ?1", rusqlite::params![id])?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute("DELETE FROM flows WHERE id = ?1", rusqlite::params![id])?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Flow,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2379,6 +2877,23 @@ pub fn update_flow_with_snapshot(
                 created_by,
             ],
         )?;
+        let flow_version_id = tx.last_insert_rowid();
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowVersion,
+            flow_version_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            flow_version_changed_fields(
+                id,
+                next_ver,
+                &old_flow_json,
+                &old_name,
+                old_description.as_deref(),
+                old_status.as_deref(),
+                created_by,
+            ),
+            params.actor_user_id,
+        )?;
 
         // Prune — zostawiamy tylko FLOW_VERSIONS_KEEP najnowszych
         tx.execute(
@@ -2409,6 +2924,14 @@ pub fn update_flow_with_snapshot(
     if rows_affected == 0 {
         return Err(anyhow::anyhow!("CONFLICT"));
     }
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Update,
+        flow_changed_fields(params),
+        params.actor_user_id,
+    )?;
 
     tx.commit()?;
     Ok(())
@@ -2457,12 +2980,23 @@ pub fn create_flow_model_binding(
     model_pattern: &str,
     priority: i64,
 ) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO flow_model_bindings (flow_id, model_pattern, priority) VALUES (?1, ?2, ?3)",
         rusqlite::params![flow_id, model_pattern, priority],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        flow_binding_changed_fields(flow_id, model_pattern, priority),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn update_flow_model_binding(
@@ -2472,20 +3006,46 @@ pub fn update_flow_model_binding(
     model_pattern: &str,
     priority: i64,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE flow_model_bindings SET flow_id = ?2, model_pattern = ?3, priority = ?4 WHERE id = ?1",
         rusqlite::params![id, flow_id, model_pattern, priority],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            flow_binding_changed_fields(flow_id, model_pattern, priority),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 pub fn delete_flow_model_binding(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM flow_model_bindings WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3086,11 +3646,30 @@ pub fn set_user_role(pool: &DbPool, user_id: i64, role: &str) -> Result<()> {
         _ => anyhow::bail!("Nieprawidlowa rola: {}", role),
     };
     let is_admin = role == "admin";
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_accounts SET role = ?1, is_admin = ?2, updated_at = datetime('now') WHERE id = ?3",
         rusqlite::params![role, is_admin, user_id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("role".to_string(), field_string(role));
+        fields.insert(
+            "is_admin".to_string(),
+            crate::sync::ledger::FieldValue::Bool(is_admin),
+        );
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            user_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            fields,
+            None,
+        )?;
+        bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3103,13 +3682,24 @@ pub fn create_user_account(
     display_name: &str,
     email: &str,
 ) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO user_accounts (username, password_hash, display_name, email) \
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![username, password_hash, display_name, email],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        user_account_changed_fields(Some(username), Some(display_name), Some(email), Some(true)),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Pobiera uzytkownika po nazwie z tabeli user_accounts.
@@ -3153,11 +3743,23 @@ pub fn list_user_accounts(pool: &DbPool) -> Result<Vec<UserAccount>> {
 
 /// Aktualizuje hash hasla uzytkownika w tabeli user_accounts.
 pub fn update_user_account_password(pool: &DbPool, id: i64, new_password_hash: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_accounts SET password_hash = ?1, updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![new_password_hash, id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            password_changed_fields(),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3169,22 +3771,50 @@ pub fn update_user_account(
     email: &str,
     is_active: bool,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_accounts SET display_name = ?1, email = ?2, is_active = ?3, \
          updated_at = datetime('now') WHERE id = ?4",
         rusqlite::params![display_name, email, is_active, id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            user_account_changed_fields(None, Some(display_name), Some(email), Some(is_active)),
+            None,
+        )?;
+        bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 /// Usuwa uzytkownika z tabeli user_accounts (kaskadowo czlonkostwa w grupach).
 pub fn delete_user_account(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM user_accounts WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserAccount,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+        bump_sync_permission_epoch_with_conn(&tx, crate::services::org::DEFAULT_ORG_ID)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3220,12 +3850,23 @@ pub fn verify_user_account_password(
 
 /// Tworzy nowa grupe uzytkownikow. Zwraca ID.
 pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO user_groups (name, description) VALUES (?1, ?2)",
         rusqlite::params![name, description],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        group_changed_fields(Some(name), Some(description)),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Lista wszystkich grup uzytkownikow.
@@ -3248,21 +3889,45 @@ pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
 
 /// Dodaje uzytkownika do grupy.
 pub fn add_user_to_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?1, ?2)",
         rusqlite::params![group_id, user_id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::GroupMember,
+            group_member_resource_id(group_id, user_id),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            group_member_changed_fields(group_id, user_id),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 /// Usuwa uzytkownika z grupy.
 pub fn remove_user_from_group(pool: &DbPool, group_id: i64, user_id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM group_members WHERE group_id = ?1 AND user_id = ?2",
         rusqlite::params![group_id, user_id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::GroupMember,
+            group_member_resource_id(group_id, user_id),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            group_member_changed_fields(group_id, user_id),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3290,11 +3955,23 @@ pub fn get_user_groups(pool: &DbPool, user_id: i64) -> Result<Vec<UserGroup>> {
 
 /// Aktualizuje nazwe i opis grupy.
 pub fn update_group(pool: &DbPool, id: i64, name: &str, description: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "UPDATE user_groups SET name = ?1, description = ?2 WHERE id = ?3",
         rusqlite::params![name, description, id],
     )?;
+    if rows_affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            group_changed_fields(Some(name), Some(description)),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3335,11 +4012,25 @@ pub fn get_group_by_id(pool: &DbPool, id: i64) -> Result<Option<UserGroup>> {
 
 /// Usuwa grupe uzytkownikow (kaskadowo czlonkostwa).
 pub fn delete_group(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
         "DELETE FROM user_groups WHERE id = ?1",
         rusqlite::params![id],
     )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), crate::sync::ledger::FieldValue::I64(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::UserGroup,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -4447,6 +5138,927 @@ pub fn get_trusted_node_public_key(pool: &DbPool, node_id: &str) -> Result<Optio
         )
         .optional()?;
     Ok(result)
+}
+
+// =============================================================================
+// Sync Identity Registry — node/device, user keys i przypisania
+// =============================================================================
+
+fn row_to_sync_node_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncNodeIdentity> {
+    Ok(SyncNodeIdentity {
+        node_id: row.get(0)?,
+        public_key: row.get(1)?,
+        public_key_type: row.get(2)?,
+        display_name: row.get(3)?,
+        node_kind: row.get(4)?,
+        trust_status: row.get(5)?,
+        owner_user_id: row.get(6)?,
+        sync_profile: row.get(7)?,
+        last_seen_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn row_to_user_identity_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserIdentityKey> {
+    Ok(UserIdentityKey {
+        key_id: row.get(0)?,
+        user_id: row.get(1)?,
+        key_type: row.get(2)?,
+        public_key: row.get(3)?,
+        purpose: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        revoked_at: row.get(7)?,
+    })
+}
+
+fn row_to_node_user_assignment(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeUserAssignment> {
+    Ok(NodeUserAssignment {
+        node_id: row.get(0)?,
+        user_id: row.get(1)?,
+        assignment_mode: row.get(2)?,
+        valid_from: row.get(3)?,
+        valid_until: row.get(4)?,
+        created_by: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn row_to_sync_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncPolicy> {
+    let resource_type: String = row.get(3)?;
+    let resource_id: String = row.get(4)?;
+    Ok(SyncPolicy {
+        policy_id: row.get(0)?,
+        org_id: row.get(1)?,
+        addon_id: row.get(2)?,
+        resource_type: (!resource_type.is_empty()).then_some(resource_type),
+        resource_id: (!resource_id.is_empty()).then_some(resource_id),
+        mode: row.get(5)?,
+        authority_node_id: row.get(6)?,
+        retention_days: row.get(7)?,
+        is_enabled: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+/// Rejestruje albo aktualizuje techniczna tozsamosc node/device.
+pub fn upsert_sync_node_identity(
+    pool: &DbPool,
+    node_id: &str,
+    public_key: &str,
+    public_key_type: &str,
+    display_name: &str,
+    node_kind: &str,
+    trust_status: &str,
+    owner_user_id: Option<i64>,
+    sync_profile: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO sync_nodes \
+         (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(node_id) DO UPDATE SET \
+             public_key = excluded.public_key, \
+             public_key_type = excluded.public_key_type, \
+             display_name = excluded.display_name, \
+             node_kind = excluded.node_kind, \
+             trust_status = excluded.trust_status, \
+             owner_user_id = excluded.owner_user_id, \
+             sync_profile = excluded.sync_profile",
+        rusqlite::params![
+            node_id,
+            public_key,
+            public_key_type,
+            display_name,
+            node_kind,
+            trust_status,
+            owner_user_id,
+            sync_profile
+        ],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, crate::services::org::DEFAULT_ORG_ID)?;
+    Ok(())
+}
+
+/// Pobiera techniczna tozsamosc node/device.
+pub fn get_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<Option<SyncNodeIdentity>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
+                owner_user_id, sync_profile, last_seen_at, created_at, updated_at \
+         FROM sync_nodes WHERE node_id = ?1",
+    )?;
+    let result = stmt
+        .query_row(rusqlite::params![node_id], row_to_sync_node_identity)
+        .optional()?;
+    Ok(result)
+}
+
+/// Aktualizuje czas ostatniej aktywnosci node/device.
+pub fn touch_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE sync_nodes \
+         SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE node_id = ?1",
+        rusqlite::params![node_id],
+    )?;
+    Ok(())
+}
+
+/// Dodaje albo odswieza kryptograficzny klucz uzytkownika.
+pub fn upsert_user_identity_key(
+    pool: &DbPool,
+    key_id: &str,
+    user_id: i64,
+    key_type: &str,
+    public_key: &str,
+    purpose: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO user_identity_keys (key_id, user_id, key_type, public_key, purpose, status, revoked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', NULL) \
+         ON CONFLICT(key_id) DO UPDATE SET \
+             user_id = excluded.user_id, \
+             key_type = excluded.key_type, \
+             public_key = excluded.public_key, \
+             purpose = excluded.purpose, \
+             status = 'active', \
+             revoked_at = NULL",
+        rusqlite::params![key_id, user_id, key_type, public_key, purpose],
+    )?;
+    Ok(())
+}
+
+/// Pobiera aktywne klucze kryptograficzne uzytkownika.
+pub fn list_active_user_identity_keys(pool: &DbPool, user_id: i64) -> Result<Vec<UserIdentityKey>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT key_id, user_id, key_type, public_key, purpose, status, created_at, revoked_at \
+         FROM user_identity_keys \
+         WHERE user_id = ?1 AND status = 'active' \
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], row_to_user_identity_key)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Revoke klucza uzytkownika bez usuwania historii.
+pub fn revoke_user_identity_key(pool: &DbPool, key_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE user_identity_keys \
+         SET status = 'revoked', revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE key_id = ?1",
+        rusqlite::params![key_id],
+    )?;
+    Ok(())
+}
+
+/// Przypisuje uzytkownika do node/device.
+pub fn assign_node_to_user(
+    pool: &DbPool,
+    node_id: &str,
+    user_id: i64,
+    assignment_mode: &str,
+    created_by: Option<i64>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO node_user_assignments \
+         (node_id, user_id, assignment_mode, valid_until, created_by) \
+         VALUES (?1, ?2, ?3, NULL, ?4) \
+         ON CONFLICT(node_id, user_id, assignment_mode) DO UPDATE SET \
+             valid_until = NULL, \
+             created_by = excluded.created_by",
+        rusqlite::params![node_id, user_id, assignment_mode, created_by],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, crate::services::org::DEFAULT_ORG_ID)?;
+    Ok(())
+}
+
+/// Konczy aktywne przypisanie uzytkownika do node/device.
+pub fn revoke_node_user_assignment(
+    pool: &DbPool,
+    node_id: &str,
+    user_id: i64,
+    assignment_mode: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE node_user_assignments \
+         SET valid_until = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE node_id = ?1 AND user_id = ?2 AND assignment_mode = ?3 AND valid_until IS NULL",
+        rusqlite::params![node_id, user_id, assignment_mode],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, crate::services::org::DEFAULT_ORG_ID)?;
+    Ok(())
+}
+
+/// Lista aktywnych przypisan danego node/device.
+pub fn list_active_node_user_assignments(
+    pool: &DbPool,
+    node_id: &str,
+) -> Result<Vec<NodeUserAssignment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, user_id, assignment_mode, valid_from, valid_until, created_by, created_at \
+         FROM node_user_assignments \
+         WHERE node_id = ?1 AND valid_until IS NULL \
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![node_id], row_to_node_user_assignment)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Lista node/device aktywnie przypisanych do uzytkownika.
+pub fn list_sync_nodes_for_user(pool: &DbPool, user_id: i64) -> Result<Vec<SyncNodeIdentity>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT n.node_id, n.public_key, n.public_key_type, n.display_name, n.node_kind, \
+                n.trust_status, n.owner_user_id, n.sync_profile, n.last_seen_at, \
+                n.created_at, n.updated_at \
+         FROM sync_nodes n \
+         JOIN node_user_assignments a ON a.node_id = n.node_id \
+         WHERE a.user_id = ?1 AND a.valid_until IS NULL \
+         ORDER BY n.display_name, n.node_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], row_to_sync_node_identity)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+// =============================================================================
+// Sync Permission Engine — decyzje dostepu dla zasobow synchronizowanych
+// =============================================================================
+
+fn row_to_sync_resource_acl(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncResourceAcl> {
+    Ok(SyncResourceAcl {
+        org_id: row.get(0)?,
+        addon_id: row.get(1)?,
+        resource_type: row.get(2)?,
+        resource_id: row.get(3)?,
+        owner_user_id: row.get(4)?,
+        assigned_user_id: row.get(5)?,
+        department_id: row.get(6)?,
+        manager_user_id: row.get(7)?,
+        visibility_scope: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+/// Aktualizuje profil organizacyjny usera uzywany do effective permissions.
+pub fn upsert_sync_user_org_profile(
+    pool: &DbPool,
+    org_id: &str,
+    user_id: i64,
+    department_id: Option<&str>,
+    manager_user_id: Option<i64>,
+    is_department_manager: bool,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO sync_user_org_profiles \
+         (org_id, user_id, department_id, manager_user_id, is_department_manager) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(org_id, user_id) DO UPDATE SET \
+             department_id = excluded.department_id, \
+             manager_user_id = excluded.manager_user_id, \
+             is_department_manager = excluded.is_department_manager",
+        rusqlite::params![
+            org_id,
+            user_id,
+            department_id,
+            manager_user_id,
+            is_department_manager
+        ],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    Ok(())
+}
+
+/// Aktualizuje metadata dostepu dla pojedynczego zasobu.
+pub fn upsert_sync_resource_acl(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    owner_user_id: Option<i64>,
+    assigned_user_id: Option<i64>,
+    department_id: Option<&str>,
+    manager_user_id: Option<i64>,
+    visibility_scope: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO sync_resource_acl \
+         (org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, department_id, manager_user_id, visibility_scope) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(org_id, addon_id, resource_type, resource_id) DO UPDATE SET \
+             owner_user_id = excluded.owner_user_id, \
+             assigned_user_id = excluded.assigned_user_id, \
+             department_id = excluded.department_id, \
+             manager_user_id = excluded.manager_user_id, \
+             visibility_scope = excluded.visibility_scope",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            owner_user_id,
+            assigned_user_id,
+            department_id,
+            manager_user_id,
+            visibility_scope
+        ],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    Ok(())
+}
+
+/// Pobiera metadata dostepu zasobu.
+pub fn get_sync_resource_acl(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncResourceAcl>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, \
+                department_id, manager_user_id, visibility_scope, created_at, updated_at \
+         FROM sync_resource_acl \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+    )?;
+    let acl = stmt
+        .query_row(
+            rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            row_to_sync_resource_acl,
+        )
+        .optional()?;
+    Ok(acl)
+}
+
+/// Przyznaje jawny dostep do zasobu userowi albo node.
+pub fn grant_sync_explicit_share(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+    granted_by: Option<i64>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO sync_explicit_shares \
+         (org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action, granted_by, revoked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL) \
+         ON CONFLICT(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action) DO UPDATE SET \
+             granted_by = excluded.granted_by, \
+             granted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), \
+             revoked_at = NULL",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+            granted_by
+        ],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    Ok(())
+}
+
+/// Cofa jawny dostep do zasobu.
+pub fn revoke_sync_explicit_share(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE sync_explicit_shares \
+         SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+           AND subject_type = ?5 AND subject_id = ?6 AND action = ?7 AND revoked_at IS NULL",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action
+        ],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    Ok(())
+}
+
+/// Sprawdza effective access usera do zasobu.
+pub fn can_user_access_sync_resource(
+    pool: &DbPool,
+    user_id: i64,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+) -> Result<SyncAccessDecision> {
+    let conn = acquire(pool)?;
+    can_user_access_sync_resource_with_conn(
+        &conn,
+        user_id,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        action,
+    )
+}
+
+fn can_user_access_sync_resource_with_conn(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    action: &str,
+) -> Result<SyncAccessDecision> {
+    if is_user_org_admin_with_conn(conn, user_id, org_id)? {
+        return Ok(allow("admin"));
+    }
+
+    if has_explicit_share_with_conn(
+        conn,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        "user",
+        &user_id.to_string(),
+        action,
+    )? {
+        return Ok(allow("explicit_share"));
+    }
+
+    let acl = load_sync_resource_acl_with_conn(conn, org_id, addon_id, resource_type, resource_id)?;
+    let Some(acl) = acl else {
+        return Ok(deny("resource_acl_missing"));
+    };
+
+    if acl.owner_user_id == Some(user_id) {
+        return Ok(allow("owner"));
+    }
+    if acl.assigned_user_id == Some(user_id) {
+        return Ok(allow("assigned"));
+    }
+    if acl.manager_user_id == Some(user_id) {
+        return Ok(allow("manager"));
+    }
+    if acl.visibility_scope == "all" {
+        return Ok(allow("all"));
+    }
+    if acl.visibility_scope == "department"
+        && user_in_department_with_conn(conn, org_id, user_id, acl.department_id.as_deref())?
+    {
+        return Ok(allow("department"));
+    }
+    if acl.visibility_scope == "manager_subtree"
+        && user_manages_subject_with_conn(conn, org_id, user_id, acl.assigned_user_id)?
+    {
+        return Ok(allow("manager_subtree"));
+    }
+
+    Ok(deny("no_matching_rule"))
+}
+
+/// Sprawdza czy node moze dostac zasob w outbox/sync receive.
+pub fn can_node_receive_sync_resource(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<SyncAccessDecision> {
+    let conn = acquire(pool)?;
+    can_node_receive_sync_resource_with_conn(
+        &conn,
+        node_id,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+    )
+}
+
+fn can_node_receive_sync_resource_with_conn(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<SyncAccessDecision> {
+    let node = load_sync_node_identity_with_conn(conn, node_id)?;
+    let Some(node) = node else {
+        return Ok(deny("node_missing"));
+    };
+    if node.trust_status != "trusted" {
+        return Ok(deny("node_not_trusted"));
+    }
+    if node.sync_profile == "authority" {
+        return Ok(allow("authority_node"));
+    }
+    if has_explicit_share_with_conn(
+        conn,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+        "node",
+        node_id,
+        "sync_receive",
+    )? {
+        return Ok(allow("explicit_node_share"));
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT user_id FROM node_user_assignments \
+         WHERE node_id = ?1 AND valid_until IS NULL",
+    )?;
+    let user_ids = stmt
+        .query_map(rusqlite::params![node_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for user_id in user_ids {
+        let decision = can_user_access_sync_resource_with_conn(
+            conn,
+            user_id,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            "sync_receive",
+        )?;
+        if decision.allowed {
+            return Ok(allow(&format!("assigned_user:{}", decision.reason)));
+        }
+    }
+
+    Ok(deny("no_assigned_user_access"))
+}
+
+fn load_sync_resource_acl_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncResourceAcl>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, \
+                department_id, manager_user_id, visibility_scope, created_at, updated_at \
+         FROM sync_resource_acl \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+    )?;
+    Ok(stmt
+        .query_row(
+            rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            row_to_sync_resource_acl,
+        )
+        .optional()?)
+}
+
+fn load_sync_node_identity_with_conn(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+) -> Result<Option<SyncNodeIdentity>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
+                owner_user_id, sync_profile, last_seen_at, created_at, updated_at \
+         FROM sync_nodes WHERE node_id = ?1",
+    )?;
+    Ok(stmt
+        .query_row(rusqlite::params![node_id], row_to_sync_node_identity)
+        .optional()?)
+}
+
+fn is_user_org_admin_with_conn(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+    org_id: &str,
+) -> Result<bool> {
+    let is_admin = conn
+        .query_row(
+            "SELECT is_admin FROM user_accounts WHERE id = ?1 AND is_active = 1",
+            rusqlite::params![user_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if is_admin {
+        return Ok(true);
+    }
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) \
+         FROM org_memberships \
+         WHERE org_id = ?1 AND user_id = ?2 AND role_id = 'role-org-admin'",
+        rusqlite::params![org_id, user_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn has_explicit_share_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_explicit_shares \
+         WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+           AND subject_type = ?5 AND subject_id = ?6 AND action = ?7 AND revoked_at IS NULL",
+        rusqlite::params![
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn user_in_department_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    user_id: i64,
+    department_id: Option<&str>,
+) -> Result<bool> {
+    let Some(department_id) = department_id else {
+        return Ok(false);
+    };
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_user_org_profiles \
+         WHERE org_id = ?1 AND user_id = ?2 AND department_id = ?3",
+        rusqlite::params![org_id, user_id, department_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn user_manages_subject_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    manager_user_id: i64,
+    subject_user_id: Option<i64>,
+) -> Result<bool> {
+    let Some(subject_user_id) = subject_user_id else {
+        return Ok(false);
+    };
+    if subject_user_id == manager_user_id {
+        return Ok(true);
+    }
+    let count: i64 = conn.query_row(
+        "WITH RECURSIVE subtree(user_id) AS ( \
+            SELECT user_id FROM sync_user_org_profiles WHERE org_id = ?1 AND manager_user_id = ?2 \
+            UNION ALL \
+            SELECT p.user_id FROM sync_user_org_profiles p JOIN subtree s ON p.manager_user_id = s.user_id \
+            WHERE p.org_id = ?1 \
+         ) \
+         SELECT COUNT(*) FROM subtree WHERE user_id = ?3",
+        rusqlite::params![org_id, manager_user_id, subject_user_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn allow(reason: &str) -> SyncAccessDecision {
+    SyncAccessDecision {
+        allowed: true,
+        reason: reason.to_string(),
+    }
+}
+
+fn deny(reason: &str) -> SyncAccessDecision {
+    SyncAccessDecision {
+        allowed: false,
+        reason: reason.to_string(),
+    }
+}
+
+// =============================================================================
+// Sync Policy — tryb synchronizacji i selekcja odbiorcow
+// =============================================================================
+
+/// Zapisuje polityke synchronizacji. Brak typu zasobu oznacza caly addon,
+/// a brak ID zasobu oznacza wszystkie zasoby danego typu.
+pub fn upsert_sync_policy(
+    pool: &DbPool,
+    policy_id: &str,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+    mode: &str,
+    authority_node_id: Option<&str>,
+    retention_days: Option<i64>,
+    is_enabled: bool,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let resource_type = resource_type.unwrap_or("");
+    let resource_id = resource_id.unwrap_or("");
+    conn.execute(
+        "INSERT INTO sync_policies \
+         (policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, retention_days, is_enabled) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(org_id, addon_id, resource_type, resource_id) DO UPDATE SET \
+             policy_id = excluded.policy_id, \
+             mode = excluded.mode, \
+             authority_node_id = excluded.authority_node_id, \
+             retention_days = excluded.retention_days, \
+             is_enabled = excluded.is_enabled",
+        rusqlite::params![
+            policy_id,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+            mode,
+            authority_node_id,
+            retention_days,
+            is_enabled
+        ],
+    )?;
+    bump_sync_permission_epoch_with_conn(&conn, org_id)?;
+    Ok(())
+}
+
+/// Pobiera najbardziej szczegolna aktywna polityke dla zasobu.
+pub fn get_effective_sync_policy(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncPolicy>> {
+    let conn = acquire(pool)?;
+    get_effective_sync_policy_with_conn(&conn, org_id, addon_id, resource_type, resource_id)
+}
+
+/// Wyznacza nody, do ktorych wolno wyslac operacje danego zasobu.
+pub fn list_sync_targets_for_resource(
+    pool: &DbPool,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Vec<SyncPolicyTarget>> {
+    let conn = acquire(pool)?;
+    let Some(policy) =
+        get_effective_sync_policy_with_conn(&conn, org_id, addon_id, resource_type, resource_id)?
+    else {
+        return Ok(Vec::new());
+    };
+    if !policy.is_enabled {
+        return Ok(Vec::new());
+    }
+
+    match policy.mode.as_str() {
+        "local_only" | "ephemeral" => Ok(Vec::new()),
+        "authority_readthrough" | "authority_write" => {
+            let Some(node_id) = policy.authority_node_id else {
+                return Ok(Vec::new());
+            };
+            if can_node_receive_sync_resource_with_conn(
+                &conn,
+                &node_id,
+                org_id,
+                addon_id,
+                resource_type,
+                resource_id,
+            )?
+            .allowed
+            {
+                Ok(vec![SyncPolicyTarget {
+                    node_id,
+                    reason: policy.mode,
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        "replicated_by_permission" | "sharded" => list_permission_filtered_sync_targets_with_conn(
+            &conn,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+        ),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn get_effective_sync_policy_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<SyncPolicy>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, \
+                retention_days, is_enabled, created_at, updated_at \
+         FROM sync_policies \
+         WHERE org_id = ?1 \
+           AND addon_id = ?2 \
+           AND is_enabled = 1 \
+           AND (resource_type = ?3 OR resource_type = '') \
+           AND (resource_id = ?4 OR resource_id = '') \
+         ORDER BY \
+           CASE WHEN resource_id = ?4 THEN 2 WHEN resource_id = '' THEN 0 ELSE -1 END DESC, \
+           CASE WHEN resource_type = ?3 THEN 1 WHEN resource_type = '' THEN 0 ELSE -1 END DESC \
+         LIMIT 1",
+    )?;
+    Ok(stmt
+        .query_row(
+            rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            row_to_sync_policy,
+        )
+        .optional()?)
+}
+
+fn list_permission_filtered_sync_targets_with_conn(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Vec<SyncPolicyTarget>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id FROM sync_nodes \
+         WHERE trust_status = 'trusted' \
+           AND sync_profile IN ('standard','limited','authority','storage_only') \
+         ORDER BY node_id",
+    )?;
+    let node_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut targets = Vec::new();
+    for node_id in node_ids {
+        let decision = can_node_receive_sync_resource_with_conn(
+            conn,
+            &node_id,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+        )?;
+        if decision.allowed {
+            targets.push(SyncPolicyTarget {
+                node_id,
+                reason: decision.reason,
+            });
+        }
+    }
+    Ok(targets)
 }
 
 // =============================================================================
@@ -12380,5 +13992,434 @@ mod chunk_c_visibility_consumer_tests {
             revoked_after.is_none(),
             "manifest reinstall reactivates a manifest-revoked row"
         );
+    }
+
+    #[test]
+    fn sync_identity_registry_maps_node_to_user() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('jan', 'hash', 'Jan', 'jan@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+
+        upsert_sync_node_identity(
+            &db,
+            "node-a",
+            "pub-a",
+            "ed25519",
+            "Laptop Jana",
+            "laptop",
+            "trusted",
+            Some(user_id),
+            "standard",
+        )
+        .expect("upsert node");
+        assign_node_to_user(&db, "node-a", user_id, "primary", Some(user_id)).expect("assign node");
+
+        let nodes = list_sync_nodes_for_user(&db, user_id).expect("list nodes");
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "node-a");
+        assert_eq!(nodes[0].owner_user_id, Some(user_id));
+    }
+
+    #[test]
+    fn user_identity_key_revoke_removes_key_from_active_list() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('ewa', 'hash', 'Ewa', 'ewa@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+
+        upsert_user_identity_key(&db, "key-1", user_id, "ed25519", "pub-user", "sync")
+            .expect("insert key");
+        revoke_user_identity_key(&db, "key-1").expect("revoke key");
+
+        let keys = list_active_user_identity_keys(&db, user_id).expect("list keys");
+
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn sync_permission_allows_owner_and_denies_unrelated_user() {
+        let db = make_db();
+        let (owner_id, other_id) = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('owner', 'hash', 'Owner', 'owner@example.com')",
+                [],
+            )
+            .expect("insert owner");
+            let owner_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('other', 'hash', 'Other', 'other@example.com')",
+                [],
+            )
+            .expect("insert other");
+            (owner_id, conn.last_insert_rowid())
+        };
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "person",
+            "person-1",
+            Some(owner_id),
+            None,
+            None,
+            None,
+            "own",
+        )
+        .expect("acl");
+
+        let owner = can_user_access_sync_resource(
+            &db,
+            owner_id,
+            "org-default",
+            "contacts",
+            "person",
+            "person-1",
+            "read",
+        )
+        .expect("owner access");
+        let other = can_user_access_sync_resource(
+            &db,
+            other_id,
+            "org-default",
+            "contacts",
+            "person",
+            "person-1",
+            "read",
+        )
+        .expect("other access");
+
+        assert!(owner.allowed);
+        assert!(!other.allowed);
+    }
+
+    #[test]
+    fn sync_permission_explicit_share_can_be_revoked() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('shared', 'hash', 'Shared', 'shared@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            None,
+            None,
+            None,
+            None,
+            "explicit_share",
+        )
+        .expect("acl");
+        grant_sync_explicit_share(
+            &db,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            "user",
+            &user_id.to_string(),
+            "read",
+            None,
+        )
+        .expect("share");
+        revoke_sync_explicit_share(
+            &db,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            "user",
+            &user_id.to_string(),
+            "read",
+        )
+        .expect("revoke");
+
+        let decision = can_user_access_sync_resource(
+            &db,
+            user_id,
+            "org-default",
+            "contacts",
+            "company",
+            "company-1",
+            "read",
+        )
+        .expect("decision");
+
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn sync_permission_node_receives_resource_for_assigned_user() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('node-user', 'hash', 'Node User', 'node-user@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+        upsert_sync_node_identity(
+            &db,
+            "node-sync",
+            "pub-node",
+            "ed25519",
+            "Phone",
+            "phone",
+            "trusted",
+            Some(user_id),
+            "standard",
+        )
+        .expect("node");
+        assign_node_to_user(&db, "node-sync", user_id, "primary", None).expect("assign");
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "person",
+            "person-2",
+            None,
+            Some(user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("acl");
+
+        let decision = can_node_receive_sync_resource(
+            &db,
+            "node-sync",
+            "org-default",
+            "contacts",
+            "person",
+            "person-2",
+        )
+        .expect("decision");
+
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn sync_permission_authority_node_can_receive_without_user_assignment() {
+        let db = make_db();
+        upsert_sync_node_identity(
+            &db,
+            "node-authority",
+            "pub-node",
+            "ed25519",
+            "Server",
+            "authority",
+            "trusted",
+            None,
+            "authority",
+        )
+        .expect("node");
+
+        let decision = can_node_receive_sync_resource(
+            &db,
+            "node-authority",
+            "org-default",
+            "contacts",
+            "person",
+            "person-3",
+        )
+        .expect("decision");
+
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn sync_policy_local_only_produces_no_targets() {
+        let db = make_db();
+        upsert_sync_policy(
+            &db,
+            "policy-local",
+            "org-default",
+            "contacts",
+            Some("person"),
+            None,
+            "local_only",
+            None,
+            None,
+            true,
+        )
+        .expect("policy");
+
+        let targets =
+            list_sync_targets_for_resource(&db, "org-default", "contacts", "person", "person-1")
+                .expect("targets");
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn sync_policy_replicated_by_permission_returns_allowed_node() {
+        let db = make_db();
+        let user_id = {
+            let conn = db.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO user_accounts (username, password_hash, display_name, email) \
+                 VALUES ('sync-target', 'hash', 'Sync Target', 'sync-target@example.com')",
+                [],
+            )
+            .expect("insert user");
+            conn.last_insert_rowid()
+        };
+        upsert_sync_node_identity(
+            &db,
+            "node-target",
+            "pub-node",
+            "ed25519",
+            "Laptop",
+            "laptop",
+            "trusted",
+            Some(user_id),
+            "standard",
+        )
+        .expect("node");
+        assign_node_to_user(&db, "node-target", user_id, "primary", None).expect("assign");
+        upsert_sync_resource_acl(
+            &db,
+            "org-default",
+            "contacts",
+            "person",
+            "person-4",
+            None,
+            Some(user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("acl");
+        upsert_sync_policy(
+            &db,
+            "policy-repl",
+            "org-default",
+            "contacts",
+            Some("person"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("policy");
+
+        let targets =
+            list_sync_targets_for_resource(&db, "org-default", "contacts", "person", "person-4")
+                .expect("targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, "node-target");
+    }
+
+    #[test]
+    fn sync_policy_resource_override_wins_over_type_policy() {
+        let db = make_db();
+        upsert_sync_policy(
+            &db,
+            "policy-type",
+            "org-default",
+            "contacts",
+            Some("person"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("type policy");
+        upsert_sync_policy(
+            &db,
+            "policy-resource",
+            "org-default",
+            "contacts",
+            Some("person"),
+            Some("person-private"),
+            "local_only",
+            None,
+            None,
+            true,
+        )
+        .expect("resource policy");
+
+        let policy =
+            get_effective_sync_policy(&db, "org-default", "contacts", "person", "person-private")
+                .expect("policy")
+                .expect("effective policy");
+
+        assert_eq!(policy.policy_id, "policy-resource");
+        assert_eq!(policy.mode, "local_only");
+    }
+
+    #[test]
+    fn sync_policy_authority_write_targets_authority_node() {
+        let db = make_db();
+        upsert_sync_node_identity(
+            &db,
+            "node-authority-write",
+            "pub-node",
+            "ed25519",
+            "Authority",
+            "authority",
+            "trusted",
+            None,
+            "authority",
+        )
+        .expect("node");
+        upsert_sync_policy(
+            &db,
+            "policy-authority",
+            "org-default",
+            "contacts",
+            Some("activity"),
+            None,
+            "authority_write",
+            Some("node-authority-write"),
+            None,
+            true,
+        )
+        .expect("policy");
+
+        let targets = list_sync_targets_for_resource(
+            &db,
+            "org-default",
+            "contacts",
+            "activity",
+            "activity-1",
+        )
+        .expect("targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, "node-authority-write");
     }
 }

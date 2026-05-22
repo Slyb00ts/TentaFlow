@@ -34,6 +34,7 @@ pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod recorder;
 pub mod resume_token;
+pub mod role_catalog;
 pub mod state;
 pub mod stream;
 pub mod stream_handlers;
@@ -491,6 +492,16 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "SchedulerJobRunNowResponse"
             }
         },
+        MessageBody::SyncConflictBody(p) => match p {
+            tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",
+            tentaflow_protocol::SyncConflictPayload::ListResponse(_) => "SyncConflictsListResponse",
+            tentaflow_protocol::SyncConflictPayload::ResolveRequest(_) => {
+                "SyncConflictResolveRequest"
+            }
+            tentaflow_protocol::SyncConflictPayload::ResolveResponse(_) => {
+                "SyncConflictResolveResponse"
+            }
+        },
         MessageBody::FlowListRequest => "FlowListRequest",
         MessageBody::FlowListResponse { .. } => "FlowListResponse",
         MessageBody::FlowDetailRequest { .. } => "FlowDetailRequest",
@@ -640,14 +651,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
         MessageBody::AuditEventBody(_) => "AuditEvent",
-        MessageBody::ContainerListRequest => "ContainerListRequest",
-        MessageBody::ContainerListResponse { .. } => "ContainerListResponse",
-        MessageBody::ContainerStartRequest { .. } => "ContainerStartRequest",
-        MessageBody::ContainerStartResponse { .. } => "ContainerStartResponse",
-        MessageBody::ContainerStopRequest { .. } => "ContainerStopRequest",
-        MessageBody::ContainerStopResponse { .. } => "ContainerStopResponse",
-        MessageBody::ContainerLogStreamRequest { .. } => "ContainerLogStreamRequest",
-        MessageBody::ContainerLogChunkBody(_) => "ContainerLogChunk",
+        MessageBody::ContainerBody(p) => match p {
+            tentaflow_protocol::ContainerPayload::ListRequest => "ContainerListRequest",
+            tentaflow_protocol::ContainerPayload::ListResponse { .. } => "ContainerListResponse",
+            tentaflow_protocol::ContainerPayload::StartRequest { .. } => "ContainerStartRequest",
+            tentaflow_protocol::ContainerPayload::StartResponse { .. } => "ContainerStartResponse",
+            tentaflow_protocol::ContainerPayload::StopRequest { .. } => "ContainerStopRequest",
+            tentaflow_protocol::ContainerPayload::StopResponse { .. } => "ContainerStopResponse",
+            tentaflow_protocol::ContainerPayload::LogStreamRequest { .. } => {
+                "ContainerLogStreamRequest"
+            }
+            tentaflow_protocol::ContainerPayload::LogChunkBody(_) => "ContainerLogChunk",
+        },
         MessageBody::VoiceProfileListRequest => "VoiceProfileListRequest",
         MessageBody::VoiceProfileListResponse { .. } => "VoiceProfileListResponse",
         MessageBody::TtsRuleListRequest => "TtsRuleListRequest",
@@ -876,6 +891,37 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonNetworkRulesSetResponseBody(_) => "AddonNetworkRulesSetResponse",
         MessageBody::AddonReloadRequestBody(_) => "AddonReloadRequest",
         MessageBody::AddonReloadResponseBody(_) => "AddonReloadResponse",
+        MessageBody::RoleCatalogBody(p) => match p {
+            tentaflow_protocol::RoleCatalogPayload::ListRequest(_) => "RoleCatalogListRequest",
+            tentaflow_protocol::RoleCatalogPayload::ListResponse { .. } => {
+                "RoleCatalogListResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::GetRequest { .. } => "RoleCatalogGetRequest",
+            tentaflow_protocol::RoleCatalogPayload::GetBySlugRequest { .. } => {
+                "RoleCatalogGetBySlugRequest"
+            }
+            tentaflow_protocol::RoleCatalogPayload::GetResponse { .. } => "RoleCatalogGetResponse",
+            tentaflow_protocol::RoleCatalogPayload::ListLocalesRequest => {
+                "RoleCatalogListLocalesRequest"
+            }
+            tentaflow_protocol::RoleCatalogPayload::ListLocalesResponse { .. } => {
+                "RoleCatalogListLocalesResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::CreateRequest(_) => "RoleCatalogCreateRequest",
+            tentaflow_protocol::RoleCatalogPayload::CreateResponse(_) => {
+                "RoleCatalogCreateResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::UpdateRequest(_) => "RoleCatalogUpdateRequest",
+            tentaflow_protocol::RoleCatalogPayload::UpdateResponse(_) => {
+                "RoleCatalogUpdateResponse"
+            }
+            tentaflow_protocol::RoleCatalogPayload::DeactivateRequest { .. } => {
+                "RoleCatalogDeactivateRequest"
+            }
+            tentaflow_protocol::RoleCatalogPayload::DeactivateResponse { .. } => {
+                "RoleCatalogDeactivateResponse"
+            }
+        },
         MessageBody::Error(_) => "Error",
     }
 }
@@ -998,6 +1044,142 @@ mod tests {
         match resp {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotImplemented),
             _ => panic!("expected error"),
+        }
+    }
+
+    fn sync_test_ctx(role: &str) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0xFF, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                role: Some(role.to_string()),
+            },
+            correlation_id: 1,
+            resume_secret: None,
+            state: state::AppState::for_test(),
+            org_context: None,
+        }
+    }
+
+    fn with_tmp_home<F: FnOnce()>(f: F) {
+        let _guard = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        f();
+        if let Some(p) = prev {
+            std::env::set_var("HOME", p);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    fn sync_conflict_capture(addon_id: &str) -> crate::sync::runtime::SqlWriteCapture {
+        crate::sync::runtime::SqlWriteCapture {
+            capture_id: format!("dispatch-conflict-{addon_id}"),
+            org_id: "org-default".to_string(),
+            addon_id: addon_id.to_string(),
+            table_name: "contacts".to_string(),
+            action: crate::sync::runtime::SqlWriteAction::Insert,
+            resource_type: "contacts".to_string(),
+            resource_id: "1".to_string(),
+            query: "INSERT INTO contacts (id, name) VALUES (?1, ?2)".to_string(),
+            params: vec![
+                serde_json::Value::from(1),
+                serde_json::Value::String("Ewa".to_string()),
+            ],
+            rows_affected: 1,
+            last_insert_id: 1,
+            actor_user_id: Some(1),
+            created_at_ms: crate::sync::runtime::now_ms(),
+        }
+    }
+
+    #[test]
+    fn sync_conflict_list_dispatch_returns_rows_for_admin() {
+        with_tmp_home(|| {
+            let addon_id = "dispatch-conflict-list-test";
+            let operation_id = crate::sync::ledger::OperationId::from_hash([0xA1; 32]);
+            crate::addon::storage_sql_exec::record_sync_conflict(
+                &sync_conflict_capture(addon_id),
+                operation_id,
+                "node-b",
+                &crate::addon::storage_sql_exec::StorageSqlError::SqlConstraint,
+            )
+            .expect("record conflict");
+
+            let ctx = sync_test_ctx("admin");
+            let body = MessageBody::SyncConflictBody(
+                tentaflow_protocol::SyncConflictPayload::ListRequest(
+                    tentaflow_protocol::SyncConflictsListRequest {
+                        org_id: "org-default".to_string(),
+                        addon_id: addon_id.to_string(),
+                        status: "open".to_string(),
+                        limit: 10,
+                    },
+                ),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
+
+            assert!(!is_err);
+            match resp {
+                MessageBody::SyncConflictBody(
+                    tentaflow_protocol::SyncConflictPayload::ListResponse(response),
+                ) => {
+                    assert_eq!(response.conflicts.len(), 1);
+                    assert_eq!(response.conflicts[0].operation_id, operation_id.to_hex());
+                }
+                _ => panic!("expected sync conflict list response"),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_list_dispatch_rejects_non_admin() {
+        let ctx = sync_test_ctx("user");
+        let body =
+            MessageBody::SyncConflictBody(tentaflow_protocol::SyncConflictPayload::ListRequest(
+                tentaflow_protocol::SyncConflictsListRequest {
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    status: "open".to_string(),
+                    limit: 10,
+                },
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected auth error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_conflict_resolve_dispatch_rejects_invalid_operation_id() {
+        let ctx = sync_test_ctx("admin");
+        let body =
+            MessageBody::SyncConflictBody(tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+                tentaflow_protocol::SyncConflictResolveRequest {
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    operation_id: "not-hex".to_string(),
+                    resolution: tentaflow_protocol::SyncConflictResolution::AcceptRemote,
+                },
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::BadRequest),
+            _ => panic!("expected bad request"),
         }
     }
 

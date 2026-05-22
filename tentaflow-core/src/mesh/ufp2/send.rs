@@ -128,7 +128,10 @@ mod tests {
             tentaflow_protocol::mesh::MESH_MSG_NODE_INFO
         ));
         assert!(!is_migrated_to_ufp2_discriminator(
-            tentaflow_protocol::mesh::MESH_MSG_COMMAND
+            tentaflow_protocol::mesh::MESH_MSG_HELLO
+        ));
+        assert!(!is_migrated_to_ufp2_discriminator(
+            tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH
         ));
     }
 

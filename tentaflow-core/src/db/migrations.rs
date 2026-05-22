@@ -202,6 +202,28 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             MigrationStep::Rust(backfill_admin_org_memberships),
         ),
         (39, "scheduled_jobs", MigrationStep::Sql(SCHEDULED_JOBS)),
+        (
+            40,
+            "platform_locales",
+            MigrationStep::Sql(PLATFORM_LOCALES_SCHEMA),
+        ),
+        (41, "role_catalog", MigrationStep::Sql(ROLE_CATALOG_SCHEMA)),
+        (
+            42,
+            "sync_identity_registry",
+            MigrationStep::Sql(SYNC_IDENTITY_REGISTRY),
+        ),
+        (
+            43,
+            "sync_permission_engine",
+            MigrationStep::Sql(SYNC_PERMISSION_ENGINE),
+        ),
+        (44, "sync_policy", MigrationStep::Sql(SYNC_POLICY)),
+        (
+            45,
+            "core_sync_captures",
+            MigrationStep::Sql(CORE_SYNC_CAPTURES),
+        ),
     ]
 }
 
@@ -394,6 +416,239 @@ CREATE TABLE IF NOT EXISTS gate_check_cache (
     PRIMARY KEY (claim_id, ctx_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_gate_cache_expires ON gate_check_cache(expires_at);
+"#;
+
+// v42 — Identity Registry dla Sync Ledger. `sync_nodes` opisuje techniczna
+// tozsamosc node/device, `user_identity_keys` przechowuje kryptograficzne
+// klucze uzytkownika, a `node_user_assignments` mapuje kto moze uzywac danego
+// noda. `trusted_nodes` zostaje aktywnym store mesh trust; nowa tabela dostaje
+// backfill jako warstwa administracyjna pod permissions/sync policy.
+const SYNC_IDENTITY_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_nodes (
+    node_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    public_key_type TEXT NOT NULL DEFAULT 'ed25519'
+        CHECK(public_key_type IN ('ed25519','secp256k1')),
+    display_name TEXT NOT NULL DEFAULT '',
+    node_kind TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(node_kind IN ('unknown','phone','tablet','laptop','desktop','server','shared','authority')),
+    trust_status TEXT NOT NULL DEFAULT 'untrusted'
+        CHECK(trust_status IN ('untrusted','pending','trusted','revoked')),
+    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    sync_profile TEXT NOT NULL DEFAULT 'standard'
+        CHECK(sync_profile IN ('standard','limited','authority','storage_only','ephemeral')),
+    last_seen_at TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_owner ON sync_nodes(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_trust ON sync_nodes(trust_status);
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_kind ON sync_nodes(node_kind);
+
+CREATE TRIGGER IF NOT EXISTS sync_nodes_updated_at
+AFTER UPDATE ON sync_nodes
+FOR EACH ROW
+BEGIN
+    UPDATE sync_nodes
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE node_id = NEW.node_id;
+END;
+
+CREATE TABLE IF NOT EXISTS user_identity_keys (
+    key_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    key_type TEXT NOT NULL CHECK(key_type IN ('ed25519','secp256k1')),
+    public_key TEXT NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'sync'
+        CHECK(purpose IN ('auth','sync','admin','recovery')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','revoked')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    revoked_at TEXT NULL,
+    UNIQUE(user_id, key_type, public_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_identity_keys_user ON user_identity_keys(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_user_identity_keys_public ON user_identity_keys(key_type, public_key);
+
+CREATE TABLE IF NOT EXISTS node_user_assignments (
+    node_id TEXT NOT NULL REFERENCES sync_nodes(node_id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    assignment_mode TEXT NOT NULL
+        CHECK(assignment_mode IN ('primary','allowed','shared_session','authority_operator')),
+    valid_from TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    valid_until TEXT NULL,
+    created_by INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY(node_id, user_id, assignment_mode)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_user_assignments_user ON node_user_assignments(user_id, valid_until);
+CREATE INDEX IF NOT EXISTS idx_node_user_assignments_node ON node_user_assignments(node_id, valid_until);
+
+INSERT OR IGNORE INTO sync_nodes (node_id, public_key, display_name, trust_status, created_at, updated_at)
+SELECT node_id,
+       public_key,
+       COALESCE(NULLIF(hostname, ''), node_id),
+       CASE WHEN is_active = 1 THEN 'trusted' ELSE 'untrusted' END,
+       approved_at,
+       approved_at
+FROM trusted_nodes;
+"#;
+
+// v43 — fundament Permission Engine dla Sync Ledger. Tabele trzymaja
+// minimalny, domenowo-neutralny opis zasobu i relacje dostepu, na ktorych
+// pozniej opieraja sie polityki per addon oraz filtr outbox.
+const SYNC_PERMISSION_ENGINE: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_user_org_profiles (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    department_id TEXT NULL,
+    manager_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    is_department_manager INTEGER NOT NULL DEFAULT 0 CHECK(is_department_manager IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY(org_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_user_org_profiles_department
+    ON sync_user_org_profiles(org_id, department_id);
+CREATE INDEX IF NOT EXISTS idx_sync_user_org_profiles_manager
+    ON sync_user_org_profiles(org_id, manager_user_id);
+
+CREATE TRIGGER IF NOT EXISTS sync_user_org_profiles_updated_at
+AFTER UPDATE ON sync_user_org_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE sync_user_org_profiles
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE org_id = NEW.org_id AND user_id = NEW.user_id;
+END;
+
+CREATE TABLE IF NOT EXISTS sync_resource_acl (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    assigned_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    department_id TEXT NULL,
+    manager_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    visibility_scope TEXT NOT NULL DEFAULT 'assigned'
+        CHECK(visibility_scope IN ('private','own','assigned','department','manager_subtree','explicit_share','all')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY(org_id, addon_id, resource_type, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_owner
+    ON sync_resource_acl(org_id, owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_assigned
+    ON sync_resource_acl(org_id, assigned_user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_department
+    ON sync_resource_acl(org_id, department_id);
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_manager
+    ON sync_resource_acl(org_id, manager_user_id);
+
+CREATE TRIGGER IF NOT EXISTS sync_resource_acl_updated_at
+AFTER UPDATE ON sync_resource_acl
+FOR EACH ROW
+BEGIN
+    UPDATE sync_resource_acl
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE org_id = NEW.org_id
+      AND addon_id = NEW.addon_id
+      AND resource_type = NEW.resource_type
+      AND resource_id = NEW.resource_id;
+END;
+
+CREATE TABLE IF NOT EXISTS sync_explicit_shares (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('user','node')),
+    subject_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('read','write','sync_receive','admin')),
+    granted_by INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    granted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    revoked_at TEXT NULL,
+    PRIMARY KEY(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_explicit_shares_subject
+    ON sync_explicit_shares(org_id, subject_type, subject_id, action, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_sync_explicit_shares_resource
+    ON sync_explicit_shares(org_id, addon_id, resource_type, resource_id, revoked_at);
+"#;
+
+// v44 — Sync Policy. Polityka jest konfigurowana przez TentaFlow, nie przez
+// addon. Najbardziej szczegolny wpis wygrywa: resource > resource_type > addon.
+const SYNC_POLICY: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_policies (
+    policy_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL DEFAULT '',
+    resource_id TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL
+        CHECK(mode IN ('local_only','replicated_by_permission','authority_readthrough','authority_write','sharded','ephemeral')),
+    authority_node_id TEXT NULL REFERENCES sync_nodes(node_id) ON DELETE SET NULL,
+    retention_days INTEGER NULL CHECK(retention_days IS NULL OR retention_days >= 0),
+    is_enabled INTEGER NOT NULL DEFAULT 1 CHECK(is_enabled IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK (
+        (mode IN ('authority_readthrough','authority_write') AND authority_node_id IS NOT NULL)
+        OR (mode NOT IN ('authority_readthrough','authority_write'))
+    ),
+    CHECK (
+        (resource_id = '')
+        OR (resource_type <> '')
+    ),
+    UNIQUE(org_id, addon_id, resource_type, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_policies_lookup
+    ON sync_policies(org_id, addon_id, resource_type, resource_id, is_enabled);
+CREATE INDEX IF NOT EXISTS idx_sync_policies_authority
+    ON sync_policies(authority_node_id, is_enabled);
+
+CREATE TRIGGER IF NOT EXISTS sync_policies_updated_at
+AFTER UPDATE ON sync_policies
+FOR EACH ROW
+BEGIN
+    UPDATE sync_policies
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE policy_id = NEW.policy_id;
+END;
+"#;
+
+const CORE_SYNC_CAPTURES: &str = r#"
+CREATE TABLE IF NOT EXISTS __tentaflow_core_sync_captures (
+    capture_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    table_name TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    primary_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
+    changed_fields_blob BLOB NOT NULL,
+    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+    operation_id TEXT NULL,
+    error_message TEXT NULL,
+    created_at_ms INTEGER NOT NULL,
+    ledgered_at_ms INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_core_sync_captures_status
+    ON __tentaflow_core_sync_captures(status, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_core_sync_captures_resource
+    ON __tentaflow_core_sync_captures(org_id, resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_core_sync_captures_operation
+    ON __tentaflow_core_sync_captures(operation_id);
 "#;
 
 // F2 P2.a — formalise the legal value set for `model_aliases.strategy`.
@@ -2332,4 +2587,160 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job
     ON scheduled_runs(job_id, scheduled_for DESC);
 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status
     ON scheduled_runs(status);
+"#;
+
+// v40 — `platform_locales`: katalog jezykow interfejsu per organizacja.
+// Tabela trzyma kody ISO 639-1 dostepne dla danej organizacji oraz wskazuje
+// jezyk domyslny. Dane sluza warstwie aplikacyjnej do walidacji kompletnosci
+// tlumaczen w `role_catalog.name_translations` i pozniej w innych tabelach
+// platformy (stanowiska, etykiety addonow). SQLite nie wymusza obecnosci
+// kluczy JSON dla wszystkich locale — kontrolka jest po stronie Rust
+// (services/role_catalog), tu seedujemy startowy zestaw pl + en.
+//
+// Czesciowy unikalny indeks `idx_platform_locales_one_default_per_org`
+// gwarantuje ze w danej organizacji jest dokladnie jeden jezyk z
+// `is_default = 1` — bez tego UI mialby ambiwalentny fallback.
+const PLATFORM_LOCALES_SCHEMA: &str = r#"
+CREATE TABLE platform_locales (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+  code          TEXT NOT NULL,
+  display_name  TEXT NOT NULL,
+  is_default    INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+  is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  UNIQUE (org_id, code)
+);
+
+CREATE INDEX idx_platform_locales_org ON platform_locales(org_id);
+CREATE UNIQUE INDEX idx_platform_locales_one_default_per_org
+  ON platform_locales(org_id) WHERE is_default = 1;
+
+INSERT INTO platform_locales (id, org_id, code, display_name, is_default, is_active)
+VALUES
+  (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+   'org-default', 'pl', 'Polski', 1, 1),
+  (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+   'org-default', 'en', 'English', 0, 1);
+"#;
+
+// v41 — `role_catalog`: globalny, administrowalny katalog rol funkcjonalnych
+// w organizacji. Rola opisuje *funkcje* osoby (np. handlowiec, PM techniczny,
+// architekt) niezaleznie od stanowiska w drzewie organizacyjnym. Stanowiska
+// i tabele typu `responsible_persons` w CRM bedaca referencja do wpisu z tego
+// katalogu.
+//
+// `name_translations` i `description_translations` trzymane jako JSON
+// (`{"pl":"...","en":"..."}`) — SQLite nie ma JSONB, walidujemy `json_valid`,
+// pelna walidacja kompletnosci kluczy wzgledem `platform_locales` zyje w
+// `services/role_catalog/repo.rs`. Seed zapewnia komplet pl + en dla wszystkich
+// 14 rol z dokumentu `00-platform-roles-catalog.md`.
+//
+// `default_visibility_scope` dziedziczy sie do reguly P2 (permissions) jako
+// startowa propozycja — admin moze zmienic w UI bez modyfikacji katalogu.
+// `is_manager` jest uzywane przez O1 do layoutu drzewa stanowisk; nie wplywa
+// bezposrednio na uprawnienia (te zyja w P2 jako reguly `flag:is_manager`).
+const ROLE_CATALOG_SCHEMA: &str = r#"
+CREATE TABLE role_catalog (
+  id                          TEXT PRIMARY KEY,
+  org_id                      TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+  slug                        TEXT NOT NULL CHECK (slug GLOB '[a-z][a-z0-9_]*' AND length(slug) <= 50),
+  kind                        TEXT NOT NULL CHECK (kind IN ('sales','technical','management','external','other')),
+  name_translations           TEXT NOT NULL DEFAULT '{}',
+  description_translations    TEXT NOT NULL DEFAULT '{}',
+  icon                        TEXT,
+  color_hint                  TEXT,
+  is_manager                  INTEGER NOT NULL DEFAULT 0 CHECK (is_manager IN (0,1)),
+  default_visibility_scope    TEXT NOT NULL DEFAULT 'assigned'
+    CHECK (default_visibility_scope IN ('assigned','own','section','department','all')),
+  is_active                   INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+  created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  updated_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  created_by                  TEXT,
+  UNIQUE (org_id, slug),
+  CHECK (json_valid(name_translations)),
+  CHECK (json_valid(description_translations))
+);
+
+CREATE INDEX idx_role_catalog_org_active ON role_catalog(org_id, is_active);
+CREATE INDEX idx_role_catalog_org_kind   ON role_catalog(org_id, kind);
+
+CREATE TRIGGER role_catalog_updated_at
+AFTER UPDATE ON role_catalog
+FOR EACH ROW
+BEGIN
+  UPDATE role_catalog SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = NEW.id;
+END;
+
+INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description_translations, icon, is_manager, default_visibility_scope) VALUES
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','handlowiec_l1','sales',
+ json_object('pl','Handlowiec L1','en','Sales Rep L1'),
+ json_object('pl','Junior — podstawowa rola sprzedazowa, prowadzi wlasne dealy','en','Junior — entry-level sales role, owns their own deals'),
+ 'i-briefcase', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','handlowiec_l2','sales',
+ json_object('pl','Handlowiec L2','en','Sales Rep L2'),
+ json_object('pl','Mid — samodzielnie prowadzi dealy oraz wspiera juniorow','en','Mid-level — runs deals independently and supports juniors'),
+ 'i-briefcase', 0, 'own'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','sales_lead','sales',
+ json_object('pl','Lider sprzedazy','en','Sales Lead'),
+ json_object('pl','Kierownik sekcji sprzedazowej, prowadzi zespol handlowcow','en','Manages a sales section and a team of sales reps'),
+ 'i-users', 1, 'section'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','pm_technical','technical',
+ json_object('pl','PM techniczny','en','Technical PM'),
+ json_object('pl','Project Manager po stronie technicznej dealu/projektu','en','Project Manager on the technical side of a deal or project'),
+ 'i-clipboard', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','architect_senior','technical',
+ json_object('pl','Architekt senior','en','Senior Architect'),
+ json_object('pl','Architekt rozwiazan, odpowiada za design techniczny','en','Solutions architect responsible for technical design'),
+ 'i-cube', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','consultant_technical','technical',
+ json_object('pl','Konsultant techniczny','en','Technical Consultant'),
+ json_object('pl','Konsultant doradzajacy klientowi w obszarze technicznym','en','Consultant advising the client on technical matters'),
+ 'i-headset', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','developer','technical',
+ json_object('pl','Programista','en','Developer'),
+ json_object('pl','Programista realizujacy implementacje na projekcie','en','Developer implementing project work'),
+ 'i-code', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','qa','technical',
+ json_object('pl','Tester QA','en','QA Engineer'),
+ json_object('pl','Odpowiada za testy i jakosc dostarczanych rozwiazan','en','Responsible for testing and quality of delivered solutions'),
+ 'i-bug', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','section_director','management',
+ json_object('pl','Dyrektor sekcji','en','Section Director'),
+ json_object('pl','Dyrektor odpowiedzialny za sekcje organizacyjna','en','Director responsible for an organizational section'),
+ 'i-building', 1, 'section'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','sales_director','management',
+ json_object('pl','Dyrektor sprzedazy','en','Sales Director'),
+ json_object('pl','Dyrektor pionu sprzedazy, nadzoruje wiele sekcji','en','Sales department director, oversees multiple sections'),
+ 'i-chart', 1, 'department'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','ceo','management',
+ json_object('pl','Prezes','en','CEO'),
+ json_object('pl','Prezes zarzadu, najwyzszy poziom decyzyjny','en','Chief Executive Officer, top decision-making level'),
+ 'i-crown', 1, 'all'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','decision_maker','external',
+ json_object('pl','Decydent klienta','en','Client Decision Maker'),
+ json_object('pl','Osoba po stronie klienta podejmujaca decyzje zakupowe','en','Person on the client side making purchasing decisions'),
+ 'i-user-check', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','influencer','external',
+ json_object('pl','Influencer po stronie klienta','en','Client Influencer'),
+ json_object('pl','Osoba wplywajaca na decyzje klienta, bez bezposredniej decyzyjnosci','en','Person influencing client decisions without direct authority'),
+ 'i-user', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','power_user_sponsor','external',
+ json_object('pl','Sponsor wewnetrzny u klienta','en','Internal Sponsor at Client'),
+ json_object('pl','Kluczowy uzytkownik i sponsor wdrozenia po stronie klienta','en','Key user and rollout sponsor on the client side'),
+ 'i-user-cog', 0, 'assigned');
 "#;

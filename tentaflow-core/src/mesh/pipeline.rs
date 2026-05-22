@@ -615,7 +615,7 @@ async fn handle_peer_connected(
         };
         if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&pull) {
             if let Err(e) = qm_events
-                .send_to_peer(
+                .send_ufp2_to_peer(
                     &node_id,
                     tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET,
                     &bytes,
@@ -1940,7 +1940,7 @@ fn spawn_quic_event_handler(
                             }
                         };
                         if let Err(e) = qm
-                            .send_to_peer(
+                            .send_ufp2_to_peer(
                                 &peer,
                                 tentaflow_protocol::mesh::MESH_MSG_SERVICES_GET_RESPONSE,
                                 &bytes,
@@ -2521,7 +2521,7 @@ fn spawn_heartbeat_sender(
                                     };
                                 if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                                     let _ = quic_mesh
-                                        .broadcast_to_trusted(
+                                        .broadcast_ufp2_to_trusted(
                                             tentaflow_protocol::mesh::MESH_MSG_SERVICES_ANNOUNCE,
                                             &bytes,
                                             None,

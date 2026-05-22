@@ -37,7 +37,10 @@ impl std::fmt::Debug for SubscriptionHandle {
         f.debug_struct("SubscriptionHandle")
             .field("stream_id", &self.stream_id)
             .field("mime_type", &self.mime_type)
-            .field("init_segment_len", &self.init_segment.as_ref().map(|b| b.len()))
+            .field(
+                "init_segment_len",
+                &self.init_segment.as_ref().map(|b| b.len()),
+            )
             .finish()
     }
 }

@@ -11,6 +11,7 @@
 // backfills can target it.
 
 use rusqlite::{params, OptionalExtension};
+use std::collections::BTreeMap;
 
 use super::error::{OrgError, Result};
 use super::{Organization, Role};
@@ -35,6 +36,92 @@ fn now_utc() -> String {
     let (h, m, s) = (rem / 3600, (rem / 60) % 60, rem % 60);
     let (y, mo, d) = days_to_ymd(days as i64);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
+}
+
+fn field_string(value: &str) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::String(value.to_string())
+}
+
+fn field_optional_string(value: Option<&str>) -> crate::sync::ledger::FieldValue {
+    value
+        .map(|v| crate::sync::ledger::FieldValue::String(v.to_string()))
+        .unwrap_or(crate::sync::ledger::FieldValue::Null)
+}
+
+fn organization_changed_fields(
+    name: Option<&str>,
+    slug: Option<&str>,
+    contact_email: Option<Option<&str>>,
+    dpo_contact: Option<Option<&str>>,
+    retention_policy_json: Option<Option<&str>>,
+    status: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    if let Some(value) = name {
+        fields.insert("name".to_string(), field_string(value));
+    }
+    if let Some(value) = slug {
+        fields.insert("slug".to_string(), field_string(value));
+    }
+    if let Some(value) = contact_email {
+        fields.insert("contact_email".to_string(), field_optional_string(value));
+    }
+    if let Some(value) = dpo_contact {
+        fields.insert("dpo_contact".to_string(), field_optional_string(value));
+    }
+    if let Some(value) = retention_policy_json {
+        fields.insert(
+            "retention_policy_json".to_string(),
+            field_optional_string(value),
+        );
+    }
+    if let Some(value) = status {
+        fields.insert("status".to_string(), field_string(value));
+    }
+    fields
+}
+
+fn org_membership_resource_id(org_id: &str, user_id: &str) -> String {
+    format!("{}:{}", org_id, user_id)
+}
+
+fn org_membership_changed_fields(
+    org_id: &str,
+    user_id: &str,
+    role_id: Option<&str>,
+    granted_by: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
+    if let Some(value) = role_id {
+        fields.insert("role_id".to_string(), field_string(value));
+    }
+    if let Some(value) = granted_by {
+        fields.insert("granted_by".to_string(), field_string(value));
+    }
+    fields
+}
+
+fn record_core_capture_tx(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
+    kind: crate::sync::core_registry::CoreSyncResourceKind,
+    resource_id: impl Into<String>,
+    action: crate::sync::runtime::SqlWriteAction,
+    changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
+    actor_user_id: Option<i64>,
+) -> Result<()> {
+    let capture = crate::sync::core_capture::CoreWriteCapture::new(
+        kind,
+        org_id,
+        resource_id,
+        action,
+        changed_fields,
+        actor_user_id,
+    );
+    crate::sync::core_capture::record_core_write_capture(tx, &capture).map_err(map_db)?;
+    Ok(())
 }
 
 // Civil-from-days (Howard Hinnant). Computes (year, month, day) from days
@@ -63,11 +150,12 @@ pub fn create_organization(
     retention_policy_json: Option<&str>,
     _created_by_user_id: Option<i64>,
 ) -> Result<Organization> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let tx = conn.transaction().map_err(map_db)?;
     let org_id = uuid::Uuid::new_v4().to_string();
     let created_at = now_utc();
 
-    let res = conn.execute(
+    let res = tx.execute(
         "INSERT INTO organizations (org_id, name, slug, contact_email, dpo_contact, \
             retention_policy_json, status, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
@@ -82,16 +170,35 @@ pub fn create_organization(
         ],
     );
     match res {
-        Ok(_) => Ok(Organization {
-            org_id,
-            name: name.to_string(),
-            slug: slug.to_string(),
-            contact_email: contact_email.map(String::from),
-            dpo_contact: dpo_contact.map(String::from),
-            retention_policy_json: retention_policy_json.map(String::from),
-            status: "active".to_string(),
-            created_at,
-        }),
+        Ok(_) => {
+            record_core_capture_tx(
+                &tx,
+                &org_id,
+                crate::sync::core_registry::CoreSyncResourceKind::Organization,
+                org_id.clone(),
+                crate::sync::runtime::SqlWriteAction::Insert,
+                organization_changed_fields(
+                    Some(name),
+                    Some(slug),
+                    Some(contact_email),
+                    Some(dpo_contact),
+                    Some(retention_policy_json),
+                    Some("active"),
+                ),
+                _created_by_user_id,
+            )?;
+            tx.commit().map_err(map_db)?;
+            Ok(Organization {
+                org_id,
+                name: name.to_string(),
+                slug: slug.to_string(),
+                contact_email: contact_email.map(String::from),
+                dpo_contact: dpo_contact.map(String::from),
+                retention_policy_json: retention_policy_json.map(String::from),
+                status: "active".to_string(),
+                created_at,
+            })
+        }
         Err(rusqlite::Error::SqliteFailure(ref err, ref msg))
             if err.code == rusqlite::ErrorCode::ConstraintViolation
                 && msg
@@ -171,7 +278,8 @@ pub fn list_organizations(pool: &DbPool, status_filter: Option<&str>) -> Result<
 }
 
 pub fn update_organization(pool: &DbPool, org_id: &str, patch: &OrgPatch) -> Result<bool> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let tx = conn.transaction().map_err(map_db)?;
 
     let mut sets: Vec<String> = Vec::new();
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -199,7 +307,7 @@ pub fn update_organization(pool: &DbPool, org_id: &str, patch: &OrgPatch) -> Res
     if sets.is_empty() {
         // Nothing to update — verify the row exists so callers can distinguish
         // "not found" from "no-op".
-        let exists: Option<i64> = conn
+        let exists: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM organizations WHERE org_id = ?1",
                 params![org_id],
@@ -220,20 +328,52 @@ pub fn update_organization(pool: &DbPool, org_id: &str, patch: &OrgPatch) -> Res
         .iter()
         .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
         .collect();
-    let n = conn
+    let n = tx
         .execute(&sql, rusqlite::params_from_iter(params_dyn.iter().copied()))
         .map_err(map_db)?;
+    if n > 0 {
+        record_core_capture_tx(
+            &tx,
+            org_id,
+            crate::sync::core_registry::CoreSyncResourceKind::Organization,
+            org_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            organization_changed_fields(
+                patch.name.as_deref(),
+                None,
+                patch.contact_email.as_ref().map(|v| v.as_deref()),
+                patch.dpo_contact.as_ref().map(|v| v.as_deref()),
+                patch.retention_policy_json.as_ref().map(|v| v.as_deref()),
+                patch.status.as_deref(),
+            ),
+            None,
+        )?;
+    }
+    tx.commit().map_err(map_db)?;
     Ok(n > 0)
 }
 
 pub fn delete_organization(pool: &DbPool, org_id: &str) -> Result<bool> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
-    let n = conn
+    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let tx = conn.transaction().map_err(map_db)?;
+    let n = tx
         .execute(
             "UPDATE organizations SET status = 'deleted' WHERE org_id = ?1 AND status != 'deleted'",
             params![org_id],
         )
         .map_err(map_db)?;
+    if n > 0 {
+        record_core_capture_tx(
+            &tx,
+            org_id,
+            crate::sync::core_registry::CoreSyncResourceKind::Organization,
+            org_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            organization_changed_fields(None, None, None, None, None, Some("deleted")),
+            None,
+        )?;
+    }
+    tx.commit().map_err(map_db)?;
     drop(conn);
     if n > 0 {
         // Org deletion implicitly revokes every per-org gate decision; the
@@ -252,10 +392,11 @@ pub fn add_membership(
     role_id: &str,
     granted_by: &str,
 ) -> Result<bool> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let tx = conn.transaction().map_err(map_db)?;
     // Validate the foreign references before INSERT so we can surface
     // structured errors instead of bare FK constraint failures.
-    let org_exists: Option<i64> = conn
+    let org_exists: Option<i64> = tx
         .query_row(
             "SELECT 1 FROM organizations WHERE org_id = ?1",
             params![org_id],
@@ -266,7 +407,7 @@ pub fn add_membership(
     if org_exists.is_none() {
         return Err(OrgError::NotFound(org_id.to_string()));
     }
-    let role_exists: Option<i64> = conn
+    let role_exists: Option<i64> = tx
         .query_row(
             "SELECT 1 FROM roles WHERE role_id = ?1",
             params![role_id],
@@ -279,38 +420,69 @@ pub fn add_membership(
     }
 
     let granted_at = now_utc();
-    let n = conn
+    let n = tx
         .execute(
             "INSERT OR IGNORE INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![org_id, user_id, role_id, granted_at, granted_by],
         )
         .map_err(map_db)?;
+    if n > 0 {
+        record_core_capture_tx(
+            &tx,
+            org_id,
+            crate::sync::core_registry::CoreSyncResourceKind::OrgMembership,
+            org_membership_resource_id(org_id, user_id),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            org_membership_changed_fields(org_id, user_id, Some(role_id), Some(granted_by)),
+            None,
+        )?;
+    }
+    tx.commit().map_err(map_db)?;
     drop(conn);
-    // Drop the DB guard before touching the RBAC cache so a future cache
-    // implementation that re-reads the DB cannot deadlock on the same pool.
-    crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
-    // Membership rebinds can flip gate decisions (a role's permission set
-    // implicitly affects gate eligibility). Flush the gate-check cache
-    // wholesale — keyed by ctx_hash, no reverse index by user/org exists.
-    crate::services::policy::GateCheckCache::global().invalidate_all();
+    if n > 0 {
+        crate::db::repository::bump_sync_permission_epoch(pool, org_id).map_err(map_db)?;
+        // Drop the DB guard before touching the RBAC cache so a future cache
+        // implementation that re-reads the DB cannot deadlock on the same pool.
+        crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
+        // Membership rebinds can flip gate decisions (a role's permission set
+        // implicitly affects gate eligibility). Flush the gate-check cache
+        // wholesale — keyed by ctx_hash, no reverse index by user/org exists.
+        crate::services::policy::GateCheckCache::global().invalidate_all();
+    }
     Ok(n > 0)
 }
 
 pub fn remove_membership(pool: &DbPool, org_id: &str, user_id: &str) -> Result<bool> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
-    let n = conn
+    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let tx = conn.transaction().map_err(map_db)?;
+    let n = tx
         .execute(
             "DELETE FROM org_memberships WHERE org_id = ?1 AND user_id = ?2",
             params![org_id, user_id],
         )
         .map_err(map_db)?;
+    if n > 0 {
+        record_core_capture_tx(
+            &tx,
+            org_id,
+            crate::sync::core_registry::CoreSyncResourceKind::OrgMembership,
+            org_membership_resource_id(org_id, user_id),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            org_membership_changed_fields(org_id, user_id, None, None),
+            None,
+        )?;
+    }
+    tx.commit().map_err(map_db)?;
     drop(conn);
-    crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
-    // Membership rebinds can flip gate decisions (a role's permission set
-    // implicitly affects gate eligibility). Flush the gate-check cache
-    // wholesale — keyed by ctx_hash, no reverse index by user/org exists.
-    crate::services::policy::GateCheckCache::global().invalidate_all();
+    if n > 0 {
+        crate::db::repository::bump_sync_permission_epoch(pool, org_id).map_err(map_db)?;
+        crate::services::rbac::PermissionMatrix::global().invalidate(user_id, org_id);
+        // Membership rebinds can flip gate decisions (a role's permission set
+        // implicitly affects gate eligibility). Flush the gate-check cache
+        // wholesale — keyed by ctx_hash, no reverse index by user/org exists.
+        crate::services::policy::GateCheckCache::global().invalidate_all();
+    }
     Ok(n > 0)
 }
 
@@ -475,6 +647,9 @@ pub struct OrgPatch {
 mod tests {
     use super::*;
     use crate::db::DbPool;
+    use crate::sync::core_capture::load_core_write_capture;
+    use crate::sync::ledger::FieldValue;
+    use crate::sync::runtime::SqlWriteAction;
     use tempfile::TempDir;
 
     fn open_pool() -> (TempDir, DbPool) {
@@ -482,6 +657,18 @@ mod tests {
         let path = dir.path().join("org_test.db");
         let pool = crate::db::init(&path).expect("init DB");
         (dir, pool)
+    }
+
+    fn capture_id_for_resource(pool: &DbPool, resource_type: &str, resource_id: &str) -> String {
+        let conn = pool.lock().expect("lock");
+        conn.query_row(
+            "SELECT capture_id FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 \
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![resource_type, resource_id],
+            |row| row.get(0),
+        )
+        .expect("capture id")
     }
 
     #[test]
@@ -587,6 +774,81 @@ mod tests {
         assert!(add_membership(&pool, &org.org_id, "user-1", &viewer.role_id, "admin").unwrap());
         // Second call is a no-op (INSERT OR IGNORE returns 0 affected).
         assert!(!add_membership(&pool, &org.org_id, "user-1", &viewer.role_id, "admin").unwrap());
+    }
+
+    #[test]
+    fn create_organization_records_core_capture() {
+        let (_d, pool) = open_pool();
+        let actor_id = crate::db::repository::create_user_account(
+            &pool,
+            "org-actor",
+            "hash",
+            "Org Actor",
+            "org-actor@example.com",
+        )
+        .unwrap();
+        let org = create_organization(
+            &pool,
+            "Captured",
+            "captured",
+            Some("captured@example.com"),
+            None,
+            None,
+            Some(actor_id),
+        )
+        .unwrap();
+        let capture_id = capture_id_for_resource(&pool, "core.organization", &org.org_id);
+        let conn = pool.lock().expect("lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(capture.actor_user_id, Some(actor_id));
+        assert_eq!(
+            capture.changed_fields.get("name"),
+            Some(&FieldValue::String("Captured".to_string()))
+        );
+    }
+
+    #[test]
+    fn add_membership_records_core_capture() {
+        let (_d, pool) = open_pool();
+        let org = create_organization(&pool, "Org2", "org2", None, None, None, None).unwrap();
+        let role = list_roles(&pool)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "org_viewer")
+            .unwrap();
+        add_membership(&pool, &org.org_id, "user-2", &role.role_id, "admin").unwrap();
+        let resource_id = org_membership_resource_id(&org.org_id, "user-2");
+        let capture_id = capture_id_for_resource(&pool, "core.org_membership", &resource_id);
+        let conn = pool.lock().expect("lock");
+        let capture = load_core_write_capture(&conn, &capture_id)
+            .expect("load capture")
+            .expect("capture");
+
+        assert_eq!(capture.action, SqlWriteAction::Insert);
+        assert_eq!(
+            capture.changed_fields.get("role_id"),
+            Some(&FieldValue::String(role.role_id))
+        );
+    }
+
+    #[test]
+    fn add_membership_bumps_sync_permission_epoch() {
+        let (_d, pool) = open_pool();
+        let org = create_organization(&pool, "Org3", "org3", None, None, None, None).unwrap();
+        let role = list_roles(&pool)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "org_viewer")
+            .unwrap();
+        let before = crate::db::repository::get_sync_permission_epoch(&pool, &org.org_id).unwrap();
+        assert!(add_membership(&pool, &org.org_id, "user-3", &role.role_id, "admin").unwrap());
+        let after = crate::db::repository::get_sync_permission_epoch(&pool, &org.org_id).unwrap();
+
+        assert!(after > before);
     }
 
     #[test]

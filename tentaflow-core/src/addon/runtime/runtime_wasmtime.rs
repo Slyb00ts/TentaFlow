@@ -73,9 +73,7 @@ pub fn create_engine() -> Result<WasmEngine> {
     // creation. Both calls must succeed (panic if feature missing).
     config.async_stack_size(16 * 1024 * 1024);
     config.max_wasm_stack(4 * 1024 * 1024);
-    info!(
-        "stack config: async_stack=16MB, max_wasm_stack=4MB"
-    );
+    info!("stack config: async_stack=16MB, max_wasm_stack=4MB");
 
     let engine = WasmEngine::new(&config)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc silnika Wasmtime: {e}"))?;
