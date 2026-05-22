@@ -4245,7 +4245,7 @@ pub const GRAPHEDGE_INLINE: InlineMeta = InlineMeta {
         FieldMeta { key: 1, name: "source_id", wire: "tstr", required: true, default: None },
         FieldMeta { key: 2, name: "target_id", wire: "tstr", required: true, default: None },
         FieldMeta { key: 3, name: "label", wire: "Option<BindRef>", required: false, default: None },
-        FieldMeta { key: 4, name: "weight", wire: "Option<f32>", required: false, default: None },
+        FieldMeta { key: 4, name: "weight", wire: "Option<f64>", required: false, default: None },
         FieldMeta { key: 5, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
     ],
 };
@@ -4331,7 +4331,7 @@ pub const FILEMETA_INLINE: InlineMeta = InlineMeta {
         FieldMeta { key: 2, name: "size_bytes", wire: "u64", required: true, default: None },
         FieldMeta { key: 3, name: "mime", wire: "tstr", required: true, default: None },
         FieldMeta { key: 4, name: "ts_ms", wire: "i64", required: true, default: None },
-        FieldMeta { key: 5, name: "upload_progress", wire: "f32", required: true, default: None },
+        FieldMeta { key: 5, name: "upload_progress", wire: "f64", required: true, default: None },
         FieldMeta { key: 6, name: "status", wire: "Enum<FileUploadStatus>", required: true, default: None },
         FieldMeta { key: 7, name: "signed_url_ref", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 8, name: "error_message", wire: "Option<tstr>", required: false, default: None },

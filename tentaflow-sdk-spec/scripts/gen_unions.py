@@ -29,7 +29,7 @@ from typing import Iterable
 # Mirror of TYPE_ALIASES + PRIMS from gen_schema.py so we keep wire-strings
 # consistent between component/inline metadata and union metadata.
 PRIMS = {
-    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64",
+    "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f64",
 }
 TYPE_ALIASES = {
     "LiveRegionPoliteness": "LiveRegion",

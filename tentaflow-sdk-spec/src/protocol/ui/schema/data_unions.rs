@@ -703,7 +703,7 @@ pub const ASPECTRATIO_UNION: UnionMeta = UnionMeta {
             rust_name: "Custom",
             wire_kind: "custom",
             fields: &[
-                FieldMeta { key: 0, name: "ratio", wire: "f32", required: true, default: None },
+                FieldMeta { key: 0, name: "ratio", wire: "f64", required: true, default: None },
             ],
         },
     ],

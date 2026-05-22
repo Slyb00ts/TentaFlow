@@ -9,6 +9,7 @@
 #[macro_use]
 pub mod macros;
 
+pub mod canonical;
 pub mod control;
 pub mod envelope;
 pub mod ids;
