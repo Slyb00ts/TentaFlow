@@ -13,7 +13,9 @@ use super::super::typed_field::{
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
-use super::super::actions::Button;
+use super::super::actions::{Button, SegmentedControl};
+use super::super::data::StatCard;
+use super::super::form::{SearchBox, Select};
 
 
 // -----------------------------------------------------------------------------
@@ -37,6 +39,15 @@ impl Toolbar {
     pub const TAG: u16 = 0x0005;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        if let Some(s) = &self.search {
+            ensure_ref_tag_encode(s.tag, SearchBox::TAG, "Toolbar", "search")?;
+        }
+        if let Some(v) = &self.view_mode {
+            ensure_ref_tag_encode(v.tag, SegmentedControl::TAG, "Toolbar", "view_mode")?;
+        }
+        if let Some(s) = &self.sort_control {
+            ensure_ref_tag_encode(s.tag, Select::TAG, "Toolbar", "sort_control")?;
+        }
         for b in &self.trailing_actions {
             ensure_ref_tag_encode(b.tag, Button::TAG, "Toolbar", "trailing_actions")?;
         }
@@ -89,6 +100,18 @@ impl Toolbar {
         for b in &trailing_actions {
             ensure_ref_tag_decode(b.tag, Button::TAG, "Toolbar", "trailing_actions")?;
         }
+        let search: Option<Component> = search;
+        let view_mode: Option<Component> = view_mode;
+        let sort_control: Option<Component> = sort_control;
+        if let Some(s) = &search {
+            ensure_ref_tag_decode(s.tag, SearchBox::TAG, "Toolbar", "search")?;
+        }
+        if let Some(v) = &view_mode {
+            ensure_ref_tag_decode(v.tag, SegmentedControl::TAG, "Toolbar", "view_mode")?;
+        }
+        if let Some(s) = &sort_control {
+            ensure_ref_tag_decode(s.tag, Select::TAG, "Toolbar", "sort_control")?;
+        }
         Ok(Toolbar {
             search,
             filters: filters.unwrap_or_default(),
@@ -118,6 +141,9 @@ impl StatGroup {
     pub const TAG: u16 = 0x000A;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for s in &self.stats {
+            ensure_ref_tag_encode(s.tag, StatCard::TAG, "StatGroup", "stats")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(3);
         entries.push((0, encode_to_value(&self.stats)?));
         entries.push((1, encode_to_value(&self.columns)?));
@@ -149,6 +175,9 @@ impl StatGroup {
             }
         }
         let stats_vec: Vec<Component> = stats.unwrap_or_default();
+        for s in &stats_vec {
+            ensure_ref_tag_decode(s.tag, StatCard::TAG, "StatGroup", "stats")?;
+        }
         // §2 0x000A: default `columns = stats.len()` (clamped to u8 range).
         let columns_default = u8::try_from(stats_vec.len()).unwrap_or(u8::MAX);
         Ok(StatGroup {

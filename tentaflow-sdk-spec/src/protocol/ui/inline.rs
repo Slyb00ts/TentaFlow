@@ -2385,6 +2385,30 @@ mod tests_chunk_1_7b {
         assert_eq!(b1, b2);
     }
 
+    #[test]
+    fn split_size_decode_value_before_kind() {
+        // Wire form with `value` BEFORE `kind` (non-canonical order on input,
+        // host validator handles canonical wire enforcement separately).
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("value").unwrap().f64(42.5).unwrap()
+            .str("kind").unwrap().str("percent").unwrap();
+        let v: SplitSize = minicbor::decode(&buf).unwrap();
+        assert_eq!(v, SplitSize::Percent { value: 42.5 });
+    }
+
+    #[test]
+    fn split_size_decode_px_value_before_kind() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("value").unwrap().u32(120).unwrap()
+            .str("kind").unwrap().str("px").unwrap();
+        let v: SplitSize = minicbor::decode(&buf).unwrap();
+        assert_eq!(v, SplitSize::Px { value: 120 });
+    }
+
     fn empty_comp() -> Component {
         Component {
             tag: 0x0001,
@@ -2877,14 +2901,17 @@ impl<C> Encode<C> for SplitSize {
 impl<'b, C> Decode<'b, C> for SplitSize {
     fn decode(
         d: &mut Decoder<'b>,
-        _ctx: &mut C,
+        ctx: &mut C,
     ) -> Result<Self, minicbor::decode::Error> {
         let len = d.map()?.ok_or_else(|| {
             minicbor::decode::Error::message("indefinite-length map forbidden")
         })?;
+        // Two-pass approach: buffer `value` as a generic `Value` regardless of
+        // key order, then resolve to u32/f64 in the variant match below using
+        // `kind`. This makes the decoder independent of `kind` vs `value`
+        // ordering on the wire.
         let mut kind: Option<String> = None;
-        let mut value_u: Option<u32> = None;
-        let mut value_f: Option<f64> = None;
+        let mut value: Option<Value> = None;
         let mut seen_kind = false;
         let mut seen_value = false;
         for _ in 0..len {
@@ -2902,17 +2929,7 @@ impl<'b, C> Decode<'b, C> for SplitSize {
                         return Err(minicbor::decode::Error::message("SplitSize: duplicate `value` key"));
                     }
                     seen_value = true;
-                    match kind.as_deref() {
-                        Some("percent") => {
-                            // Accept f16/f32/f64 wire form; widen to f64.
-                            let v = match d.datatype()? {
-                                minicbor::data::Type::F16 | minicbor::data::Type::F32 => d.f32()? as f64,
-                                _ => d.f64()?,
-                            };
-                            value_f = Some(v);
-                        }
-                        _ => value_u = Some(d.u32()?),
-                    }
+                    value = Some(Value::decode(d, ctx)?);
                 }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
@@ -2924,23 +2941,45 @@ impl<'b, C> Decode<'b, C> for SplitSize {
         let kind = kind.ok_or_else(|| minicbor::decode::Error::message("SplitSize missing kind"))?;
         match kind.as_str() {
             "auto" => {
-                if value_u.is_some() || value_f.is_some() {
+                if value.is_some() {
                     return Err(minicbor::decode::Error::message(
                         "SplitSize.auto must not carry value",
                     ));
                 }
                 Ok(SplitSize::Auto)
             }
-            "px" => Ok(SplitSize::Px {
-                value: value_u
-                    .ok_or_else(|| minicbor::decode::Error::message("SplitSize.px missing value"))?,
-            }),
+            "px" => {
+                let v = value.ok_or_else(|| {
+                    minicbor::decode::Error::message("SplitSize.px missing value")
+                })?;
+                let n: u32 = match v {
+                    Value::U64(n) => u32::try_from(n).map_err(|_| {
+                        minicbor::decode::Error::message("SplitSize.px value out of u32 range")
+                    })?,
+                    _ => {
+                        return Err(minicbor::decode::Error::message(
+                            "SplitSize.px value must be a non-negative integer",
+                        ))
+                    }
+                };
+                Ok(SplitSize::Px { value: n })
+            }
             "percent" => {
-                let v = value_f.ok_or_else(|| {
+                let v = value.ok_or_else(|| {
                     minicbor::decode::Error::message("SplitSize.percent missing value")
                 })?;
-                validate_split_percent(v).map_err(minicbor::decode::Error::message)?;
-                Ok(SplitSize::Percent { value: v })
+                let f: f64 = match v {
+                    Value::F64(f) => f,
+                    Value::U64(n) => n as f64,
+                    Value::I64(n) => n as f64,
+                    _ => {
+                        return Err(minicbor::decode::Error::message(
+                            "SplitSize.percent value must be a number",
+                        ))
+                    }
+                };
+                validate_split_percent(f).map_err(minicbor::decode::Error::message)?;
+                Ok(SplitSize::Percent { value: f })
             }
             other => Err(minicbor::decode::Error::message(format!(
                 "unknown SplitSize.kind: {other}"
