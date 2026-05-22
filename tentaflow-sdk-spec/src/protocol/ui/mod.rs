@@ -27,6 +27,7 @@ pub mod typed_field;
 pub mod patch;
 pub mod slot;
 pub mod slot_msg;
+pub mod specialized;
 pub mod state;
 pub mod tokens;
 pub mod ui_payload;
