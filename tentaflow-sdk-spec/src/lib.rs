@@ -69,7 +69,7 @@ pub use protocol::{
             DecisionOption, DefItem, DimensionToken, FeatureItem, FileMeta, FilterChipDef,
             Footnote, GaugeThreshold, GraphEdge, GraphNode, GridChild, GridCol, GridTrack,
             HeatmapBucket, HeatmapColumn, HeatmapRow, HeatmapScale, IconRef, InboxItem,
-            InlineBadge, InlineChip, KvItem, MapMarker, MenuItem, NavTab, PermissionDef,
+            InlineBadge, InlineChip, KvItem, LogEvent, MapMarker, MenuItem, NavTab, PermissionDef,
             RadioCardOption, RadioOption, RangePreset, RangePresetRange, RoleDef,
             SegmentOption, SelectGroup, SelectOption, SelectValue, SidebarItem, SliderMark,
             SplitSize, StackSegment, StepDef, TabItem, TableColumn, TableColumnWidth,
@@ -102,7 +102,7 @@ pub use protocol::{
         slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow},
         specialized::{
             Audio, Carousel, CodeEditor, FpsCounter, IFrame, ImageGallery, LiveCameraTile,
-            MapView, PdfViewer, StepProgress, Stopwatch, Terminal, VideoStream,
+            MapView, PdfViewer, StepProgress, Stopwatch, Terminal, VideoStream, VirtualizedLog,
         },
         state::{PatchRejectReason, PatchRejected, StatePatch, StateReset, StateSnapshot},
         tokens::{
@@ -113,7 +113,7 @@ pub use protocol::{
             CarouselGestures, CheckboxSize, ChartAxisScale, CodeEditorTheme, ColorPickerVariant,
             DrawerSize, FabPosition, FabSize, FileCapture, FilterChipsMode, FormFieldLayout,
             FormLayout, FpsVariant, GateVariant, IFrameReferrerPolicy, IFrameSandbox, InputMode,
-            InputSize, InputType, LinkUnderline, MenuPlacement, ModalSize, PdfZoomMode,
+            InputSize, InputType, LinkUnderline, LogLevel, LogVariant, MenuPlacement, ModalSize, PdfZoomMode,
             PopoverPlacement, RadioCardVariant, RadioGroupOrientation, SearchVariant, SegmentSize,
             SkeletonVariant, SliderRowLayout, SpinnerSize, SpinnerVariant, StepProgressVariant,
             StopwatchVariant, TerminalTheme, TileProvider, TimePrecision, ToggleSize, TogglePosition,

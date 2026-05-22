@@ -1344,3 +1344,24 @@ string_enum! {
         UnsafeUrl = "unsafe-url",
     }
 }
+
+string_enum! {
+    /// `VirtualizedLog.variant` (catalog §8 0x0611).
+    pub enum LogVariant {
+        Compact = "compact",
+        Default = "default",
+        Expanded = "expanded",
+    }
+}
+
+string_enum! {
+    /// Log event level (catalog §8 0x0611 LogEvent).
+    pub enum LogLevel {
+        Trace = "trace",
+        Debug = "debug",
+        Info = "info",
+        Warn = "warn",
+        Error = "error",
+        Fatal = "fatal",
+    }
+}
