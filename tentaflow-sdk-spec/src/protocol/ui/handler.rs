@@ -15,6 +15,7 @@ use super::bind::StatePath;
 use super::patch::PatchOp;
 use super::tokens::ScrollBehavior;
 use super::validation::{StateCondition, ValidationRule};
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 /// Total recursion depth limit (Confirm/Conditional/Debounce nesting). §10.3.
 pub const HANDLER_MAX_RECURSION_DEPTH: usize = 8;
@@ -73,8 +74,14 @@ impl<'b, C> Decode<'b, C> for FailurePolicy {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "action" => action = Some(LocalAction::decode(d, ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "FailurePolicy", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "action" => {
+                    assert_no_dup_tstr(&action, "FailurePolicy", "action")?;
+                    action = Some(LocalAction::decode(d, ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown FailurePolicy key: {other}"
@@ -384,25 +391,69 @@ impl<'b, C> Decode<'b, C> for LocalAction {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "slot_id" => slot_id = Some(d.str()?.to_string()),
-                "path" => path = Some(StatePath::decode(d, ctx)?),
-                "value" => match kind.as_deref() {
-                    Some("copy") => copy_value = Some(d.str()?.to_string()),
-                    _ => {
-                        value = Some(crate::protocol::value::Value::decode(d, ctx)?);
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "LocalAction", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "slot_id" => {
+                    assert_no_dup_tstr(&slot_id, "LocalAction", "slot_id")?;
+                    slot_id = Some(d.str()?.to_string());
+                }
+                "path" => {
+                    assert_no_dup_tstr(&path, "LocalAction", "path")?;
+                    path = Some(StatePath::decode(d, ctx)?);
+                }
+                "value" => {
+                    if value.is_some() || copy_value.is_some() {
+                        return Err(minicbor::decode::Error::message(
+                            "LocalAction: duplicate key 'value'",
+                        ));
                     }
-                },
-                "delta" => delta = Some(d.i64()?),
-                "panel_id" => panel_id = Some(d.str()?.to_string()),
-                "component_id" => component_id = Some(d.str()?.to_string()),
-                "behavior" => behavior = Some(ScrollBehavior::decode(d, ctx)?),
-                "title" => title = Some(d.str()?.to_string()),
-                "message" => message = Some(d.str()?.to_string()),
-                "destructive" => destructive = Some(d.bool()?),
-                "then" => then = Some(Box::new(Handler::decode(d, ctx)?)),
-                "field_component_id" => field_component_id = Some(d.str()?.to_string()),
+                    match kind.as_deref() {
+                        Some("copy") => copy_value = Some(d.str()?.to_string()),
+                        _ => {
+                            value = Some(crate::protocol::value::Value::decode(d, ctx)?);
+                        }
+                    }
+                }
+                "delta" => {
+                    assert_no_dup_tstr(&delta, "LocalAction", "delta")?;
+                    delta = Some(d.i64()?);
+                }
+                "panel_id" => {
+                    assert_no_dup_tstr(&panel_id, "LocalAction", "panel_id")?;
+                    panel_id = Some(d.str()?.to_string());
+                }
+                "component_id" => {
+                    assert_no_dup_tstr(&component_id, "LocalAction", "component_id")?;
+                    component_id = Some(d.str()?.to_string());
+                }
+                "behavior" => {
+                    assert_no_dup_tstr(&behavior, "LocalAction", "behavior")?;
+                    behavior = Some(ScrollBehavior::decode(d, ctx)?);
+                }
+                "title" => {
+                    assert_no_dup_tstr(&title, "LocalAction", "title")?;
+                    title = Some(d.str()?.to_string());
+                }
+                "message" => {
+                    assert_no_dup_tstr(&message, "LocalAction", "message")?;
+                    message = Some(d.str()?.to_string());
+                }
+                "destructive" => {
+                    assert_no_dup_tstr(&destructive, "LocalAction", "destructive")?;
+                    destructive = Some(d.bool()?);
+                }
+                "then" => {
+                    assert_no_dup_tstr(&then, "LocalAction", "then")?;
+                    then = Some(Box::new(Handler::decode(d, ctx)?));
+                }
+                "field_component_id" => {
+                    assert_no_dup_tstr(&field_component_id, "LocalAction", "field_component_id")?;
+                    field_component_id = Some(d.str()?.to_string());
+                }
                 "rules" => {
+                    assert_no_dup_tstr(&rules, "LocalAction", "rules")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -412,9 +463,16 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                     }
                     rules = Some(v);
                 }
-                "on_invalid" => on_invalid = Some(Box::new(LocalAction::decode(d, ctx)?)),
-                "ms" => ms = Some(d.u32()?),
+                "on_invalid" => {
+                    assert_no_dup_tstr(&on_invalid, "LocalAction", "on_invalid")?;
+                    on_invalid = Some(Box::new(LocalAction::decode(d, ctx)?));
+                }
+                "ms" => {
+                    assert_no_dup_tstr(&ms, "LocalAction", "ms")?;
+                    ms = Some(d.u32()?);
+                }
                 "steps" => {
+                    assert_no_dup_tstr(&steps, "LocalAction", "steps")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -424,8 +482,14 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                     }
                     steps = Some(v);
                 }
-                "when" => when_cond = Some(StateCondition::decode(d, ctx)?),
-                "else" => else_branch = Some(Box::new(Handler::decode(d, ctx)?)),
+                "when" => {
+                    assert_no_dup_tstr(&when_cond, "LocalAction", "when")?;
+                    when_cond = Some(StateCondition::decode(d, ctx)?);
+                }
+                "else" => {
+                    assert_no_dup_tstr(&else_branch, "LocalAction", "else")?;
+                    else_branch = Some(Box::new(Handler::decode(d, ctx)?));
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown LocalAction key: {other}"
@@ -799,11 +863,24 @@ impl<'b, C> Decode<'b, C> for Handler {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "action" => local_action = Some(LocalAction::decode(d, ctx)?),
-                "action_id" => action_id = Some(d.str()?.to_string()),
-                "params" => params = Some(CborMap::decode(d, ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "Handler", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "action" => {
+                    assert_no_dup_tstr(&local_action, "Handler", "action")?;
+                    local_action = Some(LocalAction::decode(d, ctx)?);
+                }
+                "action_id" => {
+                    assert_no_dup_tstr(&action_id, "Handler", "action_id")?;
+                    action_id = Some(d.str()?.to_string());
+                }
+                "params" => {
+                    assert_no_dup_tstr(&params, "Handler", "params")?;
+                    params = Some(CborMap::decode(d, ctx)?);
+                }
                 "optimistic" => {
+                    assert_no_dup_tstr(&optimistic, "Handler", "optimistic")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -813,7 +890,10 @@ impl<'b, C> Decode<'b, C> for Handler {
                     }
                     optimistic = Some(v);
                 }
-                "on_failure" => on_failure = Some(FailurePolicy::decode(d, ctx)?),
+                "on_failure" => {
+                    assert_no_dup_tstr(&on_failure, "Handler", "on_failure")?;
+                    on_failure = Some(FailurePolicy::decode(d, ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown Handler key: {other}"

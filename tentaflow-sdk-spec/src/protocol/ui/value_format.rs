@@ -5,6 +5,7 @@
 // =============================================================================
 
 use minicbor::{Decode, Decoder, Encode, Encoder};
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 string_enum! {
     /// Base for byte formatting: SI (1000) or binary (1024).
@@ -165,12 +166,30 @@ impl<'b, C> Decode<'b, C> for ValueFormat {
         for _ in 0..len {
             let key = d.str()?;
             match key {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "decimals" => decimals = Some(d.u8()?),
-                "thousands_sep" => thousands_sep = Some(d.bool()?),
-                "code" => code = Some(d.str()?.to_string()),
-                "base" => base = Some(BytesBase::decode(d, ctx)?),
-                "style" => style_raw = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "ValueFormat", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "decimals" => {
+                    assert_no_dup_tstr(&decimals, "ValueFormat", "decimals")?;
+                    decimals = Some(d.u8()?);
+                }
+                "thousands_sep" => {
+                    assert_no_dup_tstr(&thousands_sep, "ValueFormat", "thousands_sep")?;
+                    thousands_sep = Some(d.bool()?);
+                }
+                "code" => {
+                    assert_no_dup_tstr(&code, "ValueFormat", "code")?;
+                    code = Some(d.str()?.to_string());
+                }
+                "base" => {
+                    assert_no_dup_tstr(&base, "ValueFormat", "base")?;
+                    base = Some(BytesBase::decode(d, ctx)?);
+                }
+                "style" => {
+                    assert_no_dup_tstr(&style_raw, "ValueFormat", "style")?;
+                    style_raw = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown ValueFormat key: {other}"

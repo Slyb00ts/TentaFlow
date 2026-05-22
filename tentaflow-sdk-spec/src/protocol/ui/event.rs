@@ -8,6 +8,7 @@
 use minicbor::{Decode, Decoder, Encode, Encoder};
 
 use crate::protocol::value::Value;
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 /// One segment of a compiled Topic.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -56,8 +57,14 @@ impl<'b, C> Decode<'b, C> for TopicSegment {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "value" => value = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "TopicSegment", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "TopicSegment", "value")?;
+                    value = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown TopicSegment key: {other}"
