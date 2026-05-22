@@ -2968,13 +2968,15 @@ impl<'b, C> Decode<'b, C> for SplitSize {
                 let v = value.ok_or_else(|| {
                     minicbor::decode::Error::message("SplitSize.percent missing value")
                 })?;
+                // Strict: percent value MUST be CBOR float (RFC 8949 major
+                // type 7 float). Integer encodings are rejected — the SDK
+                // contract is `Percent { value: f64 }` and accepting integers
+                // would silently widen on encode/decode round-trip.
                 let f: f64 = match v {
                     Value::F64(f) => f,
-                    Value::U64(n) => n as f64,
-                    Value::I64(n) => n as f64,
                     _ => {
                         return Err(minicbor::decode::Error::message(
-                            "SplitSize.percent value must be a number",
+                            "SplitSize.percent value must be a CBOR float (f64)",
                         ))
                     }
                 };
