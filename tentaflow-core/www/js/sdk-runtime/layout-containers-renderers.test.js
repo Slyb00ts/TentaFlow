@@ -1,0 +1,538 @@
+// =============================================================================
+// Plik: sdk-runtime/layout-containers-renderers.test.js
+// Opis: Testy 4 containerów Layout (Krok 3.3a-2): Flex, Grid, Stack, Cluster.
+// =============================================================================
+
+import './_dom-test-harness.js';
+
+import { StateStore } from './state-store.js';
+import {
+  ComponentRenderer,
+  _clearComponentRendererRegistry,
+} from './component-renderer.js';
+import { registerLayoutAtomicRenderers, SPACER_TAG, DIVIDER_TAG } from './layout-atomic-renderers.js';
+import {
+  registerLayoutContainersRenderers,
+  FLEX_TAG,
+  GRID_TAG,
+  STACK_TAG,
+  CLUSTER_TAG,
+} from './layout-containers-renderers.js';
+import { bootstrapSdkRuntime } from './bootstrap.js';
+
+const results = [];
+function test(name, fn) {
+  try {
+    fn();
+    results.push({ name, ok: true });
+  } catch (err) {
+    results.push({ name, ok: false, err });
+  }
+}
+function assertEq(actual, expected, msg) {
+  const a = JSON.stringify(actual, (_k, v) =>
+    typeof v === 'bigint' ? `${v}n` : v
+  );
+  const b = JSON.stringify(expected, (_k, v) =>
+    typeof v === 'bigint' ? `${v}n` : v
+  );
+  if (a !== b) {
+    throw new Error(`${msg || 'assertEq'}: expected ${b}, got ${a}`);
+  }
+}
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || 'assert failed');
+}
+function assertThrows(fn, msg) {
+  let threw = false;
+  try {
+    fn();
+  } catch {
+    threw = true;
+  }
+  if (!threw) throw new Error(msg || 'expected throw');
+}
+
+// Helpery
+function makeStore() {
+  return new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n });
+}
+function makeDispatcher() {
+  return { emit() {} };
+}
+function makeEngine() {
+  return new ComponentRenderer({
+    store: makeStore(),
+    eventDispatcher: makeDispatcher(),
+    locale: 'en-US',
+  });
+}
+function comp(tag, fields, extra = {}) {
+  return {
+    tag,
+    id: 'cmp1',
+    fields,
+    handlers: extra.handlers ?? null,
+    bind: extra.bind ?? null,
+    a11y: extra.a11y ?? null,
+    visibility: extra.visibility ?? null,
+    test_id: extra.test_id ?? null,
+  };
+}
+function setup() {
+  _clearComponentRendererRegistry();
+  registerLayoutAtomicRenderers();
+  registerLayoutContainersRenderers();
+  document.body.innerHTML = '';
+}
+
+// ============================================================================
+// Flex
+// ============================================================================
+
+test('Flex renders with all required + optional classes', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'],
+      [1, 'lg'],
+      [2, 'space_between'],
+      [3, 'center'],
+      [4, 'wrap'],
+      [5, []],
+      [6, 'md'],
+      [7, 'subtle'],
+      [8, 'lg'],
+    ])
+  );
+  assert(el.classList.contains('tf-flex'));
+  assert(el.classList.contains('tf-flex--direction-row'));
+  assert(el.classList.contains('tf-flex--gap-lg'));
+  assert(el.classList.contains('tf-flex--justify-space_between'));
+  assert(el.classList.contains('tf-flex--align-center'));
+  assert(el.classList.contains('tf-flex--wrap-wrap'));
+  assert(el.classList.contains('tf-flex--padding-md'));
+  assert(el.classList.contains('tf-flex--bg-subtle'));
+  assert(el.classList.contains('tf-flex--radius-lg'));
+});
+
+test('Flex uses default gap "md" when absent', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'column'],
+      [2, 'start'],
+      [3, 'stretch'],
+      [4, 'no_wrap'],
+    ])
+  );
+  assert(el.classList.contains('tf-flex--gap-md'));
+});
+
+test('Flex renders children in order', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'],
+      [1, 'sm'],
+      [2, 'start'],
+      [3, 'center'],
+      [4, 'no_wrap'],
+      [
+        5,
+        [
+          comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'a' }),
+          comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'b' }),
+          comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'c' }),
+        ],
+      ],
+    ])
+  );
+  const tids = [...el.children].map((c) => c.getAttribute('data-testid'));
+  assertEq(tids, ['a', 'b', 'c']);
+});
+
+test('Flex rejects invalid direction', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(FLEX_TAG, [
+        [0, 'diagonal'],
+        [1, 'md'],
+        [2, 'start'],
+        [3, 'center'],
+        [4, 'no_wrap'],
+      ])
+    )
+  );
+});
+
+// ============================================================================
+// Grid
+// ============================================================================
+
+test('Grid Equal sets repeat(N, minmax(0, 1fr))', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(GRID_TAG, [
+      [0, { kind: 'equal', count: 3 }],
+      [1, 'md'],
+      [4, []],
+    ])
+  );
+  assertEq(el.style.gridTemplateColumns, 'repeat(3, minmax(0, 1fr))');
+});
+
+test('Grid Explicit maps each GridCol variant', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(GRID_TAG, [
+      [
+        0,
+        {
+          kind: 'explicit',
+          cols: [
+            { kind: 'auto' },
+            { kind: 'fr', value: 2 },
+            { kind: 'px', value: 240 },
+            { kind: 'min_content' },
+            { kind: 'max_content' },
+            { kind: 'fill' },
+          ],
+        },
+      ],
+      [1, 'sm'],
+      [4, []],
+    ])
+  );
+  assertEq(
+    el.style.gridTemplateColumns,
+    'auto 2fr 240px min-content max-content minmax(0, 1fr)'
+  );
+});
+
+test('Grid Equal with count=0 rejected', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'equal', count: 0 }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
+test('Grid Explicit with empty cols rejected', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'explicit', cols: [] }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
+test('Grid renders GridChild with col_span, row_span, col_start, align_self', () => {
+  setup();
+  const engine = makeEngine();
+  const child = comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'gc' });
+  const el = engine.render(
+    comp(GRID_TAG, [
+      [0, { kind: 'equal', count: 3 }],
+      [1, 'md'],
+      [
+        4,
+        [
+          {
+            component: child,
+            col_span: 2,
+            row_span: 1,
+            col_start: 2,
+            align_self: 'center',
+            justify_self: 'space_around',
+          },
+        ],
+      ],
+    ])
+  );
+  const ch = el.querySelector('[data-testid="gc"]');
+  assertEq(ch.style.gridColumn, 'span 2');
+  assertEq(ch.style.gridRow, 'span 1');
+  assertEq(ch.style.gridColumnStart, '2');
+  assertEq(ch.style.alignSelf, 'center');
+  assertEq(ch.style.justifySelf, 'space-around');
+});
+
+test('Grid applies row_gap/column_gap/align_items classes when present', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(GRID_TAG, [
+      [0, { kind: 'equal', count: 2 }],
+      [1, 'md'],
+      [2, 'xs'],
+      [3, 'lg'],
+      [4, []],
+      [5, 'sm'],
+      [6, 'baseline'],
+    ])
+  );
+  assert(el.classList.contains('tf-grid--row-gap-xs'));
+  assert(el.classList.contains('tf-grid--col-gap-lg'));
+  assert(el.classList.contains('tf-grid--padding-sm'));
+  assert(el.classList.contains('tf-grid--align-baseline'));
+});
+
+// ============================================================================
+// Stack
+// ============================================================================
+
+test('Stack uses defaults gap=md align=stretch when fields absent', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(STACK_TAG, []));
+  assert(el.classList.contains('tf-stack'));
+  assert(el.classList.contains('tf-stack--gap-md'));
+  assert(el.classList.contains('tf-stack--align-stretch'));
+});
+
+test('Stack renders children + optional padding', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(STACK_TAG, [
+      [0, 'xl'],
+      [1, 'center'],
+      [2, [comp(DIVIDER_TAG, [[0, 'horizontal'], [1, 'default'], [2, 'sm']])]],
+      [3, 'md'],
+    ])
+  );
+  assert(el.classList.contains('tf-stack--gap-xl'));
+  assert(el.classList.contains('tf-stack--align-center'));
+  assert(el.classList.contains('tf-stack--padding-md'));
+  assertEq(el.children.length, 1);
+  assert(el.children[0].classList.contains('tf-divider'));
+});
+
+test('Stack rejects invalid align', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(comp(STACK_TAG, [[0, 'md'], [1, 'middle'], [2, []]]))
+  );
+});
+
+// ============================================================================
+// Cluster
+// ============================================================================
+
+test('Cluster renders with all 3 mandatory tokens + children', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(CLUSTER_TAG, [
+      [0, 'sm'],
+      [1, 'start'],
+      [2, 'space_evenly'],
+      [3, [comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])]],
+    ])
+  );
+  assert(el.classList.contains('tf-cluster'));
+  assert(el.classList.contains('tf-cluster--gap-sm'));
+  assert(el.classList.contains('tf-cluster--align-start'));
+  assert(el.classList.contains('tf-cluster--justify-space_evenly'));
+  assertEq(el.children.length, 1);
+});
+
+test('Flex rejects unknown field key', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(FLEX_TAG, [
+        [0, 'row'], [1, 'md'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+        [99, 'rogue'],
+      ])
+    )
+  );
+});
+
+test('GridCol.fr rejects extra keys', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'explicit', cols: [{ kind: 'fr', value: 1, malicious: true }] }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
+test('GridTrack.equal rejects cols field (variant mixing)', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'equal', count: 3, cols: [] }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
+test('GridTrack.explicit rejects cols.length > MAX_GRID_COLS', () => {
+  setup();
+  const engine = makeEngine();
+  const tooMany = new Array(300).fill({ kind: 'auto' });
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'explicit', cols: tooMany }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
+test('GridCol.px rejects value > MAX_GRID_PX', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'explicit', cols: [{ kind: 'px', value: 9_999_999 }] }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
+test('Cluster rejects missing gap', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(comp(CLUSTER_TAG, [[1, 'start'], [2, 'center'], [3, []]]))
+  );
+});
+
+// ============================================================================
+// Cleanup propagacja przez children
+// ============================================================================
+
+test('destroy on Flex root unhooks bound child subscriptions', () => {
+  setup();
+  const store = new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n });
+  store.applySnapshot({
+    entries: [{ path: [{ kind: 'key', value: 'lbl' }], value: 'first' }],
+    state_revision: 0,
+    truncated: false,
+  });
+  const engine = new ComponentRenderer({
+    store,
+    eventDispatcher: makeDispatcher(),
+    locale: 'en-US',
+  });
+  const child = comp(DIVIDER_TAG, [
+    [0, 'horizontal'],
+    [1, 'default'],
+    [2, 'sm'],
+    [3, { kind: 'bound', path: [{ kind: 'key', value: 'lbl' }] }],
+  ]);
+  const root = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'],
+      [1, 'sm'],
+      [2, 'start'],
+      [3, 'center'],
+      [4, 'no_wrap'],
+      [5, [child]],
+    ])
+  );
+  const labelEl = root.querySelector('.tf-divider__label');
+  assertEq(labelEl.textContent, 'first');
+  engine.destroy(root);
+  store.applyPatch({
+    base_revision: 0,
+    new_revision: 1,
+    ops: [
+      {
+        path: [{ kind: 'key', value: 'lbl' }],
+        op: { kind: 'set', value: 'second' },
+      },
+    ],
+  });
+  // Po destroy subskrypcja dziecka jest zwolniona — tekst nie zmienia się.
+  assertEq(labelEl.textContent, 'first');
+});
+
+// ============================================================================
+// Bootstrap
+// ============================================================================
+
+test('bootstrap registers atomic + containers renderers idempotentnie', () => {
+  _clearComponentRendererRegistry();
+  bootstrapSdkRuntime();
+  // Druga inwokacja — nie rzuca duplicate-register.
+  bootstrapSdkRuntime();
+  // Tag z atomic (SPACER) + tag z containers (FLEX) muszą być widoczne.
+  const engine = makeEngine();
+  engine.render(comp(SPACER_TAG, [[0, 'md'], [1, 'x']]));
+  engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+    ])
+  );
+});
+
+// ---- report ----
+
+function reportResults() {
+  let pass = 0;
+  let fail = 0;
+  const lines = [];
+  for (const r of results) {
+    if (r.ok) {
+      pass++;
+      lines.push(`✓ ${r.name}`);
+    } else {
+      fail++;
+      lines.push(
+        `✗ ${r.name}\n    ${r.err && r.err.stack ? r.err.stack : r.err}`
+      );
+    }
+  }
+  lines.push('');
+  lines.push(
+    `${pass}/${pass + fail} tests passed${fail ? ` — ${fail} FAILED` : ''}`
+  );
+  return { pass, fail, text: lines.join('\n') };
+}
+
+if (typeof process !== 'undefined') {
+  const r = reportResults();
+  // eslint-disable-next-line no-console
+  console.log(r.text);
+  if (r.fail > 0) process.exit(1);
+}
+
+export { reportResults };
