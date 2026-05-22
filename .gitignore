@@ -110,6 +110,10 @@ Cargo.lock
 !tentaflow-mobile/Cargo.lock
 !tentaflow-memory/Cargo.lock
 !tentaflow-containers/*/Cargo.lock
+# Cargo binary entry points are conventionally under `src/bin/` — the
+# generic `bin/` ignore above must not swallow them.
+!tentaflow-sdk-gen/src/bin/
+!tentaflow-sdk-gen/src/bin/**
 
 # =============================================================================
 # WASM build artefakty (addony kompilowane lokalnie)
