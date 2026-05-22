@@ -12,7 +12,8 @@
 // initialisable in plain Rust. Codegen tokenises the strings.
 //
 // Type-string grammar (used by codegen):
-//   primitive       := "bool" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64" | "f64" | "tstr"
+//   primitive       := "bool" | "u8" | "u16" | "u32" | "u64" | "i32" | "i64"
+//                    | "f32" | "f64" | "tstr"
 //   binding         := "BindRef" | "StatePath"
 //   enum_ref        := "Enum<" enum-name ">"
 //   inline_ref      := "Inline<" inline-name ">"
