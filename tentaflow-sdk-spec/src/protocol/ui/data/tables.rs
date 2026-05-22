@@ -7,10 +7,11 @@ use super::super::component::{Component, FieldMap};
 use super::super::inline::{TableColumn, TablePagination};
 use super::super::tokens::{Density, EmptyCellVariant, TableSelectMode, TableVariant, TreeVariant};
 use super::super::typed_field::{
-    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
-    unknown_field, IntoComponentError,
+    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
+    ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
+use super::super::actions::Button;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
@@ -52,6 +53,12 @@ impl Table {
     pub const TAG: u16 = 0x0211;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for b in &self.row_actions {
+            ensure_ref_tag_encode(b.tag, Button::TAG, "Table", "row_actions")?;
+        }
+        for b in &self.bulk_actions {
+            ensure_ref_tag_encode(b.tag, Button::TAG, "Table", "bulk_actions")?;
+        }
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(18);
         e.push((0, encode_to_value(&self.columns)?));
         e.push((1, encode_to_value(&self.rows_path)?));
@@ -132,8 +139,20 @@ impl Table {
             sticky_columns: sticky_columns.ok_or_else(|| missing_field("Table", "sticky_columns"))?,
             pagination,
             empty_state,
-            row_actions: row_actions.unwrap_or_default(),
-            bulk_actions: bulk_actions.unwrap_or_default(),
+            row_actions: {
+                let v: Vec<Component> = row_actions.unwrap_or_default();
+                for b in &v {
+                    ensure_ref_tag_decode(b.tag, Button::TAG, "Table", "row_actions")?;
+                }
+                v
+            },
+            bulk_actions: {
+                let v: Vec<Component> = bulk_actions.unwrap_or_default();
+                for b in &v {
+                    ensure_ref_tag_decode(b.tag, Button::TAG, "Table", "bulk_actions")?;
+                }
+                v
+            },
             virtualize: virtualize.ok_or_else(|| missing_field("Table", "virtualize"))?,
             row_expandable: row_expandable.ok_or_else(|| missing_field("Table", "row_expandable"))?,
             expanded_row_template_id,

@@ -241,6 +241,79 @@ mod tests {
         assert!(Header::try_from_component(&c).is_err());
     }
 
+    fn non_button(id: &str) -> Component {
+        // 0x040C Fab carrying the wrong tag for ComponentRef<Button>.
+        Component {
+            tag: 0x040C, id: id.into(), fields: FieldMap::default(),
+            handlers: None, bind: None, a11y: None, visibility: None, test_id: None,
+        }
+    }
+
+    #[test]
+    fn header_rejects_non_button_action() {
+        let bad = Header {
+            icon: icon(IconName::Brain), title: lit("T"),
+            status_badge: None, subtitle: None, meta_chips: vec![],
+            actions: vec![non_button("bad")],
+            density: Density::Default,
+        };
+        assert!(bad.into_component("h").is_err());
+    }
+
+    #[test]
+    fn empty_state_rejects_non_button_primary_action() {
+        let bad = EmptyState {
+            icon: icon(IconName::Brain), heading: lit("h"),
+            message: None,
+            primary_action: Some(non_button("bad")),
+            secondary_action: None,
+            variant: EmptyStateVariant::Default,
+        };
+        assert!(bad.into_component("e").is_err());
+    }
+
+    #[test]
+    fn welcome_hero_rejects_non_button_primary_action() {
+        let bad = WelcomeHero {
+            illustration: icon(IconName::Brain),
+            title: lit("t"), subtitle: lit("s"),
+            features: vec![],
+            primary_action: non_button("bad"),
+            secondary_action: None,
+        };
+        assert!(bad.into_component("w").is_err());
+    }
+
+    #[test]
+    fn toolbar_rejects_non_button_trailing_action() {
+        let bad = Toolbar {
+            search: None, filters: vec![], view_mode: None, sort_control: None,
+            trailing_actions: vec![non_button("bad")],
+            density: Density::Default,
+        };
+        assert!(bad.into_component("tb").is_err());
+    }
+
+    #[test]
+    fn inspector_rejects_non_button_action() {
+        let bad = Inspector {
+            title: lit("t"), content_slot: "x".into(),
+            actions: vec![non_button("bad")],
+            tabs: None, collapsible: false,
+        };
+        assert!(bad.into_component("i").is_err());
+    }
+
+    #[test]
+    fn error_boundary_rejects_non_button_action() {
+        let bad = ErrorBoundary {
+            error_code: None, title: lit("err"), message: None,
+            actions: vec![non_button("bad")],
+            technical_details: None,
+        };
+        assert!(bad.into_component("eb").is_err());
+    }
+
     #[test]
     fn duplicate_field_key_rejected() {
         let mut c = Header {
