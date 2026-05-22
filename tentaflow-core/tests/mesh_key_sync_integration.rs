@@ -254,7 +254,7 @@ fn receive_handler_has_is_trusted_gate() {
 
     // Bound the scope: read a generous window after the arm header. The
     // handler body is well under 2 KiB; this avoids matching `is_trusted`
-    // from unrelated handlers (e.g. TrustedKeysSync, RelayFrameReceived).
+    // from unrelated handlers (e.g. TrustedKeysSync).
     let scope_end = (handler_start + 2048).min(src.len());
     let scope = &src[handler_start..scope_end];
 

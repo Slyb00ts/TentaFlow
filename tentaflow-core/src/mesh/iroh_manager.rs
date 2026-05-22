@@ -175,10 +175,6 @@ pub enum IrohMeshEvent {
         node_id: String,
         data: Vec<u8>,
     },
-    ContainerListUpdate {
-        node_id: String,
-        data: Vec<u8>,
-    },
     MeshCommandReceived {
         from_node_id: String,
         command: Vec<u8>,
@@ -205,22 +201,6 @@ pub enum IrohMeshEvent {
         node_id: String,
         request_id: String,
         payload: Vec<u8>,
-    },
-    FullStateReceived {
-        node_id: String,
-        state: Vec<u8>,
-    },
-    KeyRotationReceived {
-        node_id: String,
-        ephemeral_public_key_hex: String,
-    },
-    KeyRotationResponseReceived {
-        node_id: String,
-        ephemeral_public_key_hex: String,
-    },
-    RelayFrameReceived {
-        from_node_id: String,
-        frame: tentaflow_protocol::mesh::MeshRelayFrame,
     },
     /// Odkryty nowy peer przez mDNS/DHT — wypala zanim zaczniemy dial.
     /// Pipeline pisze do peer_store z source=discovered zeby UI widzial peera
@@ -1730,42 +1710,6 @@ impl IrohMeshManager {
         }
     }
 
-    pub async fn send_key_rotation(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
-            target_node_id,
-            tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION,
-            data,
-        )
-        .await
-    }
-
-    pub async fn send_key_rotation_response(
-        &self,
-        target_node_id: &str,
-        data: &[u8],
-    ) -> Result<()> {
-        self.send_to_peer(
-            target_node_id,
-            tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION_RESPONSE,
-            data,
-        )
-        .await
-    }
-
-    /// Wysyla relay frame (multi-hop) do nastepnego noda w trasie.
-    pub async fn send_relay_frame(&self, next_hop_id: &str, frame_bytes: &[u8]) -> Result<()> {
-        self.send_to_peer(
-            next_hop_id,
-            tentaflow_protocol::mesh::MESH_MSG_RELAY_FRAME,
-            frame_bytes,
-        )
-        .await
-    }
-
-    /// Wysyla payload przez relay do docelowego peera (wybiera pierwszy hop z config).
-    pub async fn send_via_relay(&self, via_node_id: &str, frame_bytes: &[u8]) -> Result<()> {
-        self.send_relay_frame(via_node_id, frame_bytes).await
-    }
 }
 
 /// Kopia referencji uzywana w spawned tasks — bez `Arc<Self>` aby unikac cyklu.
@@ -2164,10 +2108,6 @@ impl IrohMeshManagerRef {
             }
             x if x == MESH_MSG_NODE_LEAVING => IrohMeshEvent::NodeLeavingReceived {
                 node_id: remote_hex,
-            },
-            x if x == MESH_MSG_CONTAINER_LIST => IrohMeshEvent::ContainerListUpdate {
-                node_id: remote_hex,
-                data: payload,
             },
             x if x == MESH_MSG_COMMAND => IrohMeshEvent::MeshCommandReceived {
                 from_node_id: remote_hex,
