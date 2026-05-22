@@ -229,6 +229,64 @@ mod tests {
     }
 
     #[test]
+    fn classify_ufp2_carries_pairing_request_discriminator() {
+        // 4c2.2: pairing types travel UFP/2 just like heartbeat. The
+        // classifier extracts the legacy discriminator from the envelope's
+        // `kind` field so existing dispatch + frame_policy::is_pre_trust_frame
+        // continue to work unchanged.
+        let key = fresh_key();
+        let source = public_key_bytes(&key);
+        let dest = [0x33u8; NODE_ID_LEN];
+        let wire = build_signed_envelope_wire(
+            &key,
+            source,
+            dest,
+            tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST,
+            b"pairing-request-body".to_vec(),
+            0,
+        )
+        .unwrap();
+        let r = classify_inbound(wire[0], wire[1..].to_vec(), source, dest).unwrap();
+        match r {
+            InboundMeshFrame::Ufp2(decoded) => {
+                assert_eq!(
+                    decoded.legacy_discriminator,
+                    tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST
+                );
+                assert_eq!(decoded.body, b"pairing-request-body");
+            }
+            _ => panic!("expected Ufp2 branch"),
+        }
+    }
+
+    #[test]
+    fn classify_ufp2_carries_trusted_keys_sync_discriminator() {
+        let key = fresh_key();
+        let source = public_key_bytes(&key);
+        let dest = [0x44u8; NODE_ID_LEN];
+        let wire = build_signed_envelope_wire(
+            &key,
+            source,
+            dest,
+            tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
+            b"trusted-keys-payload".to_vec(),
+            0,
+        )
+        .unwrap();
+        let r = classify_inbound(wire[0], wire[1..].to_vec(), source, dest).unwrap();
+        match r {
+            InboundMeshFrame::Ufp2(decoded) => {
+                assert_eq!(
+                    decoded.legacy_discriminator,
+                    tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC
+                );
+                assert_eq!(decoded.body, b"trusted-keys-payload");
+            }
+            _ => panic!("expected Ufp2 branch"),
+        }
+    }
+
+    #[test]
     fn classify_unknown_first_byte_returns_protocol_error() {
         let peer = [0u8; NODE_ID_LEN];
         let local = [1u8; NODE_ID_LEN];

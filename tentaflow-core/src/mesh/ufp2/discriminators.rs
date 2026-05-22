@@ -20,50 +20,43 @@ pub const fn kind_from_legacy(disc: u8) -> Kind {
 
 /// Convert a UFP/2 `Kind` on the Mesh channel back to its legacy u8
 /// discriminator. Returns `None` if `kind.0` does not correspond to a
-/// currently-allocated `MESH_MSG_*` constant. We refuse to map kinds in
-/// unallocated holes of the 0x10..=0x4C range so a misbehaving sender
-/// cannot smuggle frames through the legacy dispatch table by claiming an
-/// unused discriminator.
+/// currently-migrated `MESH_MSG_*` constant. We refuse to map kinds for
+/// types not yet on the UFP/2 path so a misbehaving sender cannot smuggle
+/// frames through the legacy dispatch table by claiming a discriminator
+/// for an unmigrated message type — the legacy wire is the only valid
+/// path for those until their 4c2.x migration commit.
 pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
     if kind.0 > u8::MAX as u16 {
         return None;
     }
     let disc = kind.0 as u8;
-    if is_allocated_mesh_discriminator(disc) {
+    if is_migrated_to_ufp2_discriminator(disc) {
         Some(disc)
     } else {
         None
     }
 }
 
-/// True iff `disc` corresponds to a `MESH_MSG_*` constant currently
-/// allocated in `tentaflow_protocol::mesh`. Kept in sync with the legacy
-/// header: when new constants are added there, add them here AND to the
-/// `kinds` re-export below. The `discriminator_allowlist_matches_legacy_constants`
-/// test catches drift.
-pub fn is_allocated_mesh_discriminator(disc: u8) -> bool {
+/// True iff `disc` is a `MESH_MSG_*` discriminator whose send path has
+/// already been migrated to UFP/2 in some 4c2.x chunk. `send_ufp2_to_peer`
+/// uses this as a gate so that pre-migration types (which still go through
+/// the legacy `[disc][rkyv]` wire) are not accidentally double-routed
+/// through the UFP/2 path. Each 4c2.x chunk that migrates a new type
+/// extends this list AND the test below.
+///
+/// Currently migrated:
+/// - 4c2.1: HEARTBEAT
+/// - 4c2.2: PAIRING_REQUEST, PAIRING_CONFIRM, PAIRING_REJECT,
+///   TRUST_REVOKED, TRUSTED_KEYS_SYNC
+pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
         disc,
         legacy::MESH_MSG_HEARTBEAT
-            | legacy::MESH_MSG_CRDT_DELTA
-            | legacy::MESH_MSG_FULL_STATE
-            | legacy::MESH_MSG_FORWARD_REQ
-            | legacy::MESH_MSG_FORWARD_RES
-            | legacy::MESH_MSG_MODEL_LIST
-            | legacy::MESH_MSG_CONTAINER_LIST
-            | legacy::MESH_MSG_NODE_INFO
-            | legacy::MESH_MSG_HELLO
-            | legacy::MESH_MSG_TOPOLOGY_ANNOUNCE
-            | legacy::MESH_MSG_KNOWN_PEERS
             | legacy::MESH_MSG_PAIRING_REQUEST
             | legacy::MESH_MSG_PAIRING_CONFIRM
             | legacy::MESH_MSG_PAIRING_REJECT
             | legacy::MESH_MSG_TRUST_REVOKED
             | legacy::MESH_MSG_TRUSTED_KEYS_SYNC
-            | legacy::MESH_MSG_COMMAND
-            | legacy::MESH_MSG_COMMAND_RESPONSE
-            | legacy::MESH_MSG_DEPLOY_PROGRESS
-            | legacy::MESH_MSG_LOG_CHUNK
     )
 }
 
@@ -102,14 +95,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kind_roundtrip_via_legacy() {
+    fn kind_roundtrip_via_legacy_for_migrated_types() {
         for disc in [
             legacy::MESH_MSG_HEARTBEAT,
-            legacy::MESH_MSG_NODE_INFO,
             legacy::MESH_MSG_PAIRING_REQUEST,
+            legacy::MESH_MSG_PAIRING_CONFIRM,
+            legacy::MESH_MSG_PAIRING_REJECT,
+            legacy::MESH_MSG_TRUST_REVOKED,
             legacy::MESH_MSG_TRUSTED_KEYS_SYNC,
-            legacy::MESH_MSG_COMMAND,
-            legacy::MESH_MSG_TOPOLOGY_ANNOUNCE,
         ] {
             let kind = kind_from_legacy(disc);
             let back = legacy_from_kind(kind).unwrap();
@@ -124,13 +117,44 @@ mod tests {
     }
 
     #[test]
-    fn legacy_from_kind_rejects_unallocated_holes() {
-        // Holes in the 0x10..=0x4C range — these are NOT MESH_MSG_*
-        // constants and a sender claiming them MUST NOT route through the
-        // legacy dispatch.
-        assert!(legacy_from_kind(Kind(0x0017)).is_none()); // hole between MODEL_LIST/CONTAINER_LIST and NODE_INFO
-        assert!(legacy_from_kind(Kind(0x0025)).is_none()); // between TRUSTED_KEYS_SYNC and COMMAND-range
-        assert!(legacy_from_kind(Kind(0x0034)).is_none()); // between LOG_CHUNK (0x33) and 0x40 services
+    fn legacy_from_kind_rejects_unmigrated_discriminators() {
+        // Discriminators that ARE allocated MESH_MSG_* but have not yet
+        // been migrated to UFP/2 (4c2.3+) — sender claiming them through
+        // UFP/2 MUST be rejected so the legacy wire stays the only valid
+        // path until migration.
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HELLO as u16)).is_none());
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_COMMAND as u16)).is_none());
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_NODE_INFO as u16)).is_none());
+        // Holes in the 0x10..=0x4C range — not even legacy.
+        assert!(legacy_from_kind(Kind(0x0017)).is_none());
+        assert!(legacy_from_kind(Kind(0x0034)).is_none());
+    }
+
+    #[test]
+    fn migrated_discriminator_allowlist_matches_chunks() {
+        // 4c2.1 + 4c2.2 = 6 migrated types. When a new 4c2.x chunk lands,
+        // add its types here AND to `is_migrated_to_ufp2_discriminator`.
+        let migrated = [
+            legacy::MESH_MSG_HEARTBEAT,
+            legacy::MESH_MSG_PAIRING_REQUEST,
+            legacy::MESH_MSG_PAIRING_CONFIRM,
+            legacy::MESH_MSG_PAIRING_REJECT,
+            legacy::MESH_MSG_TRUST_REVOKED,
+            legacy::MESH_MSG_TRUSTED_KEYS_SYNC,
+        ];
+        for d in migrated {
+            assert!(
+                is_migrated_to_ufp2_discriminator(d),
+                "discriminator 0x{:02X} should be on the migrated allowlist",
+                d
+            );
+        }
+        // Future-chunk types: explicitly NOT migrated yet.
+        assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_NODE_INFO));
+        assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_COMMAND));
+        assert!(!is_migrated_to_ufp2_discriminator(
+            legacy::MESH_MSG_SYNC_PUSH
+        ));
     }
 
     #[test]

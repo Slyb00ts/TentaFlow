@@ -642,7 +642,7 @@ pub fn confirm_pairing(
                     if let Err(e) = qm.send_trusted_keys_sync(&node_id, &sync_data).await {
                         warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
                     }
-                    qm.broadcast_to_trusted(
+                    qm.broadcast_ufp2_to_trusted(
                         tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
                         &sync_data,
                         Some(&node_id),
@@ -754,7 +754,7 @@ pub fn revoke_trust(
         tokio::spawn(async move {
             // Wyslij PRZED revoke — klucze szyfrowania jeszcze istnieja.
             if let Err(e) = qm
-                .send_to_peer(
+                .send_ufp2_to_peer(
                     &revoked_id,
                     tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
                     &data,
@@ -766,7 +766,7 @@ pub fn revoke_trust(
                     revoked_id, e
                 );
             }
-            qm.broadcast_to_trusted(
+            qm.broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
                 &data,
                 Some(&revoked_id),
