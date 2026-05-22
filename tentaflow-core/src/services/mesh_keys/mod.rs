@@ -324,7 +324,7 @@ impl MeshKeyPool {
         // Step 3 — fan out to every trusted peer in parallel. `broadcast_to_trusted`
         // returns one (peer_id, Result) tuple per attempted peer.
         let results = iroh_manager
-            .broadcast_to_trusted(
+            .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_HMAC_KEYS_SYNC,
                 &bytes,
                 None,
