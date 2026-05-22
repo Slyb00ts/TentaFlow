@@ -123,15 +123,12 @@ mod tests {
         assert!(is_migrated_to_ufp2_discriminator(
             tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED
         ));
-        // Not yet migrated — future 4c2.x will add these to the allowlist.
+        // Bi-stream types — never go through the UFP/2 unicast send path.
         assert!(!is_migrated_to_ufp2_discriminator(
-            tentaflow_protocol::mesh::MESH_MSG_NODE_INFO
+            tentaflow_protocol::mesh::MESH_MSG_FORWARD_REQ
         ));
         assert!(!is_migrated_to_ufp2_discriminator(
-            tentaflow_protocol::mesh::MESH_MSG_HELLO
-        ));
-        assert!(!is_migrated_to_ufp2_discriminator(
-            tentaflow_protocol::mesh::MESH_MSG_CRDT_DELTA
+            tentaflow_protocol::mesh::MESH_MSG_FORWARD_STREAM_REQ
         ));
     }
 
