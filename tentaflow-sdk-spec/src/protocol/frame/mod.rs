@@ -32,6 +32,7 @@ pub mod error;
 pub mod flags;
 pub mod fragment;
 pub mod pipeline;
+pub mod replay;
 pub mod sign;
 
 pub use address::{NodeAddress, NodeAddressKind};
@@ -61,4 +62,8 @@ pub use fragment::{
     finalize_reassembled_envelope, split_envelope_into_fragments, AcceptOutcome,
     FragmentSendCrypto, ReassemblyManager, AEAD_OVERHEAD_BYTES, MAX_FRAGMENT_COUNT,
     MAX_REASSEMBLY_BYTES, REASSEMBLY_TIMEOUT_MS,
+};
+pub use replay::{
+    check_clock_skew_with, DedupKey, ReplayGuard, DEFAULT_CLOCK_SKEW_MS,
+    DEFAULT_DEDUP_CAPACITY_PER_SOURCE, NON_FRAGMENT_INDEX_SENTINEL,
 };
