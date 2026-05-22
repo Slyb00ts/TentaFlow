@@ -1185,7 +1185,7 @@ impl IrohMeshManager {
             let id = entry.key().clone();
             futs.push(async move {
                 let _ = self
-                    .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
+                    .send_ufp2_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
                     .await;
             });
         }
@@ -1193,19 +1193,19 @@ impl IrohMeshManager {
     }
 
     pub async fn send_node_info(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data)
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data)
             .await
     }
 
     pub async fn send_hello(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_HELLO, data)
+        self.send_ufp2_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_HELLO, data)
             .await
     }
 
     /// Wysyla TopologyAnnounce do jednego zaufanego peera (unicast).
     /// Broadcast realizuje pipeline przez iteracje listy peerow.
     pub async fn send_topology_announce(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_TOPOLOGY_ANNOUNCE,
             data,
@@ -1214,7 +1214,7 @@ impl IrohMeshManager {
     }
 
     pub async fn send_known_peers(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_KNOWN_PEERS,
             data,
@@ -1308,25 +1308,25 @@ impl IrohMeshManager {
     pub async fn send_node_leaving(&self) {
         let data = vec![];
         let _ = self
-            .broadcast_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_LEAVING, &data, None)
+            .broadcast_ufp2_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_LEAVING, &data, None)
             .await;
     }
 
     pub async fn broadcast_node_info(&self, data: &[u8]) {
         let _ = self
-            .broadcast_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data, None)
+            .broadcast_ufp2_to_trusted(tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data, None)
             .await;
     }
 
     pub async fn broadcast_crdt_delta(&self, data: Vec<u8>) {
         let _ = self
-            .broadcast_to_trusted(tentaflow_protocol::mesh::MESH_MSG_CRDT_DELTA, &data, None)
+            .broadcast_ufp2_to_trusted(tentaflow_protocol::mesh::MESH_MSG_CRDT_DELTA, &data, None)
             .await;
     }
 
     pub async fn broadcast_alias_sync(&self, aliases_json: Vec<u8>) {
         let _ = self
-            .broadcast_to_trusted(
+            .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_ALIAS_SYNC,
                 &aliases_json,
                 None,
