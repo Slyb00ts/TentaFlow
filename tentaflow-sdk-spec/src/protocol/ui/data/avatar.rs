@@ -8,8 +8,8 @@ use super::super::tokens::{
     AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus, Tone,
 };
 use super::super::typed_field::{
-    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
-    unknown_field, IntoComponentError,
+    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
+    ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
 
@@ -88,6 +88,9 @@ impl AvatarGroup {
     pub const TAG: u16 = 0x020E;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for a in &self.avatars {
+            ensure_ref_tag_encode(a.tag, Avatar::TAG, "AvatarGroup", "avatars")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
         entries.push((0, encode_to_value(&self.avatars)?));
         entries.push((1, encode_to_value(&self.max_visible)?));
@@ -112,8 +115,12 @@ impl AvatarGroup {
                 other => return Err(unknown_field("AvatarGroup", *other)),
             }
         }
+        let avatars: Vec<Component> = avatars.unwrap_or_default();
+        for a in &avatars {
+            ensure_ref_tag_decode(a.tag, Avatar::TAG, "AvatarGroup", "avatars")?;
+        }
         Ok(AvatarGroup {
-            avatars: avatars.unwrap_or_default(),
+            avatars,
             max_visible: max_visible.ok_or_else(|| missing_field("AvatarGroup", "max_visible"))?,
             overlap: overlap.ok_or_else(|| missing_field("AvatarGroup", "overlap"))?,
             size: size.ok_or_else(|| missing_field("AvatarGroup", "size"))?,
