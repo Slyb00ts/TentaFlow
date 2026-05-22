@@ -3240,3 +3240,27 @@ impl<'b, C> Decode<'b, C> for GridTrack {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// LogEvent — inline struct for VirtualizedLog (catalog §8 0x0611).
+// -----------------------------------------------------------------------------
+
+/// One entry in a `VirtualizedLog.events_path` stream (catalog §8 0x0611).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct LogEvent {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub ts_ms: i64,
+    #[n(2)]
+    pub level: super::tokens::LogLevel,
+    #[n(3)]
+    pub source: Option<String>,
+    #[n(4)]
+    pub message: BindRef,
+    #[n(5)]
+    pub details: Option<crate::protocol::control::CborMap>,
+    #[n(6)]
+    pub trace_id: Option<String>,
+}
