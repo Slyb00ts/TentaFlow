@@ -525,6 +525,21 @@ impl MeshSecurity {
         self.signing_key.sign(data).to_bytes().to_vec()
     }
 
+    /// Reference to the node's Ed25519 signing key. Used by the UFP/2 mesh
+    /// codec to sign outgoing envelopes via `sdk_spec::frame::sign_envelope`.
+    /// Crate-internal only — never exposed across the FFI boundary.
+    pub(crate) fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    /// Raw 32-byte Ed25519 public key for the local node. Mirrors the
+    /// hex-encoded value returned by `ed25519_public_key_hex` but in the
+    /// byte shape expected by `NodeAddress::node` and UFP/2 envelope
+    /// signature scope (§6.3).
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.verifying_key.to_bytes()
+    }
+
     /// Weryfikuje podpis od zaufanego noda.
     pub fn verify(&self, node_id: &str, data: &[u8], signature_bytes: &[u8]) -> Result<bool> {
         let key = self
