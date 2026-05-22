@@ -9,6 +9,7 @@
 
 pub mod gallery;
 pub mod iframe;
+pub mod log;
 pub mod map;
 pub mod media;
 pub mod telemetry;
@@ -17,6 +18,7 @@ pub mod wizard;
 
 pub use gallery::{Carousel, ImageGallery, PdfViewer};
 pub use iframe::IFrame;
+pub use log::VirtualizedLog;
 pub use map::MapView;
 pub use media::{Audio, LiveCameraTile, VideoStream};
 pub use telemetry::{FpsCounter, Stopwatch};
@@ -30,9 +32,9 @@ mod tests {
     use crate::protocol::ui::component::{Component, FieldMap};
     use crate::protocol::ui::inline::{AspectRatio, DimensionToken, StepDef};
     use crate::protocol::ui::tokens::{
-        AudioControls, AudioVariant, CarouselGestures, CodeEditorTheme, FpsVariant,
-        IFrameReferrerPolicy, IFrameSandbox, ImageFit, PdfZoomMode, Spacing, StepProgressVariant,
-        StopwatchVariant, TerminalTheme, TileProvider, Tone, VideoControls,
+        AudioControls, AudioVariant, CarouselGestures, CodeEditorTheme, Density, FpsVariant,
+        IFrameReferrerPolicy, IFrameSandbox, ImageFit, LogLevel, LogVariant, PdfZoomMode, Spacing,
+        StepProgressVariant, StopwatchVariant, TerminalTheme, TileProvider, Tone, VideoControls,
     };
     use crate::protocol::value::Value;
 
@@ -203,6 +205,58 @@ mod tests {
             referrer_policy: IFrameReferrerPolicy::NoReferrer,
         };
         rt(v, |m| m.into_component("if").unwrap(), IFrame::try_from_component);
+    }
+
+    #[test]
+    fn virtualized_log_roundtrip() {
+        let v = VirtualizedLog {
+            events_path: p("events"),
+            variant: LogVariant::Expanded,
+            max_buffer_events: 5_000,
+            auto_scroll: true, searchable: true,
+            filter_levels: vec![LogLevel::Info, LogLevel::Warn, LogLevel::Error],
+            show_timestamps: true, show_source: false, copyable: true,
+            height: DimensionToken::Full,
+            max_height: Some(DimensionToken::Px { value: 600 }),
+            density: Density::Compact,
+        };
+        rt(v, |m| m.into_component("vl").unwrap(), VirtualizedLog::try_from_component);
+    }
+
+    #[test]
+    fn virtualized_log_default_max_buffer_events() {
+        // max_buffer_events absent → defaults to 10_000.
+        let v = VirtualizedLog {
+            events_path: p("ev"),
+            variant: LogVariant::Default,
+            max_buffer_events: 10_000,
+            auto_scroll: true, searchable: false,
+            filter_levels: vec![],
+            show_timestamps: true, show_source: false, copyable: false,
+            height: DimensionToken::Full, max_height: None,
+            density: Density::Default,
+        };
+        let mut c = v.clone().into_component("vl").unwrap();
+        c.fields.0.retain(|(k, _)| *k != 2);
+        assert_eq!(VirtualizedLog::try_from_component(&c).unwrap(), v);
+    }
+
+    #[test]
+    fn virtualized_log_default_height_full() {
+        // height absent → defaults to DimensionToken::Full.
+        let v = VirtualizedLog {
+            events_path: p("ev"),
+            variant: LogVariant::Default,
+            max_buffer_events: 1000,
+            auto_scroll: true, searchable: false,
+            filter_levels: vec![],
+            show_timestamps: false, show_source: false, copyable: false,
+            height: DimensionToken::Full, max_height: None,
+            density: Density::Default,
+        };
+        let mut c = v.clone().into_component("vl").unwrap();
+        c.fields.0.retain(|(k, _)| *k != 9);
+        assert_eq!(VirtualizedLog::try_from_component(&c).unwrap(), v);
     }
 
     #[test]
