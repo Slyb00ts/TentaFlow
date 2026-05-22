@@ -108,6 +108,31 @@ mod tests {
     }
 
     #[test]
+    fn build_signed_envelope_wire_lower_layer_has_no_discriminator_gate() {
+        // build_signed_envelope_wire itself does NOT gate discriminators —
+        // it's a lower-level builder. The gate is in
+        // `IrohMeshManager::send_ufp2_to_peer` via
+        // `is_migrated_to_ufp2_discriminator`. This test documents the
+        // boundary so future 4c2.x migrations know to route through the
+        // manager helper rather than calling the builder directly with
+        // raw u8 values.
+        use crate::mesh::ufp2::is_migrated_to_ufp2_discriminator;
+        assert!(is_migrated_to_ufp2_discriminator(
+            tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST
+        ));
+        assert!(is_migrated_to_ufp2_discriminator(
+            tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED
+        ));
+        // Not yet migrated — future 4c2.x will add these to the allowlist.
+        assert!(!is_migrated_to_ufp2_discriminator(
+            tentaflow_protocol::mesh::MESH_MSG_NODE_INFO
+        ));
+        assert!(!is_migrated_to_ufp2_discriminator(
+            tentaflow_protocol::mesh::MESH_MSG_COMMAND
+        ));
+    }
+
+    #[test]
     fn signed_envelope_tamper_detected_at_decode() {
         let key = fresh_key();
         let source = public_key_bytes(&key);
