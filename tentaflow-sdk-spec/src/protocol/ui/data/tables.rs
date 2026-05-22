@@ -12,6 +12,7 @@ use super::super::typed_field::{
 };
 use super::super::super::value::Value;
 use super::super::actions::Button;
+use super::super::molecules::EmptyState;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
@@ -53,6 +54,9 @@ impl Table {
     pub const TAG: u16 = 0x0211;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        if let Some(es) = &self.empty_state {
+            ensure_ref_tag_encode(es.tag, EmptyState::TAG, "Table", "empty_state")?;
+        }
         for b in &self.row_actions {
             ensure_ref_tag_encode(b.tag, Button::TAG, "Table", "row_actions")?;
         }
@@ -138,7 +142,13 @@ impl Table {
             sticky_header: sticky_header.ok_or_else(|| missing_field("Table", "sticky_header"))?,
             sticky_columns: sticky_columns.ok_or_else(|| missing_field("Table", "sticky_columns"))?,
             pagination,
-            empty_state,
+            empty_state: {
+                let es: Option<Component> = empty_state;
+                if let Some(c) = &es {
+                    ensure_ref_tag_decode(c.tag, EmptyState::TAG, "Table", "empty_state")?;
+                }
+                es
+            },
             row_actions: {
                 let v: Vec<Component> = row_actions.unwrap_or_default();
                 for b in &v {
@@ -181,6 +191,9 @@ impl List {
     pub const TAG: u16 = 0x0212;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        if let Some(es) = &self.empty_state {
+            ensure_ref_tag_encode(es.tag, EmptyState::TAG, "List", "empty_state")?;
+        }
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(7);
         e.push((0, encode_to_value(&self.items_path)?));
         e.push((1, encode_to_value(&self.item_template_id)?));
@@ -220,7 +233,13 @@ impl List {
             divider: divider.ok_or_else(|| missing_field("List", "divider"))?,
             density: density.ok_or_else(|| missing_field("List", "density"))?,
             virtualize: virtualize.ok_or_else(|| missing_field("List", "virtualize"))?,
-            empty_state,
+            empty_state: {
+                let es: Option<Component> = empty_state;
+                if let Some(c) = &es {
+                    ensure_ref_tag_decode(c.tag, EmptyState::TAG, "List", "empty_state")?;
+                }
+                es
+            },
             max_visible,
         })
     }

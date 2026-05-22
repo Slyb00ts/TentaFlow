@@ -295,6 +295,27 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_rejects_non_searchbox_in_search_slot() {
+        // ComponentRef<SearchBox> (0x0307) — provide a Fab (0x040C) instead.
+        let bad = Toolbar {
+            search: Some(non_button("nope")), // 0x040C
+            filters: vec![], view_mode: None, sort_control: None,
+            trailing_actions: vec![], density: Density::Default,
+        };
+        assert!(bad.into_component("tb").is_err());
+    }
+
+    #[test]
+    fn stat_group_rejects_non_statcard() {
+        // ComponentRef<StatCard> (0x0208) — provide a Fab instead.
+        let bad = StatGroup {
+            stats: vec![non_button("nope")],
+            columns: 2, density: Density::Default,
+        };
+        assert!(bad.into_component("sg").is_err());
+    }
+
+    #[test]
     fn inspector_rejects_non_button_action() {
         let bad = Inspector {
             title: lit("t"), content_slot: "x".into(),
