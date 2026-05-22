@@ -464,3 +464,79 @@
   background: var(--tf-bg-accent);
   color: var(--text-inverse, #fff);
 }
+
+/* =============================================================================
+   tf-breadcrumb (0x0110) + tf-pagination (0x0111) — chunk 3.3a-5
+   ============================================================================= */
+.tf-breadcrumb {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.tf-breadcrumb__list {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  min-width: 0;
+}
+.tf-breadcrumb__item { display: inline-flex; align-items: center; min-width: 0; }
+.tf-breadcrumb__item--current { font-weight: 600; }
+.tf-breadcrumb__item--ellipsis { color: var(--text-muted, #888); }
+.tf-breadcrumb__link {
+  color: inherit;
+  text-decoration: none;
+  padding: var(--tf-space-xxs) var(--tf-space-xs);
+  border-radius: var(--tf-radius-sm);
+}
+.tf-breadcrumb__link[role="link"] { cursor: pointer; }
+.tf-breadcrumb__link[role="link"]:hover { background: var(--tf-bg-subtle); }
+.tf-breadcrumb__separator {
+  color: var(--text-muted, #888);
+  list-style: none;
+  user-select: none;
+}
+
+.tf-pagination {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+}
+.tf-pagination__btn,
+.tf-pagination__page {
+  background: transparent;
+  border: 1px solid currentColor;
+  padding: var(--tf-space-xs) var(--tf-space-sm);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  border-radius: var(--tf-radius-sm);
+  min-width: 2em;
+}
+.tf-pagination__btn[disabled],
+.tf-pagination__page[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.tf-pagination__page--current {
+  background: var(--tf-bg-accent);
+  color: var(--text-inverse, #fff);
+  border-color: var(--tf-bg-accent);
+}
+.tf-pagination__middle {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+}
+.tf-pagination__ellipsis { color: var(--text-muted, #888); padding: 0 var(--tf-space-xxs); }
+.tf-pagination__summary { color: var(--text-muted, #888); font-size: 0.85em; }
+.tf-pagination__input {
+  width: 4em;
+  padding: var(--tf-space-xs);
+  font: inherit;
+  border: 1px solid currentColor;
+  border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-subtle);
+}
