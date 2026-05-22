@@ -43,10 +43,12 @@ fn main() -> ExitCode {
     if decoded != expected {
         eprintln!(
             "self_test: manifest payload diverges from in-process registry \
-            ({} vs {} components, {} vs {} enums, {} vs {} inline structs)",
+            ({} vs {} components, {} vs {} enums, {} vs {} inline structs, \
+            {} vs {} tagged unions)",
             decoded.components.len(), expected.components.len(),
             decoded.enums.len(), expected.enums.len(),
             decoded.inline_structs.len(), expected.inline_structs.len(),
+            decoded.tagged_unions.len(), expected.tagged_unions.len(),
         );
         return ExitCode::from(4);
     }
@@ -69,9 +71,11 @@ fn main() -> ExitCode {
         return ExitCode::from(6);
     }
     eprintln!(
-        "self_test: OK ({} components, {} enums, {} inline structs, {} bytes, byte-canonical)",
+        "self_test: OK ({} components, {} enums, {} inline structs, {} tagged unions, \
+        {} bytes, byte-canonical)",
         decoded.components.len(), decoded.enums.len(),
-        decoded.inline_structs.len(), bytes.len(),
+        decoded.inline_structs.len(), decoded.tagged_unions.len(),
+        bytes.len(),
     );
     ExitCode::SUCCESS
 }

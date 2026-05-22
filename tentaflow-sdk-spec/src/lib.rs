@@ -96,8 +96,8 @@ pub use protocol::{
             PanelReset, PanelShell, Viewport,
         },
         schema::{
-            section as schema_section, ComponentMeta, EnumMeta, FieldMeta, InlineMeta,
-            ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS,
+            section as schema_section, ComponentMeta, EnumMeta, FieldMeta, InlineMeta, UnionMeta,
+            VariantMeta, ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS, ALL_TAGGED_UNIONS,
         },
         patch::{PatchOp, PatchOpKind},
         slot::{
