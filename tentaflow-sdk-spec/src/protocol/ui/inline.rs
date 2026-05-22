@@ -16,6 +16,7 @@ use super::bind::{BindRef, StatePath};
 use super::handler::LocalAction;
 use super::icon_name::IconName;
 use super::tokens::{BadgeVariant, IconSize, Tone};
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 // -----------------------------------------------------------------------------
 // IconRef
@@ -117,13 +118,34 @@ impl<'b, C> Decode<'b, C> for IconRef {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "name" => name = Some(IconName::decode(d, ctx)?),
-                "size" => size = Some(IconSize::decode(d, ctx)?),
-                "tone" => tone = Some(Tone::decode(d, ctx)?),
-                "ref" => ref_ = Some(d.str()?.to_string()),
-                "size_px" => size_px = Some(d.u16()?),
-                "alt" => alt = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "IconRef", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "name" => {
+                    assert_no_dup_tstr(&name, "IconRef", "name")?;
+                    name = Some(IconName::decode(d, ctx)?);
+                }
+                "size" => {
+                    assert_no_dup_tstr(&size, "IconRef", "size")?;
+                    size = Some(IconSize::decode(d, ctx)?);
+                }
+                "tone" => {
+                    assert_no_dup_tstr(&tone, "IconRef", "tone")?;
+                    tone = Some(Tone::decode(d, ctx)?);
+                }
+                "ref" => {
+                    assert_no_dup_tstr(&ref_, "IconRef", "ref")?;
+                    ref_ = Some(d.str()?.to_string());
+                }
+                "size_px" => {
+                    assert_no_dup_tstr(&size_px, "IconRef", "size_px")?;
+                    size_px = Some(d.u16()?);
+                }
+                "alt" => {
+                    assert_no_dup_tstr(&alt, "IconRef", "alt")?;
+                    alt = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown IconRef key: {other}"
@@ -225,10 +247,22 @@ impl<'b, C> Decode<'b, C> for AvatarRef {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "ref" => ref_ = Some(d.str()?.to_string()),
-                "initials" => initials = Some(d.str()?.to_string()),
-                "icon" => icon = Some(IconRef::decode(d, ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "AvatarRef", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "ref" => {
+                    assert_no_dup_tstr(&ref_, "AvatarRef", "ref")?;
+                    ref_ = Some(d.str()?.to_string());
+                }
+                "initials" => {
+                    assert_no_dup_tstr(&initials, "AvatarRef", "initials")?;
+                    initials = Some(d.str()?.to_string());
+                }
+                "icon" => {
+                    assert_no_dup_tstr(&icon, "AvatarRef", "icon")?;
+                    icon = Some(IconRef::decode(d, ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown AvatarRef key: {other}"
@@ -411,8 +445,14 @@ impl<'b, C> Decode<'b, C> for SelectValue {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "value" => value_raw = Some(Value::decode(d, _ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "SelectValue", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value_raw, "SelectValue", "value")?;
+                    value_raw = Some(Value::decode(d, _ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown SelectValue key: {other}"
@@ -1601,13 +1641,23 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "value" => match kind.as_deref() {
-                    Some("spacing") => {
-                        spacing_value = Some(super::tokens::Spacing::decode(d, ctx)?);
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "DimensionToken", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    if value_raw.is_some() || spacing_value.is_some() {
+                        return Err(minicbor::decode::Error::message(
+                            "DimensionToken: duplicate key 'value'",
+                        ));
                     }
-                    _ => value_raw = Some(Value::decode(d, ctx)?),
-                },
+                    match kind.as_deref() {
+                        Some("spacing") => {
+                            spacing_value = Some(super::tokens::Spacing::decode(d, ctx)?);
+                        }
+                        _ => value_raw = Some(Value::decode(d, ctx)?),
+                    }
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown DimensionToken key: {other}"
@@ -1762,8 +1812,14 @@ impl<'b, C> Decode<'b, C> for AspectRatio {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "ratio" => ratio = Some(d.f32()?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "AspectRatio", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "ratio" => {
+                    assert_no_dup_tstr(&ratio, "AspectRatio", "ratio")?;
+                    ratio = Some(d.f32()?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown AspectRatio key: {other}"
@@ -1887,8 +1943,14 @@ impl<'b, C> Decode<'b, C> for TableColumnWidth {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "value" => value = Some(d.u64()?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "TableColumnWidth", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "TableColumnWidth", "value")?;
+                    value = Some(d.u64()?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown TableColumnWidth key: {other}"
@@ -2041,13 +2103,32 @@ impl<'b, C> Decode<'b, C> for HeatmapScale {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "min" => min = Some(d.f64()?),
-                "max" => max = Some(d.f64()?),
-                "color_from" => color_from = Some(Tone::decode(d, ctx)?),
-                "color_to" => color_to = Some(Tone::decode(d, ctx)?),
-                "base" => base = Some(d.f64()?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "HeatmapScale", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "min" => {
+                    assert_no_dup_tstr(&min, "HeatmapScale", "min")?;
+                    min = Some(d.f64()?);
+                }
+                "max" => {
+                    assert_no_dup_tstr(&max, "HeatmapScale", "max")?;
+                    max = Some(d.f64()?);
+                }
+                "color_from" => {
+                    assert_no_dup_tstr(&color_from, "HeatmapScale", "color_from")?;
+                    color_from = Some(Tone::decode(d, ctx)?);
+                }
+                "color_to" => {
+                    assert_no_dup_tstr(&color_to, "HeatmapScale", "color_to")?;
+                    color_to = Some(Tone::decode(d, ctx)?);
+                }
+                "base" => {
+                    assert_no_dup_tstr(&base, "HeatmapScale", "base")?;
+                    base = Some(d.f64()?);
+                }
                 "buckets" => {
+                    assert_no_dup_tstr(&buckets, "HeatmapScale", "buckets")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -2202,8 +2283,14 @@ impl<'b, C> Decode<'b, C> for DatePresetResolve {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "offset_days" => offset_days = Some(d.i32()?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "DatePresetResolve", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "offset_days" => {
+                    assert_no_dup_tstr(&offset_days, "DatePresetResolve", "offset_days")?;
+                    offset_days = Some(d.i32()?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown DatePresetResolve key: {other}"

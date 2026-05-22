@@ -10,6 +10,7 @@ use minicbor::{Decode, Decoder, Encode, Encoder};
 use super::envelope::ProtocolVersion;
 use super::ids::{DeviceId, Hash32, SessionId};
 use super::value::Value;
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -202,10 +203,22 @@ impl<'b, C> Decode<'b, C> for ResumeStatus {
         for _ in 0..len {
             let key = d.str()?;
             match key {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "mode" => mode = Some(ResumeMode::decode(d, ctx)?),
-                "next_msg_id" => next_msg_id = Some(d.u64()?),
-                "reason" => reason = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "ResumeStatus", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "mode" => {
+                    assert_no_dup_tstr(&mode, "ResumeStatus", "mode")?;
+                    mode = Some(ResumeMode::decode(d, ctx)?);
+                }
+                "next_msg_id" => {
+                    assert_no_dup_tstr(&next_msg_id, "ResumeStatus", "next_msg_id")?;
+                    next_msg_id = Some(d.u64()?);
+                }
+                "reason" => {
+                    assert_no_dup_tstr(&reason, "ResumeStatus", "reason")?;
+                    reason = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown ResumeStatus key: {other}"
@@ -410,8 +423,12 @@ impl<'b, C> Decode<'b, C> for RejectReason {
         for _ in 0..len {
             let key = d.str()?;
             match key {
-                "kind" => kind = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "RejectReason", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
                 "supported" => {
+                    assert_no_dup_tstr(&supported, "RejectReason", "supported")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -421,8 +438,14 @@ impl<'b, C> Decode<'b, C> for RejectReason {
                     }
                     supported = Some(v);
                 }
-                "method" => method = Some(d.str()?.to_string()),
-                "capability" => capability = Some(d.str()?.to_string()),
+                "method" => {
+                    assert_no_dup_tstr(&method, "RejectReason", "method")?;
+                    method = Some(d.str()?.to_string());
+                }
+                "capability" => {
+                    assert_no_dup_tstr(&capability, "RejectReason", "capability")?;
+                    capability = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown RejectReason key: {other}"
@@ -646,9 +669,18 @@ impl<'b, C> Decode<'b, C> for RateLimitScope {
         for _ in 0..len {
             let key = d.str()?;
             match key {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "channel" => channel = Some(d.u8()?),
-                "action_id" => action_id = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "RateLimitScope", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "channel" => {
+                    assert_no_dup_tstr(&channel, "RateLimitScope", "channel")?;
+                    channel = Some(d.u8()?);
+                }
+                "action_id" => {
+                    assert_no_dup_tstr(&action_id, "RateLimitScope", "action_id")?;
+                    action_id = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown RateLimitScope key: {other}"

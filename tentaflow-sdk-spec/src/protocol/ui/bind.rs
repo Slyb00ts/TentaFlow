@@ -8,6 +8,7 @@
 use minicbor::{Decode, Decoder, Encode, Encoder};
 
 use crate::protocol::value::Value;
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 /// Maximum number of segments per StatePath (matches ServerLimits.max_state_path_segments).
 pub const MAX_STATE_PATH_SEGMENTS: usize = 32;
@@ -63,8 +64,12 @@ impl<'b, C> Decode<'b, C> for PathSegment {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "PathSegment", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
                 "value" => {
+                    assert_no_dup_tstr(&key_value, "PathSegment", "value")?;
                     // Value type depends on already-known kind. If kind not yet
                     // seen we decode as either tstr or u32 by peeking datatype.
                     match kind.as_deref() {
@@ -231,9 +236,18 @@ impl<'b, C> Decode<'b, C> for BindRef {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "value" => value = Some(Value::decode(d, ctx)?),
-                "path" => path = Some(StatePath::decode(d, ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "BindRef", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "BindRef", "value")?;
+                    value = Some(Value::decode(d, ctx)?);
+                }
+                "path" => {
+                    assert_no_dup_tstr(&path, "BindRef", "path")?;
+                    path = Some(StatePath::decode(d, ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown BindRef key: {other}"
@@ -407,16 +421,38 @@ impl<'b, C> Decode<'b, C> for BindSpec {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "path" => path = Some(StatePath::decode(d, ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "BindSpec", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "path" => {
+                    assert_no_dup_tstr(&path, "BindSpec", "path")?;
+                    path = Some(StatePath::decode(d, ctx)?);
+                }
                 "format" => {
+                    assert_no_dup_tstr(&format, "BindSpec", "format")?;
                     format = Some(super::value_format::ValueFormat::decode(d, ctx)?)
                 }
-                "name" => name = Some(d.str()?.to_string()),
-                "class_name" => class_name = Some(d.str()?.to_string()),
-                "negate" => negate = Some(d.bool()?),
-                "item_template_id" => item_template_id = Some(d.str()?.to_string()),
-                "key_field" => key_field = Some(d.str()?.to_string()),
+                "name" => {
+                    assert_no_dup_tstr(&name, "BindSpec", "name")?;
+                    name = Some(d.str()?.to_string());
+                }
+                "class_name" => {
+                    assert_no_dup_tstr(&class_name, "BindSpec", "class_name")?;
+                    class_name = Some(d.str()?.to_string());
+                }
+                "negate" => {
+                    assert_no_dup_tstr(&negate, "BindSpec", "negate")?;
+                    negate = Some(d.bool()?);
+                }
+                "item_template_id" => {
+                    assert_no_dup_tstr(&item_template_id, "BindSpec", "item_template_id")?;
+                    item_template_id = Some(d.str()?.to_string());
+                }
+                "key_field" => {
+                    assert_no_dup_tstr(&key_field, "BindSpec", "key_field")?;
+                    key_field = Some(d.str()?.to_string());
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown BindSpec key: {other}"
