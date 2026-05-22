@@ -290,6 +290,16 @@ mod tests {
     }
 
     #[test]
+    fn manifest_bytes_pass_strict_canonical_validation() {
+        // The end-to-end smoke test for Krok 4a — the manifest we ship must
+        // satisfy the canonical-CBOR validator we built for the host wire.
+        let m = build_manifest();
+        let bytes = minicbor::to_vec(&m).expect("encode");
+        tentaflow_sdk_spec::validate_canonical(&bytes)
+            .expect("emitted manifest must be canonical CBOR");
+    }
+
+    #[test]
     fn manifest_encoding_is_byte_stable() {
         let m = build_manifest();
         let b1 = minicbor::to_vec(&m).unwrap();

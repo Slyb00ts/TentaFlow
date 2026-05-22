@@ -20,6 +20,7 @@
 pub mod protocol;
 
 pub use protocol::{
+    canonical::{validate_canonical, CanonicalError, CanonicalErrorKind},
     control::{
         AuthContext, Backpressure, BackpressureSeverity, Capability, CapabilityRejection,
         CapabilityRevoked, CborMap, ControlPayload, ControlTag, CreditBudget, CreditGrant,

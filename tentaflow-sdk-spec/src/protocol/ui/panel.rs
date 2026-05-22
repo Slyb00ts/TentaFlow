@@ -20,7 +20,7 @@ pub struct Viewport {
     #[n(1)]
     pub height_px: u32,
     #[n(2)]
-    pub density: f32,
+    pub density: f64,
 }
 
 /// Panel-open context enriched by core (assigned_epoch is core-controlled).

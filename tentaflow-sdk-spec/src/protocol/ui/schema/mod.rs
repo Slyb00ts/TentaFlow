@@ -74,7 +74,7 @@ mod tests {
     /// `types.rs` grammar comment.
     fn validate_wire(s: &str) -> Result<(), String> {
         let primitives = [
-            "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64", "tstr",
+            "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f64", "tstr",
             "BindRef", "StatePath", "Component", "CborMap", "Value",
         ];
         if primitives.contains(&s) {
