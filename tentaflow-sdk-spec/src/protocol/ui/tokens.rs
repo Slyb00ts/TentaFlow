@@ -1290,3 +1290,57 @@ string_enum! {
         Full = "full",
     }
 }
+
+string_enum! {
+    /// `Carousel.gestures` (catalog §8 0x060C).
+    pub enum CarouselGestures {
+        Swipe = "swipe",
+        ArrowsOnly = "arrows_only",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// `PdfViewer.zoom_mode` (catalog §8 0x060D).
+    pub enum PdfZoomMode {
+        FitWidth = "fit_width",
+        FitHeight = "fit_height",
+        Actual = "actual",
+        Custom = "custom",
+    }
+}
+
+string_enum! {
+    /// `StepProgress.variant` (catalog §8 0x060F).
+    pub enum StepProgressVariant {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+        Compact = "compact",
+    }
+}
+
+string_enum! {
+    /// `IFrame.sandbox` token (catalog §8 0x060A). Allow-listed tokens only;
+    /// host validator rejects `allow-same-origin`, `allow-top-navigation`,
+    /// `allow-popups-to-escape-sandbox` per spec.
+    pub enum IFrameSandbox {
+        AllowScripts = "allow-scripts",
+        AllowForms = "allow-forms",
+        AllowPopups = "allow-popups",
+        AllowModals = "allow-modals",
+    }
+}
+
+string_enum! {
+    /// `IFrame.referrer_policy` (catalog §8 0x060A). Default `no-referrer`.
+    pub enum IFrameReferrerPolicy {
+        NoReferrer = "no-referrer",
+        NoReferrerWhenDowngrade = "no-referrer-when-downgrade",
+        Origin = "origin",
+        OriginWhenCrossOrigin = "origin-when-cross-origin",
+        SameOrigin = "same-origin",
+        StrictOrigin = "strict-origin",
+        StrictOriginWhenCrossOrigin = "strict-origin-when-cross-origin",
+        UnsafeUrl = "unsafe-url",
+    }
+}
