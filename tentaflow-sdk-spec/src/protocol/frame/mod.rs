@@ -30,6 +30,7 @@ pub mod compress;
 pub mod envelope;
 pub mod error;
 pub mod flags;
+pub mod fragment;
 pub mod pipeline;
 pub mod sign;
 
@@ -56,3 +57,8 @@ pub use compress::{
     COMPRESSION_THRESHOLD_BYTES, DEFAULT_MAX_DECOMPRESSED_BYTES,
 };
 pub use pipeline::{receive_envelope_pipeline, send_envelope_pipeline, ReceiveCrypto, SendCrypto};
+pub use fragment::{
+    finalize_reassembled_envelope, split_envelope_into_fragments, AcceptOutcome,
+    FragmentSendCrypto, ReassemblyManager, AEAD_OVERHEAD_BYTES, MAX_FRAGMENT_COUNT,
+    MAX_REASSEMBLY_BYTES, REASSEMBLY_TIMEOUT_MS,
+};
