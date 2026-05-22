@@ -511,7 +511,7 @@ pub const ICONREF_UNION: UnionMeta = UnionMeta {
             rust_name: "Named",
             wire_kind: "named",
             fields: &[
-                FieldMeta { key: 0, name: "name", wire: "Inline<IconName>", required: true, default: None },
+                FieldMeta { key: 0, name: "name", wire: "Enum<IconName>", required: true, default: None },
                 FieldMeta { key: 1, name: "size", wire: "Option<Enum<IconSize>>", required: false, default: None },
                 FieldMeta { key: 2, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
             ],
