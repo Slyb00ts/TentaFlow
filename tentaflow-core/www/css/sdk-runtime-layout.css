@@ -540,3 +540,91 @@
   border-radius: var(--tf-radius-sm);
   background: var(--tf-bg-subtle);
 }
+
+/* =============================================================================
+   tf-button (0x0401) — chunk 3.3b-1
+   ============================================================================= */
+.tf-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--tf-space-xs);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 500;
+  border-radius: var(--tf-radius-sm);
+  white-space: nowrap;
+  user-select: none;
+  position: relative;
+}
+.tf-button:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tf-button--full-width { width: 100%; }
+
+/* sizes */
+.tf-button--size-xs { padding: var(--tf-space-xxs) var(--tf-space-xs); font-size: 0.75rem; }
+.tf-button--size-sm { padding: var(--tf-space-xs) var(--tf-space-sm);  font-size: 0.875rem; }
+.tf-button--size-md { padding: var(--tf-space-sm) var(--tf-space-md);  font-size: 1rem; }
+.tf-button--size-lg { padding: var(--tf-space-md) var(--tf-space-lg);  font-size: 1.125rem; }
+
+/* densities */
+.tf-button--density-compact { padding-block: var(--tf-space-xxs); }
+.tf-button--density-comfortable { padding-block: var(--tf-space-md); }
+
+/* variants */
+.tf-button--variant-primary {
+  background: var(--accent-bg, #1e40af);
+  color: var(--text-inverse, #fff);
+}
+.tf-button--variant-secondary {
+  background: var(--tf-bg-subtle);
+  color: inherit;
+  border-color: currentColor;
+}
+.tf-button--variant-tertiary {
+  background: transparent;
+  color: var(--accent-bg, #1e40af);
+}
+.tf-button--variant-ghost {
+  background: transparent;
+  color: inherit;
+}
+.tf-button--variant-ghost:hover { background: var(--tf-bg-subtle); }
+.tf-button--variant-destructive {
+  background: var(--tone-critical, #b91c1c);
+  color: var(--text-inverse, #fff);
+}
+.tf-button--variant-link {
+  background: transparent;
+  color: var(--accent-bg, #1e40af);
+  text-decoration: underline;
+  padding-inline: var(--tf-space-xs);
+}
+
+/* tones — variant gets a tone-aware accent (subtle, only for tertiary/ghost) */
+.tf-button--tone-success.tf-button--variant-tertiary  { color: var(--tone-success, #15803d); }
+.tf-button--tone-warning.tf-button--variant-tertiary  { color: var(--tone-warning, #c2410c); }
+.tf-button--tone-critical.tf-button--variant-tertiary { color: var(--tone-critical, #b91c1c); }
+.tf-button--tone-info.tf-button--variant-tertiary     { color: var(--tone-info, #0369a1); }
+
+/* loading state — spinner CSS-only przez pseudo-element */
+.tf-button--loading .tf-button__label { visibility: hidden; }
+.tf-button--loading::after {
+  content: '';
+  position: absolute;
+  width: 1em;
+  height: 1em;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  border-top-color: transparent;
+  animation: tf-button-spin 0.7s linear infinite;
+}
+@keyframes tf-button-spin { to { transform: rotate(360deg); } }

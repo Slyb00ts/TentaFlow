@@ -14,20 +14,19 @@ import { SPACER_TAG, DIVIDER_TAG } from './layout-atomic-renderers.js';
 import {
   CARD_TAG, SECTION_CARD_TAG, COLLAPSIBLE_TAG, ACCORDION_TAG,
 } from './layout-cards-renderers.js';
-import { registerComponentRenderer } from './component-renderer.js';
-
-// Button renderer doszyje chunk 3.3b. Tu rejestrujemy minimalny stub
-// (tylko stworzenie button-elementu), żeby SectionCard.header_actions
-// miało po czym walidować tag 0x0200.
-const BUTTON_TAG = 0x0200;
-function registerFakeButton() {
-  if (typeof globalThis.__fakeBtnRegistered !== 'undefined') return;
-  registerComponentRenderer(BUTTON_TAG, (c, _ctx) => {
-    const b = document.createElement('button');
-    b.classList.add('tf-button');
-    return b;
-  });
-  globalThis.__fakeBtnRegistered = true;
+// Button (tag 0x0401) realny renderer rejestruje się w `bootstrapSdkRuntime`
+// przez chunk 3.3b-1. Helper budowy fixture'owego Button-component'u
+// (minimal valid shape) używamy w SectionCard.header_actions tests.
+const BUTTON_TAG = 0x0401;
+function makeButtonFixture(extra = {}) {
+  return comp(BUTTON_TAG, [
+    [0, 'primary'],
+    [1, 'neutral'],
+    [2, { kind: 'literal', value: 'OK' }],
+    [5, 'md'],
+    [6, false],
+    [9, 'default'],
+  ], extra);
 }
 
 const results = [];
@@ -73,9 +72,7 @@ function comp(tag, fields, extra = {}) {
 }
 function setup() {
   _clearComponentRendererRegistry();
-  globalThis.__fakeBtnRegistered = undefined;
   bootstrapSdkRuntime();
-  registerFakeButton();
   document.body.innerHTML = '';
 }
 
@@ -209,8 +206,8 @@ test('Card renders children in order', () => {
 test('SectionCard renders header with title + subtitle + Button actions + divider', () => {
   setup();
   const engine = makeEngine();
-  // header_actions MUSI być Button tag=0x0200 (spec §3 0x0107).
-  const btn = comp(BUTTON_TAG, [], { test_id: 'btn1' });
+  // header_actions MUSI być Button tag=0x0401 (spec §3 0x0107).
+  const btn = makeButtonFixture({ test_id: 'btn1' });
   const el = engine.render(
     comp(SECTION_CARD_TAG, [
       [0, { kind: 'literal', value: 'Tytuł' }],
