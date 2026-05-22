@@ -92,11 +92,8 @@ pub mod kinds {
 
     pub const HEARTBEAT: Kind = Kind(legacy::MESH_MSG_HEARTBEAT as u16);
     pub const CRDT_DELTA: Kind = Kind(legacy::MESH_MSG_CRDT_DELTA as u16);
-    pub const FULL_STATE: Kind = Kind(legacy::MESH_MSG_FULL_STATE as u16);
     pub const FORWARD_REQ: Kind = Kind(legacy::MESH_MSG_FORWARD_REQ as u16);
-    pub const FORWARD_RES: Kind = Kind(legacy::MESH_MSG_FORWARD_RES as u16);
     pub const MODEL_LIST: Kind = Kind(legacy::MESH_MSG_MODEL_LIST as u16);
-    pub const CONTAINER_LIST: Kind = Kind(legacy::MESH_MSG_CONTAINER_LIST as u16);
     pub const NODE_INFO: Kind = Kind(legacy::MESH_MSG_NODE_INFO as u16);
     pub const HELLO: Kind = Kind(legacy::MESH_MSG_HELLO as u16);
     pub const TOPOLOGY_ANNOUNCE: Kind = Kind(legacy::MESH_MSG_TOPOLOGY_ANNOUNCE as u16);
@@ -226,7 +223,6 @@ mod tests {
         for &k in &[
             kinds::HEARTBEAT,
             kinds::CRDT_DELTA,
-            kinds::FULL_STATE,
             kinds::NODE_INFO,
             kinds::HELLO,
             kinds::TOPOLOGY_ANNOUNCE,

@@ -583,74 +583,6 @@ impl PeerManager {
                     .event_tx
                     .send(MeshEvent::HeartbeatReceived { from: node_id });
             }
-            IrohMeshEvent::FullStateReceived { node_id, state } => {
-                // Deserializuj FullState z rkyv i zaktualizuj modele + kontenery + CRDT
-                if let Ok(archived) = rkyv::access::<
-                    rkyv::Archived<tentaflow_protocol::mesh::MeshFullState>,
-                    rkyv::rancor::Error,
-                >(&state)
-                {
-                    let models: Vec<PeerModelInfo> = archived
-                        .models
-                        .iter()
-                        .map(|m| PeerModelInfo {
-                            name: m.name.to_string(),
-                            size_bytes: m.size_bytes.into(),
-                            backend: m.backend.to_string(),
-                            max_context: m.max_context.into(),
-                            quantization: m.quantization.to_string(),
-                        })
-                        .collect();
-
-                    let containers: Vec<PeerContainerInfo> = archived
-                        .containers
-                        .iter()
-                        .map(|c| PeerContainerInfo {
-                            id: c.id.to_string(),
-                            name: c.name.to_string(),
-                            image: c.image.to_string(),
-                            status: c.status.to_string(),
-                            cpu_percent: c.cpu_percent.into(),
-                            memory_mb: c.memory_mb.into(),
-                            memory_limit_mb: 0,
-                        })
-                        .collect();
-
-                    self.update_peer_models(&node_id, models);
-                    self.update_peer_containers(&node_id, containers);
-
-                    // CRDT sync z version_vector
-                    let crdt_ops: Vec<CrdtOperation> = archived
-                        .crdt_operations
-                        .iter()
-                        .filter_map(|op| {
-                            // Konwersja CrdtSyncOp -> CrdtOperation
-                            let clock = LamportClock {
-                                time: op.clock_time.into(),
-                                node_id_hash: op.clock_node_hash.into(),
-                            };
-                            match &op.op_type {
-                                rkyv::Archived::<tentaflow_protocol::mesh::CrdtOpType>::SetValue(v) => {
-                                    Some(CrdtOperation::UpsertAlias {
-                                        alias: op.key.to_string(),
-                                        target: v.to_string(),
-                                        clock,
-                                    })
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect();
-
-                    if !crdt_ops.is_empty() {
-                        let _ = self.sync_state(&node_id, crdt_ops);
-                    }
-
-                    info!(peer_id = %node_id, "Przetworzono FullState od peera");
-                } else {
-                    warn!(peer_id = %node_id, "Nie udalo sie zdeserializowac FullState");
-                }
-            }
             IrohMeshEvent::ModelListUpdate { node_id, data } => {
                 if let Ok(models) = serde_json::from_slice::<Vec<serde_json::Value>>(&data) {
                     let peer_models: Vec<PeerModelInfo> = models
@@ -668,28 +600,6 @@ impl PeerManager {
                     self.update_peer_models(&node_id, peer_models);
                 }
             }
-            IrohMeshEvent::ContainerListUpdate { node_id, data } => {
-                if let Ok(containers) = serde_json::from_slice::<Vec<serde_json::Value>>(&data) {
-                    let peer_containers: Vec<PeerContainerInfo> = containers
-                        .iter()
-                        .filter_map(|c| {
-                            Some(PeerContainerInfo {
-                                id: c.get("id")?.as_str()?.to_string(),
-                                name: c.get("name")?.as_str()?.to_string(),
-                                image: c.get("image")?.as_str()?.to_string(),
-                                status: c.get("status")?.as_str()?.to_string(),
-                                cpu_percent: c.get("cpu_percent")?.as_f64()? as f32,
-                                memory_mb: c.get("memory_mb")?.as_u64()?,
-                                memory_limit_mb: c
-                                    .get("memory_limit_mb")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                            })
-                        })
-                        .collect();
-                    self.update_peer_containers(&node_id, peer_containers);
-                }
-            }
             IrohMeshEvent::CrdtDeltaReceived { .. }
             | IrohMeshEvent::ForwardRequest { .. }
             | IrohMeshEvent::ForwardRequestReceived { .. }
@@ -702,14 +612,11 @@ impl PeerManager {
             | IrohMeshEvent::MeshDeployProgressReceived { .. }
             | IrohMeshEvent::MeshLogChunkReceived { .. }
             | IrohMeshEvent::TrustRevokedReceived { .. }
-            | IrohMeshEvent::KeyRotationReceived { .. }
-            | IrohMeshEvent::KeyRotationResponseReceived { .. }
             | IrohMeshEvent::TrustedKeysSyncReceived { .. }
             | IrohMeshEvent::HmacKeysSyncReceived { .. }
             | IrohMeshEvent::FrameProxyRequestReceived { .. }
             | IrohMeshEvent::FrameProxyResponseReceived { .. }
             | IrohMeshEvent::NodeLeavingReceived { .. }
-            | IrohMeshEvent::RelayFrameReceived { .. }
             | IrohMeshEvent::AliasSyncReceived { .. }
             | IrohMeshEvent::PeerDiscovered { .. }
             | IrohMeshEvent::HelloReceived { .. }

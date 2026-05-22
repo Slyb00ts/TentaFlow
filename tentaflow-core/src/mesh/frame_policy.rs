@@ -12,8 +12,8 @@ use tentaflow_protocol::mesh::{
 /// Returns `true` for frames that may be accepted from peers that are NOT yet
 /// trusted. Currently only the three pairing handshake frames qualify.
 ///
-/// Every other mesh frame (heartbeat, hello, node_info, models, containers,
-/// commands, key rotation, trusted-keys sync, trust revoked, ...) MUST come
+/// Every other mesh frame (heartbeat, hello, node_info, models,
+/// commands, trusted-keys sync, trust revoked, ...) MUST come
 /// from a peer that is already in the trusted set; otherwise it must be
 /// dropped before any application-level state is touched.
 #[inline]
@@ -62,16 +62,6 @@ mod tests {
     #[test]
     fn command_is_post_trust() {
         assert!(!is_pre_trust_frame(MESH_MSG_COMMAND));
-    }
-
-    #[test]
-    fn key_rotation_is_post_trust() {
-        assert!(!is_pre_trust_frame(MESH_MSG_KEY_ROTATION));
-    }
-
-    #[test]
-    fn key_rotation_response_is_post_trust() {
-        assert!(!is_pre_trust_frame(MESH_MSG_KEY_ROTATION_RESPONSE));
     }
 
     #[test]

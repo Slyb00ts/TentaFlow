@@ -1685,11 +1685,6 @@ fn spawn_quic_event_handler(
                     info!("Node {} opuszcza mesh (graceful leave)", node_id);
                     qm_events.disconnect_peer(&node_id).await;
                 }
-                Ok(IrohMeshEvent::KeyRotationReceived { .. })
-                | Ok(IrohMeshEvent::KeyRotationResponseReceived { .. }) => {
-                    // Rotacja kluczy jest obsluzona przez iroh TLS per-connection —
-                    // legacy zdarzenia od starych peerow sa ignorowane.
-                }
                 Ok(IrohMeshEvent::TrustedKeysSyncReceived { node_id, keys }) => {
                     // Akceptuj sync TYLKO od trusted peera
                     let sender_trusted = match &mesh_security {
@@ -1761,61 +1756,6 @@ fn spawn_quic_event_handler(
                         );
                     }
                 }
-                Ok(IrohMeshEvent::RelayFrameReceived {
-                    from_node_id: _,
-                    frame,
-                }) => {
-                    // Sprawdz TTL
-                    if frame.ttl == 0 {
-                        warn!(source = %frame.source_node_id, dest = %frame.destination_node_id, "Relay frame TTL wyczerpany — odrzucam");
-                        continue;
-                    }
-
-                    // Czy ja jestem odbiorca koncowym?
-                    if frame.destination_node_id == local_node_id {
-                        // iroh TLS zapewnia end-to-end encryption na polaczeniu —
-                        // payload jest juz odszyfrowany przy odbiorze streamu.
-                        info!(
-                            source = %frame.source_node_id,
-                            disc = frame.discriminant,
-                            hops = 5u8.saturating_sub(frame.ttl) + 1,
-                            "Otrzymano relay frame (multi-hop)"
-                        );
-                    } else {
-                        // Forward do next-hop
-                        let mut forwarded_frame = frame;
-                        forwarded_frame.ttl -= 1;
-
-                        if let Some(route) =
-                            peer_store.get_route(&forwarded_frame.destination_node_id)
-                        {
-                            let frame_bytes =
-                                rkyv::to_bytes::<rkyv::rancor::Error>(&forwarded_frame)
-                                    .map(|v| v.to_vec())
-                                    .unwrap_or_default();
-                            if let Err(e) = qm_events
-                                .send_relay_frame(&route.next_hop, &frame_bytes)
-                                .await
-                            {
-                                warn!(
-                                    dest = %forwarded_frame.destination_node_id,
-                                    next_hop = %route.next_hop,
-                                    "Blad forwarding relay frame: {}", e
-                                );
-                            } else {
-                                debug!(
-                                    source = %forwarded_frame.source_node_id,
-                                    dest = %forwarded_frame.destination_node_id,
-                                    next_hop = %route.next_hop,
-                                    ttl = forwarded_frame.ttl,
-                                    "Relay frame forwarded"
-                                );
-                            }
-                        } else {
-                            warn!(dest = %forwarded_frame.destination_node_id, "Brak route — nie moge forwardowac relay frame");
-                        }
-                    }
-                }
                 Ok(IrohMeshEvent::MeshCommandReceived {
                     from_node_id,
                     command,
@@ -1840,17 +1780,6 @@ fn spawn_quic_event_handler(
                         debug!(peer_id = %node_id, "Pomijam CrdtDelta od niezaufanego peera (safety net)");
                     }
                     // Dalsze przetwarzanie CRDT delta (jesli bedzie potrzebne) — tu placeholder
-                }
-                Ok(IrohMeshEvent::FullStateReceived { node_id, .. }) => {
-                    // Safety net — przetwarzaj FullState TYLKO od trusted peerow
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false, // Zero trust — bez MeshSecurity nie przetwarzaj danych
-                    };
-                    if !is_trusted {
-                        debug!(peer_id = %node_id, "Pomijam FullState od niezaufanego peera (safety net)");
-                    }
-                    // Dalsze przetwarzanie FullState (jesli bedzie potrzebne) — tu placeholder
                 }
                 Ok(IrohMeshEvent::ModelListUpdate { node_id, data }) => {
                     // ModelsSync — nadpisuje liste modeli danego peera.
