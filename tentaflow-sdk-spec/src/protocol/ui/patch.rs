@@ -11,6 +11,7 @@ use crate::protocol::control::CborMap;
 use crate::protocol::value::Value;
 
 use super::bind::StatePath;
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 /// Single mutation applied at a state path.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -121,13 +122,29 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "index" => index = Some(d.u32()?),
-                "delta" => delta = Some(d.i64()?),
-                "value" => match kind.as_deref() {
-                    Some("merge_map") => map_value = Some(CborMap::decode(d, ctx)?),
-                    _ => value = Some(Value::decode(d, ctx)?),
-                },
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "PatchOpKind", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "index" => {
+                    assert_no_dup_tstr(&index, "PatchOpKind", "index")?;
+                    index = Some(d.u32()?);
+                }
+                "delta" => {
+                    assert_no_dup_tstr(&delta, "PatchOpKind", "delta")?;
+                    delta = Some(d.i64()?);
+                }
+                "value" => {
+                    if value.is_some() || map_value.is_some() {
+                        return Err(minicbor::decode::Error::message(
+                            "PatchOpKind: duplicate key 'value'",
+                        ));
+                    }
+                    match kind.as_deref() {
+                        Some("merge_map") => map_value = Some(CborMap::decode(d, ctx)?),
+                        _ => value = Some(Value::decode(d, ctx)?),
+                    }
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown PatchOpKind key: {other}"

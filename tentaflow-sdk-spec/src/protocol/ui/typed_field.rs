@@ -69,6 +69,28 @@ pub fn ensure_ref_tag_decode(
     Ok(())
 }
 
+/// Reject duplicate occurrence of a tstr-discriminated map key in tagged-union
+/// decoders (chunks 1.1-1.7). Pattern: check slot before each assignment.
+///
+/// ```ignore
+/// "kind" => {
+///     assert_no_dup_tstr(&kind, "ValidationRule", "kind")?;
+///     kind = Some(d.str()?.to_string());
+/// }
+/// ```
+pub fn assert_no_dup_tstr<T>(
+    slot: &Option<T>,
+    comp: &'static str,
+    key: &'static str,
+) -> Result<(), minicbor::decode::Error> {
+    if slot.is_some() {
+        return Err(minicbor::decode::Error::message(format!(
+            "{comp}: duplicate key '{key}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Standard "missing required field" error.
 pub fn missing_field(comp: &'static str, field: &'static str) -> minicbor::decode::Error {
     minicbor::decode::Error::message(format!("{comp}: missing required field `{field}`"))

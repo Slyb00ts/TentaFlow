@@ -10,6 +10,7 @@ use minicbor::{Decode, Decoder, Encode, Encoder};
 
 use crate::protocol::control::CborMap;
 use crate::protocol::ids::ClientActionId;
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 use crate::protocol::value::Value;
 
 /// `FormFieldValue` (§6.5). Tuple of value + locally-validated flag.
@@ -213,12 +214,28 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "reason" => reason = Some(d.str()?.to_string()),
-                "error_code" => error_code = Some(d.u16()?),
-                "required_permission" => required_permission = Some(d.str()?.to_string()),
-                "retry_after_ms" => retry_after_ms = Some(d.u32()?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "ActionStatus", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "reason" => {
+                    assert_no_dup_tstr(&reason, "ActionStatus", "reason")?;
+                    reason = Some(d.str()?.to_string());
+                }
+                "error_code" => {
+                    assert_no_dup_tstr(&error_code, "ActionStatus", "error_code")?;
+                    error_code = Some(d.u16()?);
+                }
+                "required_permission" => {
+                    assert_no_dup_tstr(&required_permission, "ActionStatus", "required_permission")?;
+                    required_permission = Some(d.str()?.to_string());
+                }
+                "retry_after_ms" => {
+                    assert_no_dup_tstr(&retry_after_ms, "ActionStatus", "retry_after_ms")?;
+                    retry_after_ms = Some(d.u32()?);
+                }
                 "field_errors" => {
+                    assert_no_dup_tstr(&field_errors, "ActionStatus", "field_errors")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -228,9 +245,16 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
                     }
                     field_errors = Some(v);
                 }
-                "message" => message = Some(d.str()?.to_string()),
-                "to_action_id" => to_action_id = Some(d.str()?.to_string()),
+                "message" => {
+                    assert_no_dup_tstr(&message, "ActionStatus", "message")?;
+                    message = Some(d.str()?.to_string());
+                }
+                "to_action_id" => {
+                    assert_no_dup_tstr(&to_action_id, "ActionStatus", "to_action_id")?;
+                    to_action_id = Some(d.str()?.to_string());
+                }
                 "params" => {
+                    assert_no_dup_tstr(&params, "ActionStatus", "params")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;

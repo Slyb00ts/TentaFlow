@@ -12,6 +12,7 @@ use crate::protocol::control::CborMap;
 use crate::protocol::value::Value;
 
 use super::bind::StatePath;
+use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 
 /// Field-level validation rule (catalog §1.5 `ValidationRule`).
 #[derive(Debug, Clone, PartialEq)]
@@ -165,22 +166,36 @@ impl<'b, C> Decode<'b, C> for ValidationRule {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "value" => match kind.as_deref() {
-                    Some("min_length") | Some("max_length") => value_u16 = Some(d.u16()?),
-                    Some("min") | Some("max") => value_f64 = Some(d.f64()?),
-                    _ => {
-                        // Type-peek fallback.
-                        match d.datatype()? {
-                            minicbor::data::Type::F16
-                            | minicbor::data::Type::F32
-                            | minicbor::data::Type::F64 => value_f64 = Some(d.f64()?),
-                            _ => value_u16 = Some(d.u16()?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "ValidationRule", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    if value_u16.is_some() || value_f64.is_some() {
+                        return Err(minicbor::decode::Error::message(
+                            "ValidationRule: duplicate key 'value'",
+                        ));
+                    }
+                    match kind.as_deref() {
+                        Some("min_length") | Some("max_length") => value_u16 = Some(d.u16()?),
+                        Some("min") | Some("max") => value_f64 = Some(d.f64()?),
+                        _ => {
+                            // Type-peek fallback.
+                            match d.datatype()? {
+                                minicbor::data::Type::F16
+                                | minicbor::data::Type::F32
+                                | minicbor::data::Type::F64 => value_f64 = Some(d.f64()?),
+                                _ => value_u16 = Some(d.u16()?),
+                            }
                         }
                     }
-                },
-                "regex" => regex = Some(d.str()?.to_string()),
+                }
+                "regex" => {
+                    assert_no_dup_tstr(&regex, "ValidationRule", "regex")?;
+                    regex = Some(d.str()?.to_string());
+                }
                 "schemes" => {
+                    assert_no_dup_tstr(&schemes, "ValidationRule", "schemes")?;
                     let n = d.array()?.ok_or_else(|| {
                         minicbor::decode::Error::message("indefinite-length array forbidden")
                     })?;
@@ -190,11 +205,26 @@ impl<'b, C> Decode<'b, C> for ValidationRule {
                     }
                     schemes = Some(v);
                 }
-                "region" => region = Some(d.str()?.to_string()),
-                "min" => min_s = Some(d.str()?.to_string()),
-                "max" => max_s = Some(d.str()?.to_string()),
-                "id" => id = Some(d.str()?.to_string()),
-                "params" => params = Some(CborMap::decode(d, ctx)?),
+                "region" => {
+                    assert_no_dup_tstr(&region, "ValidationRule", "region")?;
+                    region = Some(d.str()?.to_string());
+                }
+                "min" => {
+                    assert_no_dup_tstr(&min_s, "ValidationRule", "min")?;
+                    min_s = Some(d.str()?.to_string());
+                }
+                "max" => {
+                    assert_no_dup_tstr(&max_s, "ValidationRule", "max")?;
+                    max_s = Some(d.str()?.to_string());
+                }
+                "id" => {
+                    assert_no_dup_tstr(&id, "ValidationRule", "id")?;
+                    id = Some(d.str()?.to_string());
+                }
+                "params" => {
+                    assert_no_dup_tstr(&params, "ValidationRule", "params")?;
+                    params = Some(CborMap::decode(d, ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown ValidationRule key: {other}"
@@ -385,9 +415,18 @@ impl<'b, C> Decode<'b, C> for StateCondition {
         for _ in 0..len {
             let k = d.str()?;
             match k {
-                "kind" => kind = Some(d.str()?.to_string()),
-                "path" => path = Some(StatePath::decode(d, ctx)?),
-                "value" => value = Some(Value::decode(d, ctx)?),
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "StateCondition", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "path" => {
+                    assert_no_dup_tstr(&path, "StateCondition", "path")?;
+                    path = Some(StatePath::decode(d, ctx)?);
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "StateCondition", "value")?;
+                    value = Some(Value::decode(d, ctx)?);
+                }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
                         "unknown StateCondition key: {other}"
@@ -507,6 +546,29 @@ mod tests {
             .unwrap();
         let res: Result<ValidationRule, _> = minicbor::decode(&buf);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn validation_rule_duplicate_kind_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("kind").unwrap().str("required").unwrap()
+            .str("kind").unwrap().str("required").unwrap();
+        let err = minicbor::decode::<ValidationRule>(&buf).unwrap_err();
+        assert!(format!("{err}").contains("duplicate key 'kind'"));
+    }
+
+    #[test]
+    fn validation_rule_duplicate_value_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(3).unwrap()
+            .str("kind").unwrap().str("min_length").unwrap()
+            .str("value").unwrap().u16(2).unwrap()
+            .str("value").unwrap().u16(5).unwrap();
+        let err = minicbor::decode::<ValidationRule>(&buf).unwrap_err();
+        assert!(format!("{err}").contains("duplicate"));
     }
 
     #[test]
