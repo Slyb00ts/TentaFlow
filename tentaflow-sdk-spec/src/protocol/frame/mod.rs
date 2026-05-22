@@ -34,6 +34,7 @@ pub mod fragment;
 pub mod pipeline;
 pub mod replay;
 pub mod sign;
+pub mod validator;
 
 pub use address::{NodeAddress, NodeAddressKind};
 pub use auth::{Auth, AuthKind};
@@ -66,4 +67,7 @@ pub use fragment::{
 pub use replay::{
     check_clock_skew_with, DedupKey, ReplayGuard, DEFAULT_CLOCK_SKEW_MS,
     DEFAULT_DEDUP_CAPACITY_PER_SOURCE, NON_FRAGMENT_INDEX_SENTINEL,
+};
+pub use validator::{
+    channel_auth_policy, validate_envelope, ChannelAuthPolicy, SignRequirement,
 };
