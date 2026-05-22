@@ -1107,3 +1107,104 @@ string_enum! {
         Inline = "inline",
     }
 }
+
+string_enum! {
+    /// `Alert.variant` (catalog §7 0x0501).
+    pub enum AlertVariant {
+        Default = "default",
+        Filled = "filled",
+        Outlined = "outlined",
+        Soft = "soft",
+    }
+}
+
+string_enum! {
+    /// `Banner.position` (catalog §7 0x0502).
+    pub enum BannerPosition {
+        Top = "top",
+        Inline = "inline",
+    }
+}
+
+string_enum! {
+    /// `Skeleton.variant` (catalog §7 0x0506).
+    pub enum SkeletonVariant {
+        Text = "text",
+        Circle = "circle",
+        Rectangle = "rectangle",
+        Card = "card",
+        TableRow = "table_row",
+    }
+}
+
+string_enum! {
+    /// `Spinner.size` (catalog §7 0x0507).
+    pub enum SpinnerSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+        Xl = "xl",
+    }
+}
+
+string_enum! {
+    /// `Spinner.variant` (catalog §7 0x0507).
+    pub enum SpinnerVariant {
+        Default = "default",
+        Ring = "ring",
+        Dots = "dots",
+        Bars = "bars",
+    }
+}
+
+string_enum! {
+    /// `Modal.size` (catalog §7 0x0509).
+    pub enum ModalSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+        Xl = "xl",
+        Fullscreen = "fullscreen",
+    }
+}
+
+string_enum! {
+    /// `Drawer.size` (catalog §7 0x050A).
+    pub enum DrawerSize {
+        Xs = "xs",
+        Sm = "sm",
+        Md = "md",
+        Lg = "lg",
+        Xl = "xl",
+    }
+}
+
+string_enum! {
+    /// `Popover.placement` (catalog §7 0x050B).
+    pub enum PopoverPlacement {
+        Top = "top",
+        TopStart = "top_start",
+        TopEnd = "top_end",
+        Bottom = "bottom",
+        BottomStart = "bottom_start",
+        BottomEnd = "bottom_end",
+        Left = "left",
+        LeftStart = "left_start",
+        LeftEnd = "left_end",
+        Right = "right",
+        RightStart = "right_start",
+        RightEnd = "right_end",
+    }
+}
+
+string_enum! {
+    /// `GateScreen.variant` (catalog §7 0x050D).
+    pub enum GateVariant {
+        AuthRequired = "auth_required",
+        PermissionDenied = "permission_denied",
+        RateLimited = "rate_limited",
+        Maintenance = "maintenance",
+    }
+}
