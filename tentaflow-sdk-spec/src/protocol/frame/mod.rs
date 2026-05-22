@@ -23,6 +23,7 @@
 // =============================================================================
 
 pub mod address;
+pub mod aead;
 pub mod auth;
 pub mod channel;
 pub mod envelope;
@@ -42,4 +43,9 @@ pub use flags::Flags;
 pub use sign::{
     canonical_envelope_for_signing, public_key_bytes, sign_envelope, signing_key_from_bytes,
     verify_envelope, SIGNATURE_PLACEHOLDER,
+};
+pub use aead::{
+    compute_aad, decrypt_body, decrypt_envelope_body, encrypt_body, encrypt_envelope_body,
+    AeadKey, NonceCounter, PersistHint, AEAD_KEY_LEN, AEAD_NONCE_LEN, AEAD_TAG_LEN,
+    COUNTER_ROTATION_THRESHOLD, MAX_KEY_AGE_MS, NONCE_COUNTER_LEN, NONCE_PREFIX_LEN,
 };
