@@ -960,68 +960,6 @@ impl IrohMeshManager {
     }
 
     /// Wysyla ramke `[disc][data]` na uni streamie do peera.
-    pub async fn send_to_peer(
-        &self,
-        target_node_id: &str,
-        discriminant: u8,
-        data: &[u8],
-    ) -> Result<()> {
-        let connection = self
-            .connections
-            .get(target_node_id)
-            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
-            .connection
-            .clone();
-
-        let mut send = connection
-            .open_uni()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
-        send.write_all(&[discriminant])
-            .await
-            .map_err(|e| anyhow::anyhow!("write discriminant: {e}"))?;
-        if !data.is_empty() {
-            send.write_all(data)
-                .await
-                .map_err(|e| anyhow::anyhow!("write payload: {e}"))?;
-        }
-        send.finish()
-            .map_err(|e| anyhow::anyhow!("finish uni: {e}"))?;
-        Ok(())
-    }
-
-    pub async fn broadcast_to_trusted(
-        &self,
-        discriminant: u8,
-        data: &[u8],
-        exclude: Option<&str>,
-    ) -> Vec<(String, Result<()>)> {
-        use futures::future::join_all;
-        let trusted = self.security.trusted_node_ids_snapshot();
-        // Jeden pass po DashMap: filtracja + build future. Brak posredniej Vec<String>.
-        // Klon String tylko dla peerow ktorzy przechodza filtr (trusted ∩ !exclude).
-        let mut futs = Vec::with_capacity(self.connections.len());
-        for entry in self.connections.iter() {
-            let id = entry.key();
-            if !trusted.contains(id) {
-                continue;
-            }
-            if let Some(e) = exclude {
-                if id.as_str() == e {
-                    continue;
-                }
-            }
-            let node_id = id.clone();
-            futs.push(async move {
-                let res = self.send_to_peer(&node_id, discriminant, data).await;
-                (node_id, res)
-            });
-        }
-        // PARALLEL: send_to_peer na kazdy cel rownolegle. 1000 peerow sekwencyjnie
-        // 2-5s (open_uni + write + finish); rownolegle max(rtt) + overhead, <50ms.
-        join_all(futs).await
-    }
-
     pub async fn connected_peers(&self) -> Vec<String> {
         self.connections.iter().map(|e| e.key().clone()).collect()
     }
@@ -1043,17 +981,14 @@ impl IrohMeshManager {
     }
 
     // =========================================================================
-    // Convenience wrappers — odpowiedniki metod QuicMeshManager. Kazdy deleguje
-    // do `send_to_peer` z odpowiednim discriminantem z `tentaflow_protocol::mesh`.
+    // Convenience wrappers — odpowiedniki metod QuicMeshManager. Kazdy
+    // wraca payload w podpisanej UFP/2 envelope przez `send_ufp2_to_peer`.
     // =========================================================================
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        // UFP/2 wire (4c2.1): the heartbeat body is the legacy rkyv-serialized
-        // MeshHeartbeat blob, wrapped in a signed UFP/2 envelope. Receivers
-        // detect UFP/2 vs legacy by the first byte (CBOR map header 0xAA..=0xB1
-        // vs MESH_MSG_* 0x10..=0x4C). Other mesh message types travel the
-        // legacy wire until migrated in their dedicated 4c2.x chunk.
+        // UFP/2 wire: the heartbeat body is the legacy rkyv-serialized
+        // MeshHeartbeat blob, wrapped in a signed UFP/2 envelope.
         let mut futs = Vec::with_capacity(self.connections.len());
         for entry in self.connections.iter() {
             let id = entry.key().clone();
@@ -1118,7 +1053,7 @@ impl IrohMeshManager {
     ) -> Result<()> {
         if !crate::mesh::ufp2::is_migrated_to_ufp2_discriminator(legacy_discriminator) {
             return Err(anyhow::anyhow!(
-                "send_ufp2_to_peer: discriminator 0x{:02X} has not been migrated to UFP/2 yet (use legacy send_to_peer until its 4c2.x chunk lands)",
+                "send_ufp2_to_peer: discriminator 0x{:02X} is not on the UFP/2 unicast allowlist (bi-stream types FORWARD_REQ/FORWARD_STREAM_REQ use their own protocol)",
                 legacy_discriminator
             ));
         }
@@ -1880,21 +1815,14 @@ impl IrohMeshManagerRef {
             return Err(IrohStreamError::FrameTooLarge(tail.len()));
         }
 
-        // UFP/2 dispatch (4c2.1): the first byte distinguishes legacy
-        // `[disc][rkyv]` wire from a complete UFP/2 envelope. UFP/2
-        // arrivals are signature-verified inside `classify_inbound` AND
-        // bound to the transport peer (envelope.source.id == remote peer
-        // pubkey, envelope.destination.id == local node pubkey) so a
-        // trusted peer cannot relay or replay another node's envelope.
-        // The legacy discriminator is then extracted from the envelope's
-        // `kind` field so the rest of this function can route via the
-        // existing `[disc, payload]` event flow without further branches.
-        //
-        // NOTE on replay/epoch: per-channel ReplayGuard + policy_epoch
-        // enforcement lands in 4c2.2-4c2.5 when state-changing frames
-        // migrate. Heartbeat is liveness-only and tolerates retransmits
-        // by design, so the foundation defers per-message replay state
-        // until it actually matters.
+        // UFP/2 receive: every unicast mesh frame is a signed UFP/2
+        // envelope. `classify_inbound` reassembles the bytes, decodes
+        // CBOR, runs the structural validator, verifies the Ed25519
+        // signature, and binds envelope.source.id / destination.id to the
+        // transport peer / local node so a trusted peer cannot relay or
+        // replay another node's envelope. The legacy discriminator is
+        // recovered from envelope.kind so the existing event dispatch
+        // below routes by `frame_type` unchanged.
         let local_pubkey = self.security.verifying_key_bytes();
         let peer_pubkey_opt = parse_iroh_node_id_to_pubkey(&remote_hex);
         let (frame_type, payload) = if let Some(peer_pubkey) = peer_pubkey_opt {
@@ -1904,10 +1832,6 @@ impl IrohMeshManagerRef {
                 peer_pubkey,
                 local_pubkey,
             ) {
-                Ok(crate::mesh::ufp2::InboundMeshFrame::Legacy {
-                    discriminator,
-                    payload,
-                }) => (discriminator, payload),
                 Ok(crate::mesh::ufp2::InboundMeshFrame::Ufp2(decoded)) => {
                     (decoded.legacy_discriminator, decoded.body)
                 }
