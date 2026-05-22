@@ -13,6 +13,7 @@
 import { registerLayoutAtomicRenderers } from './layout-atomic-renderers.js';
 import { registerLayoutContainersRenderers } from './layout-containers-renderers.js';
 import { registerLayoutCardsRenderers } from './layout-cards-renderers.js';
+import { registerLayoutNavRenderers } from './layout-nav-renderers.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -21,5 +22,6 @@ export function bootstrapSdkRuntime() {
   registerLayoutAtomicRenderers();
   registerLayoutContainersRenderers();
   registerLayoutCardsRenderers();
-  // Kolejne grupy dołączane w nastepnych chunkach 3.3a-4, 3.3b, 3.3c, ...
+  registerLayoutNavRenderers();
+  // Kolejne grupy dołączane w nastepnych chunkach 3.3a-5+, 3.3b, 3.3c, ...
 }
