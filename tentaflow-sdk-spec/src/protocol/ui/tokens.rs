@@ -1208,3 +1208,85 @@ string_enum! {
         Maintenance = "maintenance",
     }
 }
+
+string_enum! {
+    /// `VideoStream.controls` (catalog §8 0x0604).
+    pub enum VideoControls {
+        None = "none",
+        Minimal = "minimal",
+        Full = "full",
+    }
+}
+
+string_enum! {
+    /// `LiveCameraTile.status` (catalog §8 0x0605).
+    pub enum CameraStatus {
+        Online = "online",
+        Offline = "offline",
+        Buffering = "buffering",
+        Error = "error",
+    }
+}
+
+string_enum! {
+    /// `MapView.tile_provider` (catalog §8 0x0606).
+    pub enum TileProvider {
+        Osm = "osm",
+        Mapbox = "mapbox",
+        TileServer = "tile_server",
+    }
+}
+
+string_enum! {
+    /// `CodeEditor.theme` (catalog §8 0x0607).
+    pub enum CodeEditorTheme {
+        Auto = "auto",
+        Light = "light",
+        Dark = "dark",
+    }
+}
+
+string_enum! {
+    /// `Terminal.theme` (catalog §8 0x0608).
+    pub enum TerminalTheme {
+        Default = "default",
+        HighContrast = "high_contrast",
+        Dim = "dim",
+    }
+}
+
+string_enum! {
+    /// `Audio.controls` (catalog §8 0x0609).
+    pub enum AudioControls {
+        None = "none",
+        Minimal = "minimal",
+        Full = "full",
+    }
+}
+
+string_enum! {
+    /// `Audio.variant` (catalog §8 0x0609).
+    pub enum AudioVariant {
+        Default = "default",
+        Compact = "compact",
+        Waveform = "waveform",
+    }
+}
+
+string_enum! {
+    /// `FpsCounter.variant` (catalog §8 0x060E).
+    pub enum FpsVariant {
+        Minimal = "minimal",
+        Detailed = "detailed",
+    }
+}
+
+string_enum! {
+    /// `Stopwatch.variant` (catalog §8 0x0610).
+    pub enum StopwatchVariant {
+        Seconds = "seconds",
+        Minutes = "minutes",
+        Hours = "hours",
+        Full = "full",
+    }
+}
