@@ -1291,7 +1291,7 @@ impl IrohMeshManager {
     /// Caller is responsible for trust + cooldown gating; this is a thin
     /// wrapper around `send_to_peer` with the right discriminant.
     pub async fn send_hmac_keys_sync(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_HMAC_KEYS_SYNC,
             data,
@@ -1304,7 +1304,7 @@ impl IrohMeshManager {
     /// `request_id` with a pending response slot (P3.C-2 wires the slot
     /// map). `data` is the rkyv-encoded `FrameProxyRequestPayload`.
     pub async fn send_frame_proxy_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_REQUEST,
             data,
@@ -1317,7 +1317,7 @@ impl IrohMeshManager {
     /// `FrameProxyResponsePayload` (Found / NotFound / Unavailable) and
     /// pushes it back on the same trust link.
     pub async fn send_frame_proxy_response(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(
+        self.send_ufp2_to_peer(
             node_id,
             tentaflow_protocol::mesh::MESH_MSG_FRAME_PROXY_RESPONSE,
             data,
