@@ -17,6 +17,12 @@ minicbor = { version = "2.2", default-features = false, features = ["alloc", "de
 # AEAD + lz4 land in 4c1c/4c1d.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
 
+# UFP/2 AEAD per §7.2 — ChaCha20-Poly1305 (RFC 8439), 256-bit key, 96-bit nonce.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+
+# Secret material zeroization on drop.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
 [dev-dependencies]
 # Deterministic CSPRNG for sign/verify tests.
 rand_core = { version = "0.6", features = ["getrandom"] }
