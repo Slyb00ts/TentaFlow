@@ -53,6 +53,8 @@ pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
 /// - 4c2.4: HMAC_KEYS_SYNC, FRAME_PROXY_REQUEST, FRAME_PROXY_RESPONSE
 /// - 4c2.5: SYNC_PUSH, SYNC_ACK, SYNC_PULL, SYNC_PULL_RESPONSE,
 ///   SYNC_SNAPSHOT_PULL, SYNC_SNAPSHOT_RESPONSE
+/// - 4c2.6b: NODE_INFO, HELLO, TOPOLOGY_ANNOUNCE, KNOWN_PEERS, CRDT_DELTA,
+///   ALIAS_SYNC, MODEL_LIST, NODE_LEAVING
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
         disc,
@@ -79,6 +81,14 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_SYNC_PULL_RESPONSE
             | legacy::MESH_MSG_SYNC_SNAPSHOT_PULL
             | legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE
+            | legacy::MESH_MSG_NODE_INFO
+            | legacy::MESH_MSG_HELLO
+            | legacy::MESH_MSG_TOPOLOGY_ANNOUNCE
+            | legacy::MESH_MSG_KNOWN_PEERS
+            | legacy::MESH_MSG_CRDT_DELTA
+            | legacy::MESH_MSG_ALIAS_SYNC
+            | legacy::MESH_MSG_MODEL_LIST
+            | legacy::MESH_MSG_NODE_LEAVING
     )
 }
 
@@ -95,6 +105,8 @@ pub mod kinds {
     pub const FORWARD_REQ: Kind = Kind(legacy::MESH_MSG_FORWARD_REQ as u16);
     pub const MODEL_LIST: Kind = Kind(legacy::MESH_MSG_MODEL_LIST as u16);
     pub const NODE_INFO: Kind = Kind(legacy::MESH_MSG_NODE_INFO as u16);
+    pub const ALIAS_SYNC: Kind = Kind(legacy::MESH_MSG_ALIAS_SYNC as u16);
+    pub const NODE_LEAVING: Kind = Kind(legacy::MESH_MSG_NODE_LEAVING as u16);
     pub const HELLO: Kind = Kind(legacy::MESH_MSG_HELLO as u16);
     pub const TOPOLOGY_ANNOUNCE: Kind = Kind(legacy::MESH_MSG_TOPOLOGY_ANNOUNCE as u16);
     pub const KNOWN_PEERS: Kind = Kind(legacy::MESH_MSG_KNOWN_PEERS as u16);
@@ -146,13 +158,11 @@ mod tests {
 
     #[test]
     fn legacy_from_kind_rejects_unmigrated_discriminators() {
-        // Discriminators that ARE allocated MESH_MSG_* but have not yet
-        // been migrated to UFP/2 — sender claiming them through UFP/2 MUST
-        // be rejected so the legacy wire stays the only valid path until
-        // migration.
-        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HELLO as u16)).is_none());
-        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_NODE_INFO as u16)).is_none());
-        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_CRDT_DELTA as u16)).is_none());
+        // Bi-stream protocol discriminators (FORWARD_REQ, FORWARD_STREAM_REQ)
+        // never travel as UFP/2 unicast envelopes — sender claiming them on
+        // the UFP/2 path MUST be rejected.
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_FORWARD_REQ as u16)).is_none());
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_FORWARD_STREAM_REQ as u16)).is_none());
         // Holes in the 0x10..=0x4C range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
         assert!(legacy_from_kind(Kind(0x0034)).is_none());
@@ -160,8 +170,8 @@ mod tests {
 
     #[test]
     fn migrated_discriminator_allowlist_matches_chunks() {
-        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 + 4c2.5 = 23 migrated types. When a
-        // new 4c2.x chunk lands, add its types here AND to
+        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 + 4c2.5 + 4c2.6b = 31 migrated
+        // types. When a new 4c2.x chunk lands, add its types here AND to
         // `is_migrated_to_ufp2_discriminator`.
         let migrated = [
             legacy::MESH_MSG_HEARTBEAT,
@@ -187,6 +197,14 @@ mod tests {
             legacy::MESH_MSG_SYNC_PULL_RESPONSE,
             legacy::MESH_MSG_SYNC_SNAPSHOT_PULL,
             legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+            legacy::MESH_MSG_NODE_INFO,
+            legacy::MESH_MSG_HELLO,
+            legacy::MESH_MSG_TOPOLOGY_ANNOUNCE,
+            legacy::MESH_MSG_KNOWN_PEERS,
+            legacy::MESH_MSG_CRDT_DELTA,
+            legacy::MESH_MSG_ALIAS_SYNC,
+            legacy::MESH_MSG_MODEL_LIST,
+            legacy::MESH_MSG_NODE_LEAVING,
         ];
         for d in migrated {
             assert!(
@@ -195,14 +213,13 @@ mod tests {
                 d
             );
         }
-        // Pre-migration mesh types still routed via legacy wire.
-        assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_NODE_INFO));
-        assert!(!is_migrated_to_ufp2_discriminator(legacy::MESH_MSG_HELLO));
+        // Remaining legacy-only mesh types (bi-stream protocol — not
+        // migrated to UFP/2 unicast envelope).
         assert!(!is_migrated_to_ufp2_discriminator(
-            legacy::MESH_MSG_CRDT_DELTA
+            legacy::MESH_MSG_FORWARD_REQ
         ));
         assert!(!is_migrated_to_ufp2_discriminator(
-            legacy::MESH_MSG_MODEL_LIST
+            legacy::MESH_MSG_FORWARD_STREAM_REQ
         ));
     }
 
