@@ -50,6 +50,7 @@ pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
 ///   TRUST_REVOKED, TRUSTED_KEYS_SYNC
 /// - 4c2.3: COMMAND, COMMAND_RESPONSE, DEPLOY_PROGRESS, LOG_CHUNK,
 ///   SERVICES_GET, SERVICES_GET_RESPONSE, SERVICES_ANNOUNCE, SERVICES_UPDATE
+/// - 4c2.4: HMAC_KEYS_SYNC, FRAME_PROXY_REQUEST, FRAME_PROXY_RESPONSE
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
         disc,
@@ -67,6 +68,9 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_SERVICES_GET_RESPONSE
             | legacy::MESH_MSG_SERVICES_ANNOUNCE
             | legacy::MESH_MSG_SERVICES_UPDATE
+            | legacy::MESH_MSG_HMAC_KEYS_SYNC
+            | legacy::MESH_MSG_FRAME_PROXY_REQUEST
+            | legacy::MESH_MSG_FRAME_PROXY_RESPONSE
     )
 }
 
@@ -98,6 +102,9 @@ pub mod kinds {
     pub const COMMAND_RESPONSE: Kind = Kind(legacy::MESH_MSG_COMMAND_RESPONSE as u16);
     pub const DEPLOY_PROGRESS: Kind = Kind(legacy::MESH_MSG_DEPLOY_PROGRESS as u16);
     pub const LOG_CHUNK: Kind = Kind(legacy::MESH_MSG_LOG_CHUNK as u16);
+    pub const HMAC_KEYS_SYNC: Kind = Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16);
+    pub const FRAME_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_REQUEST as u16);
+    pub const FRAME_PROXY_RESPONSE: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_RESPONSE as u16);
 }
 
 #[cfg(test)]
@@ -135,7 +142,6 @@ mod tests {
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HELLO as u16)).is_none());
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_NODE_INFO as u16)).is_none());
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_SYNC_PUSH as u16)).is_none());
-        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16)).is_none());
         // Holes in the 0x10..=0x4C range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
         assert!(legacy_from_kind(Kind(0x0034)).is_none());
@@ -143,8 +149,8 @@ mod tests {
 
     #[test]
     fn migrated_discriminator_allowlist_matches_chunks() {
-        // 4c2.1 + 4c2.2 + 4c2.3 = 14 migrated types. When a new 4c2.x
-        // chunk lands, add its types here AND to
+        // 4c2.1 + 4c2.2 + 4c2.3 + 4c2.4 = 17 migrated types. When a new
+        // 4c2.x chunk lands, add its types here AND to
         // `is_migrated_to_ufp2_discriminator`.
         let migrated = [
             legacy::MESH_MSG_HEARTBEAT,
@@ -161,6 +167,9 @@ mod tests {
             legacy::MESH_MSG_SERVICES_GET_RESPONSE,
             legacy::MESH_MSG_SERVICES_ANNOUNCE,
             legacy::MESH_MSG_SERVICES_UPDATE,
+            legacy::MESH_MSG_HMAC_KEYS_SYNC,
+            legacy::MESH_MSG_FRAME_PROXY_REQUEST,
+            legacy::MESH_MSG_FRAME_PROXY_RESPONSE,
         ];
         for d in migrated {
             assert!(
@@ -176,10 +185,7 @@ mod tests {
             legacy::MESH_MSG_SYNC_PUSH
         ));
         assert!(!is_migrated_to_ufp2_discriminator(
-            legacy::MESH_MSG_HMAC_KEYS_SYNC
-        ));
-        assert!(!is_migrated_to_ufp2_discriminator(
-            legacy::MESH_MSG_FRAME_PROXY_REQUEST
+            legacy::MESH_MSG_SYNC_ACK
         ));
     }
 
