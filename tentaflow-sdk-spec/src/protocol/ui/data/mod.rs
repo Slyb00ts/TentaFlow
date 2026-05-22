@@ -268,6 +268,55 @@ mod tests {
         assert_eq!(Table::try_from_component(&c).unwrap(), t);
     }
 
+    fn non_button(id: &str) -> Component {
+        Component {
+            tag: 0x040C, id: id.into(), fields: FieldMap::default(),
+            handlers: None, bind: None, a11y: None, visibility: None, test_id: None,
+        }
+    }
+
+    #[test]
+    fn table_rejects_non_button_row_action() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::{TableSelectMode, TableVariant};
+        let bad = Table {
+            columns: vec![],
+            rows_path: StatePath::new(vec![PathSegment::Key("rows".into())]),
+            row_key_field: "id".into(),
+            variant: TableVariant::Default, density: Density::Default,
+            sortable: false, sort_by: None,
+            selectable: TableSelectMode::None, selected_ids: None,
+            sticky_header: true, sticky_columns: 0,
+            pagination: None, empty_state: None,
+            row_actions: vec![non_button("bad")],
+            bulk_actions: vec![],
+            virtualize: false, row_expandable: false,
+            expanded_row_template_id: None,
+        };
+        assert!(bad.into_component("tbl").is_err());
+    }
+
+    #[test]
+    fn table_rejects_non_button_bulk_action() {
+        use crate::protocol::ui::bind::{PathSegment, StatePath};
+        use crate::protocol::ui::tokens::{TableSelectMode, TableVariant};
+        let bad = Table {
+            columns: vec![],
+            rows_path: StatePath::new(vec![PathSegment::Key("rows".into())]),
+            row_key_field: "id".into(),
+            variant: TableVariant::Default, density: Density::Default,
+            sortable: false, sort_by: None,
+            selectable: TableSelectMode::None, selected_ids: None,
+            sticky_header: true, sticky_columns: 0,
+            pagination: None, empty_state: None,
+            row_actions: vec![],
+            bulk_actions: vec![non_button("bad")],
+            virtualize: false, row_expandable: false,
+            expanded_row_template_id: None,
+        };
+        assert!(bad.into_component("tbl").is_err());
+    }
+
     #[test]
     fn list_roundtrip() {
         use crate::protocol::ui::bind::{PathSegment, StatePath};

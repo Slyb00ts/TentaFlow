@@ -9,10 +9,11 @@ use super::super::inline::{
 };
 use super::super::tokens::Density;
 use super::super::typed_field::{
-    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
-    unknown_field, IntoComponentError,
+    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
+    ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
+use super::super::actions::Button;
 
 
 // -----------------------------------------------------------------------------
@@ -36,6 +37,9 @@ impl Toolbar {
     pub const TAG: u16 = 0x0005;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for b in &self.trailing_actions {
+            ensure_ref_tag_encode(b.tag, Button::TAG, "Toolbar", "trailing_actions")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
         if let Some(s) = &self.search {
             entries.push((0, encode_to_value(s)?));
@@ -81,12 +85,16 @@ impl Toolbar {
                 other => return Err(unknown_field("Toolbar", *other)),
             }
         }
+        let trailing_actions: Vec<Component> = trailing_actions.unwrap_or_default();
+        for b in &trailing_actions {
+            ensure_ref_tag_decode(b.tag, Button::TAG, "Toolbar", "trailing_actions")?;
+        }
         Ok(Toolbar {
             search,
             filters: filters.unwrap_or_default(),
             view_mode,
             sort_control,
-            trailing_actions: trailing_actions.unwrap_or_default(),
+            trailing_actions,
             density: density.ok_or_else(|| missing_field("Toolbar", "density"))?,
         })
     }
@@ -168,6 +176,9 @@ impl Inspector {
     pub const TAG: u16 = 0x000C;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for b in &self.actions {
+            ensure_ref_tag_encode(b.tag, Button::TAG, "Inspector", "actions")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
         entries.push((0, encode_to_value(&self.title)?));
         entries.push((1, encode_to_value(&self.content_slot)?));
@@ -206,11 +217,15 @@ impl Inspector {
                 other => return Err(unknown_field("Inspector", *other)),
             }
         }
+        let actions: Vec<Component> = actions.unwrap_or_default();
+        for b in &actions {
+            ensure_ref_tag_decode(b.tag, Button::TAG, "Inspector", "actions")?;
+        }
         Ok(Inspector {
             title: title.ok_or_else(|| missing_field("Inspector", "title"))?,
             content_slot: content_slot
                 .ok_or_else(|| missing_field("Inspector", "content_slot"))?,
-            actions: actions.unwrap_or_default(),
+            actions,
             tabs,
             collapsible: collapsible
                 .ok_or_else(|| missing_field("Inspector", "collapsible"))?,

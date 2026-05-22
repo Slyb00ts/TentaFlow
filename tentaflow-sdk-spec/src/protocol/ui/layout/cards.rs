@@ -11,10 +11,11 @@ use super::super::tokens::{
     AccordionMode, BackgroundToken, CardVariant, RadiusToken, ShadowToken, Tone,
 };
 use super::super::typed_field::{
-    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
-    unknown_field, IntoComponentError,
+    decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
+    ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
 use super::super::super::value::Value;
+use super::super::actions::Button;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
@@ -140,6 +141,9 @@ impl SectionCard {
     pub const TAG: u16 = 0x0107;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        for b in &self.header_actions {
+            ensure_ref_tag_encode(b.tag, Button::TAG, "SectionCard", "header_actions")?;
+        }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(14);
         entries.push((0, encode_to_value(&self.title)?));
         if let Some(s) = &self.subtitle { entries.push((1, encode_to_value(s)?)); }
@@ -194,10 +198,14 @@ impl SectionCard {
                 other => return Err(unknown_field("SectionCard", *other)),
             }
         }
+        let header_actions: Vec<Component> = header_actions.unwrap_or_default();
+        for b in &header_actions {
+            ensure_ref_tag_decode(b.tag, Button::TAG, "SectionCard", "header_actions")?;
+        }
         Ok(SectionCard {
             title: title.ok_or_else(|| missing_field("SectionCard", "title"))?,
             subtitle,
-            header_actions: header_actions.unwrap_or_default(),
+            header_actions,
             header_divider: header_divider.ok_or_else(|| missing_field("SectionCard", "header_divider"))?,
             body: body.unwrap_or_default(),
             footer,
