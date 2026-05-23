@@ -21,6 +21,7 @@ import { registerActionLinkFabRenderers } from './action-link-fab-renderer.js';
 import { registerActionButtonGroupRenderer } from './action-button-group-renderer.js';
 import { registerActionMenuRenderers } from './action-menu-renderer.js';
 import { registerActionBarsRenderers } from './action-bars-renderer.js';
+import { registerFormAtomicRenderers } from './form-atomic-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -37,7 +38,7 @@ export function bootstrapSdkRuntime() {
   registerActionButtonGroupRenderer();
   registerActionMenuRenderers();
   registerActionBarsRenderers();
-  // 3.3b Action: KOMPLETNE (13/13). Kolejne grupy: 3.3c Form, 3.3d Data,
-  // 3.3e Feedback, 3.3f Specialized, 3.3g Molecules.
+  registerFormAtomicRenderers();
+  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (3/29 atomic).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
