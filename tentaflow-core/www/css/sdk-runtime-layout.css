@@ -976,3 +976,89 @@
 }
 .tf-wizard-footer__center { flex: 1 1 auto; justify-content: center; }
 .tf-wizard-footer__right { margin-left: auto; }
+
+/* =============================================================================
+   tf-toggle (0x030A) + tf-checkbox (0x030B) + tf-radio (0x030C) — 3.3c-1
+   ============================================================================= */
+.tf-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  cursor: pointer;
+}
+.tf-toggle--label-leading  { flex-direction: row; }
+.tf-toggle--label-trailing { flex-direction: row-reverse; }
+.tf-toggle__switch {
+  position: relative;
+  display: inline-block;
+  width: 2.5em;
+  height: 1.4em;
+  background: var(--tf-bg-muted);
+  border: 0;
+  border-radius: var(--tf-radius-pill);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  flex: 0 0 auto;
+}
+.tf-toggle__switch:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-toggle__switch[disabled] { opacity: 0.5; cursor: not-allowed; }
+.tf-toggle__switch--on { background: var(--accent-bg, #1e40af); }
+.tf-toggle__knob {
+  position: absolute;
+  top: 0.15em;
+  left: 0.15em;
+  width: 1.1em;
+  height: 1.1em;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.15s ease;
+}
+.tf-toggle__switch--on .tf-toggle__knob {
+  transform: translateX(1.1em);
+}
+.tf-toggle--size-sm .tf-toggle__switch { width: 2em;   height: 1.1em; }
+.tf-toggle--size-lg .tf-toggle__switch { width: 3em;   height: 1.7em; }
+.tf-toggle--tone-success.tf-toggle__switch--on { background: var(--tone-success, #15803d); }
+.tf-toggle__label { font: inherit; }
+.tf-toggle__hint  { font-size: 0.85em; color: var(--text-muted, #888); }
+
+.tf-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  cursor: pointer;
+}
+.tf-checkbox__input {
+  width: 1em;
+  height: 1em;
+  margin: 0;
+  cursor: pointer;
+}
+.tf-checkbox__input:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-checkbox--size-sm .tf-checkbox__input { width: 0.85em; height: 0.85em; }
+.tf-checkbox--size-lg .tf-checkbox__input { width: 1.25em; height: 1.25em; }
+.tf-checkbox__hint { font-size: 0.85em; color: var(--text-muted, #888); }
+
+.tf-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  cursor: pointer;
+}
+.tf-radio__input {
+  width: 1em;
+  height: 1em;
+  margin: 0;
+  cursor: pointer;
+}
+.tf-radio__input:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-radio__hint { font-size: 0.85em; color: var(--text-muted, #888); }
