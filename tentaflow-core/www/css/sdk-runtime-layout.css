@@ -1615,3 +1615,74 @@
   border-color: var(--accent-bg, #1e40af);
   box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
 }
+
+/* ============================================================================
+   tf-datepicker / tf-daterange / tf-timepicker / tf-datetimepicker — chunk 3.3c-4
+   ============================================================================ */
+.tf-datepicker,
+.tf-daterange,
+.tf-timepicker,
+.tf-datetimepicker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-datepicker__label,
+.tf-daterange__label,
+.tf-timepicker__label,
+.tf-datetimepicker__label {
+  font-size: 0.9em;
+  font-weight: 500;
+  color: var(--text-strong, #111);
+}
+.tf-datepicker__input,
+.tf-timepicker__input,
+.tf-datetimepicker__input,
+.tf-daterange__input {
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0.4em 0.6em;
+  font: inherit;
+  color: inherit;
+  outline: 0;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-datepicker__input:focus-visible,
+.tf-timepicker__input:focus-visible,
+.tf-datetimepicker__input:focus-visible,
+.tf-daterange__input:focus-visible {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+}
+.tf-daterange__fields {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+}
+.tf-daterange__dash {
+  color: var(--text-muted, #888);
+}
+.tf-datepicker__presets,
+.tf-daterange__presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--tf-space-xs);
+}
+.tf-datepicker__preset,
+.tf-daterange__preset {
+  background: var(--surface-muted, #f4f4f5);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: 1em;
+  padding: 0.2em 0.7em;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+  color: inherit;
+}
+.tf-datepicker__preset:hover,
+.tf-daterange__preset:hover {
+  background: var(--accent-bg-soft, rgba(30, 64, 175, 0.1));
+  border-color: var(--accent-bg, #1e40af);
+}
