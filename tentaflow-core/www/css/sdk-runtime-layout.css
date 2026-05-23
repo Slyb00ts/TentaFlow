@@ -1928,3 +1928,125 @@
 .tf-color-picker__hex:focus-visible {
   border-color: var(--accent-bg, #1e40af);
 }
+
+/* ============================================================================
+   tf-radio-group (0x030D) + tf-radio-card-group (0x030E) — chunk 3.3c-7
+   ============================================================================ */
+.tf-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-radio-group__label {
+  font-size: 0.9em;
+  font-weight: 500;
+  color: var(--text-strong, #111);
+}
+.tf-radio-group__list {
+  display: flex;
+  gap: var(--tf-space-sm);
+}
+.tf-radio-group--horizontal .tf-radio-group__list { flex-direction: row; flex-wrap: wrap; }
+.tf-radio-group--vertical .tf-radio-group__list { flex-direction: column; }
+.tf-radio-group--density-compact .tf-radio-group__list { gap: var(--tf-space-xs); }
+.tf-radio-group--density-comfortable .tf-radio-group__list { gap: var(--tf-space-md); }
+.tf-radio-group__item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4em;
+  cursor: pointer;
+}
+.tf-radio-group__item--disabled { opacity: 0.5; cursor: not-allowed; }
+.tf-radio-group__input {
+  width: 1em; height: 1em;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent-bg, #1e40af);
+}
+.tf-radio-group__item-label { color: var(--text-strong, #111); }
+.tf-radio-group__item-hint {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+  margin-left: 0.25em;
+}
+
+.tf-radio-card-group {
+  display: grid;
+  grid-template-columns: repeat(var(--tf-radio-card-cols, 2), minmax(0, 1fr));
+  gap: var(--tf-space-sm);
+  font: inherit;
+}
+.tf-radio-card-group__card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--tf-space-sm);
+  padding: 1em;
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  background: var(--surface-bg, #fff);
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-radio-card-group__card:hover { border-color: var(--accent-bg, #1e40af); }
+.tf-radio-card-group__card--selected {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 2px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+  background: var(--accent-bg-soft, rgba(30, 64, 175, 0.05));
+}
+.tf-radio-card-group__card--disabled { opacity: 0.5; cursor: not-allowed; }
+.tf-radio-card-group--variant-compact .tf-radio-card-group__card { padding: 0.5em 0.75em; }
+.tf-radio-card-group--variant-feature .tf-radio-card-group__card { flex-direction: column; align-items: center; text-align: center; padding: 1.25em; }
+.tf-radio-card-group__input {
+  position: absolute;
+  top: 0.5em;
+  right: 0.5em;
+  accent-color: var(--accent-bg, #1e40af);
+}
+.tf-radio-card-group__icon { flex: 0 0 auto; }
+.tf-radio-card-group__body { flex: 1 1 auto; display: flex; flex-direction: column; gap: 0.25em; }
+.tf-radio-card-group__title { font-weight: 500; color: var(--text-strong, #111); }
+.tf-radio-card-group__description { font-size: 0.9em; color: var(--text-muted, #888); }
+.tf-radio-card-group__badge { position: absolute; bottom: 0.5em; right: 0.5em; }
+
+.tf-inline-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25em;
+  padding: 0.1em 0.5em;
+  border-radius: 1em;
+  font-size: 0.75em;
+  line-height: 1.2;
+}
+.tf-inline-badge--variant-solid {
+  background: var(--accent-bg, #1e40af);
+  color: #fff;
+}
+.tf-inline-badge--variant-soft {
+  background: var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+  color: var(--accent-bg, #1e40af);
+}
+.tf-inline-badge--variant-outline {
+  background: transparent;
+  border: 1px solid currentColor;
+  color: var(--text-muted, #71717a);
+}
+.tf-inline-badge--variant-pulse {
+  background: var(--accent-bg, #1e40af);
+  color: #fff;
+  animation: tf-inline-badge-pulse 1.2s ease-in-out infinite;
+}
+.tf-inline-badge--variant-dot {
+  width: 0.5em; height: 0.5em;
+  padding: 0;
+  background: var(--accent-bg, #1e40af);
+  border-radius: 50%;
+}
+.tf-inline-badge--tone-success.tf-inline-badge--variant-solid { background: var(--tone-success, #15803d); }
+.tf-inline-badge--tone-critical.tf-inline-badge--variant-solid { background: var(--tone-critical, #b91c1c); }
+.tf-inline-badge--pulse { animation: tf-inline-badge-pulse 1.2s ease-in-out infinite; }
+@keyframes tf-inline-badge-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
