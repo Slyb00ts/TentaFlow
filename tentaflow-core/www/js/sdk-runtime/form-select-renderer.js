@@ -176,24 +176,6 @@ function createOptionIcon(iconRef, ctx) {
 // Reactive helpers
 // =============================================================================
 
-function applyDisabledReactive(element, bindRef, ctx) {
-  if (bindRef == null) return () => false;
-  let active = false;
-  const apply = () => {
-    active = resolveBindRef(bindRef, ctx.store) === true;
-    if (active) {
-      element.setAttribute('disabled', '');
-      element.setAttribute('aria-disabled', 'true');
-    } else {
-      element.removeAttribute('disabled');
-      element.removeAttribute('aria-disabled');
-    }
-  };
-  apply();
-  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
-  return () => active;
-}
-
 function applyTextBind(element, bindRef, ctx) {
   const apply = () => {
     const v = resolveBindRef(bindRef, ctx.store);
@@ -266,24 +248,28 @@ function renderSelect(component, ctx) {
   if (virtualize) wrapper.classList.add('tf-select--virtualize');
 
   let labelEl = null;
+  let labelDomId = null;
   if (labelBind != null) {
-    labelEl = document.createElement('label');
+    labelEl = document.createElement('div');
     labelEl.classList.add('tf-select__label');
+    labelDomId = `tf-select-${component.id}-label`;
+    labelEl.setAttribute('id', labelDomId);
     applyTextBind(labelEl, labelBind, ctx);
     wrapper.appendChild(labelEl);
   }
 
-  // Trigger button — WAI-ARIA combobox pattern requires role=combobox on
-  // the focusable element. Button hosting popover daje fixed focus target.
-  const trigger = document.createElement('button');
-  trigger.setAttribute('type', 'button');
+  // Trigger to <div role="combobox"> — NIE <button> — bo zawiera nested
+  // interaktywny element (clear button), a button-in-button jest
+  // niepoprawnym HTML i łamie a11y/focus.
+  const trigger = document.createElement('div');
   trigger.setAttribute('role', 'combobox');
   trigger.setAttribute('aria-haspopup', 'listbox');
   trigger.setAttribute('aria-expanded', 'false');
+  trigger.setAttribute('tabindex', '0');
   trigger.classList.add('tf-select__trigger');
   const triggerId = `tf-select-${component.id}`;
   trigger.setAttribute('id', triggerId);
-  if (labelEl) labelEl.setAttribute('for', triggerId);
+  if (labelDomId) trigger.setAttribute('aria-labelledby', labelDomId);
 
   if (labelBind == null) {
     if (component.a11y == null || component.a11y.label == null) {
@@ -335,7 +321,31 @@ function renderSelect(component, ctx) {
   caret.textContent = '▾';
   trigger.appendChild(caret);
 
-  const isDisabledFn = applyDisabledReactive(trigger, disabledBind, ctx);
+  // Disabled state na <div role=combobox>: aria-disabled + zdjęcie tabindex
+  // (div nie ma natywnego `disabled`). Nested clear <button> NIE może
+  // pozostać tabbable — synchronizujemy `disabled` na nim w tym samym
+  // handler'ze.
+  const isDisabledFn = (() => {
+    if (disabledBind == null) return () => false;
+    let active = false;
+    const apply = () => {
+      active = resolveBindRef(disabledBind, ctx.store) === true;
+      if (active) {
+        trigger.setAttribute('aria-disabled', 'true');
+        trigger.setAttribute('data-disabled', '');
+        trigger.removeAttribute('tabindex');
+        if (clearButton) clearButton.disabled = true;
+      } else {
+        trigger.removeAttribute('aria-disabled');
+        trigger.removeAttribute('data-disabled');
+        trigger.setAttribute('tabindex', '0');
+        if (clearButton) clearButton.disabled = false;
+      }
+    };
+    apply();
+    ctx.registerCleanup(subscribeBindRef(disabledBind, ctx.store, apply));
+    return () => active;
+  })();
 
   wrapper.appendChild(trigger);
 
