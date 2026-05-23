@@ -38,6 +38,7 @@ import { registerDataTreeEmptyRenderers } from './data-tree-empty-renderer.js';
 import { registerDataListRenderer } from './data-list-renderer.js';
 import { registerDataTableRenderer } from './data-table-renderer.js';
 import { registerDataSparklineRenderer } from './data-sparkline-renderer.js';
+import { registerDataLineChartRenderer } from './data-line-chart-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -71,7 +72,8 @@ export function bootstrapSdkRuntime() {
   registerDataListRenderer();
   registerDataTableRenderer();
   registerDataSparklineRenderer();
+  registerDataLineChartRenderer();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
-  // 3.3d Data Display: in progress (21/38 — + Sparkline). EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
+  // 3.3d Data Display: in progress (22/38 — + LineChart real SVG z axes/legend/tooltip/zoom/brush). EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
