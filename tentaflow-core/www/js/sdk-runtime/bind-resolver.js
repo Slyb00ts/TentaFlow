@@ -19,7 +19,8 @@ import { isPrefixOf } from './state-store.js';
 /// Sprawdza shape `BindRef` — `{ kind: 'literal', value }` lub
 /// `{ kind: 'bound', path }`. Wymaga zdekodowanego JS obiektu, nie
 /// surowego CBOR.
-function assertBindRef(bindRef, ctx) {
+export function assertBindRef(bindRef, ctx) { return _assertBindRef(bindRef, ctx); }
+function _assertBindRef(bindRef, ctx) {
   if (!bindRef || typeof bindRef !== 'object') {
     throw new TypeError(`${ctx}: BindRef must be object`);
   }
