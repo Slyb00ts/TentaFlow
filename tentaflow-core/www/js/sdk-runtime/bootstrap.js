@@ -31,6 +31,7 @@ import { registerFormRangeNumericRenderers } from './form-range-numeric-renderer
 import { registerFormFileColorRenderers } from './form-file-color-renderer.js';
 import { registerFormRadioGroupsRenderers } from './form-radio-groups-renderer.js';
 import { registerFormWrappersRenderers } from './form-wrappers-renderer.js';
+import { registerDataTextRenderers } from './data-text-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -57,6 +58,8 @@ export function bootstrapSdkRuntime() {
   registerFormFileColorRenderers();
   registerFormRadioGroupsRenderers();
   registerFormWrappersRenderers();
-  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26 — wszystkie grupy).
+  registerDataTextRenderers();
+  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
+  // 3.3d Data Display: in progress (6/38 — text components).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
