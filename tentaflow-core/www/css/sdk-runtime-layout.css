@@ -2050,3 +2050,135 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
 }
+
+/* ============================================================================
+   tf-form-field (0x031A) + tf-form-group (0x031B) + tf-form-section (0x031C) +
+   tf-form (0x031D) — chunk 3.3c-8
+   ============================================================================ */
+.tf-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+}
+.tf-form-field--layout-horizontal {
+  flex-direction: row;
+  align-items: baseline;
+  gap: var(--tf-space-md);
+}
+.tf-form-field--layout-horizontal .tf-form-field__label {
+  flex: 0 0 12em;
+}
+.tf-form-field__label {
+  font-size: 0.9em;
+  font-weight: 500;
+  color: var(--text-strong, #111);
+}
+.tf-form-field__required-mark { color: var(--tone-critical, #b91c1c); margin-left: 0.2em; }
+.tf-form-field__child { display: block; }
+.tf-form-field--layout-horizontal .tf-form-field__child { flex: 1 1 auto; }
+.tf-form-field__hint {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+}
+.tf-form-field__error {
+  font-size: 0.85em;
+  color: var(--tone-critical, #b91c1c);
+}
+.tf-form-field--invalid .tf-form-field__label { color: var(--tone-critical, #b91c1c); }
+
+.tf-form-group {
+  display: block;
+  margin: 0;
+  padding: 0;
+}
+.tf-form-group__header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  margin-bottom: var(--tf-space-sm);
+}
+.tf-form-group__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  padding: 0.2em 0;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.tf-form-group__toggle::before {
+  content: '▸';
+  display: inline-block;
+  transition: transform 0.15s ease;
+  color: var(--text-muted, #888);
+}
+.tf-form-group--expanded .tf-form-group__toggle::before { transform: rotate(90deg); }
+.tf-form-group__title {
+  font-size: 1em;
+  font-weight: 600;
+  color: var(--text-strong, #111);
+  margin: 0;
+}
+.tf-form-group__description {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+  margin: 0;
+}
+.tf-form-group__body {
+  display: flex;
+  flex-direction: column;
+}
+.tf-form-group--spacing-zero  .tf-form-group__body { gap: 0; }
+.tf-form-group--spacing-xxs   .tf-form-group__body { gap: 0.125rem; }
+.tf-form-group--spacing-xs    .tf-form-group__body { gap: 0.25rem; }
+.tf-form-group--spacing-sm    .tf-form-group__body { gap: 0.5rem; }
+.tf-form-group--spacing-md    .tf-form-group__body { gap: 0.75rem; }
+.tf-form-group--spacing-lg    .tf-form-group__body { gap: 1rem; }
+.tf-form-group--spacing-xl    .tf-form-group__body { gap: 1.5rem; }
+.tf-form-group--spacing-xxl   .tf-form-group__body { gap: 2rem; }
+
+.tf-form-section {
+  display: block;
+  margin: 0;
+  padding: 0;
+}
+.tf-form-section--divider-top {
+  padding-top: var(--tf-space-lg);
+  border-top: 1px solid var(--border-base, #d4d4d8);
+}
+.tf-form-section__header { margin-bottom: var(--tf-space-md); }
+.tf-form-section__title {
+  font-size: 1.1em;
+  font-weight: 600;
+  color: var(--text-strong, #111);
+  margin: 0;
+}
+.tf-form-section__description {
+  font-size: 0.9em;
+  color: var(--text-muted, #888);
+  margin: 0.25em 0 0;
+}
+.tf-form-section__body {
+  display: flex;
+  flex-direction: column;
+}
+.tf-form-section--spacing-zero  .tf-form-section__body { gap: 0; }
+.tf-form-section--spacing-xxs   .tf-form-section__body { gap: 0.125rem; }
+.tf-form-section--spacing-xs    .tf-form-section__body { gap: 0.25rem; }
+.tf-form-section--spacing-sm    .tf-form-section__body { gap: 0.5rem; }
+.tf-form-section--spacing-md    .tf-form-section__body { gap: 0.75rem; }
+.tf-form-section--spacing-lg    .tf-form-section__body { gap: 1rem; }
+.tf-form-section--spacing-xl    .tf-form-section__body { gap: 1.5rem; }
+.tf-form-section--spacing-xxl   .tf-form-section__body { gap: 2rem; }
+
+.tf-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-md);
+}
+.tf-form--layout-horizontal { flex-direction: row; flex-wrap: wrap; align-items: baseline; }
+.tf-form--layout-compact { gap: var(--tf-space-sm); }
+.tf-form[data-disabled] { opacity: 0.5; pointer-events: none; }
