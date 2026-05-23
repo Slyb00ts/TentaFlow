@@ -19,6 +19,7 @@ import { registerActionButtonRenderer } from './action-button-renderer.js';
 import { registerActionIconButtonRenderer } from './action-icon-button-renderer.js';
 import { registerActionLinkFabRenderers } from './action-link-fab-renderer.js';
 import { registerActionButtonGroupRenderer } from './action-button-group-renderer.js';
+import { registerActionMenuRenderers } from './action-menu-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -33,6 +34,7 @@ export function bootstrapSdkRuntime() {
   registerActionIconButtonRenderer();
   registerActionLinkFabRenderers();
   registerActionButtonGroupRenderer();
-  // Kolejne grupy dołączane w nastepnych chunkach 3.3b-5+, 3.3c, ...
+  registerActionMenuRenderers();
+  // Kolejne grupy dołączane w nastepnych chunkach 3.3b-6+, 3.3c, ...
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
