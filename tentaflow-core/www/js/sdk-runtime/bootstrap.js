@@ -33,6 +33,7 @@ import { registerFormRadioGroupsRenderers } from './form-radio-groups-renderer.j
 import { registerFormWrappersRenderers } from './form-wrappers-renderer.js';
 import { registerDataTextRenderers } from './data-text-renderer.js';
 import { registerDataStatLabelsRenderers } from './data-stat-labels-renderer.js';
+import { registerDataAvatarListsRenderers } from './data-avatar-lists-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -61,7 +62,8 @@ export function bootstrapSdkRuntime() {
   registerFormWrappersRenderers();
   registerDataTextRenderers();
   registerDataStatLabelsRenderers();
+  registerDataAvatarListsRenderers();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
-  // 3.3d Data Display: in progress (12/38 — text + stat/labels).
+  // 3.3d Data Display: in progress (16/38 — text + stat/labels + avatar/lists).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
