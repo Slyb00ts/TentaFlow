@@ -1062,3 +1062,112 @@
   outline-offset: 2px;
 }
 .tf-radio__hint { font-size: 0.85em; color: var(--text-muted, #888); }
+
+/* ============================================================================
+   tf-input (0x0301) + tf-textarea (0x0302) — chunk 3.3c-2
+   ============================================================================ */
+.tf-input {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-input__label {
+  font-size: 0.9em;
+  color: var(--text-strong, #111);
+  font-weight: 500;
+}
+.tf-input__field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0 var(--tf-space-sm);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-input__field:focus-within {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+}
+.tf-input__control {
+  flex: 1 1 auto;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  min-width: 0;
+}
+.tf-input--size-sm .tf-input__control { padding: 0.25em 0; font-size: 0.85em; }
+.tf-input--size-md .tf-input__control { padding: 0.4em 0;  font-size: 1em; }
+.tf-input--size-lg .tf-input__control { padding: 0.55em 0; font-size: 1.1em; }
+.tf-input__control[disabled] { cursor: not-allowed; color: var(--text-muted, #888); }
+.tf-input__control[readonly] { background: var(--surface-muted, #f4f4f5); }
+.tf-input__affix {
+  color: var(--text-muted, #71717a);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+.tf-input__icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted, #71717a);
+}
+.tf-input__hint {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+}
+.tf-input__error {
+  font-size: 0.85em;
+  color: var(--tone-critical, #b91c1c);
+}
+.tf-input--invalid .tf-input__field {
+  border-color: var(--tone-critical, #b91c1c);
+}
+.tf-input--invalid .tf-input__field:focus-within {
+  box-shadow: 0 0 0 3px var(--tone-critical-soft, rgba(185, 28, 28, 0.15));
+}
+
+.tf-textarea {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+}
+.tf-textarea__label {
+  font-size: 0.9em;
+  color: var(--text-strong, #111);
+  font-weight: 500;
+}
+.tf-textarea__control {
+  resize: vertical;
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0.5em 0.65em;
+  font: inherit;
+  color: inherit;
+  outline: 0;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-textarea__control:focus-visible {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+}
+.tf-textarea--size-sm .tf-textarea__control { font-size: 0.85em; padding: 0.4em 0.55em; }
+.tf-textarea--size-lg .tf-textarea__control { font-size: 1.1em;  padding: 0.6em 0.75em; }
+.tf-textarea--monospace .tf-textarea__control {
+  font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+.tf-textarea--autoresize .tf-textarea__control { resize: none; overflow: hidden; }
+.tf-textarea__control[disabled] { cursor: not-allowed; color: var(--text-muted, #888); }
+.tf-textarea__control[readonly] { background: var(--surface-muted, #f4f4f5); }
+.tf-textarea__hint {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+}
+.tf-input--invalid .tf-textarea__control,
+.tf-textarea.tf-input--invalid .tf-textarea__control {
+  border-color: var(--tone-critical, #b91c1c);
+}
