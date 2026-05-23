@@ -2721,3 +2721,43 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   font: inherit;
   font-size: 0.85em;
 }
+
+/* ============================================================================
+   tf-sparkline (0x0215) — chunk 3.3d-7
+   ============================================================================ */
+.tf-sparkline { vertical-align: middle; }
+.tf-sparkline__svg { display: block; }
+.tf-sparkline__line { fill: none; stroke: var(--accent-bg, #1e40af); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.tf-sparkline__area { fill: var(--accent-bg-soft, rgba(30, 64, 175, 0.15)); }
+.tf-sparkline__bar  { fill: var(--accent-bg, #1e40af); }
+/* Per-tone overrides — line dostaje TYLKO stroke (zachowuje fill: none),
+   bar i area dostaja fill. */
+.tf-sparkline--tone-neutral .tf-sparkline__line { stroke: var(--text-strong, #111); }
+.tf-sparkline--tone-neutral .tf-sparkline__bar  { fill: var(--text-strong, #111); }
+.tf-sparkline--tone-neutral .tf-sparkline__area { fill: rgba(17, 17, 17, 0.12); }
+.tf-sparkline--tone-primary .tf-sparkline__line { stroke: var(--accent-bg, #1e40af); }
+.tf-sparkline--tone-primary .tf-sparkline__bar  { fill: var(--accent-bg, #1e40af); }
+.tf-sparkline--tone-primary .tf-sparkline__area { fill: var(--accent-bg-soft, rgba(30, 64, 175, 0.15)); }
+.tf-sparkline--tone-info    .tf-sparkline__line { stroke: var(--tone-info, #1e40af); }
+.tf-sparkline--tone-info    .tf-sparkline__bar  { fill: var(--tone-info, #1e40af); }
+.tf-sparkline--tone-info    .tf-sparkline__area { fill: rgba(30, 64, 175, 0.15); }
+.tf-sparkline--tone-success .tf-sparkline__line { stroke: var(--tone-success, #15803d); }
+.tf-sparkline--tone-success .tf-sparkline__bar  { fill: var(--tone-success, #15803d); }
+.tf-sparkline--tone-success .tf-sparkline__area { fill: rgba(21, 128, 61, 0.18); }
+.tf-sparkline--tone-critical .tf-sparkline__line { stroke: var(--tone-critical, #b91c1c); }
+.tf-sparkline--tone-critical .tf-sparkline__bar  { fill: var(--tone-critical, #b91c1c); }
+.tf-sparkline--tone-critical .tf-sparkline__area { fill: rgba(185, 28, 28, 0.18); }
+.tf-sparkline--tone-warning .tf-sparkline__line { stroke: var(--tone-warning, #b45309); }
+.tf-sparkline--tone-warning .tf-sparkline__bar  { fill: var(--tone-warning, #b45309); }
+.tf-sparkline--tone-warning .tf-sparkline__area { fill: rgba(180, 83, 9, 0.18); }
+.tf-sparkline--tone-muted .tf-sparkline__line { stroke: var(--text-muted, #888); }
+.tf-sparkline--tone-muted .tf-sparkline__bar  { fill: var(--text-muted, #888); }
+.tf-sparkline--tone-muted .tf-sparkline__area { fill: rgba(136, 136, 136, 0.15); }
+.tf-sparkline__stats {
+  display: inline-flex;
+  gap: 0.25em;
+  font-size: 0.75em;
+  color: var(--text-muted, #71717a);
+  font-variant-numeric: tabular-nums;
+}
+.tf-sparkline__sep { color: var(--text-muted, #888); }
