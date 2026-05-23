@@ -2873,3 +2873,15 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 }
 .tf-chart__tooltip-series { font-weight: 600; color: var(--text-strong, #111); }
 .tf-chart__tooltip-value { color: var(--text-muted, #71717a); font-variant-numeric: tabular-nums; }
+
+/* ============================================================================
+   tf-chart--area (AreaChart 0x0218) — chunk 3.3d-9. Reuse tf-chart shared.
+   ============================================================================ */
+.tf-chart__area { fill: var(--accent-bg, #1e40af); }
+.tf-chart__area--tone-neutral  { fill: var(--text-strong, #111); }
+.tf-chart__area--tone-primary  { fill: var(--accent-bg, #1e40af); }
+.tf-chart__area--tone-info     { fill: var(--tone-info, #1e40af); }
+.tf-chart__area--tone-success  { fill: var(--tone-success, #15803d); }
+.tf-chart__area--tone-warning  { fill: var(--tone-warning, #b45309); }
+.tf-chart__area--tone-critical { fill: var(--tone-critical, #b91c1c); }
+.tf-chart__area--tone-muted    { fill: var(--text-muted, #888); }
