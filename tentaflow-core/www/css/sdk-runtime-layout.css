@@ -2613,3 +2613,64 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
+
+/* ============================================================================
+   tf-list (0x0212) + tf-empty-state (0x0003 — tymczasowo) — chunk 3.3d-5
+   ============================================================================ */
+.tf-list { font: inherit; }
+.tf-list__items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.tf-list--density-compact     .tf-list__items { gap: 0; }
+.tf-list--density-default     .tf-list__items { gap: 0.25rem; }
+.tf-list--density-comfortable .tf-list__items { gap: 0.5rem; }
+.tf-list__item {
+  padding: 0.5em 0.75em;
+  cursor: pointer;
+  border-radius: var(--tf-radius-sm, 0.25rem);
+}
+.tf-list__item:hover { background: var(--surface-muted, #f4f4f5); }
+.tf-list__item:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: -2px;
+}
+.tf-list--divider .tf-list__item { border-bottom: 1px solid var(--border-base, #d4d4d8); }
+.tf-list--divider .tf-list__item:last-child { border-bottom: 0; }
+.tf-list--virtualize .tf-list__items { contain: content; }
+.tf-list__more {
+  padding: 0.5em 0.75em;
+  color: var(--text-muted, #888);
+  font-size: 0.85em;
+  text-align: center;
+}
+
+.tf-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--tf-space-sm);
+  padding: var(--tf-space-lg);
+  color: var(--text-muted, #71717a);
+}
+.tf-empty-state--variant-compact { padding: var(--tf-space-md); gap: var(--tf-space-xs); }
+.tf-empty-state--variant-illustrated { padding: var(--tf-space-xl); }
+.tf-empty-state__icon {
+  font-size: 2rem;
+  color: var(--text-muted, #888);
+}
+.tf-empty-state--variant-illustrated .tf-empty-state__icon { font-size: 4rem; }
+.tf-empty-state__heading {
+  font-size: 1.1em;
+  font-weight: 600;
+  color: var(--text-strong, #111);
+  margin: 0;
+}
+.tf-empty-state__message {
+  font-size: 0.95em;
+  margin: 0;
+  max-width: 40ch;
+}
+.tf-empty-state__actions {
+  display: inline-flex;
+  gap: var(--tf-space-sm);
+  margin-top: var(--tf-space-xs);
+}
