@@ -1686,3 +1686,112 @@
   background: var(--accent-bg-soft, rgba(30, 64, 175, 0.1));
   border-color: var(--accent-bg, #1e40af);
 }
+
+/* ============================================================================
+   tf-slider / tf-range-slider / tf-slider-row / tf-numeric / tf-currency
+   chunk 3.3c-5
+   ============================================================================ */
+.tf-slider,
+.tf-slider-row,
+.tf-range-slider,
+.tf-numeric,
+.tf-currency {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-slider__label,
+.tf-slider-row__label,
+.tf-range-slider__label,
+.tf-numeric__label,
+.tf-currency__label {
+  font-size: 0.9em;
+  font-weight: 500;
+  color: var(--text-strong, #111);
+}
+.tf-slider__field,
+.tf-slider-row__field,
+.tf-range-slider__field,
+.tf-numeric__field,
+.tf-currency__field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+}
+.tf-slider__input,
+.tf-slider-row__input,
+.tf-range-slider__input {
+  flex: 1 1 auto;
+  accent-color: var(--accent-bg, #1e40af);
+}
+.tf-slider--tone-success .tf-slider__input,
+.tf-slider-row--tone-success .tf-slider-row__input,
+.tf-range-slider--tone-success .tf-range-slider__input {
+  accent-color: var(--tone-success, #15803d);
+}
+.tf-slider--tone-critical .tf-slider__input,
+.tf-slider-row--tone-critical .tf-slider-row__input,
+.tf-range-slider--tone-critical .tf-range-slider__input {
+  accent-color: var(--tone-critical, #b91c1c);
+}
+.tf-slider__value,
+.tf-slider-row__value,
+.tf-range-slider__value {
+  min-width: 3ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong, #111);
+}
+.tf-slider-row--layout-compact .tf-slider-row__field {
+  flex-wrap: wrap;
+}
+.tf-numeric__field,
+.tf-currency__field {
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0 var(--tf-space-sm);
+}
+.tf-numeric__field:focus-within,
+.tf-currency__field:focus-within {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+}
+.tf-numeric__input,
+.tf-currency__input {
+  flex: 1 1 auto;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  min-width: 0;
+  padding: 0.4em 0;
+  font-variant-numeric: tabular-nums;
+}
+.tf-numeric--size-sm .tf-numeric__input,
+.tf-currency--size-sm .tf-currency__input {
+  padding: 0.25em 0;
+  font-size: 0.85em;
+}
+.tf-numeric--size-lg .tf-numeric__input,
+.tf-currency--size-lg .tf-currency__input {
+  padding: 0.55em 0;
+  font-size: 1.1em;
+}
+.tf-currency__symbol {
+  color: var(--text-muted, #71717a);
+  font-weight: 500;
+}
+.tf-numeric__hint,
+.tf-currency__hint {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+}
+.tf-numeric__formatted,
+.tf-currency__formatted {
+  font-size: 0.85em;
+  color: var(--text-muted, #71717a);
+  font-variant-numeric: tabular-nums;
+}
