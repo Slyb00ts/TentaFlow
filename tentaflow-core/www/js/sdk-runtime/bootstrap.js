@@ -41,6 +41,7 @@ import { registerDataSparklineRenderer } from './data-sparkline-renderer.js';
 import { registerDataLineChartRenderer } from './data-line-chart-renderer.js';
 import { registerDataAreaChartRenderer } from './data-area-chart-renderer.js';
 import { registerDataBarChartRenderers } from './data-bar-chart-renderer.js';
+import { registerDataPieChartRenderer } from './data-pie-chart-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -77,7 +78,8 @@ export function bootstrapSdkRuntime() {
   registerDataLineChartRenderer();
   registerDataAreaChartRenderer();
   registerDataBarChartRenderers();
+  registerDataPieChartRenderer();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
-  // 3.3d Data Display: in progress (25/38 — + BarChart + StackedBar). EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
+  // 3.3d Data Display: in progress (26/38 — + PieChart pie/donut z slice arcs). Charts group KOMPLETNA. EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
