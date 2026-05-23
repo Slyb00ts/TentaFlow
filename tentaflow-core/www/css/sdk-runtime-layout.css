@@ -2992,3 +2992,86 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 .tf-pie-chart__legend-swatch--tone-muted    { background: var(--text-muted, #888); }
 .tf-pie-chart__legend-label { flex: 1 1 auto; }
 .tf-pie-chart__legend-value { color: var(--text-muted, #71717a); font-variant-numeric: tabular-nums; }
+
+/* =============================================================================
+   tf-heatmap (Heatmap 0x021B) + tf-gauge (Gauge 0x021C) — chunk 3.3d-12
+   ============================================================================= */
+
+.tf-heatmap { display: block; font: inherit; position: relative; }
+.tf-heatmap__layout { display: flex; align-items: flex-start; gap: var(--tf-space-md); }
+.tf-heatmap--legend-bottom .tf-heatmap__layout { flex-direction: column; }
+.tf-heatmap__svg { display: block; }
+.tf-heatmap__col-label,
+.tf-heatmap__row-label {
+  font-size: 11px;
+  fill: var(--text-muted, #71717a);
+}
+.tf-heatmap__cell {
+  stroke: var(--surface-bg, #fff);
+  stroke-width: 1;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+.tf-heatmap__cell:hover { opacity: 0.8; }
+.tf-heatmap__tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--surface-elev, #fff);
+  color: var(--text-strong, #111);
+  border: 1px solid var(--border-default, #d4d4d8);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  z-index: 10;
+}
+.tf-heatmap__legend {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.tf-heatmap__legend--position-top_right { margin-left: auto; align-self: flex-start; }
+.tf-heatmap__legend-gradient {
+  width: 120px;
+  height: 12px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+.tf-heatmap__legend-tick { color: var(--text-muted, #71717a); font-variant-numeric: tabular-nums; }
+.tf-heatmap__legend-bucket { display: inline-flex; align-items: center; gap: 4px; }
+.tf-heatmap__legend-swatch {
+  width: 0.85em; height: 0.85em; border-radius: 2px; flex: 0 0 auto;
+}
+.tf-heatmap__legend-bucket-label { color: var(--text-default, #1f1f1f); }
+
+.tf-gauge { display: inline-block; font: inherit; position: relative; }
+.tf-gauge__svg { display: block; width: 100%; height: 100%; }
+.tf-gauge__track { stroke: var(--border-muted, #e4e4e7); stroke-linecap: round; }
+.tf-gauge__value-arc { stroke-linecap: round; transition: d 0.2s ease; }
+.tf-gauge__value-arc--tone-neutral  { stroke: var(--text-strong, #111); }
+.tf-gauge__value-arc--tone-primary  { stroke: var(--accent-bg, #1e40af); }
+.tf-gauge__value-arc--tone-info     { stroke: var(--tone-info, #1e40af); }
+.tf-gauge__value-arc--tone-success  { stroke: var(--tone-success, #15803d); }
+.tf-gauge__value-arc--tone-warning  { stroke: var(--tone-warning, #b45309); }
+.tf-gauge__value-arc--tone-critical { stroke: var(--tone-critical, #b91c1c); }
+.tf-gauge__value-arc--tone-muted    { stroke: var(--text-muted, #888); }
+.tf-gauge__threshold { stroke-width: 2; }
+.tf-gauge__threshold--tone-neutral  { stroke: var(--text-strong, #111); }
+.tf-gauge__threshold--tone-primary  { stroke: var(--accent-bg, #1e40af); }
+.tf-gauge__threshold--tone-info     { stroke: var(--tone-info, #1e40af); }
+.tf-gauge__threshold--tone-success  { stroke: var(--tone-success, #15803d); }
+.tf-gauge__threshold--tone-warning  { stroke: var(--tone-warning, #b45309); }
+.tf-gauge__threshold--tone-critical { stroke: var(--tone-critical, #b91c1c); }
+.tf-gauge__threshold--tone-muted    { stroke: var(--text-muted, #888); }
+.tf-gauge__value-text {
+  font-size: 18px;
+  font-weight: 600;
+  fill: var(--text-strong, #111);
+  font-variant-numeric: tabular-nums;
+}
+.tf-gauge__label {
+  font-size: 11px;
+  fill: var(--text-muted, #71717a);
+}
