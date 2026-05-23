@@ -96,7 +96,7 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
 const VALUE_FORMAT_VARIANT_KEYS = {
   plain:    new Set(['kind']),
   number:   new Set(['kind', 'decimals', 'thousands_sep']),
-  currency: new Set(['kind', 'code', 'decimals']),
+  currency: new Set(['kind', 'code']),
   percent:  new Set(['kind', 'decimals']),
   bytes:    new Set(['kind', 'base']),
   duration: new Set(['kind', 'style']),
