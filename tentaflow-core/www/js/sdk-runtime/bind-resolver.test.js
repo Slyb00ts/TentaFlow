@@ -110,6 +110,18 @@ test('resolveBindRef rejects bad shape', () => {
   assertThrows(() => resolveBindRef({ kind: 'bound', path: {} }, store));
 });
 
+test('resolveBindRef literal rejects extra keys (strict shape mirror Rust)', () => {
+  const store = newStore();
+  assertThrows(() => resolveBindRef({ kind: 'literal', value: 1, path: PATH('a') }, store));
+  assertThrows(() => resolveBindRef({ kind: 'literal', value: 1, extra: true }, store));
+});
+
+test('resolveBindRef bound rejects extra keys (strict shape mirror Rust)', () => {
+  const store = newStore();
+  assertThrows(() => resolveBindRef({ kind: 'bound', path: PATH('a'), value: 1 }, store));
+  assertThrows(() => resolveBindRef({ kind: 'bound', path: PATH('a'), extra: true }, store));
+});
+
 test('subscribeBindRef literal returns noop unsub', () => {
   const store = newStore();
   let hits = 0;

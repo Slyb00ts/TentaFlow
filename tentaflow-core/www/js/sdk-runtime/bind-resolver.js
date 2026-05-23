@@ -28,9 +28,19 @@ function _assertBindRef(bindRef, ctx) {
     if (!('value' in bindRef)) {
       throw new TypeError(`${ctx}: BindRef.literal missing value`);
     }
+    for (const k of Object.keys(bindRef)) {
+      if (k !== 'kind' && k !== 'value') {
+        throw new TypeError(`${ctx}: BindRef.literal unexpected key '${k}'`);
+      }
+    }
   } else if (bindRef.kind === 'bound') {
     if (!Array.isArray(bindRef.path)) {
       throw new TypeError(`${ctx}: BindRef.bound.path must be Array<PathSegment>`);
+    }
+    for (const k of Object.keys(bindRef)) {
+      if (k !== 'kind' && k !== 'path') {
+        throw new TypeError(`${ctx}: BindRef.bound unexpected key '${k}'`);
+      }
     }
   } else {
     throw new TypeError(`${ctx}: BindRef.kind must be 'literal' or 'bound'`);
