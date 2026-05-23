@@ -2885,3 +2885,64 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 .tf-chart__area--tone-warning  { fill: var(--tone-warning, #b45309); }
 .tf-chart__area--tone-critical { fill: var(--tone-critical, #b91c1c); }
 .tf-chart__area--tone-muted    { fill: var(--text-muted, #888); }
+
+/* ============================================================================
+   tf-chart--bar (BarChart 0x0217) + tf-stacked-bar (0x021A) — chunk 3.3d-10
+   ============================================================================ */
+.tf-chart__bar { fill: var(--accent-bg, #1e40af); }
+.tf-chart__bar--tone-neutral  { fill: var(--text-strong, #111); }
+.tf-chart__bar--tone-primary  { fill: var(--accent-bg, #1e40af); }
+.tf-chart__bar--tone-info     { fill: var(--tone-info, #1e40af); }
+.tf-chart__bar--tone-success  { fill: var(--tone-success, #15803d); }
+.tf-chart__bar--tone-warning  { fill: var(--tone-warning, #b45309); }
+.tf-chart__bar--tone-critical { fill: var(--tone-critical, #b91c1c); }
+.tf-chart__bar--tone-muted    { fill: var(--text-muted, #888); }
+
+.tf-stacked-bar { display: flex; flex-direction: column; gap: var(--tf-space-xs); font: inherit; }
+.tf-stacked-bar__bar {
+  display: flex;
+  width: 100%;
+  background: var(--surface-muted, #f4f4f5);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  overflow: hidden;
+}
+.tf-stacked-bar__segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 0.75em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  overflow: hidden;
+  transition: width 0.2s ease;
+}
+.tf-stacked-bar__segment-rest { background: transparent; }
+.tf-stacked-bar__segment--tone-neutral  { background: var(--text-strong, #111); }
+.tf-stacked-bar__segment--tone-primary  { background: var(--accent-bg, #1e40af); }
+.tf-stacked-bar__segment--tone-info     { background: var(--tone-info, #1e40af); }
+.tf-stacked-bar__segment--tone-success  { background: var(--tone-success, #15803d); }
+.tf-stacked-bar__segment--tone-warning  { background: var(--tone-warning, #b45309); }
+.tf-stacked-bar__segment--tone-critical { background: var(--tone-critical, #b91c1c); }
+.tf-stacked-bar__segment--tone-muted    { background: var(--text-muted, #888); }
+.tf-stacked-bar__segment-percent { white-space: nowrap; padding: 0 0.4em; }
+.tf-stacked-bar__legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm);
+  font-size: 0.85em;
+}
+.tf-stacked-bar__legend-item { display: inline-flex; align-items: center; gap: 0.4em; }
+.tf-stacked-bar__legend-swatch { width: 0.8em; height: 0.8em; border-radius: 2px; flex: 0 0 auto; background: var(--accent-bg, #1e40af); }
+.tf-stacked-bar__legend-swatch--tone-neutral  { background: var(--text-strong, #111); }
+.tf-stacked-bar__legend-swatch--tone-primary  { background: var(--accent-bg, #1e40af); }
+.tf-stacked-bar__legend-swatch--tone-info     { background: var(--tone-info, #1e40af); }
+.tf-stacked-bar__legend-swatch--tone-success  { background: var(--tone-success, #15803d); }
+.tf-stacked-bar__legend-swatch--tone-warning  { background: var(--tone-warning, #b45309); }
+.tf-stacked-bar__legend-swatch--tone-critical { background: var(--tone-critical, #b91c1c); }
+.tf-stacked-bar__legend-swatch--tone-muted    { background: var(--text-muted, #888); }
+.tf-stacked-bar__legend-value { color: var(--text-muted, #71717a); font-variant-numeric: tabular-nums; }
