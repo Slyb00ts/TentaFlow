@@ -28,6 +28,7 @@ import { registerFormMultiSelectRenderers } from './form-multiselect-renderer.js
 import { registerFormComboboxRenderers } from './form-combobox-renderer.js';
 import { registerFormDatetimeRenderers } from './form-datetime-renderer.js';
 import { registerFormRangeNumericRenderers } from './form-range-numeric-renderer.js';
+import { registerFormFileColorRenderers } from './form-file-color-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -51,6 +52,7 @@ export function bootstrapSdkRuntime() {
   registerFormComboboxRenderers();
   registerFormDatetimeRenderers();
   registerFormRangeNumericRenderers();
-  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (18/29 — atomic + text + selectors + datetime + range/numeric).
+  registerFormFileColorRenderers();
+  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (20/29 — + file/color).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
