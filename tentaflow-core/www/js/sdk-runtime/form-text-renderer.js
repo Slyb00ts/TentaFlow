@@ -18,6 +18,7 @@ import {
   lookupComponentRenderer,
 } from './component-renderer.js';
 import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
 // Wspólne walidatory enumów i tokenów
@@ -61,8 +62,6 @@ const INPUT_MODES = new Set([
   'none', 'text', 'tel', 'url', 'email', 'numeric', 'decimal', 'search',
 ]);
 const INPUT_SIZES = new Set(['sm', 'md', 'lg']);
-const ICON_REF_KEYS = new Set(['name', 'tone', 'size', 'label']);
-
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
     throw new TypeError(
@@ -116,38 +115,8 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
 // IconRef parser (catalog §1.5)
 // =============================================================================
 
-/// Zwraca string name lub null gdy iconRef == null. Pełną walidację shape'u
-/// — `name` (IconName enum), opcjonalne `tone`, `size`, `label`.
-function parseIconRef(ref, ctx) {
-  if (ref == null) return null;
-  if (typeof ref !== 'object') {
-    throw new TypeError(`${ctx}: IconRef must be object`);
-  }
-  assertOnlyKnownObjectKeys(ref, ICON_REF_KEYS, ctx);
-  if (typeof ref.name !== 'string' || ref.name.length === 0) {
-    throw new TypeError(`${ctx}.name must be non-empty string`);
-  }
-  return ref;
-}
-
-function createIconElement(iconRef) {
-  const el = document.createElement('span');
-  el.classList.add('tf-input__icon');
-  el.setAttribute('data-icon-name', iconRef.name);
-  if (typeof iconRef.tone === 'string') {
-    el.setAttribute('data-icon-tone', iconRef.tone);
-  }
-  if (typeof iconRef.size === 'string') {
-    el.setAttribute('data-icon-size', iconRef.size);
-  }
-  if (typeof iconRef.label === 'string' && iconRef.label.length > 0) {
-    el.setAttribute('aria-label', iconRef.label);
-    el.setAttribute('role', 'img');
-  } else {
-    el.setAttribute('aria-hidden', 'true');
-  }
-  return el;
-}
+// IconRef parsing + render delegowany do shared `renderIcon` (icon-renderer.js)
+// — wspiera oba warianty IconRef::Named / IconRef::Asset zgodnie z inline.rs §1.5.
 
 // =============================================================================
 // Reactive helpers
@@ -275,12 +244,8 @@ function renderInput(component, ctx) {
   const placeholderBind = ctx.readField(component.fields, 2);
   const labelBind = ctx.readField(component.fields, 3);
   const hintBind = ctx.readField(component.fields, 4);
-  const leadingIcon = parseIconRef(
-    ctx.readField(component.fields, 5), 'Input.leading_icon'
-  );
-  const trailingIcon = parseIconRef(
-    ctx.readField(component.fields, 6), 'Input.trailing_icon'
-  );
+  const leadingIconRaw = ctx.readField(component.fields, 5);
+  const trailingIconRaw = ctx.readField(component.fields, 6);
   const prefixBind = ctx.readField(component.fields, 7);
   const suffixBind = ctx.readField(component.fields, 8);
   // validators — szczegółowa walidacja po stronie host'a (Faza 6 trust
@@ -344,8 +309,9 @@ function renderInput(component, ctx) {
     fieldRow.appendChild(prefixEl);
   }
 
-  if (leadingIcon) {
-    const iconEl = createIconElement(leadingIcon);
+  if (leadingIconRaw != null) {
+    const iconEl = renderIcon(leadingIconRaw, 'Input.leading_icon');
+    iconEl.classList.add('tf-input__icon');
     iconEl.classList.add('tf-input__icon--leading');
     fieldRow.appendChild(iconEl);
   }
@@ -409,8 +375,9 @@ function renderInput(component, ctx) {
 
   fieldRow.appendChild(input);
 
-  if (trailingIcon) {
-    const iconEl = createIconElement(trailingIcon);
+  if (trailingIconRaw != null) {
+    const iconEl = renderIcon(trailingIconRaw, 'Input.trailing_icon');
+    iconEl.classList.add('tf-input__icon');
     iconEl.classList.add('tf-input__icon--trailing');
     fieldRow.appendChild(iconEl);
   }
