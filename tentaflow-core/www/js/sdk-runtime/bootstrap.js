@@ -25,6 +25,7 @@ import { registerFormAtomicRenderers } from './form-atomic-renderer.js';
 import { registerFormTextRenderers } from './form-text-renderer.js';
 import { registerFormSelectRenderers } from './form-select-renderer.js';
 import { registerFormMultiSelectRenderers } from './form-multiselect-renderer.js';
+import { registerFormComboboxRenderers } from './form-combobox-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -45,6 +46,7 @@ export function bootstrapSdkRuntime() {
   registerFormTextRenderers();
   registerFormSelectRenderers();
   registerFormMultiSelectRenderers();
-  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (7/29 — atomic + text + Select + MultiSelect).
+  registerFormComboboxRenderers();
+  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (9/29 — atomic + text + selectors complete).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
