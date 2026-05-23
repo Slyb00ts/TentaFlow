@@ -628,3 +628,108 @@
   animation: tf-button-spin 0.7s linear infinite;
 }
 @keyframes tf-button-spin { to { transform: rotate(360deg); } }
+
+/* =============================================================================
+   tf-link-button (0x0404) — chunk 3.3b-3
+   ============================================================================= */
+.tf-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+  background: transparent;
+  border: 0;
+  padding: var(--tf-space-xxs) var(--tf-space-xs);
+  cursor: pointer;
+  font: inherit;
+  color: var(--accent-bg, #1e40af);
+  border-radius: var(--tf-radius-sm);
+}
+.tf-link-button:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-link-button--underline-always { text-decoration: underline; }
+.tf-link-button--underline-never  { text-decoration: none; }
+.tf-link-button--underline-hover  { text-decoration: none; }
+.tf-link-button--underline-hover:hover { text-decoration: underline; }
+.tf-link-button--tone-primary  { color: var(--tone-primary, #1e40af); }
+.tf-link-button--tone-success  { color: var(--tone-success, #15803d); }
+.tf-link-button--tone-warning  { color: var(--tone-warning, #c2410c); }
+.tf-link-button--tone-critical { color: var(--tone-critical, #b91c1c); }
+.tf-link-button--tone-info     { color: var(--tone-info, #0369a1); }
+.tf-link-button--tone-muted    { color: var(--text-muted, #888); }
+.tf-link-button--tone-neutral  { color: inherit; }
+.tf-link-button__icon { width: 1em; height: 1em; flex: 0 0 auto; }
+
+/* =============================================================================
+   tf-link (0x0405) — chunk 3.3b-3
+   ============================================================================= */
+.tf-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-xxs);
+  color: var(--accent-bg, #1e40af);
+}
+.tf-link:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 2px;
+}
+.tf-link--underline-always { text-decoration: underline; }
+.tf-link--underline-never  { text-decoration: none; }
+.tf-link--underline-hover  { text-decoration: none; }
+.tf-link--underline-hover:hover { text-decoration: underline; }
+.tf-link--tone-primary  { color: var(--tone-primary, #1e40af); }
+.tf-link--tone-success  { color: var(--tone-success, #15803d); }
+.tf-link--tone-warning  { color: var(--tone-warning, #c2410c); }
+.tf-link--tone-critical { color: var(--tone-critical, #b91c1c); }
+.tf-link--tone-info     { color: var(--tone-info, #0369a1); }
+.tf-link--tone-muted    { color: var(--text-muted, #888); }
+.tf-link--tone-neutral  { color: inherit; }
+.tf-link__icon { width: 1em; height: 1em; flex: 0 0 auto; }
+
+/* =============================================================================
+   tf-fab (0x040C) — chunk 3.3b-3
+   ============================================================================= */
+.tf-fab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--tf-space-sm);
+  background: var(--accent-bg, #1e40af);
+  color: var(--text-inverse, #fff);
+  border: 0;
+  border-radius: var(--tf-radius-pill);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 500;
+}
+.tf-fab:focus-visible {
+  outline: 2px solid var(--accent-bg, #1e40af);
+  outline-offset: 3px;
+}
+.tf-fab--size-sm { width: 40px; height: 40px; font-size: 1rem; }
+.tf-fab--size-md { width: 56px; height: 56px; font-size: 1.25rem; }
+.tf-fab--size-lg { width: 64px; height: 64px; font-size: 1.5rem; }
+.tf-fab--extended {
+  width: auto;
+  padding-inline: var(--tf-space-md);
+}
+.tf-fab--position-bottom_right {
+  position: fixed; bottom: var(--tf-space-lg); right: var(--tf-space-lg);
+  z-index: 800;
+}
+.tf-fab--position-bottom_left {
+  position: fixed; bottom: var(--tf-space-lg); left: var(--tf-space-lg);
+  z-index: 800;
+}
+.tf-fab--position-inline { position: relative; }
+.tf-fab--tone-primary   { background: var(--tone-primary, #1e40af); }
+.tf-fab--tone-success   { background: var(--tone-success, #15803d); }
+.tf-fab--tone-warning   { background: var(--tone-warning, #c2410c); }
+.tf-fab--tone-critical  { background: var(--tone-critical, #b91c1c); }
+.tf-fab--tone-info      { background: var(--tone-info, #0369a1); }
+.tf-fab--tone-muted     { background: var(--text-muted, #888); }
+.tf-fab--tone-neutral   { background: var(--tf-bg-inverse); }
+.tf-fab__icon { width: 1em; height: 1em; }
+.tf-fab__label { white-space: nowrap; }
