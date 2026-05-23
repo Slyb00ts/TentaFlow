@@ -249,12 +249,12 @@ test('Input leading_icon + trailing_icon renderowane jako .tf-input__icon', () =
   const engine = makeEngine();
   const el = engine.render(comp(INPUT_TAG, inputFields({
     3: { kind: 'literal', value: 'L' },
-    5: { name: 'search' }, 6: { name: 'x' },
+    5: { kind: 'named', name: 'search' }, 6: { kind: 'named', name: 'x' },
   })));
   const lead = el.querySelector('.tf-input__icon--leading');
   const trail = el.querySelector('.tf-input__icon--trailing');
-  assertEq(lead.getAttribute('data-icon-name'), 'search');
-  assertEq(trail.getAttribute('data-icon-name'), 'x');
+  assert(lead.classList.contains('tf-icon--name-search'));
+  assert(trail.classList.contains('tf-icon--name-x'));
 });
 
 test('Input prefix/suffix renderowane jako reactive .tf-input__affix', () => {

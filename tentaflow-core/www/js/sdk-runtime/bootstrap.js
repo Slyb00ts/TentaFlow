@@ -23,6 +23,7 @@ import { registerActionMenuRenderers } from './action-menu-renderer.js';
 import { registerActionBarsRenderers } from './action-bars-renderer.js';
 import { registerFormAtomicRenderers } from './form-atomic-renderer.js';
 import { registerFormTextRenderers } from './form-text-renderer.js';
+import { registerFormSelectRenderers } from './form-select-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -41,6 +42,7 @@ export function bootstrapSdkRuntime() {
   registerActionBarsRenderers();
   registerFormAtomicRenderers();
   registerFormTextRenderers();
-  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (5/29 — atomic + text).
+  registerFormSelectRenderers();
+  // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: in progress (6/29 — atomic + text + Select).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
