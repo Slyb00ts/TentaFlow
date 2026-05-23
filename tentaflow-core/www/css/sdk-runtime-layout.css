@@ -1473,3 +1473,145 @@
   margin: 0;
   padding: 0;
 }
+
+/* ============================================================================
+   tf-combobox (0x0305) + tf-autocomplete (0x0306) — chunk 3.3c-3c
+   ============================================================================ */
+.tf-combobox {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-combobox__label {
+  font-size: 0.9em;
+  color: var(--text-strong, #111);
+  font-weight: 500;
+}
+.tf-combobox__field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0 var(--tf-space-sm);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-combobox__field:focus-within {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+}
+.tf-combobox__input {
+  flex: 1 1 auto;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  min-width: 0;
+  padding: 0.4em 0;
+}
+.tf-combobox--size-sm .tf-combobox__input { padding: 0.25em 0; font-size: 0.85em; }
+.tf-combobox--size-lg .tf-combobox__input { padding: 0.55em 0; font-size: 1.1em; }
+.tf-combobox__input[disabled] {
+  cursor: not-allowed;
+  color: var(--text-muted, #888);
+}
+.tf-combobox__clear,
+.tf-combobox__caret {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0 0.15em;
+  cursor: pointer;
+}
+.tf-combobox__clear { color: var(--text-muted, #71717a); }
+.tf-combobox__clear:hover { color: var(--text-strong, #111); }
+.tf-combobox__caret { color: var(--text-muted, #888); }
+.tf-combobox--open .tf-combobox__caret { transform: rotate(180deg); }
+
+.tf-combobox__popover {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  max-height: 16rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.tf-combobox--virtualize .tf-combobox__popover { max-height: 24rem; }
+.tf-combobox__listbox {
+  list-style: none;
+  margin: 0;
+  padding: 0.25em 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.tf-combobox__option {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+  padding: 0.4em 0.6em;
+  cursor: pointer;
+  user-select: none;
+}
+.tf-combobox__option:hover,
+.tf-combobox__option--active {
+  background: var(--surface-muted, #f4f4f5);
+}
+.tf-combobox__option[aria-selected="true"] {
+  background: var(--accent-bg-soft, rgba(30, 64, 175, 0.1));
+  color: var(--accent-bg, #1e40af);
+}
+.tf-combobox__option--disabled { opacity: 0.4; cursor: not-allowed; }
+.tf-combobox__option-label { flex: 1 1 auto; }
+.tf-combobox__option-description {
+  font-size: 0.85em;
+  color: var(--text-muted, #888);
+}
+.tf-combobox__group { display: block; }
+.tf-combobox__group-header {
+  padding: 0.4em 0.6em 0.2em;
+  font-size: 0.8em;
+  font-weight: 600;
+  color: var(--text-muted, #71717a);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.tf-combobox__group-list { list-style: none; margin: 0; padding: 0; }
+
+.tf-autocomplete {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-autocomplete__label {
+  font-size: 0.9em;
+  color: var(--text-strong, #111);
+  font-weight: 500;
+}
+.tf-autocomplete__input {
+  background: var(--surface-bg, #fff);
+  border: 1px solid var(--border-base, #d4d4d8);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0.4em 0.6em;
+  font: inherit;
+  color: inherit;
+  outline: 0;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tf-autocomplete__input:focus-visible {
+  border-color: var(--accent-bg, #1e40af);
+  box-shadow: 0 0 0 3px var(--accent-bg-soft, rgba(30, 64, 175, 0.15));
+}
