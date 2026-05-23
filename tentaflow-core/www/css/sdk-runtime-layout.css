@@ -3075,3 +3075,84 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   font-size: 11px;
   fill: var(--text-muted, #71717a);
 }
+
+/* =============================================================================
+   tf-progress-bar (ProgressBar 0x021D) + tf-rating (RatingDisplay 0x021E)
+   chunk 3.3d-13
+   ============================================================================= */
+
+.tf-progress-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font: inherit;
+  width: 100%;
+}
+.tf-progress-bar__track {
+  width: 100%;
+  background: var(--border-muted, #e4e4e7);
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+.tf-progress-bar--size-xs .tf-progress-bar__track { height: 4px; }
+.tf-progress-bar--size-sm .tf-progress-bar__track { height: 8px; }
+.tf-progress-bar--size-md .tf-progress-bar__track { height: 12px; }
+.tf-progress-bar--size-lg .tf-progress-bar__track { height: 18px; }
+.tf-progress-bar__fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent-bg, #1e40af);
+  transition: width 0.2s ease;
+  border-radius: 999px;
+}
+.tf-progress-bar--tone-neutral  .tf-progress-bar__fill { background: var(--text-strong, #111); }
+.tf-progress-bar--tone-primary  .tf-progress-bar__fill { background: var(--accent-bg, #1e40af); }
+.tf-progress-bar--tone-info     .tf-progress-bar__fill { background: var(--tone-info, #1e40af); }
+.tf-progress-bar--tone-success  .tf-progress-bar__fill { background: var(--tone-success, #15803d); }
+.tf-progress-bar--tone-warning  .tf-progress-bar__fill { background: var(--tone-warning, #b45309); }
+.tf-progress-bar--tone-critical .tf-progress-bar__fill { background: var(--tone-critical, #b91c1c); }
+.tf-progress-bar--tone-muted    .tf-progress-bar__fill { background: var(--text-muted, #888); }
+.tf-progress-bar--variant-striped .tf-progress-bar__fill {
+  background-image: linear-gradient(
+    45deg,
+    rgba(255,255,255,0.18) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255,255,255,0.18) 50%,
+    rgba(255,255,255,0.18) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 1em 1em;
+}
+.tf-progress-bar--variant-indeterminate .tf-progress-bar__fill {
+  width: 35% !important;
+  animation: tf-progress-indeterminate 1.4s infinite linear;
+}
+@keyframes tf-progress-indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(285%); }
+}
+.tf-progress-bar__label {
+  font-size: 11px;
+  color: var(--text-muted, #71717a);
+  font-variant-numeric: tabular-nums;
+  align-self: flex-end;
+}
+.tf-progress-bar[aria-invalid="true"] .tf-progress-bar__fill { background: var(--tone-critical, #b91c1c); }
+
+.tf-rating { display: inline-flex; align-items: center; gap: 6px; font: inherit; }
+.tf-rating__icons { display: inline-flex; gap: 2px; }
+.tf-rating__icon { width: 1.1em; height: 1.1em; display: block; }
+.tf-rating__icon-track { fill: var(--border-muted, #e4e4e7); }
+.tf-rating__icon-fill  { fill: var(--accent-bg, #f59e0b); }
+.tf-rating--variant-hearts .tf-rating__icon-fill  { fill: var(--tone-critical, #b91c1c); }
+.tf-rating--variant-stars  .tf-rating__icon-fill  { fill: #f59e0b; }
+.tf-rating--variant-circles .tf-rating__icon-fill { fill: var(--accent-bg, #1e40af); }
+.tf-rating__value,
+.tf-rating__numeric {
+  color: var(--text-default, #1f1f1f);
+  font-variant-numeric: tabular-nums;
+}
+.tf-rating[aria-invalid="true"] .tf-rating__icon-fill { fill: var(--tone-critical, #b91c1c); }
