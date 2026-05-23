@@ -95,6 +95,19 @@ function keydown(el, key, mods = {}) {
 // Render + selected value
 // ============================================================================
 
+test('Select trigger to <div role=combobox> (NIE <button>) by uniknąć button-in-button', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A')], clearable: true,
+    3: { kind: 'literal', value: 'L' },
+  })));
+  const trigger = el.querySelector('.tf-select__trigger');
+  assertEq(trigger.tagName, 'DIV');
+  assertEq(trigger.getAttribute('role'), 'combobox');
+  assertEq(trigger.getAttribute('tabindex'), '0');
+});
+
 test('Select renderuje trigger combobox + placeholder gdy brak wartości', () => {
   setup();
   const store = makeStore();
@@ -520,6 +533,31 @@ test('Select group ma role=group + aria-labelledby na samym group elemencie', ()
   assertEq(group.getAttribute('role'), 'group');
   const header = el.querySelector('.tf-select__group-header');
   assertEq(group.getAttribute('aria-labelledby'), header.id);
+});
+
+test('Select disabled + clearable wyłącza nested clear button', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('sel'), value: 'a' }, { path: PATH('lock'), value: true }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(SELECT_TAG, selectFields({
+    options: [tstrOpt('a', 'A')], clearable: true,
+    3: { kind: 'literal', value: 'L' },
+    7: { kind: 'bound', path: PATH('lock') },
+  })));
+  const trigger = el.querySelector('.tf-select__trigger');
+  const clear = el.querySelector('.tf-select__clear');
+  assert(!trigger.hasAttribute('tabindex'), 'trigger powinno stracić tabindex w disabled');
+  assertEq(clear.disabled, true);
+  // Flip OFF — clear znowu enabled.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lock'), op: { kind: 'set', value: false } }],
+  });
+  assertEq(clear.disabled, false);
 });
 
 test('Select disabled flip mid-open blokuje commit click', () => {
