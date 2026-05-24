@@ -1,0 +1,34 @@
+[addon]
+id = "e2e-smoke"
+name = "E2E Smoke Test"
+version = "1.0.0"
+description = "Minimal addon validating full CBOR UI pipeline"
+category = "test"
+keywords = ["test", "e2e", "cbor"]
+author = "TentaFlow Tests"
+license = "Apache-2.0"
+icon = "beaker"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "ui"
+display_name = "Render UI"
+description = "CBOR UI channel"
+risk = "low"
+
+[application]
+entry_panel = "main"
+title = "E2E Smoke"
+icon = "beaker"
+sort_order = 999
+
+[visibility]
+admin_only = false
+show_in_catalog = false
+
+[resources]
+memory_mb = 32
+fuel_limit = 5000000
+storage_total_mb = 1
