@@ -3250,3 +3250,86 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 .tf-json-viewer__value--bool    { color: #b45309; }
 .tf-json-viewer__value--null    { color: #71717a; font-style: italic; }
 .tf-json-viewer__children { margin-left: 14px; border-left: 1px dashed var(--border-muted, #e4e4e7); padding-left: 8px; }
+
+/* =============================================================================
+   tf-calendar + tf-image + tf-visually-hidden + tf-live-region (chunk 3.3d-15)
+   ============================================================================= */
+
+.tf-calendar { display: inline-block; font: inherit; }
+.tf-calendar__header { padding: 4px 0 8px; text-align: center; }
+.tf-calendar__title { font-weight: 600; font-size: 14px; }
+.tf-calendar__dow-row,
+.tf-calendar__week {
+  display: grid;
+  grid-template-columns: repeat(7, 2.4em);
+  gap: 2px;
+  justify-items: center;
+}
+.tf-calendar__dow-row { margin-bottom: 2px; }
+.tf-calendar__dow-cell { font-size: 11px; color: var(--text-muted, #71717a); text-align: center; width: 100%; }
+.tf-calendar__week-no {
+  font-size: 10px;
+  color: var(--text-muted, #71717a);
+  width: 2em;
+  text-align: right;
+  padding-right: 4px;
+  align-self: center;
+}
+.tf-calendar:has(.tf-calendar__week-no) .tf-calendar__dow-row,
+.tf-calendar:has(.tf-calendar__week-no) .tf-calendar__week {
+  grid-template-columns: 2em repeat(7, 2.4em);
+}
+.tf-calendar__day {
+  width: 2.2em; height: 2.2em;
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: none; border-radius: 4px;
+  cursor: pointer; font: inherit; font-size: 13px;
+  transition: background 0.1s ease;
+}
+.tf-calendar__day:hover:not(:disabled) { background: var(--surface-hover, #f4f4f5); }
+.tf-calendar__day--outside { visibility: hidden; cursor: default; }
+.tf-calendar__day--today { font-weight: 700; outline: 2px solid var(--accent-bg, #1e40af); outline-offset: -2px; border-radius: 50%; }
+.tf-calendar__day--has-event { position: relative; }
+.tf-calendar__day--has-event::after {
+  content: '';
+  position: absolute; bottom: 2px; left: 50%; transform: translateX(-50%);
+  width: 4px; height: 4px; border-radius: 50%;
+  background: var(--accent-bg, #1e40af);
+}
+.tf-calendar__day--tone-success::after  { background: var(--tone-success, #15803d); }
+.tf-calendar__day--tone-warning::after  { background: var(--tone-warning, #b45309); }
+.tf-calendar__day--tone-critical::after { background: var(--tone-critical, #b91c1c); }
+.tf-calendar__day--tone-info::after     { background: var(--tone-info, #1e40af); }
+.tf-calendar__day--tone-muted::after    { background: var(--text-muted, #888); }
+.tf-calendar__error { color: var(--text-muted, #71717a); padding: 8px; }
+
+.tf-image { display: inline-block; overflow: hidden; }
+.tf-image__img { display: block; width: 100%; height: 100%; }
+.tf-image--clickable { cursor: pointer; }
+.tf-image--radius-none { border-radius: 0; }
+.tf-image--radius-xs   { border-radius: 2px; }
+.tf-image--radius-sm   { border-radius: 4px; }
+.tf-image--radius-md   { border-radius: 8px; }
+.tf-image--radius-lg   { border-radius: 12px; }
+.tf-image--radius-xl   { border-radius: 16px; }
+.tf-image--radius-pill  { border-radius: 999px; }
+.tf-image--radius-circle { border-radius: 50%; }
+
+.tf-visually-hidden {
+  position: absolute !important;
+  width: 1px !important; height: 1px !important;
+  padding: 0 !important; margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.tf-live-region { font: inherit; }
+.tf-live-region--tone-success  { color: var(--tone-success, #15803d); }
+.tf-live-region--tone-warning  { color: var(--tone-warning, #b45309); }
+.tf-live-region--tone-critical { color: var(--tone-critical, #b91c1c); }
+.tf-live-region--tone-info     { color: var(--tone-info, #1e40af); }
+.tf-live-region--tone-primary  { color: var(--accent-bg, #1e40af); }
+.tf-live-region--tone-neutral  { color: var(--text-strong, #111); }
+.tf-live-region--tone-muted    { color: var(--text-muted, #888); }
