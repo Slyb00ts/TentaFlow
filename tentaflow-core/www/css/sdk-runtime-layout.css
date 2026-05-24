@@ -3391,3 +3391,211 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   background: var(--surface-muted, #f4f4f5);
   font-weight: 600;
 }
+
+/* =============================================================================
+   Feedback Inline — Alert, Banner, Callout, Toast, Hint, OfflineBanner
+   chunk 3.3e-1
+   ============================================================================= */
+
+/* --- Alert (0x0501) --- */
+.tf-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default, #d4d4d8);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.tf-alert__icon { flex-shrink: 0; margin-top: 2px; }
+.tf-alert__body { flex: 1; min-width: 0; }
+.tf-alert__title { font-weight: 600; margin-bottom: 2px; }
+.tf-alert__message { color: var(--text-default, #3f3f46); }
+.tf-alert__actions { display: flex; gap: 8px; margin-top: 8px; }
+.tf-alert__close {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1.125rem;
+  line-height: 1;
+  padding: 0 2px;
+  color: var(--text-muted, #71717a);
+  opacity: 0.7;
+}
+.tf-alert__close:hover { opacity: 1; }
+.tf-alert--variant-filled { border-color: transparent; }
+.tf-alert--variant-outlined { background: transparent; }
+.tf-alert--variant-soft { border-color: transparent; }
+.tf-alert--tone-neutral { background: var(--surface-muted, #f4f4f5); }
+.tf-alert--tone-primary { background: var(--primary-surface, #eff6ff); border-color: var(--primary-border, #bfdbfe); }
+.tf-alert--tone-info { background: var(--info-surface, #eff6ff); border-color: var(--info-border, #bfdbfe); }
+.tf-alert--tone-success { background: var(--success-surface, #f0fdf4); border-color: var(--success-border, #bbf7d0); }
+.tf-alert--tone-warning { background: var(--warning-surface, #fffbeb); border-color: var(--warning-border, #fde68a); }
+.tf-alert--tone-critical { background: var(--critical-surface, #fef2f2); border-color: var(--critical-border, #fecaca); }
+.tf-alert--tone-muted { background: var(--surface-muted, #f4f4f5); border-color: var(--border-default, #d4d4d8); }
+.tf-alert--variant-filled.tf-alert--tone-primary { background: var(--primary-bg, #2563eb); color: #fff; }
+.tf-alert--variant-filled.tf-alert--tone-info { background: var(--info-bg, #3b82f6); color: #fff; }
+.tf-alert--variant-filled.tf-alert--tone-success { background: var(--success-bg, #16a34a); color: #fff; }
+.tf-alert--variant-filled.tf-alert--tone-warning { background: var(--warning-bg, #d97706); color: #fff; }
+.tf-alert--variant-filled.tf-alert--tone-critical { background: var(--critical-bg, #dc2626); color: #fff; }
+.tf-alert--variant-filled .tf-alert__message { color: inherit; }
+.tf-alert--variant-filled .tf-alert__close { color: inherit; }
+
+/* --- Banner (0x0502) --- */
+.tf-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.tf-banner--position-top {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.tf-banner__icon { flex-shrink: 0; }
+.tf-banner__message { flex: 1; min-width: 0; }
+.tf-banner__action { flex-shrink: 0; }
+.tf-banner__close {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1.125rem;
+  line-height: 1;
+  padding: 0 2px;
+  color: var(--text-muted, #71717a);
+  opacity: 0.7;
+}
+.tf-banner__close:hover { opacity: 1; }
+.tf-banner--tone-neutral { background: var(--surface-muted, #f4f4f5); }
+.tf-banner--tone-primary { background: var(--primary-surface, #eff6ff); }
+.tf-banner--tone-info { background: var(--info-surface, #eff6ff); }
+.tf-banner--tone-success { background: var(--success-surface, #f0fdf4); }
+.tf-banner--tone-warning { background: var(--warning-surface, #fffbeb); }
+.tf-banner--tone-critical { background: var(--critical-surface, #fef2f2); }
+.tf-banner--tone-muted { background: var(--surface-muted, #f4f4f5); }
+
+/* --- Callout (0x0503) --- */
+.tf-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  border-left: 3px solid var(--border-default, #d4d4d8);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.tf-callout__icon { flex-shrink: 0; margin-top: 2px; }
+.tf-callout__body { flex: 1; min-width: 0; }
+.tf-callout__title { font-weight: 600; margin-bottom: 4px; }
+.tf-callout__content {}
+.tf-callout--tone-neutral { background: var(--surface-muted, #f4f4f5); border-left-color: var(--border-default, #a1a1aa); }
+.tf-callout--tone-primary { background: var(--primary-surface, #eff6ff); border-left-color: var(--primary-bg, #2563eb); }
+.tf-callout--tone-info { background: var(--info-surface, #eff6ff); border-left-color: var(--info-bg, #3b82f6); }
+.tf-callout--tone-success { background: var(--success-surface, #f0fdf4); border-left-color: var(--success-bg, #16a34a); }
+.tf-callout--tone-warning { background: var(--warning-surface, #fffbeb); border-left-color: var(--warning-bg, #d97706); }
+.tf-callout--tone-critical { background: var(--critical-surface, #fef2f2); border-left-color: var(--critical-bg, #dc2626); }
+.tf-callout--tone-muted { background: var(--surface-muted, #f4f4f5); border-left-color: var(--text-muted, #71717a); }
+
+/* --- Toast (0x0504) --- */
+.tf-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--surface-elevated, #fff);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  min-width: 240px;
+  max-width: 420px;
+}
+.tf-toast__icon { flex-shrink: 0; margin-top: 2px; }
+.tf-toast__body { flex: 1; min-width: 0; }
+.tf-toast__title { font-weight: 600; }
+.tf-toast__message { color: var(--text-muted, #71717a); margin-top: 2px; }
+.tf-toast__action {
+  flex-shrink: 0;
+  align-self: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--primary-bg, #2563eb);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+.tf-toast__action:hover { background: var(--primary-surface, #eff6ff); }
+.tf-toast--tone-success .tf-toast__icon { color: var(--success-bg, #16a34a); }
+.tf-toast--tone-warning .tf-toast__icon { color: var(--warning-bg, #d97706); }
+.tf-toast--tone-critical .tf-toast__icon { color: var(--critical-bg, #dc2626); }
+.tf-toast--tone-info .tf-toast__icon { color: var(--info-bg, #3b82f6); }
+.tf-toast--tone-primary .tf-toast__icon { color: var(--primary-bg, #2563eb); }
+
+/* --- Hint (0x0505) --- */
+.tf-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--text-muted, #71717a);
+}
+.tf-hint__icon { flex-shrink: 0; }
+.tf-hint__content {}
+.tf-hint--tone-info { color: var(--info-bg, #3b82f6); }
+.tf-hint--tone-success { color: var(--success-bg, #16a34a); }
+.tf-hint--tone-warning { color: var(--warning-bg, #d97706); }
+.tf-hint--tone-critical { color: var(--critical-bg, #dc2626); }
+.tf-hint--tone-muted { color: var(--text-muted, #71717a); }
+.tf-hint--tone-primary { color: var(--primary-bg, #2563eb); }
+.tf-hint--tone-neutral { color: var(--text-default, #3f3f46); }
+
+/* --- OfflineBanner (0x050F) --- */
+.tf-offline-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--critical-surface, #fef2f2);
+  color: var(--critical-bg, #dc2626);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.tf-offline-banner__spinner {
+  display: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tf-offline-banner--reconnecting .tf-offline-banner__spinner {
+  display: inline-block;
+  animation: tf-offline-spin 0.8s linear infinite;
+}
+@keyframes tf-offline-spin {
+  to { transform: rotate(360deg); }
+}
+.tf-offline-banner__message { flex: 1; min-width: 0; }
+.tf-offline-banner__action {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: inherit;
+  padding: 4px 12px;
+}
+.tf-offline-banner__action:hover { background: rgba(220, 38, 38, 0.08); }
