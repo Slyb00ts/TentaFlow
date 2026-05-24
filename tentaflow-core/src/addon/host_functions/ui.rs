@@ -154,6 +154,57 @@ pub fn ui_render_cbor(
                         }
                     }
                 }
+                UiTag::StateSnapshot => {
+                    if let Err(e) = handle_state_snapshot(&cbor_bytes, &mut session, &addon_id) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: StateSnapshot rejected: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
+                UiTag::StatePatch => {
+                    if let Err(e) = handle_state_patch(&cbor_bytes, &mut session, &addon_id) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: StatePatch rejected: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
+                UiTag::StateReset => {
+                    if let Err(e) = handle_state_reset(&cbor_bytes, &mut session, &addon_id) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: StateReset rejected: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
                 _ => {}
             }
         }
@@ -379,6 +430,107 @@ fn handle_panel_shell_registration(
 }
 
 // =============================================================================
+// State dispatch helpers — StateSnapshot / StatePatch / StateReset
+// =============================================================================
+
+/// Decode the body struct after skipping the outer array + tag u16.
+fn decode_state_body<'b, T>(bytes: &'b [u8]) -> Result<T, String>
+where
+    T: minicbor::Decode<'b, ()>,
+{
+    let mut dec = minicbor::Decoder::new(bytes);
+    dec.array()
+        .map_err(|e| format!("array: {e}"))?
+        .ok_or("indefinite array")?;
+    dec.u16().map_err(|e| format!("tag: {e}"))?;
+    minicbor::Decode::decode(&mut dec, &mut ())
+        .map_err(|e| format!("body decode: {e}"))
+}
+
+/// Validates panel open + epoch match.
+fn validate_panel_epoch(
+    session: &crate::addon::ui_session::SessionState,
+    addon_id: &str,
+    panel_id: &str,
+    panel_epoch: u64,
+) -> Result<(), String> {
+    match session.get_panel(addon_id, panel_id) {
+        Some(ownership) => {
+            if ownership.panel_epoch != panel_epoch {
+                Err(format!(
+                    "epoch_mismatch: expected={}, got={}",
+                    ownership.panel_epoch, panel_epoch
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        None => Err(format!(
+            "panel_not_open: addon={addon_id} panel={panel_id}"
+        )),
+    }
+}
+
+fn handle_state_snapshot(
+    bytes: &[u8],
+    session: &mut crate::addon::ui_session::SessionState,
+    addon_id: &str,
+) -> Result<(), String> {
+    let snap: tentaflow_sdk_spec::protocol::ui::state::StateSnapshot =
+        decode_state_body(bytes)?;
+
+    validate_panel_epoch(session, addon_id, &snap.panel_id, snap.panel_epoch)?;
+
+    session
+        .advance_state_revision(addon_id, &snap.panel_id, snap.state_revision)
+        .map_err(|e| e.to_string())
+}
+
+fn handle_state_patch(
+    bytes: &[u8],
+    session: &mut crate::addon::ui_session::SessionState,
+    addon_id: &str,
+) -> Result<(), String> {
+    let patch: tentaflow_sdk_spec::protocol::ui::state::StatePatch =
+        decode_state_body(bytes)?;
+
+    validate_panel_epoch(session, addon_id, &patch.panel_id, patch.panel_epoch)?;
+
+    session
+        .validate_state_revision(addon_id, &patch.panel_id, patch.base_revision)
+        .map_err(|e| e.to_string())?;
+
+    // §8.3: addon-initiated patches cannot write to reserved namespaces.
+    for op in &patch.ops {
+        if let Some(tentaflow_sdk_spec::protocol::ui::bind::PathSegment::Key(root)) =
+            op.path.segments.first()
+        {
+            crate::addon::ui_session::SessionState::validate_state_path_writable(root, false)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    session
+        .advance_state_revision(addon_id, &patch.panel_id, patch.new_revision)
+        .map_err(|e| e.to_string())
+}
+
+fn handle_state_reset(
+    bytes: &[u8],
+    session: &mut crate::addon::ui_session::SessionState,
+    addon_id: &str,
+) -> Result<(), String> {
+    let reset: tentaflow_sdk_spec::protocol::ui::state::StateReset =
+        decode_state_body(bytes)?;
+
+    validate_panel_epoch(session, addon_id, &reset.panel_id, reset.panel_epoch)?;
+
+    session
+        .advance_state_revision(addon_id, &reset.panel_id, reset.new_revision)
+        .map_err(|e| e.to_string())
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -529,5 +681,194 @@ mod tests {
         handle_panel_shell_registration(&bytes, &mut session, "a").unwrap();
         let err = handle_panel_shell_registration(&bytes, &mut session, "a");
         assert!(err.is_err());
+    }
+
+    // =========================================================================
+    // State dispatch tests
+    // =========================================================================
+
+    use tentaflow_sdk_spec::protocol::ui::state::{StatePatch, StateReset, StateSnapshot};
+    use tentaflow_sdk_spec::protocol::ui::bind::{PathSegment, StatePath};
+    use tentaflow_sdk_spec::protocol::ui::patch::{PatchOp, PatchOpKind};
+    use tentaflow_sdk_spec::protocol::ui::slot::StateEntry;
+    use tentaflow_sdk_spec::protocol::value::Value;
+
+    #[test]
+    fn state_snapshot_advances_revision() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "main").unwrap();
+
+        let payload = UiPayload::StateSnapshot(StateSnapshot {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            state_revision: 5,
+            entries: vec![StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("count".into())]),
+                value: Value::U64(42),
+            }],
+            truncated: false,
+        });
+        let bytes = encode_payload(&payload);
+
+        handle_state_snapshot(&bytes, &mut session, "a").unwrap();
+
+        assert_eq!(session.get_panel("a", "main").unwrap().state_revision, 5);
+    }
+
+    #[test]
+    fn state_snapshot_rejects_epoch_mismatch() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "main").unwrap();
+
+        let payload = UiPayload::StateSnapshot(StateSnapshot {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 999,
+            state_revision: 1,
+            entries: vec![],
+            truncated: false,
+        });
+        let bytes = encode_payload(&payload);
+
+        let err = handle_state_snapshot(&bytes, &mut session, "a");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("epoch_mismatch"));
+    }
+
+    #[test]
+    fn state_patch_revision_mismatch_rejected() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "main").unwrap();
+
+        // Current revision is 0, send base_revision = 5.
+        let payload = UiPayload::StatePatch(StatePatch {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            base_revision: 5,
+            new_revision: 6,
+            ops: vec![PatchOp {
+                path: StatePath::new(vec![PathSegment::Key("items".into())]),
+                op: PatchOpKind::Set { value: Value::Null },
+            }],
+        });
+        let bytes = encode_payload(&payload);
+
+        let err = handle_state_patch(&bytes, &mut session, "a");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("revision mismatch"));
+    }
+
+    #[test]
+    fn state_patch_reserved_namespace_rejected() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "main").unwrap();
+
+        let payload = UiPayload::StatePatch(StatePatch {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            base_revision: 0,
+            new_revision: 1,
+            ops: vec![PatchOp {
+                path: StatePath::new(vec![
+                    PathSegment::Key("__system".into()),
+                    PathSegment::Key("theme".into()),
+                ]),
+                op: PatchOpKind::Set {
+                    value: Value::Text("dark".into()),
+                },
+            }],
+        });
+        let bytes = encode_payload(&payload);
+
+        let err = handle_state_patch(&bytes, &mut session, "a");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("reserved namespace"));
+    }
+
+    #[test]
+    fn state_patch_non_reserved_namespace_accepted() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "main").unwrap();
+
+        let payload = UiPayload::StatePatch(StatePatch {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            base_revision: 0,
+            new_revision: 1,
+            ops: vec![PatchOp {
+                path: StatePath::new(vec![PathSegment::Key("items".into())]),
+                op: PatchOpKind::Set {
+                    value: Value::U64(10),
+                },
+            }],
+        });
+        let bytes = encode_payload(&payload);
+
+        handle_state_patch(&bytes, &mut session, "a").unwrap();
+
+        assert_eq!(session.get_panel("a", "main").unwrap().state_revision, 1);
+    }
+
+    #[test]
+    fn state_patch_all_reserved_roots_rejected() {
+        for root in crate::addon::ui_session::RESERVED_STATE_ROOTS {
+            let mut session = crate::addon::ui_session::SessionState::new();
+            session.open_panel("a", "main").unwrap();
+
+            let payload = UiPayload::StatePatch(StatePatch {
+                addon_id: "a".into(),
+                panel_id: "main".into(),
+                panel_epoch: 1,
+                base_revision: 0,
+                new_revision: 1,
+                ops: vec![PatchOp {
+                    path: StatePath::new(vec![PathSegment::Key(root.to_string())]),
+                    op: PatchOpKind::Delete,
+                }],
+            });
+            let bytes = encode_payload(&payload);
+
+            let err = handle_state_patch(&bytes, &mut session, "a");
+            assert!(err.is_err(), "expected rejection for root={root}");
+        }
+    }
+
+    #[test]
+    fn state_reset_advances_revision() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "main").unwrap();
+
+        let payload = UiPayload::StateReset(StateReset {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            new_revision: 10,
+        });
+        let bytes = encode_payload(&payload);
+
+        handle_state_reset(&bytes, &mut session, "a").unwrap();
+
+        assert_eq!(session.get_panel("a", "main").unwrap().state_revision, 10);
+    }
+
+    #[test]
+    fn state_reset_rejects_panel_not_open() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+
+        let payload = UiPayload::StateReset(StateReset {
+            addon_id: "a".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            new_revision: 1,
+        });
+        let bytes = encode_payload(&payload);
+
+        let err = handle_state_reset(&bytes, &mut session, "a");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("panel_not_open"));
     }
 }
