@@ -6,12 +6,9 @@
 //       kazdym dispatchu.
 // =============================================================================
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
-
-use crate::addon::ui_session::SessionState;
+use crate::addon::ui_session::SessionRegistry;
 use crate::config::RouterConfig;
 use crate::crypto::{SecretsCipher, SettingsCipher};
 use crate::db::DbPool;
@@ -24,53 +21,6 @@ use crate::services::handles_cache::LiveHandlesCache;
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;
 use crate::services::runtime::quic_handle::ServiceManager;
-
-// =============================================================================
-// SessionRegistry — per-WS-connection UI session state
-// =============================================================================
-
-/// Process-wide registry of UI panel session state, keyed by connection_id.
-/// Each WS connection gets its own `SessionState` tracking open panels, slot
-/// declarations, state revisions, etc. Fine-grained Mutex per session avoids
-/// contention between independent connections.
-pub struct SessionRegistry {
-    sessions: RwLock<HashMap<u64, Arc<Mutex<SessionState>>>>,
-}
-
-impl Default for SessionRegistry {
-    fn default() -> Self {
-        Self {
-            sessions: RwLock::new(HashMap::new()),
-        }
-    }
-}
-
-impl SessionRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the session state for `connection_id`, creating a fresh one if
-    /// this connection hasn't been seen yet.
-    pub fn get_or_create(&self, connection_id: u64) -> Arc<Mutex<SessionState>> {
-        {
-            let read = self.sessions.read();
-            if let Some(s) = read.get(&connection_id) {
-                return s.clone();
-            }
-        }
-        let mut write = self.sessions.write();
-        write
-            .entry(connection_id)
-            .or_insert_with(|| Arc::new(Mutex::new(SessionState::new())))
-            .clone()
-    }
-
-    /// Removes the session for `connection_id` (called on WS disconnect).
-    pub fn remove(&self, connection_id: u64) {
-        self.sessions.write().remove(&connection_id);
-    }
-}
 
 /// Wszystkie shared resources serwera. Handlery uzywaja przez `ctx.state`.
 pub struct AppState {
@@ -114,7 +64,7 @@ pub struct AppState {
     /// consumed by routing call sites (krok N7.3). Empty in N7.1.
     pub live_handles: Arc<LiveHandlesCache>,
     /// Per-WS-connection UI panel session state (Faza 6 Krok 4).
-    pub ui_sessions: SessionRegistry,
+    pub ui_sessions: Arc<SessionRegistry>,
 }
 
 impl AppState {
@@ -164,7 +114,7 @@ impl AppState {
             port_allocator: None,
             mesh_services_registry: Arc::new(MeshServicesRegistry::new()),
             live_handles,
-            ui_sessions: SessionRegistry::new(),
+            ui_sessions: Arc::new(SessionRegistry::new()),
         })
     }
 }
