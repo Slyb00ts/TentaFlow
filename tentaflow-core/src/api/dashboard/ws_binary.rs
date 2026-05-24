@@ -35,6 +35,10 @@ type SharedSink<S> = Arc<AsyncMutex<SplitSink<WebSocketStream<S>, Message>>>;
 /// Konserwatywnie 1 MiB — typowe requesty sa <1 KiB, deploy manifests mieszcza sie w 64 KiB.
 const MAX_FRAME_SIZE: usize = 1_048_576;
 
+/// Monotonic counter for unique per-connection identifiers. Used as key in the
+/// UI SessionRegistry so panel lifecycle state is scoped per WS socket.
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Mapuje SQLite i64 user_id do 16-bajtowego SessionAuth user_id.
 /// Format zeby odroznic od stub `[0u8; 16]` (system user / nieuwierzytelniony):
 ///   bajt 0    = 0xFF (marker "i64-derived")
@@ -78,6 +82,8 @@ pub async fn handle_ws_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+
     let session = match user_id {
         Some(id) => SessionAuth::UserSession {
             user_id: user_id_to_bytes(id),
@@ -409,6 +415,7 @@ pub async fn handle_ws_connection<S>(
                 let ctx = HandlerContext {
                     session: session.clone(),
                     correlation_id: envelope.correlation_id,
+                    connection_id,
                     resume_secret: Some(resume_secret.clone()),
                     state: app_state.clone(),
                     org_context,
@@ -569,6 +576,8 @@ pub async fn handle_ws_connection<S>(
             "binary-WS: cleanup subskrypcji przy disconnect"
         );
     }
+
+    app_state.ui_sessions.remove(connection_id);
 
     debug!("binary-WS: polaczenie zamkniete");
 }

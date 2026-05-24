@@ -40,6 +40,7 @@ pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod ui_channel;
 
 pub use state::AppState;
 
@@ -58,6 +59,9 @@ pub struct HandlerContext {
     pub session: SessionAuth,
     /// Correlation_id dla tracing/spans.
     pub correlation_id: u64,
+    /// Per-WS-connection unique identifier. Used as a key in the UI session
+    /// registry so panel lifecycle state is scoped to the originating socket.
+    pub connection_id: u64,
     /// Connection-scoped resume secret (HMAC key dla resume token verify).
     pub resume_secret: Option<std::sync::Arc<Vec<u8>>>,
     /// Shared resources serwera (DB, Router, MeshPeerStore, ...).
@@ -887,6 +891,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonNetworkRulesSetResponseBody(_) => "AddonNetworkRulesSetResponse",
         MessageBody::AddonReloadRequestBody(_) => "AddonReloadRequest",
         MessageBody::AddonReloadResponseBody(_) => "AddonReloadResponse",
+        MessageBody::UiChannelCbor(_) => "UiChannelCbor",
         MessageBody::RoleCatalogBody(p) => match p {
             tentaflow_protocol::RoleCatalogPayload::ListRequest(_) => "RoleCatalogListRequest",
             tentaflow_protocol::RoleCatalogPayload::ListResponse { .. } => {
@@ -1026,6 +1031,7 @@ mod tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
             org_context: None,
@@ -1050,6 +1056,7 @@ mod tests {
                 role: Some(role.to_string()),
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
             org_context: None,
@@ -1260,6 +1267,7 @@ mod tests {
                 role: None,
             },
             correlation_id: 100,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
             org_context: None,
@@ -1290,6 +1298,7 @@ mod tests {
             &HandlerContext {
                 session: SessionAuth::Anonymous,
                 correlation_id: 1,
+                connection_id: 0,
                 resume_secret: None,
                 state: state::AppState::for_test(),
                 org_context: None,
@@ -1332,6 +1341,7 @@ mod tests {
                 role: None,
             },
             correlation_id: 7,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
             org_context: None,
@@ -1346,6 +1356,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 8,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
             org_context: None,
@@ -1363,6 +1374,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 9,
+            connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
             org_context: None,
@@ -1416,6 +1428,7 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
             org_context: None,
@@ -1452,6 +1465,7 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 2,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
             org_context: None,
@@ -1481,6 +1495,7 @@ mod visibility_enforcement_tests {
                 role: Some("admin".to_string()),
             },
             correlation_id: 3,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
             org_context: None,
@@ -1507,6 +1522,7 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 4,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
             org_context: None,
@@ -1538,6 +1554,7 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 5,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
             org_context: None,
@@ -1573,6 +1590,7 @@ mod visibility_enforcement_tests {
                 role: None,
             },
             correlation_id: 6,
+            connection_id: 0,
             resume_secret: None,
             state: state.clone(),
             org_context: None,

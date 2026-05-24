@@ -4122,6 +4122,12 @@ pub enum MessageBody {
     // into a single discriminant to stay inside the 256-variant cap.
     StreamBody(crate::stream::StreamPayload),
 
+    // ---- UI Channel CBOR (Faza 6 Krok 4) ----
+    // Raw CBOR bytes for the addon UI binary protocol. The dispatch handler
+    // decodes the UiTag, validates ownership/permissions via SessionState,
+    // and routes to the appropriate panel lifecycle handler.
+    UiChannelCbor(Vec<u8>),
+
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
     Error(ProtocolError),

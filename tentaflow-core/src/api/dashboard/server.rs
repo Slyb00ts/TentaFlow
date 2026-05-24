@@ -797,6 +797,7 @@ pub async fn handle_request(
             port_allocator: port_allocator.clone(),
             mesh_services_registry: mesh_services_registry.clone(),
             live_handles: service_manager.live_handles.clone(),
+            ui_sessions: crate::dispatch::state::SessionRegistry::new(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
