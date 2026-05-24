@@ -205,6 +205,23 @@ pub fn ui_render_cbor(
                         return ABI_ERR_OPERATION;
                     }
                 }
+                UiTag::Command => {
+                    if let Err(e) = validate_command_security(&cbor_bytes) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: Command security validation failed: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
                 _ => {}
             }
         }
@@ -528,6 +545,46 @@ fn handle_state_reset(
     session
         .advance_state_revision(addon_id, &reset.panel_id, reset.new_revision)
         .map_err(|e| e.to_string())
+}
+
+// =============================================================================
+// Command security validation (defense-in-depth)
+// =============================================================================
+
+/// Defense-in-depth: validates security-sensitive Command fields even though
+/// the SDK spec encoder already rejects invalid values. Catches a malicious
+/// addon that crafts raw CBOR bypassing the encoder.
+fn validate_command_security(bytes: &[u8]) -> Result<(), String> {
+    let cmd: tentaflow_sdk_spec::protocol::ui::command::Command = decode_state_body(bytes)?;
+
+    match &cmd {
+        tentaflow_sdk_spec::protocol::ui::command::Command::NavigateExternal { url, .. } => {
+            if !url.starts_with("https://") {
+                return Err(format!(
+                    "NavigateExternal URL must use https:// scheme: {url}"
+                ));
+            }
+        }
+        tentaflow_sdk_spec::protocol::ui::command::Command::Download { filename, .. } => {
+            if filename.is_empty() || filename.len() > 128 {
+                return Err(format!(
+                    "Download filename length out of range: {}",
+                    filename.len()
+                ));
+            }
+            if !filename
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "Download filename contains invalid characters: {filename}"
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -870,5 +927,121 @@ mod tests {
         let err = handle_state_reset(&bytes, &mut session, "a");
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("panel_not_open"));
+    }
+
+    // =========================================================================
+    // Command security validation tests
+    // =========================================================================
+
+    use tentaflow_sdk_spec::protocol::ui::command::Command;
+    use tentaflow_sdk_spec::protocol::ui::tokens::NavigateTarget;
+
+    fn encode_command(cmd: &Command) -> Vec<u8> {
+        let payload = UiPayload::Command(cmd.clone());
+        encode_payload(&payload)
+    }
+
+    #[test]
+    fn command_navigate_external_https_accepted() {
+        let cmd = Command::NavigateExternal {
+            url: "https://example.com".into(),
+            target: NavigateTarget::NewTab,
+        };
+        let bytes = encode_command(&cmd);
+        assert!(validate_command_security(&bytes).is_ok());
+    }
+
+    #[test]
+    fn command_navigate_external_http_rejected() {
+        // Manually craft CBOR bypassing the encoder's check.
+        // The SDK decoder itself also rejects non-https URLs, so the
+        // rejection comes from the decode layer (defense-in-depth stack).
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0140).unwrap();
+            enc.map(3).unwrap();
+            enc.str("kind").unwrap().str("navigate_external").unwrap();
+            enc.str("url").unwrap().str("http://evil.com").unwrap();
+            enc.str("target").unwrap().str("new_tab").unwrap();
+        }
+        let err = validate_command_security(&buf);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("https"));
+    }
+
+    #[test]
+    fn command_download_filename_valid() {
+        let cmd = Command::Download {
+            signed_url_ref: "ref-123".into(),
+            filename: "report_2026.pdf".into(),
+        };
+        let bytes = encode_command(&cmd);
+        assert!(validate_command_security(&bytes).is_ok());
+    }
+
+    #[test]
+    fn command_download_filename_invalid_rejected() {
+        // Craft CBOR with path traversal filename. The SDK decoder itself
+        // rejects filenames that don't match [a-zA-Z0-9._-]+, so the error
+        // surfaces from the decode layer (defense-in-depth stack).
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0140).unwrap();
+            enc.map(3).unwrap();
+            enc.str("kind").unwrap().str("download").unwrap();
+            enc.str("signed_url_ref").unwrap().str("ref-1").unwrap();
+            enc.str("filename").unwrap().str("../../etc/passwd").unwrap();
+        }
+        let err = validate_command_security(&buf);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("filename"));
+    }
+
+    #[test]
+    fn command_download_filename_too_long_rejected() {
+        let long_name = "a".repeat(129);
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0140).unwrap();
+            enc.map(3).unwrap();
+            enc.str("kind").unwrap().str("download").unwrap();
+            enc.str("signed_url_ref").unwrap().str("ref-1").unwrap();
+            enc.str("filename").unwrap().str(&long_name).unwrap();
+        }
+        let err = validate_command_security(&buf);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("filename"));
+    }
+
+    #[test]
+    fn command_download_filename_empty_rejected() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0140).unwrap();
+            enc.map(3).unwrap();
+            enc.str("kind").unwrap().str("download").unwrap();
+            enc.str("signed_url_ref").unwrap().str("ref-1").unwrap();
+            enc.str("filename").unwrap().str("").unwrap();
+        }
+        let err = validate_command_security(&buf);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("filename"));
+    }
+
+    #[test]
+    fn command_focus_passes_without_validation() {
+        let cmd = Command::Focus {
+            component_id: "btn-1".into(),
+        };
+        let bytes = encode_command(&cmd);
+        assert!(validate_command_security(&bytes).is_ok());
     }
 }
