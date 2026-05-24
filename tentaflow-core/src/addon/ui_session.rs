@@ -1,0 +1,830 @@
+// =============================================================================
+// File: addon/ui_session.rs
+// Per-connection UI session state for the addon CBOR binary protocol (Faza 6
+// Krok 4). Tracks open panels, slot declarations, state revisions, declared
+// actions, event topic patterns, local capabilities and credit-based flow
+// control.
+// =============================================================================
+
+use std::collections::{HashMap, HashSet};
+
+use thiserror::Error;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Root state keys reserved by the platform (§8.3). Addons cannot write to
+/// paths starting with any of these unless the write originates from a local
+/// action handler (which the host itself drives).
+pub const RESERVED_STATE_ROOTS: &[&str] = &[
+    "__system",
+    "__user",
+    "__draft",
+    "__optimistic",
+    "__committed",
+];
+
+/// Slot id prefix reserved for shell-injected slots (§8.4). Addons must not
+/// declare slots whose id starts with this prefix — those are managed by the
+/// host shell.
+pub const RESERVED_SLOT_PREFIX: &str = "__shell:";
+
+/// Initial UI channel credits (§8.2 flow control).
+const INITIAL_UI_CREDITS: u32 = 256;
+
+// =============================================================================
+// TopicPattern — compiled event topic pattern
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicPatternSegment {
+    Literal(String),
+    /// Matches exactly one segment.
+    Wildcard,
+}
+
+/// Compiled event topic pattern. Segments are separated by `.` in the manifest
+/// declaration; `*` is a single-segment wildcard. No runtime glob — the
+/// pattern is pre-compiled at registration time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicPattern {
+    pub segments: Vec<TopicPatternSegment>,
+}
+
+impl TopicPattern {
+    /// Parse a dotted topic string into segments. `*` becomes `Wildcard`,
+    /// everything else becomes `Literal`.
+    pub fn parse(raw: &str) -> Self {
+        let segments = raw
+            .split('.')
+            .map(|s| {
+                if s == "*" {
+                    TopicPatternSegment::Wildcard
+                } else {
+                    TopicPatternSegment::Literal(s.to_owned())
+                }
+            })
+            .collect();
+        Self { segments }
+    }
+}
+
+// =============================================================================
+// LocalCapability
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalCapability {
+    Clipboard,
+    Download,
+    NavigateExternal,
+    FormReset,
+}
+
+// =============================================================================
+// UiCredits — credit-based flow control
+// =============================================================================
+
+#[derive(Debug, Clone)]
+pub struct UiCredits {
+    available: u32,
+    initial: u32,
+    consumed_in_window: u32,
+}
+
+impl UiCredits {
+    fn new(initial: u32) -> Self {
+        Self {
+            available: initial,
+            initial,
+            consumed_in_window: 0,
+        }
+    }
+
+    fn try_consume(&mut self) -> Result<(), SessionError> {
+        if self.available == 0 {
+            return Err(SessionError::CreditsExhausted);
+        }
+        self.available -= 1;
+        self.consumed_in_window += 1;
+        Ok(())
+    }
+
+    fn grant(&mut self, amount: u32) {
+        self.available = self.available.saturating_add(amount);
+        self.consumed_in_window = 0;
+    }
+
+    fn should_grant(&self) -> bool {
+        self.consumed_in_window >= self.initial / 2
+    }
+}
+
+// =============================================================================
+// PanelOwnership
+// =============================================================================
+
+#[derive(Debug, Clone)]
+pub struct PanelOwnership {
+    pub panel_epoch: u64,
+    pub state_revision: u64,
+    pub declared_slots: HashSet<String>,
+    pub declared_actions: HashSet<String>,
+    pub declared_event_publish: Vec<TopicPattern>,
+    pub declared_event_subscribe: Vec<TopicPattern>,
+    pub declared_local_capabilities: HashSet<LocalCapability>,
+    /// Set to `true` after `register_shell` succeeds. Prevents double
+    /// registration for the same panel open cycle.
+    shell_registered: bool,
+}
+
+// =============================================================================
+// SessionError
+// =============================================================================
+
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum SessionError {
+    #[error("panel not open: addon={addon_id} panel={panel_id}")]
+    PanelNotOpen { addon_id: String, panel_id: String },
+
+    #[error("epoch mismatch: expected {expected}, got {got}")]
+    EpochMismatch { expected: u64, got: u64 },
+
+    #[error("slot ownership violation: addon={addon_id} panel={panel_id} slot={slot_id}")]
+    SlotOwnershipViolation {
+        addon_id: String,
+        panel_id: String,
+        slot_id: String,
+    },
+
+    #[error("reserved slot prefix in slot_id: {slot_id}")]
+    ReservedSlotPrefix { slot_id: String },
+
+    #[error("state revision mismatch: expected {expected}, got {got}")]
+    RevisionMismatch { expected: u64, got: u64 },
+
+    #[error("action not declared: addon={addon_id} panel={panel_id} action={action_id}")]
+    ActionNotDeclared {
+        addon_id: String,
+        panel_id: String,
+        action_id: String,
+    },
+
+    #[error("reserved namespace: {path_root}")]
+    ReservedNamespace { path_root: String },
+
+    #[error("UI credits exhausted")]
+    CreditsExhausted,
+
+    #[error("panel already open: addon={addon_id} panel={panel_id}")]
+    PanelAlreadyOpen { addon_id: String, panel_id: String },
+
+    #[error("shell already registered: addon={addon_id} panel={panel_id}")]
+    ShellAlreadyRegistered { addon_id: String, panel_id: String },
+}
+
+// =============================================================================
+// SessionState
+// =============================================================================
+
+#[derive(Debug)]
+pub struct SessionState {
+    open_panels: HashMap<(String, String), PanelOwnership>,
+    ui_credits: UiCredits,
+    next_epoch: u64,
+}
+
+impl SessionState {
+    pub fn new() -> Self {
+        Self {
+            open_panels: HashMap::new(),
+            ui_credits: UiCredits::new(INITIAL_UI_CREDITS),
+            next_epoch: 1,
+        }
+    }
+
+    /// Registers a panel as open, assigns a monotonically increasing epoch.
+    pub fn open_panel(&mut self, addon_id: &str, panel_id: &str) -> Result<u64, SessionError> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        if self.open_panels.contains_key(&key) {
+            return Err(SessionError::PanelAlreadyOpen {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            });
+        }
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.open_panels.insert(
+            key,
+            PanelOwnership {
+                panel_epoch: epoch,
+                state_revision: 0,
+                declared_slots: HashSet::new(),
+                declared_actions: HashSet::new(),
+                declared_event_publish: Vec::new(),
+                declared_event_subscribe: Vec::new(),
+                declared_local_capabilities: HashSet::new(),
+                shell_registered: false,
+            },
+        );
+        Ok(epoch)
+    }
+
+    /// Removes a panel, returning its ownership data for cleanup.
+    pub fn close_panel(
+        &mut self,
+        addon_id: &str,
+        panel_id: &str,
+    ) -> Option<PanelOwnership> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        self.open_panels.remove(&key)
+    }
+
+    pub fn get_panel(&self, addon_id: &str, panel_id: &str) -> Option<&PanelOwnership> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        self.open_panels.get(&key)
+    }
+
+    pub fn get_panel_mut(
+        &mut self,
+        addon_id: &str,
+        panel_id: &str,
+    ) -> Option<&mut PanelOwnership> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        self.open_panels.get_mut(&key)
+    }
+
+    /// Called when the host receives a PanelShell declaration from the addon.
+    /// Validates epoch, rejects reserved slot prefixes, and stores all
+    /// declarations on the panel ownership record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_shell(
+        &mut self,
+        addon_id: &str,
+        panel_id: &str,
+        panel_epoch: u64,
+        slots: HashSet<String>,
+        actions: HashSet<String>,
+        publish_topics: Vec<TopicPattern>,
+        subscribe_topics: Vec<TopicPattern>,
+        capabilities: HashSet<LocalCapability>,
+    ) -> Result<(), SessionError> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        let ownership = self.open_panels.get_mut(&key).ok_or_else(|| {
+            SessionError::PanelNotOpen {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            }
+        })?;
+
+        if ownership.shell_registered {
+            return Err(SessionError::ShellAlreadyRegistered {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            });
+        }
+
+        if ownership.panel_epoch != panel_epoch {
+            return Err(SessionError::EpochMismatch {
+                expected: ownership.panel_epoch,
+                got: panel_epoch,
+            });
+        }
+
+        for slot_id in &slots {
+            if slot_id.starts_with(RESERVED_SLOT_PREFIX) {
+                return Err(SessionError::ReservedSlotPrefix {
+                    slot_id: slot_id.clone(),
+                });
+            }
+        }
+
+        ownership.declared_slots = slots;
+        ownership.declared_actions = actions;
+        ownership.declared_event_publish = publish_topics;
+        ownership.declared_event_subscribe = subscribe_topics;
+        ownership.declared_local_capabilities = capabilities;
+        ownership.shell_registered = true;
+
+        Ok(())
+    }
+
+    /// Checks that `slot_id` belongs to the declared slots of the given panel.
+    pub fn validate_slot_ownership(
+        &self,
+        addon_id: &str,
+        panel_id: &str,
+        slot_id: &str,
+    ) -> Result<(), SessionError> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        let ownership = self.open_panels.get(&key).ok_or_else(|| {
+            SessionError::PanelNotOpen {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            }
+        })?;
+        if !ownership.declared_slots.contains(slot_id) {
+            return Err(SessionError::SlotOwnershipViolation {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+                slot_id: slot_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that `base_revision` matches the panel's current
+    /// `state_revision`. Returns `Ok(())` on match, or `Err` with the
+    /// current revision on mismatch.
+    pub fn validate_state_revision(
+        &self,
+        addon_id: &str,
+        panel_id: &str,
+        base_revision: u64,
+    ) -> Result<(), SessionError> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        let ownership = self.open_panels.get(&key).ok_or_else(|| {
+            SessionError::PanelNotOpen {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            }
+        })?;
+        if ownership.state_revision != base_revision {
+            return Err(SessionError::RevisionMismatch {
+                expected: ownership.state_revision,
+                got: base_revision,
+            });
+        }
+        Ok(())
+    }
+
+    /// Advances the panel's state revision after a successful state patch.
+    pub fn advance_state_revision(
+        &mut self,
+        addon_id: &str,
+        panel_id: &str,
+        new_revision: u64,
+    ) -> Result<(), SessionError> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        let ownership = self.open_panels.get_mut(&key).ok_or_else(|| {
+            SessionError::PanelNotOpen {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            }
+        })?;
+        ownership.state_revision = new_revision;
+        Ok(())
+    }
+
+    /// Checks that `action_id` is among the panel's declared actions.
+    pub fn validate_action(
+        &self,
+        addon_id: &str,
+        panel_id: &str,
+        action_id: &str,
+    ) -> Result<(), SessionError> {
+        let key = (addon_id.to_owned(), panel_id.to_owned());
+        let ownership = self.open_panels.get(&key).ok_or_else(|| {
+            SessionError::PanelNotOpen {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+            }
+        })?;
+        if !ownership.declared_actions.contains(action_id) {
+            return Err(SessionError::ActionNotDeclared {
+                addon_id: addon_id.to_owned(),
+                panel_id: panel_id.to_owned(),
+                action_id: action_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Enforces §8.3 namespace rules. Reserved root paths (`__system`,
+    /// `__user`, etc.) are writable only from local action handlers
+    /// (`from_local_action = true`). Addon-initiated state patches must not
+    /// touch them.
+    pub fn validate_state_path_writable(
+        path_root: &str,
+        from_local_action: bool,
+    ) -> Result<(), SessionError> {
+        if !from_local_action
+            && RESERVED_STATE_ROOTS.contains(&path_root)
+        {
+            return Err(SessionError::ReservedNamespace {
+                path_root: path_root.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Consumes one UI credit. Returns `Err(CreditsExhausted)` when none
+    /// remain.
+    pub fn try_consume_credit(&mut self) -> Result<(), SessionError> {
+        self.ui_credits.try_consume()
+    }
+
+    /// Grants additional credits to the session. Typically called by the
+    /// receiver side when it has processed enough frames.
+    pub fn grant_credits(&mut self, amount: u32) {
+        self.ui_credits.grant(amount);
+    }
+
+    /// Returns `true` when the receiver should send a credit grant — i.e.
+    /// when >=50% of the initial credits have been consumed.
+    pub fn should_grant_credits(&self) -> bool {
+        self.ui_credits.should_grant()
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_close_panel_lifecycle() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+        assert_eq!(epoch, 1);
+        assert!(state.get_panel("addon-a", "main").is_some());
+
+        let ownership = state.close_panel("addon-a", "main");
+        assert!(ownership.is_some());
+        assert_eq!(ownership.unwrap().panel_epoch, 1);
+        assert!(state.get_panel("addon-a", "main").is_none());
+    }
+
+    #[test]
+    fn open_panel_already_open() {
+        let mut state = SessionState::new();
+        state.open_panel("addon-a", "main").unwrap();
+        let err = state.open_panel("addon-a", "main").unwrap_err();
+        assert!(matches!(err, SessionError::PanelAlreadyOpen { .. }));
+    }
+
+    #[test]
+    fn close_nonexistent_panel_returns_none() {
+        let mut state = SessionState::new();
+        assert!(state.close_panel("nope", "nope").is_none());
+    }
+
+    #[test]
+    fn epoch_monotonicity() {
+        let mut state = SessionState::new();
+        let e1 = state.open_panel("a", "p1").unwrap();
+        let e2 = state.open_panel("a", "p2").unwrap();
+        let e3 = state.open_panel("b", "p1").unwrap();
+        assert!(e1 < e2);
+        assert!(e2 < e3);
+
+        // Close and reopen — epoch must still increase.
+        state.close_panel("a", "p1");
+        let e4 = state.open_panel("a", "p1").unwrap();
+        assert!(e4 > e3);
+    }
+
+    #[test]
+    fn slot_ownership_valid() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        let mut slots = HashSet::new();
+        slots.insert("content".to_owned());
+        slots.insert("sidebar".to_owned());
+
+        state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                slots,
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        assert!(state
+            .validate_slot_ownership("addon-a", "main", "content")
+            .is_ok());
+        assert!(state
+            .validate_slot_ownership("addon-a", "main", "sidebar")
+            .is_ok());
+    }
+
+    #[test]
+    fn slot_ownership_violation() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        let mut slots = HashSet::new();
+        slots.insert("content".to_owned());
+
+        state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                slots,
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let err = state
+            .validate_slot_ownership("addon-a", "main", "other")
+            .unwrap_err();
+        assert!(matches!(err, SessionError::SlotOwnershipViolation { .. }));
+    }
+
+    #[test]
+    fn reserved_slot_prefix_rejected() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        let mut slots = HashSet::new();
+        slots.insert("__shell:nav".to_owned());
+
+        let err = state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                slots,
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::ReservedSlotPrefix { .. }));
+    }
+
+    #[test]
+    fn state_revision_match_and_mismatch() {
+        let mut state = SessionState::new();
+        state.open_panel("addon-a", "main").unwrap();
+
+        // Initially at revision 0.
+        assert!(state
+            .validate_state_revision("addon-a", "main", 0)
+            .is_ok());
+
+        // Advance to 1.
+        state
+            .advance_state_revision("addon-a", "main", 1)
+            .unwrap();
+
+        // Now base_revision 0 is stale.
+        let err = state
+            .validate_state_revision("addon-a", "main", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::RevisionMismatch {
+                expected: 1,
+                got: 0
+            }
+        ));
+
+        // Matching revision works.
+        assert!(state
+            .validate_state_revision("addon-a", "main", 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn reserved_namespace_enforcement() {
+        for root in RESERVED_STATE_ROOTS {
+            let err =
+                SessionState::validate_state_path_writable(root, false).unwrap_err();
+            assert!(matches!(err, SessionError::ReservedNamespace { .. }));
+
+            // From a local action handler, reserved roots are writable.
+            assert!(SessionState::validate_state_path_writable(root, true).is_ok());
+        }
+
+        // Non-reserved roots are always writable.
+        assert!(SessionState::validate_state_path_writable("items", false).is_ok());
+        assert!(SessionState::validate_state_path_writable("items", true).is_ok());
+    }
+
+    #[test]
+    fn credit_consumption_and_exhaustion() {
+        let mut state = SessionState::new();
+
+        // Consume all credits.
+        for _ in 0..INITIAL_UI_CREDITS {
+            state.try_consume_credit().unwrap();
+        }
+
+        // Next consume must fail.
+        let err = state.try_consume_credit().unwrap_err();
+        assert!(matches!(err, SessionError::CreditsExhausted));
+    }
+
+    #[test]
+    fn credit_grant_and_should_grant_threshold() {
+        let mut state = SessionState::new();
+
+        // Consume less than 50% — should_grant is false.
+        for _ in 0..(INITIAL_UI_CREDITS / 2 - 1) {
+            state.try_consume_credit().unwrap();
+        }
+        assert!(!state.should_grant_credits());
+
+        // Consume one more to reach exactly 50%.
+        state.try_consume_credit().unwrap();
+        assert!(state.should_grant_credits());
+
+        // Grant resets the window.
+        state.grant_credits(INITIAL_UI_CREDITS);
+        assert!(!state.should_grant_credits());
+    }
+
+    #[test]
+    fn action_validation() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        let mut actions = HashSet::new();
+        actions.insert("save".to_owned());
+        actions.insert("delete".to_owned());
+
+        state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                actions,
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        assert!(state
+            .validate_action("addon-a", "main", "save")
+            .is_ok());
+        assert!(state
+            .validate_action("addon-a", "main", "delete")
+            .is_ok());
+
+        let err = state
+            .validate_action("addon-a", "main", "hack")
+            .unwrap_err();
+        assert!(matches!(err, SessionError::ActionNotDeclared { .. }));
+    }
+
+    #[test]
+    fn register_shell_epoch_mismatch() {
+        let mut state = SessionState::new();
+        let _epoch = state.open_panel("addon-a", "main").unwrap();
+
+        let err = state
+            .register_shell(
+                "addon-a",
+                "main",
+                999,
+                HashSet::new(),
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::EpochMismatch { .. }));
+    }
+
+    #[test]
+    fn register_shell_already_registered() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let err = state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::ShellAlreadyRegistered { .. }));
+    }
+
+    #[test]
+    fn register_shell_panel_not_open() {
+        let mut state = SessionState::new();
+
+        let err = state
+            .register_shell(
+                "addon-a",
+                "main",
+                1,
+                HashSet::new(),
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::PanelNotOpen { .. }));
+    }
+
+    #[test]
+    fn get_panel_mut_modifies_ownership() {
+        let mut state = SessionState::new();
+        state.open_panel("addon-a", "main").unwrap();
+
+        let ownership = state.get_panel_mut("addon-a", "main").unwrap();
+        ownership.state_revision = 42;
+
+        assert_eq!(
+            state.get_panel("addon-a", "main").unwrap().state_revision,
+            42
+        );
+    }
+
+    #[test]
+    fn topic_pattern_parse() {
+        let p = TopicPattern::parse("addon.*.updated");
+        assert_eq!(p.segments.len(), 3);
+        assert_eq!(
+            p.segments[0],
+            TopicPatternSegment::Literal("addon".to_owned())
+        );
+        assert_eq!(p.segments[1], TopicPatternSegment::Wildcard);
+        assert_eq!(
+            p.segments[2],
+            TopicPatternSegment::Literal("updated".to_owned())
+        );
+    }
+
+    #[test]
+    fn validate_on_nonexistent_panel() {
+        let state = SessionState::new();
+
+        assert!(matches!(
+            state.validate_slot_ownership("x", "y", "z"),
+            Err(SessionError::PanelNotOpen { .. })
+        ));
+        assert!(matches!(
+            state.validate_state_revision("x", "y", 0),
+            Err(SessionError::PanelNotOpen { .. })
+        ));
+        assert!(matches!(
+            state.validate_action("x", "y", "a"),
+            Err(SessionError::PanelNotOpen { .. })
+        ));
+    }
+
+    #[test]
+    fn advance_revision_panel_not_open() {
+        let mut state = SessionState::new();
+        let err = state
+            .advance_state_revision("x", "y", 1)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::PanelNotOpen { .. }));
+    }
+
+    #[test]
+    fn grant_credits_saturates() {
+        let mut state = SessionState::new();
+        state.grant_credits(u32::MAX);
+        // Should not panic on overflow — saturating add.
+        state.grant_credits(1);
+        assert!(state.try_consume_credit().is_ok());
+    }
+}
