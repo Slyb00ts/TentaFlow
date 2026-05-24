@@ -115,6 +115,23 @@ pub fn ui_render_cbor(
             let session_lock = registry.get_or_create(conn_id);
             let mut session = session_lock.lock();
 
+            // Credit-based rate limiting — consume 1 credit per outbound message.
+            if session.try_consume_credit().is_err() {
+                tracing::warn!(addon = %addon_id, "ui_render_cbor: UI credits exhausted");
+                audit_log(
+                    caller.data(),
+                    "ui.render_cbor",
+                    Some("ui"),
+                    None,
+                    "denied",
+                    Some("credits_exhausted"),
+                );
+                return ABI_ERR_OPERATION;
+            }
+            if session.should_grant_credits() {
+                session.grant_credits(256);
+            }
+
             match tag {
                 UiTag::PanelShell => {
                     if let Err(e) = handle_panel_shell_registration(&cbor_bytes, &mut session, &addon_id) {
