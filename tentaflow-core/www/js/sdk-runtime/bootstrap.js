@@ -46,6 +46,7 @@ import { registerDataHeatmapGaugeRenderers } from './data-heatmap-gauge-renderer
 import { registerDataProgressRatingRenderers } from './data-progress-rating-renderer.js';
 import { registerDataDiffDlJsonRenderers } from './data-diff-dl-json-renderer.js';
 import { registerDataSpecialisedRenderers } from './data-specialised-renderer.js';
+import { registerDataMarkdownRenderer } from './data-markdown-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -87,7 +88,8 @@ export function bootstrapSdkRuntime() {
   registerDataProgressRatingRenderers();
   registerDataDiffDlJsonRenderers();
   registerDataSpecialisedRenderers();
+  registerDataMarkdownRenderer();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
-  // 3.3d Data Display: in progress (37/38 — brakuje Markdown 0x0220). EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
+  // 3.3d Data Display: KOMPLETNE (38/38). EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
