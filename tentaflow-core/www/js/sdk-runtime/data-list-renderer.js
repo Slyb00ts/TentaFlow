@@ -1,20 +1,16 @@
 // =============================================================================
-// Plik: sdk-runtime/data-list-renderer.js
-// Opis: Renderer §4 Data Display List (0x0212) — chunk 3.3d-5.
+// File: sdk-runtime/data-list-renderer.js
+// Description: Renderer for Data Display List (0x0212) — chunk 3.3d-5.
 //
-// Items pochodzą z `items_path` (StatePath → Array). Każdy item powinien
-// mieć przynajmniej `id` (string). `item_template_id` jest host-side
-// templating identifier — renderer eksponuje go przez `data-template-id`
-// na każdym <li>, ale samej renderowanej zawartości nie wytwarza
-// (host/slot manager z chunka 3.5 podpina pełny template). Bez template'u
-// renderer pokazuje fallback (item.label || item.title || item.id) żeby
-// lista była widoczna nawet bez host'a.
+// Items come from `items_path` (StatePath -> Array). Each item should have
+// at least `id` (string). `item_template_id` is a host-side templating
+// identifier exposed via `data-template-id` on each <li>.
 //
-// Empty state: gdy items.length === 0, renderuje opcjonalny `empty_state`
-// ComponentRef<EmptyState> (tag 0x0003) przez ctx.renderChild.
-// max_visible: truncate widoczne items + "show more" indicator z licznikiem.
+// Empty state: when items.length === 0, renders optional `empty_state`
+// ComponentRef<EmptyState> (tag 0x0003) via ctx.renderChild.
+// max_visible: truncates visible items + "show more" indicator with count.
 //
-// Handler per spec: `item_click` z `{ item_id, item_index, action_id? }`.
+// Handler per spec: `item_click` with `{ item_id, item_index, action_id? }`.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs List.
 // =============================================================================
@@ -23,13 +19,9 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
-import { renderIcon } from './icon-renderer.js';
 
 const DENSITIES = new Set(['compact', 'default', 'comfortable']);
 const EMPTY_STATE_TAG = 0x0003;
-const EMPTY_STATE_VARIANTS = new Set(['default', 'compact', 'illustrated']);
-const BUTTON_TAG = 0x0401;
 // item_template_id grammar: [a-z0-9_-]+ length 1..=64 (mirror inne id grammars).
 const TEMPLATE_ID_RE = /^[a-z0-9_-]{1,64}$/;
 
@@ -101,91 +93,6 @@ function fallbackItemText(item) {
 function extractItemId(item, index) {
   if (item != null && typeof item === 'object' && typeof item.id === 'string') return item.id;
   return `item-${index}`;
-}
-
-// =============================================================================
-// EmptyState (0x0003) — molecules §2
-// =============================================================================
-// EmptyState jest §2 molecules group (osobny chunk w przyszlosci), ale List
-// trzyma go jako empty_state ref. Rejestrujemy minimalny renderer tutaj —
-// gdy molecules chunk powstanie, ta implementacja zostanie zaktualizowana
-// w miejscu lub odznaczona/przeniesiona zgodnie z deduplikacja.
-
-export const EMPTY_STATE_COMPONENT_TAG = 0x0003;
-const EMPTY_STATE_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
-
-function applyTextBind(element, bindRef, ctx) {
-  const apply = () => {
-    const v = resolveBindRef(bindRef, ctx.store);
-    element.textContent = v == null ? '' : String(v);
-  };
-  apply();
-  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
-}
-
-function renderEmptyState(component, ctx) {
-  assertOnlyKnownFields(component.fields, EMPTY_STATE_FIELD_KEYS, 'EmptyState');
-
-  const iconRaw = ctx.readField(component.fields, 0);
-  if (iconRaw == null) throw new TypeError('EmptyState.icon is required (IconRef)');
-  const heading = ctx.readField(component.fields, 1);
-  if (heading == null) throw new TypeError('EmptyState.heading is required (BindRef)');
-  const messageBind = ctx.readField(component.fields, 2);
-  const primaryActionRaw = ctx.readField(component.fields, 3);
-  const secondaryActionRaw = ctx.readField(component.fields, 4);
-  const variant = requireEnum(ctx.readField(component.fields, 5), EMPTY_STATE_VARIANTS, 'EmptyState.variant');
-
-  if (primaryActionRaw != null) {
-    if (!primaryActionRaw || primaryActionRaw.tag !== BUTTON_TAG) {
-      throw new TypeError('EmptyState.primary_action: expected ComponentRef<Button> (0x0401)');
-    }
-  }
-  if (secondaryActionRaw != null) {
-    if (!secondaryActionRaw || secondaryActionRaw.tag !== BUTTON_TAG) {
-      throw new TypeError('EmptyState.secondary_action: expected ComponentRef<Button> (0x0401)');
-    }
-  }
-
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-empty-state');
-  wrapper.classList.add(`tf-empty-state--variant-${variant}`);
-  wrapper.setAttribute('role', 'status');
-
-  const iconEl = renderIcon(iconRaw, 'EmptyState.icon');
-  iconEl.classList.add('tf-empty-state__icon');
-  wrapper.appendChild(iconEl);
-
-  const headingEl = document.createElement('h3');
-  headingEl.classList.add('tf-empty-state__heading');
-  applyTextBind(headingEl, heading, ctx);
-  wrapper.appendChild(headingEl);
-
-  if (messageBind != null) {
-    const msg = document.createElement('p');
-    msg.classList.add('tf-empty-state__message');
-    applyTextBind(msg, messageBind, ctx);
-    wrapper.appendChild(msg);
-  }
-
-  if (primaryActionRaw != null || secondaryActionRaw != null) {
-    const actions = document.createElement('div');
-    actions.classList.add('tf-empty-state__actions');
-    if (primaryActionRaw != null) {
-      const btn = ctx.renderChild(primaryActionRaw);
-      btn.classList.add('tf-empty-state__action');
-      btn.classList.add('tf-empty-state__action--primary');
-      actions.appendChild(btn);
-    }
-    if (secondaryActionRaw != null) {
-      const btn = ctx.renderChild(secondaryActionRaw);
-      btn.classList.add('tf-empty-state__action');
-      btn.classList.add('tf-empty-state__action--secondary');
-      actions.appendChild(btn);
-    }
-    wrapper.appendChild(actions);
-  }
-
-  return wrapper;
 }
 
 // =============================================================================
@@ -319,8 +226,5 @@ function renderList(component, ctx) {
 // =============================================================================
 
 export function registerDataListRenderer() {
-  if (!lookupComponentRenderer(EMPTY_STATE_COMPONENT_TAG)) {
-    registerComponentRenderer(EMPTY_STATE_COMPONENT_TAG, renderEmptyState);
-  }
   if (!lookupComponentRenderer(LIST_TAG)) registerComponentRenderer(LIST_TAG, renderList);
 }

@@ -1,13 +1,13 @@
 // =============================================================================
-// Plik: sdk-runtime/bootstrap.js
-// Opis: Centralny bootstrap SDK runtime'u (Faza 6 Krok 3). Rejestruje
-// rendererów wszystkich grup komponentów w globalnym registry
-// `ComponentRenderer`. Wywoływany RAZ przed pierwszym renderem panelu
-// (chunk 3.7 cutover wpina to do `addon-app.js` / nowego shell'a).
+// File: sdk-runtime/bootstrap.js
+// Description: Central bootstrap for SDK runtime (Phase 6 Step 3). Registers
+// renderers for all component groups in the global `ComponentRenderer`
+// registry. Called ONCE before the first panel render (chunk 3.7 cutover
+// wires this into `addon-app.js` / the new shell).
 //
-// Sub-chunki 3.3a..3.3g rejestrują się tutaj kolejno; każda grupa jest
-// idempotentna (skip jeśli już zarejestrowane), więc bootstrap można
-// wywołać wielokrotnie bez efektu ubocznego.
+// Sub-chunks 3.3a..3.3f register here sequentially; each group is idempotent
+// (skip if already registered), so bootstrap can be called multiple times
+// without side effects.
 // =============================================================================
 
 import { registerLayoutAtomicRenderers } from './layout-atomic-renderers.js';
@@ -50,10 +50,11 @@ import { registerDataMarkdownRenderer } from './data-markdown-renderer.js';
 import { registerFeedbackInlineRenderers } from './feedback-inline-renderer.js';
 import { registerFeedbackLoadingRenderers } from './feedback-loading-renderer.js';
 import { registerFeedbackOverlayRenderers } from './feedback-overlay-renderer.js';
+import { registerMoleculePageRenderers } from './molecule-page-renderer.js';
+import { registerMoleculeShellRenderers } from './molecule-shell-renderer.js';
 
-/// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
-/// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
-/// już-zarejestrowane tagi.
+/// Registers all current component renderers. Called by the panel shell
+/// at bootstrap. Idempotent — subsequent calls skip already-registered tags.
 export function bootstrapSdkRuntime() {
   registerLayoutAtomicRenderers();
   registerLayoutContainersRenderers();
@@ -95,8 +96,10 @@ export function bootstrapSdkRuntime() {
   registerFeedbackInlineRenderers();
   registerFeedbackLoadingRenderers();
   registerFeedbackOverlayRenderers();
+  registerMoleculeShellRenderers();
+  registerMoleculePageRenderers();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
   // 3.3d Data Display: KOMPLETNE (38/38). 3.3e Feedback: KOMPLETNE (14/14).
-  // EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
+  // 3.3f Molecules: KOMPLETNE (12/12).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
