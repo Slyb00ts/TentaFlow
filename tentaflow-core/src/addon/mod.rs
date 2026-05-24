@@ -29,6 +29,8 @@ pub mod storage_sql;
 pub mod storage_sql_exec;
 pub mod tool_dispatch;
 pub mod ui;
+pub mod ui_audit;
+pub mod ui_session;
 pub mod utils;
 
 use std::collections::HashMap;
