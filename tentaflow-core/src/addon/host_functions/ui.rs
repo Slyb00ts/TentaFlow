@@ -313,6 +313,14 @@ pub fn ui_render_cbor(
             timestamp: chrono::Utc::now(),
         });
 
+    // Publish to tokio broadcast for WS push to the frontend connection.
+    crate::dispatch::ui_cbor_broadcast::publish(
+        crate::dispatch::ui_cbor_broadcast::UiCborPush {
+            user_id: cache_user_id.unwrap_or(0),
+            cbor: cbor_bytes,
+        },
+    );
+
     audit_log(
         caller.data(),
         "ui.render_cbor",

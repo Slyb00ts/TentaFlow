@@ -8723,3 +8723,680 @@ pub fn encode_ui_channel_cbor(cbor_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::UiChannelCbor(cbor_bytes.to_vec()))
         .map_err(|e| JsError::new(&e))
 }
+
+/// Encode PanelOpen into MessageBody::UiChannelCbor frame.
+#[wasm_bindgen(js_name = encodeUiPanelOpen)]
+pub fn encode_ui_panel_open(
+    addon_id: String,
+    panel_id: String,
+    locale: String,
+    theme: String,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::panel::{PanelOpen, PanelOpenContext, Viewport};
+    use tentaflow_sdk_spec::UiPayload;
+
+    let payload = UiPayload::PanelOpen(PanelOpen {
+        addon_id,
+        panel_id,
+        ctx: PanelOpenContext {
+            user_id: String::new(),
+            locale,
+            theme,
+            viewport: Viewport {
+                width_px: viewport_width,
+                height_px: viewport_height,
+                density: 1.0,
+            },
+            deep_link: None,
+            prefers_reduced_motion: false,
+            prefers_high_contrast: false,
+            assigned_epoch: 0,
+        },
+    });
+
+    encode_ui_payload_inner(&payload)
+}
+
+/// Encode PanelClose into MessageBody::UiChannelCbor frame.
+#[wasm_bindgen(js_name = encodeUiPanelClose)]
+pub fn encode_ui_panel_close(
+    addon_id: String,
+    panel_id: String,
+    panel_epoch: u64,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::panel::{CloseReason, PanelClose};
+    use tentaflow_sdk_spec::UiPayload;
+
+    let payload = UiPayload::PanelClose(PanelClose {
+        addon_id,
+        panel_id,
+        panel_epoch,
+        reason: CloseReason::UserNavigated,
+    });
+
+    encode_ui_payload_inner(&payload)
+}
+
+/// Encode Action into MessageBody::UiChannelCbor frame.
+#[wasm_bindgen(js_name = encodeUiAction)]
+pub fn encode_ui_action(
+    addon_id: String,
+    panel_id: String,
+    panel_epoch: u64,
+    action_id: String,
+    params_json: String,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::action::Action;
+    use tentaflow_sdk_spec::UiPayload;
+
+    let payload = UiPayload::Action(Action {
+        addon_id,
+        panel_id,
+        panel_epoch,
+        action_id,
+        params: json_to_cbor_map(&params_json)?,
+        form_values: None,
+        user_gesture: true,
+        client_action_id: tentaflow_sdk_spec::protocol::ids::ClientActionId::from_bytes(
+            random_16_bytes(),
+        ),
+    });
+
+    encode_ui_payload_inner(&payload)
+}
+
+/// Decode UI channel CBOR payload into a JS-friendly object.
+#[wasm_bindgen(js_name = decodeUiPayload)]
+pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
+    use tentaflow_sdk_spec::UiPayload;
+
+    let payload: UiPayload = minicbor::decode(cbor_bytes)
+        .map_err(|e| JsError::new(&format!("CBOR decode: {e}")))?;
+
+    let obj = js_sys::Object::new();
+    let tag = payload.tag().as_u16();
+    set(&obj, "tag", (tag as f64).into());
+
+    match payload {
+        UiPayload::PanelOpen(p) => {
+            set(&obj, "addonId", p.addon_id.into());
+            set(&obj, "panelId", p.panel_id.into());
+            set(&obj, "assignedEpoch", (p.ctx.assigned_epoch as f64).into());
+        }
+        UiPayload::PanelShell(s) => {
+            set(&obj, "addonId", s.addon_id.into());
+            set(&obj, "panelId", s.panel_id.into());
+            set(&obj, "panelEpoch", (s.panel_epoch as f64).into());
+            // Layout Component as CBOR bytes for the renderer
+            let mut layout_cbor = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut layout_cbor);
+            let _ = minicbor::Encode::encode(&s.layout, &mut enc, &mut ());
+            set(
+                &obj,
+                "layoutCbor",
+                js_sys::Uint8Array::from(&layout_cbor[..]).into(),
+            );
+            // Slots as JS array
+            let slots = js_sys::Array::new();
+            for slot in &s.slots {
+                let s_obj = js_sys::Object::new();
+                set(&s_obj, "id", slot.id.clone().into());
+                slots.push(&s_obj.into());
+            }
+            set(&obj, "slots", slots.into());
+            // Initial state entries as CBOR bytes
+            let mut state_cbor = Vec::new();
+            let mut enc2 = minicbor::Encoder::new(&mut state_cbor);
+            let _ = minicbor::Encode::encode(&s.initial_state, &mut enc2, &mut ());
+            set(
+                &obj,
+                "initialStateCbor",
+                js_sys::Uint8Array::from(&state_cbor[..]).into(),
+            );
+        }
+        UiPayload::PanelReady(r) => {
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "panelId", r.panel_id.into());
+            set(&obj, "panelEpoch", (r.panel_epoch as f64).into());
+        }
+        UiPayload::PanelError(e) => {
+            set(&obj, "addonId", e.addon_id.into());
+            set(&obj, "panelId", e.panel_id.into());
+            set(&obj, "message", e.message.into());
+        }
+        UiPayload::PanelClose(c) => {
+            set(&obj, "addonId", c.addon_id.into());
+            set(&obj, "panelId", c.panel_id.into());
+            set(&obj, "panelEpoch", (c.panel_epoch as f64).into());
+        }
+        UiPayload::PanelReset(r) => {
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "panelId", r.panel_id.into());
+            set(&obj, "newPanelEpoch", (r.new_panel_epoch as f64).into());
+        }
+        UiPayload::SlotContent(sc) => {
+            set(&obj, "addonId", sc.addon_id.into());
+            set(&obj, "panelId", sc.panel_id.into());
+            set(&obj, "panelEpoch", (sc.panel_epoch as f64).into());
+            set(&obj, "slotId", sc.slot_id.into());
+            let mut frag_cbor = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut frag_cbor);
+            let _ = minicbor::Encode::encode(&sc.fragment, &mut enc, &mut ());
+            set(
+                &obj,
+                "fragmentCbor",
+                js_sys::Uint8Array::from(&frag_cbor[..]).into(),
+            );
+        }
+        UiPayload::SlotClear(c) => {
+            set(&obj, "addonId", c.addon_id.into());
+            set(&obj, "panelId", c.panel_id.into());
+            set(&obj, "panelEpoch", (c.panel_epoch as f64).into());
+            set(&obj, "slotId", c.slot_id.into());
+        }
+        UiPayload::SlotShow(s) => {
+            set(&obj, "addonId", s.addon_id.into());
+            set(&obj, "panelId", s.panel_id.into());
+            set(&obj, "panelEpoch", (s.panel_epoch as f64).into());
+            set(&obj, "slotId", s.slot_id.into());
+        }
+        UiPayload::SlotHide(h) => {
+            set(&obj, "addonId", h.addon_id.into());
+            set(&obj, "panelId", h.panel_id.into());
+            set(&obj, "panelEpoch", (h.panel_epoch as f64).into());
+            set(&obj, "slotId", h.slot_id.into());
+        }
+        UiPayload::StateSnapshot(ss) => {
+            set(&obj, "addonId", ss.addon_id.into());
+            set(&obj, "panelId", ss.panel_id.into());
+            set(&obj, "panelEpoch", (ss.panel_epoch as f64).into());
+            set(&obj, "stateRevision", (ss.state_revision as f64).into());
+            let mut entries_cbor = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut entries_cbor);
+            let _ = minicbor::Encode::encode(&ss.entries, &mut enc, &mut ());
+            set(
+                &obj,
+                "entriesCbor",
+                js_sys::Uint8Array::from(&entries_cbor[..]).into(),
+            );
+            set(&obj, "truncated", ss.truncated.into());
+        }
+        UiPayload::StatePatch(sp) => {
+            set(&obj, "addonId", sp.addon_id.into());
+            set(&obj, "panelId", sp.panel_id.into());
+            set(&obj, "panelEpoch", (sp.panel_epoch as f64).into());
+            set(&obj, "baseRevision", (sp.base_revision as f64).into());
+            set(&obj, "newRevision", (sp.new_revision as f64).into());
+            let mut ops_cbor = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut ops_cbor);
+            let _ = minicbor::Encode::encode(&sp.ops, &mut enc, &mut ());
+            set(
+                &obj,
+                "opsCbor",
+                js_sys::Uint8Array::from(&ops_cbor[..]).into(),
+            );
+        }
+        UiPayload::StateReset(sr) => {
+            set(&obj, "addonId", sr.addon_id.into());
+            set(&obj, "panelId", sr.panel_id.into());
+            set(&obj, "panelEpoch", (sr.panel_epoch as f64).into());
+            set(&obj, "newRevision", (sr.new_revision as f64).into());
+        }
+        UiPayload::PatchRejected(pr) => {
+            set(&obj, "addonId", pr.addon_id.into());
+            set(&obj, "panelId", pr.panel_id.into());
+            set(&obj, "panelEpoch", (pr.panel_epoch as f64).into());
+            set(&obj, "rejectedMsgId", (pr.rejected_msg_id as f64).into());
+            if let Some(rev) = pr.current_revision {
+                set(&obj, "currentRevision", (rev as f64).into());
+            }
+        }
+        UiPayload::Action(a) => {
+            set(&obj, "addonId", a.addon_id.into());
+            set(&obj, "panelId", a.panel_id.into());
+            set(&obj, "panelEpoch", (a.panel_epoch as f64).into());
+            set(&obj, "actionId", a.action_id.into());
+        }
+        UiPayload::ActionAck(ack) => {
+            set(&obj, "addonId", ack.addon_id.into());
+            set(&obj, "panelId", ack.panel_id.into());
+            set(&obj, "panelEpoch", (ack.panel_epoch as f64).into());
+            set(&obj, "actionId", ack.action_id.into());
+            let status_str = match &ack.status {
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok => "ok",
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Error { .. } => "error",
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Rejected { .. } => {
+                    "rejected"
+                }
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::PermissionDenied {
+                    ..
+                } => "permission_denied",
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::RateLimited { .. } => {
+                    "rate_limited"
+                }
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::ValidationFailed {
+                    ..
+                } => "validation_failed",
+                tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Redirected { .. } => {
+                    "redirected"
+                }
+            };
+            set(&obj, "status", status_str.into());
+        }
+        UiPayload::Command(_) => {
+            // Full command decode not exposed; frontend uses raw CBOR via tag dispatch.
+        }
+        UiPayload::Event(ev) => {
+            set(&obj, "sourceAddonId", ev.source_addon_id.into());
+            // Encode topic as CBOR bytes for frontend topic matching
+            let mut topic_cbor = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut topic_cbor);
+            let _ = minicbor::Encode::encode(&ev.topic, &mut enc, &mut ());
+            set(
+                &obj,
+                "topicCbor",
+                js_sys::Uint8Array::from(&topic_cbor[..]).into(),
+            );
+            set(&obj, "tsMs", (ev.ts_ms as f64).into());
+        }
+        UiPayload::Batch(_) => {
+            // Batch is decoded member-by-member on frontend.
+        }
+    }
+
+    Ok(obj.into())
+}
+
+// -- Private helpers for UI channel encode/decode --
+
+/// Encodes a UiPayload to CBOR then wraps in MessageBody::UiChannelCbor.
+fn encode_ui_payload_inner(
+    payload: &tentaflow_sdk_spec::UiPayload,
+) -> Result<Vec<u8>, JsError> {
+    let mut cbor_buf = Vec::with_capacity(128);
+    let mut enc = minicbor::Encoder::new(&mut cbor_buf);
+    minicbor::Encode::encode(payload, &mut enc, &mut ())
+        .map_err(|e| JsError::new(&format!("CBOR encode error: {e}")))?;
+    encode_body_inner(&MessageBody::UiChannelCbor(cbor_buf)).map_err(|e| JsError::new(&e))
+}
+
+/// Converts a JSON string to CborMap (Vec<(String, Value)>).
+fn json_to_cbor_map(
+    json_str: &str,
+) -> Result<tentaflow_sdk_spec::protocol::control::CborMap, JsError> {
+    use tentaflow_sdk_spec::protocol::control::CborMap;
+    use tentaflow_sdk_spec::protocol::value::Value;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| JsError::new(&format!("JSON parse: {e}")))?;
+
+    let obj = match parsed {
+        serde_json::Value::Object(m) => m,
+        _ => return Ok(CborMap(Vec::new())),
+    };
+
+    let entries: Vec<(String, Value)> = obj
+        .into_iter()
+        .map(|(k, v)| (k, json_value_to_cbor_value(v)))
+        .collect();
+
+    Ok(CborMap(entries))
+}
+
+fn json_value_to_cbor_value(v: serde_json::Value) -> tentaflow_sdk_spec::protocol::value::Value {
+    use tentaflow_sdk_spec::protocol::value::Value;
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Value::U64(u)
+            } else if let Some(i) = n.as_i64() {
+                Value::I64(i)
+            } else {
+                Value::F64(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => Value::Text(s),
+        serde_json::Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(json_value_to_cbor_value).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let entries: Vec<(Value, Value)> = obj
+                .into_iter()
+                .map(|(k, v)| (Value::Text(k), json_value_to_cbor_value(v)))
+                .collect();
+            Value::Map(entries)
+        }
+    }
+}
+
+/// Generate 16 random bytes for ClientActionId using getrandom.
+fn random_16_bytes() -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).unwrap_or_default();
+    buf
+}
+
+// =============================================================================
+// Component CBOR decoder — converts Component wire bytes to the JS shape
+// expected by ComponentRenderer: { tag, id, fields, handlers, bind, a11y,
+// visibility, test_id }.
+// =============================================================================
+
+/// Decode a CBOR-encoded Component into a JS object suitable for ComponentRenderer.
+#[wasm_bindgen(js_name = decodeComponentCbor)]
+pub fn decode_component_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::component::Component;
+    let component: Component = minicbor::decode(cbor_bytes)
+        .map_err(|e| JsError::new(&format!("Component CBOR decode: {e}")))?;
+    component_to_js(&component).map_err(|e| JsError::new(&e))
+}
+
+/// Decode CBOR-encoded Vec<StateEntry> into JS array of { path, value }.
+#[wasm_bindgen(js_name = decodeStateEntriesCbor)]
+pub fn decode_state_entries_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::bind::PathSegment;
+    use tentaflow_sdk_spec::protocol::ui::slot::StateEntry;
+
+    let entries: Vec<StateEntry> = minicbor::decode(cbor_bytes)
+        .map_err(|e| JsError::new(&format!("StateEntries CBOR decode: {e}")))?;
+
+    let arr = js_sys::Array::new();
+    for entry in &entries {
+        let obj = js_sys::Object::new();
+        let path_arr = js_sys::Array::new();
+        for seg in &entry.path.segments {
+            let seg_obj = js_sys::Object::new();
+            match seg {
+                PathSegment::Key(k) => {
+                    set(&seg_obj, "kind", "key".into());
+                    set(&seg_obj, "value", k.as_str().into());
+                }
+                PathSegment::Index(i) => {
+                    set(&seg_obj, "kind", "index".into());
+                    set(&seg_obj, "value", (*i as f64).into());
+                }
+            }
+            path_arr.push(&seg_obj.into());
+        }
+        set(&obj, "path", path_arr.into());
+        set(&obj, "value", value_to_js(&entry.value).map_err(|e| JsError::new(&e))?);
+        arr.push(&obj.into());
+    }
+    Ok(arr.into())
+}
+
+/// Decode CBOR-encoded Vec<PatchOp> into JS array of { path, op, ... }.
+#[wasm_bindgen(js_name = decodePatchOpsCbor)]
+pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
+    use tentaflow_sdk_spec::protocol::ui::bind::PathSegment;
+    use tentaflow_sdk_spec::protocol::ui::patch::{PatchOp, PatchOpKind};
+
+    let ops: Vec<PatchOp> = minicbor::decode(cbor_bytes)
+        .map_err(|e| JsError::new(&format!("PatchOps CBOR decode: {e}")))?;
+
+    let arr = js_sys::Array::new();
+    for op in &ops {
+        let obj = js_sys::Object::new();
+        let path_arr = js_sys::Array::new();
+        for seg in &op.path.segments {
+            let seg_obj = js_sys::Object::new();
+            match seg {
+                PathSegment::Key(k) => {
+                    set(&seg_obj, "kind", "key".into());
+                    set(&seg_obj, "value", k.as_str().into());
+                }
+                PathSegment::Index(i) => {
+                    set(&seg_obj, "kind", "index".into());
+                    set(&seg_obj, "value", (*i as f64).into());
+                }
+            }
+            path_arr.push(&seg_obj.into());
+        }
+        set(&obj, "path", path_arr.into());
+        match &op.op {
+            PatchOpKind::Set { value } => {
+                set(&obj, "op", "set".into());
+                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+            }
+            PatchOpKind::Delete => {
+                set(&obj, "op", "delete".into());
+            }
+            PatchOpKind::AppendArray { value } => {
+                set(&obj, "op", "append_array".into());
+                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+            }
+            PatchOpKind::PrependArray { value } => {
+                set(&obj, "op", "prepend_array".into());
+                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+            }
+            PatchOpKind::InsertArray { index, value } => {
+                set(&obj, "op", "insert_array".into());
+                set(&obj, "index", (*index as f64).into());
+                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+            }
+            PatchOpKind::RemoveArray { index } => {
+                set(&obj, "op", "remove_array".into());
+                set(&obj, "index", (*index as f64).into());
+            }
+            PatchOpKind::MergeMap { value } => {
+                set(&obj, "op", "merge_map".into());
+                let m_obj = js_sys::Object::new();
+                for (k, v) in &value.0 {
+                    set(&m_obj, k, value_to_js(v).map_err(|e| JsError::new(&e))?);
+                }
+                set(&obj, "value", m_obj.into());
+            }
+            PatchOpKind::Increment { delta } => {
+                set(&obj, "op", "increment".into());
+                set(&obj, "delta", (*delta as f64).into());
+            }
+        }
+        arr.push(&obj.into());
+    }
+    Ok(arr.into())
+}
+
+fn component_to_js(c: &tentaflow_sdk_spec::protocol::ui::component::Component) -> Result<JsValue, String> {
+    let obj = js_sys::Object::new();
+    set(&obj, "tag", (c.tag as f64).into());
+    set(&obj, "id", c.id.clone().into());
+
+    // fields: Array<[u8, Value]>
+    let fields_arr = js_sys::Array::new();
+    for (k, v) in &c.fields.0 {
+        let pair = js_sys::Array::new();
+        pair.push(&(*k as f64).into());
+        pair.push(&value_to_js(v)?);
+        fields_arr.push(&pair.into());
+    }
+    set(&obj, "fields", fields_arr.into());
+
+    // handlers: Array<[EventKind(string), Handler(object)]> | null
+    match &c.handlers {
+        Some(hm) => {
+            let handlers_arr = js_sys::Array::new();
+            for (ek, h) in &hm.0 {
+                let pair = js_sys::Array::new();
+                pair.push(&ek.as_str().into());
+                pair.push(&handler_to_js(h)?);
+                handlers_arr.push(&pair.into());
+            }
+            set(&obj, "handlers", handlers_arr.into());
+        }
+        None => {
+            set(&obj, "handlers", JsValue::NULL);
+        }
+    }
+
+    // bind: BindSpec object | null
+    match &c.bind {
+        Some(bs) => set(&obj, "bind", bind_spec_to_js(bs)?),
+        None => set(&obj, "bind", JsValue::NULL),
+    }
+
+    // a11y: object | null
+    match &c.a11y {
+        Some(a) => set(&obj, "a11y", accessibility_to_js(a)?),
+        None => set(&obj, "a11y", JsValue::NULL),
+    }
+
+    // visibility: object | null
+    match &c.visibility {
+        Some(v) => set(&obj, "visibility", visibility_to_js(v)?),
+        None => set(&obj, "visibility", JsValue::NULL),
+    }
+
+    // test_id: string | null
+    match &c.test_id {
+        Some(tid) => set(&obj, "test_id", tid.as_str().into()),
+        None => set(&obj, "test_id", JsValue::NULL),
+    }
+
+    Ok(obj.into())
+}
+
+fn value_to_js(v: &tentaflow_sdk_spec::protocol::value::Value) -> Result<JsValue, String> {
+    use tentaflow_sdk_spec::protocol::value::Value;
+
+    match v {
+        Value::Null => Ok(JsValue::NULL),
+        Value::Bool(b) => Ok((*b).into()),
+        Value::U64(n) => Ok((*n as f64).into()),
+        Value::I64(n) => Ok((*n as f64).into()),
+        Value::F64(f) => Ok((*f).into()),
+        Value::Bytes(b) => Ok(js_sys::Uint8Array::from(&b[..]).into()),
+        Value::Text(s) => Ok(s.as_str().into()),
+        Value::Array(items) => {
+            let arr = js_sys::Array::new();
+            for item in items {
+                arr.push(&value_to_js(item)?);
+            }
+            Ok(arr.into())
+        }
+        Value::Map(entries) => {
+            // Heuristic: if this map has integer keys 0 (u64 tag) and 1 (text id),
+            // it might be an embedded Component encoded via encode_to_value.
+            if let Some(component) = try_decode_component_from_value(v) {
+                return component_to_js(&component);
+            }
+            // Otherwise return as a plain JS object (text-keyed) or array of pairs
+            // (mixed-key). All FieldMap values use text keys or integer keys.
+            if entries.iter().all(|(k, _)| matches!(k, Value::Text(_))) {
+                let obj = js_sys::Object::new();
+                for (k, val) in entries {
+                    if let Value::Text(key) = k {
+                        set(&obj, key, value_to_js(val)?);
+                    }
+                }
+                Ok(obj.into())
+            } else {
+                // Integer-keyed or mixed: return as array of [key, value] pairs
+                let arr = js_sys::Array::new();
+                for (k, val) in entries {
+                    let pair = js_sys::Array::new();
+                    pair.push(&value_to_js(k)?);
+                    pair.push(&value_to_js(val)?);
+                    arr.push(&pair.into());
+                }
+                Ok(arr.into())
+            }
+        }
+    }
+}
+
+/// Attempt to decode a Value as a Component (for embedded children in FieldMap).
+fn try_decode_component_from_value(
+    v: &tentaflow_sdk_spec::protocol::value::Value,
+) -> Option<tentaflow_sdk_spec::protocol::ui::component::Component> {
+    use tentaflow_sdk_spec::protocol::ui::typed_field::decode_from_value;
+    decode_from_value(v).ok()
+}
+
+/// Encode a minicbor-Encode value to CBOR, decode as generic Value, then to JS.
+/// Used for complex sub-structures (Handler, BindSpec, etc.) where hand-coding
+/// every variant is impractical.
+fn encode_decode_to_js<T: minicbor::Encode<()>>(v: &T) -> Result<JsValue, String> {
+    let mut buf = Vec::new();
+    minicbor::encode(v, &mut buf)
+        .map_err(|e| format!("encode_decode_to_js encode: {e}"))?;
+    let val: tentaflow_sdk_spec::protocol::value::Value = minicbor::decode(&buf)
+        .map_err(|e| format!("encode_decode_to_js decode: {e}"))?;
+    value_to_js(&val)
+}
+
+fn handler_to_js(h: &tentaflow_sdk_spec::protocol::ui::handler::Handler) -> Result<JsValue, String> {
+    encode_decode_to_js(h)
+}
+
+
+fn bind_spec_to_js(bs: &tentaflow_sdk_spec::protocol::ui::bind::BindSpec) -> Result<JsValue, String> {
+    encode_decode_to_js(bs)
+}
+
+fn accessibility_to_js(
+    a: &tentaflow_sdk_spec::protocol::ui::a11y::Accessibility,
+) -> Result<JsValue, String> {
+    let obj = js_sys::Object::new();
+    if let Some(r) = &a.role {
+        set(&obj, "role", r.as_str().into());
+    }
+    if let Some(l) = &a.label {
+        set(&obj, "label", bind_ref_to_js(l)?);
+    }
+    if let Some(lf) = &a.label_for {
+        set(&obj, "label_for", lf.as_str().into());
+    }
+    if let Some(db) = &a.described_by {
+        set(&obj, "described_by", db.as_str().into());
+    }
+    if let Some(live) = &a.live {
+        set(&obj, "live", live.as_str().into());
+    }
+    if let Some(exp) = &a.expanded {
+        set(&obj, "expanded", bind_ref_to_js(exp)?);
+    }
+    if let Some(dis) = &a.disabled {
+        set(&obj, "disabled", bind_ref_to_js(dis)?);
+    }
+    if let Some(req) = &a.required {
+        set(&obj, "required", bind_ref_to_js(req)?);
+    }
+    if let Some(inv) = &a.invalid {
+        set(&obj, "invalid", bind_ref_to_js(inv)?);
+    }
+    if let Some(pr) = &a.pressed {
+        set(&obj, "pressed", bind_ref_to_js(pr)?);
+    }
+    if let Some(sel) = &a.selected {
+        set(&obj, "selected", bind_ref_to_js(sel)?);
+    }
+    Ok(obj.into())
+}
+
+fn visibility_to_js(
+    v: &tentaflow_sdk_spec::protocol::ui::a11y::Visibility,
+) -> Result<JsValue, String> {
+    let obj = js_sys::Object::new();
+    if let Some(vis) = &v.visible {
+        set(&obj, "visible", bind_ref_to_js(vis)?);
+    }
+    if let Some(bp) = &v.display_above_breakpoint {
+        set(&obj, "display_above_breakpoint", bp.as_str().into());
+    }
+    if let Some(bp) = &v.display_below_breakpoint {
+        set(&obj, "display_below_breakpoint", bp.as_str().into());
+    }
+    if v.hidden_for_assistive {
+        set(&obj, "hidden_for_assistive", true.into());
+    }
+    Ok(obj.into())
+}
+
+fn bind_ref_to_js(br: &tentaflow_sdk_spec::protocol::ui::bind::BindRef) -> Result<JsValue, String> {
+    // BindRef uses tstr keys in CBOR, so encode_decode_to_js yields a proper JS object
+    encode_decode_to_js(br)
+}

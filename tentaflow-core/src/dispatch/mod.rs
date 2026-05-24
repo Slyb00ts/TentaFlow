@@ -40,6 +40,7 @@ pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod ui_cbor_broadcast;
 pub mod ui_channel;
 
 pub use state::AppState;
