@@ -233,7 +233,7 @@ export function parseDimensionToken(raw, ctx) {
   throw new TypeError(`${ctx}: unknown DimensionToken kind '${kind}'`);
 }
 
-function parseAspectRatio(raw, ctx) {
+export function parseAspectRatio(raw, ctx) {
   if (raw == null) return null;
   if (typeof raw !== 'object' || !raw.kind) throw new TypeError(`${ctx}: AspectRatio must have kind`);
   const keys = Object.keys(raw);
