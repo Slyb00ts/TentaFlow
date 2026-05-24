@@ -74,9 +74,6 @@ tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
 # Envelope between iroh streams and sdk-spec types).
 minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
 
-# Typed UI schema shared with `tentaflow-addon-sdk` so guest addons build
-# `PanelTree` values directly instead of serializing through `serde_json::Value`.
-tentaflow-ui-schema = { path = "../tentaflow-ui-schema" }
 
 # Proc-macro #[handler] + #[policy] + #[observed]
 tentaflow-macros = { path = "../tentaflow-macros" }
