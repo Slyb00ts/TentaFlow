@@ -5053,40 +5053,8 @@ register_iam_variant!(
 );
 
 // =============================================================================
-// Apps menu + UI v2 endpointy — multiplex 6 operacji w `AddonUiBody`
-// (zeby zmiescic sie w 256-variant rkyv limicie). Schema v14.
+// Apps menu — multiplexed in `AddonUiBody` (256-variant rkyv limit).
 // =============================================================================
-
-fn addon_ui_err(e: anyhow::Error) -> ProtocolError {
-    ProtocolError::internal(format!("AddonUi: {}", e))
-}
-
-/// Lazy-start addonu z `[application]` przed serwowaniem panelu lub
-/// dispatch'em UI action. Pure `[application]` (bez `[service]`) nie jest
-/// auto-started przez `auto_start_services`, wiec bez tego helpera klikanie
-/// tile'a w launcherze zwracalo by pusty panel. Idempotent — jesli addon
-/// ma juz uruchomione instancje, no-op. Bledy ignorujemy (panel po prostu
-/// bedzie pusty / ResAction zwroci blad, oba diagnostyczne dla usera).
-fn ensure_application_addon_running(
-    manager: &std::sync::Arc<crate::addon::AddonManager>,
-    addon_id: &str,
-) {
-    if manager.has_running_instance(addon_id) {
-        return;
-    }
-    match manager.start_addon(addon_id, None, None) {
-        Ok(iid) => tracing::info!(
-            "ensure_application_addon_running: '{}' lazy started, instance={}",
-            addon_id,
-            iid
-        ),
-        Err(e) => tracing::warn!(
-            "ensure_application_addon_running: '{}' fail: {}",
-            addon_id,
-            e
-        ),
-    }
-}
 
 #[handler(variant = "AddonUiBody", since = (1, 0))]
 #[policy(UserSession)]
@@ -5101,10 +5069,8 @@ pub fn addon_ui_dispatch(
         _ => return Err(ProtocolError::bad_request("expected AddonUiBody")),
     };
 
-    // Visibility check — addon moze byc admin_only lub ograniczony do grup.
-    // Wszystkie 3 sciezki AddonUi musza honorowac to samo co AddonsList
-    // (codex review: P1, hidden addons nie moga byc enumerowane przez
-    // launcher ani uruchamiane przez UI action).
+    // Visibility: admin_only / group-restricted addons must not appear in
+    // the launcher for unauthorized users.
     let user_id_bytes = require_user_id(ctx)?;
     let user_id = user_id_to_i64(&user_id_bytes)
         .ok_or_else(|| ProtocolError::internal("nie udalo sie zdekodowac user_id z sesji"))?;
@@ -5159,73 +5125,8 @@ pub fn addon_ui_dispatch(
             P::ResApplicationsList { applications }
         }
 
-        // ---- UI panel get ----
-        P::ReqPanelGet { addon_id, panel_id } => {
-            // Visibility check — addon admin_only lub group-restricted nie
-            // moze byc otwierany przez non-admin (codex P1).
-            if !visible_to_user(addon_id)? {
-                return Err(ProtocolError::not_found("addon"));
-            }
-            let manager = ctx
-                .state
-                .addon_manager
-                .as_ref()
-                .ok_or_else(|| ProtocolError::internal("addon manager not configured"))?;
-            // Lazy-start dla [application] addonow bez [service] — przed
-            // serwowaniem pierwszego panelu uruchamiamy addon, zeby on_start
-            // miał szansę zawołać `ui_render` (codex P1: tile widoczny w
-            // launcherze, ale klikanie zwracalo empty panel bo addon nigdy
-            // nie wystartował).
-            ensure_application_addon_running(manager, addon_id);
-            // Cache scoped po (user_id, addon_id, panel_id) — codex P1:
-            // wczesniejszy klucz (addon_id, panel_id) leakowal panel jednego
-            // usera do drugiego gdy addon obslugiwal user-specific dane.
-            // Fallback do (0, addon, panel) — default panel zarejestrowany
-            // przez `on_start` system call, ten sam dla wszystkich uzytkownikow.
-            let tree_json = {
-                let cache = manager.ui_panels();
-                let map = cache.read();
-                let value = map
-                    .get(&(user_id, addon_id.clone(), panel_id.clone()))
-                    .or_else(|| map.get(&(0, addon_id.clone(), panel_id.clone())));
-                value
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-                    .unwrap_or_default()
-            };
-            P::ResPanelGet {
-                addon_id: addon_id.clone(),
-                panel_id: panel_id.clone(),
-                tree_json,
-            }
-        }
-
-        // ---- UI action ----
-        P::ReqAction {
-            addon_id,
-            panel_id,
-            action_id,
-            params_json,
-        } => {
-            if !visible_to_user(addon_id)? {
-                return Err(ProtocolError::not_found("addon"));
-            }
-            let manager = ctx
-                .state
-                .addon_manager
-                .as_ref()
-                .ok_or_else(|| ProtocolError::internal("addon manager not configured"))?;
-            ensure_application_addon_running(manager, addon_id);
-            let params: serde_json::Value = serde_json::from_str(params_json)
-                .map_err(|e| ProtocolError::bad_request(format!("params_json invalid: {}", e)))?;
-            let result_value = manager
-                .invoke_ui_action(addon_id, panel_id, action_id, params, Some(user_id))
-                .map_err(addon_ui_err)?;
-            let result_json = serde_json::to_string(&result_value).unwrap_or_default();
-            P::ResAction { result_json }
-        }
-
-        // Response variants nie powinny przychodzic jako request.
-        P::ResApplicationsList { .. } | P::ResPanelGet { .. } | P::ResAction { .. } => {
+        // Response variants should not arrive as requests.
+        P::ResApplicationsList { .. } => {
             return Err(ProtocolError::bad_request("response variant in request"));
         }
     };
@@ -5253,16 +5154,6 @@ macro_rules! register_addon_ui_variant {
 register_addon_ui_variant!(
     "AddonApplicationsListRequest",
     "tentaflow_ws_handler_addon_apps_list",
-    crate::dispatch::SessionAuthKind::UserSession
-);
-register_addon_ui_variant!(
-    "AddonUiPanelGetRequest",
-    "tentaflow_ws_handler_addon_ui_panel_get",
-    crate::dispatch::SessionAuthKind::UserSession
-);
-register_addon_ui_variant!(
-    "AddonUiActionRequest",
-    "tentaflow_ws_handler_addon_ui_action",
     crate::dispatch::SessionAuthKind::UserSession
 );
 
