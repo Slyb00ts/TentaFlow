@@ -135,8 +135,7 @@ impl DashboardServer {
         self
     }
 
-    /// Ustawia AddonManager — udostepnia ui_panels cache i invoke_ui_action
-    /// dla handlerów Apps menu / UI v2.
+    /// Ustawia AddonManager — udostepnia ui_panels cache dla Apps menu.
     pub fn with_addon_manager(
         mut self,
         addon_manager: Option<Arc<crate::addon::AddonManager>>,

@@ -775,10 +775,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::AddonUiPayload::ResApplicationsList { .. } => {
                 "AddonApplicationsListResponse"
             }
-            tentaflow_protocol::AddonUiPayload::ReqPanelGet { .. } => "AddonUiPanelGetRequest",
-            tentaflow_protocol::AddonUiPayload::ResPanelGet { .. } => "AddonUiPanelGetResponse",
-            tentaflow_protocol::AddonUiPayload::ReqAction { .. } => "AddonUiActionRequest",
-            tentaflow_protocol::AddonUiPayload::ResAction { .. } => "AddonUiActionResponse",
         },
         MessageBody::IamBody(p) => match p {
             tentaflow_protocol::IamPayload::ReqListUsers => "IamListUsersRequest",

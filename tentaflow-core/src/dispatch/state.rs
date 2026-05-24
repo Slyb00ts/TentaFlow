@@ -34,8 +34,8 @@ pub struct AppState {
     pub local_node_id: Arc<str>,
     pub mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     pub permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
-    /// AddonManager — udostępnia ui_panels cache + invoke_ui_action dla
-    /// handlerów Apps menu / UI v2. None w testach które nie ładują WASM.
+    /// AddonManager — udostępnia ui_panels cache dla Apps menu.
+    /// None w testach które nie ładują WASM.
     pub addon_manager: Option<Arc<crate::addon::AddonManager>>,
     pub license: Arc<dyn LicenseChecker>,
     pub meeting_manager: Arc<crate::meeting::MeetingManager>,

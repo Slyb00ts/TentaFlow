@@ -1809,45 +1809,6 @@ export const encode = {
     );
   },
 
-  /** MessageBody::AddonUiBody(ReqPanelGet) — pobierz drzewo UI panelu.
-   *  Payload: { addonId, panelId }.
-   *  Sygnatura `(correlationId, payload, sequence)` jak addonDetailRequest —
-   *  binary-ws-client woła `encode[kind](corrId, ...args, seq)`. */
-  addonUiPanelGetRequest(correlationId, payload, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeAddonUiPanelGetRequest(
-      String(payload.addonId ?? payload.addon_id ?? ''),
-      String(payload.panelId ?? payload.panel_id ?? ''),
-    );
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::AddonUiBody(ReqAction) — button click / form submit.
-   *  Payload: { addonId, panelId, actionId, params } gdzie params to
-   *  zwykly obiekt JS — codec stringify'uje do JSON. */
-  addonUiActionRequest(correlationId, payload, sequence = 1) {
-    assertReady();
-    const params = payload.params ?? {};
-    const paramsJson =
-      typeof params === 'string' ? params : JSON.stringify(params);
-    const body = _wasm.encodeAddonUiActionRequest(
-      String(payload.addonId ?? payload.addon_id ?? ''),
-      String(payload.panelId ?? payload.panel_id ?? ''),
-      String(payload.actionId ?? payload.action_id ?? ''),
-      paramsJson,
-    );
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
 
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {
@@ -1949,6 +1910,38 @@ export const encode = {
   schedulerJobRunNowRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeSchedulerJobRunNowRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  syncConflictsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSyncConflictsListRequest(
+      String(payload.orgId ?? payload.org_id ?? 'org-default'),
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.status ?? 'open'),
+      Number(payload.limit ?? 100) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  syncConflictResolveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSyncConflictResolveRequest(
+      String(payload.orgId ?? payload.org_id ?? 'org-default'),
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.operationId ?? payload.operation_id ?? ''),
+      String(payload.resolution ?? ''),
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2728,6 +2721,152 @@ export const encode = {
     assertReady();
     const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
     const body = _wasm.encodeStreamCloseRequest(streamId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // ---------------------------------------------------------------------------
+  // RoleCatalogBody — katalog ról biznesowych (admin). Payload przekazywany do
+  // WASM jako JSON string aby wesprzec Vec<(String,String)> + Option<Option<_>>
+  // bez serde-wasm-bindgen w tym crate'cie.
+  // ---------------------------------------------------------------------------
+
+  /** MessageBody::RoleCatalogBody(ListRequest). Payload: { kind?, isActive?, search?, limit?, offset? }. */
+  roleCatalogListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const filter = {
+      kind: payload?.kind ?? null,
+      is_active: payload?.isActive ?? payload?.is_active ?? null,
+      search: payload?.search ?? null,
+      limit: payload?.limit ?? null,
+      offset: payload?.offset ?? null,
+    };
+    const body = _wasm.encodeRoleCatalogListRequest(JSON.stringify(filter));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(GetRequest). Payload: { id }. */
+  roleCatalogGetRequest(correlationId, { id }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogGetRequest(String(id));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(GetBySlugRequest). Payload: { slug }. */
+  roleCatalogGetBySlugRequest(correlationId, { slug }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogGetBySlugRequest(String(slug));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(ListLocalesRequest) — unit. */
+  roleCatalogListLocalesRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogListLocalesRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(CreateRequest). Payload (camelCase z UI) jest
+   *  remapowany na snake_case zgodny z DTO `RoleCatalogCreateRequest`. */
+  roleCatalogCreateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const req = {
+      slug: String(payload?.slug ?? ''),
+      kind: String(payload?.kind ?? ''),
+      name_translations: payload?.nameTranslations ?? payload?.name_translations ?? [],
+      description_translations:
+        payload?.descriptionTranslations ?? payload?.description_translations ?? [],
+      icon: payload?.icon ?? null,
+      color_hint: payload?.colorHint ?? payload?.color_hint ?? null,
+      is_manager: !!(payload?.isManager ?? payload?.is_manager ?? false),
+      default_visibility_scope: String(
+        payload?.defaultVisibilityScope ?? payload?.default_visibility_scope ?? 'assigned',
+      ),
+    };
+    const body = _wasm.encodeRoleCatalogCreateRequest(JSON.stringify(req));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(UpdateRequest) — patch.
+   *  Pola w `payload` mogą być nieobecne (nie ruszaj), `null` (wyczysc) lub
+   *  konkretną wartością. icon/colorHint mapowane na Option<Option<String>>. */
+  roleCatalogUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const req = { id: String(payload?.id ?? '') };
+    if (Object.prototype.hasOwnProperty.call(payload, 'kind') && payload.kind !== undefined) {
+      req.kind = payload.kind === null ? null : String(payload.kind);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'nameTranslations')
+      && payload.nameTranslations !== undefined
+    ) {
+      req.name_translations = payload.nameTranslations;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'descriptionTranslations')
+      && payload.descriptionTranslations !== undefined
+    ) {
+      req.description_translations = payload.descriptionTranslations;
+    }
+    // icon: Option<Option<String>> — w JSON: brak pola = None, null = Some(None) (clear),
+    // string = Some(Some(value)).
+    if (Object.prototype.hasOwnProperty.call(payload, 'icon') && payload.icon !== undefined) {
+      req.icon = payload.icon === null ? null : String(payload.icon);
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, 'colorHint') && payload.colorHint !== undefined) {
+      req.color_hint = payload.colorHint === null ? null : String(payload.colorHint);
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, 'isManager') && payload.isManager !== undefined) {
+      req.is_manager = !!payload.isManager;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(payload, 'defaultVisibilityScope')
+      && payload.defaultVisibilityScope !== undefined
+    ) {
+      req.default_visibility_scope = String(payload.defaultVisibilityScope);
+    }
+    const body = _wasm.encodeRoleCatalogUpdateRequest(JSON.stringify(req));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::RoleCatalogBody(DeactivateRequest). Payload: { id }. */
+  roleCatalogDeactivateRequest(correlationId, { id }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRoleCatalogDeactivateRequest(String(id));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
