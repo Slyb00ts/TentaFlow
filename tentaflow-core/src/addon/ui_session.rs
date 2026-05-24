@@ -7,7 +7,9 @@
 // =============================================================================
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
+use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 
 // =============================================================================
@@ -445,6 +447,96 @@ impl Default for SessionState {
 }
 
 // =============================================================================
+// SessionRegistry — per-WS-connection UI session state
+// =============================================================================
+
+/// Process-wide registry of UI panel session state, keyed by connection_id.
+/// Each WS connection gets its own `SessionState` tracking open panels, slot
+/// declarations, state revisions, etc. Fine-grained Mutex per session avoids
+/// contention between independent connections.
+pub struct SessionRegistry {
+    sessions: RwLock<HashMap<u64, Arc<Mutex<SessionState>>>>,
+    /// Maps (addon_id, user_id) to connection_id so host functions can look up
+    /// which SessionState owns the panel they are rendering to.
+    addon_connections: RwLock<HashMap<(String, i64), u64>>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            addon_connections: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the session state for `connection_id`, creating a fresh one if
+    /// this connection hasn't been seen yet.
+    pub fn get_or_create(&self, connection_id: u64) -> Arc<Mutex<SessionState>> {
+        {
+            let read = self.sessions.read();
+            if let Some(s) = read.get(&connection_id) {
+                return s.clone();
+            }
+        }
+        let mut write = self.sessions.write();
+        write
+            .entry(connection_id)
+            .or_insert_with(|| Arc::new(Mutex::new(SessionState::new())))
+            .clone()
+    }
+
+    /// Removes the session for `connection_id` (called on WS disconnect).
+    pub fn remove(&self, connection_id: u64) {
+        self.sessions.write().remove(&connection_id);
+    }
+
+    /// Records which connection_id is serving a given addon+user panel session.
+    pub fn register_addon_connection(&self, addon_id: &str, user_id: i64, connection_id: u64) {
+        self.addon_connections
+            .write()
+            .insert((addon_id.to_owned(), user_id), connection_id);
+    }
+
+    /// Removes the addon+user → connection_id mapping (panel close / disconnect).
+    pub fn unregister_addon_connection(&self, addon_id: &str, user_id: i64) {
+        self.addon_connections
+            .write()
+            .remove(&(addon_id.to_owned(), user_id));
+    }
+
+    /// Looks up the connection_id serving a given addon+user panel.
+    pub fn find_connection(&self, addon_id: &str, user_id: i64) -> Option<u64> {
+        self.addon_connections
+            .read()
+            .get(&(addon_id.to_owned(), user_id))
+            .copied()
+    }
+}
+
+// =============================================================================
+// Global SessionRegistry — accessible from host functions without threading
+// through AddonState.
+// =============================================================================
+
+static GLOBAL_SESSION_REGISTRY: OnceLock<Arc<SessionRegistry>> = OnceLock::new();
+
+/// Initializes the process-wide global registry. Called once at server startup.
+pub fn init_global_registry(registry: Arc<SessionRegistry>) {
+    let _ = GLOBAL_SESSION_REGISTRY.set(registry);
+}
+
+/// Returns the process-wide global registry (None before `init_global_registry`).
+pub fn global_registry() -> Option<&'static Arc<SessionRegistry>> {
+    GLOBAL_SESSION_REGISTRY.get()
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -826,5 +918,47 @@ mod tests {
         // Should not panic on overflow — saturating add.
         state.grant_credits(1);
         assert!(state.try_consume_credit().is_ok());
+    }
+
+    // =========================================================================
+    // SessionRegistry tests
+    // =========================================================================
+
+    #[test]
+    fn registry_get_or_create_and_remove() {
+        let reg = SessionRegistry::new();
+        let s1 = reg.get_or_create(1);
+        let s2 = reg.get_or_create(1);
+        // Same Arc for same connection_id.
+        assert!(Arc::ptr_eq(&s1, &s2));
+
+        reg.remove(1);
+        let s3 = reg.get_or_create(1);
+        // After removal a fresh session is created.
+        assert!(!Arc::ptr_eq(&s1, &s3));
+    }
+
+    #[test]
+    fn registry_addon_connection_lifecycle() {
+        let reg = SessionRegistry::new();
+
+        assert!(reg.find_connection("contacts", 1).is_none());
+
+        reg.register_addon_connection("contacts", 1, 42);
+        assert_eq!(reg.find_connection("contacts", 1), Some(42));
+
+        // Different user_id — not found.
+        assert!(reg.find_connection("contacts", 2).is_none());
+
+        reg.unregister_addon_connection("contacts", 1);
+        assert!(reg.find_connection("contacts", 1).is_none());
+    }
+
+    #[test]
+    fn registry_addon_connection_overwrite() {
+        let reg = SessionRegistry::new();
+        reg.register_addon_connection("a", 1, 10);
+        reg.register_addon_connection("a", 1, 20);
+        assert_eq!(reg.find_connection("a", 1), Some(20));
     }
 }

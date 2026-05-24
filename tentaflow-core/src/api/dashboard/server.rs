@@ -59,6 +59,11 @@ impl DashboardServer {
         router: Arc<Router>,
         mesh_peer_store: MeshPeerStore,
     ) -> Self {
+        // Initialize the process-wide SessionRegistry so host functions can
+        // locate panel sessions for outbound slot ownership validation.
+        crate::addon::ui_session::init_global_registry(
+            Arc::new(crate::addon::ui_session::SessionRegistry::new()),
+        );
         Self {
             db,
             bind: bind.to_string(),
@@ -797,7 +802,9 @@ pub async fn handle_request(
             port_allocator: port_allocator.clone(),
             mesh_services_registry: mesh_services_registry.clone(),
             live_handles: service_manager.live_handles.clone(),
-            ui_sessions: crate::dispatch::state::SessionRegistry::new(),
+            ui_sessions: crate::addon::ui_session::global_registry()
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::addon::ui_session::SessionRegistry::new())),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
