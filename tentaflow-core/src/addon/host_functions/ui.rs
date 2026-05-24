@@ -3,6 +3,8 @@
 // UI host functions — CBOR-based UI channel + notifications.
 // =============================================================================
 
+use std::collections::HashSet;
+
 use tracing::info;
 
 use super::{
@@ -104,6 +106,59 @@ pub fn ui_render_cbor(
     };
 
     let addon_id = caller.data().addon_id.clone();
+
+    // Validate outbound slot/shell messages against session state.
+    if let Some(registry) = crate::addon::ui_session::global_registry() {
+        let user_id = caller.data().user_id.unwrap_or(0);
+
+        if let Some(conn_id) = registry.find_connection(&addon_id, user_id) {
+            let session_lock = registry.get_or_create(conn_id);
+            let mut session = session_lock.lock();
+
+            match tag {
+                UiTag::PanelShell => {
+                    if let Err(e) = handle_panel_shell_registration(&cbor_bytes, &mut session, &addon_id) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: PanelShell registration rejected: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
+                UiTag::SlotContent | UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
+                    if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(&cbor_bytes) {
+                        if let Err(e) = session.validate_slot_ownership(&addon_id, &panel_id, &slot_id) {
+                            tracing::warn!(
+                                addon = %addon_id,
+                                panel = %panel_id,
+                                slot = %slot_id,
+                                "ui_render_cbor: slot ownership violation: {e}"
+                            );
+                            audit_log(
+                                caller.data(),
+                                "ui.render_cbor",
+                                Some("ui"),
+                                None,
+                                "denied",
+                                Some(&format!("slot_ownership_violation: {e}")),
+                            );
+                            return ABI_ERR_OPERATION;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     info!(
         "ui_render_cbor: addon='{}', tag=0x{:04X}, bytes={}",
         addon_id,
@@ -252,4 +307,227 @@ pub fn ui_notify(
     );
 
     ABI_OK
+}
+
+// =============================================================================
+// CBOR extraction helpers for slot dispatch validation
+// =============================================================================
+
+/// Extracts `panel_id` (key 1) and `slot_id` (key 3) from the body map of a
+/// slot message (SlotContent/SlotClear/SlotShow/SlotHide).
+/// Wire: array(2) [ tag: u16, body: map { 0: addon_id, 1: panel_id, 2: epoch, 3: slot_id, ... } ]
+fn extract_panel_and_slot_id(bytes: &[u8]) -> Option<(String, String)> {
+    let mut dec = minicbor::Decoder::new(bytes);
+    // Skip outer array header + tag
+    let _arr_len = dec.array().ok()??;
+    let _tag = dec.u16().ok()?;
+
+    // Body is a map — scan for keys 1 and 3.
+    let map_len = dec.map().ok()??;
+    let mut panel_id: Option<String> = None;
+    let mut slot_id: Option<String> = None;
+
+    for _ in 0..map_len {
+        let key = dec.u32().ok()?;
+        match key {
+            1 => panel_id = Some(dec.str().ok()?.to_owned()),
+            3 => slot_id = Some(dec.str().ok()?.to_owned()),
+            _ => { dec.skip().ok()?; }
+        }
+        if panel_id.is_some() && slot_id.is_some() {
+            break;
+        }
+    }
+
+    Some((panel_id?, slot_id?))
+}
+
+/// Processes a PanelShell message: extracts slot declarations and registers the
+/// shell in the session state.
+/// Wire: array(2) [ 0x0102, body: map { 0: addon_id, 1: panel_id, 2: epoch, 4: slots, ... } ]
+fn handle_panel_shell_registration(
+    bytes: &[u8],
+    session: &mut crate::addon::ui_session::SessionState,
+    addon_id: &str,
+) -> Result<(), String> {
+    let mut dec = minicbor::Decoder::new(bytes);
+    // Skip outer array header + tag
+    dec.array()
+        .map_err(|e| format!("array: {e}"))?
+        .ok_or("indefinite array")?;
+    dec.u16().map_err(|e| format!("tag: {e}"))?;
+
+    // Decode PanelShell body using minicbor derive (map-keyed struct).
+    let shell: tentaflow_sdk_spec::protocol::ui::panel::PanelShell =
+        minicbor::Decode::decode(&mut dec, &mut ())
+            .map_err(|e| format!("PanelShell decode: {e}"))?;
+
+    let slots: HashSet<String> = shell.slots.iter().map(|s| s.id.clone()).collect();
+
+    session
+        .register_shell(
+            addon_id,
+            &shell.panel_id,
+            shell.panel_epoch,
+            slots,
+            HashSet::new(),
+            Vec::new(),
+            Vec::new(),
+            HashSet::new(),
+        )
+        .map_err(|e| e.to_string())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minicbor::Encode;
+    use tentaflow_sdk_spec::UiPayload;
+    use tentaflow_sdk_spec::protocol::ui::slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow};
+    use tentaflow_sdk_spec::protocol::ui::component::{Component, FieldMap};
+    use tentaflow_sdk_spec::protocol::ui::panel::PanelShell;
+    use tentaflow_sdk_spec::protocol::ui::slot::{
+        CachePolicy, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility,
+    };
+
+    fn encode_payload(p: &UiPayload) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        p.encode(&mut enc, &mut ()).unwrap();
+        buf
+    }
+
+    fn empty_comp() -> Component {
+        Component {
+            tag: 0x0001,
+            id: "x".into(),
+            fields: FieldMap::default(),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
+        }
+    }
+
+    #[test]
+    fn extract_panel_and_slot_from_slot_content() {
+        let payload = UiPayload::SlotContent(SlotContent {
+            addon_id: "contacts".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            slot_id: "content".into(),
+            fragment: empty_comp(),
+            state_overlay: None,
+        });
+        let bytes = encode_payload(&payload);
+        let (panel, slot) = extract_panel_and_slot_id(&bytes).unwrap();
+        assert_eq!(panel, "main");
+        assert_eq!(slot, "content");
+    }
+
+    #[test]
+    fn extract_panel_and_slot_from_slot_clear() {
+        let payload = UiPayload::SlotClear(SlotClear {
+            addon_id: "a".into(),
+            panel_id: "settings".into(),
+            panel_epoch: 2,
+            slot_id: "sidebar".into(),
+        });
+        let bytes = encode_payload(&payload);
+        let (panel, slot) = extract_panel_and_slot_id(&bytes).unwrap();
+        assert_eq!(panel, "settings");
+        assert_eq!(slot, "sidebar");
+    }
+
+    #[test]
+    fn extract_panel_and_slot_from_slot_show_hide() {
+        for payload in [
+            UiPayload::SlotShow(SlotShow {
+                addon_id: "a".into(),
+                panel_id: "p".into(),
+                panel_epoch: 1,
+                slot_id: "modal".into(),
+            }),
+            UiPayload::SlotHide(SlotHide {
+                addon_id: "a".into(),
+                panel_id: "p".into(),
+                panel_epoch: 1,
+                slot_id: "modal".into(),
+            }),
+        ] {
+            let bytes = encode_payload(&payload);
+            let (panel, slot) = extract_panel_and_slot_id(&bytes).unwrap();
+            assert_eq!(panel, "p");
+            assert_eq!(slot, "modal");
+        }
+    }
+
+    #[test]
+    fn panel_shell_registration_creates_slots() {
+        let shell = UiPayload::PanelShell(PanelShell {
+            addon_id: "contacts".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            layout: empty_comp(),
+            slots: vec![
+                SlotDecl {
+                    id: "content".into(),
+                    semantics: SlotSemantics::MainContent,
+                    default_state: SlotDefault::Empty,
+                    cache_policy: CachePolicy::None,
+                    visibility: SlotVisibility::Always,
+                    max_payload_bytes: None,
+                },
+                SlotDecl {
+                    id: "drawer".into(),
+                    semantics: SlotSemantics::Drawer,
+                    default_state: SlotDefault::Empty,
+                    cache_policy: CachePolicy::None,
+                    visibility: SlotVisibility::Hidden,
+                    max_payload_bytes: None,
+                },
+            ],
+            initial_state: vec![],
+            initial_commands: vec![],
+        });
+
+        let bytes = encode_payload(&shell);
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("contacts", "main").unwrap();
+
+        handle_panel_shell_registration(&bytes, &mut session, "contacts").unwrap();
+
+        // Declared slots pass validation.
+        assert!(session.validate_slot_ownership("contacts", "main", "content").is_ok());
+        assert!(session.validate_slot_ownership("contacts", "main", "drawer").is_ok());
+
+        // Undeclared slot fails.
+        assert!(session.validate_slot_ownership("contacts", "main", "other").is_err());
+    }
+
+    #[test]
+    fn panel_shell_registration_rejects_double_register() {
+        let shell = UiPayload::PanelShell(PanelShell {
+            addon_id: "a".into(),
+            panel_id: "p".into(),
+            panel_epoch: 1,
+            layout: empty_comp(),
+            slots: vec![],
+            initial_state: vec![],
+            initial_commands: vec![],
+        });
+
+        let bytes = encode_payload(&shell);
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("a", "p").unwrap();
+
+        handle_panel_shell_registration(&bytes, &mut session, "a").unwrap();
+        let err = handle_panel_shell_registration(&bytes, &mut session, "a");
+        assert!(err.is_err());
+    }
 }

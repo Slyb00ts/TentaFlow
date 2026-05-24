@@ -139,6 +139,13 @@ fn handle_panel_open(
         }
     }
 
+    // Track which connection is serving this addon+user panel so host
+    // functions can locate the SessionState for outbound validation.
+    let user_id = extract_user_id_i64(ctx).unwrap_or(0);
+    ctx.state
+        .ui_sessions
+        .register_addon_connection(&panel_open.addon_id, user_id, ctx.connection_id);
+
     // Stamp the assigned_epoch into the context before returning.
     panel_open.ctx.assigned_epoch = epoch;
 
@@ -172,6 +179,14 @@ fn handle_panel_close(
     }
 
     session.close_panel(&panel_close.addon_id, &panel_close.panel_id);
+
+    // Drop session lock before calling into registry (avoids nested lock).
+    drop(session);
+
+    let user_id = extract_user_id_i64(ctx).unwrap_or(0);
+    ctx.state
+        .ui_sessions
+        .unregister_addon_connection(&panel_close.addon_id, user_id);
 
     // Echo the PanelClose back as acknowledgment.
     let response = UiPayload::PanelClose(panel_close);
