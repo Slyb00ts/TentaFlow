@@ -3599,3 +3599,203 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   padding: 4px 12px;
 }
 .tf-offline-banner__action:hover { background: rgba(220, 38, 38, 0.08); }
+
+/* =============================================================================
+   Skeleton (0x0506) — chunk 3.3e-2
+   ============================================================================= */
+
+.tf-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tf-skeleton--table_row {
+  flex-direction: row;
+}
+.tf-skeleton__line {
+  height: 12px;
+  border-radius: 4px;
+  background: var(--tf-color-skeleton, rgba(128, 128, 128, 0.15));
+}
+.tf-skeleton__line:last-child {
+  width: 60%;
+}
+.tf-skeleton__circle {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--tf-color-skeleton, rgba(128, 128, 128, 0.15));
+}
+.tf-skeleton__rect {
+  width: 100%;
+  height: 100%;
+  min-height: 16px;
+  border-radius: 4px;
+  background: var(--tf-color-skeleton, rgba(128, 128, 128, 0.15));
+}
+.tf-skeleton__card-header {
+  height: 24px;
+  margin-bottom: 4px;
+}
+.tf-skeleton__card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tf-skeleton__table-row {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+}
+.tf-skeleton__table-cell {
+  flex: 1;
+  height: 16px;
+}
+.tf-skeleton--animate .tf-skeleton__line,
+.tf-skeleton--animate .tf-skeleton__circle,
+.tf-skeleton--animate .tf-skeleton__rect {
+  background: linear-gradient(
+    90deg,
+    var(--tf-color-skeleton, rgba(128, 128, 128, 0.15)) 25%,
+    var(--tf-color-skeleton-highlight, rgba(128, 128, 128, 0.25)) 50%,
+    var(--tf-color-skeleton, rgba(128, 128, 128, 0.15)) 75%
+  );
+  background-size: 200% 100%;
+  animation: tf-skeleton-shimmer 1.5s ease-in-out infinite;
+}
+@keyframes tf-skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* =============================================================================
+   Spinner (0x0507) — chunk 3.3e-2
+   ============================================================================= */
+
+.tf-spinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.tf-spinner--size-xs { --tf-spinner-size: 12px; }
+.tf-spinner--size-sm { --tf-spinner-size: 16px; }
+.tf-spinner--size-md { --tf-spinner-size: 24px; }
+.tf-spinner--size-lg { --tf-spinner-size: 32px; }
+.tf-spinner--size-xl { --tf-spinner-size: 48px; }
+
+.tf-spinner--tone-neutral  { --tf-spinner-color: var(--tf-color-text, #6b7280); }
+.tf-spinner--tone-primary  { --tf-spinner-color: var(--tf-color-primary, #3b82f6); }
+.tf-spinner--tone-info     { --tf-spinner-color: var(--tf-color-info, #3b82f6); }
+.tf-spinner--tone-success  { --tf-spinner-color: var(--tf-color-success, #22c55e); }
+.tf-spinner--tone-warning  { --tf-spinner-color: var(--tf-color-warning, #f59e0b); }
+.tf-spinner--tone-critical { --tf-spinner-color: var(--tf-color-critical, #ef4444); }
+.tf-spinner--tone-muted    { --tf-spinner-color: var(--tf-color-muted, #9ca3af); }
+
+/* default: border spinner with colored top */
+.tf-spinner--default .tf-spinner__circle {
+  width: var(--tf-spinner-size);
+  height: var(--tf-spinner-size);
+  border: 2px solid rgba(128, 128, 128, 0.2);
+  border-top-color: var(--tf-spinner-color);
+  border-radius: 50%;
+  animation: tf-spinner-rotate 0.75s linear infinite;
+}
+
+/* ring: full ring with partial arc */
+.tf-spinner--ring .tf-spinner__circle {
+  width: var(--tf-spinner-size);
+  height: var(--tf-spinner-size);
+  border: 2px solid transparent;
+  border-top-color: var(--tf-spinner-color);
+  border-right-color: var(--tf-spinner-color);
+  border-radius: 50%;
+  animation: tf-spinner-rotate 0.75s linear infinite;
+}
+
+@keyframes tf-spinner-rotate {
+  to { transform: rotate(360deg); }
+}
+
+/* dots: 3 bouncing dots */
+.tf-spinner--dots {
+  gap: calc(var(--tf-spinner-size) * 0.25);
+}
+.tf-spinner--dots .tf-spinner__dot {
+  width: calc(var(--tf-spinner-size) * 0.35);
+  height: calc(var(--tf-spinner-size) * 0.35);
+  border-radius: 50%;
+  background: var(--tf-spinner-color);
+  animation: tf-spinner-bounce 1.2s ease-in-out infinite;
+}
+.tf-spinner--dots .tf-spinner__dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.tf-spinner--dots .tf-spinner__dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes tf-spinner-bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+/* bars: 4 vertical bars with staggered animation */
+.tf-spinner--bars {
+  gap: calc(var(--tf-spinner-size) * 0.1);
+  align-items: flex-end;
+}
+.tf-spinner--bars .tf-spinner__bar {
+  width: calc(var(--tf-spinner-size) * 0.15);
+  height: var(--tf-spinner-size);
+  background: var(--tf-spinner-color);
+  border-radius: 2px;
+  animation: tf-spinner-bars 1s ease-in-out infinite;
+}
+.tf-spinner--bars .tf-spinner__bar:nth-child(2) { animation-delay: 0.1s; }
+.tf-spinner--bars .tf-spinner__bar:nth-child(3) { animation-delay: 0.2s; }
+.tf-spinner--bars .tf-spinner__bar:nth-child(4) { animation-delay: 0.3s; }
+@keyframes tf-spinner-bars {
+  0%, 100% { transform: scaleY(0.4); }
+  50% { transform: scaleY(1); }
+}
+
+/* =============================================================================
+   LoadingBar (0x0508) — chunk 3.3e-2
+   ============================================================================= */
+
+.tf-loading-bar {
+  position: relative;
+  width: 100%;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--tf-color-loading-bar-bg, rgba(128, 128, 128, 0.12));
+}
+
+.tf-loading-bar--tone-neutral  .tf-loading-bar__track { background: var(--tf-color-text, #6b7280); }
+.tf-loading-bar--tone-primary  .tf-loading-bar__track { background: var(--tf-color-primary, #3b82f6); }
+.tf-loading-bar--tone-info     .tf-loading-bar__track { background: var(--tf-color-info, #3b82f6); }
+.tf-loading-bar--tone-success  .tf-loading-bar__track { background: var(--tf-color-success, #22c55e); }
+.tf-loading-bar--tone-warning  .tf-loading-bar__track { background: var(--tf-color-warning, #f59e0b); }
+.tf-loading-bar--tone-critical .tf-loading-bar__track { background: var(--tf-color-critical, #ef4444); }
+.tf-loading-bar--tone-muted    .tf-loading-bar__track { background: var(--tf-color-muted, #9ca3af); }
+
+.tf-loading-bar__track {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.2s ease;
+}
+
+.tf-loading-bar--determinate .tf-loading-bar__track {
+  width: 0%;
+}
+
+.tf-loading-bar--indeterminate .tf-loading-bar__track {
+  width: 40%;
+  animation: tf-loading-bar-indeterminate 1.5s ease-in-out infinite;
+}
+
+@keyframes tf-loading-bar-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
