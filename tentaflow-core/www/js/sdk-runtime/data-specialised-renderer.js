@@ -207,7 +207,7 @@ const IMAGE_FITS = new Set(['cover', 'contain', 'fill', 'none']);
 const RADIUS_TOKENS = new Set(['none', 'xs', 'sm', 'md', 'lg', 'xl', 'pill', 'circle']);
 
 const SPACING_TOKENS = new Set(['zero', 'xxs', 'xs', 'sm', 'md', 'lg', 'xl', 'xxl']);
-function parseDimensionToken(raw, ctx) {
+export function parseDimensionToken(raw, ctx) {
   if (raw == null) return null;
   if (typeof raw !== 'object' || !raw.kind) throw new TypeError(`${ctx}: DimensionToken must have kind`);
   const kind = raw.kind;
