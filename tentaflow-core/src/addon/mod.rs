@@ -447,11 +447,10 @@ pub struct AddonState {
     pub router: Option<Arc<crate::routing::router::Router>>,
     /// Per-account mutex map used to serialize OAuth refresh_token calls.
     pub oauth_refresh_guard: Arc<oauth_refresh_guard::OAuthRefreshGuard>,
-    /// Shared cache UI panel state — host function `ui_render` zapisuje tu
-    /// drzewo komponentow, MessageBody handler `AddonUiPanelGetRequest`
-    /// odczytuje. `None` w testach event_bus w izolacji.
+    /// Shared cache of raw validated CBOR bytes from `ui_render_cbor`.
+    /// `None` in isolated event_bus tests.
     pub ui_panels:
-        Option<Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>>>,
+        Option<Arc<PlRwLock<HashMap<(i64, String, String), Vec<u8>>>>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -512,12 +511,9 @@ pub struct AddonManager {
     /// wola `cancel()` na tokenie — tick loop wychodzi po nastepnym
     /// `select!`, zwalnia uchwyt do instancji.
     service_tasks: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
-    /// Cache ostatnio wyrenderowanego UI tree per (addon_id, panel_id).
-    /// Addon woła `ui_render(panel_id, tree)` z guest WASM, host zapisuje
-    /// `tree` w tym cache; frontend GUI pyta przez MessageBody
-    /// `AddonUiPanelGetRequest`. Push do frontu przez bus subscribe wraca
-    /// w przyszlej iteracji.
-    ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>>,
+    /// Cache of raw validated CBOR bytes from `ui_render_cbor`, keyed by
+    /// (user_id, addon_id, slot). Frontend receives CBOR via event bus push.
+    ui_panels: Arc<PlRwLock<HashMap<(i64, String, String), Vec<u8>>>>,
 }
 
 /// Returns the subset of `owned` alias names that should be activated on
@@ -574,11 +570,10 @@ impl AddonManager {
         })
     }
 
-    /// Zwraca handle do cache UI panel state — host function `ui_render`
-    /// uzywa do zapisu, handler `AddonUiPanelGetRequest` do odczytu.
+    /// Handle to the raw validated CBOR bytes cache written by `ui_render_cbor`.
     pub fn ui_panels(
         &self,
-    ) -> Arc<PlRwLock<HashMap<(i64, String, String), tentaflow_ui_schema::PanelTree>>> {
+    ) -> Arc<PlRwLock<HashMap<(i64, String, String), Vec<u8>>>> {
         self.ui_panels.clone()
     }
 
@@ -628,31 +623,13 @@ impl AddonManager {
         }
     }
 
-    /// Czy addon ma przynajmniej jedna running instancje. Uzywane przez
-    /// handler `AddonUiPayload::ReqPanelGet` zeby zdecydowac czy lazy-start
-    /// jest potrzebny.
+    /// Czy addon ma przynajmniej jedna running instancje.
     pub fn has_running_instance(&self, addon_id: &str) -> bool {
         self.instances
             .lock()
             .get(addon_id)
             .map(|v| !v.is_empty())
             .unwrap_or(false)
-    }
-
-    /// Wywoluje `on_request` na running instance addonu z action_id i params
-    /// — uzywane dla button click / form submit z UI panel.
-    /// Konwencja tool name: `ui.{panel_id}.{action_id}`. Reuse istniejacego
-    /// on_request ABI (parse params z JSON, wykonaj akcje, zwroc JSON).
-    pub fn invoke_ui_action(
-        &self,
-        addon_id: &str,
-        panel_id: &str,
-        action_id: &str,
-        params: serde_json::Value,
-        user_id: Option<i64>,
-    ) -> Result<serde_json::Value> {
-        let tool_name = format!("ui.{}.{}", panel_id, action_id);
-        self.call_tool(addon_id, &tool_name, params, user_id.unwrap_or(0))
     }
 
     /// Zwraca rejestr flow blocks — dispatcher buduje z tego dynamic resolver

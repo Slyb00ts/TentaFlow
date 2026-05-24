@@ -1318,6 +1318,58 @@ pub fn encode_scheduler_job_run_now_request(job_id: String) -> Result<Vec<u8>, J
     .map_err(|e| JsError::new(&e))
 }
 
+fn parse_sync_conflict_resolution(
+    resolution: &str,
+) -> Result<tentaflow_protocol::SyncConflictResolution, JsError> {
+    match resolution {
+        "keep_local" => Ok(tentaflow_protocol::SyncConflictResolution::KeepLocal),
+        "ignore" => Ok(tentaflow_protocol::SyncConflictResolution::Ignore),
+        "accept_remote" => Ok(tentaflow_protocol::SyncConflictResolution::AcceptRemote),
+        _ => Err(JsError::new("invalid sync conflict resolution")),
+    }
+}
+
+#[wasm_bindgen(js_name = encodeSyncConflictsListRequest)]
+pub fn encode_sync_conflicts_list_request(
+    org_id: String,
+    addon_id: String,
+    status: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SyncConflictBody(
+        tentaflow_protocol::SyncConflictPayload::ListRequest(
+            tentaflow_protocol::SyncConflictsListRequest {
+                org_id,
+                addon_id,
+                status,
+                limit: limit.min(500),
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeSyncConflictResolveRequest)]
+pub fn encode_sync_conflict_resolve_request(
+    org_id: String,
+    addon_id: String,
+    operation_id: String,
+    resolution: String,
+) -> Result<Vec<u8>, JsError> {
+    let resolution = parse_sync_conflict_resolution(&resolution)?;
+    encode_body_inner(&MessageBody::SyncConflictBody(
+        tentaflow_protocol::SyncConflictPayload::ResolveRequest(
+            tentaflow_protocol::SyncConflictResolveRequest {
+                org_id,
+                addon_id,
+                operation_id,
+                resolution,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::AuditLogExportRequest — eksport CSV z filtrami.
 #[wasm_bindgen(js_name = encodeAuditLogExportRequest)]
 pub fn encode_audit_log_export_request(
@@ -2037,6 +2089,28 @@ fn string_vec_to_js(values: Vec<String>) -> js_sys::Array {
         arr.push(&JsValue::from(v));
     }
     arr
+}
+
+fn sync_conflict_resolution_to_str(
+    resolution: tentaflow_protocol::SyncConflictResolution,
+) -> &'static str {
+    match resolution {
+        tentaflow_protocol::SyncConflictResolution::KeepLocal => "keep_local",
+        tentaflow_protocol::SyncConflictResolution::Ignore => "ignore",
+        tentaflow_protocol::SyncConflictResolution::AcceptRemote => "accept_remote",
+    }
+}
+
+fn set_optional_i64(obj: &js_sys::Object, key: &str, value: Option<i64>) {
+    if let Some(value) = value {
+        set(obj, key, (value as f64).into());
+    }
+}
+
+fn set_optional_string(obj: &js_sys::Object, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        set(obj, key, value.into());
+    }
 }
 
 /// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
@@ -3044,34 +3118,6 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     }
                     set(&obj, "applications", arr.into());
                 }
-                AP::ReqPanelGet { addon_id, panel_id } => {
-                    set(&obj, "variant", "AddonUiPanelGetRequest".into());
-                    set(&obj, "addonId", addon_id.clone().into());
-                    set(&obj, "addon_id", addon_id.into());
-                    set(&obj, "panelId", panel_id.clone().into());
-                    set(&obj, "panel_id", panel_id.into());
-                }
-                AP::ResPanelGet {
-                    addon_id,
-                    panel_id,
-                    tree_json,
-                } => {
-                    set(&obj, "variant", "AddonUiPanelGetResponse".into());
-                    set(&obj, "addonId", addon_id.clone().into());
-                    set(&obj, "addon_id", addon_id.into());
-                    set(&obj, "panelId", panel_id.clone().into());
-                    set(&obj, "panel_id", panel_id.into());
-                    set(&obj, "treeJson", tree_json.clone().into());
-                    set(&obj, "tree_json", tree_json.into());
-                }
-                AP::ReqAction { .. } => {
-                    set(&obj, "variant", "AddonUiActionRequest".into());
-                }
-                AP::ResAction { result_json } => {
-                    set(&obj, "variant", "AddonUiActionResponse".into());
-                    set(&obj, "resultJson", result_json.clone().into());
-                    set(&obj, "result_json", result_json.into());
-                }
             }
         }
 
@@ -3182,6 +3228,82 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SchedulerJobRunNowResponse".into());
                 set(&obj, "runJson", resp.run_json.clone().into());
                 set(&obj, "run_json", resp.run_json.into());
+            }
+        },
+        MessageBody::SyncConflictBody(payload) => match payload {
+            tentaflow_protocol::SyncConflictPayload::ListRequest(req) => {
+                set(&obj, "variant", "SyncConflictsListRequest".into());
+                set(&obj, "orgId", req.org_id.clone().into());
+                set(&obj, "org_id", req.org_id.into());
+                set(&obj, "addonId", req.addon_id.clone().into());
+                set(&obj, "addon_id", req.addon_id.into());
+                set(&obj, "status", req.status.into());
+                set(&obj, "limit", (req.limit as f64).into());
+            }
+            tentaflow_protocol::SyncConflictPayload::ListResponse(resp) => {
+                set(&obj, "variant", "SyncConflictsListResponse".into());
+                let arr = js_sys::Array::new();
+                for conflict in resp.conflicts {
+                    let item = js_sys::Object::new();
+                    set(&item, "operationId", conflict.operation_id.clone().into());
+                    set(&item, "operation_id", conflict.operation_id.into());
+                    set(&item, "orgId", conflict.org_id.clone().into());
+                    set(&item, "org_id", conflict.org_id.into());
+                    set(&item, "addonId", conflict.addon_id.clone().into());
+                    set(&item, "addon_id", conflict.addon_id.into());
+                    set(&item, "tableName", conflict.table_name.clone().into());
+                    set(&item, "table_name", conflict.table_name.into());
+                    set(&item, "resourceType", conflict.resource_type.clone().into());
+                    set(&item, "resource_type", conflict.resource_type.into());
+                    set(&item, "resourceId", conflict.resource_id.clone().into());
+                    set(&item, "resource_id", conflict.resource_id.into());
+                    set(&item, "action", conflict.action.into());
+                    set(
+                        &item,
+                        "sourceNodeId",
+                        conflict.source_node_id.clone().into(),
+                    );
+                    set(&item, "source_node_id", conflict.source_node_id.into());
+                    set(&item, "errorKind", conflict.error_kind.clone().into());
+                    set(&item, "error_kind", conflict.error_kind.into());
+                    set(&item, "errorMessage", conflict.error_message.clone().into());
+                    set(&item, "error_message", conflict.error_message.into());
+                    set(&item, "status", conflict.status.into());
+                    set(&item, "createdAtMs", (conflict.created_at_ms as f64).into());
+                    set(
+                        &item,
+                        "created_at_ms",
+                        (conflict.created_at_ms as f64).into(),
+                    );
+                    set_optional_i64(&item, "resolvedAtMs", conflict.resolved_at_ms);
+                    set_optional_i64(&item, "resolved_at_ms", conflict.resolved_at_ms);
+                    set_optional_string(&item, "resolution", conflict.resolution);
+                    arr.push(&item);
+                }
+                set(&obj, "conflicts", arr.into());
+            }
+            tentaflow_protocol::SyncConflictPayload::ResolveRequest(req) => {
+                set(&obj, "variant", "SyncConflictResolveRequest".into());
+                set(&obj, "orgId", req.org_id.clone().into());
+                set(&obj, "org_id", req.org_id.into());
+                set(&obj, "addonId", req.addon_id.clone().into());
+                set(&obj, "addon_id", req.addon_id.into());
+                set(&obj, "operationId", req.operation_id.clone().into());
+                set(&obj, "operation_id", req.operation_id.into());
+                set(
+                    &obj,
+                    "resolution",
+                    sync_conflict_resolution_to_str(req.resolution).into(),
+                );
+            }
+            tentaflow_protocol::SyncConflictPayload::ResolveResponse(resp) => {
+                set(&obj, "variant", "SyncConflictResolveResponse".into());
+                set(&obj, "operationId", resp.operation_id.clone().into());
+                set(&obj, "operation_id", resp.operation_id.into());
+                set(&obj, "status", resp.status.into());
+                set(&obj, "resolution", resp.resolution.into());
+                set(&obj, "rowsAffected", (resp.rows_affected as f64).into());
+                set(&obj, "rows_affected", (resp.rows_affected as f64).into());
             }
         },
         MessageBody::ServiceBody(payload) => decode_service_payload(&obj, payload),
@@ -3306,59 +3428,61 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "message", e.message.into());
         }
-        MessageBody::ContainerListRequest => {
-            set(&obj, "variant", "ContainerListRequest".into());
-        }
-        MessageBody::ContainerListResponse { containers } => {
-            set(&obj, "variant", "ContainerListResponse".into());
-            let arr = js_sys::Array::new();
-            for c in containers {
-                let item = js_sys::Object::new();
-                set(&item, "id", c.id.into());
-                set(&item, "name", c.name.into());
-                set(&item, "image", c.image.into());
-                set(&item, "state", c.state.into());
-                set(&item, "createdAtEpoch", c.created_at_epoch.into());
-                let ports = js_sys::Array::new();
-                for p in c.ports {
-                    ports.push(&JsValue::from_str(&p));
-                }
-                set(&item, "ports", ports.into());
-                arr.push(&item.into());
+        MessageBody::ContainerBody(payload) => match payload {
+            tentaflow_protocol::ContainerPayload::ListRequest => {
+                set(&obj, "variant", "ContainerListRequest".into());
             }
-            set(&obj, "containers", arr.into());
-        }
-        MessageBody::ContainerStartRequest { container_id } => {
-            set(&obj, "variant", "ContainerStartRequest".into());
-            set(&obj, "containerId", container_id.into());
-        }
-        MessageBody::ContainerStartResponse { started } => {
-            set(&obj, "variant", "ContainerStartResponse".into());
-            set(&obj, "started", started.into());
-        }
-        MessageBody::ContainerStopRequest { container_id } => {
-            set(&obj, "variant", "ContainerStopRequest".into());
-            set(&obj, "containerId", container_id.into());
-        }
-        MessageBody::ContainerStopResponse { stopped } => {
-            set(&obj, "variant", "ContainerStopResponse".into());
-            set(&obj, "stopped", stopped.into());
-        }
-        MessageBody::ContainerLogStreamRequest {
-            container_id,
-            follow,
-        } => {
-            set(&obj, "variant", "ContainerLogStreamRequest".into());
-            set(&obj, "containerId", container_id.into());
-            set(&obj, "follow", follow.into());
-        }
-        MessageBody::ContainerLogChunkBody(c) => {
-            set(&obj, "variant", "ContainerLogChunk".into());
-            set(&obj, "containerId", c.container_id.into());
-            set(&obj, "stream", c.stream.into());
-            set(&obj, "line", c.line.into());
-            set(&obj, "tsEpoch", c.ts_epoch.into());
-        }
+            tentaflow_protocol::ContainerPayload::ListResponse { containers } => {
+                set(&obj, "variant", "ContainerListResponse".into());
+                let arr = js_sys::Array::new();
+                for c in containers {
+                    let item = js_sys::Object::new();
+                    set(&item, "id", c.id.into());
+                    set(&item, "name", c.name.into());
+                    set(&item, "image", c.image.into());
+                    set(&item, "state", c.state.into());
+                    set(&item, "createdAtEpoch", c.created_at_epoch.into());
+                    let ports = js_sys::Array::new();
+                    for p in c.ports {
+                        ports.push(&JsValue::from_str(&p));
+                    }
+                    set(&item, "ports", ports.into());
+                    arr.push(&item.into());
+                }
+                set(&obj, "containers", arr.into());
+            }
+            tentaflow_protocol::ContainerPayload::StartRequest { container_id } => {
+                set(&obj, "variant", "ContainerStartRequest".into());
+                set(&obj, "containerId", container_id.into());
+            }
+            tentaflow_protocol::ContainerPayload::StartResponse { started } => {
+                set(&obj, "variant", "ContainerStartResponse".into());
+                set(&obj, "started", started.into());
+            }
+            tentaflow_protocol::ContainerPayload::StopRequest { container_id } => {
+                set(&obj, "variant", "ContainerStopRequest".into());
+                set(&obj, "containerId", container_id.into());
+            }
+            tentaflow_protocol::ContainerPayload::StopResponse { stopped } => {
+                set(&obj, "variant", "ContainerStopResponse".into());
+                set(&obj, "stopped", stopped.into());
+            }
+            tentaflow_protocol::ContainerPayload::LogStreamRequest {
+                container_id,
+                follow,
+            } => {
+                set(&obj, "variant", "ContainerLogStreamRequest".into());
+                set(&obj, "containerId", container_id.into());
+                set(&obj, "follow", follow.into());
+            }
+            tentaflow_protocol::ContainerPayload::LogChunkBody(c) => {
+                set(&obj, "variant", "ContainerLogChunk".into());
+                set(&obj, "containerId", c.container_id.into());
+                set(&obj, "stream", c.stream.into());
+                set(&obj, "line", c.line.into());
+                set(&obj, "tsEpoch", c.ts_epoch.into());
+            }
+        },
         MessageBody::VoiceProfileListRequest => {
             set(&obj, "variant", "VoiceProfileListRequest".into());
         }
@@ -5163,8 +5287,231 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "reason", c.reason.into());
             }
         },
+        MessageBody::RoleCatalogBody(payload) => {
+            role_catalog_payload_to_js(&obj, payload);
+        }
     }
     Ok(obj.into())
+}
+
+// Decoder dla `RoleCatalogPayload` — kazdy wariant payloadu wystawia camelCase
+// properties z pol DTO (kompatybilne z reszta web protocol glue).
+fn role_catalog_payload_to_js(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::RoleCatalogPayload,
+) {
+    use tentaflow_protocol::RoleCatalogPayload as P;
+    match payload {
+        P::ListRequest(filter) => {
+            set(obj, "variant", "RoleCatalogListRequest".into());
+            if let Some(k) = filter.kind {
+                set(obj, "kind", k.into());
+            }
+            if let Some(active) = filter.is_active {
+                set(obj, "isActive", active.into());
+            }
+            if let Some(s) = filter.search {
+                set(obj, "search", s.into());
+            }
+            if let Some(l) = filter.limit {
+                set(obj, "limit", l.into());
+            }
+            if let Some(o) = filter.offset {
+                set(obj, "offset", o.into());
+            }
+        }
+        P::ListResponse { roles } => {
+            set(obj, "variant", "RoleCatalogListResponse".into());
+            let arr = js_sys::Array::new();
+            for r in roles {
+                arr.push(&role_catalog_summary_to_js(r).into());
+            }
+            set(obj, "roles", arr.into());
+        }
+        P::GetRequest { id } => {
+            set(obj, "variant", "RoleCatalogGetRequest".into());
+            set(obj, "id", id.into());
+        }
+        P::GetBySlugRequest { slug } => {
+            set(obj, "variant", "RoleCatalogGetBySlugRequest".into());
+            set(obj, "slug", slug.into());
+        }
+        P::GetResponse { role } => {
+            set(obj, "variant", "RoleCatalogGetResponse".into());
+            if let Some(r) = role {
+                set(obj, "role", role_catalog_detail_to_js(r).into());
+            }
+        }
+        P::ListLocalesRequest => {
+            set(obj, "variant", "RoleCatalogListLocalesRequest".into());
+        }
+        P::ListLocalesResponse { locales } => {
+            set(obj, "variant", "RoleCatalogListLocalesResponse".into());
+            let arr = js_sys::Array::new();
+            for loc in locales {
+                let item = js_sys::Object::new();
+                set(&item, "code", loc.code.into());
+                set(&item, "displayName", loc.display_name.into());
+                set(&item, "isDefault", loc.is_default.into());
+                arr.push(&item.into());
+            }
+            set(obj, "locales", arr.into());
+        }
+        P::CreateRequest(req) => {
+            set(obj, "variant", "RoleCatalogCreateRequest".into());
+            set(obj, "slug", req.slug.into());
+            set(obj, "kind", req.kind.into());
+            set(
+                obj,
+                "nameTranslations",
+                translations_vec_to_js(&req.name_translations).into(),
+            );
+            set(
+                obj,
+                "descriptionTranslations",
+                translations_vec_to_js(&req.description_translations).into(),
+            );
+            if let Some(i) = req.icon {
+                set(obj, "icon", i.into());
+            }
+            if let Some(c) = req.color_hint {
+                set(obj, "colorHint", c.into());
+            }
+            set(obj, "isManager", req.is_manager.into());
+            set(
+                obj,
+                "defaultVisibilityScope",
+                req.default_visibility_scope.into(),
+            );
+        }
+        P::CreateResponse(detail) => {
+            set(obj, "variant", "RoleCatalogCreateResponse".into());
+            set(obj, "role", role_catalog_detail_to_js(detail).into());
+        }
+        P::UpdateRequest(req) => {
+            set(obj, "variant", "RoleCatalogUpdateRequest".into());
+            set(obj, "id", req.id.into());
+            if let Some(k) = req.kind {
+                set(obj, "kind", k.into());
+            }
+            if let Some(nt) = req.name_translations {
+                set(obj, "nameTranslations", translations_vec_to_js(&nt).into());
+            }
+            if let Some(dt) = req.description_translations {
+                set(
+                    obj,
+                    "descriptionTranslations",
+                    translations_vec_to_js(&dt).into(),
+                );
+            }
+            // icon/color_hint: Option<Option<String>> — Some(None) = JS null clear,
+            // Some(Some) = string. None = pole pomijane (brak modyfikacji).
+            if let Some(icon_opt) = req.icon {
+                match icon_opt {
+                    Some(v) => set(obj, "icon", v.into()),
+                    None => set(obj, "icon", JsValue::NULL),
+                }
+            }
+            if let Some(color_opt) = req.color_hint {
+                match color_opt {
+                    Some(v) => set(obj, "colorHint", v.into()),
+                    None => set(obj, "colorHint", JsValue::NULL),
+                }
+            }
+            if let Some(m) = req.is_manager {
+                set(obj, "isManager", m.into());
+            }
+            if let Some(s) = req.default_visibility_scope {
+                set(obj, "defaultVisibilityScope", s.into());
+            }
+        }
+        P::UpdateResponse(detail) => {
+            set(obj, "variant", "RoleCatalogUpdateResponse".into());
+            set(obj, "role", role_catalog_detail_to_js(detail).into());
+        }
+        P::DeactivateRequest { id } => {
+            set(obj, "variant", "RoleCatalogDeactivateRequest".into());
+            set(obj, "id", id.into());
+        }
+        P::DeactivateResponse { deactivated } => {
+            set(obj, "variant", "RoleCatalogDeactivateResponse".into());
+            set(obj, "deactivated", deactivated.into());
+        }
+    }
+}
+
+fn translations_vec_to_js(translations: &[(String, String)]) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for (code, value) in translations {
+        let pair = js_sys::Array::new();
+        pair.push(&JsValue::from_str(code));
+        pair.push(&JsValue::from_str(value));
+        arr.push(&pair.into());
+    }
+    arr
+}
+
+fn role_catalog_summary_to_js(s: tentaflow_protocol::RoleCatalogSummary) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "id", s.id.into());
+    set(&o, "slug", s.slug.into());
+    set(&o, "kind", s.kind.into());
+    set(
+        &o,
+        "nameTranslations",
+        translations_vec_to_js(&s.name_translations).into(),
+    );
+    if let Some(i) = s.icon {
+        set(&o, "icon", i.into());
+    }
+    if let Some(c) = s.color_hint {
+        set(&o, "colorHint", c.into());
+    }
+    set(&o, "isManager", s.is_manager.into());
+    set(
+        &o,
+        "defaultVisibilityScope",
+        s.default_visibility_scope.into(),
+    );
+    set(&o, "isActive", s.is_active.into());
+    o
+}
+
+fn role_catalog_detail_to_js(d: tentaflow_protocol::RoleCatalogDetail) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "id", d.id.into());
+    set(&o, "orgId", d.org_id.into());
+    set(&o, "slug", d.slug.into());
+    set(&o, "kind", d.kind.into());
+    set(
+        &o,
+        "nameTranslations",
+        translations_vec_to_js(&d.name_translations).into(),
+    );
+    set(
+        &o,
+        "descriptionTranslations",
+        translations_vec_to_js(&d.description_translations).into(),
+    );
+    if let Some(i) = d.icon {
+        set(&o, "icon", i.into());
+    }
+    if let Some(c) = d.color_hint {
+        set(&o, "colorHint", c.into());
+    }
+    set(&o, "isManager", d.is_manager.into());
+    set(
+        &o,
+        "defaultVisibilityScope",
+        d.default_visibility_scope.into(),
+    );
+    set(&o, "isActive", d.is_active.into());
+    set(&o, "createdAt", d.created_at.into());
+    set(&o, "updatedAt", d.updated_at.into());
+    if let Some(by) = d.created_by {
+        set(&o, "createdBy", by.into());
+    }
+    o
 }
 
 fn user_info_to_js(u: &tentaflow_protocol::UserInfo) -> js_sys::Object {
@@ -6905,33 +7252,6 @@ pub fn encode_addon_applications_list_request() -> Result<Vec<u8>, JsError> {
     encode_addon_ui(AddonUiPayload::ReqApplicationsList)
 }
 
-/// MessageBody::AddonUiBody(ReqPanelGet) — pobierz ostatnio wyrenderowane
-/// drzewo UI panelu addonu. Tree_json = JSON `UiComponent`; frontend renderuje
-/// przez tf-* komponenty.
-#[wasm_bindgen(js_name = encodeAddonUiPanelGetRequest)]
-pub fn encode_addon_ui_panel_get_request(
-    addon_id: String,
-    panel_id: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_addon_ui(AddonUiPayload::ReqPanelGet { addon_id, panel_id })
-}
-
-/// MessageBody::AddonUiBody(ReqAction) — button click / form submit z UI
-/// panelu. Host woła addon on_request z tool_name = "ui.{panel_id}.{action_id}".
-#[wasm_bindgen(js_name = encodeAddonUiActionRequest)]
-pub fn encode_addon_ui_action_request(
-    addon_id: String,
-    panel_id: String,
-    action_id: String,
-    params_json: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_addon_ui(AddonUiPayload::ReqAction {
-        addon_id,
-        panel_id,
-        action_id,
-        params_json,
-    })
-}
 
 // =============================================================================
 // Network settings encoders (interfejsy hosta + konfiguracja bind/filter).
@@ -8133,9 +8453,252 @@ pub fn encode_stream_subscribe_request(stream_id: String) -> Result<Vec<u8>, JsE
 #[wasm_bindgen(js_name = encodeStreamCloseRequest)]
 pub fn encode_stream_close_request(stream_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::StreamBody(
-        tentaflow_protocol::StreamPayload::CloseRequest(
-            tentaflow_protocol::StreamCloseRequest { stream_id },
-        ),
+        tentaflow_protocol::StreamPayload::CloseRequest(tentaflow_protocol::StreamCloseRequest {
+            stream_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
+// Role catalog (administrowalny katalog rol biznesowych) — `MessageBody::RoleCatalogBody`.
+// Payloady są bogate (Vec krotek, Option<Option<String>>), więc przyjmujemy
+// JSON string z UI i parsujemy do typów DTO przed enkapsulacją w rkyv.
+// =============================================================================
+
+/// MessageBody::RoleCatalogBody(ListRequest) — filter jako JSON object.
+/// Wszystkie pola filter opcjonalne; pusty `{}` zwraca pelna liste.
+#[wasm_bindgen(js_name = encodeRoleCatalogListRequest)]
+pub fn encode_role_catalog_list_request(filter_json: String) -> Result<Vec<u8>, JsError> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(&filter_json)
+        .map_err(|e| JsError::new(&format!("invalid filter JSON: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| JsError::new("filter must be JSON object"))?;
+    let filter = tentaflow_protocol::RoleCatalogListFilter {
+        kind: obj.get("kind").and_then(|x| x.as_str()).map(String::from),
+        is_active: obj.get("is_active").and_then(|x| x.as_bool()),
+        search: obj.get("search").and_then(|x| x.as_str()).map(String::from),
+        limit: obj.get("limit").and_then(|x| x.as_u64()).map(|n| n as u32),
+        offset: obj.get("offset").and_then(|x| x.as_u64()).map(|n| n as u32),
+    };
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::ListRequest(filter),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RoleCatalogBody(GetRequest { id }).
+#[wasm_bindgen(js_name = encodeRoleCatalogGetRequest)]
+pub fn encode_role_catalog_get_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::GetRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RoleCatalogBody(GetBySlugRequest { slug }).
+#[wasm_bindgen(js_name = encodeRoleCatalogGetBySlugRequest)]
+pub fn encode_role_catalog_get_by_slug_request(slug: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::GetBySlugRequest { slug },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RoleCatalogBody(ListLocalesRequest) — unit variant.
+#[wasm_bindgen(js_name = encodeRoleCatalogListLocalesRequest)]
+pub fn encode_role_catalog_list_locales_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::ListLocalesRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RoleCatalogBody(CreateRequest) — payload jako JSON object
+/// odpowiadajacy `RoleCatalogCreateRequest`. Translations sa parami
+/// `[code, value]`; brak ikony / color_hint w obiekcie = None.
+#[wasm_bindgen(js_name = encodeRoleCatalogCreateRequest)]
+pub fn encode_role_catalog_create_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("invalid create payload JSON: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| JsError::new("create payload must be JSON object"))?;
+
+    let slug = obj
+        .get("slug")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| JsError::new("missing 'slug'"))?
+        .to_string();
+    let kind = obj
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| JsError::new("missing 'kind'"))?
+        .to_string();
+
+    let parse_pairs = |key: &str| -> Result<Vec<(String, String)>, JsError> {
+        let arr = obj
+            .get(key)
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| JsError::new(&format!("missing or invalid '{key}'")))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let pair = item
+                .as_array()
+                .ok_or_else(|| JsError::new(&format!("{key} item must be [code,value]")))?;
+            if pair.len() != 2 {
+                return Err(JsError::new(&format!("{key} item must be [code,value]")));
+            }
+            let code = pair[0]
+                .as_str()
+                .ok_or_else(|| JsError::new(&format!("{key} code must be string")))?
+                .to_string();
+            let value = pair[1]
+                .as_str()
+                .ok_or_else(|| JsError::new(&format!("{key} value must be string")))?
+                .to_string();
+            out.push((code, value));
+        }
+        Ok(out)
+    };
+    let name_translations = parse_pairs("name_translations")?;
+    let description_translations = parse_pairs("description_translations")?;
+
+    let opt_str = |key: &str| -> Option<String> {
+        match obj.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    let icon = opt_str("icon");
+    let color_hint = opt_str("color_hint");
+
+    let is_manager = obj
+        .get("is_manager")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let default_visibility_scope = obj
+        .get("default_visibility_scope")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| JsError::new("missing 'default_visibility_scope'"))?
+        .to_string();
+
+    let req = tentaflow_protocol::RoleCatalogCreateRequest {
+        slug,
+        kind,
+        name_translations,
+        description_translations,
+        icon,
+        color_hint,
+        is_manager,
+        default_visibility_scope,
+    };
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::CreateRequest(req),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RoleCatalogBody(UpdateRequest) — patch update.
+/// `Option<Option<String>>` w JSON: brak pola = nie ruszaj, `null` = wyzeruj,
+/// string = ustaw. Vec<(String, String)> jako lista par `[["pl","..."], ...]`.
+/// Serde nie potrafi rozroznic "missing" od "null" dla `Option<Option<T>>`,
+/// wiec parsujemy ręcznie z `serde_json::Value`.
+#[wasm_bindgen(js_name = encodeRoleCatalogUpdateRequest)]
+pub fn encode_role_catalog_update_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("invalid update payload JSON: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| JsError::new("update payload must be JSON object"))?;
+
+    let id = obj
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| JsError::new("missing 'id' in update payload"))?
+        .to_string();
+
+    let kind = obj
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    let parse_pairs = |key: &str| -> Result<Option<Vec<(String, String)>>, JsError> {
+        let Some(arr) = obj.get(key) else {
+            return Ok(None);
+        };
+        let Some(arr) = arr.as_array() else {
+            return Err(JsError::new(&format!("{key} must be array")));
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let pair = item
+                .as_array()
+                .ok_or_else(|| JsError::new(&format!("{key} item must be [code,value]")))?;
+            if pair.len() != 2 {
+                return Err(JsError::new(&format!("{key} item must be [code,value]")));
+            }
+            let code = pair[0]
+                .as_str()
+                .ok_or_else(|| JsError::new(&format!("{key} item code must be string")))?
+                .to_string();
+            let value = pair[1]
+                .as_str()
+                .ok_or_else(|| JsError::new(&format!("{key} item value must be string")))?
+                .to_string();
+            out.push((code, value));
+        }
+        Ok(Some(out))
+    };
+    let name_translations = parse_pairs("name_translations")?;
+    let description_translations = parse_pairs("description_translations")?;
+
+    // Option<Option<String>>: obj.get == None -> None (brak pola = nie ruszaj),
+    // obj.get == Some(Null) -> Some(None) (clear), obj.get == Some(String) -> Some(Some).
+    let parse_double_opt = |key: &str| -> Result<Option<Option<String>>, JsError> {
+        match obj.get(key) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(Value::String(s)) => Ok(Some(Some(s.clone()))),
+            Some(_) => Err(JsError::new(&format!(
+                "{key} must be string or null when present"
+            ))),
+        }
+    };
+    let icon = parse_double_opt("icon")?;
+    let color_hint = parse_double_opt("color_hint")?;
+
+    let is_manager = obj.get("is_manager").and_then(|x| x.as_bool());
+    let default_visibility_scope = obj
+        .get("default_visibility_scope")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    let req = tentaflow_protocol::RoleCatalogUpdateRequest {
+        id,
+        kind,
+        name_translations,
+        description_translations,
+        icon,
+        color_hint,
+        is_manager,
+        default_visibility_scope,
+    };
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::UpdateRequest(req),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RoleCatalogBody(DeactivateRequest { id }).
+#[wasm_bindgen(js_name = encodeRoleCatalogDeactivateRequest)]
+pub fn encode_role_catalog_deactivate_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::RoleCatalogBody(
+        tentaflow_protocol::RoleCatalogPayload::DeactivateRequest { id },
     ))
     .map_err(|e| JsError::new(&e))
 }

@@ -859,6 +859,72 @@ pub enum SchedulerPayload {
 }
 
 // =============================================================================
+// Sync conflict manager — admin-only conflict review and resolution.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncConflictResolution {
+    KeepLocal,
+    Ignore,
+    AcceptRemote,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictRow {
+    pub operation_id: String,
+    pub org_id: String,
+    pub addon_id: String,
+    pub table_name: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub action: String,
+    pub source_node_id: String,
+    pub error_kind: String,
+    pub error_message: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub resolved_at_ms: Option<i64>,
+    pub resolution: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictsListRequest {
+    pub org_id: String,
+    pub addon_id: String,
+    pub status: String,
+    pub limit: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictsListResponse {
+    pub conflicts: Vec<SyncConflictRow>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictResolveRequest {
+    pub org_id: String,
+    pub addon_id: String,
+    pub operation_id: String,
+    pub resolution: SyncConflictResolution,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictResolveResponse {
+    pub operation_id: String,
+    pub status: String,
+    pub resolution: String,
+    pub rows_affected: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncConflictPayload {
+    ListRequest(SyncConflictsListRequest),
+    ListResponse(SyncConflictsListResponse),
+    ResolveRequest(SyncConflictResolveRequest),
+    ResolveResponse(SyncConflictResolveResponse),
+}
+
+// =============================================================================
 // Portainer — Docker container ops (migration-map #248-#259)
 // =============================================================================
 
@@ -879,6 +945,29 @@ pub struct ContainerLogChunk {
     pub stream: String, // "stdout" | "stderr"
     pub line: String,
     pub ts_epoch: u64,
+}
+
+/// Wszystkie operacje Portainer/Docker spakowane w jeden slot `MessageBody`.
+/// Wzorzec „1 slot per feature" — odciaza globalny limit 256 wariantow rkyv 0.8
+/// i utrzymuje wszystkie req/res/stream-chunk pod jedna dyskryminanta.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ContainerPayload {
+    /// Klient -> serwer: lista kontenerow widzianych przez node.
+    ListRequest,
+    /// Serwer -> klient: odpowiedz z lista podsumowan.
+    ListResponse { containers: Vec<ContainerSummary> },
+    /// Klient -> serwer: start danego kontenera (admin only).
+    StartRequest { container_id: String },
+    /// Serwer -> klient: ack startu (zmiana stanu obserwowana przez ListResponse).
+    StartResponse { started: bool },
+    /// Klient -> serwer: stop danego kontenera (admin only).
+    StopRequest { container_id: String },
+    /// Serwer -> klient: ack stopa.
+    StopResponse { stopped: bool },
+    /// Klient -> serwer: otworz stream logow (R-STREAM); `follow=true` => tail.
+    LogStreamRequest { container_id: String, follow: bool },
+    /// Serwer -> klient: pojedynczy chunk logu (stdout/stderr).
+    LogChunkBody(ContainerLogChunk),
 }
 
 // =============================================================================
@@ -2142,7 +2231,7 @@ pub struct AddonsListResponse {
 pub struct AddonApplicationInfo {
     pub addon_id: String,
     pub title: String,
-    /// Entry panel id — frontend loads it via `AddonUiPayload::ReqPanelGet`.
+    /// Entry panel id shown in the launcher tile.
     pub entry_panel: String,
     /// Icon name from the TentaFlow icon library (mandatory in manifest).
     pub icon: String,
@@ -2155,41 +2244,15 @@ pub struct AddonApplicationInfo {
     pub enabled: bool,
 }
 
-/// Multiplex 6 endpointów Apps menu + UI v2 w jednym slocie `MessageBody`,
-/// zeby zmiescic sie w 256-variant limicie rkyv. Tag jest na poziomie tego
-/// enum'a, nie zewnetrznego `MessageBody`.
+/// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
+/// the 256-variant rkyv limit. Panel get / UI action removed in chunk 4.2 —
+/// addon UI now goes through the CBOR channel (`ui_render_cbor`).
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub enum AddonUiPayload {
     // ---- Apps menu ----
     ReqApplicationsList,
     ResApplicationsList {
         applications: Vec<AddonApplicationInfo>,
-    },
-
-    // ---- UI panel get (read last rendered tree from cache) ----
-    ReqPanelGet {
-        addon_id: String,
-        panel_id: String,
-    },
-    /// `tree_json` empty = brak panelu w cache (addon nie wywolał ui_render).
-    ResPanelGet {
-        addon_id: String,
-        panel_id: String,
-        tree_json: String,
-    },
-
-    // ---- UI action (button click / form submit) ----
-    /// Host woła addon on_request z tool_name = "ui.{panel_id}.{action_id}".
-    /// `params_json` to JSON payload (form values, event metadata).
-    ReqAction {
-        addon_id: String,
-        panel_id: String,
-        action_id: String,
-        params_json: String,
-    },
-    /// `result_json` empty = brak wyniku.
-    ResAction {
-        result_json: String,
     },
 }
 
@@ -3733,28 +3796,13 @@ pub enum MessageBody {
     // ----- Scheduler -----
     SchedulerBody(SchedulerPayload),
 
+    // ----- Sync conflict manager -----
+    SyncConflictBody(SyncConflictPayload),
+
     // ---- Portainer (R-LIST + R-STREAM dla logs) ----
-    ContainerListRequest,
-    ContainerListResponse {
-        containers: Vec<ContainerSummary>,
-    },
-    ContainerStartRequest {
-        container_id: String,
-    },
-    ContainerStartResponse {
-        started: bool,
-    },
-    ContainerStopRequest {
-        container_id: String,
-    },
-    ContainerStopResponse {
-        stopped: bool,
-    },
-    ContainerLogStreamRequest {
-        container_id: String,
-        follow: bool,
-    },
-    ContainerLogChunkBody(ContainerLogChunk),
+    // Wzorzec „1 slot per feature" — wszystkie operacje Container w jednym
+    // wariancie MessageBody. Patrz `ContainerPayload`.
+    ContainerBody(ContainerPayload),
 
     // ---- Voice profiles (R-LIST) ----
     VoiceProfileListRequest,
@@ -4064,6 +4112,10 @@ pub enum MessageBody {
     // analogicznie do CameraAdminBody / ProfilingBody. Powod: rkyv 0.8
     // 256-variant limit + dashboard RODO surface (P8.d).
     LegalAdminBody(crate::legal::LegalAdminPayload),
+
+    // ---- Role catalog (administrowany katalog rol biznesowych, multi-tenant, i18n) ----
+    // Wzorzec „1 slot per feature" — wszystkie req/res w `RoleCatalogPayload`.
+    RoleCatalogBody(crate::types::RoleCatalogPayload),
 
     // ---- Binary stream pub/sub (Chunk B) ----
     // Subscribe/Frame/Close/Closed for the live streaming surface, packed
@@ -4386,6 +4438,44 @@ mod tests {
     }
 
     #[test]
+    fn sync_conflicts_list_round_trip() {
+        let body = MessageBody::SyncConflictBody(SyncConflictPayload::ListResponse(
+            SyncConflictsListResponse {
+                conflicts: vec![SyncConflictRow {
+                    operation_id: "aa".repeat(32),
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    table_name: "companies".to_string(),
+                    resource_type: "company".to_string(),
+                    resource_id: "1".to_string(),
+                    action: "insert".to_string(),
+                    source_node_id: "node-b".to_string(),
+                    error_kind: "sql_constraint".to_string(),
+                    error_message: "constraint failed".to_string(),
+                    status: "open".to_string(),
+                    created_at_ms: 123,
+                    resolved_at_ms: None,
+                    resolution: None,
+                }],
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn sync_conflict_resolve_round_trip() {
+        let body = MessageBody::SyncConflictBody(SyncConflictPayload::ResolveRequest(
+            SyncConflictResolveRequest {
+                org_id: "org-default".to_string(),
+                addon_id: "contacts".to_string(),
+                operation_id: "bb".repeat(32),
+                resolution: SyncConflictResolution::AcceptRemote,
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
     fn mesh_trust_revoked_round_trip() {
         let evt = MessageBody::MeshTrustEventBody(MeshTrustEventPayload::Revoked(
             MeshTrustRevokedEvent {
@@ -4464,6 +4554,261 @@ mod tests {
         });
         // DashboardSnapshot has f32 → MessageBody is PartialEq only.
         assert_eq!(round_trip(resp.clone()), resp);
+    }
+
+    // -------------------------------------------------------------------------
+    // RoleCatalogBody — round-trip dla wszystkich wariantow RoleCatalogPayload.
+    // -------------------------------------------------------------------------
+
+    fn sample_role_summary() -> crate::types::RoleCatalogSummary {
+        crate::types::RoleCatalogSummary {
+            id: "role-1".to_string(),
+            slug: "sales-rep".to_string(),
+            kind: "sales".to_string(),
+            name_translations: vec![
+                ("pl".to_string(), "Handlowiec".to_string()),
+                ("en".to_string(), "Sales rep".to_string()),
+            ],
+            icon: Some("sales".to_string()),
+            color_hint: Some("#0ea5e9".to_string()),
+            is_manager: false,
+            default_visibility_scope: "assigned".to_string(),
+            is_active: true,
+        }
+    }
+
+    fn sample_role_detail() -> crate::types::RoleCatalogDetail {
+        crate::types::RoleCatalogDetail {
+            id: "role-1".to_string(),
+            org_id: "org-x".to_string(),
+            slug: "sales-rep".to_string(),
+            kind: "sales".to_string(),
+            name_translations: vec![
+                ("pl".to_string(), "Handlowiec".to_string()),
+                ("en".to_string(), "Sales rep".to_string()),
+            ],
+            description_translations: vec![("pl".to_string(), "Opis".to_string())],
+            icon: Some("sales".to_string()),
+            color_hint: Some("#0ea5e9".to_string()),
+            is_manager: false,
+            default_visibility_scope: "assigned".to_string(),
+            is_active: true,
+            created_at: "2026-05-19T10:00:00Z".to_string(),
+            updated_at: "2026-05-19T10:00:00Z".to_string(),
+            created_by: Some("user-42".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_role_catalog_list_request_roundtrip() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListRequest(
+            crate::types::RoleCatalogListFilter {
+                kind: Some("sales".to_string()),
+                is_active: Some(true),
+                search: Some("handl".to_string()),
+                limit: Some(50),
+                offset: Some(0),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_list_response_roundtrip() {
+        let role_a = sample_role_summary();
+        let mut role_b = sample_role_summary();
+        role_b.id = "role-2".to_string();
+        role_b.slug = "team-lead".to_string();
+        role_b.kind = "management".to_string();
+        role_b.is_manager = true;
+        role_b.default_visibility_scope = "section".to_string();
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListResponse {
+            roles: vec![role_a, role_b],
+        });
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_get_request_by_id_and_by_slug() {
+        let by_id = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetRequest {
+            id: "role-1".to_string(),
+        });
+        assert_eq!(round_trip(by_id.clone()), by_id);
+
+        let by_slug =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetBySlugRequest {
+                slug: "sales-rep".to_string(),
+            });
+        assert_eq!(round_trip(by_slug.clone()), by_slug);
+    }
+
+    #[test]
+    fn test_role_catalog_get_response_some_and_none() {
+        let some = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetResponse {
+            role: Some(sample_role_detail()),
+        });
+        assert_eq!(round_trip(some.clone()), some);
+
+        let none = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetResponse {
+            role: None,
+        });
+        assert_eq!(round_trip(none.clone()), none);
+    }
+
+    #[test]
+    fn test_role_catalog_list_locales_request_response() {
+        let req =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListLocalesRequest);
+        assert_eq!(round_trip(req.clone()), req);
+
+        let res =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListLocalesResponse {
+                locales: vec![
+                    crate::types::PlatformLocaleSummary {
+                        code: "pl".to_string(),
+                        display_name: "Polski".to_string(),
+                        is_default: true,
+                    },
+                    crate::types::PlatformLocaleSummary {
+                        code: "en".to_string(),
+                        display_name: "English".to_string(),
+                        is_default: false,
+                    },
+                ],
+            });
+        assert_eq!(round_trip(res.clone()), res);
+    }
+
+    #[test]
+    fn test_role_catalog_create_request_full_fields() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateRequest(
+            crate::types::RoleCatalogCreateRequest {
+                slug: "sales-rep".to_string(),
+                kind: "sales".to_string(),
+                name_translations: vec![
+                    ("pl".to_string(), "Handlowiec".to_string()),
+                    ("en".to_string(), "Sales rep".to_string()),
+                ],
+                description_translations: vec![("pl".to_string(), "Opis".to_string())],
+                icon: Some("sales".to_string()),
+                color_hint: Some("#0ea5e9".to_string()),
+                is_manager: false,
+                default_visibility_scope: "assigned".to_string(),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_create_response() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateResponse(
+            sample_role_detail(),
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_update_request_only_kind() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
+            crate::types::RoleCatalogUpdateRequest {
+                id: "role-1".to_string(),
+                kind: Some("technical".to_string()),
+                name_translations: None,
+                description_translations: None,
+                icon: None,
+                color_hint: None,
+                is_manager: None,
+                default_visibility_scope: None,
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_update_icon_set_to_null() {
+        // Some(None) = wyzeruj (SET NULL). Sprawdza ze nested Option przechodzi
+        // przez rkyv round-trip bez zmiany na None/None.
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
+            crate::types::RoleCatalogUpdateRequest {
+                id: "role-1".to_string(),
+                icon: Some(None),
+                ..Default::default()
+            },
+        ));
+        let decoded = round_trip(body.clone());
+        assert_eq!(decoded, body);
+        match decoded {
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(req)) => {
+                assert_eq!(req.icon, Some(None));
+            }
+            _ => panic!("expected RoleCatalogBody::UpdateRequest"),
+        }
+    }
+
+    #[test]
+    fn test_role_catalog_update_icon_unchanged() {
+        // None = nie ruszaj pola.
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
+            crate::types::RoleCatalogUpdateRequest {
+                id: "role-1".to_string(),
+                icon: None,
+                ..Default::default()
+            },
+        ));
+        let decoded = round_trip(body.clone());
+        assert_eq!(decoded, body);
+        match decoded {
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(req)) => {
+                assert_eq!(req.icon, None);
+            }
+            _ => panic!("expected RoleCatalogBody::UpdateRequest"),
+        }
+    }
+
+    #[test]
+    fn test_role_catalog_deactivate_request_response() {
+        let req =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::DeactivateRequest {
+                id: "role-1".to_string(),
+            });
+        assert_eq!(round_trip(req.clone()), req);
+
+        let res =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::DeactivateResponse {
+                deactivated: true,
+            });
+        assert_eq!(round_trip(res.clone()), res);
+    }
+
+    #[test]
+    fn test_role_catalog_translations_vec_ordering_preserved() {
+        // Kolejnosc par w Vec<(String, String)> musi byc stabilna po round-trip
+        // — zalezy od tego deterministyczne porownywanie po stronie repo i UI.
+        let translations = vec![
+            ("pl".to_string(), "A".to_string()),
+            ("en".to_string(), "B".to_string()),
+            ("de".to_string(), "C".to_string()),
+            ("fr".to_string(), "D".to_string()),
+        ];
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateRequest(
+            crate::types::RoleCatalogCreateRequest {
+                slug: "x".to_string(),
+                kind: "other".to_string(),
+                name_translations: translations.clone(),
+                description_translations: vec![],
+                icon: None,
+                color_hint: None,
+                is_manager: false,
+                default_visibility_scope: "own".to_string(),
+            },
+        ));
+        let decoded = round_trip(body.clone());
+        match decoded {
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateRequest(req)) => {
+                assert_eq!(req.name_translations, translations);
+            }
+            _ => panic!("expected RoleCatalogBody::CreateRequest"),
+        }
     }
 
     #[test]
