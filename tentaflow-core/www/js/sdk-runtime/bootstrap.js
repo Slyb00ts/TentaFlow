@@ -48,6 +48,7 @@ import { registerDataDiffDlJsonRenderers } from './data-diff-dl-json-renderer.js
 import { registerDataSpecialisedRenderers } from './data-specialised-renderer.js';
 import { registerDataMarkdownRenderer } from './data-markdown-renderer.js';
 import { registerFeedbackInlineRenderers } from './feedback-inline-renderer.js';
+import { registerFeedbackLoadingRenderers } from './feedback-loading-renderer.js';
 
 /// Rejestruje wszystkie aktualne renderery komponentów. Wywoływany przez
 /// shell panelu w bootstrap'ie. Idempotentne — kolejne wywołania pomijają
@@ -91,8 +92,10 @@ export function bootstrapSdkRuntime() {
   registerDataSpecialisedRenderers();
   registerDataMarkdownRenderer();
   registerFeedbackInlineRenderers();
+  registerFeedbackLoadingRenderers();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
   // 3.3d Data Display: KOMPLETNE (38/38). 3.3e Feedback Inline: KOMPLETNE (6/6).
+  // 3.3e Feedback Loading: KOMPLETNE (3/3).
   // EmptyState (§2 0x0003) tymczasowo w data-list-renderer.
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
