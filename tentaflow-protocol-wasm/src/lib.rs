@@ -5290,6 +5290,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::RoleCatalogBody(payload) => {
             role_catalog_payload_to_js(&obj, payload);
         }
+        MessageBody::UiChannelCbor(bytes) => {
+            set(&obj, "variant", "UiChannelCbor".into());
+            set(
+                &obj,
+                "cbor",
+                js_sys::Uint8Array::from(&bytes[..]).into(),
+            );
+        }
     }
     Ok(obj.into())
 }
@@ -8701,4 +8709,17 @@ pub fn encode_role_catalog_deactivate_request(id: String) -> Result<Vec<u8>, JsE
         tentaflow_protocol::RoleCatalogPayload::DeactivateRequest { id },
     ))
     .map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
+// UI Channel CBOR (Faza 6 Krok 4) — `MessageBody::UiChannelCbor(Vec<u8>)`.
+// The CBOR bytes are opaque to the rkyv layer; the browser JS codec encodes
+// the UiPayload as CBOR itself and wraps it in this variant for transport.
+// =============================================================================
+
+/// Wraps raw CBOR bytes in `MessageBody::UiChannelCbor` for binary WS transport.
+#[wasm_bindgen(js_name = encodeUiChannelCbor)]
+pub fn encode_ui_channel_cbor(cbor_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::UiChannelCbor(cbor_bytes.to_vec()))
+        .map_err(|e| JsError::new(&e))
 }

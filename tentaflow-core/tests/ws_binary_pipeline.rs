@@ -41,6 +41,7 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
     let ctx = HandlerContext {
         session,
         correlation_id: env.correlation_id,
+        connection_id: 0,
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
         org_context: None,
