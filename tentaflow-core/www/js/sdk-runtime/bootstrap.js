@@ -54,6 +54,7 @@ import { registerMoleculePageRenderers } from './molecule-page-renderer.js';
 import { registerMoleculeShellRenderers } from './molecule-shell-renderer.js';
 import { registerSpecializedMediaRenderers } from './specialized-media-renderer.js';
 import { registerSpecializedContentRenderers } from './specialized-content-renderer.js';
+export { SlotManager } from './slot-manager.js';
 
 /// Registers all current component renderers. Called by the panel shell
 /// at bootstrap. Idempotent — subsequent calls skip already-registered tags.
