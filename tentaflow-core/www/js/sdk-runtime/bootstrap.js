@@ -52,6 +52,8 @@ import { registerFeedbackLoadingRenderers } from './feedback-loading-renderer.js
 import { registerFeedbackOverlayRenderers } from './feedback-overlay-renderer.js';
 import { registerMoleculePageRenderers } from './molecule-page-renderer.js';
 import { registerMoleculeShellRenderers } from './molecule-shell-renderer.js';
+import { registerSpecializedMediaRenderers } from './specialized-media-renderer.js';
+import { registerSpecializedContentRenderers } from './specialized-content-renderer.js';
 
 /// Registers all current component renderers. Called by the panel shell
 /// at bootstrap. Idempotent — subsequent calls skip already-registered tags.
@@ -98,8 +100,10 @@ export function bootstrapSdkRuntime() {
   registerFeedbackOverlayRenderers();
   registerMoleculeShellRenderers();
   registerMoleculePageRenderers();
+  registerSpecializedMediaRenderers();
+  registerSpecializedContentRenderers();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
   // 3.3d Data Display: KOMPLETNE (38/38). 3.3e Feedback: KOMPLETNE (14/14).
-  // 3.3f Molecules: KOMPLETNE (12/12).
+  // 3.3f Molecules: KOMPLETNE (12/12). 3.3g Specialized: KOMPLETNE (14/14).
   // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
 }
