@@ -1,6 +1,6 @@
 // =============================================================================
-// Plik: sdk-runtime/data-list-renderer.test.js
-// Opis: Testy List (0x0212) + EmptyState (0x0003 tymczasowo) — chunk 3.3d-5.
+// File: sdk-runtime/data-list-renderer.test.js
+// Description: Tests for List (0x0212) — chunk 3.3d-5.
 // =============================================================================
 
 import './_dom-test-harness.js';
@@ -10,9 +10,8 @@ import {
   _clearComponentRendererRegistry,
 } from './component-renderer.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
-import {
-  LIST_TAG, EMPTY_STATE_COMPONENT_TAG,
-} from './data-list-renderer.js';
+import { LIST_TAG } from './data-list-renderer.js';
+import { EMPTY_STATE_TAG as EMPTY_STATE_COMPONENT_TAG } from './molecule-shell-renderer.js';
 
 const results = [];
 function test(name, fn) {
