@@ -17,6 +17,10 @@ wasm-bindgen = "=0.2.120"
 js-sys = "0.3.97"
 web-sys = { version = "0.3", features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
 
+# SDK spec types for UI channel CBOR encode/decode
+tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
+minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+
 # rkyv (same pinned version jak w tentaflow-protocol)
 rkyv = { version = "0.8.16", features = ["unaligned"] }
 

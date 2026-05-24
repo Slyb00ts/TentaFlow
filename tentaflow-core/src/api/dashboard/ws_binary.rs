@@ -223,6 +223,35 @@ pub async fn handle_ws_connection<S>(
         });
     }
 
+    // Spawnuj task pushujacy UI CBOR messages (addon→frontend) jako unsolicited
+    // UiChannelCbor frames. Filtr: source_user musi odpowiadac user_id polaczenia.
+    if let Some(uid) = user_id {
+        let sink_ui = Arc::clone(&sink);
+        let seq_ui = Arc::clone(&next_server_sequence);
+        let mut ui_rx = crate::dispatch::ui_cbor_broadcast::subscribe();
+        tokio::spawn(async move {
+            loop {
+                let push = match ui_rx.recv().await {
+                    Ok(p) => p,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if push.user_id != uid {
+                    continue;
+                }
+                let _ = send_body(
+                    &sink_ui,
+                    0,
+                    next_seq(&seq_ui),
+                    tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+                    &Mb::UiChannelCbor(push.cbor),
+                    EnvelopeFlags::empty(),
+                )
+                .await;
+            }
+        });
+    }
+
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,
