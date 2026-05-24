@@ -94,13 +94,8 @@ pub fn ui_channel_dispatch(
     match payload {
         UiPayload::PanelOpen(panel_open) => handle_panel_open(ctx, panel_open),
         UiPayload::PanelClose(panel_close) => handle_panel_close(ctx, panel_close),
-        UiPayload::PanelReady(_) | UiPayload::Action(_) => Err(ProtocolError::new(
-            ProtocolErrorCode::NotImplemented,
-            format!(
-                "tag 0x{:04X} is not yet implemented in ui_channel_dispatch",
-                tag.as_u16()
-            ),
-        )),
+        UiPayload::PanelReady(panel_ready) => handle_panel_ready(ctx, panel_ready),
+        UiPayload::Action(action) => handle_action(ctx, action),
         _ => unreachable!(),
     }
 }
@@ -190,6 +185,143 @@ fn handle_panel_close(
 
     // Echo the PanelClose back as acknowledgment.
     let response = UiPayload::PanelClose(panel_close);
+    encode_response(&response)
+}
+
+/// PanelReady: validate epoch, log first_paint_ms metric, acknowledge.
+fn handle_panel_ready(
+    ctx: &HandlerContext,
+    panel_ready: tentaflow_sdk_spec::protocol::ui::panel::PanelReady,
+) -> Result<MessageBody, ProtocolError> {
+    let session_lock = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+    let session = session_lock.lock();
+
+    let ownership = session
+        .get_panel(&panel_ready.addon_id, &panel_ready.panel_id)
+        .ok_or_else(|| {
+            ProtocolError::bad_request(format!(
+                "panel not open: addon={} panel={}",
+                panel_ready.addon_id, panel_ready.panel_id
+            ))
+        })?;
+
+    if ownership.panel_epoch != panel_ready.panel_epoch {
+        return Err(ProtocolError::bad_request(format!(
+            "epoch mismatch: expected {}, got {}",
+            ownership.panel_epoch, panel_ready.panel_epoch
+        )));
+    }
+
+    drop(session);
+
+    tracing::info!(
+        addon = %panel_ready.addon_id,
+        panel = %panel_ready.panel_id,
+        first_paint_ms = panel_ready.first_paint_ms,
+        "PanelReady received"
+    );
+
+    let response = UiPayload::PanelReady(panel_ready);
+    encode_response(&response)
+}
+
+/// Converts a `tentaflow_sdk_spec::Value` to `serde_json::Value`.
+fn spec_value_to_json(v: &tentaflow_sdk_spec::protocol::value::Value) -> serde_json::Value {
+    use tentaflow_sdk_spec::protocol::value::Value as SV;
+    match v {
+        SV::Null => serde_json::Value::Null,
+        SV::Bool(b) => serde_json::Value::Bool(*b),
+        SV::U64(n) => serde_json::json!(*n),
+        SV::I64(n) => serde_json::json!(*n),
+        SV::F64(f) => serde_json::json!(*f),
+        SV::Text(s) => serde_json::Value::String(s.clone()),
+        SV::Bytes(b) => serde_json::json!(b),
+        SV::Array(items) => {
+            serde_json::Value::Array(items.iter().map(spec_value_to_json).collect())
+        }
+        SV::Map(entries) => {
+            let mut m = serde_json::Map::new();
+            for (k, v) in entries {
+                // JSON keys must be strings; use text representation of key.
+                let key = match k {
+                    SV::Text(s) => s.clone(),
+                    other => format!("{other:?}"),
+                };
+                m.insert(key, spec_value_to_json(v));
+            }
+            serde_json::Value::Object(m)
+        }
+    }
+}
+
+/// Converts `CborMap` (Vec<(String, Value)>) to `serde_json::Value::Object`.
+fn cbor_map_to_json(map: &tentaflow_sdk_spec::protocol::control::CborMap) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in &map.0 {
+        m.insert(k.clone(), spec_value_to_json(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Action: validate session, delegate to addon, return ActionAck.
+fn handle_action(
+    ctx: &HandlerContext,
+    action: tentaflow_sdk_spec::protocol::ui::action::Action,
+) -> Result<MessageBody, ProtocolError> {
+    let session_lock = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+    {
+        let session = session_lock.lock();
+
+        let ownership = session
+            .get_panel(&action.addon_id, &action.panel_id)
+            .ok_or_else(|| {
+                ProtocolError::bad_request(format!(
+                    "panel not open: addon={} panel={}",
+                    action.addon_id, action.panel_id
+                ))
+            })?;
+
+        if ownership.panel_epoch != action.panel_epoch {
+            return Err(ProtocolError::bad_request(format!(
+                "epoch mismatch: expected {}, got {}",
+                ownership.panel_epoch, action.panel_epoch
+            )));
+        }
+
+        session
+            .validate_action(&action.addon_id, &action.panel_id, &action.action_id)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    }
+    // Session lock dropped before calling addon.
+
+    let addon_mgr = ctx
+        .state
+        .addon_manager
+        .as_ref()
+        .ok_or_else(|| ProtocolError::internal("addon manager not configured"))?;
+
+    let user_id = extract_user_id_i64(ctx).unwrap_or(0);
+    let tool_name = format!("ui.{}.{}", action.panel_id, action.action_id);
+    let params_json = cbor_map_to_json(&action.params);
+
+    let status = match addon_mgr.call_tool(&action.addon_id, &tool_name, params_json, user_id) {
+        Ok(_) => tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok,
+        Err(e) => tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Error {
+            error_code: 0xFFFF,
+            message: e.to_string(),
+        },
+    };
+
+    let ack = tentaflow_sdk_spec::protocol::ui::action::ActionAck {
+        addon_id: action.addon_id,
+        panel_id: action.panel_id,
+        panel_epoch: action.panel_epoch,
+        action_id: action.action_id,
+        client_action_id: action.client_action_id,
+        status,
+    };
+
+    let response = UiPayload::ActionAck(ack);
     encode_response(&response)
 }
 
@@ -358,5 +490,174 @@ mod tests {
         let err = ui_channel_dispatch(&req, &ctx).unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
         assert!(err.message.contains("addon→frontend only"));
+    }
+
+    // =========================================================================
+    // PanelReady tests
+    // =========================================================================
+
+    fn encode_panel_ready(addon_id: &str, panel_id: &str, epoch: u64, first_paint_ms: u32) -> Vec<u8> {
+        use tentaflow_sdk_spec::protocol::ui::panel::PanelReady;
+
+        let payload = UiPayload::PanelReady(PanelReady {
+            addon_id: addon_id.to_owned(),
+            panel_id: panel_id.to_owned(),
+            panel_epoch: epoch,
+            first_paint_ms,
+        });
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        payload.encode(&mut enc, &mut ()).unwrap();
+        buf
+    }
+
+    #[test]
+    fn panel_ready_acknowledged() {
+        let ctx = test_ctx();
+        let open_cbor = encode_panel_open("contacts", "main");
+        let open_req = MessageBody::UiChannelCbor(open_cbor);
+        ui_channel_dispatch(&open_req, &ctx).unwrap();
+
+        let ready_cbor = encode_panel_ready("contacts", "main", 1, 42);
+        let ready_req = MessageBody::UiChannelCbor(ready_cbor);
+        let resp = ui_channel_dispatch(&ready_req, &ctx).unwrap();
+
+        let resp_cbor = match &resp {
+            MessageBody::UiChannelCbor(b) => b,
+            _ => panic!("expected UiChannelCbor response"),
+        };
+
+        let mut dec = minicbor::Decoder::new(resp_cbor);
+        let ui: UiPayload = UiPayload::decode(&mut dec, &mut ()).unwrap();
+        match ui {
+            UiPayload::PanelReady(pr) => {
+                assert_eq!(pr.addon_id, "contacts");
+                assert_eq!(pr.panel_id, "main");
+                assert_eq!(pr.panel_epoch, 1);
+                assert_eq!(pr.first_paint_ms, 42);
+            }
+            _ => panic!("expected PanelReady response"),
+        }
+    }
+
+    #[test]
+    fn panel_ready_rejects_not_open() {
+        let ctx = test_ctx();
+        let ready_cbor = encode_panel_ready("contacts", "main", 1, 10);
+        let ready_req = MessageBody::UiChannelCbor(ready_cbor);
+        let err = ui_channel_dispatch(&ready_req, &ctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn panel_ready_rejects_epoch_mismatch() {
+        let ctx = test_ctx();
+        let open_cbor = encode_panel_open("contacts", "main");
+        ui_channel_dispatch(&MessageBody::UiChannelCbor(open_cbor), &ctx).unwrap();
+
+        let ready_cbor = encode_panel_ready("contacts", "main", 999, 10);
+        let err = ui_channel_dispatch(&MessageBody::UiChannelCbor(ready_cbor), &ctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    // =========================================================================
+    // Action tests
+    // =========================================================================
+
+    fn encode_action(addon_id: &str, panel_id: &str, epoch: u64, action_id: &str) -> Vec<u8> {
+        use tentaflow_sdk_spec::protocol::ui::action::Action;
+        use tentaflow_sdk_spec::protocol::control::CborMap;
+        use tentaflow_sdk_spec::protocol::ids::ClientActionId;
+
+        let payload = UiPayload::Action(Action {
+            addon_id: addon_id.to_owned(),
+            panel_id: panel_id.to_owned(),
+            panel_epoch: epoch,
+            action_id: action_id.to_owned(),
+            params: CborMap(vec![]),
+            form_values: None,
+            user_gesture: true,
+            client_action_id: ClientActionId::from_bytes([1; 16]),
+        });
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        payload.encode(&mut enc, &mut ()).unwrap();
+        buf
+    }
+
+    /// Register a shell with declared actions for a panel that is already open.
+    fn register_shell_with_actions(ctx: &HandlerContext, addon_id: &str, panel_id: &str, epoch: u64, actions: &[&str]) {
+        use std::collections::HashSet;
+        let session_lock = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+        let mut session = session_lock.lock();
+        let acts: HashSet<String> = actions.iter().map(|s| s.to_string()).collect();
+        session
+            .register_shell(
+                addon_id,
+                panel_id,
+                epoch,
+                HashSet::new(),
+                acts,
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn action_dispatches_to_addon() {
+        // Without AddonManager, call_tool path returns "addon manager not
+        // configured". We verify session validation passes and the error comes
+        // from the missing addon manager.
+        let ctx = test_ctx();
+        let open_cbor = encode_panel_open("contacts", "main");
+        ui_channel_dispatch(&MessageBody::UiChannelCbor(open_cbor), &ctx).unwrap();
+
+        register_shell_with_actions(&ctx, "contacts", "main", 1, &["save"]);
+
+        let action_cbor = encode_action("contacts", "main", 1, "save");
+        let err = ui_channel_dispatch(&MessageBody::UiChannelCbor(action_cbor), &ctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::Internal);
+        assert!(err.message.contains("addon manager not configured"));
+    }
+
+    #[test]
+    fn action_rejects_undeclared_action() {
+        let ctx = test_ctx();
+        let open_cbor = encode_panel_open("contacts", "main");
+        ui_channel_dispatch(&MessageBody::UiChannelCbor(open_cbor), &ctx).unwrap();
+
+        register_shell_with_actions(&ctx, "contacts", "main", 1, &["save"]);
+
+        let action_cbor = encode_action("contacts", "main", 1, "delete");
+        let err = ui_channel_dispatch(&MessageBody::UiChannelCbor(action_cbor), &ctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert!(err.message.contains("delete"));
+    }
+
+    #[test]
+    fn action_rejects_panel_not_open() {
+        let ctx = test_ctx();
+        let action_cbor = encode_action("contacts", "main", 1, "save");
+        let err = ui_channel_dispatch(&MessageBody::UiChannelCbor(action_cbor), &ctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert!(err.message.contains("panel not open"));
+    }
+
+    #[test]
+    fn action_rejects_epoch_mismatch() {
+        let ctx = test_ctx();
+        let open_cbor = encode_panel_open("contacts", "main");
+        ui_channel_dispatch(&MessageBody::UiChannelCbor(open_cbor), &ctx).unwrap();
+
+        register_shell_with_actions(&ctx, "contacts", "main", 1, &["save"]);
+
+        let action_cbor = encode_action("contacts", "main", 999, "save");
+        let err = ui_channel_dispatch(&MessageBody::UiChannelCbor(action_cbor), &ctx).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert!(err.message.contains("epoch mismatch"));
     }
 }
