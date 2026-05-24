@@ -222,6 +222,40 @@ pub fn ui_render_cbor(
                         return ABI_ERR_OPERATION;
                     }
                 }
+                UiTag::Event => {
+                    if let Err(e) = validate_event_topic(&cbor_bytes, &addon_id, &session) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: Event topic validation failed: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
+                UiTag::Batch => {
+                    if let Err(e) = validate_batch(&cbor_bytes, &addon_id, &mut session) {
+                        tracing::warn!(
+                            addon = %addon_id,
+                            "ui_render_cbor: Batch validation failed: {e}"
+                        );
+                        audit_log(
+                            caller.data(),
+                            "ui.render_cbor",
+                            Some("ui"),
+                            None,
+                            "denied",
+                            Some(&e),
+                        );
+                        return ABI_ERR_OPERATION;
+                    }
+                }
                 _ => {}
             }
         }
@@ -545,6 +579,120 @@ fn handle_state_reset(
     session
         .advance_state_revision(addon_id, &reset.panel_id, reset.new_revision)
         .map_err(|e| e.to_string())
+}
+
+// =============================================================================
+// Event topic validation
+// =============================================================================
+
+/// Extracts topic segments from an Event message and validates against session
+/// declared_event_publish patterns.
+fn validate_event_topic(
+    bytes: &[u8],
+    addon_id: &str,
+    session: &crate::addon::ui_session::SessionState,
+) -> Result<(), String> {
+    let segments = extract_event_topic_segments(bytes)?;
+    session
+        .validate_event_publish(addon_id, &segments)
+        .map_err(|e| e.to_string())
+}
+
+/// Decodes the Event body and extracts topic as `(kind, value)` segment pairs.
+fn extract_event_topic_segments(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let event: tentaflow_sdk_spec::protocol::ui::event::Event = decode_state_body(bytes)?;
+    let segments: Vec<(String, String)> = event
+        .topic
+        .segments
+        .iter()
+        .map(|seg| match seg {
+            tentaflow_sdk_spec::protocol::ui::event::TopicSegment::Literal { value } => {
+                ("literal".to_owned(), value.clone())
+            }
+            tentaflow_sdk_spec::protocol::ui::event::TopicSegment::Id { value } => {
+                ("id".to_owned(), value.clone())
+            }
+        })
+        .collect();
+    Ok(segments)
+}
+
+// =============================================================================
+// Batch validation
+// =============================================================================
+
+/// Maximum batch members enforced at the host level.
+const BATCH_MAX_MEMBERS: usize = tentaflow_sdk_spec::BATCH_MAX_MEMBERS;
+
+/// Validates a Batch message: member count, no nested batch, per-member
+/// validation with the same rules as standalone messages.
+fn validate_batch(
+    bytes: &[u8],
+    addon_id: &str,
+    session: &mut crate::addon::ui_session::SessionState,
+) -> Result<(), String> {
+    let batch: tentaflow_sdk_spec::Batch = decode_state_body(bytes)?;
+
+    if batch.members.len() > BATCH_MAX_MEMBERS {
+        return Err(format!(
+            "batch member count {} exceeds maximum {}",
+            batch.members.len(),
+            BATCH_MAX_MEMBERS
+        ));
+    }
+
+    for (i, member) in batch.members.iter().enumerate() {
+        if member.tag == tentaflow_sdk_spec::UiTag::Batch {
+            return Err(format!("nested batch not allowed (member index {i})"));
+        }
+
+        // Re-encode the member as [tag, body] for per-tag validation.
+        let member_bytes = encode_member_as_payload(member)?;
+        validate_outbound_member(member.tag, &member_bytes, addon_id, session)
+            .map_err(|e| format!("batch member {i}: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Re-encodes a BatchMember into a standalone `[tag, body]` CBOR payload so
+/// existing per-tag validators can consume it.
+fn encode_member_as_payload(member: &tentaflow_sdk_spec::BatchMember) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    minicbor::encode(&member.body, &mut buf).map_err(|e| format!("re-encode member: {e}"))?;
+    Ok(buf)
+}
+
+/// Per-tag validation for a single batch member (same rules as standalone).
+fn validate_outbound_member(
+    tag: tentaflow_sdk_spec::UiTag,
+    member_bytes: &[u8],
+    addon_id: &str,
+    session: &mut crate::addon::ui_session::SessionState,
+) -> Result<(), String> {
+    use tentaflow_sdk_spec::UiTag;
+
+    match tag {
+        UiTag::PanelShell => {
+            handle_panel_shell_registration(member_bytes, session, addon_id)
+        }
+        UiTag::SlotContent | UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
+            if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(member_bytes) {
+                session
+                    .validate_slot_ownership(addon_id, &panel_id, &slot_id)
+                    .map_err(|e| e.to_string())
+            } else {
+                Ok(())
+            }
+        }
+        UiTag::StateSnapshot => handle_state_snapshot(member_bytes, session, addon_id),
+        UiTag::StatePatch => handle_state_patch(member_bytes, session, addon_id),
+        UiTag::StateReset => handle_state_reset(member_bytes, session, addon_id),
+        UiTag::Command => validate_command_security(member_bytes),
+        UiTag::Event => validate_event_topic(member_bytes, addon_id, session),
+        UiTag::Batch => Err("nested batch not allowed".to_string()),
+        _ => Ok(()),
+    }
 }
 
 // =============================================================================
@@ -1043,5 +1191,182 @@ mod tests {
         };
         let bytes = encode_command(&cmd);
         assert!(validate_command_security(&bytes).is_ok());
+    }
+
+    // =========================================================================
+    // Event topic validation tests
+    // =========================================================================
+
+    use tentaflow_sdk_spec::protocol::ui::event::{Event as UiEvent, Topic, TopicSegment as EvTopicSegment};
+    use crate::addon::ui_session::TopicPattern;
+
+    #[test]
+    fn event_topic_permitted_passes() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        let epoch = session.open_panel("addon-a", "main").unwrap();
+        session
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                HashSet::new(),
+                vec![TopicPattern::parse("addon-a.*.updated")],
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let payload = UiPayload::Event(UiEvent {
+            source_addon_id: "addon-a".into(),
+            topic: Topic::new(vec![
+                EvTopicSegment::Literal { value: "addon-a".into() },
+                EvTopicSegment::Id { value: "entity-5".into() },
+                EvTopicSegment::Literal { value: "updated".into() },
+            ]),
+            payload: tentaflow_sdk_spec::protocol::value::Value::Null,
+            ts_ms: 1_700_000_000_000,
+        });
+        let bytes = encode_payload(&payload);
+
+        assert!(validate_event_topic(&bytes, "addon-a", &session).is_ok());
+    }
+
+    #[test]
+    fn event_topic_not_permitted_rejected() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        let epoch = session.open_panel("addon-a", "main").unwrap();
+        session
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                HashSet::new(),
+                vec![TopicPattern::parse("addon-a.contacts.updated")],
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let payload = UiPayload::Event(UiEvent {
+            source_addon_id: "addon-a".into(),
+            topic: Topic::new(vec![
+                EvTopicSegment::Literal { value: "addon-a".into() },
+                EvTopicSegment::Literal { value: "contacts".into() },
+                EvTopicSegment::Literal { value: "deleted".into() },
+            ]),
+            payload: tentaflow_sdk_spec::protocol::value::Value::Null,
+            ts_ms: 1_700_000_000_000,
+        });
+        let bytes = encode_payload(&payload);
+
+        let err = validate_event_topic(&bytes, "addon-a", &session);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("not declared"));
+    }
+
+    // =========================================================================
+    // Batch validation tests
+    // =========================================================================
+
+    use tentaflow_sdk_spec::{Batch, BatchMember};
+
+    #[test]
+    fn batch_validates_all_members() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+        let epoch = session.open_panel("contacts", "main").unwrap();
+
+        let mut slots = HashSet::new();
+        slots.insert("content".to_owned());
+        session
+            .register_shell(
+                "contacts",
+                "main",
+                epoch,
+                slots,
+                HashSet::new(),
+                Vec::new(),
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let batch = UiPayload::Batch(Batch {
+            atomic: true,
+            members: vec![BatchMember {
+                tag: tentaflow_sdk_spec::UiTag::SlotContent,
+                body: UiPayload::SlotContent(SlotContent {
+                    addon_id: "contacts".into(),
+                    panel_id: "main".into(),
+                    panel_epoch: 1,
+                    slot_id: "content".into(),
+                    fragment: empty_comp(),
+                    state_overlay: None,
+                }),
+            }],
+        });
+        let bytes = encode_payload(&batch);
+
+        assert!(validate_batch(&bytes, "contacts", &mut session).is_ok());
+    }
+
+    #[test]
+    fn batch_rejects_nested_batch() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+
+        // Hand-craft CBOR for a batch that contains a nested batch tag.
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0160).unwrap();
+            enc.map(2).unwrap();
+            enc.str("atomic").unwrap().bool(false).unwrap();
+            enc.str("members").unwrap();
+            enc.array(1).unwrap();
+            // Member [0x0160, {atomic:false, members:[]}]
+            enc.array(2).unwrap();
+            enc.u16(0x0160).unwrap();
+            enc.map(2).unwrap();
+            enc.str("atomic").unwrap().bool(false).unwrap();
+            enc.str("members").unwrap().array(0).unwrap();
+        }
+
+        // The sdk-spec decoder itself rejects nested batch, so validate_batch
+        // will get a decode error.
+        let err = validate_batch(&buf, "a", &mut session);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn batch_rejects_oversized() {
+        let mut session = crate::addon::ui_session::SessionState::new();
+
+        // Build a batch with 65 members (exceeds BATCH_MAX_MEMBERS=64).
+        // The sdk-spec decoder rejects >64 members during decode.
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u16(0x0160).unwrap();
+            enc.map(2).unwrap();
+            enc.str("atomic").unwrap().bool(false).unwrap();
+            enc.str("members").unwrap();
+            enc.array(65).unwrap();
+            for _ in 0..65 {
+                // Each member: PanelReady
+                enc.array(2).unwrap();
+                enc.u16(0x0103).unwrap();
+                enc.map(4).unwrap();
+                enc.u32(0).unwrap().str("a").unwrap();
+                enc.u32(1).unwrap().str("p").unwrap();
+                enc.u32(2).unwrap().u64(1).unwrap();
+                enc.u32(3).unwrap().u64(5).unwrap();
+            }
+        }
+
+        let err = validate_batch(&buf, "a", &mut session);
+        assert!(err.is_err());
     }
 }

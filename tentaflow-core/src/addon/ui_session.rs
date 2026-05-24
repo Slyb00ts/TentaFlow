@@ -70,6 +70,24 @@ impl TopicPattern {
             .collect();
         Self { segments }
     }
+
+    /// Checks whether this pattern matches a concrete topic represented as
+    /// `(kind, value)` segment pairs. Match rules:
+    /// - Segment count must be equal.
+    /// - A `Wildcard` pattern segment matches any topic segment.
+    /// - A `Literal` pattern segment matches only when the value is equal.
+    pub fn matches_topic_segments(&self, segments: &[(String, String)]) -> bool {
+        if self.segments.len() != segments.len() {
+            return false;
+        }
+        self.segments
+            .iter()
+            .zip(segments.iter())
+            .all(|(pat, (_kind, value))| match pat {
+                TopicPatternSegment::Wildcard => true,
+                TopicPatternSegment::Literal(lit) => lit == value,
+            })
+    }
 }
 
 // =============================================================================
@@ -175,6 +193,9 @@ pub enum SessionError {
 
     #[error("reserved namespace: {path_root}")]
     ReservedNamespace { path_root: String },
+
+    #[error("event topic not declared: addon={addon_id}")]
+    EventTopicNotDeclared { addon_id: String },
 
     #[error("UI credits exhausted")]
     CreditsExhausted,
@@ -416,6 +437,31 @@ impl SessionState {
         {
             return Err(SessionError::ReservedNamespace {
                 path_root: path_root.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that the addon has at least one open panel whose
+    /// `declared_event_publish` patterns match the given topic segments.
+    pub fn validate_event_publish(
+        &self,
+        addon_id: &str,
+        topic_segments: &[(String, String)],
+    ) -> Result<(), SessionError> {
+        let any_match = self
+            .open_panels
+            .iter()
+            .filter(|((aid, _), _)| aid == addon_id)
+            .any(|(_, ownership)| {
+                ownership
+                    .declared_event_publish
+                    .iter()
+                    .any(|p| p.matches_topic_segments(topic_segments))
+            });
+        if !any_match {
+            return Err(SessionError::EventTopicNotDeclared {
+                addon_id: addon_id.to_owned(),
             });
         }
         Ok(())
@@ -960,5 +1006,118 @@ mod tests {
         reg.register_addon_connection("a", 1, 10);
         reg.register_addon_connection("a", 1, 20);
         assert_eq!(reg.find_connection("a", 1), Some(20));
+    }
+
+    // =========================================================================
+    // TopicPattern matching tests
+    // =========================================================================
+
+    #[test]
+    fn topic_pattern_matches_exact_literals() {
+        let p = TopicPattern::parse("addon.contacts.updated");
+        let segments = vec![
+            ("literal".into(), "addon".into()),
+            ("literal".into(), "contacts".into()),
+            ("literal".into(), "updated".into()),
+        ];
+        assert!(p.matches_topic_segments(&segments));
+    }
+
+    #[test]
+    fn topic_pattern_wildcard_matches_any_value() {
+        let p = TopicPattern::parse("addon.*.updated");
+        let segments = vec![
+            ("literal".into(), "addon".into()),
+            ("id".into(), "anything-here".into()),
+            ("literal".into(), "updated".into()),
+        ];
+        assert!(p.matches_topic_segments(&segments));
+    }
+
+    #[test]
+    fn topic_pattern_length_mismatch_rejects() {
+        let p = TopicPattern::parse("addon.contacts");
+        let segments = vec![
+            ("literal".into(), "addon".into()),
+            ("literal".into(), "contacts".into()),
+            ("literal".into(), "extra".into()),
+        ];
+        assert!(!p.matches_topic_segments(&segments));
+    }
+
+    #[test]
+    fn topic_pattern_literal_mismatch_rejects() {
+        let p = TopicPattern::parse("addon.contacts.deleted");
+        let segments = vec![
+            ("literal".into(), "addon".into()),
+            ("literal".into(), "contacts".into()),
+            ("literal".into(), "updated".into()),
+        ];
+        assert!(!p.matches_topic_segments(&segments));
+    }
+
+    // =========================================================================
+    // validate_event_publish tests
+    // =========================================================================
+
+    #[test]
+    fn validate_event_publish_allowed() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                HashSet::new(),
+                vec![TopicPattern::parse("addon-a.*.updated")],
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let segments = vec![
+            ("literal".into(), "addon-a".into()),
+            ("id".into(), "entity-123".into()),
+            ("literal".into(), "updated".into()),
+        ];
+        assert!(state.validate_event_publish("addon-a", &segments).is_ok());
+    }
+
+    #[test]
+    fn validate_event_publish_denied() {
+        let mut state = SessionState::new();
+        let epoch = state.open_panel("addon-a", "main").unwrap();
+
+        state
+            .register_shell(
+                "addon-a",
+                "main",
+                epoch,
+                HashSet::new(),
+                HashSet::new(),
+                vec![TopicPattern::parse("addon-a.contacts.updated")],
+                Vec::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let segments = vec![
+            ("literal".into(), "addon-a".into()),
+            ("literal".into(), "contacts".into()),
+            ("literal".into(), "deleted".into()),
+        ];
+        let err = state.validate_event_publish("addon-a", &segments).unwrap_err();
+        assert!(matches!(err, SessionError::EventTopicNotDeclared { .. }));
+    }
+
+    #[test]
+    fn validate_event_publish_no_panels_open() {
+        let state = SessionState::new();
+        let segments = vec![("literal".into(), "x".into())];
+        let err = state.validate_event_publish("addon-a", &segments).unwrap_err();
+        assert!(matches!(err, SessionError::EventTopicNotDeclared { .. }));
     }
 }
