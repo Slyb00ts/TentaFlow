@@ -1,0 +1,59 @@
+[
+  {
+    "type": "contacts.search_contacts",
+    "title": "Szukaj kontaktow",
+    "category": "Contacts",
+    "description": "Wyszukuje firmy i osoby w bazie Contacts.",
+    "inputs": [
+      { "name": "query", "type": "string", "required": false },
+      { "name": "kind", "type": "string", "required": false },
+      { "name": "limit", "type": "number", "required": false }
+    ],
+    "outputs": [
+      { "name": "items", "type": "array" }
+    ]
+  },
+  {
+    "type": "contacts.find_or_create_company",
+    "title": "Znajdz lub utworz firme",
+    "category": "Contacts",
+    "description": "Znajduje firme po NIP/REGON/nazwie albo tworzy ja, opcjonalnie z lookup online.",
+    "inputs": [
+      { "name": "name", "type": "string", "required": false },
+      { "name": "nip", "type": "string", "required": false },
+      { "name": "regon", "type": "string", "required": false },
+      { "name": "online_lookup", "type": "boolean", "required": false }
+    ],
+    "outputs": [
+      { "name": "company", "type": "object" }
+    ]
+  },
+  {
+    "type": "contacts.find_or_create_person",
+    "title": "Znajdz lub utworz osobe",
+    "category": "Contacts",
+    "description": "Znajduje osobe po emailu/nazwie albo tworzy nowy rekord i opcjonalnie przypina do firmy.",
+    "inputs": [
+      { "name": "full_name", "type": "string", "required": false },
+      { "name": "email", "type": "string", "required": false },
+      { "name": "company_id", "type": "string", "required": false },
+      { "name": "position_title", "type": "string", "required": false }
+    ],
+    "outputs": [
+      { "name": "person", "type": "object" }
+    ]
+  },
+  {
+    "type": "contacts.lookup_company_online",
+    "title": "Pobierz firme online",
+    "category": "Contacts",
+    "description": "Pobiera aktualne dane firmy z Wykazu VAT MF bez cache.",
+    "inputs": [
+      { "name": "nip", "type": "string", "required": false },
+      { "name": "regon", "type": "string", "required": false }
+    ],
+    "outputs": [
+      { "name": "company", "type": "object" }
+    ]
+  }
+]
