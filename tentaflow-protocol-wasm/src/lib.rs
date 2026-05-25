@@ -9200,17 +9200,118 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
     Ok(arr.into())
 }
 
+/// Look up the ComponentMeta for a given tag from the schema catalog.
+fn component_meta_for_tag(tag: u16) -> Option<&'static tentaflow_sdk_spec::ComponentMeta> {
+    tentaflow_sdk_spec::ALL_COMPONENTS.iter().find(|m| m.tag == tag).copied()
+}
+
+/// Look up an InlineMeta by name from the catalog.
+fn inline_meta_by_name(name: &str) -> Option<&'static tentaflow_sdk_spec::InlineMeta> {
+    tentaflow_sdk_spec::ALL_INLINE_STRUCTS.iter().find(|m| m.name == name).copied()
+}
+
+/// Extract the inline struct name from a wire type string like "Inline<NavTab>"
+/// or "Array<Inline<NavTab>>". Returns None if not an inline type.
+fn extract_inline_name(wire: &str) -> Option<&str> {
+    // "Inline<NavTab>" → "NavTab"
+    // "Array<Inline<NavTab>>" → "NavTab"
+    // "Option<Inline<IconRef>>" → "IconRef"
+    let start = wire.find("Inline<")?;
+    let after = &wire[start + 7..];
+    let end = after.find('>')?;
+    Some(&after[..end])
+}
+
+/// Decode a Value::Map using a known InlineMeta to produce text-keyed JS object.
+fn inline_value_to_js(
+    entries: &[(tentaflow_sdk_spec::protocol::value::Value, tentaflow_sdk_spec::protocol::value::Value)],
+    meta: &tentaflow_sdk_spec::InlineMeta,
+) -> Result<JsValue, String> {
+    use tentaflow_sdk_spec::protocol::value::Value;
+    let obj = js_sys::Object::new();
+    for (k, val) in entries {
+        let key_idx = match k {
+            Value::U64(n) => *n as u8,
+            Value::I64(n) => *n as u8,
+            _ => continue,
+        };
+        let field_name = meta.fields.iter()
+            .find(|f| f.key == key_idx)
+            .map(|f| f.name)
+            .unwrap_or("_unknown");
+        // Recursively decode the value, with inline awareness for nested types
+        let field_wire = meta.fields.iter()
+            .find(|f| f.key == key_idx)
+            .map(|f| f.wire)
+            .unwrap_or("");
+        let js_val = value_to_js_with_wire(val, field_wire)?;
+        set(&obj, field_name, js_val);
+    }
+    Ok(obj.into())
+}
+
+/// Like value_to_js but with wire-type context for inline struct resolution.
+fn value_to_js_with_wire(
+    v: &tentaflow_sdk_spec::protocol::value::Value,
+    wire: &str,
+) -> Result<JsValue, String> {
+    use tentaflow_sdk_spec::protocol::value::Value;
+    match v {
+        Value::Array(items) => {
+            let arr = js_sys::Array::new();
+            let inner_wire = if wire.starts_with("Array<") && wire.ends_with('>') {
+                &wire[6..wire.len()-1]
+            } else { "" };
+            for item in items {
+                arr.push(&value_to_js_with_wire(item, inner_wire)?);
+            }
+            Ok(arr.into())
+        }
+        Value::Map(entries) if entries.iter().any(|(k, _)| matches!(k, Value::U64(_) | Value::I64(_))) => {
+            // Integer-keyed map — try inline struct resolution via wire type context
+            if let Some(inline_name) = extract_inline_name(wire) {
+                if let Some(meta) = inline_meta_by_name(inline_name) {
+                    return inline_value_to_js(entries, meta);
+                }
+            }
+            // Try Component decode
+            if let Some(comp) = try_decode_component_from_value(v) {
+                return component_to_js(&comp);
+            }
+            // Fallback: numeric string keys
+            let obj = js_sys::Object::new();
+            for (k, val) in entries {
+                let key_str = match k {
+                    Value::U64(n) => n.to_string(),
+                    Value::I64(n) => n.to_string(),
+                    _ => format!("{k:?}"),
+                };
+                set(&obj, &key_str, value_to_js_with_wire(val, "")?);
+            }
+            Ok(obj.into())
+        }
+        // All other cases delegate to the original value_to_js
+        _ => value_to_js(v),
+    }
+}
+
 fn component_to_js(c: &tentaflow_sdk_spec::protocol::ui::component::Component) -> Result<JsValue, String> {
     let obj = js_sys::Object::new();
     set(&obj, "tag", (c.tag as f64).into());
     set(&obj, "id", c.id.clone().into());
 
-    // fields: Array<[u8, Value]>
+    // fields: Array<[u8, Value]> — use schema-aware conversion so inline
+    // structs within fields get text keys instead of integer keys.
+    let comp_meta = component_meta_for_tag(c.tag);
     let fields_arr = js_sys::Array::new();
     for (k, v) in &c.fields.0 {
+        let wire = comp_meta
+            .and_then(|m| m.fields.iter().find(|f| f.key == *k))
+            .map(|f| f.wire)
+            .unwrap_or("");
         let pair = js_sys::Array::new();
         pair.push(&(*k as f64).into());
-        pair.push(&value_to_js(v)?);
+        pair.push(&value_to_js_with_wire(v, wire)?);
         fields_arr.push(&pair.into());
     }
     set(&obj, "fields", fields_arr.into());
@@ -9302,97 +9403,21 @@ fn value_to_js(v: &tentaflow_sdk_spec::protocol::value::Value) -> Result<JsValue
                 }
                 Ok(obj.into())
             } else {
-                // Integer-keyed map (inline struct from minicbor derive).
-                // Resolve field names from the inline schema catalog so JS
-                // renderers see {id, label, icon} instead of {0, 1, 2}.
+                // Integer-keyed map without wire-type context — fallback to
+                // numeric string keys. Context-aware decoding via
+                // value_to_js_with_wire handles inline structs properly.
                 let obj = js_sys::Object::new();
-                // Build a key→name lookup from ALL_INLINE_STRUCTS + ALL_TAGGED_UNIONS.
-                // Match by counting fields: pick the first inline struct whose
-                // field count matches and whose key range covers all present keys.
-                let name_map = resolve_integer_key_names(entries);
                 for (k, val) in entries {
-                    let key_idx = match k {
-                        Value::U64(n) => *n as u8,
-                        Value::I64(n) => *n as u8,
-                        _ => {
-                            set(&obj, &format!("{k:?}"), value_to_js(val)?);
-                            continue;
-                        }
+                    let key_str = match k {
+                        Value::U64(n) => n.to_string(),
+                        Value::I64(n) => n.to_string(),
+                        _ => format!("{k:?}"),
                     };
-                    let key_str = name_map.get(&key_idx)
-                        .map(|s| s.as_str())
-                        .unwrap_or(&*key_idx.to_string())
-                        .to_string();
                     set(&obj, &key_str, value_to_js(val)?);
                 }
                 Ok(obj.into())
             }
         }
-    }
-}
-
-/// Resolve integer map keys to text field names by matching against the inline
-/// struct and tagged-union schema catalogs. Returns a map of key→name for all
-/// keys that could be resolved; unresolved keys fall back to their numeric string.
-fn resolve_integer_key_names(
-    entries: &[(tentaflow_sdk_spec::protocol::value::Value, tentaflow_sdk_spec::protocol::value::Value)],
-) -> std::collections::HashMap<u8, String> {
-    use tentaflow_sdk_spec::protocol::value::Value;
-    use tentaflow_sdk_spec::protocol::ui::schema::{ALL_INLINE_STRUCTS, ALL_TAGGED_UNIONS};
-
-    let mut present_keys: Vec<u8> = Vec::new();
-    for (k, _) in entries {
-        match k {
-            Value::U64(n) => present_keys.push(*n as u8),
-            Value::I64(n) => present_keys.push(*n as u8),
-            _ => {}
-        }
-    }
-    present_keys.sort();
-
-    if present_keys.is_empty() {
-        return std::collections::HashMap::new();
-    }
-
-    // Score each inline struct: how well does its key set match the present keys?
-    // Prefer exact match (score 0), then smallest superset (fewest extra keys).
-    let mut best: Option<(&[tentaflow_sdk_spec::FieldMeta], usize)> = None;
-
-    for meta in ALL_INLINE_STRUCTS {
-        let meta_keys: std::collections::HashSet<u8> = meta.fields.iter().map(|f| f.key).collect();
-        if present_keys.iter().all(|pk| meta_keys.contains(pk)) {
-            let extra = meta_keys.len() - present_keys.len();
-            if best.is_none() || extra < best.unwrap().1 {
-                best = Some((meta.fields, extra));
-            }
-            if extra == 0 { break; } // exact match
-        }
-    }
-
-    if best.is_none() {
-        for union_meta in ALL_TAGGED_UNIONS {
-            for variant in union_meta.variants {
-                let vkeys: std::collections::HashSet<u8> = variant.fields.iter().map(|f| f.key).collect();
-                if present_keys.iter().all(|pk| vkeys.contains(pk)) {
-                    let extra = vkeys.len() - present_keys.len();
-                    if best.is_none() || extra < best.unwrap().1 {
-                        best = Some((variant.fields, extra));
-                    }
-                    if extra == 0 { break; }
-                }
-            }
-        }
-    }
-
-    match best {
-        Some((fields, _)) => {
-            let mut map = std::collections::HashMap::new();
-            for f in fields {
-                map.insert(f.key, f.name.to_string());
-            }
-            map
-        }
-        None => std::collections::HashMap::new(),
     }
 }
 
