@@ -112,13 +112,10 @@ function renderNavTabs(component, ctx) {
   // sterowanym reaktywnie przez `active_id` BindRef.
   const tabEls = [];
   const seenIds = new Set();
+  // NavTab inline struct: 0=id, 1=label(BindRef), 2=icon, 3=badge, 4=panel_id, 5=locked
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (!item || typeof item !== 'object') {
-      throw new TypeError(`NavTabs.items[${i}] must be object`);
-    }
-    assertOnlyKnownObjectKeys(item, NAV_TAB_KEYS, `NavTabs.items[${i}]`);
-    const itemId = requireString(item.id, `NavTabs.items[${i}].id`);
+    const itemId = requireString(ctx.readField(item, 0), `NavTabs.items[${i}].id`);
     if (itemId.length === 0) {
       throw new TypeError(`NavTabs.items[${i}].id must be non-empty`);
     }
@@ -126,42 +123,35 @@ function renderNavTabs(component, ctx) {
       throw new TypeError(`NavTabs.items: duplicate id '${itemId}'`);
     }
     seenIds.add(itemId);
-    const labelBind = item.label;
+    const labelBind = ctx.readField(item, 1);
     if (labelBind == null) {
       throw new TypeError(`NavTabs.items[${i}].label must be BindRef`);
     }
     const locked = requireBool(
-      item.locked === undefined ? false : item.locked,
+      ctx.readField(item, 5) ?? false,
       `NavTabs.items[${i}].locked`
     );
-    // Icon and badge are optional decorations on each tab.
-    const itemIcon = item.icon ?? null;
-    const itemBadge = item.badge ?? null;
-    if (item.panel_id != null) {
-      // `panel_id` jest opcjonalnym mostem do Router'a (cross-panel nav).
-      // Walidujemy że to string, ale faktyczne routing pociągamy w chunku
-      // 3.7 (cutover). Tu zostaje atrybut data-panel-id do dyspozycji
-      // routera shell'a.
-      requireString(item.panel_id, `NavTabs.items[${i}].panel_id`);
-    }
+    const itemIcon = ctx.readField(item, 2) ?? null;
+    const itemBadge = ctx.readField(item, 3) ?? null;
+    const panelId = ctx.readField(item, 4) ?? null;
 
     const btn = document.createElement('button');
     btn.classList.add('tf-nav-tabs__tab');
     btn.setAttribute('role', 'tab');
     btn.setAttribute('type', 'button');
     btn.setAttribute('data-nav-tab-id', itemId);
-    if (item.panel_id != null) {
-      btn.setAttribute('data-nav-panel-id', item.panel_id);
+    if (panelId != null) {
+      btn.setAttribute('data-nav-panel-id', panelId);
     }
     if (locked) {
       btn.setAttribute('disabled', '');
       btn.classList.add('tf-nav-tabs__tab--locked');
     }
 
-    // Icon (optional, before label)
+    // Icon (optional, before label). IconRef: 0=kind, 1=name
     if (itemIcon) {
       const iconName = typeof itemIcon === 'string' ? itemIcon
-        : (itemIcon.name || itemIcon.kind || '');
+        : ctx.readField(itemIcon, 1) || '';
       if (iconName) {
         const iconEl = document.createElement('span');
         iconEl.classList.add('tf-nav-tabs__icon');
