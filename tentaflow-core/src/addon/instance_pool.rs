@@ -41,6 +41,8 @@ pub struct InstancePool {
     router: Option<Arc<crate::routing::router::Router>>,
     /// Per-account mutex map for OAuth refresh deduplication.
     oauth_refresh_guard: Arc<super::oauth_refresh_guard::OAuthRefreshGuard>,
+    /// Manifest runtime id ("wasmtime", "dotnet", "python") for adapter resolution.
+    runtime_id: String,
 }
 
 /// Wpis w puli — gotowa instancja WASM
@@ -72,6 +74,7 @@ impl InstancePool {
         settings_cipher: Arc<crate::crypto::SettingsCipher>,
         declared_permissions: Vec<String>,
         router: Option<Arc<crate::routing::router::Router>>,
+        runtime_id: String,
     ) -> Result<Self> {
         let pool = InstancePool {
             engine,
@@ -86,6 +89,7 @@ impl InstancePool {
             declared_permissions,
             router,
             oauth_refresh_guard: Arc::new(super::oauth_refresh_guard::OAuthRefreshGuard::new()),
+            runtime_id,
         };
 
         // Pre-warm instancje
@@ -145,12 +149,16 @@ impl InstancePool {
             self.addon_id, instance_id, user_id
         );
 
+        let language_adapter = super::runtime::adapter_for_runtime(&self.runtime_id)
+            .unwrap_or_else(|| Box::new(super::runtime::RustAdapter));
+
         Ok(AddonInstance {
             addon_id: self.addon_id.clone(),
             instance_id,
             user_id,
             store,
             instance,
+            language_adapter,
         })
     }
 
