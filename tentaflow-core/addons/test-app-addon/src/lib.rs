@@ -24,7 +24,12 @@ use tentaflow_sdk_spec::protocol::value::Value;
 #[link(wasm_import_module = "tentaflow")]
 extern "C" {
     fn ui_render_cbor(cbor_ptr: i32, cbor_len: i32) -> i32;
-    fn log_msg(level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32) -> i32;
+    #[link_name = "log_info"]
+    fn host_log_info(msg_ptr: i32, msg_len: i32) -> i32;
+    #[link_name = "log_warn"]
+    fn host_log_warn(msg_ptr: i32, msg_len: i32) -> i32;
+    #[link_name = "log_error"]
+    fn host_log_error(msg_ptr: i32, msg_len: i32) -> i32;
     fn store_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     fn store_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32;
     fn event_publish(
@@ -402,15 +407,7 @@ fn store_set_str(key: &str, val: &str) {
 // =============================================================================
 
 fn log_info(msg: &str) {
-    let level = "info";
-    unsafe {
-        log_msg(
-            level.as_ptr() as i32,
-            level.len() as i32,
-            msg.as_ptr() as i32,
-            msg.len() as i32,
-        );
-    }
+    unsafe { host_log_info(msg.as_ptr() as i32, msg.len() as i32); }
 }
 
 fn notify(title: &str, body: &str, level: &str) {
