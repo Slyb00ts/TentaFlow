@@ -94,6 +94,16 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
   }
 }
 
+function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
+  if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  for (const entry of fields) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
+    if (!allowedKeys.has(entry[0])) {
+      throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
+    }
+  }
+}
+
 // Limity strukturalne dla Grid — bez tego addon mógłby wymusić ogromny
 // layout (DoS przez setki/tysiące kolumn lub wartość px = u32::MAX).
 const MAX_GRID_COLS = 256;
@@ -220,34 +230,40 @@ function renderGrid(component, ctx) {
   // jako jedyną dozwoloną drogę; addon nie kontroluje raw CSS poza tym.
   el.style.gridTemplateColumns = columnsCss;
 
-  const GRID_CHILD_KEYS = new Set([
-    'component', 'col_span', 'row_span', 'col_start', 'row_start',
-    'align_self', 'justify_self',
-  ]);
+  // GridChild: 0=component, 1=col_span(u8), 2=row_span(u8), 3=col_start(u8), 4=row_start(u8), 5=align_self, 6=justify_self
+  const GRID_CHILD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
   for (const gridChild of children) {
-    if (!gridChild || typeof gridChild !== 'object' || !gridChild.component) {
-      throw new TypeError('Grid.children entry must be GridChild { component, ... }');
+    if (!Array.isArray(gridChild)) {
+      throw new TypeError('Grid.children entry must be GridChild FieldMap');
     }
-    assertOnlyKnownObjectKeys(gridChild, GRID_CHILD_KEYS, 'GridChild');
-    const colSpan = requireU8(gridChild.col_span, 'GridChild.col_span');
-    const rowSpan = requireU8(gridChild.row_span, 'GridChild.row_span');
-    const childEl = ctx.renderChild(gridChild.component);
+    assertOnlyKnownFieldMapKeys(gridChild, GRID_CHILD_KEYS, 'GridChild');
+    const gcComponent = ctx.readField(gridChild, 0);
+    if (!gcComponent) {
+      throw new TypeError('GridChild.component is required');
+    }
+    const colSpan = requireU8(ctx.readField(gridChild, 1), 'GridChild.col_span');
+    const rowSpan = requireU8(ctx.readField(gridChild, 2), 'GridChild.row_span');
+    const childEl = ctx.renderChild(gcComponent);
     childEl.style.gridColumn = `span ${colSpan}`;
     childEl.style.gridRow = `span ${rowSpan}`;
-    if (gridChild.col_start != null) {
-      const cs = requireU8(gridChild.col_start, 'GridChild.col_start');
+    const gcColStart = ctx.readField(gridChild, 3);
+    if (gcColStart != null) {
+      const cs = requireU8(gcColStart, 'GridChild.col_start');
       childEl.style.gridColumnStart = String(cs);
     }
-    if (gridChild.row_start != null) {
-      const rs = requireU8(gridChild.row_start, 'GridChild.row_start');
+    const gcRowStart = ctx.readField(gridChild, 4);
+    if (gcRowStart != null) {
+      const rs = requireU8(gcRowStart, 'GridChild.row_start');
       childEl.style.gridRowStart = String(rs);
     }
-    if (gridChild.align_self != null) {
-      const a = requireEnum(gridChild.align_self, FLEX_ALIGNS, 'GridChild.align_self');
+    const gcAlignSelf = ctx.readField(gridChild, 5);
+    if (gcAlignSelf != null) {
+      const a = requireEnum(gcAlignSelf, FLEX_ALIGNS, 'GridChild.align_self');
       childEl.style.alignSelf = flexAlignToCss(a);
     }
-    if (gridChild.justify_self != null) {
-      const j = requireEnum(gridChild.justify_self, FLEX_JUSTIFIES, 'GridChild.justify_self');
+    const gcJustifySelf = ctx.readField(gridChild, 6);
+    if (gcJustifySelf != null) {
+      const j = requireEnum(gcJustifySelf, FLEX_JUSTIFIES, 'GridChild.justify_self');
       childEl.style.justifySelf = flexJustifyToCss(j);
     }
     el.appendChild(childEl);

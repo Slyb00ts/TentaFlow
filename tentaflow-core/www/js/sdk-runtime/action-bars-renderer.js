@@ -19,8 +19,10 @@ import { BUTTON_TAG } from './action-button-renderer.js';
 const SEGMENT_SIZES = new Set(['sm', 'md', 'lg']);
 const FILTER_CHIPS_MODES = new Set(['single', 'multi']);
 
-const SEGMENT_OPTION_KEYS = new Set(['value', 'label', 'icon', 'badge']);
-const FILTER_CHIP_DEF_KEYS = new Set(['id', 'label', 'icon', 'badge', 'count_path']);
+// SegmentOption: 0=value(SelectValue), 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge)
+const SEGMENT_OPTION_KEYS = new Set([0, 1, 2, 3]);
+// FilterChipDef: 0=id, 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge), 4=count_path(StatePath)
+const FILTER_CHIP_DEF_KEYS = new Set([0, 1, 2, 3, 4]);
 const SELECT_VALUE_KEYS = new Set(['kind', 'value']);
 // Wire shape per spec `inline.rs` SelectValue::encode — kindy są `tstr`,
 // `u32`, `i32`, `bool`. NIE `uint`/`int`.
@@ -64,6 +66,15 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
       throw new TypeError(
         `${name}: unknown field key ${k} (allowed: ${[...allowedKeys].join(',')})`
       );
+    }
+  }
+}
+function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
+  if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  for (const entry of fields) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
+    if (!allowedKeys.has(entry[0])) {
+      throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
     }
   }
 }
@@ -227,39 +238,44 @@ function renderSegmentedControl(component, ctx) {
   if (fullWidth) wrapper.classList.add('tf-segmented--full-width');
   wrapper.setAttribute('role', 'radiogroup');
 
+  // SegmentOption: 0=value(SelectValue), 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge)
   const optionMeta = [];
   for (let i = 0; i < options.length; i++) {
     const opt = options[i];
-    if (!opt || typeof opt !== 'object') {
-      throw new TypeError(`SegmentedControl.options[${i}] must be object`);
+    if (!Array.isArray(opt)) {
+      throw new TypeError(`SegmentedControl.options[${i}] must be FieldMap`);
     }
-    assertOnlyKnownObjectKeys(opt, SEGMENT_OPTION_KEYS, `SegmentedControl.options[${i}]`);
-    if (opt.badge != null) {
+    assertOnlyKnownFieldMapKeys(opt, SEGMENT_OPTION_KEYS, `SegmentedControl.options[${i}]`);
+    const optBadge = ctx.readField(opt, 3);
+    if (optBadge != null) {
       // Icon/badge gracefully skipped
     }
-    if (opt.value == null) {
+    const optValue = ctx.readField(opt, 0);
+    if (optValue == null) {
       throw new TypeError(`SegmentedControl.options[${i}].value is required`);
     }
-    const parsedValue = parseSelectValue(opt.value, `SegmentedControl.options[${i}].value`);
-    if (opt.label == null && opt.icon == null) {
+    const parsedValue = parseSelectValue(optValue, `SegmentedControl.options[${i}].value`);
+    const optLabel = ctx.readField(opt, 1);
+    const optIcon = ctx.readField(opt, 2);
+    if (optLabel == null && optIcon == null) {
       throw new TypeError(
         `SegmentedControl.options[${i}]: at least one of label / icon required`
       );
     }
-    if (opt.label == null) {
+    if (optLabel == null) {
       // Icon-only segment: named icon ma aria-hidden=true, więc bez
       // label'a button radio nie ma accessible name. Spec dopuszcza
       // icon-only TYLKO gdy icon to asset z `alt`. Tu odrzucamy named
       // icon bez label'a — addon musi dodać label albo zaspecować asset
       // icon z `alt`.
-      if (opt.icon.kind === 'named') {
+      if (optIcon.kind === 'named') {
         throw new TypeError(
           `SegmentedControl.options[${i}]: icon-only with named icon requires label (accessible name)`
         );
       }
       // Asset icon bez `alt` → renderIcon ustawi aria-hidden, segment też
       // anonymous. Wymagamy alt.
-      if (opt.icon.kind === 'asset' && (typeof opt.icon.alt !== 'string' || opt.icon.alt.trim().length === 0)) {
+      if (optIcon.kind === 'asset' && (typeof optIcon.alt !== 'string' || optIcon.alt.trim().length === 0)) {
         throw new TypeError(
           `SegmentedControl.options[${i}]: icon-only with asset icon requires non-blank alt`
         );
@@ -270,21 +286,21 @@ function renderSegmentedControl(component, ctx) {
     btn.setAttribute('role', 'radio');
     btn.classList.add('tf-segmented__option');
 
-    if (opt.icon != null) {
-      const iconEl = renderIcon(opt.icon, `SegmentedControl.options[${i}].icon`);
+    if (optIcon != null) {
+      const iconEl = renderIcon(optIcon, `SegmentedControl.options[${i}].icon`);
       iconEl.classList.add('tf-segmented__option-icon');
       btn.appendChild(iconEl);
     }
-    if (opt.label != null) {
+    if (optLabel != null) {
       const labelEl = document.createElement('span');
       labelEl.classList.add('tf-segmented__option-label');
       btn.appendChild(labelEl);
       const apply = () => {
-        const v = resolveBindRef(opt.label, ctx.store);
+        const v = resolveBindRef(optLabel, ctx.store);
         labelEl.textContent = v == null ? '' : String(v);
       };
       apply();
-      ctx.registerCleanup(subscribeBindRef(opt.label, ctx.store, apply));
+      ctx.registerCleanup(subscribeBindRef(optLabel, ctx.store, apply));
     }
 
     const onClick = () => {
@@ -364,15 +380,16 @@ function renderFilterChips(component, ctx) {
   wrapper.classList.add(`tf-filter-chips--mode-${mode}`);
   wrapper.setAttribute('role', mode === 'single' ? 'radiogroup' : 'group');
 
+  // FilterChipDef: 0=id, 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge), 4=count_path(StatePath)
   const seenIds = new Set();
   const chipMeta = [];
   for (let i = 0; i < chips.length; i++) {
     const chip = chips[i];
-    if (!chip || typeof chip !== 'object') {
-      throw new TypeError(`FilterChips.chips[${i}] must be object`);
+    if (!Array.isArray(chip)) {
+      throw new TypeError(`FilterChips.chips[${i}] must be FieldMap`);
     }
-    assertOnlyKnownObjectKeys(chip, FILTER_CHIP_DEF_KEYS, `FilterChips.chips[${i}]`);
-    const chipId = requireString(chip.id, `FilterChips.chips[${i}].id`);
+    assertOnlyKnownFieldMapKeys(chip, FILTER_CHIP_DEF_KEYS, `FilterChips.chips[${i}]`);
+    const chipId = requireString(ctx.readField(chip, 0), `FilterChips.chips[${i}].id`);
     if (chipId.length === 0) {
       throw new TypeError(`FilterChips.chips[${i}].id must be non-empty`);
     }
@@ -380,15 +397,18 @@ function renderFilterChips(component, ctx) {
       throw new TypeError(`FilterChips.chips: duplicate id '${chipId}'`);
     }
     seenIds.add(chipId);
-    if (chip.label == null) {
+    const chipLabel = ctx.readField(chip, 1);
+    if (chipLabel == null) {
       throw new TypeError(`FilterChips.chips[${i}].label must be BindRef`);
     }
-    if (chip.badge != null) {
+    const chipBadge = ctx.readField(chip, 3);
+    if (chipBadge != null) {
       // Icon/badge gracefully skipped
     }
-    const countPath = chip.count_path == null
+    const countPathRaw = ctx.readField(chip, 4);
+    const countPath = countPathRaw == null
       ? null
-      : requirePath(chip.count_path, `FilterChips.chips[${i}].count_path`);
+      : requirePath(countPathRaw, `FilterChips.chips[${i}].count_path`);
 
     const btn = document.createElement('button');
     btn.setAttribute('type', 'button');
@@ -396,8 +416,9 @@ function renderFilterChips(component, ctx) {
     btn.classList.add('tf-filter-chips__chip');
     btn.setAttribute('data-chip-id', chipId);
 
-    if (chip.icon != null) {
-      const iconEl = renderIcon(chip.icon, `FilterChips.chips[${i}].icon`);
+    const chipIcon = ctx.readField(chip, 2);
+    if (chipIcon != null) {
+      const iconEl = renderIcon(chipIcon, `FilterChips.chips[${i}].icon`);
       iconEl.classList.add('tf-filter-chips__chip-icon');
       btn.appendChild(iconEl);
     }
@@ -405,11 +426,11 @@ function renderFilterChips(component, ctx) {
     labelEl.classList.add('tf-filter-chips__chip-label');
     btn.appendChild(labelEl);
     const applyLabel = () => {
-      const v = resolveBindRef(chip.label, ctx.store);
+      const v = resolveBindRef(chipLabel, ctx.store);
       labelEl.textContent = v == null ? '' : String(v);
     };
     applyLabel();
-    ctx.registerCleanup(subscribeBindRef(chip.label, ctx.store, applyLabel));
+    ctx.registerCleanup(subscribeBindRef(chipLabel, ctx.store, applyLabel));
 
     // Optional count_path — reactive number obok label'u.
     if (countPath != null) {
