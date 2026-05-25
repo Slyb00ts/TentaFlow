@@ -87,17 +87,36 @@ const AddonAppScreen = {
       handleUiMessage(msgBody.cbor);
     });
 
-    // Send PanelOpen and handle response
-    client.subscribe(correlationId, ({ envelope, body: respBody }) => {
-      if (envelope.isError || respBody.variant === 'Error') {
+    // Send PanelOpen as request-response (pending, not subscribe).
+    // The response carries the assigned epoch in a PanelOpen echo.
+    const openPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        client.pending.delete(correlationId.toString());
+        reject(new Error('PanelOpen timed out'));
+      }, 10000);
+      client.pending.set(correlationId.toString(), {
+        resolve: (result) => { clearTimeout(timer); resolve(result); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+      });
+    });
+    client._send(frame);
+
+    try {
+      const { envelope: respEnv, body: respBody } = await openPromise;
+      if (respEnv.isError || respBody.variant === 'Error') {
         showError(respBody.message ?? 'Panel open failed');
         return;
       }
-      if (respBody.variant === 'UiChannelCbor') {
-        handleUiMessage(respBody.cbor);
+      if (respBody.variant === 'UiChannelCbor' && _session) {
+        const decoded = wasm.decodeUiPayload(respBody.cbor);
+        if (decoded.assignedEpoch) {
+          _session.panelEpoch = Number(decoded.assignedEpoch);
+        }
       }
-    });
-    client._send(frame);
+    } catch (e) {
+      showError(e.message ?? 'Panel open failed');
+      return;
+    }
   },
 
   unmount() {
