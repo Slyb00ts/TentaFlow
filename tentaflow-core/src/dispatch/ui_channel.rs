@@ -113,25 +113,26 @@ fn handle_panel_open(
             .map_err(|e| ProtocolError::bad_request(e.to_string()))?
     };
 
-    // Lazy-start the addon via AddonManager so it is ready to receive
-    // PanelReady / Action messages.
+    // Start (or restart) the addon so on_start emits PanelShell.
+    // A PanelOpen to an already-running addon must still produce UI,
+    // so we stop + start to get a fresh on_start cycle.
     if let Some(addon_mgr) = ctx.state.addon_manager.as_ref() {
-        if !addon_mgr.has_running_instance(&panel_open.addon_id) {
-            let user_id = extract_user_id_i64(ctx);
-            addon_mgr
-                .start_addon(&panel_open.addon_id, user_id, None)
-                .map_err(|e| {
-                    // Roll back the panel open on addon start failure.
-                    let session_lock =
-                        ctx.state.ui_sessions.get_or_create(ctx.connection_id);
-                    let mut session = session_lock.lock();
-                    session.close_panel(&panel_open.addon_id, &panel_open.panel_id);
-                    ProtocolError::internal(format!(
-                        "failed to start addon '{}': {e}",
-                        panel_open.addon_id
-                    ))
-                })?;
+        let user_id = extract_user_id_i64(ctx);
+        if addon_mgr.has_running_instance(&panel_open.addon_id) {
+            let _ = addon_mgr.stop_addon(&panel_open.addon_id);
         }
+        addon_mgr
+            .start_addon(&panel_open.addon_id, user_id, None)
+            .map_err(|e| {
+                let session_lock =
+                    ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+                let mut session = session_lock.lock();
+                session.close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                ProtocolError::internal(format!(
+                    "failed to start addon '{}': {e}",
+                    panel_open.addon_id
+                ))
+            })?;
     }
 
     // Track which connection is serving this addon+user panel so host

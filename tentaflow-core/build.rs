@@ -71,6 +71,19 @@ fn main() {
 
             let addon_name = addon_dir.file_name().unwrap().to_string_lossy().to_string();
 
+            // Track every source file so cargo reruns build.rs when addon
+            // code changes. Without this, editing src/lib.rs inside an addon
+            // does NOT trigger a rebuild — cargo only watches the directory
+            // entry (add/remove), not recursive file content.
+            let src_dir = addon_dir.join("src");
+            if src_dir.is_dir() {
+                for src_entry in walkdir_rs(&src_dir) {
+                    println!("cargo:rerun-if-changed={}", src_entry.display());
+                }
+            }
+            println!("cargo:rerun-if-changed={}", addon_dir.join("Cargo.toml").display());
+            println!("cargo:rerun-if-changed={}", addon_dir.join("manifest.toml").display());
+
             println!(
                 "cargo:warning=Addon '{}' — rozpoczynam budowanie WASM",
                 addon_name
@@ -1983,4 +1996,20 @@ fn detect_wasm_bindgen_version() -> Option<String> {
     let text = String::from_utf8_lossy(&output.stdout);
     // Format: "wasm-bindgen 0.2.100"
     text.split_whitespace().nth(1).map(|s| s.to_string())
+}
+
+/// Recursively collect all file paths under `dir`. No external crate needed.
+fn walkdir_rs(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walkdir_rs(&path));
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
