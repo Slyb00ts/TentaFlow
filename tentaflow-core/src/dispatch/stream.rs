@@ -20,7 +20,7 @@ use tentaflow_protocol::{
 use tokio::sync::broadcast::error::RecvError;
 
 use super::subscription::{
-    push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
+    StreamHandlerMeta, Subscription, push_chunk_async, push_end, push_end_async,
 };
 use super::{HandlerContext, SessionAuthKind};
 use crate::services::stream_hub::{StreamHub, StreamHubError};
@@ -339,10 +339,10 @@ fn enforce_subscribe_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::subscription::{
-        find_stream_handler, SubscriptionEvent, SubscriptionRegistry,
-    };
     use crate::dispatch::HandlerContext;
+    use crate::dispatch::subscription::{
+        SubscriptionEvent, SubscriptionRegistry, find_stream_handler,
+    };
     use crate::services::stream_hub::{BinaryStreamSource, StreamHub};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -405,6 +405,7 @@ mod tests {
                 role: Some("admin".to_string()),
             },
             correlation_id,
+            connection_id: 0,
             resume_secret: None,
             state: crate::dispatch::state::AppState::for_test(),
             org_context: Some(test_org_context("user-stream-test", PERM_CAMERA_READ)),

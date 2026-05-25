@@ -31,9 +31,7 @@ pub enum SyncLedgerError {
     },
     #[error("hash operacji nie zgadza sie z trescia: {op_id}")]
     InvalidOperationHash { op_id: OperationId },
-    #[error(
-        "identyfikator operacji nie zgadza sie z hashem: expected={expected}, actual={actual}"
-    )]
+    #[error("identyfikator operacji nie zgadza sie z hashem: expected={expected}, actual={actual}")]
     InvalidOperationId {
         expected: OperationId,
         actual: OperationId,
@@ -445,7 +443,7 @@ pub trait SyncLedgerStore: Send + Sync {
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
     fn put_in_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()>;
     fn get_outbox_entry(&self, target: SyncTarget, op_id: OperationId)
-        -> LedgerResult<OutboxEntry>;
+    -> LedgerResult<OutboxEntry>;
     fn list_pending_outbox(
         &self,
         target: SyncTarget,

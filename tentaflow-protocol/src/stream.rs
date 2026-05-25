@@ -153,11 +153,10 @@ mod tests {
 
     #[test]
     fn message_body_stream_subscribe_round_trip() {
-        let body = MessageBody::StreamBody(StreamPayload::SubscribeRequest(
-            StreamSubscribeRequest {
+        let body =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:abc".into(),
-            },
-        ));
+            }));
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
         let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
         assert_eq!(decoded, body);

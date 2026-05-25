@@ -26,6 +26,11 @@ pub trait LanguageAdapter: Send + Sync {
     /// Export name for the event handler.
     fn export_on_event(&self) -> &str;
 
+    /// Export name for the panel-open handler. Called on a running instance
+    /// when the user opens a panel — the addon emits PanelShell/SlotContent
+    /// without restarting. Signature: (panel_id_ptr, panel_id_len, epoch) -> i32.
+    fn export_on_panel_open(&self) -> &str;
+
     /// Whether the module needs `_start` / `_initialize` before lifecycle calls.
     fn needs_wasi_start(&self) -> bool;
 
@@ -47,6 +52,7 @@ impl LanguageAdapter for RustAdapter {
     fn export_on_request(&self) -> &str { "on_request" }
     fn export_on_tick(&self) -> &str { "on_tick" }
     fn export_on_event(&self) -> &str { "on_event" }
+    fn export_on_panel_open(&self) -> &str { "on_panel_open" }
     fn needs_wasi_start(&self) -> bool { false }
     fn init_fuel_budget(&self) -> u64 { 0 }
 }
@@ -64,6 +70,7 @@ impl LanguageAdapter for DotnetAdapter {
     fn export_on_request(&self) -> &str { "tentaflow_on_request" }
     fn export_on_tick(&self) -> &str { "tentaflow_on_tick" }
     fn export_on_event(&self) -> &str { "tentaflow_on_event" }
+    fn export_on_panel_open(&self) -> &str { "tentaflow_on_panel_open" }
     fn needs_wasi_start(&self) -> bool { true }
     fn init_fuel_budget(&self) -> u64 { 50_000_000 }
 }
@@ -81,6 +88,7 @@ impl LanguageAdapter for PythonAdapter {
     fn export_on_request(&self) -> &str { "tentaflow_on_request" }
     fn export_on_tick(&self) -> &str { "tentaflow_on_tick" }
     fn export_on_event(&self) -> &str { "tentaflow_on_event" }
+    fn export_on_panel_open(&self) -> &str { "tentaflow_on_panel_open" }
     fn needs_wasi_start(&self) -> bool { true }
     fn init_fuel_budget(&self) -> u64 { 100_000_000 }
 }

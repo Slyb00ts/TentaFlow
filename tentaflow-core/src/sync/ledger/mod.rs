@@ -17,6 +17,6 @@ pub use types::{
     SyncOperationVerifier, SyncSnapshot, SyncTarget,
 };
 pub use validation::{
-    build_merkle_summary, operation_body_hash, validate_hash_chain, validate_hash_chain_from,
     Ed25519OperationSigner, HexNodeIdOperationVerifier, TrustedKeyOperationVerifier,
+    build_merkle_summary, operation_body_hash, validate_hash_chain, validate_hash_chain_from,
 };

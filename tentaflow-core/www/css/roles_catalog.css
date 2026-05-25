@@ -1,0 +1,445 @@
+/* ============ File: roles_catalog.css — Style modulu Katalog rol ============
+ *
+ * Layout 1:1 z mockupem O2 (designs/crm-v1/o02-roles-catalog.html). Prefix .rc-
+ * chroni przed kolizjami. Reuse zmiennych globalnych (--text-1/2/3, --border,
+ * --accent-*). Komponenty tf-* maja wlasne styly default — tu tylko layout +
+ * elementy ktore nie sa UI primitive (KPI tile, filter chip aktywny, banery).
+ */
+
+#roles-catalog-root .rc-loading,
+#roles-catalog-root .rc-empty,
+#roles-catalog-root .rc-error {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+#roles-catalog-root .rc-error {
+  color: var(--danger, #ef4444);
+}
+
+#roles-catalog-root .rc-screen {
+  padding: 14px 18px 24px;
+}
+
+/* ---------------------------------------------------------------------------
+ * Topbar — breadcrumb + pill-tabs + search + Nowa rola
+ * --------------------------------------------------------------------------- */
+
+#roles-catalog-root .rc-topbar {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 18px;
+  padding: 6px 0 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+
+#roles-catalog-root .rc-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+#roles-catalog-root .rc-crumb strong {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+#roles-catalog-root .rc-crumb .sep {
+  display: inline-flex;
+  width: 12px;
+  height: 12px;
+  color: var(--text-3);
+  opacity: 0.6;
+}
+
+#roles-catalog-root .rc-crumb .sep svg {
+  width: 100%;
+  height: 100%;
+}
+
+#roles-catalog-root #rc-org-tabs {
+  justify-self: center;
+}
+
+#roles-catalog-root .rc-topbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  justify-self: end;
+}
+
+#roles-catalog-root .rc-topbar-actions tf-searchbox {
+  min-width: 260px;
+}
+
+#roles-catalog-root .rc-readonly-banner {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ---------------------------------------------------------------------------
+ * KPI grid — 5 kafelkow w jednym rzedzie
+ * --------------------------------------------------------------------------- */
+
+#roles-catalog-root .rc-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin: 0 0 14px;
+}
+
+@media (max-width: 1100px) {
+  #roles-catalog-root .rc-kpi-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+#roles-catalog-root .rc-kpi-tile {
+  position: relative;
+  background: var(--bg-2, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  padding: 14px 16px 16px;
+  overflow: hidden;
+}
+
+#roles-catalog-root .rc-kpi-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  margin-bottom: 6px;
+}
+
+#roles-catalog-root .rc-kpi-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+#roles-catalog-root .rc-kpi-delta {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+
+#roles-catalog-root .rc-kpi-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--accent-2, #6366f1);
+}
+
+#roles-catalog-root .rc-kpi-all .rc-kpi-bar { background: linear-gradient(90deg, #6366f1, #a855f7); }
+#roles-catalog-root .rc-kpi-sales .rc-kpi-bar { background: #6366f1; }
+#roles-catalog-root .rc-kpi-technical .rc-kpi-bar { background: #f59e0b; }
+#roles-catalog-root .rc-kpi-management .rc-kpi-bar { background: #a855f7; }
+#roles-catalog-root .rc-kpi-external .rc-kpi-bar { background: #60a5fa; }
+
+/* ---------------------------------------------------------------------------
+ * Filter chips
+ * --------------------------------------------------------------------------- */
+
+#roles-catalog-root .rc-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+#roles-catalog-root .rc-filter-chip {
+  cursor: pointer;
+}
+
+#roles-catalog-root .rc-filter-chip[active] .tf-chip {
+  background: rgba(99, 102, 241, 0.18);
+  border-color: rgba(99, 102, 241, 0.5);
+  color: var(--text-1);
+}
+
+#roles-catalog-root .rc-chip-count {
+  margin-left: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+ * Tabela — host dla tf-table
+ * --------------------------------------------------------------------------- */
+
+#roles-catalog-root .rc-table-host {
+  background: var(--bg-2, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+#roles-catalog-root .rc-name-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+#roles-catalog-root .rc-name {
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+#roles-catalog-root .rc-slug {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#roles-catalog-root .rc-muted {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+#roles-catalog-root .rc-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #6366f1, #4f46e5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+}
+
+#roles-catalog-root .rc-avatar-sales { background: linear-gradient(135deg, #6366f1, #4f46e5); }
+#roles-catalog-root .rc-avatar-technical { background: linear-gradient(135deg, #f59e0b, #d97706); }
+#roles-catalog-root .rc-avatar-management { background: linear-gradient(135deg, #a855f7, #7e22ce); }
+#roles-catalog-root .rc-avatar-external { background: linear-gradient(135deg, #60a5fa, #2563eb); }
+#roles-catalog-root .rc-avatar-other { background: linear-gradient(135deg, #64748b, #475569); }
+
+#roles-catalog-root .rc-avatar .icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---------------------------------------------------------------------------
+ * Info banner (po tabeli) + warn banner (w modal)
+ * --------------------------------------------------------------------------- */
+
+#roles-catalog-root .rc-info-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: rgba(99, 102, 241, 0.05);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+#roles-catalog-root .rc-info-banner .icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  stroke: var(--accent-2, #6366f1);
+  fill: none;
+  stroke-width: 2;
+}
+
+#roles-catalog-root .rc-info-banner-body {
+  flex: 1;
+}
+
+#roles-catalog-root .rc-info-banner-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text-1);
+  margin-bottom: 4px;
+}
+
+#roles-catalog-root .rc-info-banner-text {
+  color: var(--text-2);
+}
+
+/* ---------------------------------------------------------------------------
+ * Modal editor — layout 2-kolumnowy
+ * --------------------------------------------------------------------------- */
+
+.rc-editor {
+  padding: 16px 20px 6px;
+}
+
+.rc-editor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 22px;
+}
+
+@media (max-width: 760px) {
+  .rc-editor-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.rc-editor-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.rc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rc-section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+.rc-color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rc-color-row tf-input {
+  flex: 1;
+}
+
+.rc-color-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+}
+
+.rc-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 0;
+}
+
+.rc-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rc-toggle-label {
+  font-weight: 600;
+  color: var(--text-1);
+  font-size: 13px;
+}
+
+.rc-toggle-hint {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.rc-warn-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  background: rgba(245, 158, 11, 0.05);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 8px;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.rc-warn-banner .icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  stroke: var(--warning, #f59e0b);
+  fill: none;
+  stroke-width: 2;
+  margin-top: 2px;
+}
+
+.rc-warn-banner-title {
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 4px;
+}
+
+.rc-warn-banner-text {
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.rc-field-error {
+  font-size: 11px;
+  color: var(--danger, #ef4444);
+}
+
+.rc-form-error {
+  margin: 12px 20px 0;
+  padding: 10px 12px;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 6px;
+  color: var(--danger, #ef4444);
+  font-size: 12px;
+}
+
+.rc-editor-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  width: 100%;
+}
+
+.rc-footer-left {
+  flex: 1;
+}
+
+.rc-footer-notice {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.rc-footer-notice strong {
+  color: var(--text-2);
+}
+
+.rc-footer-right {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}

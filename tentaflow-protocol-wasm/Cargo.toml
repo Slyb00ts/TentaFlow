@@ -42,6 +42,6 @@ console_error_panic_hook = { version = "0.1.7", optional = true }
 default = ["console_error_panic_hook"]
 
 [profile.release]
-opt-level = "z"     # size optimization (bundle size budget)
+opt-level = "s"     # balanced size + speed (decode hot path needs it)
 lto = true
 codegen-units = 1

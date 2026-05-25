@@ -182,7 +182,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         _ => {
             return Err(ProtocolError::bad_request(
                 "auth_login expected AuthLoginRequestBody variant",
-            ))
+            ));
         }
     };
 
@@ -317,7 +317,7 @@ pub fn me_preferences_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MePreferencesUpdateRequest",
-            ))
+            ));
         }
     };
     let user_id_bytes = require_user_id(ctx)?;
@@ -373,7 +373,7 @@ pub fn api_key_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "api_key_create expected ApiKeyCreateRequestBody variant",
-            ))
+            ));
         }
     };
 
@@ -420,7 +420,7 @@ pub fn api_key_revoke(
         _ => {
             return Err(ProtocolError::bad_request(
                 "api_key_revoke expected ApiKeyRevokeRequest variant",
-            ))
+            ));
         }
     };
 
@@ -593,7 +593,7 @@ pub fn model_install(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelInstallRequestBody",
-            ))
+            ));
         }
     };
 
@@ -869,7 +869,7 @@ pub fn flow_executions_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowExecutionsListRequest",
-            ))
+            ));
         }
     };
     let flow_id: i64 = flow_id_str
@@ -1107,7 +1107,7 @@ pub fn flow_version_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowVersionListRequestBody",
-            ))
+            ));
         }
     };
     let flow_id: i64 = payload
@@ -1153,7 +1153,7 @@ pub fn flow_version_get(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowVersionGetRequestBody",
-            ))
+            ));
         }
     };
     let flow_id: i64 = payload
@@ -1204,7 +1204,7 @@ pub fn flow_version_restore(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowVersionRestoreRequestBody",
-            ))
+            ));
         }
     };
     let flow_id: i64 = payload
@@ -1362,7 +1362,7 @@ pub fn cluster_detail(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterDetailRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1429,7 +1429,7 @@ pub fn cluster_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterCreateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1493,7 +1493,7 @@ pub fn cluster_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterUpdateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1560,7 +1560,7 @@ pub fn cluster_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterDeleteRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1604,7 +1604,7 @@ pub fn cluster_add_member(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterAddMemberRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1659,7 +1659,7 @@ pub fn cluster_remove_member(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterRemoveMemberRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1746,7 +1746,7 @@ pub fn mesh_pair_init(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshPairInitRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1827,7 +1827,7 @@ pub fn settings_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SettingsUpdateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1906,7 +1906,7 @@ pub fn sso_provider_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SsoProviderCreateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1986,7 +1986,7 @@ pub fn sso_provider_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SsoProviderDeleteRequestBody",
-            ))
+            ));
         }
     };
 
@@ -2340,7 +2340,7 @@ pub fn vision_infer(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected VisionBody/InferRequest",
-            ))
+            ));
         }
     };
 
@@ -2819,7 +2819,7 @@ pub async fn mesh_node_detail(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshNodeDetailRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3231,7 +3231,7 @@ pub fn model_alias_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelAliasCreateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3276,7 +3276,7 @@ pub fn model_alias_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelAliasUpdateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3330,7 +3330,7 @@ pub fn model_alias_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelAliasDeleteRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3415,7 +3415,7 @@ pub async fn service_manifest_deploy(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected DeploymentBody::ReqStart",
-            ))
+            ));
         }
     };
 
@@ -3490,7 +3490,7 @@ pub async fn service_manifest_deploy(
     );
 
     use crate::services::manifest::runtime_validate::{
-        validate_deploy_target, DeployValidationError,
+        DeployValidationError, validate_deploy_target,
     };
     validate_deploy_target(&payload.engine_id, &payload.deploy_method).map_err(
         |err| match err {
@@ -3727,9 +3727,9 @@ pub async fn deploy_vllm_recommend(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     use crate::deploy::vram_calculator::{
-        analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
-        fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
-        parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
+        AutoFitOutcome, AutoFitRequest, analyze_gpu_compatibility, auto_fit_config,
+        build_vllm_args_string, estimate_vllm_vram, fetch_hf_config,
+        max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
     };
 
     let payload = match req {
@@ -3737,7 +3737,7 @@ pub async fn deploy_vllm_recommend(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected DeployVllmRecommendRequest",
-            ))
+            ));
         }
     };
 
@@ -3926,7 +3926,7 @@ pub async fn engine_recommend(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected EngineRecommendRequest",
-            ))
+            ));
         }
     };
 
@@ -3959,7 +3959,7 @@ pub async fn engine_recommend(
                 ));
             }
             use crate::deploy::vram_calculator::{
-                auto_fit_config, fetch_hf_config, parse_hf_config_with_override, AutoFitRequest,
+                AutoFitRequest, auto_fit_config, fetch_hf_config, parse_hf_config_with_override,
             };
 
             let client = reqwest::Client::builder()
@@ -4403,7 +4403,7 @@ pub fn scheduler_jobs_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SchedulerJobsListRequestBody",
-            ))
+            ));
         }
     }
     let jobs = crate::scheduler::list_jobs(&ctx.state.db).map_err(db_err)?;
@@ -4429,7 +4429,7 @@ pub fn scheduler_actions_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SchedulerActionsListRequestBody",
-            ))
+            ));
         }
     }
     let actions = crate::scheduler::list_addon_actions(&ctx.state.db).map_err(db_err)?;
@@ -4454,7 +4454,7 @@ pub fn scheduler_runs_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SchedulerRunsListRequestBody",
-            ))
+            ));
         }
     };
     let runs = crate::scheduler::list_runs(&ctx.state.db, &payload.job_id, payload.limit as i64)
@@ -4480,7 +4480,7 @@ pub fn scheduler_job_upsert(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SchedulerJobUpsertRequestBody",
-            ))
+            ));
         }
     };
     let user_id = require_user_id(ctx)
@@ -4511,7 +4511,7 @@ pub fn scheduler_job_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SchedulerJobDeleteRequestBody",
-            ))
+            ));
         }
     };
     crate::scheduler::delete_job(&ctx.state.db, &payload.job_id).map_err(db_err)?;
@@ -4534,7 +4534,7 @@ pub async fn scheduler_job_run_now(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SchedulerJobRunNowRequestBody",
-            ))
+            ));
         }
     };
     let addon_manager = ctx
@@ -4570,7 +4570,7 @@ pub fn audit_log_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected AuditLogListRequestBody",
-            ))
+            ));
         }
     };
 
@@ -4611,7 +4611,7 @@ pub fn audit_log_export(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected AuditLogExportRequestBody",
-            ))
+            ));
         }
     };
 
@@ -4670,7 +4670,7 @@ pub fn audit_log_cleanup(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected AuditLogCleanupRequestBody",
-            ))
+            ));
         }
     };
     if payload.keep_days < 1 {
@@ -5309,6 +5309,97 @@ register_sync_conflict_variant!(
     "tentaflow_ws_handler_sync_conflict_resolve"
 );
 
+fn sync_storage_level_to_wire(
+    level: crate::sync::storage_monitor::StoragePressureLevel,
+) -> tentaflow_protocol::SyncStoragePressureLevel {
+    match level {
+        crate::sync::storage_monitor::StoragePressureLevel::Ok => {
+            tentaflow_protocol::SyncStoragePressureLevel::Ok
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Info => {
+            tentaflow_protocol::SyncStoragePressureLevel::Info
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Warning => {
+            tentaflow_protocol::SyncStoragePressureLevel::Warning
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Critical => {
+            tentaflow_protocol::SyncStoragePressureLevel::Critical
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Unknown => {
+            tentaflow_protocol::SyncStoragePressureLevel::Unknown
+        }
+    }
+}
+
+fn sync_storage_percent_to_bps(percent: Option<f64>) -> Option<u32> {
+    percent.map(|value| (value * 100.0).round().clamp(0.0, 10_000.0) as u32)
+}
+
+fn sync_storage_report_to_wire(
+    report: crate::sync::storage_monitor::StoragePressureReport,
+) -> tentaflow_protocol::SyncStorageReportResponse {
+    tentaflow_protocol::SyncStorageReportResponse {
+        root: report.root.to_string_lossy().to_string(),
+        level: sync_storage_level_to_wire(report.level),
+        total_bytes: report.total_bytes,
+        available_bytes: report.available_bytes,
+        free_percent_bps: sync_storage_percent_to_bps(report.free_percent),
+        sqlite_bytes: report.sqlite_bytes,
+        fjall_ledger_bytes: report.fjall_ledger_bytes,
+        snapshot_blob_bytes: report.snapshot_blob_bytes,
+        final_blob_bytes: report.final_blob_bytes,
+        pending_blob_chunk_bytes: report.pending_blob_chunk_bytes,
+        large_blob_block_bytes: crate::sync::storage_monitor::LARGE_BLOB_BLOCK_BYTES,
+        paths: report
+            .paths
+            .into_iter()
+            .map(|path| tentaflow_protocol::SyncStoragePathUsage {
+                label: path.label.to_string(),
+                path: path.path.to_string_lossy().to_string(),
+                bytes: path.bytes,
+            })
+            .collect(),
+    }
+}
+
+#[handler(variant = "SyncStorageBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sync_storage_dispatch(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::SyncStoragePayload as P;
+    let payload = match req {
+        MessageBody::SyncStorageBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected SyncStorageBody")),
+    };
+
+    let res = match payload {
+        P::ReportRequest(_) => {
+            let report = crate::sync::storage_monitor::current_report()
+                .map_err(|e| ProtocolError::internal(format!("sync storage report failed: {e}")))?;
+            P::ReportResponse(sync_storage_report_to_wire(report))
+        }
+        P::ReportResponse(_) => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::SyncStorageBody(res))
+}
+
+::inventory::submit! {
+    crate::dispatch::HandlerMeta {
+        variant_name: "SyncStorageReportRequest",
+        since_major: 1,
+        since_minor: 0,
+        required_auth: crate::dispatch::SessionAuthKind::Admin,
+        metric_name: "tentaflow_ws_handler_sync_storage_report",
+        dispatch_fn: __tentaflow_dispatch_sync_storage_dispatch,
+    }
+}
+
 // =============================================================================
 // Mesh & Network settings (enumeracja IPv4 NIC + bind/advertise rules)
 // =============================================================================
@@ -5334,11 +5425,7 @@ fn parse_bool_setting(raw: &Option<String>, default: bool) -> bool {
 }
 
 fn bool_to_setting(v: bool) -> &'static str {
-    if v {
-        "1"
-    } else {
-        "0"
-    }
+    if v { "1" } else { "0" }
 }
 
 fn load_network_config(
@@ -5668,7 +5755,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqList",
-            ))
+            ));
         }
     };
 
@@ -5750,7 +5837,7 @@ async fn forward_service_action(
             return (
                 false,
                 Some("mesh transport not available on this node".to_string()),
-            )
+            );
         }
     };
     if let Some(security) = ctx.state.mesh_security.as_ref() {
@@ -5796,7 +5883,7 @@ pub async fn service_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqDelete",
-            ))
+            ));
         }
     };
 
@@ -5878,7 +5965,7 @@ pub async fn service_pin(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqPin",
-            ))
+            ));
         }
     };
 
@@ -5939,7 +6026,7 @@ pub async fn service_pause(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqPause",
-            ))
+            ));
         }
     };
 
@@ -6045,7 +6132,7 @@ pub async fn service_start(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqStart",
-            ))
+            ));
         }
     };
 
@@ -6450,9 +6537,9 @@ pub async fn service_vram_hint(
     // Mesh forward NIE jest zaimplementowany dla VramHint — wymagałby
     // proxy nvidia-smi przez QUIC. Local only na razie. `node_id` ignored.
     let exclude_pids: Vec<u32> = Vec::new(); // exclude_service_id mapping na PID
-                                             // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
-                                             // własny serwis zwykle nie liczy się jako zaskakujący duży
-                                             // konsument GPU bo jest dopiero startowany lub stopped.
+    // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
+    // własny serwis zwykle nie liczy się jako zaskakujący duży
+    // konsument GPU bo jest dopiero startowany lub stopped.
     let snapshot =
         crate::services::gpu_snapshot::collect_vram_snapshot(payload.gpu_index, &exclude_pids)
             .await;

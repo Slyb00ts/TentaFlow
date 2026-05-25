@@ -244,7 +244,7 @@ pub async fn handle_ws_connection<S>(
                     0,
                     next_seq(&seq_ui),
                     tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
-                    &Mb::UiChannelCbor(push.cbor),
+                    &Mb::UiChannelCbor(push.cbor.to_vec()),
                     EnvelopeFlags::empty(),
                 )
                 .await;

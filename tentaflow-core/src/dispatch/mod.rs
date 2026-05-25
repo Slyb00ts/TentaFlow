@@ -507,6 +507,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "SyncConflictResolveResponse"
             }
         },
+        MessageBody::SyncStorageBody(p) => match p {
+            tentaflow_protocol::SyncStoragePayload::ReportRequest(_) => "SyncStorageReportRequest",
+            tentaflow_protocol::SyncStoragePayload::ReportResponse(_) => {
+                "SyncStorageReportResponse"
+            }
+        },
         MessageBody::FlowListRequest => "FlowListRequest",
         MessageBody::FlowListResponse { .. } => "FlowListResponse",
         MessageBody::FlowDetailRequest { .. } => "FlowDetailRequest",
@@ -1184,6 +1190,59 @@ mod tests {
         match resp {
             MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::BadRequest),
             _ => panic!("expected bad request"),
+        }
+    }
+
+    #[test]
+    fn sync_storage_report_dispatch_returns_report_for_admin() {
+        with_tmp_home(|| {
+            let home = crate::paths::tentaflow_home();
+            std::fs::create_dir_all(home.join("data")).expect("data dir");
+            std::fs::write(home.join("data/router.db"), vec![1u8; 9]).expect("router db");
+
+            let ctx = sync_test_ctx("admin");
+            let body = MessageBody::SyncStorageBody(
+                tentaflow_protocol::SyncStoragePayload::ReportRequest(
+                    tentaflow_protocol::SyncStorageReportRequest,
+                ),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
+
+            assert!(!is_err);
+            match resp {
+                MessageBody::SyncStorageBody(
+                    tentaflow_protocol::SyncStoragePayload::ReportResponse(response),
+                ) => {
+                    assert_eq!(response.sqlite_bytes, 9);
+                    assert_eq!(
+                        response.large_blob_block_bytes,
+                        crate::sync::storage_monitor::LARGE_BLOB_BLOCK_BYTES
+                    );
+                    assert!(response.paths.iter().any(|path| path.label == "sqlite"));
+                }
+                _ => panic!("expected sync storage report response"),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn sync_storage_report_dispatch_rejects_non_admin() {
+        let ctx = sync_test_ctx("user");
+        let body =
+            MessageBody::SyncStorageBody(tentaflow_protocol::SyncStoragePayload::ReportRequest(
+                tentaflow_protocol::SyncStorageReportRequest,
+            ));
+
+        let (resp, is_err) = dispatch(&body, &ctx).await;
+
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(error) => assert_eq!(error.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected auth error"),
         }
     }
 
