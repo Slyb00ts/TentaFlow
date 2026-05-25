@@ -237,7 +237,9 @@ function assertComponent(c, ctx) {
 
 /// Wyszukuje wartość pola po `u8 key` w `FieldMap`. Zwraca `undefined`
 /// jeśli brak. Per-tag renderery wołają to bezpośrednio z `ctx.readField`.
+/// FieldMap is always an Array of `[u8, Value]` pairs — no object fallback.
 function readField(fields, key) {
+  if (!Array.isArray(fields)) return undefined;
   for (const entry of fields) {
     if (!Array.isArray(entry) || entry.length !== 2) {
       throw new TypeError('FieldMap entry must be [u8, Value]');

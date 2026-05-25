@@ -92,6 +92,16 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
   }
 }
 
+function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
+  if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  for (const entry of fields) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
+    if (!allowedKeys.has(entry[0])) {
+      throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
+    }
+  }
+}
+
 /// BorderToken z `inline.rs` — tagged union `none/hairline/thin/strong/accent{tone}`.
 /// Walidacja per-variant + zwrócenie CSS class fragment.
 function borderTokenToClass(border, ctx) {
@@ -476,7 +486,8 @@ function renderCollapsible(component, ctx) {
 
 export const ACCORDION_TAG = 0x010E;
 const ACCORDION_FIELD_KEYS = new Set([0, 1, 2]);
-const ACCORDION_ITEM_KEYS = new Set(['id', 'header', 'body', 'default_expanded']);
+// AccordionItem: 0=id, 1=header(Component), 2=body(Vec<Component>), 3=default_expanded(bool)
+const ACCORDION_ITEM_KEYS = new Set([0, 1, 2, 3]);
 
 function renderAccordion(component, ctx) {
   assertOnlyKnownFields(component.fields, ACCORDION_FIELD_KEYS, 'Accordion');
@@ -501,18 +512,23 @@ function renderAccordion(component, ctx) {
   // Renderujemy każdy item jako sekcję, sub-elementy zachowują nazwy
   // tf-accordion__item / __header / __body.
   const itemEls = [];
+  // AccordionItem: 0=id, 1=header(Component), 2=body(Vec<Component>), 3=default_expanded(bool)
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    assertOnlyKnownObjectKeys(item, ACCORDION_ITEM_KEYS, `Accordion.items[${i}]`);
-    const itemId = requireString(item.id, `Accordion.items[${i}].id`);
+    if (!Array.isArray(item)) {
+      throw new TypeError(`Accordion.items[${i}] must be FieldMap`);
+    }
+    assertOnlyKnownFieldMapKeys(item, ACCORDION_ITEM_KEYS, `Accordion.items[${i}]`);
+    const itemId = requireString(ctx.readField(item, 0), `Accordion.items[${i}].id`);
     if (itemId.length === 0) {
       throw new TypeError(`Accordion.items[${i}].id must be non-empty`);
     }
-    if (item.header == null || typeof item.header !== 'object') {
+    const itemHeader = ctx.readField(item, 1);
+    if (itemHeader == null || typeof itemHeader !== 'object') {
       throw new TypeError(`Accordion.items[${i}].header must be Component`);
     }
-    const itemBody = requireArray(item.body, `Accordion.items[${i}].body`);
-    requireBool(item.default_expanded, `Accordion.items[${i}].default_expanded`);
+    const itemBody = requireArray(ctx.readField(item, 2), `Accordion.items[${i}].body`);
+    const defaultExpanded = requireBool(ctx.readField(item, 3), `Accordion.items[${i}].default_expanded`);
 
     const itemEl = document.createElement('div');
     itemEl.classList.add('tf-accordion__item');
@@ -522,7 +538,7 @@ function renderAccordion(component, ctx) {
     headerEl.classList.add('tf-accordion__header');
     headerEl.setAttribute('role', 'button');
     headerEl.setAttribute('tabindex', '0');
-    headerEl.appendChild(ctx.renderChild(item.header));
+    headerEl.appendChild(ctx.renderChild(itemHeader));
     itemEl.appendChild(headerEl);
 
     const bodyEl = document.createElement('div');
@@ -560,7 +576,7 @@ function renderAccordion(component, ctx) {
     wrapper.appendChild(itemEl);
     itemEls.push({
       itemId, itemEl, headerEl, bodyEl,
-      defaultExpanded: item.default_expanded === true,
+      defaultExpanded: defaultExpanded === true,
     });
   }
 

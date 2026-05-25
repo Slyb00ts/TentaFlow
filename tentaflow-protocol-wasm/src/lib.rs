@@ -9350,10 +9350,9 @@ fn extract_inline_name(wire: &str) -> Option<&str> {
     Some(&after[..end])
 }
 
-/// Decode a Value::Map using a known InlineMeta to produce text-keyed JS object.
-/// Returns inline struct as FieldMap: `Array<[u8, Value]>` — same format as
-/// Component.fields. This is THE one format for structured data in the SDK.
-/// Renderers use `ctx.readField(fieldmap, key)` to access fields by integer key.
+/// Decode a Value::Map using a known InlineMeta to produce FieldMap format:
+/// JS Array of `[u8_key, value]` pairs — same shape as Component.fields.
+/// Renderers access fields via `ctx.readField(item, integerKey)`.
 fn inline_value_to_js(
     entries: &[(
         tentaflow_sdk_spec::protocol::value::Value,
