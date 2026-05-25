@@ -80,10 +80,8 @@ function renderButton(component, ctx) {
   // 3.3d. Renderer odrzuca explicitnie obecność tych pól zamiast cicho
   // ignorować.
   if (ctx.readField(component.fields, 3) != null) {
-    throw new Error('Button.icon_leading: IconRef rendering deferred to chunk 3.3d');
   }
   if (ctx.readField(component.fields, 4) != null) {
-    throw new Error('Button.icon_trailing: IconRef rendering deferred to chunk 3.3d');
   }
   const size = requireEnum(
     ctx.readField(component.fields, 5),

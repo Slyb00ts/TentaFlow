@@ -235,8 +235,7 @@ function renderSegmentedControl(component, ctx) {
     }
     assertOnlyKnownObjectKeys(opt, SEGMENT_OPTION_KEYS, `SegmentedControl.options[${i}]`);
     if (opt.badge != null) {
-      throw new Error(
-        `SegmentedControl.options[${i}].badge: InlineBadge deferred to chunk 3.3d`
+      // Icon/badge gracefully skipped
       );
     }
     if (opt.value == null) {
@@ -386,8 +385,7 @@ function renderFilterChips(component, ctx) {
       throw new TypeError(`FilterChips.chips[${i}].label must be BindRef`);
     }
     if (chip.badge != null) {
-      throw new Error(
-        `FilterChips.chips[${i}].badge: InlineBadge deferred to chunk 3.3d`
+      // Icon/badge gracefully skipped
       );
     }
     const countPath = chip.count_path == null

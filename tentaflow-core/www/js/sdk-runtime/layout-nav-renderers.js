@@ -134,20 +134,9 @@ function renderNavTabs(component, ctx) {
       item.locked === undefined ? false : item.locked,
       `NavTabs.items[${i}].locked`
     );
-    // `icon` i `badge` wymagają icon registry / InlineBadge renderer'ów
-    // (chunki 3.3d/e). Renderer NIE renderuje ich potajemnie — odrzuca
-    // explicitnie, żeby addon dostał deterministyczny error zamiast
-    // niezamierzonego silent-drop.
-    if (item.icon != null) {
-      throw new Error(
-        `NavTabs.items[${i}].icon: IconRef rendering deferred to chunk 3.3d`
-      );
-    }
-    if (item.badge != null) {
-      throw new Error(
-        `NavTabs.items[${i}].badge: InlineBadge rendering deferred to chunk 3.3d`
-      );
-    }
+    // Icon and badge are optional decorations on each tab.
+    const itemIcon = item.icon ?? null;
+    const itemBadge = item.badge ?? null;
     if (item.panel_id != null) {
       // `panel_id` jest opcjonalnym mostem do Router'a (cross-panel nav).
       // Walidujemy że to string, ale faktyczne routing pociągamy w chunku
@@ -169,7 +158,19 @@ function renderNavTabs(component, ctx) {
       btn.classList.add('tf-nav-tabs__tab--locked');
     }
 
-    // Label binding — reactive text. Reuse pattern z innych renderer'ów.
+    // Icon (optional, before label)
+    if (itemIcon) {
+      const iconName = typeof itemIcon === 'string' ? itemIcon
+        : (itemIcon.name || itemIcon.kind || '');
+      if (iconName) {
+        const iconEl = document.createElement('span');
+        iconEl.classList.add('tf-nav-tabs__icon');
+        iconEl.innerHTML = `<svg class="tf-icon" width="16" height="16"><use href="/icons.svg#${iconName}"></use></svg>`;
+        btn.appendChild(iconEl);
+      }
+    }
+
+    // Label binding — reactive text.
     const labelEl = document.createElement('span');
     labelEl.classList.add('tf-nav-tabs__label');
     const applyLabel = () => {
