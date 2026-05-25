@@ -108,7 +108,6 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
     if (item.badge != null) {
       // InlineBadge ma własny renderer w chunku 3.3d. Tu odrzucamy obecność.
       // Icon/badge gracefully skipped
-      );
     }
     const danger = requireBool(
       item.danger === undefined ? false : item.danger,

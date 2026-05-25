@@ -236,7 +236,6 @@ function renderSegmentedControl(component, ctx) {
     assertOnlyKnownObjectKeys(opt, SEGMENT_OPTION_KEYS, `SegmentedControl.options[${i}]`);
     if (opt.badge != null) {
       // Icon/badge gracefully skipped
-      );
     }
     if (opt.value == null) {
       throw new TypeError(`SegmentedControl.options[${i}].value is required`);
@@ -386,7 +385,6 @@ function renderFilterChips(component, ctx) {
     }
     if (chip.badge != null) {
       // Icon/badge gracefully skipped
-      );
     }
     const countPath = chip.count_path == null
       ? null
