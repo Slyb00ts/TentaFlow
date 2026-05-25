@@ -17,7 +17,8 @@
 // =============================================================================
 
 use tentaflow_protocol::{
-    envelope::{message_kind, Envelope, EnvelopeFlags, Routing},
+    SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
+    envelope::{Envelope, EnvelopeFlags, Routing, message_kind},
     message_body::{
         AddonAdminOnlySetRequest, AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest,
         AddonInstallRequest, AddonLogsRequest, AddonNetworkRulesGetRequest,
@@ -45,7 +46,6 @@ use tentaflow_protocol::{
         SettingsUpdateRequest, SsoProviderCreateRequest, SsoProviderDeleteRequest,
         TranslateRequest, TtsRule,
     },
-    SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
 };
 use wasm_bindgen::prelude::*;
 
@@ -1370,6 +1370,16 @@ pub fn encode_sync_conflict_resolve_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeSyncStorageReportRequest)]
+pub fn encode_sync_storage_report_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SyncStorageBody(
+        tentaflow_protocol::SyncStoragePayload::ReportRequest(
+            tentaflow_protocol::SyncStorageReportRequest,
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::AuditLogExportRequest — eksport CSV z filtrami.
 #[wasm_bindgen(js_name = encodeAuditLogExportRequest)]
 pub fn encode_audit_log_export_request(
@@ -2098,6 +2108,28 @@ fn sync_conflict_resolution_to_str(
         tentaflow_protocol::SyncConflictResolution::KeepLocal => "keep_local",
         tentaflow_protocol::SyncConflictResolution::Ignore => "ignore",
         tentaflow_protocol::SyncConflictResolution::AcceptRemote => "accept_remote",
+    }
+}
+
+fn sync_storage_level_to_str(level: tentaflow_protocol::SyncStoragePressureLevel) -> &'static str {
+    match level {
+        tentaflow_protocol::SyncStoragePressureLevel::Ok => "ok",
+        tentaflow_protocol::SyncStoragePressureLevel::Info => "info",
+        tentaflow_protocol::SyncStoragePressureLevel::Warning => "warning",
+        tentaflow_protocol::SyncStoragePressureLevel::Critical => "critical",
+        tentaflow_protocol::SyncStoragePressureLevel::Unknown => "unknown",
+    }
+}
+
+fn set_optional_u64(obj: &js_sys::Object, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        set(obj, key, (value as f64).into());
+    }
+}
+
+fn set_optional_u32(obj: &js_sys::Object, key: &str, value: Option<u32>) {
+    if let Some(value) = value {
+        set(obj, key, (value as f64).into());
     }
 }
 
@@ -3304,6 +3336,83 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "resolution", resp.resolution.into());
                 set(&obj, "rowsAffected", (resp.rows_affected as f64).into());
                 set(&obj, "rows_affected", (resp.rows_affected as f64).into());
+            }
+        },
+        MessageBody::SyncStorageBody(payload) => match payload {
+            tentaflow_protocol::SyncStoragePayload::ReportRequest(_) => {
+                set(&obj, "variant", "SyncStorageReportRequest".into());
+            }
+            tentaflow_protocol::SyncStoragePayload::ReportResponse(resp) => {
+                set(&obj, "variant", "SyncStorageReportResponse".into());
+                set(&obj, "root", resp.root.into());
+                set(&obj, "level", sync_storage_level_to_str(resp.level).into());
+                set_optional_u64(&obj, "totalBytes", resp.total_bytes);
+                set_optional_u64(&obj, "total_bytes", resp.total_bytes);
+                set_optional_u64(&obj, "availableBytes", resp.available_bytes);
+                set_optional_u64(&obj, "available_bytes", resp.available_bytes);
+                set_optional_u32(&obj, "freePercentBps", resp.free_percent_bps);
+                set_optional_u32(&obj, "free_percent_bps", resp.free_percent_bps);
+                set(&obj, "sqliteBytes", (resp.sqlite_bytes as f64).into());
+                set(&obj, "sqlite_bytes", (resp.sqlite_bytes as f64).into());
+                set(
+                    &obj,
+                    "fjallLedgerBytes",
+                    (resp.fjall_ledger_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "fjall_ledger_bytes",
+                    (resp.fjall_ledger_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "snapshotBlobBytes",
+                    (resp.snapshot_blob_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "snapshot_blob_bytes",
+                    (resp.snapshot_blob_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "finalBlobBytes",
+                    (resp.final_blob_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "final_blob_bytes",
+                    (resp.final_blob_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "pendingBlobChunkBytes",
+                    (resp.pending_blob_chunk_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "pending_blob_chunk_bytes",
+                    (resp.pending_blob_chunk_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "largeBlobBlockBytes",
+                    (resp.large_blob_block_bytes as f64).into(),
+                );
+                set(
+                    &obj,
+                    "large_blob_block_bytes",
+                    (resp.large_blob_block_bytes as f64).into(),
+                );
+                let arr = js_sys::Array::new();
+                for path in resp.paths {
+                    let item = js_sys::Object::new();
+                    set(&item, "label", path.label.into());
+                    set(&item, "path", path.path.into());
+                    set(&item, "bytes", (path.bytes as f64).into());
+                    arr.push(&item);
+                }
+                set(&obj, "paths", arr.into());
             }
         },
         MessageBody::ServiceBody(payload) => decode_service_payload(&obj, payload),
@@ -5292,11 +5401,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::UiChannelCbor(bytes) => {
             set(&obj, "variant", "UiChannelCbor".into());
-            set(
-                &obj,
-                "cbor",
-                js_sys::Uint8Array::from(&bytes[..]).into(),
-            );
+            set(&obj, "cbor", js_sys::Uint8Array::from(&bytes[..]).into());
         }
     }
     Ok(obj.into())
@@ -7260,7 +7365,6 @@ pub fn encode_addon_applications_list_request() -> Result<Vec<u8>, JsError> {
     encode_addon_ui(AddonUiPayload::ReqApplicationsList)
 }
 
-
 // =============================================================================
 // Network settings encoders (interfejsy hosta + konfiguracja bind/filter).
 // Wrapuja NetworkPayload w MessageBody::NetworkBody i serializuja rkyv.
@@ -8734,8 +8838,8 @@ pub fn encode_ui_panel_open(
     viewport_width: u32,
     viewport_height: u32,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_sdk_spec::protocol::ui::panel::{PanelOpen, PanelOpenContext, Viewport};
     use tentaflow_sdk_spec::UiPayload;
+    use tentaflow_sdk_spec::protocol::ui::panel::{PanelOpen, PanelOpenContext, Viewport};
 
     let payload = UiPayload::PanelOpen(PanelOpen {
         addon_id,
@@ -8766,8 +8870,8 @@ pub fn encode_ui_panel_close(
     panel_id: String,
     panel_epoch: u64,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_sdk_spec::protocol::ui::panel::{CloseReason, PanelClose};
     use tentaflow_sdk_spec::UiPayload;
+    use tentaflow_sdk_spec::protocol::ui::panel::{CloseReason, PanelClose};
 
     let payload = UiPayload::PanelClose(PanelClose {
         addon_id,
@@ -8788,8 +8892,8 @@ pub fn encode_ui_action(
     action_id: String,
     params_json: String,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_sdk_spec::protocol::ui::action::Action;
     use tentaflow_sdk_spec::UiPayload;
+    use tentaflow_sdk_spec::protocol::ui::action::Action;
 
     let payload = UiPayload::Action(Action {
         addon_id,
@@ -8812,8 +8916,8 @@ pub fn encode_ui_action(
 pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
     use tentaflow_sdk_spec::UiPayload;
 
-    let payload: UiPayload = minicbor::decode(cbor_bytes)
-        .map_err(|e| JsError::new(&format!("CBOR decode: {e}")))?;
+    let payload: UiPayload =
+        minicbor::decode(cbor_bytes).map_err(|e| JsError::new(&format!("CBOR decode: {e}")))?;
 
     let obj = js_sys::Object::new();
     let tag = payload.tag().as_u16();
@@ -9012,9 +9116,7 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
 // -- Private helpers for UI channel encode/decode --
 
 /// Encodes a UiPayload to CBOR then wraps in MessageBody::UiChannelCbor.
-fn encode_ui_payload_inner(
-    payload: &tentaflow_sdk_spec::UiPayload,
-) -> Result<Vec<u8>, JsError> {
+fn encode_ui_payload_inner(payload: &tentaflow_sdk_spec::UiPayload) -> Result<Vec<u8>, JsError> {
     let mut cbor_buf = Vec::with_capacity(128);
     let mut enc = minicbor::Encoder::new(&mut cbor_buf);
     minicbor::Encode::encode(payload, &mut enc, &mut ())
@@ -9123,7 +9225,11 @@ pub fn decode_state_entries_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> 
             path_arr.push(&seg_obj.into());
         }
         set(&obj, "path", path_arr.into());
-        set(&obj, "value", value_to_js(&entry.value).map_err(|e| JsError::new(&e))?);
+        set(
+            &obj,
+            "value",
+            value_to_js(&entry.value).map_err(|e| JsError::new(&e))?,
+        );
         arr.push(&obj.into());
     }
     Ok(arr.into())
@@ -9160,23 +9266,39 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
         match &op.op {
             PatchOpKind::Set { value } => {
                 set(&obj, "op", "set".into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::Delete => {
                 set(&obj, "op", "delete".into());
             }
             PatchOpKind::AppendArray { value } => {
                 set(&obj, "op", "append_array".into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::PrependArray { value } => {
                 set(&obj, "op", "prepend_array".into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::InsertArray { index, value } => {
                 set(&obj, "op", "insert_array".into());
                 set(&obj, "index", (*index as f64).into());
-                set(&obj, "value", value_to_js(value).map_err(|e| JsError::new(&e))?);
+                set(
+                    &obj,
+                    "value",
+                    value_to_js(value).map_err(|e| JsError::new(&e))?,
+                );
             }
             PatchOpKind::RemoveArray { index } => {
                 set(&obj, "op", "remove_array".into());
@@ -9202,12 +9324,18 @@ pub fn decode_patch_ops_cbor(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
 
 /// Look up the ComponentMeta for a given tag from the schema catalog.
 fn component_meta_for_tag(tag: u16) -> Option<&'static tentaflow_sdk_spec::ComponentMeta> {
-    tentaflow_sdk_spec::ALL_COMPONENTS.iter().find(|m| m.tag == tag).copied()
+    tentaflow_sdk_spec::ALL_COMPONENTS
+        .iter()
+        .find(|m| m.tag == tag)
+        .copied()
 }
 
 /// Look up an InlineMeta by name from the catalog.
 fn inline_meta_by_name(name: &str) -> Option<&'static tentaflow_sdk_spec::InlineMeta> {
-    tentaflow_sdk_spec::ALL_INLINE_STRUCTS.iter().find(|m| m.name == name).copied()
+    tentaflow_sdk_spec::ALL_INLINE_STRUCTS
+        .iter()
+        .find(|m| m.name == name)
+        .copied()
 }
 
 /// Extract the inline struct name from a wire type string like "Inline<NavTab>"
@@ -9223,31 +9351,37 @@ fn extract_inline_name(wire: &str) -> Option<&str> {
 }
 
 /// Decode a Value::Map using a known InlineMeta to produce text-keyed JS object.
+/// Returns inline struct as FieldMap: `Array<[u8, Value]>` — same format as
+/// Component.fields. This is THE one format for structured data in the SDK.
+/// Renderers use `ctx.readField(fieldmap, key)` to access fields by integer key.
 fn inline_value_to_js(
-    entries: &[(tentaflow_sdk_spec::protocol::value::Value, tentaflow_sdk_spec::protocol::value::Value)],
+    entries: &[(
+        tentaflow_sdk_spec::protocol::value::Value,
+        tentaflow_sdk_spec::protocol::value::Value,
+    )],
     meta: &tentaflow_sdk_spec::InlineMeta,
 ) -> Result<JsValue, String> {
     use tentaflow_sdk_spec::protocol::value::Value;
-    let obj = js_sys::Object::new();
+    let arr = js_sys::Array::new();
     for (k, val) in entries {
         let key_idx = match k {
             Value::U64(n) => *n as u8,
             Value::I64(n) => *n as u8,
             _ => continue,
         };
-        let field_name = meta.fields.iter()
-            .find(|f| f.key == key_idx)
-            .map(|f| f.name)
-            .unwrap_or("_unknown");
-        // Recursively decode the value, with inline awareness for nested types
-        let field_wire = meta.fields.iter()
+        let field_wire = meta
+            .fields
+            .iter()
             .find(|f| f.key == key_idx)
             .map(|f| f.wire)
             .unwrap_or("");
         let js_val = value_to_js_with_wire(val, field_wire)?;
-        set(&obj, field_name, js_val);
+        let pair = js_sys::Array::new();
+        pair.push(&(key_idx as f64).into());
+        pair.push(&js_val);
+        arr.push(&pair.into());
     }
-    Ok(obj.into())
+    Ok(arr.into())
 }
 
 /// Like value_to_js but with wire-type context for inline struct resolution.
@@ -9260,14 +9394,20 @@ fn value_to_js_with_wire(
         Value::Array(items) => {
             let arr = js_sys::Array::new();
             let inner_wire = if wire.starts_with("Array<") && wire.ends_with('>') {
-                &wire[6..wire.len()-1]
-            } else { "" };
+                &wire[6..wire.len() - 1]
+            } else {
+                ""
+            };
             for item in items {
                 arr.push(&value_to_js_with_wire(item, inner_wire)?);
             }
             Ok(arr.into())
         }
-        Value::Map(entries) if entries.iter().any(|(k, _)| matches!(k, Value::U64(_) | Value::I64(_))) => {
+        Value::Map(entries)
+            if entries
+                .iter()
+                .any(|(k, _)| matches!(k, Value::U64(_) | Value::I64(_))) =>
+        {
             // Integer-keyed map — try inline struct resolution via wire type context
             if let Some(inline_name) = extract_inline_name(wire) {
                 if let Some(meta) = inline_meta_by_name(inline_name) {
@@ -9295,7 +9435,9 @@ fn value_to_js_with_wire(
     }
 }
 
-fn component_to_js(c: &tentaflow_sdk_spec::protocol::ui::component::Component) -> Result<JsValue, String> {
+fn component_to_js(
+    c: &tentaflow_sdk_spec::protocol::ui::component::Component,
+) -> Result<JsValue, String> {
     let obj = js_sys::Object::new();
     set(&obj, "tag", (c.tag as f64).into());
     set(&obj, "id", c.id.clone().into());
@@ -9434,19 +9576,21 @@ fn try_decode_component_from_value(
 /// every variant is impractical.
 fn encode_decode_to_js<T: minicbor::Encode<()>>(v: &T) -> Result<JsValue, String> {
     let mut buf = Vec::new();
-    minicbor::encode(v, &mut buf)
-        .map_err(|e| format!("encode_decode_to_js encode: {e}"))?;
-    let val: tentaflow_sdk_spec::protocol::value::Value = minicbor::decode(&buf)
-        .map_err(|e| format!("encode_decode_to_js decode: {e}"))?;
+    minicbor::encode(v, &mut buf).map_err(|e| format!("encode_decode_to_js encode: {e}"))?;
+    let val: tentaflow_sdk_spec::protocol::value::Value =
+        minicbor::decode(&buf).map_err(|e| format!("encode_decode_to_js decode: {e}"))?;
     value_to_js(&val)
 }
 
-fn handler_to_js(h: &tentaflow_sdk_spec::protocol::ui::handler::Handler) -> Result<JsValue, String> {
+fn handler_to_js(
+    h: &tentaflow_sdk_spec::protocol::ui::handler::Handler,
+) -> Result<JsValue, String> {
     encode_decode_to_js(h)
 }
 
-
-fn bind_spec_to_js(bs: &tentaflow_sdk_spec::protocol::ui::bind::BindSpec) -> Result<JsValue, String> {
+fn bind_spec_to_js(
+    bs: &tentaflow_sdk_spec::protocol::ui::bind::BindSpec,
+) -> Result<JsValue, String> {
     encode_decode_to_js(bs)
 }
 
