@@ -121,14 +121,7 @@ function renderBreadcrumb(component, ctx) {
     if (item.label == null) {
       throw new TypeError(`Breadcrumb.items[${itemIdx}].label is required`);
     }
-    if (item.icon != null) {
-      // Icon/badge gracefully skipped
-      );
-    }
-    if (item.local_action != null) {
-      // Icon/badge gracefully skipped
-      );
-    }
+    // icon and local_action: gracefully ignored (optional decorations)
     const isCurrent = requireBool(
       item.is_current === undefined ? false : item.is_current,
       `Breadcrumb.items[${itemIdx}].is_current`
