@@ -299,11 +299,17 @@ function handlePanelShell(decoded) {
 
   if (decoded.slots && decoded.slots.length > 0) {
     for (const slotDecl of decoded.slots) {
-      const slotEl = shell.querySelector(`[data-slot-id="${slotDecl.id}"]`);
-      console.log('[addon-app] slot lookup:', slotDecl.id, '→', slotEl ? 'FOUND' : 'NOT FOUND');
-      if (slotEl) {
-        s.slotManager.registerSlot(slotDecl.id, slotEl, slotDecl);
+      let slotEl = shell.querySelector(`[data-slot-id="${slotDecl.id}"]`);
+      // If layout didn't render a slot placeholder, create one and append
+      // to the shell. This is the normal case — the layout contains nav
+      // chrome, and slots hold the panel content below it.
+      if (!slotEl) {
+        slotEl = document.createElement('div');
+        slotEl.setAttribute('data-slot-id', slotDecl.id);
+        slotEl.classList.add('addon-slot');
+        shell.appendChild(slotEl);
       }
+      s.slotManager.registerSlot(slotDecl.id, slotEl, slotDecl);
     }
   }
 }
