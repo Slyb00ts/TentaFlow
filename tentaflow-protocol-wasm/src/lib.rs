@@ -9302,18 +9302,83 @@ fn value_to_js(v: &tentaflow_sdk_spec::protocol::value::Value) -> Result<JsValue
                 }
                 Ok(obj.into())
             } else {
-                // Integer-keyed or mixed: return as array of [key, value] pairs
-                let arr = js_sys::Array::new();
+                // Integer-keyed map (inline struct from minicbor derive).
+                // Resolve field names from the inline schema catalog so JS
+                // renderers see {id, label, icon} instead of {0, 1, 2}.
+                let obj = js_sys::Object::new();
+                // Build a key→name lookup from ALL_INLINE_STRUCTS + ALL_TAGGED_UNIONS.
+                // Match by counting fields: pick the first inline struct whose
+                // field count matches and whose key range covers all present keys.
+                let name_map = resolve_integer_key_names(entries);
                 for (k, val) in entries {
-                    let pair = js_sys::Array::new();
-                    pair.push(&value_to_js(k)?);
-                    pair.push(&value_to_js(val)?);
-                    arr.push(&pair.into());
+                    let key_idx = match k {
+                        Value::U64(n) => *n as u8,
+                        Value::I64(n) => *n as u8,
+                        _ => {
+                            set(&obj, &format!("{k:?}"), value_to_js(val)?);
+                            continue;
+                        }
+                    };
+                    let key_str = name_map.get(&key_idx)
+                        .map(|s| s.as_str())
+                        .unwrap_or(&*key_idx.to_string())
+                        .to_string();
+                    set(&obj, &key_str, value_to_js(val)?);
                 }
-                Ok(arr.into())
+                Ok(obj.into())
             }
         }
     }
+}
+
+/// Resolve integer map keys to text field names by matching against the inline
+/// struct and tagged-union schema catalogs. Returns a map of key→name for all
+/// keys that could be resolved; unresolved keys fall back to their numeric string.
+fn resolve_integer_key_names(
+    entries: &[(tentaflow_sdk_spec::protocol::value::Value, tentaflow_sdk_spec::protocol::value::Value)],
+) -> std::collections::HashMap<u8, String> {
+    use tentaflow_sdk_spec::protocol::value::Value;
+    use tentaflow_sdk_spec::protocol::ui::schema::{ALL_INLINE_STRUCTS, ALL_TAGGED_UNIONS};
+
+    let mut present_keys: Vec<u8> = Vec::new();
+    for (k, _) in entries {
+        match k {
+            Value::U64(n) => present_keys.push(*n as u8),
+            Value::I64(n) => present_keys.push(*n as u8),
+            _ => {}
+        }
+    }
+    present_keys.sort();
+
+    // Check inline structs first — most common case.
+    for meta in ALL_INLINE_STRUCTS {
+        let meta_keys: Vec<u8> = meta.fields.iter().map(|f| f.key).collect();
+        if present_keys.iter().all(|pk| meta_keys.contains(pk)) && !present_keys.is_empty() {
+            let mut map = std::collections::HashMap::new();
+            for f in meta.fields {
+                map.insert(f.key, f.name.to_string());
+            }
+            return map;
+        }
+    }
+
+    // Check tagged union variants (they also have integer-keyed fields).
+    for union_meta in ALL_TAGGED_UNIONS {
+        for variant in union_meta.variants {
+            let variant_keys: Vec<u8> = variant.fields.iter().map(|f| f.key).collect();
+            if present_keys.iter().all(|pk| variant_keys.contains(pk)) && !present_keys.is_empty() {
+                let mut map = std::collections::HashMap::new();
+                for f in variant.fields {
+                    map.insert(f.key, f.name.to_string());
+                }
+                return map;
+            }
+        }
+    }
+
+    // Also check if this is a text-keyed "kind" discriminated union — those use
+    // text keys already, so just fall through with empty map.
+    std::collections::HashMap::new()
 }
 
 /// Attempt to decode a Value as a Component (for embedded children in FieldMap).
