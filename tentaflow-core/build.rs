@@ -156,6 +156,21 @@ fn main() {
                 continue;
             }
 
+            // Validate WASM imports — all host functions MUST use the
+            // "tentaflow" namespace (not "env"). Bare `extern "C"` without
+            // `#[link(wasm_import_module = "tentaflow")]` defaults to "env"
+            // and silently breaks at runtime. Fail the build early.
+            if let Err(bad_imports) = validate_wasm_imports(&wasm_path) {
+                panic!(
+                    "\n\nAddon '{}' — WASM import namespace error!\n\
+                     The following imports use the \"env\" module instead of \"tentaflow\":\n\
+                     {}\n\n\
+                     Fix: add #[link(wasm_import_module = \"tentaflow\")] to the extern \"C\" block \
+                     in the addon's src/lib.rs.\n",
+                    addon_name, bad_imports
+                );
+            }
+
             // Skopiuj bundle (wasm + metadane) do OUT_DIR
             let bundle_addon_dir = bundle_dir.join(&addon_name);
             std::fs::create_dir_all(&bundle_addon_dir).unwrap();
@@ -363,6 +378,8 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
     code.push_str("    pub description_md: &'static str,\n");
     code.push_str("    /// Zawartosc blocks.json (moze byc pusta)\n");
     code.push_str("    pub blocks_json: &'static str,\n");
+    code.push_str("    /// Pliki migracji SQL addona\n");
+    code.push_str("    pub migrations: &'static [(&'static str, &'static str)],\n");
     code.push_str("}\n\n");
 
     code.push_str("/// Lista wszystkich wbudowanych addonow\n");
@@ -374,6 +391,7 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
         let skill_path = addon.bundle_path.join("SKILL.md");
         let desc_path = addon.bundle_path.join("DESCRIPTION.md");
         let blocks_path = addon.bundle_path.join("blocks.json");
+        let migrations_path = addon.bundle_path.join("migrations");
 
         // Plik WASM i manifest musza istniec
         if !wasm_path.exists() || !manifest_path.exists() {
@@ -417,6 +435,29 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
         } else {
             code.push_str("        blocks_json: \"\",\n");
         }
+
+        code.push_str("        migrations: &[\n");
+        if migrations_path.exists() {
+            let mut migrations = std::fs::read_dir(&migrations_path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            migrations.sort_by_key(|entry| entry.file_name());
+            for migration in migrations {
+                let path = migration.path();
+                let name = migration.file_name().to_string_lossy().to_string();
+                code.push_str(&format!(
+                    "            (\"{}\", include_str!(\"{}\")),\n",
+                    name,
+                    escape_path(&path)
+                ));
+            }
+        }
+        code.push_str("        ],\n");
 
         code.push_str("    },\n");
     }
@@ -1840,6 +1881,94 @@ fn check_wasm_browser_target() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Scans WASM binary imports for functions in the "env" module. Returns
+/// Err with a human-readable list if any are found — those indicate a
+/// missing `#[link(wasm_import_module = "tentaflow")]` on the extern block.
+/// Allowed "env" imports: none. Allowed modules: "tentaflow",
+/// "wasi_snapshot_preview1", "wasi".
+fn validate_wasm_imports(wasm_path: &Path) -> Result<(), String> {
+    let bytes = match std::fs::read(wasm_path) {
+        Ok(b) => b,
+        Err(e) => return Err(format!("  (cannot read WASM: {e})")),
+    };
+
+    // Minimal WASM binary parser — just enough to scan the import section.
+    // WASM magic: \0asm, version 1. Sections are (id: u8, size: u32leb128, payload).
+    // Import section id = 2. Each import: (module: str, name: str, desc).
+    let mut bad = Vec::new();
+    let mut pos = 8; // skip magic + version
+    while pos < bytes.len() {
+        let section_id = bytes[pos];
+        pos += 1;
+        let (section_len, adv) = read_leb128_u32(&bytes[pos..]);
+        pos += adv;
+        let section_end = pos + section_len as usize;
+
+        if section_id == 2 {
+            // Import section
+            let mut p = pos;
+            let (count, adv) = read_leb128_u32(&bytes[p..]);
+            p += adv;
+            for _ in 0..count {
+                let (mod_len, adv) = read_leb128_u32(&bytes[p..]);
+                p += adv;
+                let module = std::str::from_utf8(&bytes[p..p + mod_len as usize])
+                    .unwrap_or("?");
+                p += mod_len as usize;
+                let (name_len, adv) = read_leb128_u32(&bytes[p..]);
+                p += adv;
+                let name = std::str::from_utf8(&bytes[p..p + name_len as usize])
+                    .unwrap_or("?");
+                p += name_len as usize;
+                // Skip import descriptor (kind: u8 + type index)
+                let kind = bytes[p];
+                p += 1;
+                let (_idx, adv) = read_leb128_u32(&bytes[p..]);
+                p += adv;
+                if kind == 1 {
+                    // table import: extra (limits)
+                    let _flags = bytes[p]; p += 1;
+                    let (_init, adv) = read_leb128_u32(&bytes[p..]); p += adv;
+                    if _flags & 1 != 0 { let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv; }
+                } else if kind == 2 {
+                    // memory import: (limits)
+                    let _flags = bytes[p]; p += 1;
+                    let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv;
+                    if _flags & 1 != 0 { let (_, adv) = read_leb128_u32(&bytes[p..]); p += adv; }
+                } else if kind == 3 {
+                    // global import: valtype + mut
+                    p += 2;
+                }
+
+                if module == "env" {
+                    bad.push(format!("  env::{name}"));
+                }
+            }
+            break;
+        }
+        pos = section_end;
+    }
+
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join("\n"))
+    }
+}
+
+fn read_leb128_u32(bytes: &[u8]) -> (u32, usize) {
+    let mut result: u32 = 0;
+    let mut shift = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        result |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return (result, i + 1);
+        }
+        shift += 7;
+    }
+    (result, bytes.len())
 }
 
 /// Zwraca wersje zainstalowanego wasm-bindgen CLI (np. "0.2.100") lub None.
