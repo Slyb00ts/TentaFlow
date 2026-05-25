@@ -40,6 +40,8 @@
 #![forbid(unsafe_code)]
 #![deny(unused_must_use)]
 
+pub mod gen_csharp;
+pub mod gen_python;
 pub mod manifest;
 pub mod message;
 pub mod validation;

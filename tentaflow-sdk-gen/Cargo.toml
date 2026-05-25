@@ -18,6 +18,14 @@ path = "src/bin/emit_manifest.rs"
 name = "tentaflow-sdk-gen-self-test"
 path = "src/bin/self_test.rs"
 
+[[bin]]
+name = "tentaflow-sdk-gen-csharp"
+path = "src/bin/gen_csharp.rs"
+
+[[bin]]
+name = "tentaflow-sdk-gen-python"
+path = "src/bin/gen_python.rs"
+
 [dependencies]
 minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive", "std"] }
 tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
