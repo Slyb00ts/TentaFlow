@@ -45,7 +45,7 @@ struct Args {
     #[arg(short = 'q', long = "quic-port")]
     quic_port: Option<u16>,
 
-    /// Sciezka do bazy SQLite (domyslnie <tentaflow_home>/data/router.db)
+    /// Sciezka do bazy SQLite (domyslnie <tentaflow_home>/data/tentaflow.db)
     #[arg(long = "db")]
     db_path: Option<PathBuf>,
 
@@ -221,6 +221,33 @@ async fn run_server(args: Args) -> Result<()> {
         "Mesh identity: {}",
         &local_node_id_str[..16.min(local_node_id_str.len())]
     );
+    match tentaflow_core::sync::runtime::init(db.clone(), mesh_security.clone()) {
+        Ok(_) => {
+            info!("Sync Ledger runtime initialized");
+            match tentaflow_core::addon::storage_sql_exec::drain_installed_sql_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending SQL captures", drained),
+                Err(e) => error!("Sync Ledger SQL capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::core_capture::drain_pending_core_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending core captures", drained),
+                Err(e) => error!("Sync Ledger core capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::kv_capture::drain_pending_kv_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending KV captures", drained),
+                Err(e) => error!("Sync Ledger KV capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::blob_capture::drain_pending_blob_captures(&db, 1000) {
+                Ok(drained) => info!("Sync Ledger drained {} pending blob captures", drained),
+                Err(e) => error!("Sync Ledger blob capture drain failed: {}", e),
+            }
+            match tentaflow_core::sync::runtime::apply_unapplied_inbox(1000) {
+                Ok(Some(applied)) => info!("Sync Ledger applied {} inbox operations", applied),
+                Ok(None) => {}
+                Err(e) => error!("Sync Ledger inbox apply failed: {}", e),
+            }
+        }
+        Err(e) => error!("Sync Ledger runtime init failed: {}", e),
+    }
 
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
