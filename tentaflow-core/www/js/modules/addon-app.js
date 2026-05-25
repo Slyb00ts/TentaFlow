@@ -83,6 +83,7 @@ const AddonAppScreen = {
 
     // Subscribe to unsolicited pushes for this panel
     _session.unsubUnsolicited = client.addUnsolicitedListener(({ envelope, body: msgBody }) => {
+      console.log('[addon-app] unsolicited:', msgBody.variant, msgBody);
       if (msgBody.variant !== 'UiChannelCbor') return;
       handleUiMessage(msgBody.cbor);
     });
@@ -99,10 +100,13 @@ const AddonAppScreen = {
         reject: (err) => { clearTimeout(timer); reject(err); },
       });
     });
+    console.log('[addon-app] sending PanelOpen frame, correlationId:', correlationId);
     client._send(frame);
 
     try {
+      console.log('[addon-app] awaiting PanelOpen response...');
       const { envelope: respEnv, body: respBody } = await openPromise;
+      console.log('[addon-app] PanelOpen response:', respBody.variant, respBody);
       if (respEnv.isError || respBody.variant === 'Error') {
         showError(respBody.message ?? 'Panel open failed');
         return;
@@ -163,6 +167,8 @@ function handleUiMessage(cborBytes) {
   if (!_session) return;
   const s = _session;
 
+  console.log('[addon-app] handleUiMessage, bytes:', cborBytes?.length);
+
   let decoded;
   try {
     decoded = s.wasm.decodeUiPayload(cborBytes);
@@ -170,6 +176,7 @@ function handleUiMessage(cborBytes) {
     console.error('[addon-app] decodeUiPayload failed:', e);
     return;
   }
+  console.log('[addon-app] decoded tag:', '0x' + decoded.tag.toString(16), decoded);
 
   // Filter messages for this panel
   if (decoded.addonId && decoded.addonId !== s.addonId) return;
@@ -177,7 +184,7 @@ function handleUiMessage(cborBytes) {
 
   switch (decoded.tag) {
     case TAG_PANEL_SHELL:
-      handlePanelShell(decoded);
+      try { handlePanelShell(decoded); } catch (e) { console.error('[addon-app] handlePanelShell THREW:', e); }
       break;
     case TAG_PANEL_READY:
       break;
@@ -188,7 +195,7 @@ function handleUiMessage(cborBytes) {
       handlePanelReset(decoded);
       break;
     case TAG_SLOT_CONTENT:
-      handleSlotContent(decoded);
+      try { handleSlotContent(decoded); } catch (e) { console.error('[addon-app] handleSlotContent THREW:', e); }
       break;
     case TAG_SLOT_CLEAR:
       if (s.slotManager) s.slotManager.handleSlotClear({ slot_id: decoded.slotId });
@@ -272,12 +279,16 @@ function handlePanelShell(decoded) {
   if (decoded.layoutCbor && decoded.layoutCbor.byteLength > 0) {
     try {
       const layoutComponent = s.wasm.decodeComponentCbor(decoded.layoutCbor);
+      console.log('[addon-app] layoutComponent:', layoutComponent);
       const layoutEl = s.renderer.render(layoutComponent);
+      console.log('[addon-app] layoutEl:', layoutEl, layoutEl?.outerHTML?.substring(0, 200));
       shell.appendChild(layoutEl);
     } catch (e) {
       console.error('[addon-app] layout render failed:', e);
       shell.innerHTML = `<p class="error">Layout render error: ${escapeHtml(String(e.message))}</p>`;
     }
+  } else {
+    console.warn('[addon-app] no layoutCbor in PanelShell');
   }
 
   // Create SlotManager and register declared slots
@@ -289,6 +300,7 @@ function handlePanelShell(decoded) {
   if (decoded.slots && decoded.slots.length > 0) {
     for (const slotDecl of decoded.slots) {
       const slotEl = shell.querySelector(`[data-slot-id="${slotDecl.id}"]`);
+      console.log('[addon-app] slot lookup:', slotDecl.id, '→', slotEl ? 'FOUND' : 'NOT FOUND');
       if (slotEl) {
         s.slotManager.registerSlot(slotDecl.id, slotEl, slotDecl);
       }

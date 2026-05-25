@@ -9268,7 +9268,15 @@ fn value_to_js(v: &tentaflow_sdk_spec::protocol::value::Value) -> Result<JsValue
         Value::U64(n) => Ok((*n as f64).into()),
         Value::I64(n) => Ok((*n as f64).into()),
         Value::F64(f) => Ok((*f).into()),
-        Value::Bytes(b) => Ok(js_sys::Uint8Array::from(&b[..]).into()),
+        Value::Bytes(b) => {
+            // Children stored as CBOR-encoded Component bytes — try to decode.
+            if let Ok(comp) = minicbor::decode::<tentaflow_sdk_spec::Component>(b) {
+                if let Ok(js) = component_to_js(&comp) {
+                    return Ok(js);
+                }
+            }
+            Ok(js_sys::Uint8Array::from(&b[..]).into())
+        }
         Value::Text(s) => Ok(s.as_str().into()),
         Value::Array(items) => {
             let arr = js_sys::Array::new();
