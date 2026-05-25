@@ -29,6 +29,7 @@
     "logout": "Déconnexion",
     "addons": "Addons",
     "users": "Utilisateurs",
+    "roles_catalog": "Catalogue des rôles",
     "audit": "Journal d'audit",
     "legal": "Documents RGPD",
     "profiling_sessions": "Profilage",

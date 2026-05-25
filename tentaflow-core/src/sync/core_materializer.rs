@@ -3,7 +3,7 @@
 // Opis: Bezpieczne aplikowanie odebranych operacji Core Sync do glownej SQLite.
 // =============================================================================
 
-use super::core_registry::{descriptor_for_table, CoreSyncResourceKind, CORE_SYNC_ADDON_ID};
+use super::core_registry::{CORE_SYNC_ADDON_ID, CoreSyncResourceKind, descriptor_for_table};
 use super::ledger::{ActionType, FieldValue, LedgerResult, SyncLedgerError, SyncOperation};
 use crate::db::DbPool;
 

@@ -224,6 +224,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "core_sync_captures",
             MigrationStep::Sql(CORE_SYNC_CAPTURES),
         ),
+        (
+            46,
+            "kv_sync_captures",
+            MigrationStep::Sql(KV_SYNC_CAPTURES),
+        ),
+        (
+            47,
+            "blob_sync_captures",
+            MigrationStep::Sql(BLOB_SYNC_CAPTURES),
+        ),
     ]
 }
 
@@ -649,6 +659,56 @@ CREATE INDEX IF NOT EXISTS idx_core_sync_captures_resource
     ON __tentaflow_core_sync_captures(org_id, resource_type, resource_id);
 CREATE INDEX IF NOT EXISTS idx_core_sync_captures_operation
     ON __tentaflow_core_sync_captures(operation_id);
+"#;
+
+const KV_SYNC_CAPTURES: &str = r#"
+CREATE TABLE IF NOT EXISTS __tentaflow_kv_sync_captures (
+    capture_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('set','delete')),
+    storage_value BLOB NULL,
+    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+    operation_id TEXT NULL,
+    error_message TEXT NULL,
+    created_at_ms INTEGER NOT NULL,
+    ledgered_at_ms INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kv_sync_captures_status
+    ON __tentaflow_kv_sync_captures(status, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_kv_sync_captures_resource
+    ON __tentaflow_kv_sync_captures(org_id, addon_id, instance_id, storage_key);
+CREATE INDEX IF NOT EXISTS idx_kv_sync_captures_operation
+    ON __tentaflow_kv_sync_captures(operation_id);
+"#;
+
+const BLOB_SYNC_CAPTURES: &str = r#"
+CREATE TABLE IF NOT EXISTS __tentaflow_blob_sync_captures (
+    capture_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    blob_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    file_path TEXT NOT NULL,
+    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+    operation_id TEXT NULL,
+    error_message TEXT NULL,
+    created_at_ms INTEGER NOT NULL,
+    ledgered_at_ms INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_status
+    ON __tentaflow_blob_sync_captures(status, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_sha
+    ON __tentaflow_blob_sync_captures(org_id, sha256);
+CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_operation
+    ON __tentaflow_blob_sync_captures(operation_id);
 "#;
 
 // F2 P2.a — formalise the legal value set for `model_aliases.strategy`.

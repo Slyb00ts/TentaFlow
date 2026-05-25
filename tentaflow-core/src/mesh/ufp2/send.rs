@@ -89,6 +89,61 @@ mod tests {
     }
 
     #[test]
+    fn sync_envelopes_use_sync_ledger_channel() {
+        let key = fresh_key();
+        let source = public_key_bytes(&key);
+        let dest = [0x22u8; NODE_ID_LEN];
+        let cases = [
+            (
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                crate::mesh::ufp2::discriminators::sync_kinds::PUSH,
+            ),
+            (
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                crate::mesh::ufp2::discriminators::sync_kinds::ACK,
+            ),
+            (
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
+                crate::mesh::ufp2::discriminators::sync_kinds::PULL,
+            ),
+            (
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+                crate::mesh::ufp2::discriminators::sync_kinds::PULL_RESPONSE,
+            ),
+            (
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_PULL,
+                crate::mesh::ufp2::discriminators::sync_kinds::SNAPSHOT_PULL,
+            ),
+            (
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+                crate::mesh::ufp2::discriminators::sync_kinds::SNAPSHOT_RESPONSE,
+            ),
+        ];
+
+        for (legacy_discriminator, expected_kind) in cases {
+            let wire = build_signed_envelope_wire(
+                &key,
+                source,
+                dest,
+                legacy_discriminator,
+                b"sync-body".to_vec(),
+                7,
+            )
+            .unwrap();
+
+            let decoded = decode_incoming(&wire).unwrap();
+            assert_eq!(
+                decoded.envelope.channel,
+                tentaflow_sdk_spec::protocol::frame::channel::channels::SYNC_LEDGER
+            );
+            assert_eq!(decoded.envelope.kind, expected_kind);
+            assert_eq!(decoded.legacy_discriminator, legacy_discriminator);
+            verify_envelope(&decoded.envelope).unwrap();
+            validate_envelope(&decoded.envelope).unwrap();
+        }
+    }
+
+    #[test]
     fn signed_envelope_rejects_subject_id_mismatch() {
         let key = fresh_key();
         let other = fresh_key();

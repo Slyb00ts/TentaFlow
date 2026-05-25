@@ -4,10 +4,10 @@
 // =============================================================================
 
 use super::types::{
-    decode, encode, AppendResult, CompactionPolicy, InboxEntry, LedgerResult, NewSyncOperation,
-    OperationId, OperationQuery, OutboxEntry, PartitionHead, PartitionId, PeerCursor, PeerId,
-    RepairQueueEntry, SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation,
-    SyncOperationSigner, SyncOperationVerifier, SyncSnapshot, SyncTarget,
+    AppendResult, CompactionPolicy, InboxEntry, LedgerResult, NewSyncOperation, OperationId,
+    OperationQuery, OutboxEntry, PartitionHead, PartitionId, PeerCursor, PeerId, RepairQueueEntry,
+    SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner,
+    SyncOperationVerifier, SyncSnapshot, SyncTarget, decode, encode,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
@@ -822,10 +822,12 @@ mod tests {
         drop(store);
 
         let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
-        assert!(reopened
-            .list_due_repair_requests(peer.clone(), 200, 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            reopened
+                .list_due_repair_requests(peer.clone(), 200, 10)
+                .unwrap()
+                .is_empty()
+        );
         let due = reopened
             .list_due_repair_requests(peer.clone(), 500, 10)
             .unwrap();
@@ -836,10 +838,12 @@ mod tests {
         reopened
             .remove_repair_request(peer.clone(), partition.clone())
             .unwrap();
-        assert!(reopened
-            .list_due_repair_requests(peer, 1_000, 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            reopened
+                .list_due_repair_requests(peer, 1_000, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

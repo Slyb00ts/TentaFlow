@@ -3,7 +3,9 @@
 // UI host functions — CBOR-based UI channel + notifications.
 // =============================================================================
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tracing::info;
 
@@ -13,6 +15,13 @@ use super::{
 };
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
 use tentaflow_sdk_spec::{validate_canonical, UiTag};
+
+// Thread-local reusable buffer for guest CBOR bytes. Avoids a fresh heap
+// allocation + deallocation on every ui_render_cbor call.  The buffer grows
+// to high-water-mark and stays allocated across calls on the same thread.
+thread_local! {
+    static CBOR_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
+}
 
 // =============================================================================
 // ui_render_cbor — CBOR UI payload from addon guest
@@ -33,13 +42,9 @@ pub fn ui_render_cbor(
         None => return ABI_ERR_OPERATION,
     };
 
-    // Detach guest memory borrow before any caller.data() access.
-    let cbor_bytes = match read_guest_bytes(&memory, &caller, cbor_ptr, cbor_len) {
-        Some(b) => b.to_vec(),
-        None => return ABI_ERR_OPERATION,
-    };
-
-    if enforce_payload_size(cbor_bytes.len(), PayloadKind::UiRender).is_err() {
+    // Size check before copying — avoids allocation for oversized payloads.
+    let payload_len = cbor_len as usize;
+    if enforce_payload_size(payload_len, PayloadKind::UiRender).is_err() {
         audit_log(
             caller.data(),
             "ui.render_cbor",
@@ -50,6 +55,20 @@ pub fn ui_render_cbor(
         );
         return ABI_ERR_OPERATION;
     }
+
+    // Copy guest bytes into a thread-local reusable buffer.  The buffer
+    // grows to high-water-mark and stays allocated across calls on the
+    // same thread, eliminating per-call alloc/dealloc overhead.
+    let cbor_bytes: Vec<u8> = match CBOR_BUF.with(|cell| {
+        let guest_slice = read_guest_bytes(&memory, &caller, cbor_ptr, cbor_len)?;
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(guest_slice);
+        Some(buf.clone())
+    }) {
+        Some(v) => v,
+        None => return ABI_ERR_OPERATION,
+    };
 
     if !check_permission(caller.data(), "ui", None) {
         audit_log(
@@ -65,9 +84,8 @@ pub fn ui_render_cbor(
 
     // Validate canonical CBOR encoding (RFC 8949 Core Deterministic).
     if let Err(e) = validate_canonical(&cbor_bytes) {
-        let addon_id = caller.data().addon_id.clone();
         tracing::warn!(
-            addon = %addon_id,
+            addon = %caller.data().addon_id,
             bytes = cbor_bytes.len(),
             error = %e,
             "ui_render_cbor: canonical CBOR validation failed"
@@ -87,9 +105,8 @@ pub fn ui_render_cbor(
     let tag = match extract_ui_tag(&cbor_bytes) {
         Some(t) => t,
         None => {
-            let addon_id = caller.data().addon_id.clone();
             tracing::warn!(
-                addon = %addon_id,
+                addon = %caller.data().addon_id,
                 bytes = cbor_bytes.len(),
                 "ui_render_cbor: unknown or malformed UI tag"
             );
@@ -105,6 +122,9 @@ pub fn ui_render_cbor(
         }
     };
 
+    // Single clone of addon_id — used by session validation, cache key,
+    // event bus payload, and tracing.  All error paths above borrow from
+    // caller.data() directly to avoid cloning on rejection.
     let addon_id = caller.data().addon_id.clone();
 
     // Validate outbound slot/shell messages against session state.
@@ -132,148 +152,21 @@ pub fn ui_render_cbor(
                 session.grant_credits(256);
             }
 
-            match tag {
-                UiTag::PanelShell => {
-                    if let Err(e) = handle_panel_shell_registration(&cbor_bytes, &mut session, &addon_id) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: PanelShell registration rejected: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                UiTag::SlotContent | UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
-                    if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(&cbor_bytes) {
-                        if let Err(e) = session.validate_slot_ownership(&addon_id, &panel_id, &slot_id) {
-                            tracing::warn!(
-                                addon = %addon_id,
-                                panel = %panel_id,
-                                slot = %slot_id,
-                                "ui_render_cbor: slot ownership violation: {e}"
-                            );
-                            audit_log(
-                                caller.data(),
-                                "ui.render_cbor",
-                                Some("ui"),
-                                None,
-                                "denied",
-                                Some(&format!("slot_ownership_violation: {e}")),
-                            );
-                            return ABI_ERR_OPERATION;
-                        }
-                    }
-                }
-                UiTag::StateSnapshot => {
-                    if let Err(e) = handle_state_snapshot(&cbor_bytes, &mut session, &addon_id) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: StateSnapshot rejected: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                UiTag::StatePatch => {
-                    if let Err(e) = handle_state_patch(&cbor_bytes, &mut session, &addon_id) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: StatePatch rejected: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                UiTag::StateReset => {
-                    if let Err(e) = handle_state_reset(&cbor_bytes, &mut session, &addon_id) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: StateReset rejected: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                UiTag::Command => {
-                    if let Err(e) = validate_command_security(&cbor_bytes) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: Command security validation failed: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                UiTag::Event => {
-                    if let Err(e) = validate_event_topic(&cbor_bytes, &addon_id, &session) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: Event topic validation failed: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                UiTag::Batch => {
-                    if let Err(e) = validate_batch(&cbor_bytes, &addon_id, &mut session) {
-                        tracing::warn!(
-                            addon = %addon_id,
-                            "ui_render_cbor: Batch validation failed: {e}"
-                        );
-                        audit_log(
-                            caller.data(),
-                            "ui.render_cbor",
-                            Some("ui"),
-                            None,
-                            "denied",
-                            Some(&e),
-                        );
-                        return ABI_ERR_OPERATION;
-                    }
-                }
-                _ => {}
+            if let Err(e) = validate_tag_session(&cbor_bytes, tag, &addon_id, &mut session) {
+                tracing::warn!(
+                    addon = %addon_id,
+                    tag = tag.as_u16(),
+                    "ui_render_cbor: tag validation rejected: {e}"
+                );
+                audit_log(
+                    caller.data(),
+                    "ui.render_cbor",
+                    Some("ui"),
+                    None,
+                    "denied",
+                    Some(&e),
+                );
+                return ABI_ERR_OPERATION;
             }
         }
     }
@@ -289,11 +182,13 @@ pub fn ui_render_cbor(
     // Key uses "cbor_msg" as the panel slot — the actual panel routing
     // happens downstream in the CBOR dispatch layer.
     let cache_user_id = caller.data().user_id;
+    let cbor_arc: Arc<[u8]> = cbor_bytes.into();
+
     if let Some(cache) = caller.data().ui_panels.clone() {
         let key_user = cache_user_id.unwrap_or(0);
         cache.write().insert(
-            (key_user, addon_id.clone(), "cbor_msg".to_string()),
-            cbor_bytes.clone(),
+            (key_user, addon_id.clone(), "cbor_msg".into()),
+            cbor_arc.to_vec(),
         );
     }
 
@@ -302,35 +197,57 @@ pub fn ui_render_cbor(
         .data()
         .event_bus
         .publish(crate::addon::event_bus::Event {
-            event_type: "ui.cbor_message".to_string(),
-            source_addon: Some(addon_id.clone()),
+            event_type: "ui.cbor_message".into(),
+            source_addon: Some(addon_id),
             source_user: cache_user_id,
             payload: serde_json::json!({
-                "addon_id": &addon_id,
                 "tag": tag.as_u16(),
-                "cbor": cbor_bytes,
+                "cbor": &*cbor_arc,
             }),
             timestamp: chrono::Utc::now(),
         });
 
     // Publish to tokio broadcast for WS push to the frontend connection.
+    // Arc<[u8]> avoids cloning CBOR payload per broadcast subscriber.
     crate::dispatch::ui_cbor_broadcast::publish(
         crate::dispatch::ui_cbor_broadcast::UiCborPush {
             user_id: cache_user_id.unwrap_or(0),
-            cbor: cbor_bytes,
+            cbor: cbor_arc,
         },
     );
 
-    audit_log(
-        caller.data(),
-        "ui.render_cbor",
-        Some("ui"),
-        None,
-        "ok",
-        None,
-    );
-
     ABI_OK
+}
+
+/// Validates tag-specific session constraints.  Consolidates per-tag match
+/// arms to keep the main function lean and avoid duplicated audit_log/warn.
+fn validate_tag_session(
+    cbor_bytes: &[u8],
+    tag: UiTag,
+    addon_id: &str,
+    session: &mut crate::addon::ui_session::SessionState,
+) -> Result<(), String> {
+    match tag {
+        UiTag::PanelShell => {
+            handle_panel_shell_registration(cbor_bytes, session, addon_id)
+        }
+        UiTag::SlotContent | UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
+            if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(cbor_bytes) {
+                session
+                    .validate_slot_ownership(addon_id, &panel_id, &slot_id)
+                    .map_err(|e| format!("slot_ownership_violation: {e}"))
+            } else {
+                Ok(())
+            }
+        }
+        UiTag::StateSnapshot => handle_state_snapshot(cbor_bytes, session, addon_id),
+        UiTag::StatePatch => handle_state_patch(cbor_bytes, session, addon_id),
+        UiTag::StateReset => handle_state_reset(cbor_bytes, session, addon_id),
+        UiTag::Command => validate_command_security(cbor_bytes),
+        UiTag::Event => validate_event_topic(cbor_bytes, addon_id, session),
+        UiTag::Batch => validate_batch(cbor_bytes, addon_id, session),
+        _ => Ok(()),
+    }
 }
 
 /// Decode the outer CBOR array to extract the UI tag (u16).

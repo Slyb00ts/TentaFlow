@@ -1,21 +1,39 @@
 // =============================================================================
-// File: mesh/ufp2/discriminators.rs — MESH_MSG_* ↔ UFP/2 Kind mapping
-// Purpose: bidirectional mapping between the legacy 1-byte mesh
-// discriminators (0x10..=0x4C, defined in `tentaflow_protocol::mesh`) and
-// UFP/2 `Kind` values under `channel = 0x04 Mesh`. UFP/2 promotes the u8
-// discriminant to u16; we keep the low byte equal to the legacy value so
-// debugging and audit logs remain trivially readable across the migration.
+// File: mesh/ufp2/discriminators.rs — internal mesh dispatch to UFP/2 mapping
+// Purpose: map the internal 1-byte mesh dispatch ids to their UFP/2
+// `(channel, kind)`. Steady-state mesh frames stay on `channel=0x04 Mesh`;
+// sync frames use `channel=0x06 SyncLedger` while still returning the
+// internal dispatch id to the existing runtime.
 // =============================================================================
 
 use tentaflow_protocol::mesh as legacy;
-use tentaflow_sdk_spec::protocol::frame::channel::Kind;
+use tentaflow_sdk_spec::protocol::frame::channel::{channels, Channel, Kind};
 
 /// Convert a legacy MESH_MSG_* u8 discriminator into the matching UFP/2
-/// `Kind` value. Every kind on channel 0x04 (Mesh) keeps `low_byte ==
-/// legacy discriminator`, so 0x0010 ↔ HEARTBEAT, 0x0024 ↔ TRUSTED_KEYS_SYNC,
-/// etc.
+/// `Kind` value. Mesh-channel kinds keep `low_byte == legacy discriminator`;
+/// sync-channel kinds use the compact SyncLedger catalog ids 1..6.
 pub const fn kind_from_legacy(disc: u8) -> Kind {
-    Kind(disc as u16)
+    match disc {
+        legacy::MESH_MSG_SYNC_PUSH => sync_kinds::PUSH,
+        legacy::MESH_MSG_SYNC_ACK => sync_kinds::ACK,
+        legacy::MESH_MSG_SYNC_PULL => sync_kinds::PULL,
+        legacy::MESH_MSG_SYNC_PULL_RESPONSE => sync_kinds::PULL_RESPONSE,
+        legacy::MESH_MSG_SYNC_SNAPSHOT_PULL => sync_kinds::SNAPSHOT_PULL,
+        legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE => sync_kinds::SNAPSHOT_RESPONSE,
+        _ => Kind(disc as u16),
+    }
+}
+
+pub const fn channel_from_legacy(disc: u8) -> Channel {
+    match disc {
+        legacy::MESH_MSG_SYNC_PUSH
+        | legacy::MESH_MSG_SYNC_ACK
+        | legacy::MESH_MSG_SYNC_PULL
+        | legacy::MESH_MSG_SYNC_PULL_RESPONSE
+        | legacy::MESH_MSG_SYNC_SNAPSHOT_PULL
+        | legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE => channels::SYNC_LEDGER,
+        _ => channels::MESH,
+    }
 }
 
 /// Convert a UFP/2 `Kind` on the Mesh channel back to its legacy u8
@@ -26,6 +44,24 @@ pub const fn kind_from_legacy(disc: u8) -> Kind {
 /// for an unmigrated message type — the legacy wire is the only valid
 /// path for those until their 4c2.x migration commit.
 pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
+    legacy_from_channel_kind(channels::MESH, kind)
+}
+
+pub fn legacy_from_channel_kind(channel: Channel, kind: Kind) -> Option<u8> {
+    if channel == channels::SYNC_LEDGER {
+        return match kind {
+            sync_kinds::PUSH => Some(legacy::MESH_MSG_SYNC_PUSH),
+            sync_kinds::ACK => Some(legacy::MESH_MSG_SYNC_ACK),
+            sync_kinds::PULL => Some(legacy::MESH_MSG_SYNC_PULL),
+            sync_kinds::PULL_RESPONSE => Some(legacy::MESH_MSG_SYNC_PULL_RESPONSE),
+            sync_kinds::SNAPSHOT_PULL => Some(legacy::MESH_MSG_SYNC_SNAPSHOT_PULL),
+            sync_kinds::SNAPSHOT_RESPONSE => Some(legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE),
+            _ => None,
+        };
+    }
+    if channel != channels::MESH {
+        return None;
+    }
     if kind.0 > u8::MAX as u16 {
         return None;
     }
@@ -35,6 +71,17 @@ pub fn legacy_from_kind(kind: Kind) -> Option<u8> {
     } else {
         None
     }
+}
+
+pub mod sync_kinds {
+    use super::Kind;
+
+    pub const PUSH: Kind = Kind(0x0001);
+    pub const ACK: Kind = Kind(0x0002);
+    pub const PULL: Kind = Kind(0x0003);
+    pub const PULL_RESPONSE: Kind = Kind(0x0004);
+    pub const SNAPSHOT_PULL: Kind = Kind(0x0005);
+    pub const SNAPSHOT_RESPONSE: Kind = Kind(0x0006);
 }
 
 /// True iff `disc` is a `MESH_MSG_*` discriminator whose send path has
@@ -122,12 +169,12 @@ pub mod kinds {
     pub const HMAC_KEYS_SYNC: Kind = Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16);
     pub const FRAME_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_REQUEST as u16);
     pub const FRAME_PROXY_RESPONSE: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_RESPONSE as u16);
-    pub const SYNC_PUSH: Kind = Kind(legacy::MESH_MSG_SYNC_PUSH as u16);
-    pub const SYNC_ACK: Kind = Kind(legacy::MESH_MSG_SYNC_ACK as u16);
-    pub const SYNC_PULL: Kind = Kind(legacy::MESH_MSG_SYNC_PULL as u16);
-    pub const SYNC_PULL_RESPONSE: Kind = Kind(legacy::MESH_MSG_SYNC_PULL_RESPONSE as u16);
-    pub const SYNC_SNAPSHOT_PULL: Kind = Kind(legacy::MESH_MSG_SYNC_SNAPSHOT_PULL as u16);
-    pub const SYNC_SNAPSHOT_RESPONSE: Kind = Kind(legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE as u16);
+    pub const SYNC_PUSH: Kind = super::sync_kinds::PUSH;
+    pub const SYNC_ACK: Kind = super::sync_kinds::ACK;
+    pub const SYNC_PULL: Kind = super::sync_kinds::PULL;
+    pub const SYNC_PULL_RESPONSE: Kind = super::sync_kinds::PULL_RESPONSE;
+    pub const SYNC_SNAPSHOT_PULL: Kind = super::sync_kinds::SNAPSHOT_PULL;
+    pub const SYNC_SNAPSHOT_RESPONSE: Kind = super::sync_kinds::SNAPSHOT_RESPONSE;
 }
 
 #[cfg(test)]
@@ -259,6 +306,40 @@ mod tests {
                 "kind 0x{:04X} outside Mesh channel range 0x0010..=0x004C",
                 k.0
             );
+        }
+    }
+
+    #[test]
+    fn sync_discriminators_use_sync_ledger_channel_kinds() {
+        let cases = [
+            (legacy::MESH_MSG_SYNC_PUSH, sync_kinds::PUSH),
+            (legacy::MESH_MSG_SYNC_ACK, sync_kinds::ACK),
+            (legacy::MESH_MSG_SYNC_PULL, sync_kinds::PULL),
+            (
+                legacy::MESH_MSG_SYNC_PULL_RESPONSE,
+                sync_kinds::PULL_RESPONSE,
+            ),
+            (
+                legacy::MESH_MSG_SYNC_SNAPSHOT_PULL,
+                sync_kinds::SNAPSHOT_PULL,
+            ),
+            (
+                legacy::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+                sync_kinds::SNAPSHOT_RESPONSE,
+            ),
+        ];
+
+        for (legacy_discriminator, sync_kind) in cases {
+            assert_eq!(
+                channel_from_legacy(legacy_discriminator),
+                channels::SYNC_LEDGER
+            );
+            assert_eq!(kind_from_legacy(legacy_discriminator), sync_kind);
+            assert_eq!(
+                legacy_from_channel_kind(channels::SYNC_LEDGER, sync_kind),
+                Some(legacy_discriminator)
+            );
+            assert_eq!(legacy_from_channel_kind(channels::MESH, sync_kind), None);
         }
     }
 }

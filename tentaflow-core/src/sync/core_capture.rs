@@ -11,7 +11,7 @@ use anyhow::Result;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use super::core_registry::{descriptor_for_kind, CoreSyncResourceKind};
+use super::core_registry::{CoreSyncResourceKind, descriptor_for_kind};
 use super::ledger::FieldValue;
 use super::runtime::SqlWriteAction;
 

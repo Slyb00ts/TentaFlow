@@ -237,18 +237,16 @@ function handlePanelShell(decoded) {
     panel_epoch: decoded.panelEpoch,
   });
 
-  // Apply initial state if present
-  if (decoded.initialStateCbor && decoded.initialStateCbor.byteLength > 0) {
+  if (decoded.initialState) {
     try {
-      const entries = s.wasm.decodeStateEntriesCbor(decoded.initialStateCbor);
       s.store.applySnapshot({
-        entries,
+        entries: decoded.initialState,
         state_revision: 0,
         truncated: false,
         panel_epoch: decoded.panelEpoch,
       });
     } catch (e) {
-      console.error('[addon-app] initial state decode failed:', e);
+      console.error('[addon-app] initial state apply failed:', e);
     }
   }
 
@@ -276,19 +274,14 @@ function handlePanelShell(decoded) {
 
   shell.innerHTML = '';
 
-  if (decoded.layoutCbor && decoded.layoutCbor.byteLength > 0) {
+  if (decoded.layout) {
     try {
-      const layoutComponent = s.wasm.decodeComponentCbor(decoded.layoutCbor);
-      console.log('[addon-app] layoutComponent:', layoutComponent);
-      const layoutEl = s.renderer.render(layoutComponent);
-      console.log('[addon-app] layoutEl:', layoutEl, layoutEl?.outerHTML?.substring(0, 200));
+      const layoutEl = s.renderer.render(decoded.layout);
       shell.appendChild(layoutEl);
     } catch (e) {
       console.error('[addon-app] layout render failed:', e);
       shell.innerHTML = `<p class="error">Layout render error: ${escapeHtml(String(e.message))}</p>`;
     }
-  } else {
-    console.warn('[addon-app] no layoutCbor in PanelShell');
   }
 
   // Create SlotManager and register declared slots
@@ -317,18 +310,7 @@ function handlePanelShell(decoded) {
 function handleSlotContent(decoded) {
   const s = _session;
   if (!s || !s.slotManager) return;
-
-  let fragment = null;
-  if (decoded.fragmentCbor && decoded.fragmentCbor.byteLength > 0) {
-    try {
-      fragment = s.wasm.decodeComponentCbor(decoded.fragmentCbor);
-    } catch (e) {
-      console.error('[addon-app] fragment decode failed:', e);
-      return;
-    }
-  }
-
-  s.slotManager.handleSlotContent({ slot_id: decoded.slotId, fragment });
+  s.slotManager.handleSlotContent({ slot_id: decoded.slotId, fragment: decoded.fragment });
 }
 
 function handleStateSnapshot(decoded) {
@@ -336,15 +318,14 @@ function handleStateSnapshot(decoded) {
   if (!s || !s.store) return;
 
   try {
-    const entries = s.wasm.decodeStateEntriesCbor(decoded.entriesCbor);
     s.store.applySnapshot({
-      entries,
+      entries: decoded.entries,
       state_revision: decoded.stateRevision,
       truncated: decoded.truncated,
       panel_epoch: decoded.panelEpoch,
     });
   } catch (e) {
-    console.error('[addon-app] state snapshot decode failed:', e);
+    console.error('[addon-app] state snapshot apply failed:', e);
   }
 }
 
@@ -353,15 +334,14 @@ function handleStatePatch(decoded) {
   if (!s || !s.store) return;
 
   try {
-    const ops = s.wasm.decodePatchOpsCbor(decoded.opsCbor);
     s.store.applyPatch({
       base_revision: decoded.baseRevision,
       new_revision: decoded.newRevision,
-      ops,
+      ops: decoded.ops,
       panel_epoch: decoded.panelEpoch,
     });
   } catch (e) {
-    console.error('[addon-app] state patch decode failed:', e);
+    console.error('[addon-app] state patch apply failed:', e);
   }
 }
 

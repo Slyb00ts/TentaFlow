@@ -28,9 +28,9 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::services::rbac::OrgContext;
 use crate::services::role_catalog::{
-    create_role, deactivate_role, get_role, get_role_by_slug, list_active_locales, list_roles,
-    update_role, PlatformLocale, Role, RoleCatalogError, RoleCreateInput, RoleKind, RoleListFilter,
-    RoleUpdateInput, VisibilityScope,
+    PlatformLocale, Role, RoleCatalogError, RoleCreateInput, RoleKind, RoleListFilter,
+    RoleUpdateInput, VisibilityScope, create_role, deactivate_role, get_role, get_role_by_slug,
+    list_active_locales, list_roles, update_role,
 };
 
 // =============================================================================

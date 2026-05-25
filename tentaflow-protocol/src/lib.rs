@@ -36,16 +36,12 @@ pub use camera::{
     CameraDiscoverResponse, CameraFrameUrlRequest, CameraFrameUrlResponse, DiscoveredCameraInfo,
 };
 pub use envelope::{
-    message_kind, Envelope, EnvelopeFlags, Routing, SessionAuth, SignedSessionClaim, SCHEMA_VERSION,
+    Envelope, EnvelopeFlags, Routing, SCHEMA_VERSION, SessionAuth, SignedSessionClaim, message_kind,
 };
 pub use legal::{
     LegalAdminPayload, LegalDocumentGenerateRequest, LegalDocumentGenerateResponse,
     LegalDocumentRevokeRequest, LegalDocumentRevokeResponse, LegalDocumentSummary,
     LegalDocumentsListRequest, LegalDocumentsListResponse,
-};
-pub use stream::{
-    StreamCloseRequest, StreamClosedPayload, StreamFramePayload, StreamPayload,
-    StreamSubscribeRequest, StreamSubscribeResponse,
 };
 pub use mesh::*;
 pub use message_body::{
@@ -141,6 +137,13 @@ pub use message_body::{
     AuthLoginRequest,
     AuthLoginResponse,
     AuthMeResponse,
+    BROWSER_CAPTURE_FAILED,
+    BROWSER_CAPTURE_FORBIDDEN,
+    BROWSER_CAPTURE_KIND_DOM,
+    BROWSER_CAPTURE_KIND_SCREENSHOT,
+    BROWSER_CAPTURE_NOT_FOUND,
+    BROWSER_CAPTURE_OK,
+    BROWSER_CAPTURE_REMOTE_NODE,
     BrowserCapturePayload,
     BrowserCaptureRequest,
     BrowserCaptureResponse,
@@ -173,6 +176,7 @@ pub use message_body::{
     ClusterUpdateRequest,
     ClusterUpdateResponse,
     ContainerLogChunk,
+    ContainerPayload,
     ContainerSummary,
     DashboardSnapshot,
     DeployVllmConfig,
@@ -384,6 +388,18 @@ pub use message_body::{
     SsoProviderDeleteResponse,
     SsoProviderEntry,
     SsoProvidersListResponse,
+    SyncConflictPayload,
+    SyncConflictResolution,
+    SyncConflictResolveRequest,
+    SyncConflictResolveResponse,
+    SyncConflictRow,
+    SyncConflictsListRequest,
+    SyncConflictsListResponse,
+    SyncStoragePathUsage,
+    SyncStoragePayload,
+    SyncStoragePressureLevel,
+    SyncStorageReportRequest,
+    SyncStorageReportResponse,
     SystemEventPayload,
     TlsStatusResponse,
     TranslatePayload,
@@ -393,6 +409,12 @@ pub use message_body::{
     UserInfo,
     UserOAuthAccountRow,
     UsersListResponse,
+    VNC_TUNNEL_OPEN_FAILED,
+    VNC_TUNNEL_OPEN_FORBIDDEN,
+    VNC_TUNNEL_OPEN_NO_PORT,
+    VNC_TUNNEL_OPEN_NOT_FOUND,
+    VNC_TUNNEL_OPEN_OK,
+    VNC_TUNNEL_OPEN_REMOTE_NODE,
     VncTunnelChunk,
     VncTunnelCloseRequest,
     VncTunnelCloseResponse,
@@ -405,19 +427,6 @@ pub use message_body::{
     VoiceProfileSummary,
     WakeWord,
     WakeWordOp,
-    BROWSER_CAPTURE_FAILED,
-    BROWSER_CAPTURE_FORBIDDEN,
-    BROWSER_CAPTURE_KIND_DOM,
-    BROWSER_CAPTURE_KIND_SCREENSHOT,
-    BROWSER_CAPTURE_NOT_FOUND,
-    BROWSER_CAPTURE_OK,
-    BROWSER_CAPTURE_REMOTE_NODE,
-    VNC_TUNNEL_OPEN_FAILED,
-    VNC_TUNNEL_OPEN_FORBIDDEN,
-    VNC_TUNNEL_OPEN_NOT_FOUND,
-    VNC_TUNNEL_OPEN_NO_PORT,
-    VNC_TUNNEL_OPEN_OK,
-    VNC_TUNNEL_OPEN_REMOTE_NODE,
 };
 pub use pii::PiiRulePayload;
 pub use profiling::{
@@ -431,6 +440,10 @@ pub use profiling::{
     ProfilingSessionsResponse, ProfilingSkippedCollector, ProfilingStartRequest,
     ProfilingStartResponse, ProfilingStopRequest, ProfilingStopResponse,
     ProfilingValidateSudoRequest, ProfilingValidateSudoResponse, TimelineEvent, TransferKind,
+};
+pub use stream::{
+    StreamCloseRequest, StreamClosedPayload, StreamFramePayload, StreamPayload,
+    StreamSubscribeRequest, StreamSubscribeResponse,
 };
 pub use types::*;
 pub use vision::{

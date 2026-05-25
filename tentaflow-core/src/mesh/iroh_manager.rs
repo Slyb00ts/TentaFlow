@@ -4,7 +4,7 @@
 //       rozni sie transportem (iroh QUIC + relay + LAN mDNS + DHT pkarr) i
 //       brakiem warstwy AEAD (TLS 1.3 iroh wystarcza). Trzyma mape aktywnych
 //       polaczen po EndpointId, emituje zdarzenia do broadcast::Receiver.
-//       Message format na bidi streamie: [1 bajt discriminant][payload].
+//       Uni streamy mesh przenosza podpisane envelope UFP/2.
 // =============================================================================
 
 use std::collections::HashMap;
@@ -1064,16 +1064,33 @@ impl IrohMeshManager {
             )
         })?;
         let source_pubkey = self.security.verifying_key_bytes();
+        let epoch = self.current_policy_epoch();
         let wire = crate::mesh::ufp2::build_signed_envelope_wire(
             self.security.signing_key(),
             source_pubkey,
             dest_pubkey,
             legacy_discriminator,
             data.to_vec(),
-            0, // policy_epoch placeholder — live tracking lands in a later chunk
+            epoch,
         )
         .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))?;
         self.send_raw_envelope_to_peer(target_node_id, &wire).await
+    }
+
+    fn current_policy_epoch(&self) -> u32 {
+        crate::db::repository::get_sync_permission_epoch(
+            &self.security.db,
+            crate::services::org::DEFAULT_ORG_ID,
+        )
+        .map(|epoch| epoch.min(u32::MAX as u64) as u32)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "mesh::ufp2",
+                error = %e,
+                "current_policy_epoch: failed to read sync permission epoch"
+            );
+            0
+        })
     }
 
     /// UFP/2 broadcast helper: build a per-peer signed envelope (each

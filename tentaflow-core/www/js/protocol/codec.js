@@ -1950,6 +1950,17 @@ export const encode = {
     );
   },
 
+  syncStorageReportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSyncStorageReportRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /**
    * MessageBody::AuditLogExportRequest — Admin. Eksport CSV z filtrami
    * (max 100_000 wierszy). payload: { userId?, addonId?, action?, fromDate?, toDate?, search? }

@@ -981,24 +981,20 @@ impl AddonManager {
         user_id: Option<i64>,
         org_id: Option<String>,
     ) -> Result<String> {
-        info!(
-            "Uruchamianie addonu '{}' dla user_id={:?} org_id={:?}",
-            addon_id, user_id, org_id
-        );
+        let t_total = std::time::Instant::now();
 
-        // Pobierz lub skompiluj modul WASM
+        let t0 = std::time::Instant::now();
         let module = self.get_or_compile_module(addon_id)?;
+        let dt_compile = t0.elapsed();
 
-        // Pobierz uprawnienia addonu z DB
+        let t0 = std::time::Instant::now();
         let permissions = self.load_addon_permissions(addon_id)?;
-
-        // Zaladuj manifest z DB (potrzebny do walidacji regul sieciowych)
         let manifest = self.load_addon_manifest(addon_id)?;
-        let rt_id = manifest.runtime.clone().unwrap_or_else(|| "wasmtime".to_string());
+        let dt_db = t0.elapsed();
 
+        let rt_id = manifest.runtime.clone().unwrap_or_else(|| "wasmtime".to_string());
         let instance_id = uuid::Uuid::new_v4().to_string();
 
-        // Utworz stan addonu
         let state = AddonState {
             addon_id: addon_id.to_string(),
             instance_id: instance_id.clone(),
@@ -1032,15 +1028,12 @@ impl AddonManager {
                 .build(),
         };
 
-        // Utworz store z limitem paliwa
+        let t0 = std::time::Instant::now();
         let mut store = runtime::create_store(&self.engine, state)?;
-
-        // Utworz linker z host functions
         let mut linker = runtime::create_linker(&self.engine);
         host_functions::register_host_functions(&mut linker)?;
-
-        // Utworz instancje WASM
         let instance = runtime::instantiate(&linker, &mut store, &module)?;
+        let dt_instantiate = t0.elapsed();
 
         // Resolve language adapter from manifest runtime field
         let adapter = runtime::adapter_for_runtime(&rt_id)
@@ -1066,6 +1059,7 @@ impl AddonManager {
         }
 
         // Lifecycle on_start (export name depends on source language)
+        let t0 = std::time::Instant::now();
         if let Some(on_start) = instance
             .get_typed_func::<(), i32>(&mut store, adapter.export_on_start())
             .ok()
@@ -1077,6 +1071,12 @@ impl AddonManager {
                 bail!("{}() zwrocil blad: {}", adapter.export_on_start(), result);
             }
         }
+        let dt_on_start = t0.elapsed();
+
+        info!(
+            "start_addon '{}' timing: compile={:?} db={:?} instantiate={:?} on_start={:?} total={:?}",
+            addon_id, dt_compile, dt_db, dt_instantiate, dt_on_start, t_total.elapsed()
+        );
 
         // Zaktualizuj status instancji w DB
         {
@@ -1431,6 +1431,107 @@ impl AddonManager {
             .push(addon_instance);
 
         res
+    }
+
+    /// Calls on_panel_open on a running addon instance. The addon emits
+    /// PanelShell/SlotContent/StateSnapshot for the requested panel without
+    /// restarting. Returns Ok(true) if the export existed and was called,
+    /// Ok(false) if the addon doesn't export on_panel_open (legacy addon).
+    pub fn call_panel_open(
+        &self,
+        addon_id: &str,
+        panel_id: &str,
+        epoch: u64,
+        user_id: Option<i64>,
+    ) -> Result<bool> {
+        // Extract instance from map (brief lock)
+        let mut addon_instance = {
+            let mut instances = self.instances.lock();
+            let list = instances
+                .get_mut(addon_id)
+                .ok_or_else(|| anyhow::anyhow!("no running instance for '{}'", addon_id))?;
+            if list.is_empty() {
+                bail!("no running instance for '{}'", addon_id);
+            }
+            list.remove(0)
+        };
+
+        // Set user context on instance
+        addon_instance.store.data_mut().user_id = user_id;
+
+        // Refuel before calling
+        runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT)?;
+
+        let export_name = addon_instance.language_adapter.export_on_panel_open();
+        let has_export = addon_instance
+            .instance
+            .get_typed_func::<(i32, i32, i64), i32>(&mut addon_instance.store, export_name)
+            .is_ok();
+
+        if has_export {
+            let on_panel_open = addon_instance
+                .instance
+                .get_typed_func::<(i32, i32, i64), i32>(&mut addon_instance.store, export_name)?;
+
+            // Allocate guest memory for panel_id string
+            let alloc_fn = addon_instance
+                .instance
+                .get_typed_func::<i32, i32>(&mut addon_instance.store, "alloc")
+                .map_err(|e| anyhow::anyhow!("alloc export missing: {e}"))?;
+
+            let panel_id_bytes = panel_id.as_bytes();
+            let ptr = alloc_fn.call(&mut addon_instance.store, panel_id_bytes.len() as i32)?;
+            if ptr < 0 {
+                bail!("alloc returned invalid pointer for panel_id");
+            }
+
+            // Copy panel_id into guest memory
+            if let Some(memory) = addon_instance
+                .instance
+                .get_memory(&mut addon_instance.store, "memory")
+            {
+                let mem = memory.data_mut(&mut addon_instance.store);
+                let end = match (ptr as usize).checked_add(panel_id_bytes.len()) {
+                    Some(e) if e <= mem.len() => e,
+                    _ => {
+                        bail!("panel_id buffer exceeds guest memory");
+                    }
+                };
+                mem[ptr as usize..end].copy_from_slice(panel_id_bytes);
+            }
+
+            let result = on_panel_open.call(
+                &mut addon_instance.store,
+                (ptr, panel_id_bytes.len() as i32, epoch as i64),
+            )?;
+
+            // Dealloc
+            if let Ok(dealloc_fn) = addon_instance
+                .instance
+                .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
+            {
+                let _ = dealloc_fn.call(
+                    &mut addon_instance.store,
+                    (ptr, panel_id_bytes.len() as i32),
+                );
+            }
+
+            if result != 0 {
+                warn!(
+                    "on_panel_open('{}', '{}') returned error: {}",
+                    addon_id, panel_id, result
+                );
+            }
+        }
+
+        // Return instance to map
+        self.instances
+            .lock()
+            .entry(addon_id.to_string())
+            .or_default()
+            .push(addon_instance);
+
+        Ok(has_export)
     }
 
     /// Zatrzymuje instancje addonu

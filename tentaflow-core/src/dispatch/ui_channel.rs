@@ -38,9 +38,8 @@ fn decode_ui_payload(cbor: &[u8]) -> Result<UiPayload, ProtocolError> {
     })?;
 
     let mut decoder = minicbor::Decoder::new(cbor);
-    Decode::decode(&mut decoder, &mut ()).map_err(|e| {
-        ProtocolError::bad_request(format!("CBOR decode error: {e}"))
-    })
+    Decode::decode(&mut decoder, &mut ())
+        .map_err(|e| ProtocolError::bad_request(format!("CBOR decode error: {e}")))
 }
 
 /// Encodes a `UiPayload` into a `UiChannelCbor` response body.
@@ -74,7 +73,7 @@ pub fn ui_channel_dispatch(
         _ => {
             return Err(ProtocolError::bad_request(
                 "ui_channel_dispatch expected UiChannelCbor variant",
-            ))
+            ));
         }
     };
 
@@ -113,34 +112,52 @@ fn handle_panel_open(
             .map_err(|e| ProtocolError::bad_request(e.to_string()))?
     };
 
-    // Start (or restart) the addon so on_start emits PanelShell.
-    // A PanelOpen to an already-running addon must still produce UI,
-    // so we stop + start to get a fresh on_start cycle.
     if let Some(addon_mgr) = ctx.state.addon_manager.as_ref() {
         let user_id = extract_user_id_i64(ctx);
+
         if addon_mgr.has_running_instance(&panel_open.addon_id) {
-            let _ = addon_mgr.stop_addon(&panel_open.addon_id);
+            // Addon already running — call on_panel_open on existing instance.
+            // If the addon doesn't export on_panel_open (legacy), fall back
+            // to stop+start.
+            let has_handler = addon_mgr
+                .call_panel_open(&panel_open.addon_id, &panel_open.panel_id, epoch, user_id)
+                .unwrap_or(false);
+
+            if !has_handler {
+                let _ = addon_mgr.stop_addon(&panel_open.addon_id);
+                addon_mgr
+                    .start_addon(&panel_open.addon_id, user_id, None)
+                    .map_err(|e| {
+                        let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+                        sl.lock().close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                        ProtocolError::internal(format!(
+                            "failed to start addon '{}': {e}",
+                            panel_open.addon_id
+                        ))
+                    })?;
+            }
+        } else {
+            addon_mgr
+                .start_addon(&panel_open.addon_id, user_id, None)
+                .map_err(|e| {
+                    let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+                    sl.lock().close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                    ProtocolError::internal(format!(
+                        "failed to start addon '{}': {e}",
+                        panel_open.addon_id
+                    ))
+                })?;
         }
-        addon_mgr
-            .start_addon(&panel_open.addon_id, user_id, None)
-            .map_err(|e| {
-                let session_lock =
-                    ctx.state.ui_sessions.get_or_create(ctx.connection_id);
-                let mut session = session_lock.lock();
-                session.close_panel(&panel_open.addon_id, &panel_open.panel_id);
-                ProtocolError::internal(format!(
-                    "failed to start addon '{}': {e}",
-                    panel_open.addon_id
-                ))
-            })?;
     }
 
     // Track which connection is serving this addon+user panel so host
     // functions can locate the SessionState for outbound validation.
     let user_id = extract_user_id_i64(ctx).unwrap_or(0);
-    ctx.state
-        .ui_sessions
-        .register_addon_connection(&panel_open.addon_id, user_id, ctx.connection_id);
+    ctx.state.ui_sessions.register_addon_connection(
+        &panel_open.addon_id,
+        user_id,
+        ctx.connection_id,
+    );
 
     // Stamp the assigned_epoch into the context before returning.
     panel_open.ctx.assigned_epoch = epoch;
@@ -497,7 +514,12 @@ mod tests {
     // PanelReady tests
     // =========================================================================
 
-    fn encode_panel_ready(addon_id: &str, panel_id: &str, epoch: u64, first_paint_ms: u32) -> Vec<u8> {
+    fn encode_panel_ready(
+        addon_id: &str,
+        panel_id: &str,
+        epoch: u64,
+        first_paint_ms: u32,
+    ) -> Vec<u8> {
         use tentaflow_sdk_spec::protocol::ui::panel::PanelReady;
 
         let payload = UiPayload::PanelReady(PanelReady {
@@ -567,9 +589,9 @@ mod tests {
     // =========================================================================
 
     fn encode_action(addon_id: &str, panel_id: &str, epoch: u64, action_id: &str) -> Vec<u8> {
-        use tentaflow_sdk_spec::protocol::ui::action::Action;
         use tentaflow_sdk_spec::protocol::control::CborMap;
         use tentaflow_sdk_spec::protocol::ids::ClientActionId;
+        use tentaflow_sdk_spec::protocol::ui::action::Action;
 
         let payload = UiPayload::Action(Action {
             addon_id: addon_id.to_owned(),
@@ -589,7 +611,13 @@ mod tests {
     }
 
     /// Register a shell with declared actions for a panel that is already open.
-    fn register_shell_with_actions(ctx: &HandlerContext, addon_id: &str, panel_id: &str, epoch: u64, actions: &[&str]) {
+    fn register_shell_with_actions(
+        ctx: &HandlerContext,
+        addon_id: &str,
+        panel_id: &str,
+        epoch: u64,
+        actions: &[&str],
+    ) {
         use std::collections::HashSet;
         let session_lock = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
         let mut session = session_lock.lock();

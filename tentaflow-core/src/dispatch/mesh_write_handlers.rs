@@ -84,7 +84,7 @@ pub async fn mesh_pairing_start(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshPairingStartRequestBody",
-            ))
+            ));
         }
     };
     let MeshPairingStartRequest {
@@ -141,7 +141,7 @@ pub async fn mesh_pairing_confirm(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshPairingConfirmRequestBody",
-            ))
+            ));
         }
     };
     let MeshPairingConfirmRequest { pair_id, pin } = payload;
@@ -182,7 +182,7 @@ pub async fn mesh_pairing_reject(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshPairingRejectRequestBody",
-            ))
+            ));
         }
     };
     let MeshPairingRejectRequest { pair_id } = payload;
@@ -212,7 +212,7 @@ pub async fn mesh_trust_revoke(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshTrustRevokeRequestBody",
-            ))
+            ));
         }
     };
     let MeshTrustRevokeRequest { node_id } = payload;
@@ -247,7 +247,7 @@ pub async fn mesh_trust_retrust(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshTrustRetrustRequestBody",
-            ))
+            ));
         }
     };
     let MeshTrustRetrustRequest { node_id } = payload;
@@ -277,7 +277,7 @@ pub async fn mesh_connect(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshConnectRequestBody",
-            ))
+            ));
         }
     };
     let MeshConnectRequest { address } = payload;
@@ -328,7 +328,7 @@ pub async fn mesh_node_command(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshNodeCommandRequestBody",
-            ))
+            ));
         }
     };
     let MeshNodeCommandRequest {
@@ -425,7 +425,7 @@ pub async fn mesh_node_network_config(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshNodeNetworkConfigRequestBody",
-            ))
+            ));
         }
     };
     let MeshNodeNetworkConfigRequest {
@@ -611,8 +611,8 @@ async fn forward_profiling_to_peer(
     target_node_id: &str,
     cmd: tentaflow_protocol::mesh::MeshCommandType,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use tentaflow_protocol::mesh::MeshCommandResponsePayload as RP;
     use tentaflow_protocol::ProfilingPayload as PP;
+    use tentaflow_protocol::mesh::MeshCommandResponsePayload as RP;
 
     let qm = require_quic_mesh(ctx)?;
     let is_trusted = ctx
@@ -889,8 +889,8 @@ async fn profiling_route(
     ctx: &HandlerContext,
     payload: tentaflow_protocol::ProfilingPayload,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use tentaflow_protocol::mesh::MeshCommandType as MC;
     use tentaflow_protocol::ProfilingPayload as PP;
+    use tentaflow_protocol::mesh::MeshCommandType as MC;
 
     let local = ctx.state.local_node_id.as_ref();
     let target: String = match &payload {
@@ -910,7 +910,7 @@ async fn profiling_route(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ProfilingPayload request variant",
-            ))
+            ));
         }
     };
 
@@ -1015,6 +1015,7 @@ mod profiling_tests {
                 role: Some("admin".to_string()),
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
             org_context: None,

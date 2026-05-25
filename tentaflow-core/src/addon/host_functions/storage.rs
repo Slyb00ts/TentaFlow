@@ -196,6 +196,12 @@ pub fn storage_set(
 
     let addon_id = caller.data().addon_id.clone();
     let instance_id = caller.data().instance_id.clone();
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let actor_user_id = caller.data().user_id;
     let value_size = value.len() as i64;
 
     // Sprawdz limit storage
@@ -278,16 +284,36 @@ pub fn storage_set(
         return ABI_ERR_OPERATION;
     }
 
+    let capture = crate::sync::kv_capture::KvWriteCapture::new(
+        org_id,
+        addon_id.clone(),
+        instance_id.clone(),
+        key.clone(),
+        Some(value.clone()),
+        actor_user_id,
+    );
+
     // Zapisz w DB (INSERT OR REPLACE)
     let result = {
         match caller.data().db.lock() {
-            Ok(conn) => {
-                conn.execute(
+            Ok(mut conn) => {
+                let tx = match conn.transaction() {
+                    Ok(tx) => tx,
+                    Err(e) => return storage_set_error(caller.data(), &key, e),
+                };
+                let write_result = tx.execute(
                     "INSERT OR REPLACE INTO addon_storage \
                      (addon_id, instance_id, storage_key, storage_value, value_size_bytes, updated_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
                     rusqlite::params![&addon_id, &instance_id, &key, &value, value_size],
-                )
+                );
+                if let Err(e) = write_result {
+                    return storage_set_error(caller.data(), &key, e);
+                }
+                if let Err(e) = crate::sync::kv_capture::record_kv_write_capture(&tx, &capture) {
+                    return storage_set_error(caller.data(), &key, e);
+                }
+                tx.commit()
             }
             Err(_) => return ABI_ERR_OPERATION,
         }
@@ -295,6 +321,12 @@ pub fn storage_set(
 
     match result {
         Ok(_) => {
+            if let Err(e) = crate::sync::kv_capture::ledger_kv_capture_now(
+                &caller.data().db,
+                &capture,
+            ) {
+                tracing::warn!("storage.set sync capture failed: {}", e);
+            }
             audit_log(
                 caller.data(),
                 "storage.set",
@@ -355,14 +387,39 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
 
     let addon_id = caller.data().addon_id.clone();
     let instance_id = caller.data().instance_id.clone();
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let actor_user_id = caller.data().user_id;
+    let capture = crate::sync::kv_capture::KvWriteCapture::new(
+        org_id,
+        addon_id.clone(),
+        instance_id.clone(),
+        key.clone(),
+        None,
+        actor_user_id,
+    );
 
     let result = {
         match caller.data().db.lock() {
-            Ok(conn) => {
-                conn.execute(
+            Ok(mut conn) => {
+                let tx = match conn.transaction() {
+                    Ok(tx) => tx,
+                    Err(e) => return storage_delete_error(caller.data(), &key, e),
+                };
+                let write_result = tx.execute(
                     "DELETE FROM addon_storage WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
                     rusqlite::params![&addon_id, &instance_id, &key],
-                )
+                );
+                if let Err(e) = write_result {
+                    return storage_delete_error(caller.data(), &key, e);
+                }
+                if let Err(e) = crate::sync::kv_capture::record_kv_write_capture(&tx, &capture) {
+                    return storage_delete_error(caller.data(), &key, e);
+                }
+                tx.commit()
             }
             Err(_) => return ABI_ERR_OPERATION,
         }
@@ -370,6 +427,12 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
 
     match result {
         Ok(_) => {
+            if let Err(e) = crate::sync::kv_capture::ledger_kv_capture_now(
+                &caller.data().db,
+                &capture,
+            ) {
+                tracing::warn!("storage.delete sync capture failed: {}", e);
+            }
             audit_log(
                 caller.data(),
                 "storage.delete",
@@ -393,6 +456,32 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
             ABI_ERR_OPERATION
         }
     }
+}
+
+fn storage_set_error<E: std::fmt::Display>(data: &AddonState, key: &str, error: E) -> i32 {
+    let msg = error.to_string();
+    audit_log(
+        data,
+        "storage.set",
+        Some("storage"),
+        Some(key),
+        "error",
+        Some(&msg),
+    );
+    ABI_ERR_OPERATION
+}
+
+fn storage_delete_error<E: std::fmt::Display>(data: &AddonState, key: &str, error: E) -> i32 {
+    let msg = error.to_string();
+    audit_log(
+        data,
+        "storage.delete",
+        Some("storage"),
+        Some(key),
+        "error",
+        Some(&msg),
+    );
+    ABI_ERR_OPERATION
 }
 
 // =============================================================================

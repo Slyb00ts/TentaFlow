@@ -925,6 +925,51 @@ pub enum SyncConflictPayload {
 }
 
 // =============================================================================
+// Sync storage pressure — admin-only disk and ledger storage report.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncStoragePressureLevel {
+    Ok,
+    Info,
+    Warning,
+    Critical,
+    Unknown,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncStoragePathUsage {
+    pub label: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncStorageReportRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncStorageReportResponse {
+    pub root: String,
+    pub level: SyncStoragePressureLevel,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub free_percent_bps: Option<u32>,
+    pub sqlite_bytes: u64,
+    pub fjall_ledger_bytes: u64,
+    pub snapshot_blob_bytes: u64,
+    pub final_blob_bytes: u64,
+    pub pending_blob_chunk_bytes: u64,
+    pub large_blob_block_bytes: u64,
+    pub paths: Vec<SyncStoragePathUsage>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncStoragePayload {
+    ReportRequest(SyncStorageReportRequest),
+    ReportResponse(SyncStorageReportResponse),
+}
+
+// =============================================================================
 // Portainer — Docker container ops (migration-map #248-#259)
 // =============================================================================
 
@@ -3799,6 +3844,9 @@ pub enum MessageBody {
     // ----- Sync conflict manager -----
     SyncConflictBody(SyncConflictPayload),
 
+    // ----- Sync storage pressure -----
+    SyncStorageBody(SyncStoragePayload),
+
     // ---- Portainer (R-LIST + R-STREAM dla logs) ----
     // Wzorzec „1 slot per feature" — wszystkie operacje Container w jednym
     // wariancie MessageBody. Patrz `ContainerPayload`.
@@ -4482,6 +4530,31 @@ mod tests {
     }
 
     #[test]
+    fn sync_storage_report_round_trip() {
+        let body = MessageBody::SyncStorageBody(SyncStoragePayload::ReportResponse(
+            SyncStorageReportResponse {
+                root: "/home/user/.tentaflow".to_string(),
+                level: SyncStoragePressureLevel::Warning,
+                total_bytes: Some(1000),
+                available_bytes: Some(90),
+                free_percent_bps: Some(900),
+                sqlite_bytes: 10,
+                fjall_ledger_bytes: 20,
+                snapshot_blob_bytes: 30,
+                final_blob_bytes: 40,
+                pending_blob_chunk_bytes: 50,
+                large_blob_block_bytes: 1024 * 1024,
+                paths: vec![SyncStoragePathUsage {
+                    label: "sqlite".to_string(),
+                    path: "/home/user/.tentaflow/data/router.db".to_string(),
+                    bytes: 10,
+                }],
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
     fn mesh_trust_revoked_round_trip() {
         let evt = MessageBody::MeshTrustEventBody(MeshTrustEventPayload::Revoked(
             MeshTrustRevokedEvent {
@@ -4819,7 +4892,7 @@ mod tests {
 
     #[test]
     fn body_nests_inside_envelope() {
-        use crate::envelope::{message_kind, Envelope};
+        use crate::envelope::{Envelope, message_kind};
         let body = MessageBody::ModelListRequest;
         let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
             .expect("encode body")

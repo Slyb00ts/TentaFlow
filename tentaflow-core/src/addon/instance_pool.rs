@@ -6,18 +6,21 @@
 // =============================================================================
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::runtime::{WasmEngine, WasmInstance, WasmModule, WasmStore};
+use super::runtime::{WasmEngine, WasmInstance, WasmLinker, WasmModule, WasmStore};
 use anyhow::Result;
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use super::event_bus::EventBus;
 use super::host_functions;
 use super::permissions::PermissionChecker;
-use super::{AddonInstance, AddonState};
+use super::{AddonInstance, AddonManifest, AddonState};
 use crate::db::DbPool;
+
+static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // =============================================================================
 // InstancePool — pula pre-warmed instancji
@@ -28,6 +31,7 @@ use crate::db::DbPool;
 pub struct InstancePool {
     engine: WasmEngine,
     module: WasmModule,
+    linker: WasmLinker<AddonState>,
     pool: Mutex<VecDeque<PoolEntry>>,
     pool_size: usize,
     addon_id: String,
@@ -43,6 +47,10 @@ pub struct InstancePool {
     oauth_refresh_guard: Arc<super::oauth_refresh_guard::OAuthRefreshGuard>,
     /// Manifest runtime id ("wasmtime", "dotnet", "python") for adapter resolution.
     runtime_id: String,
+    /// Cached fuel limit from DB (0 = use default)
+    fuel_limit: u64,
+    /// Parsed manifest, shared across all instances
+    manifest: Arc<AddonManifest>,
 }
 
 /// Wpis w puli — gotowa instancja WASM
@@ -76,9 +84,45 @@ impl InstancePool {
         router: Option<Arc<crate::routing::router::Router>>,
         runtime_id: String,
     ) -> Result<Self> {
+        // Build linker once — reused for every instantiate() call
+        let mut linker = super::runtime::create_linker(&engine);
+        host_functions::register_host_functions(&mut linker)?;
+
+        // Cache fuel_limit from DB
+        let fuel_limit = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT fuel_limit FROM addon_resource_limits WHERE addon_id = ?1",
+                rusqlite::params![&addon_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64
+        };
+
+        // Cache parsed manifest from DB
+        let manifest = {
+            let conn = db.lock().unwrap();
+            let manifest_content: String = conn
+                .query_row(
+                    "SELECT manifest_json FROM addons WHERE addon_id = ?1",
+                    rusqlite::params![&addon_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| "{}".to_string());
+            Arc::new(
+                super::lifecycle::parse_manifest_toml(&manifest_content).unwrap_or_else(|_| {
+                    super::AddonManifest {
+                        addon_id: addon_id.clone(),
+                        ..Default::default()
+                    }
+                }),
+            )
+        };
+
         let pool = InstancePool {
             engine,
             module,
+            linker,
             pool: Mutex::new(VecDeque::with_capacity(pool_size)),
             pool_size,
             addon_id,
@@ -90,6 +134,8 @@ impl InstancePool {
             router,
             oauth_refresh_guard: Arc::new(super::oauth_refresh_guard::OAuthRefreshGuard::new()),
             runtime_id,
+            fuel_limit,
+            manifest,
         };
 
         // Pre-warm instancje
@@ -121,22 +167,13 @@ impl InstancePool {
         // Ustaw user_id na pobranej instancji
         store.data_mut().user_id = user_id;
 
-        // Generuj instance_id
-        let instance_id = uuid::Uuid::new_v4().to_string();
+        // Monotonic counter — no syscall, unique within process lifetime
+        let seq = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let instance_id = format!("{}:{}", self.addon_id, seq);
         store.data_mut().instance_id = instance_id.clone();
 
-        // Pobierz fuel_limit z DB (0 = domyslny)
-        let fuel_limit = {
-            let conn = self.db.lock().unwrap();
-            conn.query_row(
-                "SELECT fuel_limit FROM addon_resource_limits WHERE addon_id = ?1",
-                rusqlite::params![&self.addon_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-        };
-        let effective_fuel = if fuel_limit > 0 {
-            fuel_limit as u64
+        let effective_fuel = if self.fuel_limit > 0 {
+            self.fuel_limit
         } else {
             super::DEFAULT_FUEL_LIMIT
         };
@@ -144,7 +181,7 @@ impl InstancePool {
         // Doladuj paliwo
         super::runtime::refuel_store(&mut store, effective_fuel)?;
 
-        info!(
+        trace!(
             "InstancePool[{}]: instancja przydzielona (instance_id={}, user_id={:?})",
             self.addon_id, instance_id, user_id
         );
@@ -170,7 +207,7 @@ impl InstancePool {
 
         // Jesli pula jest pelna — po prostu dropujemy instancje
         if pool.len() >= self.pool_size {
-            info!(
+            trace!(
                 "InstancePool[{}]: pula pelna, instancja {} zostanie zdropowana",
                 self.addon_id, addon_instance.instance_id
             );
@@ -184,12 +221,13 @@ impl InstancePool {
             ..
         } = addon_instance;
 
-        // CR-007: Wyzeruj guest memory przed zwroceniem do puli
-        // Zapobiega wyciekowi danych (sekretow, kontekstu uzytkownika) miedzy sesjami
+        // CR-007: Zero guest memory before returning to pool.
+        // data_size() returns the actual wasm linear memory (pages * 64KB),
+        // not the virtual reservation — only the committed region is zeroed.
         if let Some(memory) = instance.get_memory(&mut store, "memory") {
+            let used = memory.data_size(&store);
             let mem_data = memory.data_mut(&mut store);
-            // Zeruj cala pamiec guest — bezpieczne podejscie
-            mem_data.fill(0);
+            mem_data[..used].fill(0);
         }
 
         // Wyczysc stan uzytkownika
@@ -200,7 +238,7 @@ impl InstancePool {
 
         pool.push_back(PoolEntry { store, instance });
 
-        info!(
+        trace!(
             "InstancePool[{}]: instancja zwrocona do puli ({}/{})",
             self.addon_id,
             pool.len(),
@@ -249,24 +287,6 @@ impl InstancePool {
         &self,
         user_id: Option<i64>,
     ) -> Result<(WasmStore<AddonState>, WasmInstance)> {
-        // Zaladuj manifest z DB (potrzebny do walidacji regul sieciowych)
-        let manifest = {
-            let conn = self.db.lock().unwrap();
-            let manifest_content: String = conn
-                .query_row(
-                    "SELECT manifest_json FROM addons WHERE addon_id = ?1",
-                    rusqlite::params![&self.addon_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_else(|_| "{}".to_string());
-            super::lifecycle::parse_manifest_toml(&manifest_content).unwrap_or_else(|_| {
-                super::AddonManifest {
-                    addon_id: self.addon_id.clone(),
-                    ..Default::default()
-                }
-            })
-        };
-
         let state = AddonState {
             addon_id: self.addon_id.clone(),
             instance_id: String::new(), // Bedzie ustawiony przy acquire()
@@ -283,7 +303,7 @@ impl InstancePool {
                 host_functions::network::NetworkConnectionManager::new(),
             )),
             settings_cipher: self.settings_cipher.clone(),
-            manifest: Arc::new(manifest),
+            manifest: Arc::clone(&self.manifest),
             memory_limit: super::DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.clone(),
             oauth_refresh_guard: self.oauth_refresh_guard.clone(),
@@ -302,11 +322,20 @@ impl InstancePool {
 
         let mut store = super::runtime::create_store(&self.engine, state)?;
 
-        let mut linker = super::runtime::create_linker(&self.engine);
-        host_functions::register_host_functions(&mut linker)?;
-
-        let instance = super::runtime::instantiate(&linker, &mut store, &self.module)?;
+        let instance = super::runtime::instantiate(&self.linker, &mut store, &self.module)?;
 
         Ok((store, instance))
+    }
+
+    /// Reload cached fuel_limit from DB (call after admin changes resource limits)
+    pub fn refresh_fuel_limit(&mut self) {
+        let conn = self.db.lock().unwrap();
+        self.fuel_limit = conn
+            .query_row(
+                "SELECT fuel_limit FROM addon_resource_limits WHERE addon_id = ?1",
+                rusqlite::params![&self.addon_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
     }
 }

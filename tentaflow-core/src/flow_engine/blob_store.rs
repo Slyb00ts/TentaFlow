@@ -46,11 +46,22 @@ pub trait BlobStore: Send + Sync {
 /// for free, GC = `rm -rf orphans`, backup = `rsync`.
 pub struct FileBlobStore {
     root: PathBuf,
+    sync_db: Option<crate::db::DbPool>,
 }
 
 impl FileBlobStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            sync_db: None,
+        }
+    }
+
+    pub fn with_sync(root: PathBuf, db: crate::db::DbPool) -> Self {
+        Self {
+            root,
+            sync_db: Some(db),
+        }
     }
 
     fn sharded_path(&self, sha256: &str) -> PathBuf {
@@ -60,6 +71,29 @@ impl FileBlobStore {
         path.push(format!("{sha256}.bin"));
         path
     }
+
+    fn capture_blob(&self, blob_ref: &BlobRef, path: &std::path::Path) -> Result<()> {
+        let Some(db) = &self.sync_db else {
+            return Ok(());
+        };
+        let capture = crate::sync::blob_capture::BlobWriteCapture::new(
+            crate::services::org::DEFAULT_ORG_ID,
+            &blob_ref.id,
+            &blob_ref.sha256,
+            &blob_ref.mime,
+            blob_ref.size_bytes,
+            path.to_string_lossy().to_string(),
+            None,
+        );
+        {
+            let conn = db
+                .lock()
+                .map_err(|e| anyhow!("blob sync db lock: {e}"))?;
+            crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)?;
+        }
+        crate::sync::blob_capture::ledger_blob_capture_now(db, &capture)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -68,6 +102,12 @@ impl BlobStore for FileBlobStore {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let sha256 = format!("{:x}", hasher.finalize());
+        let blob_ref = BlobRef {
+            id: uuid::Uuid::new_v4().to_string(),
+            size_bytes: bytes.len() as u64,
+            mime: mime.to_string(),
+            sha256: sha256.clone(),
+        };
 
         let path = self.sharded_path(&sha256);
         if let Some(parent) = path.parent() {
@@ -84,12 +124,8 @@ impl BlobStore for FileBlobStore {
         if fs::try_exists(&path).await.unwrap_or(false) {
             match verify_sha_on_disk(&path, &sha256).await {
                 Ok(true) => {
-                    return Ok(BlobRef {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        size_bytes: bytes.len() as u64,
-                        mime: mime.to_string(),
-                        sha256,
-                    });
+                    self.capture_blob(&blob_ref, &path)?;
+                    return Ok(blob_ref);
                 }
                 Ok(false) => {
                     // Realnie corrupted blob — usuwamy i przepisujemy.
@@ -134,12 +170,8 @@ impl BlobStore for FileBlobStore {
             }
         }
 
-        Ok(BlobRef {
-            id: uuid::Uuid::new_v4().to_string(),
-            size_bytes: bytes.len() as u64,
-            mime: mime.to_string(),
-            sha256,
-        })
+        self.capture_blob(&blob_ref, &path)?;
+        Ok(blob_ref)
     }
 
     async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {

@@ -17,6 +17,7 @@ bin/
 *.dll
 *.exe
 *.wasm
+plans/*
 
 # Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
 .build/

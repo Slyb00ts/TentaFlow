@@ -201,6 +201,21 @@ export function browserSignHex(data) {
 }
 
 /**
+ * Decode a CBOR-encoded Component into a JS object suitable for ComponentRenderer.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodeComponentCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeComponentCbor(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * Decode + bytecheck (NIGDY `access_unchecked`) pelnego envelope'u z WSS input.
  * Zwraca strukturalny widok; body wciaz zakodowany (lazy decode przez
  * `decodeMessageBody`).
@@ -228,6 +243,51 @@ export function decodeMessageBody(bytes) {
     const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.decodeMessageBody(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * Decode CBOR-encoded Vec<PatchOp> into JS array of { path, op, ... }.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodePatchOpsCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodePatchOpsCbor(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * Decode CBOR-encoded Vec<StateEntry> into JS array of { path, value }.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodeStateEntriesCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeStateEntriesCbor(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * Decode UI channel CBOR payload into a JS-friendly object.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {any}
+ */
+export function decodeUiPayload(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeUiPayload(ptr0, len0);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -785,55 +845,6 @@ export function encodeAddonToolsRequest(addon_id) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
-}
-
-/**
- * MessageBody::AddonUiBody(ReqAction) — button click / form submit z UI
- * panelu. Host woła addon on_request z tool_name = "ui.{panel_id}.{action_id}".
- * @param {string} addon_id
- * @param {string} panel_id
- * @param {string} action_id
- * @param {string} params_json
- * @returns {Uint8Array}
- */
-export function encodeAddonUiActionRequest(addon_id, panel_id, action_id, params_json) {
-    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passStringToWasm0(action_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len2 = WASM_VECTOR_LEN;
-    const ptr3 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len3 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonUiActionRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v5;
-}
-
-/**
- * MessageBody::AddonUiBody(ReqPanelGet) — pobierz ostatnio wyrenderowane
- * drzewo UI panelu addonu. Tree_json = JSON `UiComponent`; frontend renderuje
- * przez tf-* komponenty.
- * @param {string} addon_id
- * @param {string} panel_id
- * @returns {Uint8Array}
- */
-export function encodeAddonUiPanelGetRequest(addon_id, panel_id) {
-    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonUiPanelGetRequest(ptr0, len0, ptr1, len1);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v3;
 }
 
 /**
@@ -3216,6 +3227,129 @@ export function encodeRegistryListRequest() {
 }
 
 /**
+ * MessageBody::RoleCatalogBody(CreateRequest) — payload jako JSON object
+ * odpowiadajacy `RoleCatalogCreateRequest`. Translations sa parami
+ * `[code, value]`; brak ikony / color_hint w obiekcie = None.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogCreateRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogCreateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(DeactivateRequest { id }).
+ * @param {string} id
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogDeactivateRequest(id) {
+    const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogDeactivateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(GetBySlugRequest { slug }).
+ * @param {string} slug
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogGetBySlugRequest(slug) {
+    const ptr0 = passStringToWasm0(slug, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogGetBySlugRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(GetRequest { id }).
+ * @param {string} id
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogGetRequest(id) {
+    const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(ListLocalesRequest) — unit variant.
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogListLocalesRequest() {
+    const ret = wasm.encodeRoleCatalogListLocalesRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(ListRequest) — filter jako JSON object.
+ * Wszystkie pola filter opcjonalne; pusty `{}` zwraca pelna liste.
+ * @param {string} filter_json
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogListRequest(filter_json) {
+    const ptr0 = passStringToWasm0(filter_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RoleCatalogBody(UpdateRequest) — patch update.
+ * `Option<Option<String>>` w JSON: brak pola = nie ruszaj, `null` = wyzeruj,
+ * string = ustaw. Vec<(String, String)> jako lista par `[["pl","..."], ...]`.
+ * Serde nie potrafi rozroznic "missing" od "null" dla `Option<Option<T>>`,
+ * wiec parsujemy ręcznie z `serde_json::Value`.
+ * @param {string} payload_json
+ * @returns {Uint8Array}
+ */
+export function encodeRoleCatalogUpdateRequest(payload_json) {
+    const ptr0 = passStringToWasm0(payload_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRoleCatalogUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @returns {Uint8Array}
  */
 export function encodeSchedulerActionsListRequest() {
@@ -3673,6 +3807,67 @@ export function encodeSubscribeResumeRequest(resume_token) {
 }
 
 /**
+ * @param {string} org_id
+ * @param {string} addon_id
+ * @param {string} operation_id
+ * @param {string} resolution
+ * @returns {Uint8Array}
+ */
+export function encodeSyncConflictResolveRequest(org_id, addon_id, operation_id, resolution) {
+    const ptr0 = passStringToWasm0(org_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(operation_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(resolution, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSyncConflictResolveRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * @param {string} org_id
+ * @param {string} addon_id
+ * @param {string} status
+ * @param {number} limit
+ * @returns {Uint8Array}
+ */
+export function encodeSyncConflictsListRequest(org_id, addon_id, status, limit) {
+    const ptr0 = passStringToWasm0(org_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(status, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeSyncConflictsListRequest(ptr0, len0, ptr1, len1, ptr2, len2, limit);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeSyncStorageReportRequest() {
+    const ret = wasm.encodeSyncStorageReportRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * MessageBody::TlsStatusRequest (unit variant).
  * @returns {Uint8Array}
  */
@@ -3767,6 +3962,99 @@ export function encodeTtsRuleListRequest() {
     var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
+}
+
+/**
+ * Encode Action into MessageBody::UiChannelCbor frame.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {bigint} panel_epoch
+ * @param {string} action_id
+ * @param {string} params_json
+ * @returns {Uint8Array}
+ */
+export function encodeUiAction(addon_id, panel_id, panel_epoch, action_id, params_json) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(action_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiAction(ptr0, len0, ptr1, len1, panel_epoch, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Wraps raw CBOR bytes in `MessageBody::UiChannelCbor` for binary WS transport.
+ * @param {Uint8Array} cbor_bytes
+ * @returns {Uint8Array}
+ */
+export function encodeUiChannelCbor(cbor_bytes) {
+    const ptr0 = passArray8ToWasm0(cbor_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiChannelCbor(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Encode PanelClose into MessageBody::UiChannelCbor frame.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {bigint} panel_epoch
+ * @returns {Uint8Array}
+ */
+export function encodeUiPanelClose(addon_id, panel_id, panel_epoch) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiPanelClose(ptr0, len0, ptr1, len1, panel_epoch);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * Encode PanelOpen into MessageBody::UiChannelCbor frame.
+ * @param {string} addon_id
+ * @param {string} panel_id
+ * @param {string} locale
+ * @param {string} theme
+ * @param {number} viewport_width
+ * @param {number} viewport_height
+ * @returns {Uint8Array}
+ */
+export function encodeUiPanelOpen(addon_id, panel_id, locale, theme, viewport_width, viewport_height) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(panel_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(locale, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(theme, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeUiPanelOpen(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, viewport_width, viewport_height);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
 }
 
 /**

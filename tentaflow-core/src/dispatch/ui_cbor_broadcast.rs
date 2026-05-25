@@ -5,18 +5,21 @@
 // and filters by user_id before forwarding as an unsolicited UiChannelCbor frame.
 // =============================================================================
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
 const CHANNEL_CAPACITY: usize = 512;
 
 /// Payload carried over the broadcast channel.
+/// Uses `Arc<[u8]>` for CBOR bytes so cloning across N subscribers is
+/// a refcount bump (8 bytes), not N × full-payload memcpy.
 #[derive(Debug, Clone)]
 pub struct UiCborPush {
     /// User that owns the panel session receiving this message.
     pub user_id: i64,
-    /// Raw CBOR bytes (UiPayload wire encoding).
-    pub cbor: Vec<u8>,
+    /// Raw CBOR bytes (UiPayload wire encoding). Arc-shared to avoid
+    /// cloning per broadcast subscriber.
+    pub cbor: Arc<[u8]>,
 }
 
 static SENDER: OnceLock<broadcast::Sender<UiCborPush>> = OnceLock::new();

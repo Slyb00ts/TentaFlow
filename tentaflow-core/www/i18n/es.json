@@ -29,6 +29,7 @@
     "logout": "Cerrar sesión",
     "addons": "Addons",
     "users": "Usuarios",
+    "roles_catalog": "Catálogo de roles",
     "audit": "Registro de auditoría",
     "legal": "Documentos RGPD",
     "profiling_sessions": "Perfilado",
