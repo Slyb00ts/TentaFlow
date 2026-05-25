@@ -26,9 +26,8 @@ const MENU_PLACEMENTS = new Set([
   'left_start', 'left_end',
   'right_start', 'right_end',
 ]);
-const MENU_ITEM_KEYS = new Set([
-  'id', 'label', 'icon', 'badge', 'shortcut', 'danger', 'disabled', 'divider_after',
-]);
+// MenuItem FieldMap keys: 0=id, 1=label, 2=icon, 3=badge, 4=shortcut, 5=danger, 6=disabled, 7=divider_after
+const MENU_ITEM_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
@@ -65,10 +64,12 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
     }
   }
 }
-function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
-  for (const k of Object.keys(obj)) {
-    if (!allowedKeys.has(k)) {
-      throw new TypeError(`${ctx}: unexpected key '${k}'`);
+function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
+  if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  for (const entry of fields) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
+    if (!allowedKeys.has(entry[0])) {
+      throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
     }
   }
 }
@@ -81,45 +82,46 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
 /// na item dispatchuje CustomEvent `item_click` z detail.item_id na root
 /// element popup'u/listy. Lista nie posiada własnej semantyki focus —
 /// zarządza nim caller (MenuButton popup wymaga keyboard nav).
+// MenuItem: 0=id, 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge), 4=shortcut, 5=danger, 6=disabled(BindRef), 7=divider_after
 function renderMenuItems(items, ctx, listEl, options = {}) {
   const filterPredicate = options.filterPredicate || (() => true);
   const itemMeta = [];
   const seenIds = new Set();
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (!item || typeof item !== 'object') {
-      throw new TypeError(`MenuItem[${i}] must be object`);
+    if (!Array.isArray(item)) {
+      throw new TypeError(`MenuItem[${i}] must be FieldMap`);
     }
-    assertOnlyKnownObjectKeys(item, MENU_ITEM_KEYS, `MenuItem[${i}]`);
-    const itemId = requireString(item.id, `MenuItem[${i}].id`);
+    assertOnlyKnownFieldMapKeys(item, MENU_ITEM_KEYS, `MenuItem[${i}]`);
+    const itemId = requireString(ctx.readField(item, 0), `MenuItem[${i}].id`);
     if (itemId.length === 0) {
       throw new TypeError(`MenuItem[${i}].id must be non-empty`);
     }
     if (seenIds.has(itemId)) {
-      // Duplikat id zostawiłby ambiguous handler — item_click niesie
-      // tylko detail.item_id, więc renderer nie wie który item został
-      // wybrany. Odrzucamy deterministycznie.
       throw new TypeError(`MenuItem[${i}].id duplicate: '${itemId}'`);
     }
     seenIds.add(itemId);
-    if (item.label == null) {
+    const labelBind = ctx.readField(item, 1);
+    if (labelBind == null) {
       throw new TypeError(`MenuItem[${i}].label must be BindRef`);
     }
-    if (item.badge != null) {
+    const badgeRaw = ctx.readField(item, 3);
+    if (badgeRaw != null) {
       // InlineBadge ma własny renderer w chunku 3.3d. Tu odrzucamy obecność.
       // Icon/badge gracefully skipped
     }
     const danger = requireBool(
-      item.danger === undefined ? false : item.danger,
+      ctx.readField(item, 5) ?? false,
       `MenuItem[${i}].danger`
     );
     const dividerAfter = requireBool(
-      item.divider_after === undefined ? false : item.divider_after,
+      ctx.readField(item, 7) ?? false,
       `MenuItem[${i}].divider_after`
     );
-    const shortcut = item.shortcut == null
+    const shortcutRaw = ctx.readField(item, 4);
+    const shortcut = shortcutRaw == null
       ? null
-      : requireString(item.shortcut, `MenuItem[${i}].shortcut`);
+      : requireString(shortcutRaw, `MenuItem[${i}].shortcut`);
 
     const li = document.createElement('li');
     li.classList.add('tf-menu__item');
@@ -128,8 +130,9 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
     li.setAttribute('tabindex', '-1');
     if (danger) li.classList.add('tf-menu__item--danger');
 
-    if (item.icon != null) {
-      const iconEl = renderIcon(item.icon, `MenuItem[${i}].icon`);
+    const iconRaw = ctx.readField(item, 2);
+    if (iconRaw != null) {
+      const iconEl = renderIcon(iconRaw, `MenuItem[${i}].icon`);
       iconEl.classList.add('tf-menu__item-icon');
       li.appendChild(iconEl);
     }
@@ -137,11 +140,11 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
     labelEl.classList.add('tf-menu__item-label');
     li.appendChild(labelEl);
     const applyLabel = () => {
-      const v = resolveBindRef(item.label, ctx.store);
+      const v = resolveBindRef(labelBind, ctx.store);
       labelEl.textContent = v == null ? '' : String(v);
     };
     applyLabel();
-    ctx.registerCleanup(subscribeBindRef(item.label, ctx.store, applyLabel));
+    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
 
     if (shortcut != null) {
       const sc = document.createElement('span');
@@ -152,9 +155,10 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
 
     // Reactive disabled przez aria-disabled + ignorowanie kliknięć.
     let isDisabled = false;
-    if (item.disabled != null) {
+    const disabledBind = ctx.readField(item, 6);
+    if (disabledBind != null) {
       const applyDisabled = () => {
-        isDisabled = resolveBindRef(item.disabled, ctx.store) === true;
+        isDisabled = resolveBindRef(disabledBind, ctx.store) === true;
         if (isDisabled) {
           li.setAttribute('aria-disabled', 'true');
           li.classList.add('tf-menu__item--disabled');
@@ -164,7 +168,7 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
         }
       };
       applyDisabled();
-      ctx.registerCleanup(subscribeBindRef(item.disabled, ctx.store, applyDisabled));
+      ctx.registerCleanup(subscribeBindRef(disabledBind, ctx.store, applyDisabled));
     }
 
     const onClick = (e) => {
