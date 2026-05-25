@@ -9350,35 +9350,50 @@ fn resolve_integer_key_names(
     }
     present_keys.sort();
 
-    // Check inline structs first — most common case.
+    if present_keys.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    // Score each inline struct: how well does its key set match the present keys?
+    // Prefer exact match (score 0), then smallest superset (fewest extra keys).
+    let mut best: Option<(&[tentaflow_sdk_spec::FieldMeta], usize)> = None;
+
     for meta in ALL_INLINE_STRUCTS {
-        let meta_keys: Vec<u8> = meta.fields.iter().map(|f| f.key).collect();
-        if present_keys.iter().all(|pk| meta_keys.contains(pk)) && !present_keys.is_empty() {
+        let meta_keys: std::collections::HashSet<u8> = meta.fields.iter().map(|f| f.key).collect();
+        if present_keys.iter().all(|pk| meta_keys.contains(pk)) {
+            let extra = meta_keys.len() - present_keys.len();
+            if best.is_none() || extra < best.unwrap().1 {
+                best = Some((meta.fields, extra));
+            }
+            if extra == 0 { break; } // exact match
+        }
+    }
+
+    if best.is_none() {
+        for union_meta in ALL_TAGGED_UNIONS {
+            for variant in union_meta.variants {
+                let vkeys: std::collections::HashSet<u8> = variant.fields.iter().map(|f| f.key).collect();
+                if present_keys.iter().all(|pk| vkeys.contains(pk)) {
+                    let extra = vkeys.len() - present_keys.len();
+                    if best.is_none() || extra < best.unwrap().1 {
+                        best = Some((variant.fields, extra));
+                    }
+                    if extra == 0 { break; }
+                }
+            }
+        }
+    }
+
+    match best {
+        Some((fields, _)) => {
             let mut map = std::collections::HashMap::new();
-            for f in meta.fields {
+            for f in fields {
                 map.insert(f.key, f.name.to_string());
             }
-            return map;
+            map
         }
+        None => std::collections::HashMap::new(),
     }
-
-    // Check tagged union variants (they also have integer-keyed fields).
-    for union_meta in ALL_TAGGED_UNIONS {
-        for variant in union_meta.variants {
-            let variant_keys: Vec<u8> = variant.fields.iter().map(|f| f.key).collect();
-            if present_keys.iter().all(|pk| variant_keys.contains(pk)) && !present_keys.is_empty() {
-                let mut map = std::collections::HashMap::new();
-                for f in variant.fields {
-                    map.insert(f.key, f.name.to_string());
-                }
-                return map;
-            }
-        }
-    }
-
-    // Also check if this is a text-keyed "kind" discriminated union — those use
-    // text keys already, so just fall through with empty map.
-    std::collections::HashMap::new()
 }
 
 /// Attempt to decode a Value as a Component (for embedded children in FieldMap).
