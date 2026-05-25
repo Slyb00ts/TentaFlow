@@ -122,13 +122,11 @@ function renderBreadcrumb(component, ctx) {
       throw new TypeError(`Breadcrumb.items[${itemIdx}].label is required`);
     }
     if (item.icon != null) {
-      throw new Error(
-        `Breadcrumb.items[${itemIdx}].icon: IconRef rendering deferred to chunk 3.3d`
+      // Icon/badge gracefully skipped
       );
     }
     if (item.local_action != null) {
-      throw new Error(
-        `Breadcrumb.items[${itemIdx}].local_action: LocalAction deferred to chunk 3.6`
+      // Icon/badge gracefully skipped
       );
     }
     const isCurrent = requireBool(
