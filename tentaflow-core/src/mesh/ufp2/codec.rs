@@ -37,7 +37,7 @@ use tentaflow_sdk_spec::protocol::frame::{
     validator::validate_envelope,
 };
 
-use super::discriminators::{kind_from_legacy, legacy_from_kind};
+use super::discriminators::{channel_from_legacy, kind_from_legacy, legacy_from_channel_kind};
 
 /// Result of decoding an incoming UFP/2 mesh envelope: the legacy
 /// discriminator (so it slots into existing dispatch) plus the raw body
@@ -49,7 +49,7 @@ pub struct DecodedMeshEnvelope {
     pub envelope: Envelope,
 }
 
-/// Encode an outgoing mesh payload into a canonical UFP/2 envelope. The
+/// Encode an outgoing mesh/sync payload into a canonical UFP/2 envelope. The
 /// returned envelope is UNSIGNED and UNENCRYPTED — caller's `send.rs`
 /// applies signature/encryption via the sdk-spec `send_envelope_pipeline`
 /// based on per-pair crypto state.
@@ -58,7 +58,7 @@ pub struct DecodedMeshEnvelope {
 /// Ed25519 keys (the same shape used by `iroh` peer identity and the
 /// existing `tentaflow_protocol::mesh` security layer).
 ///
-/// `epoch` is the sender's current policy_epoch (§6.2). Mesh traffic is
+/// `epoch` is the sender's current policy_epoch (§6.2). Mesh/sync traffic is
 /// always `NodeIdentity`-signed in UFP/2 per §11.3, so the validator will
 /// require a non-None epoch.
 pub fn build_envelope(
@@ -68,6 +68,7 @@ pub fn build_envelope(
     body: Vec<u8>,
     epoch: u32,
 ) -> Envelope {
+    let channel = channel_from_legacy(legacy_discriminator);
     let kind = kind_from_legacy(legacy_discriminator);
     Envelope {
         protocol_version: FrameProtocolVersion::V2,
@@ -77,7 +78,7 @@ pub fn build_envelope(
         created_at_ms: now_ms(),
         flags: Flags::NONE.with(Flags::IS_SIGNED),
         priority: priority_for_kind(kind),
-        channel: channels::MESH,
+        channel,
         kind,
         body,
         correlation_id: None,
@@ -95,8 +96,8 @@ pub fn build_envelope(
 /// Performs:
 ///   1. Canonical CBOR decode (`minicbor::decode::<Envelope>`).
 ///   2. Structural validation via `validate_envelope` (4c1g).
-///   3. Channel guard: rejects envelopes with `channel != Mesh (0x04)` —
-///      mesh transport must only carry mesh-channel traffic.
+///   3. Channel guard: accepts Mesh (0x04) and SyncLedger (0x06) only —
+///      iroh mesh transport carries both steady-state mesh and ledger frames.
 ///   4. Discriminator extraction: legacy u8 derived from `kind`.
 ///
 /// Signature verification (`verify_envelope`) and replay protection
@@ -110,21 +111,21 @@ pub fn decode_incoming(bytes: &[u8]) -> Result<DecodedMeshEnvelope, FrameError> 
         )
     })?;
     validate_envelope(&envelope)?;
-    if envelope.channel != channels::MESH {
+    if envelope.channel != channels::MESH && envelope.channel != channels::SYNC_LEDGER {
         return Err(FrameError::new(
             tentaflow_sdk_spec::protocol::frame::error::FrameErrorCode::UnknownChannel,
             format!(
-                "decode_incoming: arrived on mesh transport but channel = 0x{:02X} (expected 0x04 Mesh)",
+                "decode_incoming: arrived on mesh transport but channel = 0x{:02X} (expected Mesh 0x04 or SyncLedger 0x06)",
                 envelope.channel.0
             ),
         ));
     }
-    let legacy = legacy_from_kind(envelope.kind).ok_or_else(|| {
+    let legacy = legacy_from_channel_kind(envelope.channel, envelope.kind).ok_or_else(|| {
         FrameError::new(
             tentaflow_sdk_spec::protocol::frame::error::FrameErrorCode::UnknownKind,
             format!(
-                "decode_incoming: kind 0x{:04X} outside u8 range, cannot map to legacy MESH_MSG_*",
-                envelope.kind.0
+                "decode_incoming: channel 0x{:02X} kind 0x{:04X} cannot map to internal MESH_MSG_* dispatch",
+                envelope.channel.0, envelope.kind.0
             ),
         )
     })?;

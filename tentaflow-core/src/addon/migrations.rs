@@ -47,6 +47,52 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(digest)
 }
 
+fn create_table_regex() -> &'static Regex {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| {
+        Regex::new(r"(?i)\bCREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?")
+            .expect("create table regex stale poprawny")
+    })
+}
+
+fn create_index_regex() -> &'static Regex {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| {
+        Regex::new(r"(?i)\bCREATE\s+(UNIQUE\s+)?INDEX\s+(IF\s+NOT\s+EXISTS\s+)?")
+            .expect("create index regex stale poprawny")
+    })
+}
+
+fn make_create_statements_idempotent(sql: &str) -> String {
+    let sql = create_table_regex().replace_all(sql, |caps: &regex::Captures<'_>| {
+        if caps.get(1).is_some() {
+            caps.get(0)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            "CREATE TABLE IF NOT EXISTS ".to_string()
+        }
+    });
+    let sql = create_index_regex().replace_all(&sql, |caps: &regex::Captures<'_>| {
+        if caps.get(2).is_some() {
+            caps.get(0)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else if caps.get(1).is_some() {
+            "CREATE UNIQUE INDEX IF NOT EXISTS ".to_string()
+        } else {
+            "CREATE INDEX IF NOT EXISTS ".to_string()
+        }
+    });
+    sql.into_owned()
+}
+
+fn is_already_exists_error(error: &str) -> bool {
+    error.contains("already exists")
+}
+
 // =============================================================================
 // Pojedynczy plik migracji do zaaplikowania
 // =============================================================================
@@ -226,7 +272,8 @@ fn apply_single_migration(
 
     // 2. Apply w transakcji per-addon SQLite (atomic).
     let start = Instant::now();
-    let apply_result: Result<(), String> = (|| {
+    let mut retried_idempotent = false;
+    let mut apply_result: Result<(), String> = (|| {
         let mut conn = addon_pool
             .get()
             .map_err(|_| "pool get failed".to_string())?;
@@ -240,6 +287,26 @@ fn apply_single_migration(
         tx.commit().map_err(|e| format!("COMMIT failed: {e}"))?;
         Ok(())
     })();
+    if let Err(err) = &apply_result {
+        if is_already_exists_error(err) {
+            let idempotent_sql = make_create_statements_idempotent(&mig.sql);
+            if idempotent_sql != mig.sql {
+                retried_idempotent = true;
+                apply_result = (|| {
+                    let mut conn = addon_pool
+                        .get()
+                        .map_err(|_| "pool get failed".to_string())?;
+                    let tx = conn
+                        .transaction()
+                        .map_err(|e| format!("BEGIN failed: {e}"))?;
+                    tx.execute_batch(&idempotent_sql)
+                        .map_err(|e| format!("idempotent execute_batch failed: {e}"))?;
+                    tx.commit().map_err(|e| format!("COMMIT failed: {e}"))?;
+                    Ok(())
+                })();
+            }
+        }
+    }
     let duration_ms = start.elapsed().as_millis() as i64;
 
     // 3. Zapisz wynik do core DB (UPSERT — PRIMARY KEY (addon_id, migration_name)).
@@ -277,8 +344,8 @@ fn apply_single_migration(
     match apply_result {
         Ok(()) => {
             info!(
-                "addon '{}': migracja '{}' applied w {} ms (path={:?})",
-                addon_id, mig.name, duration_ms, mig.full_path
+                "addon '{}': migracja '{}' applied w {} ms (path={:?}, idempotent_retry={})",
+                addon_id, mig.name, duration_ms, mig.full_path, retried_idempotent
             );
             Ok(ApplyOutcome::Applied)
         }
@@ -443,6 +510,51 @@ mod tests {
             .unwrap();
             assert_eq!(n2, 0, "drugi run skip");
             super::super::storage_sql::close_addon_db("org-default", "mig-idem");
+        });
+    }
+
+    #[test]
+    fn test_existing_schema_without_ledger_is_adopted() {
+        with_tmp_home(|| {
+            let bundle = tempfile::tempdir().unwrap();
+            let mig_dir = bundle.path().join("migrations");
+            let sql = "CREATE TABLE items (id INTEGER PRIMARY KEY); CREATE INDEX idx_items_id ON items(id);";
+            write_migrations(&mig_dir, &[("001_init.sql", sql)]);
+            let core_db = setup_core_db();
+            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-adopt")
+                .expect("addon db");
+            {
+                let conn = pool.get().expect("addon conn");
+                conn.execute_batch(
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY); CREATE INDEX idx_items_id ON items(id);",
+                )
+                .expect("seed existing schema");
+            }
+
+            let n = apply_migrations(
+                "mig-adopt",
+                "0.1.0",
+                "migrations",
+                bundle.path(),
+                &core_db,
+                "org-default",
+            )
+            .unwrap();
+
+            assert_eq!(n, 1);
+            let conn = core_db.lock().unwrap();
+            let (hash, status): (String, String) = conn
+                .query_row(
+                    "SELECT migration_hash, status FROM addon_migrations_applied \
+                     WHERE addon_id=?1 AND migration_name=?2",
+                    params!["mig-adopt", "001_init.sql"],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(hash, sha256_hex(sql.as_bytes()));
+            assert_eq!(status, "success");
+            drop(conn);
+            super::super::storage_sql::close_addon_db("org-default", "mig-adopt");
         });
     }
 

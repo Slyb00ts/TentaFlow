@@ -29,6 +29,7 @@
     "logout": "Logout",
     "addons": "Addons",
     "users": "Users",
+    "roles_catalog": "Role catalog",
     "audit": "Audit Log",
     "legal": "Legal Documents",
     "profiling_sessions": "Profiling",

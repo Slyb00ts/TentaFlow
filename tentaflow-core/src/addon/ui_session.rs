@@ -211,9 +211,18 @@ pub enum SessionError {
 // SessionState
 // =============================================================================
 
+/// Entry in the open-panels list. Vec-based for zero-allocation lookups
+/// (typical session has 1-3 open panels; linear scan beats HashMap).
+#[derive(Debug)]
+struct OpenPanel {
+    addon_id: String,
+    panel_id: String,
+    ownership: PanelOwnership,
+}
+
 #[derive(Debug)]
 pub struct SessionState {
-    open_panels: HashMap<(String, String), PanelOwnership>,
+    open_panels: Vec<OpenPanel>,
     ui_credits: UiCredits,
     next_epoch: u64,
 }
@@ -221,16 +230,20 @@ pub struct SessionState {
 impl SessionState {
     pub fn new() -> Self {
         Self {
-            open_panels: HashMap::new(),
+            open_panels: Vec::with_capacity(4),
             ui_credits: UiCredits::new(INITIAL_UI_CREDITS),
             next_epoch: 1,
         }
     }
 
+    #[inline]
+    fn find_panel(&self, addon_id: &str, panel_id: &str) -> Option<usize> {
+        self.open_panels.iter().position(|p| p.addon_id == addon_id && p.panel_id == panel_id)
+    }
+
     /// Registers a panel as open, assigns a monotonically increasing epoch.
     pub fn open_panel(&mut self, addon_id: &str, panel_id: &str) -> Result<u64, SessionError> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        if self.open_panels.contains_key(&key) {
+        if self.find_panel(addon_id, panel_id).is_some() {
             return Err(SessionError::PanelAlreadyOpen {
                 addon_id: addon_id.to_owned(),
                 panel_id: panel_id.to_owned(),
@@ -238,9 +251,10 @@ impl SessionState {
         }
         let epoch = self.next_epoch;
         self.next_epoch += 1;
-        self.open_panels.insert(
-            key,
-            PanelOwnership {
+        self.open_panels.push(OpenPanel {
+            addon_id: addon_id.to_owned(),
+            panel_id: panel_id.to_owned(),
+            ownership: PanelOwnership {
                 panel_epoch: epoch,
                 state_revision: 0,
                 declared_slots: HashSet::new(),
@@ -250,7 +264,7 @@ impl SessionState {
                 declared_local_capabilities: HashSet::new(),
                 shell_registered: false,
             },
-        );
+        });
         Ok(epoch)
     }
 
@@ -260,13 +274,13 @@ impl SessionState {
         addon_id: &str,
         panel_id: &str,
     ) -> Option<PanelOwnership> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        self.open_panels.remove(&key)
+        let idx = self.find_panel(addon_id, panel_id)?;
+        Some(self.open_panels.swap_remove(idx).ownership)
     }
 
     pub fn get_panel(&self, addon_id: &str, panel_id: &str) -> Option<&PanelOwnership> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        self.open_panels.get(&key)
+        let idx = self.find_panel(addon_id, panel_id)?;
+        Some(&self.open_panels[idx].ownership)
     }
 
     pub fn get_panel_mut(
@@ -274,8 +288,8 @@ impl SessionState {
         addon_id: &str,
         panel_id: &str,
     ) -> Option<&mut PanelOwnership> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        self.open_panels.get_mut(&key)
+        let idx = self.find_panel(addon_id, panel_id)?;
+        Some(&mut self.open_panels[idx].ownership)
     }
 
     /// Called when the host receives a PanelShell declaration from the addon.
@@ -293,13 +307,13 @@ impl SessionState {
         subscribe_topics: Vec<TopicPattern>,
         capabilities: HashSet<LocalCapability>,
     ) -> Result<(), SessionError> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        let ownership = self.open_panels.get_mut(&key).ok_or_else(|| {
+        let idx = self.find_panel(addon_id, panel_id).ok_or_else(|| {
             SessionError::PanelNotOpen {
                 addon_id: addon_id.to_owned(),
                 panel_id: panel_id.to_owned(),
             }
         })?;
+        let ownership = &mut self.open_panels[idx].ownership;
 
         if ownership.shell_registered {
             return Err(SessionError::ShellAlreadyRegistered {
@@ -340,8 +354,7 @@ impl SessionState {
         panel_id: &str,
         slot_id: &str,
     ) -> Result<(), SessionError> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        let ownership = self.open_panels.get(&key).ok_or_else(|| {
+        let ownership = self.get_panel(addon_id, panel_id).ok_or_else(|| {
             SessionError::PanelNotOpen {
                 addon_id: addon_id.to_owned(),
                 panel_id: panel_id.to_owned(),
@@ -366,8 +379,7 @@ impl SessionState {
         panel_id: &str,
         base_revision: u64,
     ) -> Result<(), SessionError> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        let ownership = self.open_panels.get(&key).ok_or_else(|| {
+        let ownership = self.get_panel(addon_id, panel_id).ok_or_else(|| {
             SessionError::PanelNotOpen {
                 addon_id: addon_id.to_owned(),
                 panel_id: panel_id.to_owned(),
@@ -389,8 +401,7 @@ impl SessionState {
         panel_id: &str,
         new_revision: u64,
     ) -> Result<(), SessionError> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        let ownership = self.open_panels.get_mut(&key).ok_or_else(|| {
+        let ownership = self.get_panel_mut(addon_id, panel_id).ok_or_else(|| {
             SessionError::PanelNotOpen {
                 addon_id: addon_id.to_owned(),
                 panel_id: panel_id.to_owned(),
@@ -407,8 +418,7 @@ impl SessionState {
         panel_id: &str,
         action_id: &str,
     ) -> Result<(), SessionError> {
-        let key = (addon_id.to_owned(), panel_id.to_owned());
-        let ownership = self.open_panels.get(&key).ok_or_else(|| {
+        let ownership = self.get_panel(addon_id, panel_id).ok_or_else(|| {
             SessionError::PanelNotOpen {
                 addon_id: addon_id.to_owned(),
                 panel_id: panel_id.to_owned(),
@@ -452,12 +462,12 @@ impl SessionState {
         let any_match = self
             .open_panels
             .iter()
-            .filter(|((aid, _), _)| aid == addon_id)
-            .any(|(_, ownership)| {
-                ownership
+            .filter(|p| p.addon_id == addon_id)
+            .any(|p| {
+                p.ownership
                     .declared_event_publish
                     .iter()
-                    .any(|p| p.matches_topic_segments(topic_segments))
+                    .any(|pat| pat.matches_topic_segments(topic_segments))
             });
         if !any_match {
             return Err(SessionError::EventTopicNotDeclared {
@@ -553,15 +563,21 @@ impl SessionRegistry {
     pub fn unregister_addon_connection(&self, addon_id: &str, user_id: i64) {
         self.addon_connections
             .write()
-            .remove(&(addon_id.to_owned(), user_id));
+            .retain(|(aid, uid), _| !(aid == addon_id && *uid == user_id));
     }
 
     /// Looks up the connection_id serving a given addon+user panel.
+    /// Uses linear scan to avoid String allocation on every lookup.
+    /// Typical session count is < 50, so linear scan is faster than
+    /// HashMap hashing + allocation overhead.
     pub fn find_connection(&self, addon_id: &str, user_id: i64) -> Option<u64> {
-        self.addon_connections
-            .read()
-            .get(&(addon_id.to_owned(), user_id))
-            .copied()
+        let read = self.addon_connections.read();
+        for ((aid, uid), conn_id) in read.iter() {
+            if *uid == user_id && aid == addon_id {
+                return Some(*conn_id);
+            }
+        }
+        None
     }
 }
 

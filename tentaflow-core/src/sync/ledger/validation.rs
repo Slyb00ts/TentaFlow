@@ -4,8 +4,8 @@
 // =============================================================================
 
 use super::types::{
-    hash_canonical, LedgerResult, SyncLedgerError, SyncMerkleSummary, SyncOperation,
-    SyncOperationSigner, SyncOperationVerifier,
+    LedgerResult, SyncLedgerError, SyncMerkleSummary, SyncOperation, SyncOperationSigner,
+    SyncOperationVerifier, hash_canonical,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::BTreeMap;

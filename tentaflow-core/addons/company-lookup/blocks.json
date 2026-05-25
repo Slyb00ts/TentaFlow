@@ -1,0 +1,32 @@
+{
+  "blocks": [
+    {
+      "type": "lookup_by_nip",
+      "category": "Business",
+      "label": "Company Lookup: NIP",
+      "description": "Pobiera online dane firmy z oficjalnego Wykazu VAT MF po NIP. Bez cache.",
+      "icon": "building",
+      "inputs": [
+        { "name": "in", "type": "object" }
+      ],
+      "outputs": [
+        { "name": "full", "type": "object" }
+      ],
+      "config_schema": {}
+    },
+    {
+      "type": "lookup_by_regon",
+      "category": "Business",
+      "label": "Company Lookup: REGON",
+      "description": "Pobiera online dane firmy z oficjalnego Wykazu VAT MF po REGON. Bez cache.",
+      "icon": "building",
+      "inputs": [
+        { "name": "in", "type": "object" }
+      ],
+      "outputs": [
+        { "name": "full", "type": "object" }
+      ],
+      "config_schema": {}
+    }
+  ]
+}

@@ -7,7 +7,7 @@ use crate::sync::ledger::{
     CompactionPolicy, LedgerResult, OperationQuery, OutboxEntry, PartitionId, SyncLedgerError,
     SyncLedgerStore, SyncSnapshot, SyncTarget,
 };
-use crate::sync::snapshot::{verify_snapshot_signature, SnapshotPackageStore};
+use crate::sync::snapshot::{SnapshotPackageStore, verify_snapshot_signature};
 use std::collections::{BTreeSet, HashSet};
 
 pub struct CompactionManager<'a> {
@@ -279,15 +279,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.compacted_up_to_sequence, 1);
-        assert!(store
-            .get_operations(OperationQuery {
-                partition_id: partition.clone(),
-                from_sequence: Some(1),
-                to_sequence: Some(1),
-                limit: None,
-            })
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .get_operations(OperationQuery {
+                    partition_id: partition.clone(),
+                    from_sequence: Some(1),
+                    to_sequence: Some(1),
+                    limit: None,
+                })
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store
                 .get_operations(OperationQuery {

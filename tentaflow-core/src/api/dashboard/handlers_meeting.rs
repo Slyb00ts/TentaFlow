@@ -773,6 +773,7 @@ mod tests {
                 role: if admin { Some("admin".into()) } else { None },
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state,
             org_context: None,

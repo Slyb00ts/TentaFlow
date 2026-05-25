@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: modules/settings.js
-// Opis: Ekran Ustawienia — 5 zakladek (tf-tabs underline):
+// Opis: Ekran Ustawienia z zakladkami administracyjnymi (tf-tabs underline):
 //       1) Ogólne       — surowe pary klucz/wartosc z binary protocol
 //       2) SSO / OIDC   — CRUD providerow SSO
 //       3) OAuth        — oauth_redirect_base_url
@@ -14,11 +14,16 @@
 //      testu NGC (/api/nim/catalog).
 // =============================================================================
 
-import { byId, escapeHtml, escapeAttr, toast, formatDate, formatRelative } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, formatDate, formatRelative, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { renderMeshTab, bindMeshTab } from '/js/modules/settings-network.js';
+import '/js/components/tf-button.js';
+import '/js/components/tf-chip.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-select.js';
+import '/js/components/tf-table.js';
 
 // --- Klucze obslugiwane w dedykowanych zakladkach (ukryte w "Ogólne") ---
 const DEDICATED_KEYS = new Set([
@@ -51,6 +56,10 @@ let settings = {};            // { key: { value, isSecret } }
 let ssoProviders = [];
 let apiKeys = [];
 let registries = [];
+let syncConflicts = [];
+let syncConflictsStatus = 'open';
+let syncConflictsAddonId = 'contacts';
+let storageReport = null;
 
 const SSO_TYPES = [
   { value: 'azure_ad', label: 'Azure AD' },
@@ -81,6 +90,8 @@ const SettingsScreen = {
         <tf-tab id="oauth" icon="share">${escapeHtml(I18n.t('settings.tab_oauth'))}</tf-tab>
         <tf-tab id="tls" icon="mesh-admin">${escapeHtml(I18n.t('settings.tab_tls'))}</tf-tab>
         <tf-tab id="mesh" icon="network">${escapeHtml(I18n.t('settings.tab_mesh'))}</tf-tab>
+        <tf-tab id="sync" icon="refresh">Sync</tf-tab>
+        <tf-tab id="storage" icon="database">Storage</tf-tab>
         <tf-tab id="ngc" icon="model">${escapeHtml(I18n.t('settings.tab_ngc'))}</tf-tab>
         <tf-tab id="apikeys" icon="key">${escapeHtml(I18n.t('nav.apikeys'))}</tf-tab>
         <tf-tab id="registries" icon="registry">${escapeHtml(I18n.t('nav.registries'))}</tf-tab>
@@ -101,6 +112,8 @@ const SettingsScreen = {
     ssoProviders = [];
     apiKeys = [];
     registries = [];
+    syncConflicts = [];
+    storageReport = null;
   },
 };
 
@@ -165,10 +178,262 @@ function renderTab() {
         host.innerHTML = `<div class="empty-big" style="padding:24px;color:var(--danger);">${escapeHtml(err.message || String(err))}</div>`;
       });
       break;
+    case 'sync': host.innerHTML = renderSyncTab(); bindSyncTab(); void loadSyncConflicts(); break;
+    case 'storage': host.innerHTML = renderStorageTab(); bindStorageTab(); void loadStorageReport(); break;
     case 'ngc': host.innerHTML = renderNgcTab(); bindNgcTab(); break;
     case 'apikeys': host.innerHTML = renderApiKeysTab(); bindApiKeysTab(); break;
     case 'registries': host.innerHTML = renderRegistriesTab(); bindRegistriesTab(); break;
   }
+}
+
+// ==========================================================================
+// Zakladka: Sync
+// ==========================================================================
+
+function renderSyncTab() {
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h3>Konflikty synchronizacji</h3>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <tf-input id="sync-addon-id" value="${escapeAttr(syncConflictsAddonId)}" placeholder="contacts"></tf-input>
+          <tf-select id="sync-status" value="${escapeAttr(syncConflictsStatus)}">
+            <option value="open">open</option>
+            <option value="resolved">resolved</option>
+            <option value="ignored">ignored</option>
+            <option value="superseded">superseded</option>
+          </tf-select>
+          <tf-button variant="ghost" size="sm" icon="refresh" id="sync-refresh">Odśwież</tf-button>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="form-hint" style="margin:0 0 12px;">
+          Konflikty pochodzą z lokalnej tabeli addonu <code>__tentaflow_sync_conflicts</code>. Akcje resolve idą przez binary protocol i wymagają roli admina.
+        </p>
+        <tf-table id="sync-conflicts-table" sortable>
+          <tf-column key="resource" label="Zasób" renderer="html" sortable></tf-column>
+          <tf-column key="operation" label="Operacja" renderer="html"></tf-column>
+          <tf-column key="source" label="Źródło" sortable></tf-column>
+          <tf-column key="error" label="Błąd" renderer="html"></tf-column>
+          <tf-column key="statusChip" label="Status" renderer="chip" sortable></tf-column>
+          <tf-column key="actions" label="Akcje" renderer="html"></tf-column>
+        </tf-table>
+      </div>
+    </div>
+  `;
+}
+
+function bindSyncTab() {
+  byId('sync-refresh')?.addEventListener('click', loadSyncConflicts);
+  byId('sync-addon-id')?.addEventListener('change', () => {
+    syncConflictsAddonId = byId('sync-addon-id')?.value?.trim() || 'contacts';
+    void loadSyncConflicts();
+  });
+  byId('sync-status')?.addEventListener('change', () => {
+    syncConflictsStatus = byId('sync-status')?.value || 'open';
+    void loadSyncConflicts();
+  });
+  renderSyncConflictsTable();
+}
+
+async function loadSyncConflicts() {
+  const addonId = byId('sync-addon-id')?.value?.trim() || syncConflictsAddonId || 'contacts';
+  const status = byId('sync-status')?.value || syncConflictsStatus || 'open';
+  syncConflictsAddonId = addonId;
+  syncConflictsStatus = status;
+  try {
+    const resp = await ApiBinary.one('syncConflictsListRequest', {
+      orgId: 'org-default',
+      addonId,
+      status,
+      limit: 100,
+    });
+    syncConflicts = Array.isArray(resp.conflicts) ? resp.conflicts : [];
+    renderSyncConflictsTable();
+  } catch (err) {
+    syncConflicts = [];
+    renderSyncConflictsTable();
+    toast(`Sync: ${err.message}`, 'error');
+  }
+}
+
+function renderSyncConflictsTable() {
+  const table = byId('sync-conflicts-table');
+  if (!table) return;
+  table.rows = syncConflicts.map((row) => {
+    const operationId = row.operationId || row.operation_id || '';
+    const status = row.status || 'open';
+    const resourceType = row.resourceType || row.resource_type || '';
+    const resourceId = row.resourceId || row.resource_id || '';
+    const tableName = row.tableName || row.table_name || '';
+    const sourceNodeId = row.sourceNodeId || row.source_node_id || '';
+    const errorKind = row.errorKind || row.error_kind || '';
+    const errorMessage = row.errorMessage || row.error_message || '';
+    return {
+      resource: `
+        <strong>${escapeHtml(resourceType || tableName || 'resource')}</strong>
+        <div class="muted"><code>${escapeHtml(resourceId || operationId.slice(0, 16))}</code></div>
+      `,
+      operation: `
+        <span>${escapeHtml(row.action || '')}</span>
+        <div class="muted"><code>${escapeHtml(operationId.slice(0, 24))}</code></div>
+      `,
+      source: sourceNodeId ? sourceNodeId.slice(0, 16) : 'local',
+      error: `
+        <strong>${escapeHtml(errorKind)}</strong>
+        <div class="muted">${escapeHtml(errorMessage)}</div>
+      `,
+      statusChip: conflictStatusChip(status),
+      actions: renderSyncConflictActions(operationId, status),
+    };
+  });
+  if (!table._syncConflictActionBound) {
+    table._syncConflictActionBound = true;
+    table.shadowRoot?.addEventListener('click', async (event) => {
+      const btn = event.target.closest?.('[data-sync-resolution]');
+      if (!btn) return;
+      await resolveSyncConflict(btn.dataset.syncOperation, btn.dataset.syncResolution);
+    });
+  }
+}
+
+function conflictStatusChip(status) {
+  const chipStatus = status === 'open' ? 'warn' : status === 'resolved' ? 'ok' : 'info';
+  return { status: chipStatus, label: status || 'unknown' };
+}
+
+function renderSyncConflictActions(operationId, status) {
+  if (status !== 'open') return '<span class="muted">—</span>';
+  const op = escapeAttr(operationId);
+  return `
+    <div style="display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;">
+      <tf-button variant="ghost" size="sm" icon="check" data-sync-operation="${op}" data-sync-resolution="keep_local">Local</tf-button>
+      <tf-button variant="ghost" size="sm" icon="x" data-sync-operation="${op}" data-sync-resolution="ignore">Ignore</tf-button>
+      <tf-button variant="primary" size="sm" icon="download" data-sync-operation="${op}" data-sync-resolution="accept_remote">Remote</tf-button>
+    </div>
+  `;
+}
+
+async function resolveSyncConflict(operationId, resolution) {
+  if (!operationId || !resolution) return;
+  try {
+    await ApiBinary.one('syncConflictResolveRequest', {
+      orgId: 'org-default',
+      addonId: syncConflictsAddonId,
+      operationId,
+      resolution,
+    });
+    toast(`Konflikt rozwiązany: ${resolution}`, 'success');
+    await loadSyncConflicts();
+  } catch (err) {
+    toast(`Resolve conflict: ${err.message}`, 'error');
+  }
+}
+
+// ==========================================================================
+// Zakladka: Storage
+// ==========================================================================
+
+function renderStorageTab() {
+  const report = storageReport;
+  const level = String(report?.level || 'unknown').toLowerCase();
+  const total = numberField(report, 'totalBytes', 'total_bytes');
+  const available = numberField(report, 'availableBytes', 'available_bytes');
+  const freePercentBps = numberField(report, 'freePercentBps', 'free_percent_bps');
+  const freeLabel = Number.isFinite(freePercentBps) ? `${(freePercentBps / 100).toFixed(2)}%` : '—';
+  const used = Number.isFinite(total) && Number.isFinite(available) ? Math.max(0, total - available) : null;
+  const root = report?.root || '';
+  const blockBytes = numberField(report, 'largeBlobBlockBytes', 'large_blob_block_bytes');
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h3>Storage</h3>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          ${storageLevelChip(level)}
+          <tf-button variant="ghost" size="sm" icon="refresh" id="storage-refresh">Odśwież</tf-button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px;">
+          ${storageMetric('Wolne', freeLabel)}
+          ${storageMetric('Dostępne', formatBytes(available))}
+          ${storageMetric('Użyte', formatBytes(used))}
+          ${storageMetric('Łącznie', formatBytes(total))}
+          ${storageMetric('Blokada blobów', level === 'critical' ? `>${formatBytes(blockBytes)}` : 'nieaktywna')}
+        </div>
+        <div style="margin:0 0 12px;" class="muted">
+          <code>${escapeHtml(root || 'TENTAFLOW_HOME')}</code>
+        </div>
+        <tf-table id="storage-paths-table" sortable>
+          <tf-column key="label" label="Obszar" sortable></tf-column>
+          <tf-column key="bytes" label="Rozmiar" sortable></tf-column>
+          <tf-column key="path" label="Ścieżka" renderer="html"></tf-column>
+        </tf-table>
+      </div>
+    </div>
+  `;
+}
+
+function bindStorageTab() {
+  byId('storage-refresh')?.addEventListener('click', loadStorageReport);
+  renderStoragePathsTable();
+}
+
+async function loadStorageReport() {
+  try {
+    storageReport = await ApiBinary.one('syncStorageReportRequest');
+    renderStorageSummary();
+    renderStoragePathsTable();
+  } catch (err) {
+    storageReport = null;
+    renderStorageSummary();
+    renderStoragePathsTable();
+    toast(`Storage: ${err.message}`, 'error');
+  }
+}
+
+function renderStorageSummary() {
+  if (currentTab !== 'storage') return;
+  const host = byId('settings-tab-body');
+  if (!host) return;
+  host.innerHTML = renderStorageTab();
+  bindStorageTab();
+}
+
+function renderStoragePathsTable() {
+  const table = byId('storage-paths-table');
+  if (!table) return;
+  const paths = Array.isArray(storageReport?.paths) ? storageReport.paths : [];
+  table.rows = paths.map((row) => ({
+    label: row.label || '',
+    bytes: formatBytes(Number(row.bytes || 0)),
+    path: `<code>${escapeHtml(row.path || '')}</code>`,
+  }));
+}
+
+function storageMetric(label, value) {
+  return `
+    <div style="border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--panel);min-width:0;">
+      <div class="muted" style="font-size:12px;margin-bottom:6px;">${escapeHtml(label)}</div>
+      <div style="font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(value)}</div>
+    </div>
+  `;
+}
+
+function storageLevelChip(level) {
+  const status = level === 'critical' || level === 'warning'
+    ? 'warn'
+    : level === 'ok'
+      ? 'ok'
+      : 'info';
+  return `<tf-chip status="${status}">${escapeHtml(level || 'unknown')}</tf-chip>`;
+}
+
+function numberField(obj, camelKey, snakeKey) {
+  const raw = obj?.[camelKey] ?? obj?.[snakeKey];
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
 }
 
 // ==========================================================================

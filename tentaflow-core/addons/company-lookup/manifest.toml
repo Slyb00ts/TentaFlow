@@ -1,0 +1,120 @@
+[addon]
+id = "company-lookup"
+name = "Company Lookup PL"
+version = "1.0.0"
+description = "Online lookup firm w oficjalnym API Wykazu podatnikow VAT MF po NIP albo REGON. Addon nie cache'uje danych."
+category = "business"
+keywords = ["firma", "nip", "regon", "vat", "adres", "mf", "biala-lista"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = "https://www.gov.pl/web/kas/api-wykazu-podatnikow-vat"
+icon = "building"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "http.request"
+display_name = "Online lookup w Wykazie VAT"
+description = "Wykonuje publiczne zapytania HTTP do wl-api.mf.gov.pl bez lokalnego cache."
+risk = "medium"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Company lookup jako flow block"
+description = "Udostepnia lookup firmy po NIP albo REGON innym flow/addonom."
+risk = "low"
+
+[[network_rule]]
+id = "mf-vat-whitelist-https"
+protocol = "tcp"
+host = "wl-api.mf.gov.pl"
+port = 443
+description = "Oficjalne API Wykazu podatnikow VAT Ministerstwa Finansow."
+required = true
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 64
+fuel_limit = 10000000
+http_requests_per_minute = 120
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "lookup_by_nip"
+display_name = "Pobierz firme po NIP"
+description = "Pobiera online dane firmy z oficjalnego Wykazu VAT MF po numerze NIP."
+keywords = ["firma", "nip", "adres", "vat"]
+
+[[tool.parameter]]
+name = "nip"
+param_type = "string"
+description = "10-cyfrowy NIP, z myslnikami albo bez."
+required = true
+
+[[tool.parameter]]
+name = "date"
+param_type = "string"
+description = "Data stanu rejestru w formacie YYYY-MM-DD. Domyslnie dzisiejsza data UTC."
+required = false
+
+[[tool]]
+id = "lookup_by_regon"
+display_name = "Pobierz firme po REGON"
+description = "Pobiera online dane firmy z oficjalnego Wykazu VAT MF po numerze REGON."
+keywords = ["firma", "regon", "adres", "vat"]
+
+[[tool.parameter]]
+name = "regon"
+param_type = "string"
+description = "9- albo 14-cyfrowy REGON."
+required = true
+
+[[tool.parameter]]
+name = "date"
+param_type = "string"
+description = "Data stanu rejestru w formacie YYYY-MM-DD. Domyslnie dzisiejsza data UTC."
+required = false
+
+[[tool]]
+id = "lookup_many_by_nip"
+display_name = "Pobierz wiele firm po NIP"
+description = "Pobiera online dane wielu firm z oficjalnego Wykazu VAT MF po numerach NIP."
+keywords = ["firma", "nip", "batch", "vat"]
+
+[[tool.parameter]]
+name = "nips"
+param_type = "string"
+description = "Lista NIP rozdzielona przecinkami albo tablica stringow."
+required = true
+
+[[tool.parameter]]
+name = "date"
+param_type = "string"
+description = "Data stanu rejestru w formacie YYYY-MM-DD. Domyslnie dzisiejsza data UTC."
+required = false
+
+[[tool]]
+id = "lookup_company"
+display_name = "Pobierz firme po identyfikatorze"
+description = "Rozpoznaje NIP albo REGON i pobiera online dane firmy z Wykazu VAT MF."
+keywords = ["firma", "nip", "regon", "adres", "vat"]
+
+[[tool.parameter]]
+name = "identifier"
+param_type = "string"
+description = "NIP albo REGON."
+required = true
+
+[[tool.parameter]]
+name = "date"
+param_type = "string"
+description = "Data stanu rejestru w formacie YYYY-MM-DD. Domyslnie dzisiejsza data UTC."
+required = false

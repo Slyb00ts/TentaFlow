@@ -29,6 +29,7 @@
     "logout": "Abmelden",
     "addons": "Addons",
     "users": "Benutzer",
+    "roles_catalog": "Rollenkatalog",
     "audit": "Audit-Protokoll",
     "legal": "DSGVO-Dokumente",
     "profiling_sessions": "Profiling",

@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::ledger::{
-    build_merkle_summary, hash_canonical, validate_hash_chain, validate_hash_chain_from,
     HexNodeIdOperationVerifier, LedgerResult, OperationQuery, PartitionId, SnapshotId,
     SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
-    SyncSnapshot,
+    SyncSnapshot, build_merkle_summary, hash_canonical, validate_hash_chain,
+    validate_hash_chain_from,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -1335,15 +1335,17 @@ mod tests {
                 keep_operations_after_sequence: Some(2),
             })
             .unwrap();
-        assert!(store
-            .get_operations(OperationQuery {
-                partition_id: partition.clone(),
-                from_sequence: Some(1),
-                to_sequence: Some(1),
-                limit: None,
-            })
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .get_operations(OperationQuery {
+                    partition_id: partition.clone(),
+                    from_sequence: Some(1),
+                    to_sequence: Some(1),
+                    limit: None,
+                })
+                .unwrap()
+                .is_empty()
+        );
 
         let result = manager
             .restore_sql_from_package(SnapshotSqlPackageRestoreRequest {
