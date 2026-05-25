@@ -13,6 +13,7 @@ use super::{
     ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 use crate::addon::event_bus::EventSubscriber;
+use crate::addon::runtime;
 
 // =============================================================================
 // event_subscribe — subskrypcja eventu
@@ -71,11 +72,21 @@ pub fn event_subscribe(
         addon_id, event_type
     );
 
-    // Zarejestruj subskrypcje w event bus
+    // Resolve event export name from the addon's manifest runtime
+    let rt_id = caller
+        .data()
+        .manifest
+        .runtime
+        .as_deref()
+        .unwrap_or("wasmtime");
+    let event_export = runtime::adapter_for_runtime(rt_id)
+        .map(|a| a.export_on_event().to_string())
+        .unwrap_or_else(|| "on_event".to_string());
+
     let subscriber = EventSubscriber {
         addon_id: addon_id.clone(),
         instance_id: instance_id.clone(),
-        callback_name: "on_event".to_string(),
+        callback_name: event_export,
     };
 
     let subscription_id = caller.data().event_bus.subscribe(&event_type, subscriber);
