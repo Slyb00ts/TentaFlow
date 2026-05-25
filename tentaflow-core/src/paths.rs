@@ -10,7 +10,7 @@
 //       tentaflow-containers/             <- extracted repo bundle
 //         llm/  stt/  tts/  agents/ ...
 //     data/
-//       router.db                         <- sqlite database
+//       tentaflow.db                      <- sqlite database
 //     models/                             <- SHARED between Docker AND native
 //       hub/                              <- HF cache layout (auto-created)
 //         models--speakleash--Bielik-11B-v2.6/...
@@ -265,7 +265,7 @@ pub fn data_dir() -> PathBuf {
 
 /// Default sqlite database path.
 pub fn database_path() -> PathBuf {
-    data_dir().join("router.db")
+    data_dir().join("tentaflow.db")
 }
 
 /// Root directory for RODO/GDPR legal-document PDFs (F2 P8). Layout:
