@@ -1019,6 +1019,15 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         .get("runtime")
         .and_then(|v| v.as_str())
         .map(String::from);
+    if let Some(ref rt) = runtime {
+        if !crate::addon::runtime::KNOWN_RUNTIMES.contains(&rt.as_str()) {
+            anyhow::bail!(
+                "unknown addon runtime '{}', expected one of: {}",
+                rt,
+                crate::addon::runtime::KNOWN_RUNTIMES.join(", ")
+            );
+        }
+    }
     let license = addon
         .get("license")
         .and_then(|v| v.as_str())

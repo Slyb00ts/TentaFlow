@@ -475,6 +475,8 @@ pub struct AddonInstance {
     pub user_id: Option<i64>,
     pub store: WasmStore<AddonState>,
     pub instance: WasmInstance,
+    /// Language-specific export name mapping (Rust / .NET / Python).
+    pub language_adapter: Box<dyn runtime::LanguageAdapter>,
 }
 
 // =============================================================================
@@ -992,6 +994,7 @@ impl AddonManager {
 
         // Zaladuj manifest z DB (potrzebny do walidacji regul sieciowych)
         let manifest = self.load_addon_manifest(addon_id)?;
+        let rt_id = manifest.runtime.clone().unwrap_or_else(|| "wasmtime".to_string());
 
         let instance_id = uuid::Uuid::new_v4().to_string();
 
@@ -1039,16 +1042,39 @@ impl AddonManager {
         // Utworz instancje WASM
         let instance = runtime::instantiate(&linker, &mut store, &module)?;
 
-        // Wywolaj on_start() jesli addon go eksportuje
+        // Resolve language adapter from manifest runtime field
+        let adapter = runtime::adapter_for_runtime(&rt_id)
+            .unwrap_or_else(|| Box::new(runtime::RustAdapter));
+
+        // .NET NativeAOT / CPython need _start or _initialize to bootstrap
+        // their managed runtime (GC, interpreter) before any lifecycle call.
+        if adapter.needs_wasi_start() {
+            let init_fuel = adapter.init_fuel_budget();
+            if init_fuel > 0 {
+                runtime::refuel_store(&mut store, init_fuel)?;
+            }
+            let wasi_start = instance
+                .get_typed_func::<(), ()>(&mut store, "_start")
+                .ok()
+                .or_else(|| instance.get_typed_func::<(), ()>(&mut store, "_initialize").ok());
+            if let Some(f) = wasi_start {
+                f.call(&mut store, ())
+                    .map_err(|e| anyhow::anyhow!("WASI _start/_initialize failed: {e}"))?;
+            }
+            // Refuel to default budget after init consumed its share
+            runtime::refuel_store(&mut store, DEFAULT_FUEL_LIMIT)?;
+        }
+
+        // Lifecycle on_start (export name depends on source language)
         if let Some(on_start) = instance
-            .get_typed_func::<(), i32>(&mut store, "on_start")
+            .get_typed_func::<(), i32>(&mut store, adapter.export_on_start())
             .ok()
         {
             let result = on_start
                 .call(&mut store, ())
-                .map_err(|e| anyhow::anyhow!("Blad wywolania on_start(): {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Blad wywolania {}(): {e}", adapter.export_on_start()))?;
             if result != 0 {
-                bail!("on_start() zwrocil blad: {}", result);
+                bail!("{}() zwrocil blad: {}", adapter.export_on_start(), result);
             }
         }
 
@@ -1068,6 +1094,7 @@ impl AddonManager {
             user_id,
             store,
             instance,
+            language_adapter: adapter,
         };
 
         // Dodaj do mapy instancji
@@ -1367,13 +1394,12 @@ impl AddonManager {
             })
         });
 
-        // Wywolaj on_tick(timestamp_ms) -> i32 — addon nie musi go eksportowac;
-        // brak exportu = no-op (instance zostaje aktywna na inne hooks
-        // jak on_event).
+        // Lifecycle on_tick (export name from language adapter)
+        let tick_export = addon_instance.language_adapter.export_on_tick();
         let res: Result<()> = (|| {
             if let Ok(on_tick) = addon_instance
                 .instance
-                .get_typed_func::<i64, i32>(&mut addon_instance.store, "on_tick")
+                .get_typed_func::<i64, i32>(&mut addon_instance.store, tick_export)
             {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
                 let code = on_tick
@@ -1476,14 +1502,15 @@ impl AddonManager {
             }
         }
 
-        // Wywolaj on_stop() jesli addon go eksportuje
+        // Lifecycle on_stop (export name from language adapter)
+        let stop_export = addon_instance.language_adapter.export_on_stop();
         if let Some(on_stop) = addon_instance
             .instance
-            .get_typed_func::<(), i32>(&mut addon_instance.store, "on_stop")
+            .get_typed_func::<(), i32>(&mut addon_instance.store, stop_export)
             .ok()
         {
             if let Err(e) = on_stop.call(&mut addon_instance.store, ()) {
-                warn!("Blad wywolania on_stop() dla '{}': {}", instance_id, e);
+                warn!("Blad wywolania {}() dla '{}': {}", stop_export, instance_id, e);
             }
         }
 
@@ -1641,14 +1668,15 @@ impl AddonManager {
                 );
             }
 
-            // Wywolaj on_request w guest
+            // Lifecycle on_request (export name from language adapter)
+            let req_export = addon_instance.language_adapter.export_on_request();
             let on_request = addon_instance
                 .instance
                 .get_typed_func::<(i32, i32, i32, i32, i32), i32>(
                     &mut addon_instance.store,
-                    "on_request",
+                    req_export,
                 )
-                .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji on_request(): {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji {}(): {e}", req_export))?;
 
             let result_code = on_request
                 .call(
@@ -1782,6 +1810,7 @@ impl AddonManager {
         let module = self.get_or_compile_module(addon_id)?;
         let permissions = self.load_addon_permissions(addon_id)?;
         let manifest = self.load_addon_manifest(addon_id)?;
+        let block_rt_id = manifest.runtime.clone().unwrap_or_else(|| "wasmtime".to_string());
 
         let instance_id = format!("block-{}", uuid::Uuid::new_v4());
 
@@ -1846,6 +1875,27 @@ impl AddonManager {
         host_functions::register_host_functions(&mut linker)?;
         let instance = runtime::instantiate(&linker, &mut store, &module)?;
 
+        // Language adapter for correct export names
+        let block_adapter = runtime::adapter_for_runtime(&block_rt_id)
+            .unwrap_or_else(|| Box::new(runtime::RustAdapter));
+
+        // .NET / Python WASI init for ephemeral block instances
+        if block_adapter.needs_wasi_start() {
+            let init_fuel = block_adapter.init_fuel_budget();
+            if init_fuel > 0 {
+                runtime::refuel_store(&mut store, init_fuel)?;
+            }
+            let wasi_start = instance
+                .get_typed_func::<(), ()>(&mut store, "_start")
+                .ok()
+                .or_else(|| instance.get_typed_func::<(), ()>(&mut store, "_initialize").ok());
+            if let Some(f) = wasi_start {
+                f.call(&mut store, ())
+                    .map_err(|e| anyhow::anyhow!("WASI _start/_initialize failed: {e}"))?;
+            }
+            runtime::refuel_store(&mut store, fuel_budget)?;
+        }
+
         // Request: konwencja tool = "block.{block_type}", params = envelope JSON.
         // Addon parsuje `params` jako FlowEnvelope-shaped Value.
         let envelope_value: serde_json::Value = serde_json::from_slice(envelope_json)
@@ -1898,9 +1948,10 @@ impl AddonManager {
                 bail!("alloc(out_len) zwrocil {}", out_len_ptr);
             }
 
+            let block_req_export = block_adapter.export_on_request();
             let on_request = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "on_request")
-                .map_err(|e| anyhow::anyhow!("brak on_request: {e}"))?;
+                .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, block_req_export)
+                .map_err(|e| anyhow::anyhow!("brak {}: {e}", block_req_export))?;
 
             let result_code = on_request
                 .call(
@@ -1913,10 +1964,10 @@ impl AddonManager {
                         out_len_ptr,
                     ),
                 )
-                .map_err(|e| anyhow::anyhow!("on_request fail: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("{} fail: {e}", block_req_export))?;
 
             if result_code != 0 {
-                bail!("on_request zwrocil kod bledu: {}", result_code);
+                bail!("{} zwrocil kod bledu: {}", block_req_export, result_code);
             }
 
             let mem_data = memory.data(&store);
@@ -2003,9 +2054,10 @@ impl AddonManager {
 
         // Wykonaj WASM poza lockiem
         for (addon_id, _pos, ref mut addon_instance) in &mut extracted {
+            let event_export = addon_instance.language_adapter.export_on_event();
             if let Ok(on_event) = addon_instance
                 .instance
-                .get_typed_func::<(i32, i32), i32>(&mut addon_instance.store, "on_event")
+                .get_typed_func::<(i32, i32), i32>(&mut addon_instance.store, event_export)
             {
                 if let Ok(alloc_fn) = addon_instance
                     .instance
