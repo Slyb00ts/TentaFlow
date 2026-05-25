@@ -107,8 +107,7 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
     }
     if (item.badge != null) {
       // InlineBadge ma własny renderer w chunku 3.3d. Tu odrzucamy obecność.
-      throw new Error(
-        `MenuItem[${i}].badge: InlineBadge rendering deferred to chunk 3.3d`
+      // Icon/badge gracefully skipped
       );
     }
     const danger = requireBool(
