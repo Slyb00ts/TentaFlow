@@ -779,6 +779,11 @@ pub async fn handle_request(
                 .unwrap_or_default(),
         );
 
+        // Initialize SessionRegistry before AppState so both dispatch and host
+        // functions share the same instance.
+        let shared_sessions = Arc::new(crate::addon::ui_session::SessionRegistry::new());
+        crate::addon::ui_session::init_global_registry(shared_sessions.clone());
+
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
         let meeting_manager =
             crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
@@ -802,9 +807,7 @@ pub async fn handle_request(
             port_allocator: port_allocator.clone(),
             mesh_services_registry: mesh_services_registry.clone(),
             live_handles: service_manager.live_handles.clone(),
-            ui_sessions: crate::addon::ui_session::global_registry()
-                .cloned()
-                .expect("SessionRegistry must be initialized before AppState"),
+            ui_sessions: shared_sessions.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
