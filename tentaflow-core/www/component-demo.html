@@ -7,8 +7,6 @@
 <link rel="stylesheet" href="/css/controls.css">
 <link rel="stylesheet" href="/css/style.css">
 <link rel="stylesheet" href="/css/addon-app.css">
-<link rel="stylesheet" href="/css/sdk-theme.css">
-<link rel="stylesheet" href="/css/sdk-motion.css">
 <style>
   html, body { overflow: visible !important; height: auto !important; }
   body { padding: 0 !important; }
@@ -663,6 +661,64 @@ fetch('/index.html').then(r => r.text()).then(html => {
   <tf-chat-panel title="AI Assistant" open id="demo-chat-panel" style="height:420px"></tf-chat-panel>
 </div>
 
+<!-- ========== COMBOBOX ========== -->
+<div class="section">
+  <div class="section-label">Combobox — tf-combobox</div>
+  <div class="box w400">
+    <tf-combobox placeholder="Search contacts..." id="demo-combobox"></tf-combobox>
+  </div>
+</div>
+
+<!-- ========== MULTISELECT ========== -->
+<div class="section">
+  <div class="section-label">Multiselect — tf-multiselect</div>
+  <div class="box w400">
+    <tf-multiselect placeholder="Select detectors..." id="demo-multiselect"></tf-multiselect>
+  </div>
+</div>
+
+<!-- ========== FILE + COLOR INPUT ========== -->
+<div class="section">
+  <div class="section-label">File Input + Color Input</div>
+  <div class="row">
+    <div class="box" style="width:300px">
+      <div class="label">tf-file-input</div>
+      <tf-file-input label="Upload image" accept="image/*"></tf-file-input>
+    </div>
+    <div class="box" style="width:200px">
+      <div class="label">tf-color-input</div>
+      <tf-color-input label="Accent color" value="#6366f1"></tf-color-input>
+    </div>
+  </div>
+</div>
+
+<!-- ========== MODAL ========== -->
+<div class="section">
+  <div class="section-label">Modal / Drawer — tf-modal</div>
+  <div class="row">
+    <tf-button variant="primary" id="open-modal">Open Modal</tf-button>
+    <tf-button variant="secondary" id="open-drawer">Open Drawer (right)</tf-button>
+  </div>
+</div>
+
+<!-- ========== SKELETON ========== -->
+<div class="section">
+  <div class="section-label">Skeleton — tf-skeleton</div>
+  <div class="row" style="gap:24px">
+    <div class="box" style="width:300px">
+      <div class="label">Text skeleton</div>
+      <tf-skeleton variant="text" lines="3"></tf-skeleton>
+    </div>
+    <div class="box">
+      <div class="label">Circle + rect</div>
+      <div class="row" style="gap:12px;align-items:center">
+        <tf-skeleton variant="circle" width="40" height="40"></tf-skeleton>
+        <tf-skeleton variant="rect" width="200" height="16"></tf-skeleton>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ========== SPECIALIZED (display-only notes) ========== -->
 <div class="section">
   <div class="section-label">Specialized (runtime-only)</div>
@@ -817,6 +873,46 @@ cmdPalette.items = [
   { id:'a2', group:'Actions', title:'Export report', subtitle:'PDF/CSV export', icon:'download', shortcut:'E' },
 ];
 document.getElementById('open-palette')?.addEventListener('click', () => TfCommandPalette.open());
+
+// Combobox
+const cb = document.getElementById('demo-combobox');
+if (cb) cb.options = [
+  { value: 'ak', label: 'Anna Kowalska', description: 'Sales · East' },
+  { value: 'mk', label: 'Marek Kowalczyk', description: 'Director · West' },
+  { value: 'pj', label: 'Piotr Jarocki', description: 'Admin · DevOps' },
+  { value: 'jw', label: 'Jakub Wojtczak', description: 'CIO · Santander' },
+  { value: 'mw', label: 'Magda Wiśniewska', description: 'VP Sales · VW' },
+];
+
+// Multiselect
+const ms = document.getElementById('demo-multiselect');
+if (ms) {
+  ms.options = [
+    { value: 'd1', label: 'D1 — ADR plates' },
+    { value: 'd2', label: 'D2 — Aggression' },
+    { value: 'd3', label: 'D3 — Abandoned luggage' },
+    { value: 'd5', label: 'D5 — Vehicle tracking' },
+    { value: 'd6', label: 'D6 — Zone violation' },
+  ];
+  ms.value = ['d1', 'd2'];
+}
+
+// Modal
+import { TfModal } from '/js/components/tf-modal.js';
+document.getElementById('open-modal')?.addEventListener('click', async () => {
+  await TfModal.open({ title: 'Confirm action', body: 'Are you sure you want to proceed with this operation?', actions: [
+    { label: 'Cancel', variant: 'ghost', action: 'cancel' },
+    { label: 'Confirm', variant: 'primary', action: 'confirm' },
+  ]});
+});
+document.getElementById('open-drawer')?.addEventListener('click', () => {
+  const m = document.createElement('tf-modal');
+  m.setAttribute('variant', 'drawer-right');
+  m.setAttribute('title', 'Camera details');
+  m.innerHTML = '<div style="padding:16px;color:var(--tf-text-2);font-size:13px">Drawer content with camera settings, stream config, detector assignments...</div>';
+  document.body.appendChild(m);
+  m.setAttribute('open', '');
+});
 
 // Face mode switching
 const face = document.getElementById('demo-face');

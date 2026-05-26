@@ -235,7 +235,8 @@ export function renderIcon(name, options = {}) {
   svg.setAttribute('focusable', 'false');
 
   if (color) {
-    svg.style.color = `var(--sdk-color-${color}, currentColor)`;
+    const colorMap = { primary: 'tf-accent-1', accent: 'tf-accent-2', success: 'tf-success', warning: 'tf-warning', danger: 'tf-danger', info: 'tf-info', text: 'tf-text', text_muted: 'tf-text-2', text_subtle: 'tf-text-3' };
+    svg.style.color = `var(--${colorMap[color] || 'tf-text'}, currentColor)`;
   }
 
   if (ariaLabel) {
