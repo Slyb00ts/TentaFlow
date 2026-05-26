@@ -5,6 +5,9 @@
 
 #![allow(clippy::too_many_lines, clippy::collapsible_else_if, dead_code)]
 
+#[used]
+static BUILD_TS: &str = "20260526-1210";
+
 extern crate alloc;
 
 use alloc::string::String;
