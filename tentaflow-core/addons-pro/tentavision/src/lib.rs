@@ -1151,6 +1151,8 @@ fn sparkline(_points: Vec<f64>) -> Component {
 struct PanelState {
     current_panel: String,
     add_form_visible: bool,
+    wizard_step: u8,
+    cameras_filter: String,
     form_name: String,
     form_url: String,
     error_message: Option<String>,
@@ -1448,7 +1450,8 @@ impl PanelState {
     const fn new() -> Self {
         Self {
             current_panel: String::new(),
-            add_form_visible: false, form_name: String::new(), form_url: String::new(),
+            add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
+            form_name: String::new(), form_url: String::new(),
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
@@ -1660,11 +1663,14 @@ fn render_panel(panel_id: &str) {
 fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
     log::info(&alloc::format!("TentaVision UI action '{}'", action));
     match action {
-        "camera-add-show" => { with_state(|s| { s.add_form_visible = true; s.discover.reset(); s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
-        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
+        "camera-add-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.discover.visible = false; s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
+        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); s.form_name.clear(); s.form_url.clear(); }); json!({"ok":true}) }
+        "wizard-next" => { with_state(|s| { if s.wizard_step < 3 { s.wizard_step += 1; } }); json!({"ok":true}) }
+        "wizard-prev" => { with_state(|s| { if s.wizard_step > 0 { s.wizard_step -= 1; } }); json!({"ok":true}) }
+        "cameras-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.cameras_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
         "camera-add-submit" => handle_camera_add_submit(params),
         "camera-remove" => handle_camera_remove(params),
-        "discover-show" => { with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.discover.visible = true; s.clear_messages(); }); json!({"ok":true}) }
+        "discover-show" => { with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
         "discover-cancel" => { with_state(|s| { s.discover.reset(); s.clear_messages(); }); json!({"ok":true}) }
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
@@ -2124,76 +2130,386 @@ fn build_live_content() -> Component {
 fn build_cameras_content() -> Component {
     let cameras = camera_list().unwrap_or_default();
     let messages = build_messages_section();
-    let (add_visible, discover_visible) = with_state(|s| (s.add_form_visible, s.discover.visible));
+    let (add_visible, filter) = with_state(|s| (s.add_form_visible, s.cameras_filter.clone()));
 
     let mut children = vec![messages];
 
+    // Header: heading + search + add button
+    let search_input = {
+        use tentaflow_sdk_spec::protocol::ui::form::Input;
+        Input {
+            r#type: InputType::Search,
+            bind_path: StatePath::new(vec![PathSegment::Key("cameras_search".into())]),
+            placeholder: Some(lit("Szukaj po nazwie, IP, vendorze...")),
+            label: None,
+            hint: None,
+            leading_icon: Some(icon_named(parse_icon_name("search"))),
+            trailing_icon: None,
+            prefix: None,
+            suffix: None,
+            validators: vec![],
+            max_length: None,
+            min_length: None,
+            pattern: None,
+            autocomplete: None,
+            input_mode: None,
+            disabled: None,
+            readonly: None,
+            error: None,
+            size: InputSize::Md,
+        }.into_component("cameras_search").expect("Input")
+    };
     let toolbar = stack_h(vec![
         heading(2, "Kamery"),
-        button_with_icon("Dodaj", "camera-add-show", "primary", "plus"),
-        button_with_icon("Wykryj ONVIF", "discover-show", "secondary", "search"),
-        button("Odśwież", "cameras-refresh", "ghost"),
+        search_input,
+        button_with_icon("Dodaj kamerę", "camera-add-show", "primary", "plus"),
     ]);
     children.push(toolbar);
 
+    // Use demo data when no real cameras exist
+    let use_demo = cameras.is_empty();
+    struct CamRow { name: &'static str, vendor: &'static str, addr: &'static str, status: &'static str, profile: &'static str, fps: &'static str, diag: &'static str, diag_tone: &'static str }
+    let demo_rows: Vec<CamRow> = vec![
+        CamRow { name: "C-01 brama wjazdowa", vendor: "Hikvision \u{00b7} ISAPI + RTSP", addr: "192.168.40.11", status: "online", profile: "ADR-brama", fps: "5/5", diag: "OK", diag_tone: "success" },
+        CamRow { name: "C-04 wjazd-2", vendor: "Axis \u{00b7} VAPIX + ACAP", addr: "192.168.40.14", status: "online", profile: "Bezpieczeństwo-noc", fps: "12/15", diag: "backpressure", diag_tone: "warning" },
+        CamRow { name: "C-07 peron", vendor: "ONVIF Profile T+M", addr: "192.168.40.17", status: "online", profile: "Peron-publiczny", fps: "10/10", diag: "OK", diag_tone: "success" },
+        CamRow { name: "C-12 magazyn", vendor: "Dahua \u{00b7} CGI", addr: "192.168.40.22", status: "offline", profile: "\u{2014}", fps: "\u{2014}", diag: "brak heartbeat", diag_tone: "critical" },
+        CamRow { name: "C-15 parking", vendor: "UniFi Protect \u{00b7} v3.x", addr: "unifi://nvr-1/cam-15", status: "online", profile: "ANPR-parking", fps: "5/5", diag: "obraz przyciemniony", diag_tone: "warning" },
+        CamRow { name: "C-18 dok", vendor: "Hanwha \u{00b7} ONVIF S+T", addr: "192.168.40.28", status: "online", profile: "ADR-dok", fps: "5/5", diag: "OK", diag_tone: "success" },
+        CamRow { name: "C-22 wjazd ADR", vendor: "Bosch \u{00b7} ONVIF S", addr: "192.168.40.32", status: "degraded", profile: "ADR-brama", fps: "3/5", diag: "drift 38ms", diag_tone: "warning" },
+    ];
+
+    // Compute filter counts
+    let (total, online, offline, warnings, unlinked) = if use_demo {
+        let t = demo_rows.len();
+        let on = demo_rows.iter().filter(|r| r.status == "online").count();
+        let off = demo_rows.iter().filter(|r| r.status == "offline").count();
+        let warn = demo_rows.iter().filter(|r| r.diag_tone == "warning" || r.diag_tone == "critical").count();
+        (t, on, off, warn, 3usize)
+    } else {
+        let t = cameras.len();
+        let on = cameras.iter().filter(|c| c.status == "online").count();
+        let off = cameras.iter().filter(|c| c.status == "offline").count();
+        (t, on, off, 0usize, 0usize)
+    };
+
+    // Sub-filter tabs
+    let active_filter = if filter.is_empty() { "all" } else { &filter };
+    let sub_tabs = filter_chips(
+        vec![
+            FilterChipDef { id: "all".into(), label: lit(&alloc::format!("Wszystkie ({})", total)), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "online".into(), label: lit(&alloc::format!("Online ({})", online)), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "offline".into(), label: lit(&alloc::format!("Offline ({})", offline)), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "warnings".into(), label: lit(&alloc::format!("Ostrzeżenia ({})", warnings)), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "unlinked".into(), label: lit(&alloc::format!("Niepowiązane ({})", unlinked)), icon: None, badge: None, count_path: None },
+        ],
+        active_filter,
+    );
+    children.push(sub_tabs);
+
+    // Wizard modal (when visible)
     if add_visible {
-        children.push(build_add_camera_form());
-    }
-    if discover_visible {
-        children.push(build_discover_wizard());
+        children.push(build_add_camera_wizard());
     }
 
-    if cameras.is_empty() {
-        children.push(card(None, vec![empty_state("Brak kamer", Some("Użyj przycisku 'Dodaj' lub 'Wykryj ONVIF'."), Some("cameras"))]));
+    // Camera table
+    if use_demo {
+        let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
+        for r in &demo_rows {
+            table_rows.push(build_camera_row(r.name, r.vendor, r.addr, r.status, r.profile, r.fps, r.diag, r.diag_tone));
+        }
+        children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
+    } else if cameras.is_empty() {
+        children.push(card(None, vec![empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras"))]));
     } else {
-        let cols = vec![
-            Value::Text("Nazwa".into()), Value::Text("Vendor".into()),
-            Value::Text("URL".into()), Value::Text("Status".into()),
-            Value::Text("Akcje".into()),
-        ];
-        let rows: Vec<Value> = cameras.iter().map(|c| {
-            Value::Array(vec![
-                Value::Text(c.display_name.clone()), Value::Text(c.vendor.clone()),
-                Value::Text(redact_url_for_display(&c.url)), Value::Text(c.status.clone()),
-                Value::Text("×".into()),
-            ])
-        }).collect();
-        children.push(card(None, vec![table(cols, rows)]));
+        let mut table_rows: Vec<Component> = vec![build_cameras_table_header()];
+        for c in &cameras {
+            table_rows.push(build_camera_row(&c.display_name, &c.vendor, &redact_url_for_display(&c.url), &c.status, "\u{2014}", "\u{2014}", "\u{2014}", "muted"));
+        }
+        children.push(card(None, vec![stack_v_gap("xs", table_rows)]));
     }
+
     stack_v(children)
 }
 
-fn build_add_camera_form() -> Component {
-    let (_name, _url, err) = with_state(|s| (s.form_name.clone(), s.form_url.clone(), s.error_message.clone()));
-    let mut form_children = vec![
-        heading(3, "Dodaj kamerę"),
-        input("Nazwa", "np. Wejście główne", "name"),
-        input("URL", "rtsp://...", "url"),
-    ];
-    if let Some(e) = err { form_children.push(alert(&e, "danger")); }
-    form_children.push(stack_h(vec![
-        button("Zapisz", "camera-add-submit", "primary"),
-        button("Anuluj", "camera-add-cancel", "ghost"),
-    ]));
-    card(Some("Nowa kamera"), form_children)
+fn build_camera_status_chip(status: &str) -> Component {
+    let (label, tone) = match status {
+        "online" => ("online", "success"),
+        "offline" => ("offline", "critical"),
+        "degraded" => ("degraded", "warning"),
+        _ => (status, "muted"),
+    };
+    chip_toned(label, tone)
 }
 
-fn build_discover_wizard() -> Component {
-    let (scanning, cams, _selected, _custom_name, err) = with_state(|s| {
-        (s.discover.scanning, s.discover.cameras.len(), s.discover.selected_index, s.discover.custom_name.clone(), s.discover.error_message.clone())
-    });
-    let mut children = vec![heading(3, "Wykrywanie ONVIF")];
-    if scanning { children.push(spinner("md")); children.push(text("Skanowanie sieci...")); }
-    else if cams == 0 {
-        children.push(button("Skanuj sieć", "discover-scan", "primary"));
-        children.push(text("Naciśnij aby wykryć kamery ONVIF w sieci lokalnej."));
+fn build_camera_row(name: &str, vendor: &str, addr: &str, status: &str, profile: &str, fps: &str, diag: &str, diag_tone: &str) -> Component {
+    let name_cell = text_styled(name, "body_strong");
+    let vendor_cell = text(vendor);
+    let addr_cell = text_styled(addr, "mono");
+    let status_cell = build_camera_status_chip(status);
+    let profile_cell = if profile == "\u{2014}" {
+        text("\u{2014}")
     } else {
-        children.push(text(&alloc::format!("Znaleziono {} kamer", cams)));
-        children.push(button("Dodaj wybraną", "discover-add", "primary"));
+        ChipComp {
+            variant: ChipVariant::Soft,
+            tone: Tone::Primary,
+            label: lit(profile),
+            icon: None,
+            avatar: None,
+            selected: None,
+            removable: false,
+        }.into_component(next_id()).expect("Chip")
+    };
+    let fps_cell = if fps == "\u{2014}" {
+        text("\u{2014}")
+    } else {
+        text_styled(fps, "body_strong")
+    };
+    let diag_cell = match diag_tone {
+        "success" => chip_toned_icon(diag, "success", "check"),
+        "warning" => chip_toned(diag, "warning"),
+        "critical" => chip_toned_icon(diag, "critical", "info"),
+        _ => chip_toned(diag, "muted"),
+    };
+    let action_cell = button("\u{22ef}", "camera-row-action", "ghost");
+
+    Flex {
+        direction: FlexDirection::Row,
+        gap: Spacing::Md,
+        justify: FlexJustify::Start,
+        align: FlexAlign::Center,
+        wrap: FlexWrap::NoWrap,
+        children: vec![name_cell, vendor_cell, addr_cell, status_cell, profile_cell, fps_cell, diag_cell, action_cell],
+        padding: None,
+        background: None,
+        radius: None,
+    }.into_component(next_id()).expect("Flex")
+}
+
+fn build_cameras_table_header() -> Component {
+    let headers: Vec<Component> = ["Nazwa", "Vendor / Protokół", "Adres", "Status", "Profil", "FPS", "Diagnostyka", ""]
+        .iter().map(|h| text_styled(h, "caption")).collect();
+    Flex {
+        direction: FlexDirection::Row,
+        gap: Spacing::Md,
+        justify: FlexJustify::Start,
+        align: FlexAlign::Center,
+        wrap: FlexWrap::NoWrap,
+        children: headers,
+        padding: None,
+        background: None,
+        radius: None,
+    }.into_component(next_id()).expect("Flex")
+}
+
+fn build_add_camera_wizard() -> Component {
+    let (step, scanning, discovered_count, err) = with_state(|s| {
+        (s.wizard_step, s.discover.scanning, s.discover.cameras.len(), s.error_message.clone())
+    });
+
+    let step_labels = ["Odkrywanie", "Wybór & poświadczenia", "Podgląd & kalibracja", "Profil analityczny"];
+    let step_indicator = step_progress(
+        step_labels.iter().enumerate().map(|(i, label)| StepDef {
+            id: alloc::format!("step{}", i),
+            label: lit(label),
+            optional: false,
+            status: if (i as u8) < step { Some(lit("done")) } else if i as u8 == step { Some(lit("active")) } else { None },
+            description: None,
+        }).collect(),
+        &alloc::format!("step{}", step),
+    );
+
+    let title = alloc::format!("Dodaj kamerę \u{2014} krok {} z 4", step + 1);
+
+    let body = match step {
+        0 => build_wizard_step_discovery(scanning, discovered_count),
+        1 => build_wizard_step_selection(),
+        2 => build_wizard_step_preview(),
+        3 => build_wizard_step_profile(),
+        _ => text("Nieznany krok."),
+    };
+
+    let mut body_children = vec![step_indicator, body];
+    if let Some(e) = err { body_children.push(alert(&e, "critical")); }
+
+    // Footer buttons
+    let mut footer = Vec::new();
+    if step > 0 {
+        footer.push(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"));
     }
-    if let Some(e) = err { children.push(alert(&e, "danger")); }
-    children.push(button("Anuluj", "discover-cancel", "ghost"));
-    card(Some("Wykrywanie ONVIF"), children)
+    footer.push(button("Anuluj", "camera-add-cancel", "ghost"));
+    if step < 3 {
+        let next_label = match step {
+            0 => "Dalej: Wybór",
+            1 => "Dalej: Podgląd",
+            2 => "Dalej: Profil",
+            _ => "Dalej",
+        };
+        footer.push(button(next_label, "wizard-next", "primary"));
+    } else {
+        footer.push(button("Zakończ", "camera-add-submit", "primary"));
+    }
+
+    SectionCard {
+        title: lit(&title),
+        subtitle: None,
+        header_actions: vec![button("×", "camera-add-cancel", "ghost")],
+        header_divider: true,
+        body: body_children,
+        footer: Some(vec![stack_h(footer)]),
+        padding: Spacing::Lg,
+        gap: Spacing::Md,
+        variant: CardVariant::Outlined,
+        radius: RadiusToken::Lg,
+        shadow: ShadowToken::Md,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::None,
+        accent: None,
+    }.into_component(next_id()).expect("SectionCard")
+}
+
+fn build_wizard_step_discovery(scanning: bool, discovered_count: usize) -> Component {
+    if scanning {
+        return stack_v(vec![
+            spinner("lg"),
+            text("Skanowanie sieci kamerowej (ONVIF WS-Discovery + mDNS + ARP)..."),
+        ]);
+    }
+    if discovered_count == 0 {
+        return stack_v(vec![
+            text("Automatyczne wyszukiwanie kamer w sieci lokalnej."),
+            stack_h(vec![
+                button_with_icon("Skanuj sieć", "discover-scan", "primary", "search"),
+            ]),
+        ]);
+    }
+    let discovered = with_state(|s| s.discover.cameras.iter().enumerate().map(|(i, c)| {
+        (i, c.suggested_name.clone(), c.url.clone(), c.vendor.clone())
+    }).collect::<Vec<_>>());
+    let selected_idx = with_state(|s| s.discover.selected_index);
+
+    let mut cam_rows: Vec<Component> = Vec::new();
+    for (i, name, url, vendor) in &discovered {
+        let is_sel = selected_idx == Some(*i);
+        let label = text_styled(name, "body_strong");
+        let meta = text_styled(&alloc::format!("{} \u{00b7} {}", url, vendor), "caption");
+        let capability = if vendor.contains("ONVIF") {
+            chip_toned_icon("ONVIF OK", "success", "check")
+        } else if vendor.contains("ACAP") || vendor.contains("edge") {
+            chip_toned("edge analytics", "info")
+        } else if vendor.contains("RTSP") || vendor.to_ascii_lowercase().contains("rtsp") {
+            chip_toned("tylko RTSP", "warning")
+        } else {
+            chip_toned("standard", "muted")
+        };
+        let row_content = stack_h(vec![
+            stack_v_gap("xs", vec![label, meta]),
+            capability,
+        ]);
+        let tone = if is_sel { Tone::Primary } else { Tone::Neutral };
+        let mut row_card = Card {
+            variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
+            padding: Spacing::Sm,
+            gap: Spacing::Sm,
+            radius: RadiusToken::Sm,
+            shadow: ShadowToken::None,
+            border: BorderToken::Hairline,
+            background: BackgroundToken::None,
+            accent: if is_sel { Some(tone) } else { None },
+            children: vec![row_content],
+            interactive: true,
+            clickable: true,
+        }.into_component(next_id()).expect("Card");
+        let mut params = CborMap::default();
+        params.0.push(("index".into(), Value::U64(*i as u64)));
+        row_card.handlers = Some(HandlerMap(vec![(
+            tentaflow_sdk_spec::EventKind::Click,
+            Handler::Backend {
+                action_id: "discover-select".into(),
+                params,
+                optimistic: None,
+                on_failure: FailurePolicy::Toast,
+            },
+        )]));
+        cam_rows.push(row_card);
+    }
+
+    stack_v(vec![
+        text(&alloc::format!("Znaleziono {} kamer w sieci kamerowej.", discovered_count)),
+        stack_v_gap("xs", cam_rows),
+        button_with_icon("Skanuj ponownie", "discover-scan", "ghost", "search"),
+    ])
+}
+
+fn build_wizard_step_selection() -> Component {
+    let discovered_count = with_state(|s| s.discover.cameras.len());
+
+    let discovery_summary = if discovered_count > 0 {
+        text(&alloc::format!("Znaleziono {} nowe kamery w sieci kamerowej (VLAN 40). Wybierz tę, którą chcesz dodać.", discovered_count))
+    } else {
+        text("Brak wyników skanowania. Wróć do kroku 1 aby skanować lub wprowadź dane ręcznie.")
+    };
+
+    // Credential form fields
+    let name_input = input("Nazwa kamery", "C-23 wjazd-ADR-2", "name");
+    let location_select = select("Lokalizacja / strefa", vec![
+        SelectOption { value: SelectValue::Text("brama".into()), label: lit("Brama wjazdowa"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("parking".into()), label: lit("Parking"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("hala".into()), label: lit("Hala"), icon: None, disabled: false, group_id: None, description: None },
+    ], "camera_location");
+    let user_input = input("Użytkownik", "admin", "camera_user");
+    let password_input = {
+        use tentaflow_sdk_spec::protocol::ui::form::Input;
+        Input {
+            r#type: InputType::Password,
+            bind_path: StatePath::new(vec![PathSegment::Key("camera_password".into())]),
+            placeholder: Some(lit("zapisz w vault TentaFlow")),
+            label: Some(lit("Hasło")),
+            hint: Some(lit("Poświadczenia w secret store. Rotacja co 90 dni.")),
+            leading_icon: None,
+            trailing_icon: None,
+            prefix: None,
+            suffix: None,
+            validators: vec![],
+            max_length: None,
+            min_length: None,
+            pattern: None,
+            autocomplete: None,
+            input_mode: None,
+            disabled: None,
+            readonly: None,
+            error: None,
+            size: InputSize::Md,
+        }.into_component("camera_password").expect("Input")
+    };
+    let form_grid = grid(2, vec![name_input, location_select, user_input, password_input]);
+
+    // Firmware warning alert
+    let firmware_alert = AlertComp {
+        tone: parse_tone("warning"),
+        variant: AlertVariant::Default,
+        icon: Some(icon_named(parse_icon_name("info"))),
+        title: Some(lit("Wykryto wariancje firmware")),
+        message: lit("Hikvision firmware 5.7.x ma wyłączony ONVIF domyślnie. Po podaniu poświadczeń włączymy go automatycznie (wymaga uprawnień admin). Alternatywnie: RTSP fallback."),
+        actions: None,
+        dismissible: false,
+    }.into_component(next_id()).expect("Alert");
+
+    stack_v(vec![discovery_summary, form_grid, firmware_alert])
+}
+
+fn build_wizard_step_preview() -> Component {
+    stack_v(vec![
+        text("Podgląd strumienia i kalibracja kamery."),
+        empty_state("Oczekiwanie na podgląd", Some("Wprowadź poświadczenia w kroku 2, aby uzyskać podgląd strumienia."), Some("video")),
+    ])
+}
+
+fn build_wizard_step_profile() -> Component {
+    stack_v(vec![
+        text("Przypisz profil analityczny do kamery."),
+        empty_state("Wybierz profil", Some("Wybierz istniejący profil lub utwórz nowy."), Some("brain")),
+    ])
 }
 
 fn build_alarms_content() -> Component {
