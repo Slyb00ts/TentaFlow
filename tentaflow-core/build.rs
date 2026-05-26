@@ -83,6 +83,10 @@ fn main() {
             }
             println!("cargo:rerun-if-changed={}", addon_dir.join("Cargo.toml").display());
             println!("cargo:rerun-if-changed={}", addon_dir.join("manifest.toml").display());
+            println!("cargo:rerun-if-changed={}", addon_dir.join("src").display());
+            if addon_dir.join("migrations").exists() {
+                println!("cargo:rerun-if-changed={}", addon_dir.join("migrations").display());
+            }
 
             println!(
                 "cargo:warning=Addon '{}' — rozpoczynam budowanie WASM",
