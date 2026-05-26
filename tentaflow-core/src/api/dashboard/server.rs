@@ -59,11 +59,6 @@ impl DashboardServer {
         router: Arc<Router>,
         mesh_peer_store: MeshPeerStore,
     ) -> Self {
-        // Initialize the process-wide SessionRegistry. This single Arc is shared
-        // between AppState.ui_sessions (used by WS dispatch) and the global registry
-        // (used by addon host functions like ui_render_cbor).
-        let shared_session_registry = Arc::new(crate::addon::ui_session::SessionRegistry::new());
-        crate::addon::ui_session::init_global_registry(shared_session_registry.clone());
         Self {
             db,
             bind: bind.to_string(),
