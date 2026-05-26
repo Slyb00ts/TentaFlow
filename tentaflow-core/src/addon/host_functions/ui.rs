@@ -420,15 +420,28 @@ fn handle_panel_shell_registration(
     dec.u16().map_err(|e| format!("tag: {e}"))?;
 
     // Decode PanelShell body using minicbor derive (map-keyed struct).
+    tracing::info!("PanelShell: decoding body...");
     let shell: tentaflow_sdk_spec::protocol::ui::panel::PanelShell =
-        minicbor::Decode::decode(&mut dec, &mut ())
-            .map_err(|e| format!("PanelShell decode: {e}"))?;
+        match minicbor::Decode::decode(&mut dec, &mut ()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "PanelShell decode FAILED");
+                return Err(format!("PanelShell decode: {e}"));
+            }
+        };
 
     let slots: HashSet<String> = shell.slots.iter().map(|s| s.id.clone()).collect();
 
     // Extract action_ids from all handlers in the layout component tree.
     let mut actions = HashSet::new();
     extract_action_ids_from_component(&shell.layout, &mut actions);
+    tracing::info!(
+        actions = ?actions,
+        layout_tag = shell.layout.tag,
+        layout_has_handlers = shell.layout.handlers.is_some(),
+        layout_fields_count = shell.layout.fields.0.len(),
+        "PanelShell action extraction"
+    );
 
     session
         .register_shell(
