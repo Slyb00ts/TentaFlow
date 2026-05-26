@@ -2352,7 +2352,7 @@ fn build_add_camera_wizard() -> Component {
         gap: Spacing::Md,
         variant: CardVariant::Outlined,
         radius: RadiusToken::Lg,
-        shadow: ShadowToken::Md,
+        shadow: ShadowToken::Medium,
         border: BorderToken::Hairline,
         background: BackgroundToken::None,
         accent: None,
