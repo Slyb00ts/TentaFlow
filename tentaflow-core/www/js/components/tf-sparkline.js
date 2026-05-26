@@ -35,7 +35,7 @@ class TfSparkline extends HTMLElement {
 
   _resolveColor() {
     const role = this._color || 'primary';
-    const map = { primary: '--sdk-color-primary', success: '--sdk-color-success', warning: '--sdk-color-warning', danger: '--sdk-color-danger', info: '--sdk-color-info', accent: '--sdk-color-accent' };
+    const map = { primary: '--tf-accent-1', success: '--tf-success', warning: '--tf-warning', danger: '--tf-danger', info: '--tf-info', accent: '--tf-accent-2' };
     const v = map[role];
     if (!v) return '#6366f1';
     return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || '#6366f1';

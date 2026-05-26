@@ -185,29 +185,28 @@ class TfCanvas extends HTMLElement {
   }
 }
 
-// Mapowanie semantycznych rol koloru SDK na konkretne CSS variables ustawione
-// przez sdk-theme.css. Zwracamy resolved hex/rgb przez getComputedStyle.
+// Color role → CSS variable from controls.css (--tf-* design tokens).
 function colorVar(role) {
   if (!role) return '#888';
   const map = {
-    primary: '--sdk-color-primary',
-    primary_hover: '--sdk-color-primary-hover',
-    accent: '--sdk-color-accent',
-    accent_hover: '--sdk-color-accent-hover',
-    success: '--sdk-color-success',
-    warning: '--sdk-color-warning',
-    danger: '--sdk-color-danger',
-    info: '--sdk-color-info',
-    text: '--sdk-color-text',
-    text_muted: '--sdk-color-text-muted',
-    text_subtle: '--sdk-color-text-subtle',
-    text_inverse: '--sdk-color-text-inverse',
-    bg: '--sdk-color-bg',
-    bg_elevated: '--sdk-color-bg-elevated',
-    bg_surface: '--sdk-color-bg-surface',
-    bg_input: '--sdk-color-bg-input',
-    border: '--sdk-color-border',
-    border_hover: '--sdk-color-border-hover',
+    primary: '--tf-accent-1',
+    primary_hover: '--tf-accent-2',
+    accent: '--tf-accent-2',
+    accent_hover: '--tf-accent-1',
+    success: '--tf-success',
+    warning: '--tf-warning',
+    danger: '--tf-danger',
+    info: '--tf-info',
+    text: '--tf-text',
+    text_muted: '--tf-text-2',
+    text_subtle: '--tf-text-3',
+    text_inverse: '--tf-bg',
+    bg: '--tf-bg',
+    bg_elevated: '--tf-bg-card',
+    bg_surface: '--tf-bg-2',
+    bg_input: '--tf-bg-input',
+    border: '--tf-border',
+    border_hover: '--tf-border-hover',
   };
   const varName = map[role];
   if (!varName) return '#888';
