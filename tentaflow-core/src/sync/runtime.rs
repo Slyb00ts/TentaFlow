@@ -13,16 +13,16 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::addon::storage_sql_exec::{SyncConflictResolution, SyncConflictResolveResult};
-use crate::db::{DbPool, repository};
+use crate::db::{repository, DbPool};
 use crate::mesh::security::MeshSecurity;
 use crate::paths;
 use crate::sync::ledger::{
     ActionType, FieldValue, FjallSyncLedgerStore, HexNodeIdOperationVerifier,
-    HybridLogicalTimestamp, LedgerResult, NewSyncOperation, OperationId, OperationQuery,
-    PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, OperationId,
+    OperationQuery, PartitionId, PeerCursor, PeerId, RepairQueueEntry, SnapshotId, SyncLedgerError,
     SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
 };
-use crate::sync::snapshot::{SnapshotManager, SnapshotPackageStore, verify_snapshot_signature};
+use crate::sync::snapshot::{verify_snapshot_signature, SnapshotManager, SnapshotPackageStore};
 use tentaflow_protocol::mesh::{
     MeshSyncAckPayload, MeshSyncOperationWire, MeshSyncPullPayload, MeshSyncPullResponsePayload,
     MeshSyncPushPayload, MeshSyncSnapshotPullPayload, MeshSyncSnapshotResponsePayload,
@@ -970,7 +970,7 @@ impl SyncRuntime {
 
     fn apply_unapplied_inbox(&self, limit: usize) -> LedgerResult<usize> {
         let mut entries = self.ledger.list_unapplied_inbox(limit)?;
-        entries.sort_by_key(|entry| blob_apply_priority(&entry.operation));
+        entries.sort_by(|left, right| inbox_apply_order(left).cmp(&inbox_apply_order(right)));
         let mut applied = 0usize;
         for entry in entries {
             if entry.operation.body.resource_type == "core.blob" {
@@ -1670,6 +1670,14 @@ fn blob_apply_priority(operation: &SyncOperation) -> u8 {
     }
 }
 
+fn inbox_apply_order(entry: &InboxEntry) -> (u8, &str, u64) {
+    (
+        blob_apply_priority(&entry.operation),
+        entry.operation.body.partition_id.as_str(),
+        entry.operation.body.partition_sequence,
+    )
+}
+
 fn apply_blob_operation(operation: &SyncOperation) -> LedgerResult<BlobApplyOutcome> {
     match operation.body.table_name.as_str() {
         "blob_store_chunks" => apply_blob_chunk_operation(operation),
@@ -1928,10 +1936,15 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::db::migrations;
+    use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
     use crate::sync::ledger::CompactionPolicy;
     use crate::sync::snapshot::SnapshotBuildRequest;
     use rusqlite::Connection;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     struct RuntimeHarness {
         runtime: SyncRuntime,
@@ -1940,6 +1953,12 @@ mod tests {
 
     fn make_db() -> DbPool {
         let conn = Connection::open_in_memory().expect("open db");
+        migrations::run(&conn).expect("run migrations");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn make_db_at(path: &Path) -> DbPool {
+        let conn = Connection::open(path).expect("open persistent db");
         migrations::run(&conn).expect("run migrations");
         Arc::new(Mutex::new(conn))
     }
@@ -1966,6 +1985,299 @@ mod tests {
                 local_node_id,
             },
             _ledger_dir: ledger_dir,
+        }
+    }
+
+    fn make_runtime_from_paths(db_path: &Path, ledger_path: &Path, key_seed: u8) -> SyncRuntime {
+        let db = make_db_at(db_path);
+        let security = make_security(db.clone(), key_seed);
+        let local_node_id = security.ed25519_public_key_hex();
+        let ledger = Arc::new(FjallSyncLedgerStore::open(ledger_path).expect("ledger"));
+        SyncRuntime {
+            db,
+            ledger,
+            signer: RuntimeSigner {
+                node_id: local_node_id.clone(),
+                security,
+            },
+            local_node_id,
+        }
+    }
+
+    async fn make_mesh_manager(runtime: &SyncRuntime) -> Arc<IrohMeshManager> {
+        let cfg = IrohMeshConfig {
+            node_id: String::new(),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            relay_url: None,
+            enable_lan_discovery: false,
+            enable_dht_discovery: false,
+        };
+        IrohMeshManager::new(cfg, runtime.signer.security.clone())
+            .await
+            .expect("mesh manager")
+    }
+
+    fn loopback_addr_of(manager: &IrohMeshManager) -> std::net::SocketAddr {
+        manager
+            .endpoint()
+            .bound_sockets()
+            .into_iter()
+            .find(|addr| addr.is_ipv4())
+            .expect("bound v4 socket")
+    }
+
+    async fn wait_connected(manager: &IrohMeshManager, peer_id: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.is_connected(peer_id).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("mesh connected");
+    }
+
+    async fn connected_mesh_pair(
+        source: &SyncRuntime,
+        receiver: &SyncRuntime,
+    ) -> (
+        Arc<IrohMeshManager>,
+        Arc<IrohMeshManager>,
+        tokio::sync::broadcast::Receiver<IrohMeshEvent>,
+        tokio::sync::broadcast::Receiver<IrohMeshEvent>,
+    ) {
+        let source_mesh = make_mesh_manager(source).await;
+        let receiver_mesh = make_mesh_manager(receiver).await;
+        let _source_task = source_mesh.start();
+        let _receiver_task = receiver_mesh.start();
+
+        let source_id = source_mesh.node_id();
+        let receiver_id = receiver_mesh.node_id();
+        let source_addr = loopback_addr_of(&source_mesh);
+        let receiver_addr = loopback_addr_of(&receiver_mesh);
+        let source_events = source_mesh.subscribe();
+        let receiver_events = receiver_mesh.subscribe();
+
+        let dial_source = {
+            let source_mesh = source_mesh.clone();
+            let receiver_id = receiver_id.clone();
+            async move {
+                source_mesh
+                    .connect_to_peer_direct(&receiver_id, receiver_addr)
+                    .await
+            }
+        };
+        let dial_receiver = {
+            let receiver_mesh = receiver_mesh.clone();
+            let source_id = source_id.clone();
+            async move {
+                receiver_mesh
+                    .connect_to_peer_direct(&source_id, source_addr)
+                    .await
+            }
+        };
+        let (source_dial, receiver_dial) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(dial_source, dial_receiver)
+        })
+        .await
+        .expect("mesh dial timeout");
+        source_dial.expect("source dial");
+        receiver_dial.expect("receiver dial");
+        wait_connected(&source_mesh, &receiver_id).await;
+        wait_connected(&receiver_mesh, &source_id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        (source_mesh, receiver_mesh, source_events, receiver_events)
+    }
+
+    async fn connect_mesh_managers(source_mesh: &IrohMeshManager, receiver_mesh: &IrohMeshManager) {
+        let source_id = source_mesh.node_id();
+        let receiver_id = receiver_mesh.node_id();
+        let source_addr = loopback_addr_of(source_mesh);
+        let receiver_addr = loopback_addr_of(receiver_mesh);
+        let source_dial = source_mesh.connect_to_peer_direct(&receiver_id, receiver_addr);
+        let receiver_dial = receiver_mesh.connect_to_peer_direct(&source_id, source_addr);
+        let (source_dial, receiver_dial) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(source_dial, receiver_dial)
+        })
+        .await
+        .expect("mesh dial timeout");
+        source_dial.expect("source dial");
+        receiver_dial.expect("receiver dial");
+        wait_connected(source_mesh, &receiver_id).await;
+        wait_connected(receiver_mesh, &source_id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    async fn send_push_and_ack_over_mesh(
+        source: &SyncRuntime,
+        receiver: &SyncRuntime,
+        source_mesh: &IrohMeshManager,
+        receiver_mesh: &IrohMeshManager,
+        source_events: &mut tokio::sync::broadcast::Receiver<IrohMeshEvent>,
+        receiver_events: &mut tokio::sync::broadcast::Receiver<IrohMeshEvent>,
+        push: MeshSyncPushPayload,
+    ) -> MeshSyncAckPayload {
+        let push_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode push");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                &push_bytes,
+            )
+            .await
+            .expect("send push");
+
+        let received_push = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data })
+                        if from_node_id == source.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("sync push event");
+        let received_push = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+            rkyv::rancor::Error,
+        >(&received_push)
+        .expect("decode push");
+        let ack = receiver
+            .handle_push_payload(&source.local_node_id, received_push)
+            .expect("handle push");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("sync ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode ack");
+        source
+            .handle_ack_payload(&receiver.local_node_id, received_ack.clone())
+            .expect("handle ack");
+        received_ack
+    }
+
+    fn ack_for(receiver: &SyncRuntime, operation_ids: Vec<Vec<u8>>) -> MeshSyncAckPayload {
+        MeshSyncAckPayload {
+            from_node_id: receiver.local_node_id.clone(),
+            operation_ids,
+        }
+    }
+
+    fn core_capture_for(
+        kind: crate::sync::core_registry::CoreSyncResourceKind,
+        resource_id: &str,
+        fields: BTreeMap<String, FieldValue>,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        crate::sync::core_capture::CoreWriteCapture::new(
+            kind,
+            "org-default",
+            resource_id,
+            SqlWriteAction::Insert,
+            fields,
+            Some(7),
+        )
+    }
+
+    fn trust_each_other(source: &SyncRuntime, receiver: &SyncRuntime) {
+        source
+            .signer
+            .security
+            .add_trusted_key(
+                &receiver.local_node_id,
+                &receiver.signer.security.public_key_hex(),
+                "receiver",
+            )
+            .expect("source trusts receiver");
+        receiver
+            .signer
+            .security
+            .add_trusted_key(
+                &source.local_node_id,
+                &source.signer.security.public_key_hex(),
+                "source",
+            )
+            .expect("receiver trusts source");
+    }
+
+    fn test_home_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn unique_addon_id(prefix: &str) -> String {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+        format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        old_value: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(name: &'static str, value: &std::path::Path) -> Self {
+            let guard = Self {
+                name,
+                old_value: std::env::var_os(name),
+            };
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old_value {
+                Some(value) => unsafe {
+                    std::env::set_var(self.name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.name);
+                },
+            }
         }
     }
 
@@ -3201,6 +3513,1462 @@ mod tests {
         });
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_sync_push_materializes_core_flow_and_acks() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(71);
+        let receiver = make_runtime(72);
+        seed_core_authority_target(
+            &source.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        seed_core_authority_target(
+            &receiver.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let capture = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("71", "Mesh E2E Flow"))
+            .expect("record core flow");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+            .expect("build push")
+            .expect("pending push");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode push");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                &bytes,
+            )
+            .await
+            .expect("send push");
+
+        let received_push = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("sync push event");
+        let received_push = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+            rkyv::rancor::Error,
+        >(&received_push)
+        .expect("decode push");
+        let ack = receiver
+            .runtime
+            .handle_push_payload(&source.runtime.local_node_id, received_push)
+            .expect("handle push");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("sync ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode ack");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
+            .expect("handle ack");
+
+        let flow = repository::get_flow(&receiver.runtime.db, 71)
+            .expect("get flow")
+            .expect("flow");
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                capture.op_id,
+            )
+            .expect("outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(flow.name, "Mesh E2E Flow");
+        assert!(outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_four_node_fanout_syncs_core_flow_to_all_targets() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(86);
+        let receiver_a = make_runtime(87);
+        let receiver_b = make_runtime(88);
+        let receiver_c = make_runtime(89);
+        let receivers = [&receiver_a, &receiver_b, &receiver_c];
+        let mut receiver_user_ids = Vec::new();
+        for (idx, receiver) in receivers.iter().enumerate() {
+            let user_id = repository::create_user_account(
+                &source.runtime.db,
+                &format!("fanout-user-{idx}"),
+                "hash",
+                &format!("Fanout User {idx}"),
+                &format!("fanout-{idx}@example.com"),
+            )
+            .expect("fanout user");
+            repository::upsert_sync_node_identity(
+                &source.runtime.db,
+                &receiver.runtime.local_node_id,
+                &receiver.runtime.signer.security.public_key_hex(),
+                "ed25519",
+                &format!("Fanout Node {idx}"),
+                "laptop",
+                "trusted",
+                Some(user_id),
+                "standard",
+            )
+            .expect("fanout node");
+            repository::assign_node_to_user(
+                &source.runtime.db,
+                &receiver.runtime.local_node_id,
+                user_id,
+                "primary",
+                None,
+            )
+            .expect("fanout node assignment");
+            receiver_user_ids.push(user_id);
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            trust_each_other(&source.runtime, &receiver.runtime);
+        }
+        repository::upsert_sync_policy(
+            &source.runtime.db,
+            "policy-core-flow-fanout",
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            Some("core.flow"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("fanout sync policy");
+        repository::upsert_sync_resource_acl(
+            &source.runtime.db,
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "86",
+            receiver_user_ids.first().copied(),
+            receiver_user_ids.first().copied(),
+            None,
+            None,
+            "all",
+        )
+        .expect("fanout resource acl");
+
+        let source_mesh = make_mesh_manager(&source.runtime).await;
+        let receiver_meshes = vec![
+            make_mesh_manager(&receiver_a.runtime).await,
+            make_mesh_manager(&receiver_b.runtime).await,
+            make_mesh_manager(&receiver_c.runtime).await,
+        ];
+        let _source_task = source_mesh.start();
+        for receiver_mesh in &receiver_meshes {
+            let _receiver_task = receiver_mesh.start();
+        }
+        let mut source_events = source_mesh.subscribe();
+        let mut receiver_events = receiver_meshes
+            .iter()
+            .map(|receiver_mesh| receiver_mesh.subscribe())
+            .collect::<Vec<_>>();
+
+        for receiver_mesh in &receiver_meshes {
+            connect_mesh_managers(&source_mesh, receiver_mesh).await;
+        }
+
+        let capture = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("86", "Four Node Fanout Flow"))
+            .expect("record fanout flow");
+        for idx in 0..receivers.len() {
+            let receiver = receivers[idx];
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("build fanout push")
+                .expect("fanout push");
+            send_push_and_ack_over_mesh(
+                &source.runtime,
+                &receiver.runtime,
+                &source_mesh,
+                &receiver_meshes[idx],
+                &mut source_events,
+                &mut receiver_events[idx],
+                push,
+            )
+            .await;
+        }
+
+        for receiver in receivers {
+            let flow = repository::get_flow(&receiver.runtime.db, 86)
+                .expect("get fanout flow")
+                .expect("fanout flow");
+            let outbox = source
+                .runtime
+                .ledger
+                .get_outbox_entry(
+                    SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                    capture.op_id,
+                )
+                .expect("fanout outbox");
+            assert_eq!(flow.name, "Four Node Fanout Flow");
+            assert!(outbox.acknowledged);
+        }
+
+        source_mesh.shutdown().await;
+        for receiver_mesh in receiver_meshes {
+            receiver_mesh.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_offline_outbox_survives_source_runtime_restart() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let source_db_path = source_dir.path().join("source.db");
+        let source_ledger_path = source_dir.path().join("ledger");
+        let receiver = make_runtime(90);
+
+        let (source_node_id, capture) = {
+            let source = make_runtime_from_paths(&source_db_path, &source_ledger_path, 91);
+            seed_core_authority_target(
+                &source.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            let capture = source
+                .record_core_capture(complete_core_flow_capture("91", "Restart Durable Flow"))
+                .expect("record durable flow");
+            assert_eq!(capture.queued_targets, 1);
+            let queued = source
+                .ledger
+                .get_outbox_entry(
+                    SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                    capture.op_id,
+                )
+                .expect("queued restart outbox");
+            assert!(!queued.acknowledged);
+            (source.local_node_id.clone(), capture)
+        };
+
+        let source = make_runtime_from_paths(&source_db_path, &source_ledger_path, 91);
+        assert_eq!(source.local_node_id, source_node_id);
+        seed_core_authority_target(
+            &receiver.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source, &receiver.runtime).await;
+
+        crate::mesh::pipeline::run_sync_repair_scheduler_tick_with(
+            source_mesh.as_ref(),
+            source.signer.security.as_ref(),
+            |peer_id| source.build_push_payload_for_target(peer_id, 128),
+            |peer_id| source.build_repair_pull_payloads_for_peer(peer_id, 16, 256),
+        )
+        .await;
+
+        let received_push = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data })
+                        if from_node_id == source.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("restart push event");
+        let received_push = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+            rkyv::rancor::Error,
+        >(&received_push)
+        .expect("decode restart push");
+        let ack = receiver
+            .runtime
+            .handle_push_payload(&source.local_node_id, received_push)
+            .expect("handle restart push");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode restart ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send restart ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("restart ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode restart ack");
+        source
+            .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
+            .expect("handle restart ack");
+
+        let flow = repository::get_flow(&receiver.runtime.db, 91)
+            .expect("get restart flow")
+            .expect("restart flow");
+        let outbox = source
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                capture.op_id,
+            )
+            .expect("restart outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(flow.name, "Restart Durable Flow");
+        assert!(outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_repair_pull_materializes_missing_core_flow_operations() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(73);
+        let receiver = make_runtime(74);
+        seed_core_authority_target(
+            &source.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        seed_core_authority_target(
+            &receiver.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let insert = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("73", "Initial Mesh Flow"))
+            .expect("record insert");
+        let update = source
+            .runtime
+            .record_core_capture(core_flow_update_capture("73", "Repaired Mesh Flow"))
+            .expect("record update");
+        let update_operation = source
+            .runtime
+            .ledger
+            .get_operation(update.op_id)
+            .expect("update operation");
+        let partition = update_operation.body.partition_id.as_str().to_string();
+        let gap_payload = MeshSyncPullResponsePayload {
+            from_node_id: source.runtime.local_node_id.clone(),
+            partition_id: partition.clone(),
+            from_sequence: update_operation.body.partition_sequence,
+            operations: vec![operation_to_wire(&update_operation).expect("wire update")],
+        };
+        let gap_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gap_payload)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode gap response");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+                &gap_bytes,
+            )
+            .await
+            .expect("send gap response");
+
+        let received_gap = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("gap response event");
+        let received_gap = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+            rkyv::rancor::Error,
+        >(&received_gap)
+        .expect("decode gap response");
+        receiver
+            .runtime
+            .handle_pull_response_payload(&source.runtime.local_node_id, received_gap)
+            .expect_err("gap must queue repair");
+        let repair_pulls = receiver
+            .runtime
+            .build_repair_pull_payloads_for_peer(&source.runtime.local_node_id, 8, 64)
+            .expect("repair pulls");
+        assert_eq!(repair_pulls.len(), 1);
+        assert_eq!(repair_pulls[0].from_sequence, 1);
+        let pull_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&repair_pulls[0])
+            .map(|bytes| bytes.to_vec())
+            .expect("encode repair pull");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
+                &pull_bytes,
+            )
+            .await
+            .expect("send repair pull");
+
+        let received_pull = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("repair pull event");
+        let received_pull = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullPayload,
+            rkyv::rancor::Error,
+        >(&received_pull)
+        .expect("decode repair pull");
+        let repair_response = source
+            .runtime
+            .handle_pull_payload(&receiver.runtime.local_node_id, received_pull)
+            .expect("handle repair pull");
+        let MeshSyncPullResult::Operations(repair_response) = repair_response else {
+            panic!("expected operations repair response");
+        };
+        assert_eq!(repair_response.operations.len(), 2);
+        let repair_response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&repair_response)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode repair response");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+                &repair_response_bytes,
+            )
+            .await
+            .expect("send repair response");
+
+        let received_repair = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("repair response event");
+        let received_repair = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+            rkyv::rancor::Error,
+        >(&received_repair)
+        .expect("decode repair response");
+        let ack = receiver
+            .runtime
+            .handle_pull_response_payload(&source.runtime.local_node_id, received_repair)
+            .expect("handle repair response");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode repair ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send repair ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("repair ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode repair ack");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
+            .expect("handle repair ack");
+
+        let flow = repository::get_flow(&receiver.runtime.db, 73)
+            .expect("get flow")
+            .expect("flow");
+        let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+        let insert_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target.clone(), insert.op_id)
+            .expect("insert outbox");
+        let update_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target, update.op_id)
+            .expect("update outbox");
+        let queued_repairs = receiver
+            .runtime
+            .ledger
+            .list_due_repair_requests(
+                PeerId::new(source.runtime.local_node_id.clone()).expect("peer"),
+                i64::MAX,
+                8,
+            )
+            .expect("queued repairs");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(flow.name, "Repaired Mesh Flow");
+        assert_eq!(flow.flow_json, r#"{"nodes":[{"id":"repaired"}]}"#);
+        assert!(queued_repairs.is_empty());
+        assert!(insert_outbox.acknowledged);
+        assert!(update_outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_repair_scheduler_recovers_gap_after_reconnect() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(84);
+        let receiver = make_runtime(85);
+        seed_core_authority_target(
+            &source.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        seed_core_authority_target(
+            &receiver.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, _source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let insert = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("84", "Scheduler Initial Flow"))
+            .expect("record insert");
+        let update = source
+            .runtime
+            .record_core_capture(core_flow_update_capture("84", "Scheduler Repaired Flow"))
+            .expect("record update");
+        let update_operation = source
+            .runtime
+            .ledger
+            .get_operation(update.op_id)
+            .expect("update operation");
+        let partition = update_operation.body.partition_id.as_str().to_string();
+        let gap_payload = MeshSyncPullResponsePayload {
+            from_node_id: source.runtime.local_node_id.clone(),
+            partition_id: partition.clone(),
+            from_sequence: update_operation.body.partition_sequence,
+            operations: vec![operation_to_wire(&update_operation).expect("wire update")],
+        };
+        let gap_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gap_payload)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode gap response");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+                &gap_bytes,
+            )
+            .await
+            .expect("send gap response");
+
+        let received_gap = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("gap response event");
+        let received_gap = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+            rkyv::rancor::Error,
+        >(&received_gap)
+        .expect("decode gap response");
+        receiver
+            .runtime
+            .handle_pull_response_payload(&source.runtime.local_node_id, received_gap)
+            .expect_err("gap must queue repair");
+
+        let source_addr = loopback_addr_of(&source_mesh);
+        let receiver_addr = loopback_addr_of(&receiver_mesh);
+        source_mesh
+            .disconnect_peer(&receiver.runtime.local_node_id)
+            .await;
+        receiver_mesh
+            .disconnect_peer(&source.runtime.local_node_id)
+            .await;
+        let source_reconnect =
+            source_mesh.connect_to_peer_direct(&receiver.runtime.local_node_id, receiver_addr);
+        let receiver_reconnect =
+            receiver_mesh.connect_to_peer_direct(&source.runtime.local_node_id, source_addr);
+        let (source_reconnect, receiver_reconnect) =
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(source_reconnect, receiver_reconnect)
+            })
+            .await
+            .expect("reconnect timeout");
+        source_reconnect.expect("source reconnect");
+        receiver_reconnect.expect("receiver reconnect");
+        wait_connected(&source_mesh, &receiver.runtime.local_node_id).await;
+        wait_connected(&receiver_mesh, &source.runtime.local_node_id).await;
+        let mut source_events = source_mesh.subscribe();
+        receiver_events = receiver_mesh.subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        crate::mesh::pipeline::run_sync_repair_scheduler_tick_with(
+            receiver_mesh.as_ref(),
+            receiver.runtime.signer.security.as_ref(),
+            |peer_id| receiver.runtime.build_push_payload_for_target(peer_id, 128),
+            |peer_id| {
+                receiver
+                    .runtime
+                    .build_repair_pull_payloads_for_peer(peer_id, 16, 256)
+            },
+        )
+        .await;
+
+        let received_pull = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("scheduler repair pull event");
+        let received_pull = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullPayload,
+            rkyv::rancor::Error,
+        >(&received_pull)
+        .expect("decode scheduler repair pull");
+        assert_eq!(received_pull.from_sequence, 1);
+        let repair_response = source
+            .runtime
+            .handle_pull_payload(&receiver.runtime.local_node_id, received_pull)
+            .expect("handle scheduler repair pull");
+        let MeshSyncPullResult::Operations(repair_response) = repair_response else {
+            panic!("expected operations repair response");
+        };
+        let repair_response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&repair_response)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode scheduler repair response");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL_RESPONSE,
+                &repair_response_bytes,
+            )
+            .await
+            .expect("send scheduler repair response");
+
+        let received_repair = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullResponseReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("scheduler repair response event");
+        let received_repair = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullResponsePayload,
+            rkyv::rancor::Error,
+        >(&received_repair)
+        .expect("decode scheduler repair response");
+        let ack = receiver
+            .runtime
+            .handle_pull_response_payload(&source.runtime.local_node_id, received_repair)
+            .expect("handle scheduler repair response");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode scheduler repair ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send scheduler repair ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("scheduler repair ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode scheduler repair ack");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
+            .expect("handle scheduler repair ack");
+
+        let flow = repository::get_flow(&receiver.runtime.db, 84)
+            .expect("get flow")
+            .expect("flow");
+        let queued_repairs = receiver
+            .runtime
+            .ledger
+            .list_due_repair_requests(
+                PeerId::new(source.runtime.local_node_id.clone()).expect("peer"),
+                i64::MAX,
+                8,
+            )
+            .expect("queued repairs");
+        let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+        let insert_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target.clone(), insert.op_id)
+            .expect("insert outbox");
+        let update_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target, update.op_id)
+            .expect("update outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(flow.name, "Scheduler Repaired Flow");
+        assert!(queued_repairs.is_empty());
+        assert!(insert_outbox.acknowledged);
+        assert!(update_outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_permission_revoke_stops_future_core_flow_push() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(77);
+        let receiver = make_runtime(78);
+        let new_owner_node = make_runtime(79);
+        let allowed_user_id = repository::create_user_account(
+            &source.runtime.db,
+            "mesh-revoked-user",
+            "hash",
+            "Mesh Revoked User",
+            "mesh-revoked@example.com",
+        )
+        .expect("allowed user");
+        let new_owner_id = repository::create_user_account(
+            &source.runtime.db,
+            "mesh-new-owner",
+            "hash",
+            "Mesh New Owner",
+            "mesh-new-owner@example.com",
+        )
+        .expect("new owner");
+        for (node_id, user_id, display_name) in [
+            (
+                receiver.runtime.local_node_id.as_str(),
+                allowed_user_id,
+                "Mesh Revoked Node",
+            ),
+            (
+                new_owner_node.runtime.local_node_id.as_str(),
+                new_owner_id,
+                "Mesh New Owner Node",
+            ),
+        ] {
+            repository::upsert_sync_node_identity(
+                &source.runtime.db,
+                node_id,
+                "pub",
+                "ed25519",
+                display_name,
+                "laptop",
+                "trusted",
+                Some(user_id),
+                "standard",
+            )
+            .expect("sync node");
+            repository::assign_node_to_user(&source.runtime.db, node_id, user_id, "primary", None)
+                .expect("assign node");
+        }
+        repository::upsert_sync_policy(
+            &source.runtime.db,
+            "policy-core-flow-mesh-revoke",
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            Some("core.flow"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("source sync policy");
+        repository::upsert_sync_resource_acl(
+            &source.runtime.db,
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "77",
+            Some(allowed_user_id),
+            Some(allowed_user_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("initial acl");
+        seed_core_authority_target(
+            &receiver.runtime.db,
+            "core.flow",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let insert = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("77", "Visible Before Revoke"))
+            .expect("record insert");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+            .expect("build initial push")
+            .expect("initial push");
+        let push_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&push)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode initial push");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                &push_bytes,
+            )
+            .await
+            .expect("send initial push");
+
+        let received_push = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("initial push event");
+        let received_push = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPushPayload,
+            rkyv::rancor::Error,
+        >(&received_push)
+        .expect("decode initial push");
+        let ack = receiver
+            .runtime
+            .handle_push_payload(&source.runtime.local_node_id, received_push)
+            .expect("handle initial push");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode initial ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send initial ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("initial ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode initial ack");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
+            .expect("handle initial ack");
+
+        repository::upsert_sync_resource_acl(
+            &source.runtime.db,
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "77",
+            Some(new_owner_id),
+            Some(new_owner_id),
+            None,
+            None,
+            "assigned",
+        )
+        .expect("revoked acl");
+        let update = source
+            .runtime
+            .record_core_capture(core_flow_update_capture("77", "Hidden After Revoke"))
+            .expect("record update after revoke");
+        let revoked_push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+            .expect("build revoked push");
+
+        let flow = repository::get_flow(&receiver.runtime.db, 77)
+            .expect("get flow")
+            .expect("flow");
+        let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+        let insert_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target.clone(), insert.op_id)
+            .expect("insert outbox");
+        let update_outbox = source.runtime.ledger.get_outbox_entry(target, update.op_id);
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert!(revoked_push.is_none());
+        assert_eq!(flow.name, "Visible Before Revoke");
+        assert!(insert_outbox.acknowledged);
+        assert!(update_outbox.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_kv_push_materializes_storage_on_receiver() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(80);
+        let receiver = make_runtime(81);
+        let addon_id = unique_addon_id("mesh-kv");
+        seed_authority_target_for_resource(
+            &source.runtime.db,
+            &addon_id,
+            "addon.kv",
+            &receiver.runtime.local_node_id,
+        );
+        seed_authority_target_for_resource(
+            &receiver.runtime.db,
+            &addon_id,
+            "addon.kv",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let value = format!("dark-{}", std::process::id()).into_bytes();
+        let result = source
+            .runtime
+            .record_kv_capture(kv_capture(&addon_id, "inst-1", "settings/theme", &value))
+            .expect("record kv capture");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+            .expect("build kv push")
+            .expect("kv push");
+        send_push_and_ack_over_mesh(
+            &source.runtime,
+            &receiver.runtime,
+            &source_mesh,
+            &receiver_mesh,
+            &mut source_events,
+            &mut receiver_events,
+            push,
+        )
+        .await;
+
+        let stored: Vec<u8> = receiver
+            .runtime
+            .db
+            .lock()
+            .expect("db lock")
+            .query_row(
+                "SELECT storage_value FROM addon_storage \
+                 WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
+                rusqlite::params![addon_id, "inst-1", "settings/theme"],
+                |row| row.get(0),
+            )
+            .expect("stored value");
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                result.op_id,
+            )
+            .expect("outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(stored, value);
+        assert!(outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_chunked_blob_push_materializes_file_on_receiver() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(82);
+        let receiver = make_runtime(83);
+        seed_core_authority_target(
+            &source.runtime.db,
+            "core.blob",
+            &receiver.runtime.local_node_id,
+        );
+        seed_core_authority_target(
+            &receiver.runtime.db,
+            "core.blob",
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let salt = unique_addon_id("mesh-blob");
+        let mut bytes = Vec::with_capacity(BLOB_SYNC_CHUNK_SIZE * 2 + 17);
+        for idx in 0..(BLOB_SYNC_CHUNK_SIZE * 2 + 17) {
+            bytes.push(((idx + salt.len()) % 251) as u8);
+        }
+        bytes[..salt.len()].copy_from_slice(salt.as_bytes());
+        let sha = hex::encode(sha256(&bytes));
+        let blob_source_dir = tempfile::tempdir().expect("blob dir");
+        let blob_source_path = blob_source_dir.path().join("payload.bin");
+        std::fs::write(&blob_source_path, &bytes).expect("blob write");
+        let capture = crate::sync::blob_capture::BlobWriteCapture::new(
+            "org-default",
+            &format!("blob-{salt}"),
+            &sha,
+            "application/octet-stream",
+            bytes.len() as u64,
+            blob_source_path.to_string_lossy().to_string(),
+            Some(7),
+        );
+
+        let result = source
+            .runtime
+            .record_blob_capture(capture)
+            .expect("record blob capture");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+            .expect("build blob push")
+            .expect("blob push");
+        assert_eq!(push.operations.len(), 4);
+        send_push_and_ack_over_mesh(
+            &source.runtime,
+            &receiver.runtime,
+            &source_mesh,
+            &receiver_mesh,
+            &mut source_events,
+            &mut receiver_events,
+            push,
+        )
+        .await;
+
+        let target_path = blob_path_for_sha(&sha).expect("blob path");
+        let stored = std::fs::read(target_path).expect("stored blob");
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                result.op_id,
+            )
+            .expect("manifest outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(stored, bytes);
+        assert!(!blob_chunk_dir(&sha).expect("chunk dir").exists());
+        assert!(outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_snapshot_response_restores_compacted_sql_prefix() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(75);
+        let receiver = make_runtime(76);
+        let addon_id = unique_addon_id("mesh-snap");
+        seed_authority_target(
+            &source.runtime.db,
+            &addon_id,
+            &receiver.runtime.local_node_id,
+        );
+        seed_authority_target(
+            &receiver.runtime.db,
+            &addon_id,
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+        open_contacts_table(&addon_id);
+
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let first = source
+            .runtime
+            .record_sql_capture(capture(&addon_id, "person-1", "Ala"))
+            .expect("record first");
+        let second = source
+            .runtime
+            .record_sql_capture(update_capture(&addon_id, "person-1", "Ala Nowak"))
+            .expect("record second");
+        let partition = source
+            .runtime
+            .ledger
+            .get_operation(second.op_id)
+            .expect("second operation")
+            .body
+            .partition_id;
+        let package_store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
+        let snapshot = SnapshotManager::new(source.runtime.ledger.as_ref())
+            .build_sql_package_and_persist(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(1),
+                    created_at_ms: now_ms(),
+                },
+                &source.runtime.signer,
+                &package_store,
+            )
+            .expect("snapshot package")
+            .expect("snapshot package result")
+            .snapshot;
+        source
+            .runtime
+            .ledger
+            .mark_acknowledged(
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                first.op_id,
+            )
+            .expect("ack first before compaction");
+        source
+            .runtime
+            .ledger
+            .compact(CompactionPolicy {
+                partition_id: partition.clone(),
+                keep_operations_after_sequence: Some(2),
+            })
+            .expect("compact");
+        receiver
+            .runtime
+            .queue_repair_request(&source.runtime.local_node_id, partition.as_str(), 1);
+
+        let pull = MeshSyncPullPayload {
+            from_node_id: receiver.runtime.local_node_id.clone(),
+            partition_id: partition.as_str().to_string(),
+            from_sequence: 1,
+            limit: 64,
+        };
+        let pull_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&pull)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode snapshot pull");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
+                &pull_bytes,
+            )
+            .await
+            .expect("send snapshot pull");
+
+        let received_pull = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncPullReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("snapshot pull event");
+        let received_pull = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncPullPayload,
+            rkyv::rancor::Error,
+        >(&received_pull)
+        .expect("decode snapshot pull");
+        let response = source
+            .runtime
+            .handle_pull_payload(&receiver.runtime.local_node_id, received_pull)
+            .expect("handle snapshot pull");
+        let MeshSyncPullResult::Snapshot(snapshot_response) = response else {
+            panic!("expected snapshot response");
+        };
+        assert_eq!(snapshot_response.snapshot_id, snapshot.snapshot_id.as_str());
+        assert_eq!(snapshot_response.operations_after_snapshot.len(), 1);
+        let response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot_response)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode snapshot response");
+        source_mesh
+            .send_ufp2_to_peer(
+                &receiver.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+                &response_bytes,
+            )
+            .await
+            .expect("send snapshot response");
+
+        let received_response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver_events.recv().await {
+                    Ok(IrohMeshEvent::SyncSnapshotResponseReceived { from_node_id, data })
+                        if from_node_id == source.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("snapshot response event");
+        let received_response = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncSnapshotResponsePayload,
+            rkyv::rancor::Error,
+        >(&received_response)
+        .expect("decode snapshot response");
+        let ack = receiver
+            .runtime
+            .handle_snapshot_response_payload(&source.runtime.local_node_id, received_response)
+            .expect("handle snapshot response");
+        let ack_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+            .map(|bytes| bytes.to_vec())
+            .expect("encode snapshot ack");
+        receiver_mesh
+            .send_ufp2_to_peer(
+                &source.runtime.local_node_id,
+                tentaflow_protocol::mesh::MESH_MSG_SYNC_ACK,
+                &ack_bytes,
+            )
+            .await
+            .expect("send snapshot ack");
+
+        let received_ack = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source_events.recv().await {
+                    Ok(IrohMeshEvent::SyncAckReceived { from_node_id, data })
+                        if from_node_id == receiver.runtime.local_node_id =>
+                    {
+                        return data;
+                    }
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .expect("snapshot ack event");
+        let received_ack = rkyv::from_bytes::<
+            tentaflow_protocol::mesh::MeshSyncAckPayload,
+            rkyv::rancor::Error,
+        >(&received_ack)
+        .expect("decode snapshot ack");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.runtime.local_node_id, received_ack)
+            .expect("handle snapshot ack");
+
+        let queued_repairs = receiver
+            .runtime
+            .ledger
+            .list_due_repair_requests(
+                PeerId::new(source.runtime.local_node_id.clone()).expect("peer"),
+                i64::MAX,
+                8,
+            )
+            .expect("queued repairs");
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+            .expect("open addon db");
+        let conn = pool.get().expect("conn");
+        let name: String = conn
+            .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("name");
+        let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+        let first_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target.clone(), first.op_id)
+            .expect("first outbox");
+        let second_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(target, second.op_id)
+            .expect("second outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(name, "Ala Nowak");
+        assert!(queued_repairs.is_empty());
+        assert!(first_outbox.acknowledged);
+        assert!(second_outbox.acknowledged);
+    }
+
     #[test]
     fn compacted_prefix_is_served_as_snapshot_response() {
         with_tmp_home(|| {
@@ -3340,5 +5108,509 @@ mod tests {
             assert!(first_outbox.acknowledged);
             assert!(second_outbox.acknowledged);
         });
+    }
+
+    #[test]
+    fn receiver_restart_applies_persisted_inbox_and_acks_source_outbox() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let source = make_runtime(91);
+        let receiver_db = tmp.path().join("receiver.db");
+        let receiver_ledger = tmp.path().join("receiver-ledger");
+        let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 92);
+        seed_core_authority_target(
+            &source.runtime.db,
+            "core.flow",
+            &receiver.local_node_id,
+        );
+        seed_core_authority_target(&receiver.db, "core.flow", &receiver.local_node_id);
+
+        let result = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("9101", "Restart inbox flow"))
+            .expect("record core flow");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.local_node_id, 16)
+            .expect("build push")
+            .expect("push");
+        let operation_ids = receiver
+            .store_incoming_operations(&source.runtime.local_node_id, push.operations)
+            .expect("store inbox");
+        drop(receiver);
+
+        let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 92);
+        let applied = receiver.apply_unapplied_inbox(16).expect("apply inbox");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.local_node_id, ack_for(&receiver, operation_ids))
+            .expect("ack after restart");
+        let conn = receiver.db.lock().expect("db");
+        let name: String = conn
+            .query_row("SELECT name FROM flows WHERE id = 9101", [], |row| row.get(0))
+            .expect("flow");
+        drop(conn);
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.local_node_id.clone()).expect("target"),
+                result.op_id,
+            )
+            .expect("outbox");
+
+        assert_eq!(applied, 1);
+        assert_eq!(name, "Restart inbox flow");
+        assert!(outbox.acknowledged);
+    }
+
+    #[test]
+    fn chunked_blob_restart_completes_from_persisted_partial_inbox() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(93);
+        let receiver_db = tmp.path().join("receiver.db");
+        let receiver_ledger = tmp.path().join("receiver-ledger");
+        let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 94);
+        seed_core_authority_target(
+            &source.runtime.db,
+            "core.blob",
+            &receiver.local_node_id,
+        );
+        seed_core_authority_target(&receiver.db, "core.blob", &receiver.local_node_id);
+
+        let mut bytes = Vec::with_capacity(BLOB_SYNC_CHUNK_SIZE * 2 + 23);
+        for idx in 0..(BLOB_SYNC_CHUNK_SIZE * 2 + 23) {
+            bytes.push((idx % 251) as u8);
+        }
+        let sha = hex::encode(sha256(&bytes));
+        let source_dir = tempfile::tempdir().expect("source blob dir");
+        let source_path = source_dir.path().join("payload.bin");
+        std::fs::write(&source_path, &bytes).expect("write source blob");
+        let capture = crate::sync::blob_capture::BlobWriteCapture::new(
+            "org-default",
+            "restart-blob",
+            &sha,
+            "application/octet-stream",
+            bytes.len() as u64,
+            source_path.to_string_lossy().to_string(),
+            Some(7),
+        );
+        let result = source
+            .runtime
+            .record_blob_capture(capture)
+            .expect("record blob");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.local_node_id, 16)
+            .expect("build push")
+            .expect("push");
+        assert_eq!(push.operations.len(), 4);
+        let first_ids = receiver
+            .store_incoming_operations(&source.runtime.local_node_id, push.operations[..2].to_vec())
+            .expect("store first chunks");
+        assert_eq!(receiver.apply_unapplied_inbox(16).expect("apply chunks"), 2);
+        assert!(blob_chunk_dir(&sha).expect("chunk dir").exists());
+        drop(first_ids);
+        drop(receiver);
+
+        let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 94);
+        let operation_ids = receiver
+            .store_incoming_operations(&source.runtime.local_node_id, push.operations[2..].to_vec())
+            .expect("store remaining blob operations");
+        let applied = receiver.apply_unapplied_inbox(16).expect("apply manifest");
+        source
+            .runtime
+            .handle_ack_payload(&receiver.local_node_id, ack_for(&receiver, operation_ids))
+            .expect("ack blob after restart");
+        let stored = std::fs::read(blob_path_for_sha(&sha).expect("blob path")).expect("blob");
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.local_node_id.clone()).expect("target"),
+                result.op_id,
+            )
+            .expect("manifest outbox");
+
+        assert_eq!(applied, 2);
+        assert_eq!(stored, bytes);
+        assert!(!blob_chunk_dir(&sha).expect("chunk dir").exists());
+        assert!(outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_conflicting_sql_insert_records_conflict_without_overwrite() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(95);
+        let receiver = make_runtime(96);
+        let addon_id = unique_addon_id("mesh-conflict");
+        seed_authority_target(&source.runtime.db, &addon_id, &receiver.runtime.local_node_id);
+        seed_authority_target(&receiver.runtime.db, &addon_id, &receiver.runtime.local_node_id);
+        trust_each_other(&source.runtime, &receiver.runtime);
+        open_contacts_table(&addon_id);
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+            .expect("open addon db");
+        pool.get()
+            .expect("conn")
+            .execute("INSERT INTO contacts (id, name) VALUES (1, 'Local')", [])
+            .expect("seed local");
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+
+        let result = source
+            .runtime
+            .record_sql_capture(capture(&addon_id, "person-conflict", "Remote"))
+            .expect("record conflict capture");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+            .expect("build push")
+            .expect("push");
+        send_push_and_ack_over_mesh(
+            &source.runtime,
+            &receiver.runtime,
+            &source_mesh,
+            &receiver_mesh,
+            &mut source_events,
+            &mut receiver_events,
+            push,
+        )
+        .await;
+        let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+            "org-default",
+            &addon_id,
+            Some("open"),
+            10,
+        )
+        .expect("conflicts");
+        let name: String = pool
+            .get()
+            .expect("conn")
+            .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get(0))
+            .expect("local row");
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target"),
+                result.op_id,
+            )
+            .expect("outbox");
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(name, "Local");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].resource_id, "person-conflict");
+        assert!(outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_partial_fanout_offline_target_catches_up_later() {
+        let _guard = test_home_guard();
+        let source = make_runtime(97);
+        let receiver_a = make_runtime(98);
+        let receiver_b = make_runtime(99);
+        let receiver_c = make_runtime(100);
+        let receivers = [&receiver_a, &receiver_b, &receiver_c];
+        let mut receiver_user_ids = Vec::new();
+        for (idx, receiver) in receivers.iter().enumerate() {
+            let user_id = repository::create_user_account(
+                &source.runtime.db,
+                &format!("partial-fanout-user-{idx}"),
+                "hash",
+                &format!("Partial Fanout User {idx}"),
+                &format!("partial-fanout-{idx}@example.test"),
+            )
+            .expect("partial fanout user");
+            repository::upsert_sync_node_identity(
+                &source.runtime.db,
+                &receiver.runtime.local_node_id,
+                &receiver.runtime.signer.security.public_key_hex(),
+                "ed25519",
+                &format!("Partial Fanout Node {idx}"),
+                "laptop",
+                "trusted",
+                Some(user_id),
+                "standard",
+            )
+            .expect("partial fanout node");
+            repository::assign_node_to_user(
+                &source.runtime.db,
+                &receiver.runtime.local_node_id,
+                user_id,
+                "primary",
+                None,
+            )
+            .expect("partial fanout node assignment");
+            receiver_user_ids.push(user_id);
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.flow",
+                &receiver.runtime.local_node_id,
+            );
+            trust_each_other(&source.runtime, &receiver.runtime);
+        }
+        repository::upsert_sync_policy(
+            &source.runtime.db,
+            "policy-core-flow-partial-fanout",
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            Some("core.flow"),
+            None,
+            "replicated_by_permission",
+            None,
+            None,
+            true,
+        )
+        .expect("partial fanout policy");
+        repository::upsert_sync_resource_acl(
+            &source.runtime.db,
+            "org-default",
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.flow",
+            "9701",
+            receiver_user_ids.first().copied(),
+            receiver_user_ids.first().copied(),
+            None,
+            None,
+            "all",
+        )
+        .expect("partial fanout acl");
+
+        let source_mesh = make_mesh_manager(&source.runtime).await;
+        let receiver_a_mesh = make_mesh_manager(&receiver_a.runtime).await;
+        let receiver_b_mesh = make_mesh_manager(&receiver_b.runtime).await;
+        let _source_task = source_mesh.start();
+        let _receiver_a_task = receiver_a_mesh.start();
+        let _receiver_b_task = receiver_b_mesh.start();
+        let mut source_events = source_mesh.subscribe();
+        let mut receiver_a_events = receiver_a_mesh.subscribe();
+        let mut receiver_b_events = receiver_b_mesh.subscribe();
+        connect_mesh_managers(&source_mesh, &receiver_a_mesh).await;
+        connect_mesh_managers(&source_mesh, &receiver_b_mesh).await;
+
+        let result = source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("9701", "Partial fanout flow"))
+            .expect("record flow");
+        for (receiver, receiver_mesh, receiver_events) in [
+            (&receiver_a.runtime, &receiver_a_mesh, &mut receiver_a_events),
+            (&receiver_b.runtime, &receiver_b_mesh, &mut receiver_b_events),
+        ] {
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.local_node_id, 16)
+                .expect("build push")
+                .expect("push");
+            send_push_and_ack_over_mesh(
+                &source.runtime,
+                receiver,
+                &source_mesh,
+                receiver_mesh,
+                &mut source_events,
+                receiver_events,
+                push,
+            )
+            .await;
+        }
+        let c_target = SyncTarget::new(receiver_c.runtime.local_node_id.clone()).expect("target");
+        let c_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(c_target.clone(), result.op_id)
+            .expect("c outbox before reconnect");
+        assert!(!c_outbox.acknowledged);
+
+        let receiver_c_mesh = make_mesh_manager(&receiver_c.runtime).await;
+        let _receiver_c_task = receiver_c_mesh.start();
+        let mut receiver_c_events = receiver_c_mesh.subscribe();
+        connect_mesh_managers(&source_mesh, &receiver_c_mesh).await;
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver_c.runtime.local_node_id, 16)
+            .expect("build c push")
+            .expect("c push");
+        send_push_and_ack_over_mesh(
+            &source.runtime,
+            &receiver_c.runtime,
+            &source_mesh,
+            &receiver_c_mesh,
+            &mut source_events,
+            &mut receiver_c_events,
+            push,
+        )
+        .await;
+        let conn = receiver_c.runtime.db.lock().expect("db");
+        let name: String = conn
+            .query_row("SELECT name FROM flows WHERE id = 9701", [], |row| row.get(0))
+            .expect("flow on c");
+        drop(conn);
+        let c_outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(c_target, result.op_id)
+            .expect("c outbox after reconnect");
+
+        source_mesh.shutdown().await;
+        receiver_a_mesh.shutdown().await;
+        receiver_b_mesh.shutdown().await;
+        receiver_c_mesh.shutdown().await;
+
+        assert_eq!(name, "Partial fanout flow");
+        assert!(c_outbox.acknowledged);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_core_scope_materializes_identity_rbac_and_flow_bindings() {
+        let source = make_runtime(101);
+        let receiver = make_runtime(102);
+        let resource_types = [
+            "core.user_account",
+            "core.user_group",
+            "core.group_member",
+            "core.role",
+            "core.org_membership",
+            "core.flow",
+            "core.flow_model_binding",
+        ];
+        for resource_type in resource_types {
+            seed_core_authority_target(
+                &source.runtime.db,
+                resource_type,
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                resource_type,
+                &receiver.runtime.local_node_id,
+            );
+        }
+        trust_each_other(&source.runtime, &receiver.runtime);
+        let (source_mesh, receiver_mesh, mut source_events, mut receiver_events) =
+            connected_mesh_pair(&source.runtime, &receiver.runtime).await;
+        use crate::sync::core_registry::CoreSyncResourceKind as K;
+
+        let mut role = BTreeMap::new();
+        role.insert("name".to_string(), FieldValue::String("Sync Role".to_string()));
+        role.insert("permissions_json".to_string(), FieldValue::String("[]".to_string()));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::Role, "sync-role", role))
+            .expect("record role");
+        let mut user = BTreeMap::new();
+        user.insert("username".to_string(), FieldValue::String("sync-user".to_string()));
+        user.insert("display_name".to_string(), FieldValue::String("Sync User".to_string()));
+        user.insert("email".to_string(), FieldValue::String("sync@example.test".to_string()));
+        user.insert("is_active".to_string(), FieldValue::Bool(true));
+        user.insert("is_admin".to_string(), FieldValue::Bool(false));
+        user.insert("role".to_string(), FieldValue::String("user".to_string()));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::UserAccount, "10101", user))
+            .expect("record user");
+        let mut group = BTreeMap::new();
+        group.insert("name".to_string(), FieldValue::String("Sync Group".to_string()));
+        group.insert("description".to_string(), FieldValue::String("Synchronized".to_string()));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::UserGroup, "10102", group))
+            .expect("record group");
+        let mut group_member = BTreeMap::new();
+        group_member.insert("group_id".to_string(), FieldValue::I64(10102));
+        group_member.insert("user_id".to_string(), FieldValue::I64(10101));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::GroupMember, "10102:10101", group_member))
+            .expect("record group member");
+        let mut membership = BTreeMap::new();
+        membership.insert("org_id".to_string(), FieldValue::String("org-default".to_string()));
+        membership.insert("user_id".to_string(), FieldValue::String("10101".to_string()));
+        membership.insert("role_id".to_string(), FieldValue::String("sync-role".to_string()));
+        membership.insert("granted_by".to_string(), FieldValue::String("sync-test".to_string()));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::OrgMembership, "org-default:10101", membership))
+            .expect("record membership");
+        source
+            .runtime
+            .record_core_capture(complete_core_flow_capture("10103", "Scoped flow"))
+            .expect("record flow");
+        let mut binding = BTreeMap::new();
+        binding.insert("flow_id".to_string(), FieldValue::I64(10103));
+        binding.insert("model_pattern".to_string(), FieldValue::String("sync-model".to_string()));
+        binding.insert("priority".to_string(), FieldValue::I64(10));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::FlowModelBinding, "10104", binding))
+            .expect("record binding");
+
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 32)
+            .expect("build push")
+            .expect("push");
+        send_push_and_ack_over_mesh(
+            &source.runtime,
+            &receiver.runtime,
+            &source_mesh,
+            &receiver_mesh,
+            &mut source_events,
+            &mut receiver_events,
+            push,
+        )
+        .await;
+        let mut group_member_retry = BTreeMap::new();
+        group_member_retry.insert("group_id".to_string(), FieldValue::I64(10102));
+        group_member_retry.insert("user_id".to_string(), FieldValue::I64(10101));
+        source
+            .runtime
+            .record_core_capture(core_capture_for(K::GroupMember, "10102:10101:retry", group_member_retry))
+            .expect("record group member retry");
+        let push = source
+            .runtime
+            .build_push_payload_for_target(&receiver.runtime.local_node_id, 32)
+            .expect("build retry push")
+            .expect("retry push");
+        send_push_and_ack_over_mesh(
+            &source.runtime,
+            &receiver.runtime,
+            &source_mesh,
+            &receiver_mesh,
+            &mut source_events,
+            &mut receiver_events,
+            push,
+        )
+        .await;
+        let conn = receiver.runtime.db.lock().expect("db");
+        let username: String = conn
+            .query_row("SELECT username FROM user_accounts WHERE id = 10101", [], |row| row.get(0))
+            .expect("user");
+        let group_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM group_members WHERE group_id = 10102 AND user_id = 10101", [], |row| row.get(0))
+            .expect("group member");
+        let role_name: String = conn
+            .query_row("SELECT name FROM roles WHERE role_id = 'sync-role'", [], |row| row.get(0))
+            .expect("role");
+        let membership_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM org_memberships WHERE org_id = 'org-default' AND user_id = '10101'", [], |row| row.get(0))
+            .expect("membership");
+        let binding_pattern: String = conn
+            .query_row("SELECT model_pattern FROM flow_model_bindings WHERE id = 10104", [], |row| row.get(0))
+            .expect("binding");
+        drop(conn);
+
+        source_mesh.shutdown().await;
+        receiver_mesh.shutdown().await;
+
+        assert_eq!(username, "sync-user");
+        assert_eq!(group_count, 1);
+        assert_eq!(role_name, "Sync Role");
+        assert_eq!(membership_count, 1);
+        assert_eq!(binding_pattern, "sync-model");
     }
 }

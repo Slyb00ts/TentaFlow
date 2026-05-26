@@ -2663,60 +2663,84 @@ fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<Mesh
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let peers = qm.connected_peers().await;
-            for peer_id in peers {
-                if !mesh_security.is_trusted(&peer_id) {
-                    continue;
-                }
-                match crate::sync::runtime::build_push_payload_for_target(&peer_id, 128) {
-                    Ok(Some(payload)) => {
-                        match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
-                            Ok(bytes) => {
-                                if let Err(e) = qm
-                                    .send_ufp2_to_peer(
-                                        &peer_id,
-                                        tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
-                                        &bytes,
-                                    )
-                                    .await
-                                {
-                                    debug!(peer = %peer_id, "SyncPush retry send failed: {}", e);
-                                }
-                            }
-                            Err(e) => warn!(peer = %peer_id, "SyncPush retry encode error: {}", e),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!(peer = %peer_id, "SyncPush retry build failed: {}", e),
-                }
-
-                match crate::sync::runtime::build_repair_pull_payloads_for_peer(&peer_id, 16, 256) {
-                    Ok(payloads) => {
-                        for payload in payloads {
-                            match rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                .map(|v| v.to_vec())
-                            {
-                                Ok(bytes) => {
-                                    if let Err(e) = qm
-                                        .send_ufp2_to_peer(
-                                            &peer_id,
-                                            tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
-                                            &bytes,
-                                        )
-                                        .await
-                                    {
-                                        debug!(peer = %peer_id, "SyncPull repair send failed: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(peer = %peer_id, "SyncPull repair encode error: {}", e)
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => warn!(peer = %peer_id, "SyncPull repair build failed: {}", e),
-                }
-            }
+            run_sync_repair_scheduler_tick_with(
+                qm.as_ref(),
+                mesh_security.as_ref(),
+                |peer_id| crate::sync::runtime::build_push_payload_for_target(peer_id, 128),
+                |peer_id| {
+                    crate::sync::runtime::build_repair_pull_payloads_for_peer(peer_id, 16, 256)
+                },
+            )
+            .await;
         }
     });
+}
+
+pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>(
+    qm: &IrohMeshManager,
+    mesh_security: &MeshSecurity,
+    mut build_push: BuildPush,
+    mut build_repairs: BuildRepairs,
+) where
+    BuildPush: FnMut(
+        &str,
+    ) -> crate::sync::ledger::LedgerResult<
+        Option<tentaflow_protocol::mesh::MeshSyncPushPayload>,
+    >,
+    BuildRepairs: FnMut(
+        &str,
+    ) -> crate::sync::ledger::LedgerResult<
+        Vec<tentaflow_protocol::mesh::MeshSyncPullPayload>,
+    >,
+{
+    let peers = qm.connected_peers().await;
+    for peer_id in peers {
+        if !mesh_security.is_trusted(&peer_id) {
+            continue;
+        }
+        match build_push(&peer_id) {
+            Ok(Some(payload)) => {
+                match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                    Ok(bytes) => {
+                        if let Err(e) = qm
+                            .send_ufp2_to_peer(
+                                &peer_id,
+                                tentaflow_protocol::mesh::MESH_MSG_SYNC_PUSH,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            debug!(peer = %peer_id, "SyncPush retry send failed: {}", e);
+                        }
+                    }
+                    Err(e) => warn!(peer = %peer_id, "SyncPush retry encode error: {}", e),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(peer = %peer_id, "SyncPush retry build failed: {}", e),
+        }
+
+        match build_repairs(&peer_id) {
+            Ok(payloads) => {
+                for payload in payloads {
+                    match rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                        Ok(bytes) => {
+                            if let Err(e) = qm
+                                .send_ufp2_to_peer(
+                                    &peer_id,
+                                    tentaflow_protocol::mesh::MESH_MSG_SYNC_PULL,
+                                    &bytes,
+                                )
+                                .await
+                            {
+                                debug!(peer = %peer_id, "SyncPull repair send failed: {}", e);
+                            }
+                        }
+                        Err(e) => warn!(peer = %peer_id, "SyncPull repair encode error: {}", e),
+                    }
+                }
+            }
+            Err(e) => warn!(peer = %peer_id, "SyncPull repair build failed: {}", e),
+        }
+    }
 }

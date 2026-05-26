@@ -25,6 +25,7 @@ use tentaflow_sdk_spec::{
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::ui::{
     bind::BindRef,
+    a11y::Accessibility,
     layout::{Stack, Flex, Grid, Card, SectionCard, Divider},
     layout::nav::NavTabs as NavTabsStruct,
     data::{Text as TextComp, Heading as HeadingComp, Badge as BadgeComp, Chip as ChipComp,
@@ -365,6 +366,14 @@ fn send_state_patch(key: &str, value: Value) {
 
 fn lit(s: &str) -> BindRef {
     BindRef::Literal(Value::Text(s.into()))
+}
+
+fn with_a11y_label(mut component: Component, label: &str) -> Component {
+    component.a11y = Some(Accessibility {
+        label: Some(lit(label)),
+        ..Default::default()
+    });
+    component
 }
 
 fn icon_named(name: IconName) -> IconRef {
@@ -2123,7 +2132,7 @@ fn build_cameras_content() -> Component {
     let mut children = vec![messages];
 
     // Header: heading + search + add button
-    let search_input = {
+    let search_input = with_a11y_label({
         use tentaflow_sdk_spec::protocol::ui::form::Input;
         Input {
             r#type: InputType::Search,
@@ -2146,7 +2155,7 @@ fn build_cameras_content() -> Component {
             error: None,
             size: InputSize::Md,
         }.into_component("cameras_search").expect("Input")
-    };
+    }, "Szukaj kamer");
     let toolbar = stack_h(vec![
         heading(2, "Kamery"),
         search_input,
