@@ -1973,7 +1973,6 @@ fn build_overview_content() -> Component {
 }
 
 fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Component {
-    let accent_tone = parse_tone(severity);
     let severity_label = match severity {
         "danger" => "krytyczne",
         "warning" => "ostrzeżenie",
@@ -2002,31 +2001,17 @@ fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Com
         density: Density::Default,
     }.into_component(next_id()).expect("Button");
 
-    Card {
-        variant: CardVariant::Outlined,
-        padding: Spacing::Sm,
-        gap: Spacing::Sm,
-        radius: RadiusToken::Md,
-        shadow: ShadowToken::None,
-        border: BorderToken::Hairline,
-        background: BackgroundToken::None,
-        accent: Some(accent_tone),
-        children: vec![
-            Flex {
-                direction: FlexDirection::Row,
-                gap: Spacing::Md,
-                justify: FlexJustify::SpaceBetween,
-                align: FlexAlign::Center,
-                wrap: FlexWrap::NoWrap,
-                children: vec![center, action],
-                padding: None,
-                background: None,
-                radius: None,
-            }.into_component(next_id()).expect("Flex"),
-        ],
-        interactive: false,
-        clickable: false,
-    }.into_component(next_id()).expect("Card")
+    Flex {
+        direction: FlexDirection::Row,
+        gap: Spacing::Md,
+        justify: FlexJustify::SpaceBetween,
+        align: FlexAlign::Center,
+        wrap: FlexWrap::NoWrap,
+        children: vec![center, action],
+        padding: Some(Spacing::Sm),
+        background: None,
+        radius: None,
+    }.into_component(next_id()).expect("Flex")
 }
 
 fn build_runtime_kv_row(label: &str, value_children: Vec<Component>) -> Component {
