@@ -1966,19 +1966,11 @@ fn build_overview_content() -> Component {
 fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Component {
     let accent_tone = parse_tone(severity);
     let severity_label = match severity {
-        "danger" => "critical",
-        "warning" => "warning",
+        "danger" => "krytyczne",
+        "warning" => "ostrzeżenie",
         "info" => "info",
         _ => severity,
     };
-
-    let thumbnail = AvatarComp {
-        source: AvatarRef::Icon { icon: icon_named(parse_icon_name("cameras")) },
-        size: AvatarSize::Lg,
-        shape: AvatarShape::Square,
-        status: None,
-        tone: Some(accent_tone),
-    }.into_component(next_id()).expect("Avatar");
 
     let title_text = text_styled(title, "body_strong");
     let meta_row = stack_h_gap("sm", vec![
@@ -1986,12 +1978,11 @@ fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Com
         chip_with_icon(time, "category", "clock"),
         badge(severity_label, severity),
     ]);
-
     let center = stack_v_gap("xs", vec![title_text, meta_row]);
 
     let action = ButtonComp {
         variant: ButtonVariant::Ghost,
-        tone: Tone::Primary,
+        tone: Tone::Neutral,
         label: lit("Otwórz"),
         icon_leading: None,
         icon_trailing: None,
@@ -2004,8 +1995,8 @@ fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Com
 
     Card {
         variant: CardVariant::Outlined,
-        padding: Spacing::Md,
-        gap: Spacing::Md,
+        padding: Spacing::Sm,
+        gap: Spacing::Sm,
         radius: RadiusToken::Md,
         shadow: ShadowToken::None,
         border: BorderToken::Hairline,
@@ -2015,10 +2006,10 @@ fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Com
             Flex {
                 direction: FlexDirection::Row,
                 gap: Spacing::Md,
-                justify: FlexJustify::Start,
+                justify: FlexJustify::SpaceBetween,
                 align: FlexAlign::Center,
                 wrap: FlexWrap::NoWrap,
-                children: vec![thumbnail, center, action],
+                children: vec![center, action],
                 padding: None,
                 background: None,
                 radius: None,
@@ -2078,7 +2069,7 @@ fn build_runtime_table() -> Component {
             text("12 ms (PTP OK)"),
         ]),
         build_runtime_kv_row("Audit log → WORM", vec![
-            chip_toned_icon("synced (5 min temu)", "success", "shield"),
+            chip_toned("synced (5 min temu)", "success"),
         ]),
         build_runtime_kv_row("Eval harness (daily)", vec![
             text("ostatnio 03:00"),
