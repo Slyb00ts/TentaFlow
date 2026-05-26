@@ -350,6 +350,7 @@ function renderSectionCard(component, ctx) {
     actions.classList.add('tf-section-card__actions');
     for (const action of headerActions) {
       if (!action || typeof action !== 'object') continue;
+      if (typeof action.tag !== 'number' || action.tag === 0) continue;
       actions.appendChild(ctx.renderChild(action));
     }
     el.appendChild(actions);
