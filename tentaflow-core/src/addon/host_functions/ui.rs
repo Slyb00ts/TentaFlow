@@ -231,7 +231,25 @@ fn validate_tag_session(
         UiTag::PanelShell => {
             handle_panel_shell_registration(cbor_bytes, session, addon_id)
         }
-        UiTag::SlotContent | UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
+        UiTag::SlotContent => {
+            if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(cbor_bytes) {
+                session
+                    .validate_slot_ownership(addon_id, &panel_id, &slot_id)
+                    .map_err(|e| format!("slot_ownership_violation: {e}"))?;
+                // Dynamically register action_ids from SlotContent component tree.
+                if let Ok(content) = decode_slot_content_component(cbor_bytes) {
+                    let mut new_actions = HashSet::new();
+                    extract_action_ids_from_component(&content, &mut new_actions);
+                    if !new_actions.is_empty() {
+                        session.extend_declared_actions(addon_id, &panel_id, new_actions);
+                    }
+                }
+                Ok(())
+            } else {
+                Ok(())
+            }
+        }
+        UiTag::SlotClear | UiTag::SlotShow | UiTag::SlotHide => {
             if let Some((panel_id, slot_id)) = extract_panel_and_slot_id(cbor_bytes) {
                 session
                     .validate_slot_ownership(addon_id, &panel_id, &slot_id)
@@ -408,18 +426,138 @@ fn handle_panel_shell_registration(
 
     let slots: HashSet<String> = shell.slots.iter().map(|s| s.id.clone()).collect();
 
+    // Extract action_ids from all handlers in the layout component tree.
+    let mut actions = HashSet::new();
+    extract_action_ids_from_component(&shell.layout, &mut actions);
+
     session
         .register_shell(
             addon_id,
             &shell.panel_id,
             shell.panel_epoch,
             slots,
-            HashSet::new(),
+            actions,
             Vec::new(),
             Vec::new(),
             HashSet::new(),
         )
         .map_err(|e| e.to_string())
+}
+
+/// Decodes the root Component from a SlotContent CBOR message.
+/// Wire: array(2) [ 0x0110, body: map { ..., 5: component } ]
+fn decode_slot_content_component(
+    bytes: &[u8],
+) -> Result<tentaflow_sdk_spec::protocol::ui::component::Component, String> {
+    let mut dec = minicbor::Decoder::new(bytes);
+    dec.array().map_err(|e| format!("array: {e}"))?;
+    dec.u16().map_err(|e| format!("tag: {e}"))?;
+    let content: tentaflow_sdk_spec::protocol::ui::slot_msg::SlotContent =
+        minicbor::Decode::decode(&mut dec, &mut ())
+            .map_err(|e| format!("SlotContent decode: {e}"))?;
+    Ok(content.fragment)
+}
+
+/// Recursively extracts all backend action_ids from a Component's handlers
+/// and from child Components embedded in its FieldMap values.
+fn extract_action_ids_from_component(
+    component: &tentaflow_sdk_spec::protocol::ui::component::Component,
+    actions: &mut HashSet<String>,
+) {
+    use tentaflow_sdk_spec::protocol::ui::handler::Handler;
+    use tentaflow_sdk_spec::protocol::value::Value;
+
+    if let Some(ref handler_map) = component.handlers {
+        for (_event_kind, handler) in &handler_map.0 {
+            match handler {
+                Handler::Backend { action_id, .. } | Handler::Both { action_id, .. } => {
+                    actions.insert(action_id.clone());
+                }
+                Handler::Local(_) => {}
+            }
+        }
+    }
+
+    // Scan FieldMap values for nested Components (children arrays, single child).
+    // Components in FieldMap are encoded as Value::Array([tag, id, fields, ...])
+    // or as Value::Map with integer keys matching Component struct layout.
+    for (_key, value) in &component.fields.0 {
+        extract_action_ids_from_value(value, actions);
+    }
+}
+
+fn extract_action_ids_from_value(
+    value: &tentaflow_sdk_spec::protocol::value::Value,
+    actions: &mut HashSet<String>,
+) {
+    use tentaflow_sdk_spec::protocol::value::Value;
+
+    match value {
+        Value::Array(items) => {
+            // Could be a children array of Components, or a FieldMap entry, or a plain array.
+            // Try to decode each item as a Component-like structure.
+            for item in items {
+                // FieldMap entry: [u8_key, value] pair
+                if let Value::Array(pair) = item {
+                    if pair.len() == 2 {
+                        extract_action_ids_from_value(&pair[1], actions);
+                        continue;
+                    }
+                }
+                extract_action_ids_from_value(item, actions);
+            }
+        }
+        Value::Map(entries) => {
+            // This might be a Component encoded as a map. Check for handlers (key 3)
+            // which contain action_ids, and fields (key 2) which contain children.
+            let mut has_tag = false;
+            let mut handlers_val = None;
+            let mut fields_val = None;
+
+            for (k, v) in entries {
+                if let Value::U64(key_num) = k {
+                    match *key_num {
+                        0 => has_tag = true,
+                        2 => fields_val = Some(v),
+                        3 => handlers_val = Some(v),
+                        _ => {}
+                    }
+                }
+            }
+
+            if has_tag {
+                // This looks like a Component. Extract handler action_ids.
+                if let Some(Value::Array(handler_entries)) = handlers_val {
+                    for entry in handler_entries {
+                        if let Value::Array(pair) = entry {
+                            if pair.len() == 2 {
+                                // pair[1] is Handler, which is Map with "action_id" key
+                                if let Value::Map(handler_map) = &pair[1] {
+                                    for (hk, hv) in handler_map {
+                                        if let (Value::Text(key), Value::Text(val)) = (hk, hv) {
+                                            if key == "action_id" {
+                                                actions.insert(val.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Recurse into fields
+                if let Some(fields) = fields_val {
+                    extract_action_ids_from_value(fields, actions);
+                }
+            } else {
+                // Not a component, just recurse into all values
+                for (_k, v) in entries {
+                    extract_action_ids_from_value(v, actions);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 // =============================================================================

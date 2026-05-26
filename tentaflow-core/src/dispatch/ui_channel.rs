@@ -286,6 +286,13 @@ fn handle_action(
     ctx: &HandlerContext,
     action: tentaflow_sdk_spec::protocol::ui::action::Action,
 ) -> Result<MessageBody, ProtocolError> {
+    tracing::info!(
+        addon = %action.addon_id,
+        panel = %action.panel_id,
+        action_id = %action.action_id,
+        epoch = action.panel_epoch,
+        "UI action received"
+    );
     let session_lock = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
     {
         let session = session_lock.lock();
@@ -306,9 +313,10 @@ fn handle_action(
             )));
         }
 
-        session
-            .validate_action(&action.addon_id, &action.panel_id, &action.action_id)
-            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        if let Err(e) = session.validate_action(&action.addon_id, &action.panel_id, &action.action_id) {
+            tracing::warn!(error = %e, addon = %action.addon_id, action = %action.action_id, "UI action validation failed");
+            return Err(ProtocolError::bad_request(e.to_string()));
+        }
     }
     // Session lock dropped before calling addon.
 
@@ -321,13 +329,20 @@ fn handle_action(
     let user_id = extract_user_id_i64(ctx).unwrap_or(0);
     let tool_name = format!("ui.{}.{}", action.panel_id, action.action_id);
     let params_json = cbor_map_to_json(&action.params);
+    tracing::info!(tool = %tool_name, params = %params_json, "UI action calling addon tool");
 
     let status = match addon_mgr.call_tool(&action.addon_id, &tool_name, params_json, user_id) {
-        Ok(_) => tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok,
-        Err(e) => tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Error {
-            error_code: 0xFFFF,
-            message: e.to_string(),
-        },
+        Ok(result) => {
+            tracing::info!(result = %result, "UI action tool returned");
+            tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "UI action tool error");
+            tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Error {
+                error_code: 0xFFFF,
+                message: e.to_string(),
+            }
+        }
     };
 
     let ack = tentaflow_sdk_spec::protocol::ui::action::ActionAck {
