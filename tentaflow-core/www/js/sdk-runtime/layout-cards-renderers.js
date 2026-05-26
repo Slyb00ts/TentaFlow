@@ -316,14 +316,9 @@ function renderSectionCard(component, ctx) {
     'SectionCard.accent'
   );
 
-  // Use <tf-section-card> web component
+  // Use <tf-section-card> web component — do NOT add .tf-card on host,
+  // the component creates its own styled inner div.
   const el = document.createElement('tf-section-card');
-
-  // Card-level styling via CSS classes on the host element
-  el.classList.add('tf-card');
-  applyCardClasses(el, {
-    variant, padding, gap, radius, shadow, background, accent, borderClasses,
-  });
 
   // Reactive title attribute binding
   const applyTitle = () => {
