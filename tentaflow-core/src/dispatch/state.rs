@@ -114,7 +114,11 @@ impl AppState {
             port_allocator: None,
             mesh_services_registry: Arc::new(MeshServicesRegistry::new()),
             live_handles,
-            ui_sessions: Arc::new(SessionRegistry::new()),
+            ui_sessions: {
+                let reg = Arc::new(SessionRegistry::new());
+                crate::addon::ui_session::init_global_registry(reg.clone());
+                reg
+            },
         })
     }
 }
