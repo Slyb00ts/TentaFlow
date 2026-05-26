@@ -1869,24 +1869,6 @@ CREATE TABLE registries (
 );
 CREATE INDEX idx_registries_name ON registries(name);
 
-CREATE TABLE crdt_operations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    clock_time INTEGER NOT NULL,
-    clock_node_hash INTEGER NOT NULL,
-    op_type TEXT NOT NULL,
-    op_key TEXT NOT NULL,
-    op_data TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX idx_crdt_ops_time ON crdt_operations(clock_time);
-CREATE INDEX idx_crdt_ops_key ON crdt_operations(op_key);
-
-CREATE TABLE crdt_version_vector (
-    node_hash INTEGER PRIMARY KEY,
-    last_time INTEGER NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
 CREATE TABLE user_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
