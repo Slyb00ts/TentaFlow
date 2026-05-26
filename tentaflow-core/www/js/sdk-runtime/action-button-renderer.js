@@ -60,6 +60,18 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
 export const BUTTON_TAG = 0x0401;
 const BUTTON_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
+// SDK variant → tf-button variant attribute
+const VARIANT_MAP = {
+  primary: 'primary',
+  secondary: 'secondary',
+  tertiary: 'ghost',
+  ghost: 'ghost',
+  destructive: 'danger',
+  link: 'ghost',
+};
+// SDK size → tf-button size attribute (only 'sm' supported beyond default)
+const SIZE_MAP = { xs: 'sm', sm: 'sm', md: null, lg: null };
+
 function renderButton(component, ctx) {
   assertOnlyKnownFields(component.fields, BUTTON_FIELD_KEYS, 'Button');
   const variant = requireEnum(
@@ -101,37 +113,29 @@ function renderButton(component, ctx) {
     'Button.density'
   );
 
-  const btn = document.createElement('button');
-  btn.setAttribute('type', 'button');
-  btn.classList.add('tf-button');
-  btn.classList.add(`tf-button--variant-${variant}`);
-  btn.classList.add(`tf-button--tone-${tone}`);
-  btn.classList.add(`tf-button--size-${size}`);
-  btn.classList.add(`tf-button--density-${density}`);
-  if (fullWidth) btn.classList.add('tf-button--full-width');
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', VARIANT_MAP[variant] || 'primary');
+  const mappedSize = SIZE_MAP[size];
+  if (mappedSize) btn.setAttribute('size', mappedSize);
+  if (fullWidth) btn.style.width = '100%';
 
-  // Label binding — reactive textContent.
-  const labelEl = document.createElement('span');
-  labelEl.classList.add('tf-button__label');
-  btn.appendChild(labelEl);
+  // Label binding — reactive label attribute on tf-button.
   const applyLabel = () => {
     const v = resolveBindRef(labelBind, ctx.store);
-    labelEl.textContent = v == null ? '' : String(v);
+    btn.setAttribute('label', v == null ? '' : String(v));
   };
   applyLabel();
   ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
 
-  // Reactive disabled (Option<BindRef>). Defensive: jeśli loading=true,
-  // disabled jest też wymuszony (W3C button affordance).
+  // Reactive disabled (Option<BindRef>). Defensive: loading=true forces
+  // disabled (W3C button affordance).
   let isDisabledLogical = false;
   let isLoadingLogical = false;
   const updateDisabledAttr = () => {
     if (isDisabledLogical || isLoadingLogical) {
       btn.setAttribute('disabled', '');
-      btn.setAttribute('aria-disabled', 'true');
     } else {
       btn.removeAttribute('disabled');
-      btn.removeAttribute('aria-disabled');
     }
   };
   if (disabledBind != null) {
@@ -143,16 +147,14 @@ function renderButton(component, ctx) {
     ctx.registerCleanup(subscribeBindRef(disabledBind, ctx.store, applyDisabled));
   }
 
-  // Reactive loading — pokazuje aria-busy=true + dodatkowy class + spinner
-  // wstawiany jako pseudo-element przez CSS (nie wymaga DOM injection).
+  // Reactive loading — tf-button has no loading state, so we disable and
+  // set aria-busy on the host element for screen readers.
   if (loadingBind != null) {
     const applyLoading = () => {
       isLoadingLogical = resolveBindRef(loadingBind, ctx.store) === true;
       if (isLoadingLogical) {
-        btn.classList.add('tf-button--loading');
         btn.setAttribute('aria-busy', 'true');
       } else {
-        btn.classList.remove('tf-button--loading');
         btn.removeAttribute('aria-busy');
       }
       updateDisabledAttr();

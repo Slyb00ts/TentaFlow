@@ -338,6 +338,8 @@ tf-heatmap {
 .tf-heatmap-wrap {
   position: relative;
   width: 100%;
+  display: flex;
+  flex-direction: column;
 }
 
 .tf-heatmap-grid {
@@ -383,14 +385,13 @@ tf-heatmap {
 .tf-heatmap-cell[data-level="4"] { background: rgba(239, 68, 68, 0.85); }
 
 .tf-heatmap-legend {
-  position: absolute;
-  top: -28px;
-  right: 0;
   display: inline-flex;
   align-items: center;
   gap: 4px;
   font-size: 11px;
   color: var(--sdk-color-text-muted, rgba(255, 255, 255, 0.55));
+  align-self: flex-end;
+  margin-bottom: 6px;
 }
 
 .tf-heatmap-legend-swatch {
@@ -400,7 +401,7 @@ tf-heatmap {
   border-radius: 2px;
 }
 
-.tf-heatmap-legend-swatch[data-level="1"] { background: rgba(99, 102, 241, 0.2); }
-.tf-heatmap-legend-swatch[data-level="2"] { background: rgba(99, 102, 241, 0.45); }
-.tf-heatmap-legend-swatch[data-level="3"] { background: rgba(167, 139, 250, 0.7); }
-.tf-heatmap-legend-swatch[data-level="4"] { background: rgba(239, 68, 68, 0.85); }
+.tf-heatmap-legend-swatch[data-level="1"] { background: rgba(99, 102, 241, 0.3); border-color: rgba(99, 102, 241, 0.4); }
+.tf-heatmap-legend-swatch[data-level="2"] { background: rgba(99, 102, 241, 0.55); border-color: rgba(99, 102, 241, 0.6); }
+.tf-heatmap-legend-swatch[data-level="3"] { background: rgba(167, 139, 250, 0.75); border-color: rgba(167, 139, 250, 0.8); }
+.tf-heatmap-legend-swatch[data-level="4"] { background: rgba(239, 68, 68, 0.9); border-color: rgba(239, 68, 68, 0.95); }

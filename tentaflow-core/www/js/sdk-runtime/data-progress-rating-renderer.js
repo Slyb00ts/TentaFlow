@@ -2,16 +2,14 @@
 // Plik: sdk-runtime/data-progress-rating-renderer.js
 // Opis: Renderery ProgressBar (0x021D) + RatingDisplay (0x021E) — chunk 3.3d-13.
 //
-// ProgressBar: linearny pasek z value/max → procent fill. Variants:
-// `default` (solid fill), `striped` (CSS striped pattern), `indeterminate`
-// (animated bar, ignoruje value). Tone steruje kolorem fill. show_label
-// renderuje % label nad pełną szerokością. Optional label BindRef override.
-// Size: xs/sm/md/lg → CSS variant height.
+// ProgressBar: uses <tf-progress-bar> web component with reactive value/tone/
+// size/label attributes. Variants: `default` (solid fill), `striped` (CSS
+// striped pattern), `indeterminate` (animated bar). Tone maps to tf-progress-bar
+// tone attribute. show_label renders % label.
 //
-// RatingDisplay: max sztuk symboli (stars/hearts/circles) renderowanych
-// jako SVG, lub variant=numeric → "v / max" jako text. precision steruje
-// renderowaniem ułamków: `full` (zaokrąglone do int), `half` (half-fill
-// przez clipPath linear-gradient), `decimal` (linear partial fill).
+// RatingDisplay: max symbols (stars/hearts/circles) rendered as SVG, or
+// variant=numeric as text. precision: `full` (int), `half` (half-fill),
+// `decimal` (partial fill).
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/progress.rs.
 // =============================================================================
@@ -27,8 +25,19 @@ import {
   assertOnlyKnownFields,
 } from './data-chart-shared.js';
 
+// Map SDK tones to tf-progress-bar tone attribute values
+const TONE_MAP = {
+  'primary': 'accent',
+  'success': 'success',
+  'warning': 'warning',
+  'critical': 'danger',
+  'info': 'accent',
+  'neutral': 'accent',
+  'muted': 'accent',
+};
+
 // =============================================================================
-// ProgressBar (0x021D)
+// ProgressBar (0x021D) — uses <tf-progress-bar> web component
 // =============================================================================
 
 export const PROGRESS_BAR_TAG = 0x021D;
@@ -43,8 +52,6 @@ function renderProgressBar(component, ctx) {
   if (valueBind == null) throw new TypeError('ProgressBar.value is required (BindRef)');
   assertBindRef(valueBind, 'ProgressBar.value');
   let max = ctx.readField(component.fields, 1);
-  // Spec default max=1.0 — applied on decode w Rust; tu sami obsługujemy
-  // brak pola.
   if (max == null) max = 1.0;
   max = requireF64(max, 'ProgressBar.max');
   if (!(max > 0)) throw new TypeError('ProgressBar.max must be > 0');
@@ -55,66 +62,57 @@ function renderProgressBar(component, ctx) {
   if (labelBind != null) assertBindRef(labelBind, 'ProgressBar.label');
   const size = requireEnum(ctx.readField(component.fields, 6), PROGRESS_SIZES, 'ProgressBar.size');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-progress-bar');
-  wrapper.classList.add(`tf-progress-bar--variant-${variant}`);
-  wrapper.classList.add(`tf-progress-bar--tone-${tone}`);
-  wrapper.classList.add(`tf-progress-bar--size-${size}`);
-  wrapper.setAttribute('role', 'progressbar');
-  wrapper.setAttribute('aria-valuemin', '0');
-  wrapper.setAttribute('aria-valuemax', String(max));
+  // Create <tf-progress-bar> web component
+  const el = document.createElement('tf-progress-bar');
+  el.setAttribute('tone', TONE_MAP[tone] || 'accent');
+  el.setAttribute('size', size);
 
-  const track = document.createElement('div');
-  track.classList.add('tf-progress-bar__track');
-  const fill = document.createElement('div');
-  fill.classList.add('tf-progress-bar__fill');
-  track.appendChild(fill);
-  wrapper.appendChild(track);
+  // Apply variant CSS class for striped/indeterminate
+  if (variant === 'striped') el.classList.add('tf-progress-bar--striped');
+  if (variant === 'indeterminate') el.classList.add('tf-progress-bar--indeterminate');
 
-  let labelEl = null;
-  if (showLabel) {
-    labelEl = document.createElement('span');
-    labelEl.classList.add('tf-progress-bar__label');
-    wrapper.appendChild(labelEl);
-  }
+  // ARIA attributes
+  el.setAttribute('role', 'progressbar');
+  el.setAttribute('aria-valuemin', '0');
+  el.setAttribute('aria-valuemax', String(max));
 
   const apply = () => {
     if (variant === 'indeterminate') {
-      // Indeterminate ignoruje value, ale label/aria nadal mogą być pokazane.
-      fill.style.width = '';
-      wrapper.removeAttribute('aria-valuenow');
-      if (labelEl) {
-        if (labelBind != null) {
-          const v = resolveBindRef(labelBind, ctx.store);
-          labelEl.textContent = v == null ? '' : String(v);
-        } else {
-          labelEl.textContent = '';
-        }
+      el.removeAttribute('aria-valuenow');
+      el.setAttribute('value', '0');
+      if (showLabel && labelBind != null) {
+        const v = resolveBindRef(labelBind, ctx.store);
+        el.setAttribute('label', v == null ? '' : String(v));
+      } else {
+        el.removeAttribute('label');
       }
       return;
     }
     const raw = resolveBindRef(valueBind, ctx.store);
     const invalid = (raw == null) || typeof raw !== 'number' || !Number.isFinite(raw);
     if (invalid) {
-      fill.style.width = '0%';
-      wrapper.removeAttribute('aria-valuenow');
-      if (raw != null) wrapper.setAttribute('aria-invalid', 'true');
-      else wrapper.removeAttribute('aria-invalid');
-      if (labelEl) labelEl.textContent = '—';
+      el.setAttribute('value', '0');
+      el.removeAttribute('aria-valuenow');
+      if (raw != null) el.setAttribute('aria-invalid', 'true');
+      else el.removeAttribute('aria-invalid');
+      if (showLabel) el.setAttribute('label', '—');
+      else el.removeAttribute('label');
       return;
     }
-    wrapper.removeAttribute('aria-invalid');
+    el.removeAttribute('aria-invalid');
     const clamped = Math.max(0, Math.min(max, raw));
     const pct = (clamped / max) * 100;
-    fill.style.width = `${pct.toFixed(2)}%`;
-    wrapper.setAttribute('aria-valuenow', String(clamped));
-    if (labelEl) {
+    el.setAttribute('value', String(pct.toFixed(2)));
+    el.setAttribute('aria-valuenow', String(clamped));
+    if (showLabel) {
       if (labelBind != null) {
         const v = resolveBindRef(labelBind, ctx.store);
-        labelEl.textContent = v == null ? `${pct.toFixed(0)}%` : String(v);
+        el.setAttribute('label', v == null ? `${pct.toFixed(0)}%` : String(v));
       } else {
-        labelEl.textContent = `${pct.toFixed(0)}%`;
+        el.setAttribute('label', `${pct.toFixed(0)}%`);
       }
+    } else {
+      el.removeAttribute('label');
     }
   };
   apply();
@@ -125,7 +123,7 @@ function renderProgressBar(component, ctx) {
     ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, apply));
   }
 
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
@@ -137,7 +135,6 @@ const RATING_DISPLAY_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
 const RATING_VARIANTS = new Set(['stars', 'hearts', 'circles', 'numeric']);
 const RATING_PRECISIONS = new Set(['full', 'half', 'decimal']);
 
-// SVG path data dla każdego variantu (viewBox 0 0 24 24).
 const RATING_PATHS = {
   stars: 'M12 2.5l2.95 6.55 7.05.65-5.3 4.85 1.55 6.95L12 17.85 5.75 21.5 7.3 14.55 2 9.7l7.05-.65L12 2.5z',
   hearts: 'M12 21s-7-4.35-7-10a4 4 0 0 1 7-2.65A4 4 0 0 1 19 11c0 5.65-7 10-7 10z',
@@ -151,7 +148,7 @@ function renderRatingDisplay(component, ctx) {
   if (valueBind == null) throw new TypeError('RatingDisplay.value is required (BindRef)');
   assertBindRef(valueBind, 'RatingDisplay.value');
   let max = ctx.readField(component.fields, 1);
-  if (max == null) max = 5;  // spec default
+  if (max == null) max = 5;
   max = requireU8(max, 'RatingDisplay.max');
   if (max === 0) throw new TypeError('RatingDisplay.max must be > 0');
   const variant = requireEnum(ctx.readField(component.fields, 2), RATING_VARIANTS, 'RatingDisplay.variant');
@@ -164,7 +161,6 @@ function renderRatingDisplay(component, ctx) {
   wrapper.classList.add(`tf-rating--precision-${precision}`);
   wrapper.setAttribute('role', 'img');
 
-  // Numeric variant: text "v / max", brak ikon.
   if (variant === 'numeric') {
     const txt = document.createElement('span');
     txt.classList.add('tf-rating__numeric');
@@ -196,9 +192,6 @@ function renderRatingDisplay(component, ctx) {
     return wrapper;
   }
 
-  // Stars/Hearts/Circles: max ikon SVG. Każda ikona ma dwie warstwy: track
-  // (muted) i fill (active). Fill jest clip'owany przez <clipPath> z
-  // szerokością procentową — daje precise half + decimal.
   const path = RATING_PATHS[variant];
   const clipPrefix = `tf-rating-clip-${Math.random().toString(36).slice(2, 10)}`;
   const iconsRoot = document.createElement('div');
@@ -210,12 +203,10 @@ function renderRatingDisplay(component, ctx) {
     const svg = document.createElementNS(SVG_NS, 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('class', `tf-rating__icon tf-rating__icon--${variant}`);
-    // Track
     const trackEl = document.createElementNS(SVG_NS, 'path');
     trackEl.setAttribute('d', path);
     trackEl.setAttribute('class', 'tf-rating__icon-track');
     svg.appendChild(trackEl);
-    // Clipped fill
     const defs = document.createElementNS(SVG_NS, 'defs');
     const clip = document.createElementNS(SVG_NS, 'clipPath');
     const clipId = `${clipPrefix}-${i}`;
@@ -259,7 +250,6 @@ function renderRatingDisplay(component, ctx) {
     if (invalid) wrapper.setAttribute('aria-invalid', 'true');
     else wrapper.removeAttribute('aria-invalid');
 
-    // Quantize wedlug precision: full → ceil-to-int, half → 0.5 step, decimal → raw.
     let display;
     if (precision === 'full') display = Math.round(clamped);
     else if (precision === 'half') display = Math.round(clamped * 2) / 2;

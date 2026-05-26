@@ -1,24 +1,9 @@
 // =============================================================================
 // Plik: sdk-runtime/data-table-renderer.js
-// Opis: Renderer Table (0x0211) — chunk 3.3d-6. Najbogatszy komponent Data
-// Display (18 pól): columns z TableColumn, rows_path, sortable header click,
-// selectable single/multi z checkboxes, pagination (slice rows + nav),
-// sticky_header, sticky_columns, empty_state, row_actions per-row menu,
-// bulk_actions toolbar widoczny gdy zaznaczone, row_expandable +
-// expanded_row_template_id, ColumnRender hints (text/number/currency/badge/
-// chip/tag/avatar/avatar_group/icon/stat/trend/progress/rating/actions/
-// link/custom).
-//
-// Rows: store value = Array<object>. Każdy wiersz musi mieć `row_key_field`
-// (string id). Brak → throw przy renderze tego wiersza. ColumnRender hints
-// to wskazówki dla custom rendering host'a; renderer w tej iteracji robi
-// fallback text przez field_path lookup + ValueFormat. Pełne rendering
-// per-render-hint (np. ColumnRender::Badge → tf-badge) jest deferred do
-// 3.3d-7 (gdy host registry templates jest na miejscu).
-//
-// Eventy per spec: row_click, row_double_click, selection_change.
-// Sort header click → emit `sort_change` z column_id (sort_by BindRef
-// określa write-back target przez chunk 3.6).
+// Opis: Renderer Table (0x0211) — uses <tf-table> + <tf-column> web components.
+// Columns mapped to <tf-column> children, data set via .rows property.
+// Sort, pagination, selection, bulk actions, row actions, empty state,
+// expandable rows — all SDK features preserved with reactive bindings.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs Table +
 // inline.rs (TableColumn, TablePagination, TableColumnWidth).
@@ -92,7 +77,6 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
     }
   }
 }
-// Per-variant ValueFormat allowed keys (per spec value_format.rs).
 const VALUE_FORMAT_VARIANT_KEYS = {
   plain:    new Set(['kind']),
   number:   new Set(['kind', 'decimals', 'thousands_sep']),
@@ -113,8 +97,6 @@ function assertValueFormat(fmt, ctx, locale) {
   if (typeof fmt.kind !== 'string' || !VALUE_FORMAT_KINDS.has(fmt.kind)) {
     throw new TypeError(`${ctx}: ValueFormat.kind invalid: ${fmt.kind}`);
   }
-  // Per-variant unknown-key rejection (mirror Rust decoder strictness
-  // z value_format.rs).
   const allowed = VALUE_FORMAT_VARIANT_KEYS[fmt.kind];
   for (const k of Object.keys(fmt)) {
     if (!allowed.has(k)) throw new TypeError(`${ctx}: unexpected key '${k}' for kind=${fmt.kind}`);
@@ -172,7 +154,6 @@ function parseColumn(raw, ctx, locale) {
       case 1: col.header = v; break;
       case 2: {
         const segs = requirePath(v, `${ctx}.field_path`);
-        // Per-segment shape validation (mirror StatePath struktura).
         for (let si = 0; si < segs.length; si++) {
           const s = segs[si];
           if (!s || typeof s !== 'object' || Array.isArray(s)) {
@@ -235,7 +216,6 @@ function parsePagination(raw, ctx) {
   return p;
 }
 
-/// Walidacja ComponentRef shape (minimum dla overflow entries).
 function assertComponentRef(c, expectedTag, ctxName) {
   if (!c || typeof c !== 'object' || Array.isArray(c)) {
     throw new TypeError(`${ctxName}: Component must be object`);
@@ -258,7 +238,6 @@ function applyTextBind(element, bindRef, ctx) {
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
-/// Reads nested field z row object przez field_path segments (rooted at row).
 function readRowField(row, segments) {
   let cur = row;
   for (const seg of segments) {
@@ -271,16 +250,12 @@ function readRowField(row, segments) {
   return cur;
 }
 
-/// Format value przez ColumnRender hint i optional ValueFormat. Wraca string
-/// gotowy do textContent (XSS-safe).
 function formatCellValue(value, render, format, locale) {
   if (value == null) return '';
   if (format != null) {
     try { return formatValue(value, format, locale); }
     catch { /* fall through */ }
   }
-  // ColumnRender hints fallback do tekstu — pełne komponenty per-render
-  // (badge, chip, etc.) deferred do 3.3d-7 host template registry.
   switch (render) {
     case 'number':
     case 'percent':
@@ -288,7 +263,7 @@ function formatCellValue(value, render, format, locale) {
       try {
         return new Intl.NumberFormat(locale).format(typeof value === 'bigint' ? Number(value) : value);
       } catch { return String(value); }
-    case 'currency': return String(value);  // wymaga ValueFormat dla code
+    case 'currency': return String(value);
     case 'date':
     case 'time':
     case 'datetime':
@@ -302,8 +277,17 @@ function formatCellValue(value, render, format, locale) {
   }
 }
 
+/// Map field_path to a simple key string for tf-column key attribute.
+/// Takes the first key segment's value as the column key.
+function fieldPathToKey(fieldPath) {
+  for (const seg of fieldPath) {
+    if (seg.kind === 'key') return seg.value;
+  }
+  return '';
+}
+
 // =============================================================================
-// Table (0x0211)
+// Table (0x0211) — uses <tf-table> + <tf-column> web components
 // =============================================================================
 
 export const TABLE_TAG = 0x0211;
@@ -317,7 +301,6 @@ function renderTable(component, ctx) {
     if (!Array.isArray(columnsRaw)) throw new TypeError('Table.columns: expected Array<TableColumn>');
     return columnsRaw.map((c, i) => parseColumn(c, `Table.columns[${i}]`, ctx.locale));
   })();
-  // Duplicate column id detection.
   const colIds = new Set();
   for (const col of columns) {
     if (colIds.has(col.id)) throw new TypeError(`Table.columns: duplicate id '${col.id}'`);
@@ -374,6 +357,12 @@ function renderTable(component, ctx) {
     throw new TypeError('Table.row_expandable=true requires expanded_row_template_id');
   }
 
+  // Create <tf-table> web component
+  const tfTable = document.createElement('tf-table');
+  if (sortable) tfTable.setAttribute('sortable', '');
+  if (selectMode !== 'none') tfTable.setAttribute('selectable', '');
+
+  // Wrapper div for additional SDK features (bulk actions, pagination, empty state)
   const wrapper = document.createElement('div');
   wrapper.classList.add('tf-table');
   wrapper.classList.add(`tf-table--variant-${variant}`);
@@ -381,7 +370,7 @@ function renderTable(component, ctx) {
   if (stickyHeader) wrapper.classList.add('tf-table--sticky-header');
   if (virtualize) wrapper.classList.add('tf-table--virtualize');
 
-  // Bulk actions toolbar — widoczny gdy zaznaczone rows.
+  // Bulk actions toolbar
   let bulkToolbar = null;
   if (bulkActions.length > 0 && selectMode === 'multi') {
     bulkToolbar = document.createElement('div');
@@ -394,128 +383,30 @@ function renderTable(component, ctx) {
     wrapper.appendChild(bulkToolbar);
   }
 
-  const scroll = document.createElement('div');
-  scroll.classList.add('tf-table__scroll');
-  wrapper.appendChild(scroll);
-
-  const tableEl = document.createElement('table');
-  tableEl.classList.add('tf-table__table');
-  scroll.appendChild(tableEl);
-
-  // Header rebuild zostaje stabilny (zmieniaja sie tylko sort indicators);
-  // tbody full rebuild przy patch'u.
-  const thead = document.createElement('thead');
-  if (stickyHeader) thead.classList.add('tf-table__thead--sticky');
-  const headerRow = document.createElement('tr');
-  // Selection checkbox column header.
-  if (selectMode !== 'none') {
-    const selTh = document.createElement('th');
-    selTh.classList.add('tf-table__th-select');
-    if (selectMode === 'multi') {
-      const cb = document.createElement('input');
-      cb.setAttribute('type', 'checkbox');
-      cb.classList.add('tf-table__select-all');
-      cb.setAttribute('aria-label', 'Select all');
-      selTh.appendChild(cb);
-      const onSelectAll = (e) => {
-        e.stopPropagation();
-        const rows = readVisibleRows();
-        const allIds = rows.map((r) => extractRowId(r));
-        const next = cb.checked ? allIds : [];
-        wrapper.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
-            bubbles: false,
-            detail: { selected_ids: next, mode: 'multi', all: cb.checked },
-          })
-        );
-      };
-      cb.addEventListener('change', onSelectAll);
-      ctx.registerCleanup(() => cb.removeEventListener('change', onSelectAll));
-    }
-    headerRow.appendChild(selTh);
-  }
+  // Create <tf-column> children for visible columns
   for (let i = 0; i < columns.length; i++) {
     const col = columns[i];
     if (col.hidden_by_default) continue;
-    const th = document.createElement('th');
-    th.classList.add('tf-table__th');
-    th.setAttribute('data-column-id', col.id);
-    if (col.align) th.classList.add(`tf-table__th--align-${col.align}`);
-    if (col.sticky_left || i < stickyColumns) th.classList.add('tf-table__th--sticky-left');
-    applyColumnWidth(th, col.width);
-    const headerText = document.createElement('span');
-    headerText.classList.add('tf-table__th-label');
-    applyTextBind(headerText, col.header, ctx);
-    th.appendChild(headerText);
-    if (sortable && col.sortable) {
-      th.classList.add('tf-table__th--sortable');
-      th.setAttribute('role', 'button');
-      th.setAttribute('tabindex', '0');
-      const sortIndicator = document.createElement('span');
-      sortIndicator.classList.add('tf-table__th-sort');
-      sortIndicator.setAttribute('aria-hidden', 'true');
-      th.appendChild(sortIndicator);
-      const updateSort = () => {
-        let dir = null, current = null;
-        if (sortByBind != null) {
-          const v = resolveBindRef(sortByBind, ctx.store);
-          if (v && typeof v === 'object' && v.column_id === col.id) {
-            current = v;
-            dir = SORT_DIRECTIONS.has(v.direction) ? v.direction : null;
-          }
-        }
-        sortIndicator.textContent = dir === 'asc' ? '▲' : dir === 'desc' ? '▼' : '↕';
-        th.setAttribute('aria-sort', dir === 'asc' ? 'ascending' : dir === 'desc' ? 'descending' : 'none');
-      };
-      updateSort();
-      if (sortByBind != null) {
-        ctx.registerCleanup(subscribeBindRef(sortByBind, ctx.store, updateSort));
-      }
-      const onSortClick = (e) => {
-        e.preventDefault();
-        // Toggle direction: asc → desc → none.
-        let next = { column_id: col.id, direction: 'asc' };
-        if (sortByBind != null) {
-          const v = resolveBindRef(sortByBind, ctx.store);
-          if (v && v.column_id === col.id) {
-            if (v.direction === 'asc') next = { column_id: col.id, direction: 'desc' };
-            else if (v.direction === 'desc') next = null;
-          }
-        }
-        wrapper.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('sort_change', {
-            bubbles: false,
-            detail: { sort: next },
-          })
-        );
-      };
-      const onSortKey = (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSortClick(e); }
-      };
-      th.addEventListener('click', onSortClick);
-      th.addEventListener('keydown', onSortKey);
-      ctx.registerCleanup(() => {
-        th.removeEventListener('click', onSortClick);
-        th.removeEventListener('keydown', onSortKey);
-      });
+    const tfCol = document.createElement('tf-column');
+    tfCol.setAttribute('key', fieldPathToKey(col.field_path));
+    if (sortable && col.sortable) tfCol.setAttribute('sortable', '');
+    if (col.render === 'number' || col.render === 'currency' || col.render === 'percent' || col.render === 'bytes') {
+      tfCol.setAttribute('renderer', 'num');
+      tfCol.setAttribute('align', 'num');
+    } else if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
+      tfCol.setAttribute('renderer', 'chip');
+    } else {
+      tfCol.setAttribute('renderer', 'text');
     }
-    headerRow.appendChild(th);
+    // Reactive header label
+    applyTextBind(tfCol, col.header, ctx);
+    tfCol.setAttribute('label', tfCol.textContent || col.id);
+    tfTable.appendChild(tfCol);
   }
-  // Row actions column header (jeśli row_actions != []).
-  if (rowActions.length > 0) {
-    const actTh = document.createElement('th');
-    actTh.classList.add('tf-table__th-actions');
-    actTh.setAttribute('aria-label', 'Actions');
-    headerRow.appendChild(actTh);
-  }
-  thead.appendChild(headerRow);
-  tableEl.appendChild(thead);
 
-  const tbody = document.createElement('tbody');
-  tbody.classList.add('tf-table__tbody');
-  tableEl.appendChild(tbody);
+  wrapper.appendChild(tfTable);
 
-  // Empty state slot.
+  // Empty state slot
   let emptyStateEl = null;
   if (emptyStateRaw != null) {
     emptyStateEl = ctx.renderChild(emptyStateRaw);
@@ -524,7 +415,7 @@ function renderTable(component, ctx) {
     wrapper.appendChild(emptyStateEl);
   }
 
-  // Pagination footer.
+  // Pagination footer
   let paginationEl = null;
   let pageSizeRef = null;
   if (pagination != null) {
@@ -535,7 +426,7 @@ function renderTable(component, ctx) {
     wrapper.appendChild(paginationEl);
   }
 
-  // Per-rebuild cleanups (row click listeners).
+  // Per-rebuild cleanups
   let rebuildCleanups = [];
   const runRebuildCleanups = () => {
     for (const fn of rebuildCleanups) { try { fn(); } catch {} }
@@ -586,119 +477,43 @@ function renderTable(component, ctx) {
     return Array.isArray(v) ? new Set(v.filter((s) => typeof s === 'string')) : new Set();
   };
 
+  // Transform SDK rows to flat objects for tf-table .rows property.
+  // tf-table reads values by column key from row objects.
+  const transformRows = (rows) => {
+    return rows.map((row) => {
+      const flat = { ...row };
+      // For nested field_paths, resolve and add as top-level key
+      for (const col of columns) {
+        if (col.hidden_by_default) continue;
+        const key = fieldPathToKey(col.field_path);
+        const rawVal = readRowField(row, col.field_path);
+        const formatted = formatCellValue(rawVal, col.render, col.format, ctx.locale);
+        if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
+          flat[key] = { label: formatted, status: 'info' };
+        } else {
+          flat[key] = formatted;
+        }
+      }
+      return flat;
+    });
+  };
+
   const rebuild = () => {
     runRebuildCleanups();
-    tbody.replaceChildren();
     const rows = readVisibleRows();
     if (rows.length === 0) {
-      tbody.hidden = true;
+      tfTable.rows = [];
       if (emptyStateEl) emptyStateEl.hidden = false;
       if (paginationEl) renderPagination();
       if (bulkToolbar) bulkToolbar.hidden = true;
       return;
     }
-    tbody.hidden = false;
     if (emptyStateEl) emptyStateEl.hidden = true;
 
+    // Set rows on tf-table
+    tfTable.rows = transformRows(rows);
+
     const selectedSet = getSelectedSet();
-    for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-      const row = rows[rIdx];
-      const rowId = extractRowId(row);
-      const tr = document.createElement('tr');
-      tr.classList.add('tf-table__tr');
-      tr.setAttribute('data-row-id', rowId);
-      if (selectedSet.has(rowId)) tr.classList.add('tf-table__tr--selected');
-
-      // Selection checkbox cell.
-      if (selectMode !== 'none') {
-        const td = document.createElement('td');
-        td.classList.add('tf-table__td-select');
-        const cb = document.createElement('input');
-        cb.setAttribute('type', selectMode === 'single' ? 'radio' : 'checkbox');
-        if (selectMode === 'single') cb.setAttribute('name', `tf-table-sel-${component.id}`);
-        cb.setAttribute('aria-label', 'Select row');
-        cb.checked = selectedSet.has(rowId);
-        const onSelect = (e) => {
-          e.stopPropagation();
-          let next;
-          if (selectMode === 'single') {
-            next = cb.checked ? rowId : null;
-          } else {
-            const cur = Array.from(selectedSet);
-            next = cb.checked ? [...cur.filter((i) => i !== rowId), rowId] : cur.filter((i) => i !== rowId);
-          }
-          wrapper.dispatchEvent(
-            new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
-              bubbles: false,
-              detail: { selected_ids: next, mode: selectMode, changed_row_id: rowId },
-            })
-          );
-        };
-        cb.addEventListener('change', onSelect);
-        rebuildCleanups.push(() => cb.removeEventListener('change', onSelect));
-        td.appendChild(cb);
-        tr.appendChild(td);
-      }
-
-      // Column cells.
-      for (let cIdx = 0; cIdx < columns.length; cIdx++) {
-        const col = columns[cIdx];
-        if (col.hidden_by_default) continue;
-        const td = document.createElement('td');
-        td.classList.add('tf-table__td');
-        if (col.align) td.classList.add(`tf-table__td--align-${col.align}`);
-        if (col.sticky_left || cIdx < stickyColumns) td.classList.add('tf-table__td--sticky-left');
-        td.setAttribute('data-column-id', col.id);
-        const raw = readRowField(row, col.field_path);
-        td.textContent = formatCellValue(raw, col.render, col.format, ctx.locale);
-        tr.appendChild(td);
-      }
-
-      // Row actions cell.
-      if (rowActions.length > 0) {
-        const td = document.createElement('td');
-        td.classList.add('tf-table__td-actions');
-        for (const action of rowActions) {
-          // Każda akcja jest re-render'owana per row — host'owy event
-          // dispatcher dostaje original Component handlers + addona moze
-          // odróżnić target row przez data-row-id na <tr>.
-          const btn = ctx.renderChild(action);
-          btn.classList.add('tf-table__row-action');
-          btn.setAttribute('data-row-id', rowId);
-          td.appendChild(btn);
-        }
-        tr.appendChild(td);
-      }
-
-      // Row click/dblclick events.
-      const onRowClick = (e) => {
-        if (e.target.closest('.tf-table__td-select') || e.target.closest('.tf-table__td-actions')) return;
-        wrapper.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('row_click', {
-            bubbles: false,
-            detail: { row_id: rowId },
-          })
-        );
-      };
-      const onRowDblClick = (e) => {
-        if (e.target.closest('.tf-table__td-select') || e.target.closest('.tf-table__td-actions')) return;
-        wrapper.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('row_double_click', {
-            bubbles: false,
-            detail: { row_id: rowId },
-          })
-        );
-      };
-      tr.addEventListener('click', onRowClick);
-      tr.addEventListener('dblclick', onRowDblClick);
-      rebuildCleanups.push(() => {
-        tr.removeEventListener('click', onRowClick);
-        tr.removeEventListener('dblclick', onRowDblClick);
-      });
-
-      tbody.appendChild(tr);
-    }
-
     if (bulkToolbar) {
       bulkToolbar.hidden = selectedSet.size === 0;
     }
@@ -780,6 +595,52 @@ function renderTable(component, ctx) {
     }
   };
 
+  // Bridge tf-table events to SDK event protocol
+  const onSort = (e) => {
+    const { key, dir } = e.detail || {};
+    if (!key) return;
+    const sortPayload = { column_id: key, direction: dir === 'desc' ? 'desc' : 'asc' };
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('sort_change', {
+        bubbles: false,
+        detail: { sort: sortPayload },
+      })
+    );
+  };
+  tfTable.addEventListener('sort', onSort);
+  ctx.registerCleanup(() => tfTable.removeEventListener('sort', onSort));
+
+  const onRowClick = (e) => {
+    const { row, index } = e.detail || {};
+    if (!row) return;
+    const rowId = row[rowKeyField] || `row-${index}`;
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('row_click', {
+        bubbles: false,
+        detail: { row_id: rowId },
+      })
+    );
+    // Handle selection for SDK protocol
+    if (selectMode !== 'none' && e.detail?.selected !== undefined) {
+      const selIds = selectMode === 'single'
+        ? (e.detail.selected ? rowId : null)
+        : (() => {
+          const cur = Array.from(getSelectedSet());
+          return e.detail.selected
+            ? [...cur.filter((i) => i !== rowId), rowId]
+            : cur.filter((i) => i !== rowId);
+        })();
+      wrapper.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
+          bubbles: false,
+          detail: { selected_ids: selIds, mode: selectMode, changed_row_id: rowId },
+        })
+      );
+    }
+  };
+  tfTable.addEventListener('row-click', onRowClick);
+  ctx.registerCleanup(() => tfTable.removeEventListener('row-click', onRowClick));
+
   rebuild();
   ctx.registerCleanup(ctx.store.subscribe(rowsPath, rebuild));
   if (selectedIdsBind != null) {
@@ -789,43 +650,7 @@ function renderTable(component, ctx) {
     ctx.registerCleanup(ctx.store.subscribe(pagination.current_page_path, rebuild));
   }
 
-  // Update select-all checkbox state based na selectedSet. Niezależnie
-  // od bulkToolbar — checkbox jest renderowany dla każdego selectMode=multi
-  // (header), więc musi sync ze stanem zawsze.
-  if (selectMode === 'multi') {
-    const updateSelectAll = () => {
-      const cb = headerRow.querySelector('.tf-table__select-all');
-      if (!cb) return;
-      const rows = readVisibleRows();
-      if (rows.length === 0) {
-        cb.checked = false;
-        cb.indeterminate = false;
-        return;
-      }
-      const selectedSet = getSelectedSet();
-      const ids = rows.map((r) => extractRowId(r));
-      const selCount = ids.filter((i) => selectedSet.has(i)).length;
-      cb.checked = selCount === ids.length;
-      cb.indeterminate = selCount > 0 && selCount < ids.length;
-    };
-    updateSelectAll();
-    if (selectedIdsBind != null) {
-      ctx.registerCleanup(subscribeBindRef(selectedIdsBind, ctx.store, updateSelectAll));
-    }
-    ctx.registerCleanup(ctx.store.subscribe(rowsPath, updateSelectAll));
-  }
-
   return wrapper;
-}
-
-function applyColumnWidth(el, width) {
-  switch (width.kind) {
-    case 'auto': el.style.width = 'auto'; break;
-    case 'min_content': el.style.width = 'min-content'; break;
-    case 'max_content': el.style.width = 'max-content'; break;
-    case 'px': el.style.width = `${width.value}px`; break;
-    case 'fr': el.style.width = `${width.value}fr`; break;
-  }
 }
 
 // =============================================================================
