@@ -1,16 +1,13 @@
 // =============================================================================
 // File: sdk-runtime/data-list-renderer.js
-// Description: Renderer for Data Display List (0x0212) — chunk 3.3d-5.
-//
-// Items come from `items_path` (StatePath -> Array). Each item should have
-// at least `id` (string). `item_template_id` is a host-side templating
-// identifier exposed via `data-template-id` on each <li>.
+// Description: Renderer for Data Display List (0x0212) — uses <tf-list> web
+// component. Items come from `items_path` (StatePath -> Array). Each item
+// should have at least `id` (string). Click handler emits `item_click` with
+// `{ item_id, item_index, action_id? }`.
 //
 // Empty state: when items.length === 0, renders optional `empty_state`
 // ComponentRef<EmptyState> (tag 0x0003) via ctx.renderChild.
 // max_visible: truncates visible items + "show more" indicator with count.
-//
-// Handler per spec: `item_click` with `{ item_id, item_index, action_id? }`.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs List.
 // =============================================================================
@@ -22,7 +19,6 @@ import {
 
 const DENSITIES = new Set(['compact', 'default', 'comfortable']);
 const EMPTY_STATE_TAG = 0x0003;
-// item_template_id grammar: [a-z0-9_-]+ length 1..=64 (mirror inne id grammars).
 const TEMPLATE_ID_RE = /^[a-z0-9_-]{1,64}$/;
 
 function requireEnum(v, set, ctx) {
@@ -61,7 +57,6 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
   }
 }
 
-/// Walidacja Component shape dla empty_state (ComponentRef<EmptyState>).
 function assertEmptyStateRef(c, ctx) {
   if (!c || typeof c !== 'object' || Array.isArray(c)) {
     throw new TypeError(`${ctx}: Component must be object`);
@@ -77,26 +72,29 @@ function assertEmptyStateRef(c, ctx) {
   }
 }
 
-/// Tworzy fallback text z item shape — używane gdy host nie zarejestrował
-/// template dla `item_template_id`. Preferencja: item.label > item.title >
-/// item.id > JSON.stringify(item).
-function fallbackItemText(item) {
-  if (item == null) return '';
-  if (typeof item === 'string') return item;
-  if (typeof item !== 'object') return String(item);
-  if (typeof item.label === 'string') return item.label;
-  if (typeof item.title === 'string') return item.title;
-  if (typeof item.id === 'string') return item.id;
-  try { return JSON.stringify(item); } catch { return ''; }
-}
-
 function extractItemId(item, index) {
   if (item != null && typeof item === 'object' && typeof item.id === 'string') return item.id;
   return `item-${index}`;
 }
 
+/// Transform SDK item data to tf-list item format
+function itemToTfListItem(item, index) {
+  if (item == null) return { id: `item-${index}`, title: '' };
+  if (typeof item === 'string') return { id: `item-${index}`, title: item };
+  if (typeof item !== 'object') return { id: `item-${index}`, title: String(item) };
+  return {
+    id: typeof item.id === 'string' ? item.id : `item-${index}`,
+    title: item.label || item.title || item.id || '',
+    sub: item.sub || item.subtitle || item.description || '',
+    icon: item.icon || undefined,
+    severity: item.severity || item.tone || undefined,
+    chip: item.chip || undefined,
+    chipTone: item.chipTone || item.chip_tone || undefined,
+  };
+}
+
 // =============================================================================
-// List (0x0212)
+// List (0x0212) — uses <tf-list> web component
 // =============================================================================
 
 export const LIST_TAG = 0x0212;
@@ -121,19 +119,17 @@ function renderList(component, ctx) {
     throw new TypeError('List.max_visible must be > 0 if set');
   }
 
+  // Wrapper div for additional SDK features (empty state, attributes)
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-list');
-  wrapper.classList.add(`tf-list--density-${density}`);
-  if (divider) wrapper.classList.add('tf-list--divider');
-  if (virtualize) wrapper.classList.add('tf-list--virtualize');
+  wrapper.classList.add('tf-list-wrapper');
   wrapper.setAttribute('data-template-id', itemTemplateId);
 
-  const listEl = document.createElement('ul');
-  listEl.classList.add('tf-list__items');
-  listEl.setAttribute('role', 'list');
-  wrapper.appendChild(listEl);
+  // Create <tf-list> web component
+  const tfList = document.createElement('tf-list');
+  if (density === 'compact') tfList.setAttribute('compact', '');
+  wrapper.appendChild(tfList);
 
-  // Empty state slot — renderowany conditionally (hidden gdy są items).
+  // Empty state slot
   let emptyStateEl = null;
   if (emptyStateRaw != null) {
     emptyStateEl = ctx.renderChild(emptyStateRaw);
@@ -142,81 +138,40 @@ function renderList(component, ctx) {
     wrapper.appendChild(emptyStateEl);
   }
 
-  // Per-rebuild cleanup (per-item click listeners). Pełny rebuild przy
-  // każdym store update items_path; stare listenery muszą zniknąć przed
-  // nowym renderem żeby uniknąć DOM/listener leak.
-  let rebuildCleanups = [];
-  const runRebuildCleanups = () => {
-    for (const fn of rebuildCleanups) { try { fn(); } catch {} }
-    rebuildCleanups = [];
-  };
-  ctx.registerCleanup(runRebuildCleanups);
-
   const rebuild = () => {
-    runRebuildCleanups();
-    listEl.replaceChildren();
     let items;
     try { items = ctx.store.read(itemsPath); } catch { items = undefined; }
     if (!Array.isArray(items) || items.length === 0) {
+      tfList.items = [];
       if (emptyStateEl) emptyStateEl.hidden = false;
-      listEl.hidden = true;
       return;
     }
     if (emptyStateEl) emptyStateEl.hidden = true;
-    listEl.hidden = false;
 
     const total = items.length;
     const visibleCount = maxVisible == null ? total : Math.min(total, maxVisible);
-    for (let i = 0; i < visibleCount; i++) {
-      const item = items[i];
-      const itemId = extractItemId(item, i);
-      const li = document.createElement('li');
-      li.classList.add('tf-list__item');
-      li.setAttribute('data-item-id', itemId);
-      li.setAttribute('data-item-index', String(i));
-      li.setAttribute('role', 'listitem');
-      li.setAttribute('tabindex', '0');
-      // Fallback content — host (chunk 3.5 slot manager) podmieni przez
-      // template `item_template_id`. textContent jest XSS-safe.
-      const content = document.createElement('span');
-      content.classList.add('tf-list__item-content');
-      content.textContent = fallbackItemText(item);
-      li.appendChild(content);
+    const visibleItems = items.slice(0, visibleCount);
 
-      const onClick = (e) => {
-        e.preventDefault();
-        wrapper.dispatchEvent(
-          new (globalThis.CustomEvent || globalThis.Event)('item_click', {
-            bubbles: false,
-            detail: { item_id: itemId, item_index: i, template_id: itemTemplateId },
-          })
-        );
-      };
-      const onKey = (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onClick(e);
-        }
-      };
-      li.addEventListener('click', onClick);
-      li.addEventListener('keydown', onKey);
-      rebuildCleanups.push(() => {
-        li.removeEventListener('click', onClick);
-        li.removeEventListener('keydown', onKey);
-      });
-      listEl.appendChild(li);
-    }
-    // "Show more" indicator gdy max_visible truncated.
-    if (maxVisible != null && total > maxVisible) {
-      const more = document.createElement('li');
-      more.classList.add('tf-list__more');
-      more.setAttribute('role', 'presentation');
-      more.textContent = `+${total - maxVisible} more`;
-      listEl.appendChild(more);
-    }
+    // Transform items to tf-list format
+    tfList.items = visibleItems.map((item, i) => itemToTfListItem(item, i));
   };
   rebuild();
   ctx.registerCleanup(ctx.store.subscribe(itemsPath, rebuild));
+
+  // Bridge tf-list 'item-click' event to SDK 'item_click' event
+  const onItemClick = (e) => {
+    const { item, index } = e.detail || {};
+    if (!item) return;
+    const itemId = item.id || `item-${index}`;
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('item_click', {
+        bubbles: false,
+        detail: { item_id: itemId, item_index: index, template_id: itemTemplateId },
+      })
+    );
+  };
+  tfList.addEventListener('item-click', onItemClick);
+  ctx.registerCleanup(() => tfList.removeEventListener('item-click', onItemClick));
 
   return wrapper;
 }

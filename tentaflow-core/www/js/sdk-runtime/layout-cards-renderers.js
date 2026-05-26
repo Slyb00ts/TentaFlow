@@ -2,7 +2,7 @@
 // Plik: sdk-runtime/layout-cards-renderers.js
 // Opis: Rendererzy 4 cards Layout (Faza 6 Krok 3.3a-3):
 //   - Card        (tag 0x0106) — generic container z padding/radius/shadow
-//   - SectionCard (tag 0x0107) — Card z built-in title/subtitle/header_actions
+//   - SectionCard (tag 0x0107) — tf-section-card web component z title/icon
 //   - Collapsible (tag 0x010D) — expandable section, handler "open"/"close"
 //   - Accordion   (tag 0x010E) — multi-Collapsible z mutex mode
 // Spec ref: `tentaflow-sdk-spec/src/protocol/ui/layout/cards.rs`.
@@ -103,7 +103,7 @@ function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
 }
 
 /// BorderToken z `inline.rs` — tagged union `none/hairline/thin/strong/accent{tone}`.
-/// Walidacja per-variant + zwrócenie CSS class fragment.
+/// Walidacja per-variant + zwrocenie CSS class fragment.
 function borderTokenToClass(border, ctx) {
   if (!border || typeof border !== 'object') {
     throw new TypeError(`${ctx}: BorderToken must be object`);
@@ -131,8 +131,8 @@ function borderTokenToClass(border, ctx) {
   }
 }
 
-/// Zastosuj wszystkie wspólne klasy Card-style do `el`. Używane przez
-/// Card i SectionCard (oba mają ten sam set tokenów).
+/// Zastosuj wszystkie wspolne klasy Card-style do `el`. Uzywane przez Card
+/// (raw div — tf-card nie istnieje jako web component).
 function applyCardClasses(el, opts, ctxLabel) {
   el.classList.add(`tf-card--variant-${opts.variant}`);
   el.classList.add(`tf-card--padding-${opts.padding}`);
@@ -160,8 +160,6 @@ function renderCard(component, ctx) {
     CARD_VARIANTS,
     'Card.variant'
   );
-  // §3 0x0106 defaults: padding="lg", gap="md", radius="lg",
-  // shadow=Elevated→subtle/inne→none.
   const padding = optionalEnum(
     ctx.readField(component.fields, 1),
     SPACINGS,
@@ -221,8 +219,7 @@ function renderCard(component, ctx) {
     el.setAttribute('role', 'button');
     el.setAttribute('tabindex', '0');
     // A11y: na div'ie z role=button klawiatura NIE generuje natywnego
-    // click'a — Enter/Space muszą explicite go syntetyzować, inaczej
-    // user klawiaturowy widzi focusable element bez aktywacji.
+    // click'a — Enter/Space musza explicite go syntetyzowac.
     const onKey = (e) => {
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
@@ -239,14 +236,10 @@ function renderCard(component, ctx) {
 }
 
 // =============================================================================
-// SectionCard (0x0107)
+// SectionCard (0x0107) — uses <tf-section-card> web component
 // =============================================================================
 
 export const SECTION_CARD_TAG = 0x0107;
-/// Spec §6 0x0401 Button. Walidujemy tag w SectionCard.header_actions
-/// bez importu renderer'a Button — constraint jest egzekwowany na
-/// poziomie tag-u, niezależnie od tego, czy renderer Button-a jest
-/// załadowany (chunk 3.3b-1 dodał realny renderer).
 const BUTTON_TAG = 0x0401;
 const SECTION_CARD_FIELD_KEYS = new Set([
   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
@@ -258,7 +251,7 @@ function renderSectionCard(component, ctx) {
   if (titleBind == null) {
     throw new TypeError('SectionCard.title is required (BindRef)');
   }
-  const subtitleBind = ctx.readField(component.fields, 1); // Option<BindRef>
+  const subtitleBind = ctx.readField(component.fields, 1);
   const headerActionsRaw = ctx.readField(component.fields, 2);
   const headerActions =
     headerActionsRaw === undefined
@@ -323,37 +316,39 @@ function renderSectionCard(component, ctx) {
     'SectionCard.accent'
   );
 
-  const el = document.createElement('div');
+  // Use <tf-section-card> web component
+  const el = document.createElement('tf-section-card');
+
+  // Card-level styling via CSS classes on the host element
   el.classList.add('tf-card');
-  el.classList.add('tf-section-card');
   applyCardClasses(el, {
     variant, padding, gap, radius, shadow, background, accent, borderClasses,
   });
 
-  // Header (title + subtitle + actions + optional divider).
-  const header = document.createElement('div');
-  header.classList.add('tf-section-card__header');
-  const titles = document.createElement('div');
-  titles.classList.add('tf-section-card__titles');
-  const titleEl = document.createElement('h3');
-  titleEl.classList.add('tf-section-card__title');
-  titles.appendChild(titleEl);
-  bindTextContent(titleEl, titleBind, ctx);
+  // Reactive title attribute binding
+  const applyTitle = () => {
+    const v = resolveBindRef(titleBind, ctx.store);
+    el.setAttribute('title', v == null ? '' : String(v));
+  };
+  applyTitle();
+  const offTitle = subscribeBindRef(titleBind, ctx.store, applyTitle);
+  ctx.registerCleanup(offTitle);
+
+  // Reactive subtitle via icon attribute slot (tf-section-card shows icon in
+  // header; subtitle is rendered as extra child if present)
   if (subtitleBind != null) {
     const subEl = document.createElement('div');
     subEl.classList.add('tf-section-card__subtitle');
-    titles.appendChild(subEl);
+    subEl.slot = 'subtitle';
     bindTextContent(subEl, subtitleBind, ctx);
+    el.appendChild(subEl);
   }
-  header.appendChild(titles);
 
+  // Header actions — validated as Button components, rendered into header area
   if (headerActions.length > 0) {
     const actions = document.createElement('div');
     actions.classList.add('tf-section-card__actions');
     for (const action of headerActions) {
-      // Spec §3 0x0107: header_actions to `Vec<ComponentRef<Button>>` —
-      // tylko komponenty z tag-em 0x0401 (Button) są dozwolone. Mirror
-      // Rust `ensure_ref_tag_encode/decode(Button::TAG)`.
       if (!action || typeof action !== 'object' || action.tag !== BUTTON_TAG) {
         throw new TypeError(
           `SectionCard.header_actions entry must be Button (tag 0x0401), got 0x${
@@ -363,24 +358,21 @@ function renderSectionCard(component, ctx) {
       }
       actions.appendChild(ctx.renderChild(action));
     }
-    header.appendChild(actions);
+    el.appendChild(actions);
   }
-  el.appendChild(header);
+
   if (headerDivider) {
     const divider = document.createElement('div');
     divider.classList.add('tf-section-card__header-divider');
     el.appendChild(divider);
   }
 
-  // Body.
-  const bodyEl = document.createElement('div');
-  bodyEl.classList.add('tf-section-card__body');
+  // Body children go into default slot
   for (const childComponent of body) {
-    bodyEl.appendChild(ctx.renderChild(childComponent));
+    el.appendChild(ctx.renderChild(childComponent));
   }
-  el.appendChild(bodyEl);
 
-  // Footer (opcjonalne).
+  // Footer (optional)
   if (footer && footer.length > 0) {
     const footerEl = document.createElement('div');
     footerEl.classList.add('tf-section-card__footer');
@@ -453,11 +445,6 @@ function renderCollapsible(component, ctx) {
   const offExpanded = subscribeBindRef(expandedBind, ctx.store, applyExpanded);
   ctx.registerCleanup(offExpanded);
 
-  // Toggle przez klik / Enter / Space na headerze emituje custom event
-  // `open` lub `close` zgodnie z aktualnym stanem expanded. Addon
-  // (przez component.handlers) decyduje czy zaktualizować store.
-  // Engine attachuje listenery dla EventKind 'open'/'close' do wrapper'a;
-  // my emitujemy CustomEvent na wrapper.
   const toggle = () => {
     const currentlyExpanded = resolveBindRef(expandedBind, ctx.store) === true;
     const eventName = currentlyExpanded ? 'close' : 'open';
@@ -486,7 +473,6 @@ function renderCollapsible(component, ctx) {
 
 export const ACCORDION_TAG = 0x010E;
 const ACCORDION_FIELD_KEYS = new Set([0, 1, 2]);
-// AccordionItem: 0=id, 1=header(Component), 2=body(Vec<Component>), 3=default_expanded(bool)
 const ACCORDION_ITEM_KEYS = new Set([0, 1, 2, 3]);
 
 function renderAccordion(component, ctx) {
@@ -509,10 +495,7 @@ function renderAccordion(component, ctx) {
   wrapper.classList.add(`tf-accordion--mode-${mode}`);
   wrapper.setAttribute('role', 'region');
 
-  // Renderujemy każdy item jako sekcję, sub-elementy zachowują nazwy
-  // tf-accordion__item / __header / __body.
   const itemEls = [];
-  // AccordionItem: 0=id, 1=header(Component), 2=body(Vec<Component>), 3=default_expanded(bool)
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (!Array.isArray(item)) {
@@ -580,11 +563,6 @@ function renderAccordion(component, ctx) {
     });
   }
 
-  // Wstępny zbiór expanded ID-ów dla initial render, zanim BindRef
-  // dostarczy realny stan: spec §3 0x010E pozwala każdemu `AccordionItem`
-  // mieć `default_expanded=true`. Jeśli expanded_ids resolve daje
-  // wartość, używamy jej; jeśli daje null/undefined/non-array, fallback
-  // do per-item `default_expanded` flag'ów.
   const defaultExpandedIds = itemEls
     .filter((info) => info.defaultExpanded)
     .map((info) => info.itemId);
@@ -595,14 +573,9 @@ function renderAccordion(component, ctx) {
     if (Array.isArray(raw)) {
       ids = raw.filter((s) => typeof s === 'string');
     } else {
-      // Brak/wadliwy stan w store → użyj default_expanded.
       ids = defaultExpandedIds.slice();
     }
-    // Spec §3 0x010E mode=single: max 1 expanded. Renderer przycina do
-    // pierwszego ID — zapobiega nieprawidłowemu state'owi dopóki addon
-    // nie zaktualizuje store'a.
     if (mode === 'single' && ids.length > 1) {
-      // eslint-disable-next-line no-console
       console.warn(
         `[accordion] mode='single' but expanded_ids has ${ids.length} entries — using first`
       );

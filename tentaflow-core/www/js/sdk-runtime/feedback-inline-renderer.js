@@ -4,9 +4,10 @@
 // Banner (0x0502), Callout (0x0503), Toast (0x0504), Hint (0x0505),
 // OfflineBanner (0x050F) — chunk 3.3e-1.
 //
-// All components use tone-based BEM modifiers, reactive BindRef fields,
-// optional IconRef, and (where applicable) recursive child rendering via
-// ctx.renderChild(). Dismissible components dispatch a 'dismiss' CustomEvent.
+// Alert uses <tf-alert> web component. Other components use tone-based BEM
+// modifiers, reactive BindRef fields, optional IconRef, and (where applicable)
+// recursive child rendering via ctx.renderChild(). Dismissible components
+// dispatch a 'dismiss' CustomEvent.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/feedback/inline.rs.
 // =============================================================================
@@ -24,8 +25,19 @@ import {
 import { renderIcon } from './icon-renderer.js';
 import { BUTTON_TAG } from './action-button-renderer.js';
 
+// Map SDK tones to tf-alert tone attribute values
+const TONE_TO_ALERT = {
+  'neutral': 'info',
+  'primary': 'info',
+  'success': 'success',
+  'warning': 'warning',
+  'critical': 'danger',
+  'info': 'info',
+  'muted': 'info',
+};
+
 // =============================================================================
-// Alert (0x0501)
+// Alert (0x0501) — uses <tf-alert> web component
 // =============================================================================
 
 export const ALERT_TAG = 0x0501;
@@ -46,41 +58,46 @@ function renderAlert(component, ctx) {
   const actionsRaw = ctx.readField(component.fields, 5);
   const dismissible = requireBool(ctx.readField(component.fields, 6), 'Alert.dismissible');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-alert', `tf-alert--tone-${tone}`, `tf-alert--variant-${variant}`);
-  wrapper.setAttribute('role', 'alert');
+  // Create <tf-alert> web component
+  const el = document.createElement('tf-alert');
+  el.setAttribute('tone', TONE_TO_ALERT[tone] || 'info');
+  if (dismissible) el.setAttribute('dismissable', '');
 
-  if (iconRaw != null) {
-    const iconEl = renderIcon(iconRaw, 'Alert.icon');
-    iconEl.classList.add('tf-alert__icon');
-    wrapper.appendChild(iconEl);
-  }
+  // Apply variant CSS class
+  el.classList.add(`tf-alert--variant-${variant}`);
 
-  const body = document.createElement('div');
-  body.classList.add('tf-alert__body');
-
+  // Reactive title attribute
   if (titleBind != null) {
-    const titleEl = document.createElement('div');
-    titleEl.classList.add('tf-alert__title');
     const applyTitle = () => {
       const v = resolveBindRef(titleBind, ctx.store);
-      titleEl.textContent = v == null ? '' : String(v);
+      if (v != null) el.setAttribute('title', String(v));
+      else el.removeAttribute('title');
     };
     applyTitle();
     ctx.registerCleanup(subscribeBindRef(titleBind, ctx.store, applyTitle));
-    body.appendChild(titleEl);
   }
 
-  const messageEl = document.createElement('div');
-  messageEl.classList.add('tf-alert__message');
+  // Reactive message attribute
   const applyMessage = () => {
     const v = resolveBindRef(messageBind, ctx.store);
-    messageEl.textContent = v == null ? '' : String(v);
+    el.setAttribute('message', v == null ? '' : String(v));
   };
   applyMessage();
   ctx.registerCleanup(subscribeBindRef(messageBind, ctx.store, applyMessage));
-  body.appendChild(messageEl);
 
+  // tf-alert handles dismiss internally (removes itself from DOM and emits
+  // 'dismiss' event). Bridge to SDK event protocol.
+  if (dismissible) {
+    const onDismiss = () => {
+      el.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('dismiss', {
+        bubbles: false,
+      }));
+    };
+    el.addEventListener('dismiss', onDismiss);
+    ctx.registerCleanup(() => el.removeEventListener('dismiss', onDismiss));
+  }
+
+  // Actions are rendered as children after the component builds
   if (actionsRaw != null) {
     if (!Array.isArray(actionsRaw)) throw new TypeError('Alert.actions must be array');
     const actionsEl = document.createElement('div');
@@ -89,28 +106,10 @@ function renderAlert(component, ctx) {
       if (!actionComp || actionComp.tag !== BUTTON_TAG) throw new TypeError(`Alert.actions: children must be Button (0x${BUTTON_TAG.toString(16)})`);
       actionsEl.appendChild(ctx.renderChild(actionComp));
     }
-    body.appendChild(actionsEl);
+    el.appendChild(actionsEl);
   }
 
-  wrapper.appendChild(body);
-
-  if (dismissible) {
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.classList.add('tf-alert__close');
-    closeBtn.setAttribute('aria-label', 'Dismiss');
-    closeBtn.textContent = '×';
-    const onDismiss = () => {
-      wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('dismiss', {
-        bubbles: false,
-      }));
-    };
-    closeBtn.addEventListener('click', onDismiss);
-    ctx.registerCleanup(() => closeBtn.removeEventListener('click', onDismiss));
-    wrapper.appendChild(closeBtn);
-  }
-
-  return wrapper;
+  return el;
 }
 
 // =============================================================================

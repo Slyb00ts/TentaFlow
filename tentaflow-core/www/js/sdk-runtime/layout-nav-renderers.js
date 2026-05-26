@@ -1,14 +1,12 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-nav-renderers.js
 // Opis: Renderer NavTabs (tag 0x010C) z Layout nav (Faza 6 Krok 3.3a-4).
-// Pozostałe nav primitives (Sidebar 0x010A, Tabs 0x010B, Breadcrumb 0x0110,
-// Pagination 0x0111) lecą w kolejnych sub-chunkach — Sidebar/Tabs wymagają
-// slot manager z chunka 3.5, Breadcrumb/Pagination dochodzą w 3.3a-5/6.
+// Uses <tf-tabs> + <tf-tab> web components for tab rendering with FLIP
+// indicator, horizontal overflow, and chevron scroll.
 //
 // NavTabs: page-level routing tabs. Items: NavTab { id, label, icon?,
-// badge?, panel_id?, locked }. Active item podświetlony przez `active_id`
-// BindRef. `scroll_overflow=true` włącza horizontal scroll dla overflow.
-// Handler `select` emitowany przy kliknięciu na tab.
+// badge?, panel_id?, locked }. Active item via `active_id` BindRef.
+// Handler `select` emitted on tab click.
 // Spec ref: `tentaflow-sdk-spec/src/protocol/ui/layout/nav.rs`.
 // =============================================================================
 
@@ -23,9 +21,12 @@ import {
 
 const NAV_TABS_VARIANTS = new Set(['default', 'underlined', 'pills']);
 
-const NAV_TAB_KEYS = new Set([
-  'id', 'label', 'icon', 'badge', 'panel_id', 'locked',
-]);
+// Map SDK variant names to tf-tabs variant names
+const VARIANT_MAP = {
+  'default': 'solid',
+  'underlined': 'underline',
+  'pills': 'soft',
+};
 
 function requireEnum(value, set, ctx) {
   if (typeof value !== 'string' || !set.has(value)) {
@@ -67,16 +68,8 @@ function assertOnlyKnownFields(fields, allowedKeys, componentName) {
   }
 }
 
-function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
-  for (const k of Object.keys(obj)) {
-    if (!allowedKeys.has(k)) {
-      throw new TypeError(`${ctx}: unexpected key '${k}'`);
-    }
-  }
-}
-
 // =============================================================================
-// NavTabs (0x010C)
+// NavTabs (0x010C) — uses <tf-tabs> + <tf-tab> web components
 // =============================================================================
 
 export const NAV_TABS_TAG = 0x010C;
@@ -100,19 +93,15 @@ function renderNavTabs(component, ctx) {
   if (scrollOverflowRaw === undefined) {
     throw new TypeError('NavTabs.scroll_overflow is required');
   }
-  const scrollOverflow = requireBool(scrollOverflowRaw, 'NavTabs.scroll_overflow');
+  requireBool(scrollOverflowRaw, 'NavTabs.scroll_overflow');
 
-  const wrapper = document.createElement('nav');
-  wrapper.classList.add('tf-nav-tabs');
-  wrapper.classList.add(`tf-nav-tabs--variant-${variant}`);
-  if (scrollOverflow) wrapper.classList.add('tf-nav-tabs--scroll');
-  wrapper.setAttribute('role', 'tablist');
+  // Create <tf-tabs> web component
+  const tfTabs = document.createElement('tf-tabs');
+  tfTabs.setAttribute('variant', VARIANT_MAP[variant] || 'solid');
 
-  // Mapowanie itemów. Każdy tab to <button role="tab"> z id, aria-selected
-  // sterowanym reaktywnie przez `active_id` BindRef.
-  const tabEls = [];
+  // Parse and validate items, then create <tf-tab> children
+  const tabIds = [];
   const seenIds = new Set();
-  // NavTab inline struct: 0=id, 1=label(BindRef), 2=icon, 3=badge, 4=panel_id, 5=locked
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const itemId = requireString(ctx.readField(item, 0), `NavTabs.items[${i}].id`);
@@ -135,101 +124,79 @@ function renderNavTabs(component, ctx) {
     const itemBadge = ctx.readField(item, 3) ?? null;
     const panelId = ctx.readField(item, 4) ?? null;
 
-    const btn = document.createElement('button');
-    btn.classList.add('tf-nav-tabs__tab');
-    btn.setAttribute('role', 'tab');
-    btn.setAttribute('type', 'button');
-    btn.setAttribute('data-nav-tab-id', itemId);
-    if (panelId != null) {
-      btn.setAttribute('data-nav-panel-id', panelId);
-    }
-    if (locked) {
-      btn.setAttribute('disabled', '');
-      btn.classList.add('tf-nav-tabs__tab--locked');
-    }
+    // Create <tf-tab> web component
+    const tfTab = document.createElement('tf-tab');
+    tfTab.id = itemId;
 
-    // Icon (optional, before label). IconRef: 0=kind, 1=name
+    // Icon attribute
     if (itemIcon) {
       const iconName = typeof itemIcon === 'string' ? itemIcon
         : ctx.readField(itemIcon, 1) || '';
       if (iconName) {
-        const iconEl = document.createElement('span');
-        iconEl.classList.add('tf-nav-tabs__icon');
-        iconEl.innerHTML = `<svg class="tf-icon" width="16" height="16"><use href="/icons.svg#${iconName}"></use></svg>`;
-        btn.appendChild(iconEl);
+        tfTab.setAttribute('icon', iconName);
       }
     }
 
-    // Label binding — reactive text.
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-nav-tabs__label');
+    // Badge/count attribute
+    if (itemBadge != null) {
+      tfTab.setAttribute('count', String(itemBadge));
+    }
+
+    // Locked = disabled
+    if (locked) {
+      tfTab.setAttribute('disabled', '');
+    }
+
+    if (panelId != null) {
+      tfTab.setAttribute('data-nav-panel-id', panelId);
+    }
+
+    // Reactive label — tf-tab uses textContent (innerHTML) as label source
     const applyLabel = () => {
       const v = resolveBindRef(labelBind, ctx.store);
-      labelEl.textContent = v == null ? '' : String(v);
+      const text = v == null ? '' : String(v);
+      // tf-tab stores original label in _btn._label and uses it in _update()
+      if (tfTab._btn) {
+        tfTab._btn._label = text;
+        tfTab._update();
+      } else {
+        tfTab.textContent = text;
+      }
     };
     applyLabel();
     const offLabel = subscribeBindRef(labelBind, ctx.store, applyLabel);
     ctx.registerCleanup(offLabel);
-    btn.appendChild(labelEl);
 
-    // Klik → emit CustomEvent('select') na <nav> wrapper'ze z
-    // detail.item_id. Engine attachuje listenery `select` handlers
-    // addona na wrapper'ze, więc dostają item id.
-    const onClick = (e) => {
-      if (locked) {
-        e.preventDefault();
-        return;
-      }
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('select', {
-          bubbles: false,
-          detail: { item_id: itemId },
-        })
-      );
-    };
-    btn.addEventListener('click', onClick);
-    ctx.registerCleanup(() => btn.removeEventListener('click', onClick));
-
-    wrapper.appendChild(btn);
-    tabEls.push({ itemId, btn });
+    tfTabs.appendChild(tfTab);
+    tabIds.push(itemId);
   }
 
-  // Reactive aktywny tab — single source of truth = `active_id` BindRef.
+  // Reactive active tab — set tf-tabs `value` property
   const applyActive = () => {
     const activeId = resolveBindRef(activeIdBind, ctx.store);
-    for (const { itemId, btn } of tabEls) {
-      const isActive = activeId === itemId;
-      btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
-      btn.setAttribute('tabindex', isActive ? '0' : '-1');
-      if (isActive) {
-        btn.classList.add('tf-nav-tabs__tab--active');
-      } else {
-        btn.classList.remove('tf-nav-tabs__tab--active');
-      }
+    if (activeId != null) {
+      tfTabs.value = String(activeId);
     }
   };
   applyActive();
   const off = subscribeBindRef(activeIdBind, ctx.store, applyActive);
   ctx.registerCleanup(off);
 
-  // Keyboard nav: Arrow Left/Right przesuwa fokus po tab-ach (WAI-ARIA tab pattern).
-  const onKeyNav = (e) => {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    const focusable = tabEls.filter(
-      ({ btn }) => !btn.hasAttribute('disabled')
+  // tf-tabs emits `change` event with detail.value — translate to SDK `select`
+  const onChange = (e) => {
+    const selectedId = e.detail?.value;
+    if (!selectedId) return;
+    tfTabs.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('select', {
+        bubbles: false,
+        detail: { item_id: selectedId },
+      })
     );
-    if (focusable.length === 0) return;
-    const idx = focusable.findIndex(({ btn }) => btn === document.activeElement);
-    if (idx < 0) return;
-    e.preventDefault();
-    const delta = e.key === 'ArrowLeft' ? -1 : 1;
-    const next = (idx + delta + focusable.length) % focusable.length;
-    focusable[next].btn.focus();
   };
-  wrapper.addEventListener('keydown', onKeyNav);
-  ctx.registerCleanup(() => wrapper.removeEventListener('keydown', onKeyNav));
+  tfTabs.addEventListener('change', onChange);
+  ctx.registerCleanup(() => tfTabs.removeEventListener('change', onChange));
 
-  return wrapper;
+  return tfTabs;
 }
 
 // =============================================================================

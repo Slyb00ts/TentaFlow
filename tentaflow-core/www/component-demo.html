@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Component Demo (live)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/controls.css">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/addon-app.css">
+<link rel="stylesheet" href="/css/sdk-theme.css">
+<link rel="stylesheet" href="/css/sdk-motion.css">
+<style>
+  html, body { overflow: visible !important; height: auto !important; }
+  body { padding: 0 !important; }
+  .demo { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 28px; font-weight: 800; background: linear-gradient(90deg, #fff, #60a5fa, #a78bfa);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 32px; }
+  .section { margin-bottom: 40px; }
+  .section-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em;
+    color: var(--accent-2); border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+  .row.col { flex-direction: column; align-items: stretch; }
+  .box { background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .label { font-size: 10px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .w400 { max-width: 400px; }
+  .w500 { max-width: 500px; }
+  tf-input, tf-textarea, tf-searchbox, tf-select, tf-slider { display: block; width: 100%; }
+  tf-checkbox, tf-radio { display: block; margin-bottom: 6px; }
+  tf-toggle { display: inline-flex; vertical-align: middle; }
+  tf-badge { display: inline-flex; vertical-align: middle; }
+  tf-avatar { display: inline-flex; vertical-align: middle; }
+  tf-spinner { display: inline-block; vertical-align: middle; }
+  tf-stage { display: inline-flex; vertical-align: middle; }
+  tf-status-pill { display: inline-flex; vertical-align: middle; }
+  tf-contrib-tag { display: inline-block; vertical-align: middle; }
+  tf-divider { display: block; margin: 8px 0; }
+  tf-breadcrumb { display: block; }
+  tf-stat-card { display: block; }
+  tf-section-card { display: block; }
+  tf-alert { display: block; }
+  tf-progress-bar { display: block; }
+  tf-alarm-card { display: block; }
+  tf-detail-header { display: block; }
+  tf-list { display: block; }
+  tf-timeline { display: block; }
+  tf-filter-chips { display: block; }
+  tf-empty-state { display: block; }
+  tf-key-value { display: block; }
+</style>
+<script type="module" src="/js/components/index.js"></script>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" id="icon-sprite"></svg>
+<script>
+fetch('/index.html').then(r => r.text()).then(html => {
+  const m = html.match(/<svg[^>]*data-role="sprite"[\s\S]*?<\/svg>/);
+  if (m) document.getElementById('icon-sprite').outerHTML = m[0];
+});
+</script>
+
+<div id="demo-scroll" style="position:fixed;inset:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:40px">
+<div class="demo">
+<h1>TentaFlow Component Demo</h1>
+
+<!-- ========== BUTTONS ========== -->
+<div class="section">
+  <div class="section-label">Buttons — tf-button</div>
+  <div class="row">
+    <tf-button variant="primary" icon="plus">Primary</tf-button>
+    <tf-button variant="secondary" icon="refresh">Secondary</tf-button>
+    <tf-button variant="ghost">Ghost</tf-button>
+    <tf-button variant="outline">Outline</tf-button>
+    <tf-button variant="danger">Danger</tf-button>
+    <tf-button variant="danger-solid">Danger Solid</tf-button>
+    <tf-button variant="success" icon="check">Success</tf-button>
+  </div>
+  <div class="label">Small + Icon-only + Disabled</div>
+  <div class="row">
+    <tf-button variant="primary" size="sm">Small</tf-button>
+    <tf-button variant="secondary" size="sm" icon="settings"></tf-button>
+    <tf-button variant="primary" disabled>Disabled</tf-button>
+  </div>
+</div>
+
+<!-- ========== CHIPS ========== -->
+<div class="section">
+  <div class="section-label">Chips — tf-chip</div>
+  <div class="row">
+    <tf-chip status="ok" dot>Online</tf-chip>
+    <tf-chip status="warn" dot>Warning</tf-chip>
+    <tf-chip status="err" dot>Error</tf-chip>
+    <tf-chip status="info">Info</tf-chip>
+    <tf-chip status="accent">Accent</tf-chip>
+    <tf-chip status="online" dot>Online</tf-chip>
+    <tf-chip status="offline">Offline</tf-chip>
+    <tf-chip status="pending" dot>Pending</tf-chip>
+    <tf-chip status="recording" dot>Recording</tf-chip>
+  </div>
+</div>
+
+<!-- ========== FORM CONTROLS ========== -->
+<div class="section">
+  <div class="section-label">Form Controls</div>
+  <div class="grid-2">
+    <div class="box">
+      <div class="label">tf-input</div>
+      <tf-input label="Camera Name" placeholder="Enter camera ID..." hint="Unique identifier"></tf-input>
+      <div style="height:12px"></div>
+      <tf-input label="With Error" value="bad value" error="This field is invalid"></tf-input>
+      <div style="height:12px"></div>
+      <tf-input label="With Icon" placeholder="Search..." icon="search"></tf-input>
+    </div>
+    <div>
+      <div class="box" style="margin-bottom:16px">
+        <div class="label">tf-textarea</div>
+        <tf-textarea label="Description" placeholder="Write a description..." hint="Max 500 chars" rows="3"></tf-textarea>
+      </div>
+      <div class="box">
+        <div class="label">tf-searchbox</div>
+        <tf-searchbox placeholder="Search cameras..."></tf-searchbox>
+      </div>
+    </div>
+  </div>
+  <div style="height:16px"></div>
+  <div style="display:grid;grid-template-columns:240px 180px 1fr;gap:16px;align-items:start">
+    <div class="box">
+      <div class="label">tf-select</div>
+      <tf-select>
+        <option value="">All cameras</option>
+        <option value="c01">C-01 brama</option>
+        <option value="c04">C-04 wjazd</option>
+        <option value="c07">C-07 peron</option>
+      </tf-select>
+    </div>
+    <div class="box">
+      <div class="label">tf-toggle</div>
+      <div style="display:flex;gap:12px;margin-top:8px">
+        <tf-toggle></tf-toggle>
+        <tf-toggle checked></tf-toggle>
+      </div>
+    </div>
+    <div class="box">
+      <div class="label">tf-slider</div>
+      <tf-slider min="0" max="100" value="68" step="1"></tf-slider>
+    </div>
+  </div>
+  <div style="height:16px"></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div class="box">
+      <div class="label">tf-checkbox</div>
+      <tf-checkbox label="Enable notifications" checked></tf-checkbox>
+      <tf-checkbox label="Auto-sync"></tf-checkbox>
+      <tf-checkbox label="Indeterminate" indeterminate></tf-checkbox>
+    </div>
+    <div class="box">
+      <div class="label">tf-radio</div>
+      <tf-radio-group name="mode" value="auto">
+        <tf-radio value="auto" label="Auto"></tf-radio>
+        <tf-radio value="manual" label="Manual"></tf-radio>
+        <tf-radio value="off" label="Off"></tf-radio>
+      </tf-radio-group>
+    </div>
+  </div>
+</div>
+
+<!-- ========== TABS ========== -->
+<div class="section">
+  <div class="section-label">Tabs — tf-tabs (3 variants)</div>
+  <div class="label">Solid</div>
+  <tf-tabs variant="solid" value="dashboard">
+    <tf-tab id="dashboard" icon="dashboard">Dashboard</tf-tab>
+    <tf-tab id="live" icon="video">Live view</tf-tab>
+    <tf-tab id="cameras" icon="cameras" count="24">Kamery</tf-tab>
+    <tf-tab id="alarms" icon="alert" count="7">Alarmy</tf-tab>
+  </tf-tabs>
+  <div style="height:16px"></div>
+  <div class="label">Underline</div>
+  <tf-tabs variant="underline" value="dashboard">
+    <tf-tab id="dashboard">Dashboard</tf-tab>
+    <tf-tab id="live">Live view</tf-tab>
+    <tf-tab id="cameras" count="24">Kamery</tf-tab>
+    <tf-tab id="alarms" count="7">Alarmy</tf-tab>
+    <tf-tab id="settings">Settings</tf-tab>
+  </tf-tabs>
+  <div style="height:16px"></div>
+  <div class="label">Soft</div>
+  <tf-tabs variant="soft" value="analytics">
+    <tf-tab id="analytics">Analytics</tf-tab>
+    <tf-tab id="reports">Reports</tf-tab>
+    <tf-tab id="config">Config</tf-tab>
+  </tf-tabs>
+</div>
+
+<!-- ========== SEGMENTED ========== -->
+<div class="section">
+  <div class="section-label">Segmented — tf-segmented</div>
+  <div class="row">
+    <tf-segmented value="24h">
+      <option value="1h">1h</option>
+      <option value="6h">6h</option>
+      <option value="24h" variant="accent">24h</option>
+      <option value="7d">7d</option>
+    </tf-segmented>
+    <tf-segmented value="allow">
+      <option value="allow" variant="ok">Allow</option>
+      <option value="auto">Auto</option>
+      <option value="deny" variant="err">Deny</option>
+    </tf-segmented>
+  </div>
+</div>
+
+<!-- ========== STAT CARDS ========== -->
+<div class="section">
+  <div class="section-label">Stat Cards — tf-stat-card</div>
+  <div class="grid-4">
+    <tf-stat-card label="Active cameras" value="22" suffix="/ 24" delta="2 offline (C-12, C-19)" delta-type="warn" icon="cameras"></tf-stat-card>
+    <tf-stat-card label="Active detectors" value="8" delta="D1 · D2 · D3 · D5 · D6" icon="brain"></tf-stat-card>
+    <tf-stat-card label="Alarms 24h" value="147" delta="▲ 23% vs yesterday · 3 critical" delta-type="up" icon="alert"></tf-stat-card>
+    <tf-stat-card label="GPU / latency p95" value="68%" suffix="· 1.2s" delta="within SLO budget" delta-type="up" icon="cpu"></tf-stat-card>
+  </div>
+  <div style="height:12px"></div>
+  <div class="row">
+    <tf-stat-card label="Uptime" value="99.7%" accent="success" style="width:200px"></tf-stat-card>
+    <tf-stat-card label="Errors" value="12" accent="danger" style="width:200px"></tf-stat-card>
+    <tf-stat-card label="Queue" value="347" accent="warning" style="width:200px"></tf-stat-card>
+  </div>
+</div>
+
+<!-- ========== SECTION CARD + KEY-VALUE ========== -->
+<div class="section">
+  <div class="section-label">Section Card + Key-Value</div>
+  <div class="grid-2">
+    <tf-section-card title="Recent alarms" icon="alert" action-text="All 147 →">
+      <tf-alarm-card severity="critical" title="D2 · suspected aggression" camera="C-04 wjazd" time="12:43:21"></tf-alarm-card>
+      <div style="height:8px"></div>
+      <tf-alarm-card severity="warning" title="D1 · unreadable ADR plate" camera="C-01 brama" time="12:38:04"></tf-alarm-card>
+      <div style="height:8px"></div>
+      <tf-alarm-card severity="info" title="D6 · vehicle in prohibited zone" camera="C-15 magazyn" time="12:22:09"></tf-alarm-card>
+    </tf-section-card>
+
+    <tf-section-card title="Native runtime status" icon="activity">
+      <tf-key-value id="kv-runtime"></tf-key-value>
+    </tf-section-card>
+  </div>
+</div>
+
+<!-- ========== TABLE ========== -->
+<div class="section">
+  <div class="section-label">Table — tf-table</div>
+  <tf-table sortable id="demo-table">
+    <tf-column key="camera" label="Camera"></tf-column>
+    <tf-column key="location" label="Location"></tf-column>
+    <tf-column key="status" label="Status" renderer="chip"></tf-column>
+    <tf-column key="fps" label="FPS" align="num" sortable></tf-column>
+    <tf-column key="detectors" label="Detectors"></tf-column>
+  </tf-table>
+</div>
+
+<!-- ========== LIST ========== -->
+<div class="section">
+  <div class="section-label">List — tf-list</div>
+  <div class="grid-2">
+    <div>
+      <div class="label">Standard list</div>
+      <tf-list selectable id="demo-list"></tf-list>
+    </div>
+    <div>
+      <div class="label">Compact / inbox</div>
+      <tf-list compact id="demo-inbox"></tf-list>
+    </div>
+  </div>
+</div>
+
+<!-- ========== TIMELINE ========== -->
+<div class="section">
+  <div class="section-label">Timeline — tf-timeline</div>
+  <div class="w500">
+    <tf-timeline id="demo-timeline"></tf-timeline>
+  </div>
+</div>
+
+<!-- ========== DETAIL HEADER ========== -->
+<div class="section">
+  <div class="section-label">Detail Header — tf-detail-header</div>
+  <tf-detail-header title="TentaVision" subtitle="Image analysis · deployment depo-warszawa-pn" icon="video" version="v0.4.2">
+    <span slot="badges">
+      <tf-chip status="accent" icon="cameras">22 / 24 cameras</tf-chip>
+      <tf-chip status="info" icon="brain">8 detectors active</tf-chip>
+      <tf-chip status="warn" icon="alert">3 critical (24h)</tf-chip>
+    </span>
+    <span slot="actions">
+      <tf-button variant="secondary" icon="refresh">Refresh</tf-button>
+      <tf-button variant="secondary" icon="download">Export</tf-button>
+      <tf-button variant="primary" icon="eye">Live view</tf-button>
+    </span>
+  </tf-detail-header>
+</div>
+
+<!-- ========== BREADCRUMB ========== -->
+<div class="section">
+  <div class="section-label">Breadcrumb — tf-breadcrumb</div>
+  <tf-breadcrumb>
+    <tf-breadcrumb-item href="#">Addons</tf-breadcrumb-item>
+    <tf-breadcrumb-item href="#">TentaVision</tf-breadcrumb-item>
+    <tf-breadcrumb-item current>Dashboard</tf-breadcrumb-item>
+  </tf-breadcrumb>
+</div>
+
+<!-- ========== ALERTS ========== -->
+<div class="section">
+  <div class="section-label">Alerts — tf-alert</div>
+  <div class="row col w500" style="gap:10px">
+    <tf-alert tone="info" title="Sync in progress" message="Ledger is synchronizing with 3 peers."></tf-alert>
+    <tf-alert tone="success" title="Camera added" message="C-22 wjazd-2 is now streaming at 30 fps." dismissable></tf-alert>
+    <tf-alert tone="warning" title="VRAM usage high" message="8.2 / 12 GB — consider unloading unused models."></tf-alert>
+    <tf-alert tone="danger" title="Connection lost" message="Camera C-12 is offline since 11:42."></tf-alert>
+  </div>
+</div>
+
+<!-- ========== PROGRESS + SPINNER ========== -->
+<div class="section">
+  <div class="section-label">Progress Bar + Spinner</div>
+  <div class="row">
+    <div class="w400">
+      <div class="label">tf-progress-bar</div>
+      <tf-progress-bar value="68" tone="accent" label="GPU Usage"></tf-progress-bar>
+      <div style="height:8px"></div>
+      <tf-progress-bar value="92" tone="danger" label="Disk"></tf-progress-bar>
+      <div style="height:8px"></div>
+      <tf-progress-bar value="45" tone="success" size="lg" label="Sync"></tf-progress-bar>
+    </div>
+    <div>
+      <div class="label">tf-spinner</div>
+      <div class="row">
+        <tf-spinner size="sm"></tf-spinner>
+        <tf-spinner></tf-spinner>
+        <tf-spinner size="lg"></tf-spinner>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== BADGES + AVATARS ========== -->
+<div class="section">
+  <div class="section-label">Badges + Avatars</div>
+  <div class="row">
+    <div class="label" style="margin:0">tf-badge:</div>
+    <tf-badge tone="accent" value="7"></tf-badge>
+    <tf-badge tone="danger" value="3"></tf-badge>
+    <tf-badge tone="success" value="OK"></tf-badge>
+    <div style="width:24px"></div>
+    <div class="label" style="margin:0">tf-avatar:</div>
+    <tf-avatar initials="PJ" size="sm" tone="accent"></tf-avatar>
+    <tf-avatar initials="PJ" size="md" tone="accent"></tf-avatar>
+    <tf-avatar initials="PJ" size="lg" tone="accent"></tf-avatar>
+    <tf-avatar initials="MK" size="md" tone="success"></tf-avatar>
+  </div>
+</div>
+
+<!-- ========== FILTER CHIPS + STAGE + STATUS PILL ========== -->
+<div class="section">
+  <div class="section-label">Filter Chips + Stage + Status Pill + Contrib Tag</div>
+  <div class="label">tf-filter-chips</div>
+  <tf-filter-chips id="demo-filters"></tf-filter-chips>
+  <div style="height:16px"></div>
+  <div class="label">tf-stage</div>
+  <div class="row">
+    <tf-stage stage="lead"></tf-stage>
+    <tf-stage stage="qualify"></tf-stage>
+    <tf-stage stage="offer"></tf-stage>
+    <tf-stage stage="commit"></tf-stage>
+    <tf-stage stage="execute"></tf-stage>
+    <tf-stage stage="won"></tf-stage>
+    <tf-stage stage="lost"></tf-stage>
+  </div>
+  <div style="height:16px"></div>
+  <div class="label">tf-status-pill</div>
+  <div class="row">
+    <tf-status-pill status="ok" label="Runtime OK"></tf-status-pill>
+    <tf-status-pill status="err" label="Runtime Error"></tf-status-pill>
+    <tf-status-pill status="warn" label="Degraded"></tf-status-pill>
+  </div>
+  <div style="height:16px"></div>
+  <div class="label">tf-contrib-tag</div>
+  <div class="row">
+    <tf-contrib-tag addon="crm"></tf-contrib-tag>
+    <tf-contrib-tag addon="calendar"></tf-contrib-tag>
+    <tf-contrib-tag addon="contacts"></tf-contrib-tag>
+    <tf-contrib-tag addon="billing"></tf-contrib-tag>
+    <tf-contrib-tag addon="activity"></tf-contrib-tag>
+    <tf-contrib-tag addon="ai"></tf-contrib-tag>
+    <tf-contrib-tag addon="documents"></tf-contrib-tag>
+  </div>
+</div>
+
+<!-- ========== DIVIDER ========== -->
+<div class="section">
+  <div class="section-label">Divider — tf-divider</div>
+  <div class="w400">
+    <div style="color:var(--text-2);font-size:12px">Section A</div>
+    <tf-divider></tf-divider>
+    <div style="color:var(--text-2);font-size:12px">Section B</div>
+    <tf-divider subtle></tf-divider>
+    <div style="color:var(--text-2);font-size:12px">Section C</div>
+    <tf-divider label="Or continue with"></tf-divider>
+    <div style="color:var(--text-2);font-size:12px">Section D</div>
+  </div>
+</div>
+
+<!-- ========== EMPTY STATE ========== -->
+<div class="section">
+  <div class="section-label">Empty State — tf-empty-state</div>
+  <div class="box">
+    <tf-empty-state icon="inbox" title="No alarms yet" message="Alarms will appear here once detectors are running and cameras are streaming.">
+      <tf-button variant="primary" size="sm" icon="plus">Add camera</tf-button>
+    </tf-empty-state>
+  </div>
+</div>
+
+<!-- ========== MENU ========== -->
+<div class="section">
+  <div class="section-label">Menu — tf-menu</div>
+  <div style="position:relative;display:inline-block">
+    <tf-button variant="secondary" icon="settings" id="menu-trigger">Options</tf-button>
+    <tf-menu id="demo-menu" placement="bottom-start">
+      <tf-menu-item icon="edit" action="edit">Edit camera</tf-menu-item>
+      <tf-menu-item icon="download" action="export">Export recording</tf-menu-item>
+      <tf-menu-item icon="settings" action="settings">Settings</tf-menu-item>
+      <tf-menu-divider></tf-menu-divider>
+      <tf-menu-item icon="trash" action="delete" danger>Remove camera</tf-menu-item>
+    </tf-menu>
+  </div>
+</div>
+
+<!-- ========== WINDOW ========== -->
+<div class="section">
+  <div class="section-label">Window — tf-window</div>
+  <tf-button variant="primary" id="open-window">Open Window</tf-button>
+  <tf-button variant="danger" id="open-confirm">Open Confirm Dialog</tf-button>
+</div>
+
+<!-- ========== TOAST ========== -->
+<div class="section">
+  <div class="section-label">Toast — tf-toast</div>
+  <div class="row">
+    <tf-button variant="success" id="toast-success">Success Toast</tf-button>
+    <tf-button variant="danger" id="toast-error">Error Toast</tf-button>
+    <tf-button variant="secondary" id="toast-info">Info Toast</tf-button>
+  </div>
+</div>
+
+<!-- ========== ALARM CARDS ========== -->
+<div class="section">
+  <div class="section-label">Alarm Cards — tf-alarm-card</div>
+  <div class="row col w500" style="gap:8px">
+    <tf-alarm-card severity="critical" title="D2 · suspected aggression" camera="C-04 wjazd" time="12:43:21">
+      <tf-chip status="err" dot>critical</tf-chip>
+      <tf-chip>conf 0.87</tf-chip>
+    </tf-alarm-card>
+    <tf-alarm-card severity="warning" title="D1 · unreadable ADR plate (UN 1203)" camera="C-01 brama" time="12:38:04">
+      <tf-chip status="warn">warning</tf-chip>
+      <tf-chip>legibility 0.42</tf-chip>
+    </tf-alarm-card>
+    <tf-alarm-card severity="info" title="D6 · vehicle in prohibited zone" camera="C-15 magazyn" time="12:22:09">
+      <tf-chip status="info">info</tf-chip>
+    </tf-alarm-card>
+  </div>
+</div>
+
+<!-- ========== HEATMAP ========== -->
+<div class="section">
+  <div class="section-label">Heatmap — tf-heatmap</div>
+  <div class="box" id="heatmap-box" style="max-width:700px"></div>
+</div>
+
+<!-- ========== SPARKLINE ========== -->
+<div class="section">
+  <div class="section-label">Sparkline — tf-sparkline</div>
+  <div class="row">
+    <div class="box" style="width:160px">
+      <div class="label">Primary</div>
+      <tf-sparkline id="spark-1" style="height:40px;display:block"></tf-sparkline>
+    </div>
+    <div class="box" style="width:160px">
+      <div class="label">Success (filled)</div>
+      <tf-sparkline id="spark-2" style="height:40px;display:block"></tf-sparkline>
+    </div>
+    <div class="box" style="width:160px">
+      <div class="label">Danger</div>
+      <tf-sparkline id="spark-3" style="height:40px;display:block"></tf-sparkline>
+    </div>
+  </div>
+</div>
+
+<!-- ========== CANVAS ========== -->
+<div class="section">
+  <div class="section-label">Canvas — tf-canvas</div>
+  <div class="box" style="max-width:400px">
+    <tf-canvas id="demo-canvas" style="display:block;height:200px"></tf-canvas>
+  </div>
+</div>
+
+<!-- ========== PIN INPUT ========== -->
+<div class="section">
+  <div class="section-label">PIN Input — tf-pin-input</div>
+  <div class="row">
+    <tf-pin-input length="6" group-size="3"></tf-pin-input>
+  </div>
+</div>
+
+<!-- ========== SCREEN ========== -->
+<div class="section">
+  <div class="section-label">Screen — tf-screen</div>
+  <div class="box" style="height:200px;position:relative;overflow:hidden">
+    <tf-screen style="height:100%">
+      <span slot="breadcrumb">
+        <tf-breadcrumb>
+          <tf-breadcrumb-item href="#">Home</tf-breadcrumb-item>
+          <tf-breadcrumb-item current>Dashboard</tf-breadcrumb-item>
+        </tf-breadcrumb>
+      </span>
+      <span slot="header">
+        <div style="font-size:18px;font-weight:700">Screen Component</div>
+        <div style="font-size:12px;color:var(--tf-text-3)">Header is sticky, body scrolls</div>
+      </span>
+      <span slot="tabs">
+        <tf-tabs variant="underline" value="overview">
+          <tf-tab id="overview">Overview</tf-tab>
+          <tf-tab id="details">Details</tf-tab>
+        </tf-tabs>
+      </span>
+      <div style="padding:16px;font-size:13px;color:var(--tf-text-2)">Body content goes here. The header stays fixed while this area scrolls.</div>
+    </tf-screen>
+  </div>
+</div>
+
+<!-- ========== TOOLTIP ========== -->
+<div class="section">
+  <div class="section-label">Tooltip — tf-tooltip</div>
+  <div class="row" style="gap:24px">
+    <tf-tooltip text="Camera C-04 · 30 fps · 2 detectors" side="top">
+      <tf-button variant="secondary">Hover me (top)</tf-button>
+    </tf-tooltip>
+    <tf-tooltip text="Export this recording" side="bottom">
+      <tf-button variant="secondary">Hover me (bottom)</tf-button>
+    </tf-tooltip>
+    <tf-tooltip text="Quick settings" side="right">
+      <tf-button variant="ghost" icon="settings"></tf-button>
+    </tf-tooltip>
+  </div>
+</div>
+
+<!-- ========== CALENDAR ========== -->
+<div class="section">
+  <div class="section-label">Calendar — tf-calendar</div>
+  <div id="calendar-box" style="border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--bg-card)"></div>
+</div>
+
+<!-- ========== DATEPICKER ========== -->
+<div class="section">
+  <div class="section-label">Date Picker — tf-datepicker</div>
+  <div class="row">
+    <tf-datepicker id="demo-datepicker"></tf-datepicker>
+  </div>
+</div>
+
+<!-- ========== COMMAND PALETTE ========== -->
+<div class="section">
+  <div class="section-label">Command Palette — tf-command-palette</div>
+  <tf-button variant="secondary" id="open-palette">Open Command Palette (⌘K)</tf-button>
+</div>
+
+<!-- ========== FACE ========== -->
+<div class="section">
+  <div class="section-label">Face — tf-face (multi-instance, each with own canvas + glow)</div>
+  <div class="row" style="gap:32px;align-items:end">
+    <div style="text-align:center">
+      <tf-face size="140" mode="idle"></tf-face>
+      <div style="font-size:11px;color:var(--text-3);margin-top:8px">idle</div>
+    </div>
+    <div style="text-align:center">
+      <tf-face size="140" mode="listen"></tf-face>
+      <div style="font-size:11px;color:var(--success);margin-top:8px">listen</div>
+    </div>
+    <div style="text-align:center">
+      <tf-face size="140" mode="think"></tf-face>
+      <div style="font-size:11px;color:var(--warning);margin-top:8px">think</div>
+    </div>
+    <div style="text-align:center">
+      <tf-face size="140" mode="speak"></tf-face>
+      <div style="font-size:11px;color:var(--accent-2);margin-top:8px">speak</div>
+    </div>
+  </div>
+  <div style="height:16px"></div>
+  <div class="row" style="gap:6px;align-items:center">
+    <div class="label" style="margin:0">Interactive:</div>
+    <tf-face size="200" mode="idle" id="demo-face"></tf-face>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-left:12px">
+      <div class="row" style="gap:6px">
+        <tf-button variant="ghost" size="sm" id="face-idle">idle</tf-button>
+        <tf-button variant="success" size="sm" id="face-listen">listen</tf-button>
+        <tf-button variant="outline" size="sm" id="face-think">think</tf-button>
+        <tf-button variant="primary" size="sm" id="face-speak">speak</tf-button>
+        <tf-button variant="danger" size="sm" id="face-shake">shake</tf-button>
+      </div>
+    </div>
+  </div>
+  <div style="height:16px"></div>
+  <div class="row" style="gap:10px;align-items:center">
+    <div class="label" style="margin:0">Mini (24px):</div>
+    <tf-face size="24" mode="idle"></tf-face>
+    <tf-face size="24" mode="listen"></tf-face>
+    <tf-face size="24" mode="think"></tf-face>
+    <tf-face size="24" mode="speak"></tf-face>
+  </div>
+</div>
+
+<!-- ========== CHAT BUBBLES ========== -->
+<div class="section">
+  <div class="section-label">Chat Bubble — tf-chat-bubble</div>
+  <div class="box" style="max-width:700px">
+    <tf-chat-bubble role="user" sender="Piotr Jarocki" time="14:32">
+      Show me pipeline deals above 500k from the last 30 days.
+    </tf-chat-bubble>
+    <div style="height:12px"></div>
+    <tf-chat-bubble role="assistant" sender="AI" time="14:32" model="GPT-4o" streaming>
+      Found <strong>4 deals</strong> above 500k in the pipeline:<br><br>
+      1. Santander — Q3 implementation · 520k · Offer<br>
+      2. VW Poznań — integration · 680k · Commit<br>
+      3. Tauron — expansion · 510k · Execution
+    </tf-chat-bubble>
+    <div style="height:12px"></div>
+    <div class="label">Thinking block (collapsible — from chat.js markdown renderer)</div>
+    <tf-chat-bubble role="assistant" sender="AI" time="14:33" model="GPT-4o">
+      <details class="thinking" open>
+        <summary class="thinking-head">
+          <svg class="icon-think" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-brain"/></svg>
+          <span class="label">Thinking</span>
+          <span class="meta">3.2s</span>
+          <svg class="icon chev" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-chevron-down"/></svg>
+        </summary>
+        <div class="thinking-body">Checking pipeline... filtering by amount > 500k and creation date within 30 days. Found 4 matching records. Cross-referencing with activity log for commit status.</div>
+      </details>
+      Based on the analysis, here are the 4 deals that match your criteria.
+    </tf-chat-bubble>
+  </div>
+</div>
+
+<!-- ========== CHAT COMPOSER ========== -->
+<div class="section">
+  <div class="section-label">Chat Composer — tf-chat-composer</div>
+  <div style="max-width:700px">
+    <tf-chat-composer placeholder="Ask anything..."></tf-chat-composer>
+  </div>
+</div>
+
+<!-- ========== CHAT PANEL ========== -->
+<div class="section">
+  <div class="section-label">Chat Panel — tf-chat-panel (embeddable side panel)</div>
+  <tf-chat-panel title="AI Assistant" open id="demo-chat-panel" style="height:420px"></tf-chat-panel>
+</div>
+
+<!-- ========== SPECIALIZED (display-only notes) ========== -->
+<div class="section">
+  <div class="section-label">Specialized (runtime-only)</div>
+  <div style="font-size:12px;color:var(--tf-text-3);display:flex;flex-direction:column;gap:6px">
+    <div><strong style="color:var(--tf-text-2)">tf-video-stream</strong> — fMP4 playback via MediaSource Extensions (requires live stream)</div>
+    <div><strong style="color:var(--tf-text-2)">tf-live-camera-tile</strong> — signed frame URL refresh cycle (requires running cameras)</div>
+    <div><strong style="color:var(--tf-text-2)">tf-fps-counter</strong> — binary protocol stream subscription (requires active stream)</div>
+    <div><strong style="color:var(--tf-text-2)">tf-alarm-feed</strong> — binary protocol alarm subscription (requires active detectors)</div>
+    <div><strong style="color:var(--tf-text-2)">tf-addon-ui-frame</strong> — sandboxed iframe for addon HTML (requires addon runtime)</div>
+  </div>
+</div>
+
+</div>
+</div><!-- /demo-scroll -->
+
+<script type="module">
+// Populate data-driven components
+const kv = document.getElementById('kv-runtime');
+if (kv) kv.entries = [
+  { key: 'Frame bus throughput', value: '312 fps total' },
+  { key: 'Queue depth (max)', value: '12 (cam C-04, tier 0)' },
+  { key: 'Drop rate 1h', value: '0.4%', chip: '0.4%', chipTone: 'ok' },
+  { key: 'VRAM usage', value: '8.2 / 12 GB', chip: 'tight', chipTone: 'warn' },
+  { key: 'Models loaded', value: '6 (YOLO11m, PP-OCRv5, BoT-SORT...)' },
+  { key: 'Clock-sync drift max', value: '12 ms (PTP OK)' },
+  { key: 'Audit log → WORM', value: 'synced (5 min ago)', chip: 'synced', chipTone: 'ok' },
+  { key: 'Eval harness (daily)', value: 'P/R on target · last 03:00', chip: 'P/R ok', chipTone: 'ok' },
+];
+
+const table = document.getElementById('demo-table');
+if (table) table.rows = [
+  { camera: 'C-01', location: 'Brama główna', status: 'Online', fps: 30, detectors: 'D1, D2' },
+  { camera: 'C-04', location: 'Wjazd północny', status: 'Online', fps: 25, detectors: 'D1, D3, D5' },
+  { camera: 'C-12', location: 'Magazyn', status: 'Offline', fps: 0, detectors: '—' },
+  { camera: 'C-15', location: 'Parking', status: 'Online', fps: 30, detectors: 'D6' },
+];
+
+const list = document.getElementById('demo-list');
+if (list) list.items = [
+  { id: '1', title: 'Anna Kowalska', sub: 'Sales · East', chip: 'Active', chipTone: 'ok' },
+  { id: '2', title: 'Marek Kowalczyk', sub: 'Director · West', chip: 'Away', chipTone: 'warn' },
+  { id: '3', title: 'Piotr Jarocki', sub: 'Admin · DevOps', chip: 'Active', chipTone: 'ok' },
+  { id: '4', title: 'Jakub Wojtczak', sub: 'CIO · Santander', chip: 'VIP', chipTone: 'accent' },
+];
+
+const inbox = document.getElementById('demo-inbox');
+if (inbox) inbox.items = [
+  { id: '1', title: 'Deal commit without activity 9 days', sub: 'VW Poznań · 380k', severity: 'danger', icon: 'alert' },
+  { id: '2', title: 'Meeting in 30 min — no briefing', sub: 'Santander · 520k', severity: 'warning', icon: 'clock' },
+  { id: '3', title: 'Client replied to offer', sub: 'Castorama · P. Lewandowski', severity: 'success', icon: 'check' },
+];
+
+const timeline = document.getElementById('demo-timeline');
+if (timeline) timeline.entries = [
+  { title: 'Email sent', description: 'Proposal to Santander — "Q3 2026 Implementation"', time: '14:32', dotColor: '#60a5fa', tag: 'crm', tagTone: 'accent' },
+  { title: 'Meeting ended', description: 'Demo with VW Poznań — 45 min, 3 participants', time: '11:30', dotColor: '#22c55e', tag: 'calendar', tagTone: 'info' },
+  { title: 'AI insight', description: 'Deal VW Poznań — commit without activity 9 days, churn risk', time: '09:15', dotColor: '#a78bfa', tag: 'ai', tagTone: 'warn' },
+  { title: 'Note added', description: 'Internal note about client budget', time: 'yesterday 16:40', dotColor: '#6a7196', tag: 'notes', tagTone: 'accent' },
+];
+
+const filters = document.getElementById('demo-filters');
+if (filters) filters.filters = [
+  { id: 'urgent', label: 'Needs decision', icon: 'alert', count: 7, active: true },
+  { id: 'type', label: 'Type: any', active: false },
+  { id: 'status', label: 'Status: any', active: false },
+  { id: 'vip', label: 'VIP', active: true },
+  { id: 'assigned', label: 'Assigned: me', active: false },
+];
+
+// Heatmap
+const hmBox = document.getElementById('heatmap-box');
+if (hmBox) {
+  const hm = document.createElement('tf-heatmap');
+  const rows = 6, cols = 24;
+  const rowLabels = ['C-01 brama','C-04 wjazd','C-07 peron','C-09 hala','C-12 magazyn','C-15 parking'];
+  const colLabels = Array.from({length: 24}, (_, i) => String(i));
+  const values = [];
+  for (let r = 0; r < rows; r++) {
+    const row = [];
+    for (let h = 0; h < cols; h++) {
+      const peak = (h > 7 && h < 18) ? 1 : 0.15;
+      row.push(Math.min(1, peak * Math.random() * (r === 1 ? 1.4 : 1)));
+    }
+    values.push(row);
+  }
+  hm.showLegend = true;
+  hm.rowLabels = rowLabels;
+  hm.colLabels = colLabels;
+  hmBox.appendChild(hm);
+  hm.values = values;
+}
+
+// Sparklines
+const sparkData = (n) => Array.from({length: n}, () => Math.random());
+const s1 = document.getElementById('spark-1');
+if (s1) { s1.points = sparkData(20); s1.color = 'primary'; }
+const s2 = document.getElementById('spark-2');
+if (s2) { s2.points = sparkData(20); s2.color = 'success'; s2.fill = true; }
+const s3 = document.getElementById('spark-3');
+if (s3) { s3.points = sparkData(20); s3.color = 'danger'; }
+
+// Canvas — must set properties after component is connected and has <canvas>
+requestAnimationFrame(() => {
+  const cv = document.getElementById('demo-canvas');
+  if (cv) {
+    cv.width = 380;
+    cv.height = 200;
+    cv.background = 'bg_surface';
+    cv.commands = [
+      { kind: 'rect', x: 20, y: 20, width: 340, height: 160, corner_radius: 10, fill: 'primary', stroke: { color: 'accent', width: 1 } },
+      { kind: 'circle', center: { x: 100, y: 100 }, radius: 40, fill: 'accent', stroke: { color: 'primary', width: 2 } },
+      { kind: 'text', text: 'tf-canvas', pos: { x: 200, y: 105 }, size_px: 18, color: 'text', align: 'left' },
+      { kind: 'line', from: { x: 30, y: 160 }, to: { x: 350, y: 160 }, color: 'accent', width: 1 },
+    ];
+  }
+});
+
+// Calendar — spread events across current week
+const calBox = document.getElementById('calendar-box');
+if (calBox) {
+  const cal = document.createElement('tf-calendar');
+  cal.view = 'week';
+  const now = new Date();
+  const dow = now.getDay() || 7;
+  const mon = new Date(now); mon.setDate(now.getDate() - dow + 1); mon.setHours(0,0,0,0);
+  const d = (dayOff, h, m=0) => { const t = new Date(mon); t.setDate(t.getDate()+dayOff); t.setHours(h,m,0,0); return t.toISOString(); };
+  cal.events = [
+    { id:'1', title:'Santander · oferta', subtitle:'4 osoby', start:d(1,10), end:d(1,11), color:'purple' },
+    { id:'2', title:'Stand-up', subtitle:'5 osób', start:d(2,9), end:d(2,9,15), color:'amber' },
+    { id:'3', title:'1:1 z Markiem', subtitle:'MP', start:d(2,11), end:d(2,11,30), color:'blue' },
+    { id:'4', title:'Demo VW Poznań', subtitle:'Magda W.', start:d(3,10), end:d(3,11,30), color:'blue' },
+    { id:'5', title:'VW · obiekcje cenowe', subtitle:'z Magdą', start:d(1,14), end:d(1,15), color:'purple' },
+    { id:'6', title:'Castorama · prezes', subtitle:'P. Lewandowski', start:d(2,14), end:d(2,15), color:'purple' },
+    { id:'7', title:'Sync z marketingiem', subtitle:'', start:d(3,15), end:d(3,15,30), color:'blue' },
+    { id:'8', title:'Tauron · review', subtitle:'zespół wdr.', start:d(4,11), end:d(4,12), color:'green' },
+    { id:'9', title:'Zamknięcie tygodnia', subtitle:'zespół', start:d(4,16), end:d(4,17), color:'green' },
+  ];
+  calBox.appendChild(cal);
+}
+
+// Command palette
+import { TfCommandPalette } from '/js/components/tf-command-palette.js';
+const cmdPalette = document.querySelector('tf-command-palette') || document.createElement('tf-command-palette');
+if (!cmdPalette.parentNode) document.body.appendChild(cmdPalette);
+cmdPalette.items = [
+  { id:'d1', group:'Deals', title:'Santander — implementation Q3', subtitle:'520k · Offer · Anna Kowalska', icon:'activity' },
+  { id:'d2', group:'Deals', title:'VW Poznań — integration', subtitle:'680k · Commit · Magda W.', icon:'activity' },
+  { id:'d3', group:'Deals', title:'Tauron — expansion', subtitle:'510k · Execution', icon:'activity' },
+  { id:'c1', group:'Contacts', title:'Jakub Wojtczak', subtitle:'CIO · Santander Polska', icon:'users' },
+  { id:'c2', group:'Contacts', title:'Magda Wiśniewska', subtitle:'VP Sales · VW Poznań', icon:'users' },
+  { id:'a1', group:'Actions', title:'New deal', subtitle:'Create a new deal', icon:'plus', shortcut:'N' },
+  { id:'a2', group:'Actions', title:'Export report', subtitle:'PDF/CSV export', icon:'download', shortcut:'E' },
+];
+document.getElementById('open-palette')?.addEventListener('click', () => TfCommandPalette.open());
+
+// Face mode switching
+const face = document.getElementById('demo-face');
+for (const m of ['idle','listen','think','speak']) {
+  document.getElementById('face-' + m)?.addEventListener('click', () => {
+    if (face) face.setAttribute('mode', m);
+  });
+}
+document.getElementById('face-shake')?.addEventListener('click', () => {
+  if (face && face.shakeHead) face.shakeHead();
+});
+
+// Chat panel demo messages
+const chatPanel = document.getElementById('demo-chat-panel');
+if (chatPanel) {
+  chatPanel.messages = [
+    { role: 'assistant', text: 'Hi! How can I help you?', sender: 'AI', time: '14:30', model: 'GPT-4o' },
+    { role: 'user', text: 'Show Santander deals', sender: 'You', time: '14:31' },
+    { role: 'assistant', text: 'Found 2 active Santander deals:<br>• Implementation Q3 — 520k<br>• Maintenance — 120k', sender: 'AI', time: '14:31', model: 'GPT-4o' },
+  ];
+}
+
+// Menu toggle
+document.getElementById('menu-trigger')?.addEventListener('click', () => {
+  const m = document.getElementById('demo-menu');
+  if (m) m.toggle ? m.toggle() : m.toggleAttribute('open');
+});
+
+// Window demo
+import { TfWindow } from '/js/components/tf-window.js';
+document.getElementById('open-window')?.addEventListener('click', async () => {
+  const result = await TfWindow.open({
+    title: 'Add Camera',
+    icon: 'cameras',
+    width: 420,
+    body: '<div style="padding:4px;color:var(--text-2);font-size:13px">Configure the camera stream source and assign detectors to analyze the feed.</div>',
+    actions: [
+      { label: 'Cancel', variant: 'ghost', action: 'cancel' },
+      { label: 'Save', variant: 'primary', action: 'save' },
+    ],
+  });
+  console.log('Window result:', result);
+});
+document.getElementById('open-confirm')?.addEventListener('click', async () => {
+  const ok = await TfWindow.confirm({
+    title: 'Delete camera?',
+    body: 'This will permanently remove C-12 and all associated recordings. This action cannot be undone.',
+    confirmLabel: 'Delete',
+    confirmVariant: 'danger-solid',
+  });
+  console.log('Confirm:', ok);
+});
+
+// Toast demo
+import { TfToast } from '/js/components/tf-toast.js';
+document.getElementById('toast-success')?.addEventListener('click', () => {
+  TfToast.show({ tone: 'success', title: 'Saved', message: 'Camera configuration updated.' });
+});
+document.getElementById('toast-error')?.addEventListener('click', () => {
+  TfToast.show({ tone: 'danger', title: 'Error', message: 'Failed to connect to camera C-12.' });
+});
+document.getElementById('toast-info')?.addEventListener('click', () => {
+  TfToast.show({ tone: 'info', title: 'Info', message: 'Sync started with 3 peers.' });
+});
+</script>
+
+</body>
+</html>
