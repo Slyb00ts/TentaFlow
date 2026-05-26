@@ -488,22 +488,19 @@ function renderBadge(component, ctx) {
   if (max === 0) throw new TypeError('Badge.max must be > 0');
   const pulse = requireBool(ctx.readField(component.fields, 6), 'Badge.pulse');
 
-  const wrapper = document.createElement('span');
-  wrapper.classList.add('tf-badge');
-  wrapper.classList.add(`tf-badge--variant-${variant}`);
-  wrapper.classList.add(`tf-badge--tone-${tone}`);
-  if (pulse) wrapper.classList.add('tf-badge--pulse');
+  const TONE_MAP = { neutral: 'accent', primary: 'accent', success: 'success', warning: 'warning', critical: 'danger', info: 'info', muted: 'accent' };
+  const wrapper = document.createElement('tf-badge');
+  wrapper.setAttribute('tone', TONE_MAP[tone] || 'accent');
 
-  if (iconRaw != null) {
-    const ic = renderIcon(iconRaw, 'Badge.icon');
-    ic.classList.add('tf-badge__icon');
-    wrapper.appendChild(ic);
-  }
   if (variant !== 'dot') {
-    const lblEl = document.createElement('span');
-    lblEl.classList.add('tf-badge__label');
-    applyReactiveText(lblEl, label, ctx, null);
-    wrapper.appendChild(lblEl);
+    const applyLabel = () => {
+      const v = resolveBindRef(label, ctx.store);
+      wrapper.setAttribute('value', v != null ? String(v) : '');
+    };
+    applyLabel();
+    if (typeof label === 'object' && label != null) {
+      ctx.registerCleanup(subscribeBindRef(label, ctx.store, applyLabel));
+    }
     if (count != null) {
       const cntEl = document.createElement('span');
       cntEl.classList.add('tf-badge__count');
@@ -550,73 +547,41 @@ function renderChip(component, ctx) {
   const selectedBind = ctx.readField(component.fields, 5);
   const removable = requireBool(ctx.readField(component.fields, 6), 'Chip.removable');
 
-  const wrapper = document.createElement('span');
-  wrapper.classList.add('tf-chip');
-  wrapper.classList.add(`tf-chip--variant-${variant}`);
-  wrapper.classList.add(`tf-chip--tone-${tone}`);
-  if (variant === 'toggle' || variant === 'selectable') {
-    wrapper.setAttribute('role', variant === 'toggle' ? 'button' : 'option');
-    wrapper.setAttribute('tabindex', '0');
-    wrapper.setAttribute('aria-pressed', 'false');
-    const onKey = (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        wrapper.click();
-      }
-    };
-    wrapper.addEventListener('keydown', onKey);
-    ctx.registerCleanup(() => wrapper.removeEventListener('keydown', onKey));
-  }
-
+  // Map SDK tone to tf-chip status
+  const TONE_TO_STATUS = {
+    neutral: 'info', primary: 'accent', success: 'ok', warning: 'warn',
+    critical: 'err', info: 'info', muted: 'info',
+  };
+  const wrapper = document.createElement('tf-chip');
+  wrapper.setAttribute('status', TONE_TO_STATUS[tone] || 'info');
   if (iconRaw != null) {
-    const ic = renderIcon(iconRaw, 'Chip.icon');
-    ic.classList.add('tf-chip__icon');
-    wrapper.appendChild(ic);
-  } else if (avatarRaw != null) {
-    const av = renderAvatarRef(avatarRaw, 'Chip.avatar');
-    av.classList.add('tf-chip__avatar');
-    wrapper.appendChild(av);
+    const iconName = typeof iconRaw === 'object' && iconRaw.fields
+      ? ctx.readField(iconRaw.fields, 0) : (typeof iconRaw === 'string' ? iconRaw : '');
+    if (iconName) wrapper.setAttribute('icon', iconName);
+  }
+  if (variant === 'toggle' || variant === 'selectable') {
+    wrapper.setAttribute('clickable', '');
   }
 
-  const lblEl = document.createElement('span');
-  lblEl.classList.add('tf-chip__label');
-  applyReactiveText(lblEl, label, ctx, null);
-  wrapper.appendChild(lblEl);
+  // tf-chip reads text from textContent, set it reactively
+  const applyLabel = () => {
+    const v = resolveBindRef(label, ctx.store);
+    wrapper.textContent = v != null ? String(v) : '';
+  };
+  applyLabel();
+  if (typeof label === 'object' && label != null) {
+    ctx.registerCleanup(subscribeBindRef(label, ctx.store, applyLabel));
+  }
 
   if (selectedBind != null) {
     const apply = () => {
       const sel = resolveBindRef(selectedBind, ctx.store) === true;
-      if (sel) {
-        wrapper.classList.add('tf-chip--selected');
-        wrapper.setAttribute('aria-pressed', 'true');
-      } else {
-        wrapper.classList.remove('tf-chip--selected');
-        if (wrapper.hasAttribute('aria-pressed')) wrapper.setAttribute('aria-pressed', 'false');
-      }
+      wrapper.setAttribute('active', sel ? '' : null);
+      if (sel) wrapper.setAttribute('active', '');
+      else wrapper.removeAttribute('active');
     };
     apply();
     ctx.registerCleanup(subscribeBindRef(selectedBind, ctx.store, apply));
-  }
-
-  if (removable) {
-    const rm = document.createElement('button');
-    rm.setAttribute('type', 'button');
-    rm.setAttribute('aria-label', 'Remove');
-    rm.classList.add('tf-chip__remove');
-    rm.textContent = '×';
-    const onRemove = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('remove', {
-          bubbles: false,
-          detail: null,
-        })
-      );
-    };
-    rm.addEventListener('click', onRemove);
-    ctx.registerCleanup(() => rm.removeEventListener('click', onRemove));
-    wrapper.appendChild(rm);
   }
 
   return wrapper;
