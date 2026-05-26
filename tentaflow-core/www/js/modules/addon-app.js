@@ -253,6 +253,7 @@ function handlePanelShell(decoded) {
   // Create event dispatcher that sends actions to backend
   const eventDispatcher = {
     emit({ addon_id, panel_id, panel_epoch, source_id, event_kind, handler, dom_event }) {
+      console.log('[event-dispatch]', event_kind, 'handler:', JSON.stringify(handler), 'detail:', dom_event?.detail);
       if (!handler) return;
       if (handler.kind === 'backend' || handler.kind === 'both') {
         const params = { ...(handler.params || {}) };
@@ -367,6 +368,7 @@ async function sendAction(addonId, panelId, panelEpoch, actionId, params) {
     const correlationId = client.nextCorrelationId();
     const sequence = client.takeSequence();
     const paramsJson = JSON.stringify(params ?? {});
+    console.log('[addon-app] sendAction:', actionId, paramsJson, 'epoch:', panelEpoch);
     const body = s.wasm.encodeUiAction(
       addonId, panelId, BigInt(panelEpoch), actionId, paramsJson
     );
@@ -376,6 +378,7 @@ async function sendAction(addonId, panelId, panelEpoch, actionId, params) {
       messageKind.META_HEARTBEAT, body
     );
     client._send(frame);
+    console.log('[addon-app] sendAction sent OK, corrId:', correlationId);
   } catch (e) {
     console.error('[addon-app] sendAction failed:', e);
   }
