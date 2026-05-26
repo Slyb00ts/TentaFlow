@@ -255,7 +255,11 @@ function handlePanelShell(decoded) {
     emit({ addon_id, panel_id, panel_epoch, source_id, event_kind, handler, dom_event }) {
       if (!handler) return;
       if (handler.kind === 'backend' || handler.kind === 'both') {
-        sendAction(addon_id, panel_id, panel_epoch, handler.action_id, handler.params || {});
+        const params = { ...(handler.params || {}) };
+        if (dom_event && dom_event.detail && typeof dom_event.detail === 'object') {
+          Object.assign(params, dom_event.detail);
+        }
+        sendAction(addon_id, panel_id, panel_epoch, handler.action_id, params);
       }
       // Local actions handled by renderer infrastructure
     },
