@@ -344,18 +344,12 @@ function renderSectionCard(component, ctx) {
     el.appendChild(subEl);
   }
 
-  // Header actions — validated as Button components, rendered into header area
+  // Header actions — rendered into header area (typically Button but any component allowed)
   if (headerActions.length > 0) {
     const actions = document.createElement('div');
     actions.classList.add('tf-section-card__actions');
     for (const action of headerActions) {
-      if (!action || typeof action !== 'object' || action.tag !== BUTTON_TAG) {
-        throw new TypeError(
-          `SectionCard.header_actions entry must be Button (tag 0x0401), got 0x${
-            (action && action.tag != null ? action.tag : 0).toString(16).padStart(4, '0')
-          }`
-        );
-      }
+      if (!action || typeof action !== 'object') continue;
       actions.appendChild(ctx.renderChild(action));
     }
     el.appendChild(actions);
