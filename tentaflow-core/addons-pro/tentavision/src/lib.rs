@@ -1624,9 +1624,16 @@ fn send_initial_shell() {
 
 fn build_shell_layout() -> Component {
     let nav_items = build_nav_tab_items("overview");
-    let nav = nav_tabs(nav_items, "overview");
-    // Shell is just a vertical stack with NavTabs at top and a slot placeholder below.
-    // The slot "content" is where panel content is injected via SlotContent.
+    let mut nav = nav_tabs(nav_items, "overview");
+    nav.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Select,
+        Handler::Backend {
+            action_id: "panel-navigate".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
     stack_v(vec![nav])
 }
 
@@ -1683,7 +1690,9 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "discover-add" => handle_discover_add(),
         "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
         "panel-navigate" => {
-            let target = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("overview").to_string();
+            let target = params.get("panel_id")
+                .or_else(|| params.get("item_id"))
+                .and_then(|v| v.as_str()).unwrap_or("overview").to_string();
             render_panel(&target);
             json!({"ok":true, "panel_id": target})
         }
