@@ -100,7 +100,7 @@ pub mod sync_kinds {
 /// - 4c2.4: HMAC_KEYS_SYNC, FRAME_PROXY_REQUEST, FRAME_PROXY_RESPONSE
 /// - 4c2.5: SYNC_PUSH, SYNC_ACK, SYNC_PULL, SYNC_PULL_RESPONSE,
 ///   SYNC_SNAPSHOT_PULL, SYNC_SNAPSHOT_RESPONSE
-/// - 4c2.6b: NODE_INFO, HELLO, TOPOLOGY_ANNOUNCE, KNOWN_PEERS, CRDT_DELTA,
+/// - 4c2.6b: NODE_INFO, HELLO, TOPOLOGY_ANNOUNCE, KNOWN_PEERS,
 ///   ALIAS_SYNC, MODEL_LIST, NODE_LEAVING
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
     matches!(
@@ -132,7 +132,6 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_HELLO
             | legacy::MESH_MSG_TOPOLOGY_ANNOUNCE
             | legacy::MESH_MSG_KNOWN_PEERS
-            | legacy::MESH_MSG_CRDT_DELTA
             | legacy::MESH_MSG_ALIAS_SYNC
             | legacy::MESH_MSG_MODEL_LIST
             | legacy::MESH_MSG_NODE_LEAVING
@@ -148,7 +147,6 @@ pub mod kinds {
     use super::legacy;
 
     pub const HEARTBEAT: Kind = Kind(legacy::MESH_MSG_HEARTBEAT as u16);
-    pub const CRDT_DELTA: Kind = Kind(legacy::MESH_MSG_CRDT_DELTA as u16);
     pub const FORWARD_REQ: Kind = Kind(legacy::MESH_MSG_FORWARD_REQ as u16);
     pub const MODEL_LIST: Kind = Kind(legacy::MESH_MSG_MODEL_LIST as u16);
     pub const NODE_INFO: Kind = Kind(legacy::MESH_MSG_NODE_INFO as u16);
@@ -248,7 +246,6 @@ mod tests {
             legacy::MESH_MSG_HELLO,
             legacy::MESH_MSG_TOPOLOGY_ANNOUNCE,
             legacy::MESH_MSG_KNOWN_PEERS,
-            legacy::MESH_MSG_CRDT_DELTA,
             legacy::MESH_MSG_ALIAS_SYNC,
             legacy::MESH_MSG_MODEL_LIST,
             legacy::MESH_MSG_NODE_LEAVING,
@@ -286,7 +283,6 @@ mod tests {
         // §4: Mesh channel kind range is 0x0010..=0x004C.
         for &k in &[
             kinds::HEARTBEAT,
-            kinds::CRDT_DELTA,
             kinds::NODE_INFO,
             kinds::HELLO,
             kinds::TOPOLOGY_ANNOUNCE,

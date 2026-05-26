@@ -1,14 +1,12 @@
 // =============================================================================
 // Plik: mesh/mod.rs
-// Opis: Mesh networking — gossip protocol, CRDT, odkrywanie peerow.
+// Opis: Mesh networking — odkrywanie peerow, transport i protokol UFP/2.
 // =============================================================================
 
 pub mod admin_ops;
 pub mod bandwidth_probe;
 pub mod cluster_probe;
 pub mod command_executor;
-pub mod crdt;
-pub mod crdt_store;
 pub mod frame_policy;
 pub mod gossip;
 #[cfg(all(feature = "rdma-probe", target_os = "linux"))]
@@ -21,7 +19,6 @@ pub mod macos_gpu_metrics;
 pub mod network_config;
 pub mod network_interfaces;
 pub mod node_info_collector;
-pub mod peer_manager;
 pub mod peer_registry;
 pub mod peer_store;
 pub mod pipeline;

@@ -85,11 +85,6 @@ mod tests {
     }
 
     #[test]
-    fn crdt_delta_is_post_trust() {
-        assert!(!is_pre_trust_frame(MESH_MSG_CRDT_DELTA));
-    }
-
-    #[test]
     fn unknown_discriminant_is_post_trust() {
         assert!(!is_pre_trust_frame(0xFF));
         assert!(!is_pre_trust_frame(0x00));
