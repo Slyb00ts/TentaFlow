@@ -774,10 +774,17 @@ pub async fn handle_request(
                 .unwrap_or_default(),
         );
 
-        // Initialize SessionRegistry before AppState so both dispatch and host
-        // functions share the same instance.
-        let shared_sessions = Arc::new(crate::addon::ui_session::SessionRegistry::new());
-        crate::addon::ui_session::init_global_registry(shared_sessions.clone());
+        // Ensure a single shared SessionRegistry. If already initialized (e.g. by
+        // another code path), reuse the existing one. Both dispatch and host functions
+        // must see the same instance.
+        let shared_sessions = {
+            let fresh = Arc::new(crate::addon::ui_session::SessionRegistry::new());
+            crate::addon::ui_session::init_global_registry(fresh);
+            // Always read back from global — this is the authoritative instance.
+            crate::addon::ui_session::global_registry()
+                .expect("global_registry must be set after init")
+                .clone()
+        };
 
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
         let meeting_manager =

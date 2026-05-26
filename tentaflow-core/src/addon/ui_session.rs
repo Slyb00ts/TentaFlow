@@ -571,6 +571,11 @@ impl SessionRegistry {
 
     /// Records which connection_id is serving a given addon+user panel session.
     pub fn register_addon_connection(&self, addon_id: &str, user_id: i64, connection_id: u64) {
+        tracing::info!(
+            addon = addon_id, user_id, connection_id,
+            registry_ptr = format_args!("{:p}", self),
+            "register_addon_connection"
+        );
         self.addon_connections
             .write()
             .insert((addon_id.to_owned(), user_id), connection_id);
@@ -589,7 +594,14 @@ impl SessionRegistry {
     /// HashMap hashing + allocation overhead.
     pub fn find_connection(&self, addon_id: &str, user_id: i64) -> Option<u64> {
         let read = self.addon_connections.read();
+        let count = read.len();
+        tracing::info!(
+            addon = addon_id, user_id, entries = count,
+            registry_ptr = format_args!("{:p}", self),
+            "find_connection lookup"
+        );
         for ((aid, uid), conn_id) in read.iter() {
+            tracing::info!(stored_addon = %aid, stored_uid = uid, stored_conn = conn_id, "find_connection entry");
             if *uid == user_id && aid == addon_id {
                 return Some(*conn_id);
             }
@@ -607,7 +619,9 @@ static GLOBAL_SESSION_REGISTRY: OnceLock<Arc<SessionRegistry>> = OnceLock::new()
 
 /// Initializes the process-wide global registry. Called once at server startup.
 pub fn init_global_registry(registry: Arc<SessionRegistry>) {
-    let _ = GLOBAL_SESSION_REGISTRY.set(registry);
+    if GLOBAL_SESSION_REGISTRY.set(registry).is_err() {
+        tracing::warn!("init_global_registry called twice — ignoring second call");
+    }
 }
 
 /// Returns the process-wide global registry (None before `init_global_registry`).
