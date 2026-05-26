@@ -112,6 +112,15 @@ fn handle_panel_open(
             .map_err(|e| ProtocolError::bad_request(e.to_string()))?
     };
 
+    // Register addon→connection mapping so host functions (ui_render_cbor)
+    // can find this session and register declared actions.
+    let user_id_for_conn = extract_user_id_i64(ctx).unwrap_or(0);
+    ctx.state.ui_sessions.register_addon_connection(
+        &panel_open.addon_id,
+        user_id_for_conn,
+        ctx.connection_id,
+    );
+
     if let Some(addon_mgr) = ctx.state.addon_manager.as_ref() {
         let user_id = extract_user_id_i64(ctx);
 
