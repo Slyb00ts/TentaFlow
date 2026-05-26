@@ -94,6 +94,14 @@ class TfInput extends HTMLElement {
 
     const iconEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     iconEl.classList.add('tf-input-icon');
+    iconEl.setAttribute('width', '16');
+    iconEl.setAttribute('height', '16');
+    iconEl.setAttribute('fill', 'none');
+    iconEl.setAttribute('stroke', 'currentColor');
+    iconEl.setAttribute('stroke-width', '2');
+    iconEl.setAttribute('stroke-linecap', 'round');
+    iconEl.setAttribute('stroke-linejoin', 'round');
+    iconEl.setAttribute('aria-hidden', 'true');
     const useEl = document.createElementNS('http://www.w3.org/2000/svg', 'use');
     iconEl.appendChild(useEl);
 

@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: sdk-runtime/data-stat-labels-renderer.js
-// Opis: Renderery stat + label komponentów §4 Data Display — chunk 3.3d-2:
+// Opis: Renderery stat + label komponentow §4 Data Display — chunk 3.3d-2:
 //   - KeyValue  (0x0207) — 2-kolumnowa lista label:value z KvItem
-//   - StatCard  (0x0208) — duża karta metryki z trend/footnote/clickable
+//   - StatCard  (0x0208) — <tf-stat-card> web component z trend/footnote
 //   - Stat      (0x0209) — compact stat bez kontenera
 //   - Badge     (0x020A) — status/count pill z count overflow (max)
 //   - Chip      (0x020B) — filter/tag chip z handlers click/remove
@@ -19,7 +19,7 @@ import { resolveBindRef, subscribeBindRef, formatValue } from './bind-resolver.j
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
-// Walidatory wspólne
+// Walidatory wspolne
 // =============================================================================
 
 const TONES = new Set(['neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted']);
@@ -35,9 +35,23 @@ const VALUE_FORMAT_KINDS = new Set([
   'number', 'currency', 'percent', 'bytes', 'duration',
   'date', 'time', 'datetime', 'relative', 'plain',
 ]);
-// action_id grammar: [a-z0-9_-]+ length 1..=64.
 const ACTION_ID_RE = /^[a-z0-9_-]{1,64}$/;
 const KV_ITEM_KEYS = new Set([0, 1, 2, 3, 4, 5]);
+
+// Map SDK tone names to tf-stat-card accent attribute values
+const TONE_TO_ACCENT = {
+  'success': 'success',
+  'warning': 'warning',
+  'critical': 'danger',
+  'info': 'info',
+};
+
+// Map SDK trend direction to tf-stat-card delta-type
+const TREND_TO_DELTA_TYPE = {
+  'up': 'up',
+  'down': 'down',
+  'flat': 'neutral',
+};
 
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
@@ -73,8 +87,7 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
   }
 }
 
-/// Eager ValueFormat probe — wywołuje formatValue z sample 0 żeby wymusić
-/// variant-level walidację (np. currency.code required).
+/// Eager ValueFormat probe
 function assertValueFormat(fmt, ctx, locale) {
   if (fmt == null) return;
   if (typeof fmt !== 'object' || Array.isArray(fmt)) {
@@ -140,7 +153,7 @@ function parseFootnote(raw, ctx) {
     seen.add(k);
     switch (k) {
       case 0: f.tone = requireEnum(v, TONES, `${ctx}.tone`); break;
-      case 1: if (v != null) f.icon = v; break;  // IconRef validated by renderIcon
+      case 1: if (v != null) f.icon = v; break;
       case 2: f.content = v; break;
       default: throw new TypeError(`${ctx}: unknown Footnote key ${k}`);
     }
@@ -235,11 +248,6 @@ function renderKeyValue(component, ctx) {
     dd.appendChild(valText);
 
     if (it.action_id != null) {
-      // Action button — emit `item_click` z action_id w detail (handlers per
-      // schema dla KeyValue: brak deklarowanych handler'ów, więc używamy
-      // wewnętrznego event'u tf-bind-write... NIE. KeyValue items są
-      // clickable per action_id — host dispatcher musi obsłużyć. Emitujemy
-      // standardowy 'item_click' (jest w EVENT_KIND_WIRE).
       dd.setAttribute('role', 'button');
       dd.setAttribute('tabindex', '0');
       dd.classList.add('tf-keyvalue__value--clickable');
@@ -295,7 +303,6 @@ function renderTrendBadge(trend, ctx) {
   el.appendChild(arrow);
   const pct = document.createElement('span');
   pct.classList.add('tf-trend__percent');
-  // percent jest already in 0..100 (f64). Format z 1 miejscem po przecinku.
   pct.textContent = `${Number.isInteger(trend.percent) ? trend.percent : trend.percent.toFixed(1)}%`;
   el.appendChild(pct);
   if (trend.label != null) {
@@ -324,7 +331,7 @@ function renderFootnoteBlock(fn, ctx) {
 }
 
 // =============================================================================
-// StatCard (0x0208)
+// StatCard (0x0208) — uses <tf-stat-card> web component
 // =============================================================================
 
 export const STAT_CARD_TAG = 0x0208;
@@ -349,49 +356,76 @@ function renderStatCard(component, ctx) {
   const accent = accentRaw == null ? null : requireEnum(accentRaw, TONES, 'StatCard.accent');
   const clickable = requireBool(ctx.readField(component.fields, 8), 'StatCard.clickable');
 
-  // Clickable → <button>, inaczej <article>.
-  const wrapper = document.createElement(clickable ? 'button' : 'article');
-  if (clickable) wrapper.setAttribute('type', 'button');
-  wrapper.classList.add('tf-stat-card');
-  if (accent) wrapper.classList.add(`tf-stat-card--accent-${accent}`);
-  if (clickable) wrapper.classList.add('tf-stat-card--clickable');
-
-  const header = document.createElement('header');
-  header.classList.add('tf-stat-card__header');
-  if (iconRaw != null) {
-    const ic = renderIcon(iconRaw, 'StatCard.icon');
-    ic.classList.add('tf-stat-card__icon');
-    header.appendChild(ic);
-  }
-  const lblEl = document.createElement('span');
-  lblEl.classList.add('tf-stat-card__label');
-  applyReactiveText(lblEl, label, ctx, null);
-  header.appendChild(lblEl);
-  wrapper.appendChild(header);
-
-  const valueRow = document.createElement('div');
-  valueRow.classList.add('tf-stat-card__value-row');
-  const valEl = document.createElement('span');
-  valEl.classList.add('tf-stat-card__value');
-  applyReactiveText(valEl, value, ctx, format);
-  valueRow.appendChild(valEl);
-  if (valueSuffix != null) {
-    const suf = document.createElement('span');
-    suf.classList.add('tf-stat-card__suffix');
-    applyReactiveText(suf, valueSuffix, ctx, null);
-    valueRow.appendChild(suf);
-  }
-  if (trend) valueRow.appendChild(renderTrendBadge(trend, ctx));
-  wrapper.appendChild(valueRow);
-
-  if (footnote) wrapper.appendChild(renderFootnoteBlock(footnote, ctx));
-
+  // Create <tf-stat-card> web component
+  const el = document.createElement('tf-stat-card');
   if (clickable) {
-    // Click emit — spec handlers=["click"]. Standardowy DOM click bubble
-    // dotrze do applyEventHandlers wrapper'a; addon attach'uje przez handlers.
+    el.classList.add('tf-stat-card--clickable');
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
   }
 
-  return wrapper;
+  // Map SDK accent tone to tf-stat-card accent attribute
+  if (accent) {
+    const mappedAccent = TONE_TO_ACCENT[accent] || accent;
+    el.setAttribute('accent', mappedAccent);
+  }
+
+  // Reactive icon attribute
+  if (iconRaw != null) {
+    const iconName = typeof iconRaw === 'string' ? iconRaw
+      : (iconRaw && typeof iconRaw === 'object' ? (iconRaw.name || '') : '');
+    if (iconName) el.setAttribute('icon', iconName);
+  }
+
+  // Reactive label attribute
+  const applyLabel = () => {
+    const v = resolveBindRef(label, ctx.store);
+    el.setAttribute('label', v == null ? '' : String(v));
+  };
+  applyLabel();
+  ctx.registerCleanup(subscribeBindRef(label, ctx.store, applyLabel));
+
+  // Reactive value attribute
+  const applyValue = () => {
+    const raw = resolveBindRef(value, ctx.store);
+    if (raw == null) { el.setAttribute('value', ''); return; }
+    if (format != null) {
+      try { el.setAttribute('value', formatValue(raw, format, ctx.locale)); }
+      catch { el.setAttribute('value', String(raw)); }
+    } else {
+      el.setAttribute('value', String(raw));
+    }
+  };
+  applyValue();
+  ctx.registerCleanup(subscribeBindRef(value, ctx.store, applyValue));
+
+  // Reactive suffix attribute
+  if (valueSuffix != null) {
+    const applySuffix = () => {
+      const v = resolveBindRef(valueSuffix, ctx.store);
+      if (v != null) el.setAttribute('suffix', String(v));
+      else el.removeAttribute('suffix');
+    };
+    applySuffix();
+    ctx.registerCleanup(subscribeBindRef(valueSuffix, ctx.store, applySuffix));
+  }
+
+  // Trend mapped to delta/delta-type attributes
+  if (trend) {
+    const deltaType = TREND_TO_DELTA_TYPE[trend.direction] || 'neutral';
+    el.setAttribute('delta-type', deltaType);
+    const pctText = `${Number.isInteger(trend.percent) ? trend.percent : trend.percent.toFixed(1)}%`;
+    el.setAttribute('delta', pctText);
+  }
+
+  // Footnote rendered as child element (tf-stat-card renders children via
+  // light DOM, so we append extra elements after the component builds)
+  if (footnote) {
+    const fnEl = renderFootnoteBlock(footnote, ctx);
+    el.appendChild(fnEl);
+  }
+
+  return el;
 }
 
 // =============================================================================
@@ -484,7 +518,6 @@ function renderBadge(component, ctx) {
       wrapper.appendChild(cntEl);
     }
   } else {
-    // Dot variant — bez tekstu, ale a11y label musi być na elemencie.
     wrapper.setAttribute('role', 'status');
     const sr = document.createElement('span');
     sr.classList.add('tf-visually-hidden');
@@ -517,12 +550,6 @@ function renderChip(component, ctx) {
   const selectedBind = ctx.readField(component.fields, 5);
   const removable = requireBool(ctx.readField(component.fields, 6), 'Chip.removable');
 
-  // Root jest ZAWSZE <span> żeby uniknąć nested-button HTML problem'u (× to
-  // realny <button>, gdy zagnieździsz wewnątrz <button> wrapper'a, łamiesz
-  // a11y i HTML). Interaktywność dla selectable/toggle daje role=button +
-  // tabindex=0 + keyboard handler. Chip click semantyka idzie przez
-  // standardowy DOM click bubble do applyEventHandlers wrapper'a (handlers
-  // 'click' w spec).
   const wrapper = document.createElement('span');
   wrapper.classList.add('tf-chip');
   wrapper.classList.add(`tf-chip--variant-${variant}`);
@@ -531,7 +558,6 @@ function renderChip(component, ctx) {
     wrapper.setAttribute('role', variant === 'toggle' ? 'button' : 'option');
     wrapper.setAttribute('tabindex', '0');
     wrapper.setAttribute('aria-pressed', 'false');
-    // Enter/Space na role=button musi triggerować click manually.
     const onKey = (e) => {
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
@@ -547,7 +573,6 @@ function renderChip(component, ctx) {
     ic.classList.add('tf-chip__icon');
     wrapper.appendChild(ic);
   } else if (avatarRaw != null) {
-    // AvatarRef inline render — kropla logiki podobna do Avatar component.
     const av = renderAvatarRef(avatarRaw, 'Chip.avatar');
     av.classList.add('tf-chip__avatar');
     wrapper.appendChild(av);
@@ -574,9 +599,6 @@ function renderChip(component, ctx) {
   }
 
   if (removable) {
-    // Realny <button> dla × — z stopPropagation żeby click na × nie
-    // wybubblował na wrapper (gdzie addon mógłby attach'ować handler 'click'
-    // chip'a).
     const rm = document.createElement('button');
     rm.setAttribute('type', 'button');
     rm.setAttribute('aria-label', 'Remove');
@@ -600,11 +622,7 @@ function renderChip(component, ctx) {
   return wrapper;
 }
 
-/// AvatarRef inline render — tagged union per spec inline.rs:199:
-///   { kind: "image", ref: <url> }
-///   { kind: "initials", initials: <text> }
-///   { kind: "icon", icon: IconRef }
-/// Pełny komponent Avatar (0x020D) idzie w 3.3d-3; tutaj minimum dla Chip.
+/// AvatarRef inline render
 const SAFE_AVATAR_SRC = /^(https:\/\/|data:image\/(png|jpeg|gif|webp|svg\+xml);)/;
 const AVATAR_REF_KINDS = new Set(['image', 'initials', 'icon']);
 function renderAvatarRef(ref, ctx) {
@@ -617,7 +635,6 @@ function renderAvatarRef(ref, ctx) {
   const wrap = document.createElement('span');
   wrap.classList.add('tf-avatar-ref');
   if (ref.kind === 'image') {
-    // Unknown keys check.
     for (const k of Object.keys(ref)) {
       if (k !== 'kind' && k !== 'ref') throw new TypeError(`${ctx}: unexpected key '${k}' for image`);
     }
@@ -645,7 +662,6 @@ function renderAvatarRef(ref, ctx) {
     ini.textContent = ref.initials.slice(0, 3);
     wrap.appendChild(ini);
   } else {
-    // icon
     for (const k of Object.keys(ref)) {
       if (k !== 'kind' && k !== 'icon') throw new TypeError(`${ctx}: unexpected key '${k}' for icon`);
     }

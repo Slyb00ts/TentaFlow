@@ -216,10 +216,110 @@ function renderSlider(component, ctx) {
   })();
   const tone = requireEnum(ctx.readField(component.fields, 8), TONES, 'Slider.tone');
 
-  return buildSliderUi({
-    component, ctx, bindPath, min, max, step, labelBind, showValue, format, marks,
-    tone, className: 'tf-slider',
+  // Wrapper holds tf-slider + optional label + optional value badge.
+  const wrapper = document.createElement('div');
+  wrapper.classList.add('tf-slider');
+  wrapper.classList.add(`tf-slider--tone-${tone}`);
+
+  let labelEl = null;
+  if (labelBind != null) {
+    labelEl = document.createElement('label');
+    labelEl.classList.add('tf-slider__label');
+    applyTextBind(labelEl, labelBind, ctx);
+    wrapper.appendChild(labelEl);
+  }
+
+  const fieldRow = document.createElement('div');
+  fieldRow.classList.add('tf-slider__field');
+
+  const slider = document.createElement('tf-slider');
+  slider.setAttribute('min', String(min));
+  slider.setAttribute('max', String(max));
+  slider.setAttribute('step', String(step));
+
+  if (labelBind == null) {
+    if (component.a11y == null || component.a11y.label == null) {
+      throw new TypeError('tf-slider without label requires Component.a11y.label');
+    }
+    const initial = resolveBindRef(component.a11y.label, ctx.store);
+    if (typeof initial !== 'string' || initial.trim().length === 0) {
+      throw new TypeError('tf-slider.a11y.label must resolve to non-blank string');
+    }
+    const applyAria = () => {
+      const v = resolveBindRef(component.a11y.label, ctx.store);
+      if (typeof v === 'string' && v.trim().length > 0) slider.setAttribute('aria-label', v);
+      else slider.removeAttribute('aria-label');
+    };
+    applyAria();
+    ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
+  }
+
+  // Reactive value sync: store -> tf-slider.value
+  const applyValue = () => {
+    let v;
+    try { v = ctx.store.read(bindPath); } catch { v = undefined; }
+    if (typeof v !== 'number' || !Number.isFinite(v)) return;
+    let clamped = v;
+    if (clamped < min) clamped = min;
+    if (clamped > max) clamped = max;
+    const next = String(clamped);
+    if (slider.value !== next) slider.value = next;
+  };
+  applyValue();
+  ctx.registerCleanup(ctx.store.subscribe(bindPath, applyValue));
+
+  fieldRow.appendChild(slider);
+
+  let valueBadge = null;
+  if (showValue) {
+    valueBadge = document.createElement('span');
+    valueBadge.classList.add('tf-slider__value');
+    valueBadge.setAttribute('aria-live', 'polite');
+    const sync = () => {
+      const raw = Number.parseFloat(slider.value);
+      valueBadge.textContent = Number.isFinite(raw) ? fmtSliderValue(raw, format, ctx.locale) : '';
+    };
+    sync();
+    ctx.registerCleanup(ctx.store.subscribe(bindPath, sync));
+    slider.addEventListener('input', sync);
+    ctx.registerCleanup(() => slider.removeEventListener('input', sync));
+    fieldRow.appendChild(valueBadge);
+  }
+
+  wrapper.appendChild(fieldRow);
+
+  // tf-slider emits input/change with detail.value (string). Intercept,
+  // convert to f64 and re-emit with SDK format on wrapper.
+  const onInput = (e) => {
+    e.stopPropagation();
+    const v = Number.parseFloat(e.detail?.value ?? slider.value);
+    if (!Number.isFinite(v)) return;
+    wrapper.dispatchEvent(
+      new CustomEvent('input', {
+        bubbles: false,
+        detail: { value: v, kind: 'f64' },
+      })
+    );
+  };
+  const onChange = (e) => {
+    e.stopPropagation();
+    const v = Number.parseFloat(e.detail?.value ?? slider.value);
+    if (!Number.isFinite(v)) return;
+    wrapper.dispatchEvent(
+      new CustomEvent('change', {
+        bubbles: false,
+        detail: { value: v, kind: 'f64' },
+      })
+    );
+  };
+  slider.addEventListener('input', onInput);
+  slider.addEventListener('change', onChange);
+  ctx.registerCleanup(() => {
+    slider.removeEventListener('input', onInput);
+    slider.removeEventListener('change', onChange);
   });
+
+  return wrapper;
 }
 
 /// Współdzielony builder dla Slider + SliderRow. SliderRow opakuje to
