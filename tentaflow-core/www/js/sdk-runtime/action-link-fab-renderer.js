@@ -1,12 +1,9 @@
 // =============================================================================
-// Plik: sdk-runtime/action-link-fab-renderer.js
-// Opis: Rendererzy LinkButton (0x0404), Link (0x0405), Fab (0x040C) —
-// Faza 6 Krok 3.3b-3. Wszystkie używają `renderIcon()` helpera z chunka
-// 3.3b-2. Nawigacja nie idzie przez raw `href` — addon dispatchuje
-// `click` event do backend handler'a (spec §6 0x0405 komentarz: "No raw
-// `href`; navigation flows through handlers").
-//
-// Spec ref: `tentaflow-sdk-spec/src/protocol/ui/actions/buttons.rs`.
+// File: sdk-runtime/action-link-fab-renderer.js
+// Description: Renderers for LinkButton (0x0404), Link (0x0405), Fab (0x040C)
+//              using <tf-button> web component. LinkButton/Link use ghost
+//              variant, Fab uses primary variant with icon.
+// Spec ref: tentaflow-sdk-spec/src/protocol/ui/actions/buttons.rs.
 // =============================================================================
 
 import {
@@ -41,18 +38,18 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
   }
 }
 
-/// Doczepia reaktywny label do elementu — pattern jak Button/IconButton.
-function bindLabel(element, bindRef, ctx) {
+// Reactive label binding on tf-button's label attribute.
+function bindLabelAttr(btn, bindRef, ctx) {
   const apply = () => {
     const v = resolveBindRef(bindRef, ctx.store);
-    element.textContent = v == null ? '' : String(v);
+    btn.setAttribute('label', v == null ? '' : String(v));
   };
   apply();
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
 // =============================================================================
-// LinkButton (0x0404) — link-styled button (klik → handler, NIE href)
+// LinkButton (0x0404) — link-styled button using <tf-button variant="ghost">
 // =============================================================================
 
 export const LINK_BUTTON_TAG = 0x0404;
@@ -77,33 +74,35 @@ function renderLinkButton(component, ctx) {
     'LinkButton.underline'
   );
 
-  // LinkButton emituje 'click', nie ma navigation URL'a → używamy <button>
-  // z type="button". Wygląd "link-style" ustala CSS przez tf-link-button.
-  const btn = document.createElement('button');
-  btn.setAttribute('type', 'button');
-  btn.classList.add('tf-link-button');
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', 'ghost');
   btn.classList.add(`tf-link-button--tone-${tone}`);
   btn.classList.add(`tf-link-button--underline-${underline}`);
 
+  // Leading icon via tf-button icon attribute or rendered element
   if (iconLeadingRaw != null) {
-    const icon = renderIcon(iconLeadingRaw, 'LinkButton.icon_leading');
-    icon.classList.add('tf-link-button__icon', 'tf-link-button__icon--leading');
-    btn.appendChild(icon);
+    const iconName = (iconLeadingRaw.kind === 'named') ? iconLeadingRaw.name : null;
+    if (iconName) {
+      btn.setAttribute('icon', iconName);
+    } else {
+      const icon = renderIcon(iconLeadingRaw, 'LinkButton.icon_leading');
+      btn.appendChild(icon);
+    }
   }
-  const labelEl = document.createElement('span');
-  labelEl.classList.add('tf-link-button__label');
-  btn.appendChild(labelEl);
-  bindLabel(labelEl, labelBind, ctx);
+
+  bindLabelAttr(btn, labelBind, ctx);
+
+  // Trailing icon appended after label
   if (iconTrailingRaw != null) {
     const icon = renderIcon(iconTrailingRaw, 'LinkButton.icon_trailing');
-    icon.classList.add('tf-link-button__icon', 'tf-link-button__icon--trailing');
     btn.appendChild(icon);
   }
+
   return btn;
 }
 
 // =============================================================================
-// Link (0x0405) — standardowy text link
+// Link (0x0405) — text link, no raw href, navigation via handlers
 // =============================================================================
 
 export const LINK_TAG = 0x0405;
@@ -128,40 +127,34 @@ function renderLink(component, ctx) {
   const leadingIconRaw = ctx.readField(component.fields, 3);
   const trailingIconRaw = ctx.readField(component.fields, 4);
 
-  // Spec §6 0x0405: "No raw href; navigation flows through handlers".
-  // Renderujemy <a> z href="#" + preventDefault na click (engine handler
-  // dispatchuje wire event), żeby semantyka role=link była zachowana
-  // dla screen reader'ów ALE bez faktycznej nawigacji URL'em.
-  const a = document.createElement('a');
-  a.setAttribute('href', '#');
-  a.setAttribute('role', 'link');
-  a.classList.add('tf-link');
-  a.classList.add(`tf-link--tone-${tone}`);
-  a.classList.add(`tf-link--underline-${underline}`);
-  // Blokuj default navigation (anchor href="#" inaczej scrollnie na top).
-  const onClickGuard = (e) => e.preventDefault();
-  a.addEventListener('click', onClickGuard);
-  ctx.registerCleanup(() => a.removeEventListener('click', onClickGuard));
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', 'ghost');
+  btn.classList.add(`tf-link--tone-${tone}`);
+  btn.classList.add(`tf-link--underline-${underline}`);
+  btn.setAttribute('role', 'link');
 
   if (leadingIconRaw != null) {
-    const icon = renderIcon(leadingIconRaw, 'Link.leading_icon');
-    icon.classList.add('tf-link__icon', 'tf-link__icon--leading');
-    a.appendChild(icon);
+    const iconName = (leadingIconRaw.kind === 'named') ? leadingIconRaw.name : null;
+    if (iconName) {
+      btn.setAttribute('icon', iconName);
+    } else {
+      const icon = renderIcon(leadingIconRaw, 'Link.leading_icon');
+      btn.appendChild(icon);
+    }
   }
-  const labelEl = document.createElement('span');
-  labelEl.classList.add('tf-link__label');
-  a.appendChild(labelEl);
-  bindLabel(labelEl, labelBind, ctx);
+
+  bindLabelAttr(btn, labelBind, ctx);
+
   if (trailingIconRaw != null) {
     const icon = renderIcon(trailingIconRaw, 'Link.trailing_icon');
-    icon.classList.add('tf-link__icon', 'tf-link__icon--trailing');
-    a.appendChild(icon);
+    btn.appendChild(icon);
   }
-  return a;
+
+  return btn;
 }
 
 // =============================================================================
-// Fab (0x040C) — floating action button
+// Fab (0x040C) — floating action button using <tf-button variant="primary">
 // =============================================================================
 
 export const FAB_TAG = 0x040C;
@@ -188,35 +181,31 @@ function renderFab(component, ctx) {
     FAB_POSITIONS,
     'Fab.position'
   );
-  const labelBind = ctx.readField(component.fields, 4); // Option<BindRef>
+  const labelBind = ctx.readField(component.fields, 4);
 
-  const btn = document.createElement('button');
-  btn.setAttribute('type', 'button');
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', 'primary');
+  if (size === 'sm') btn.setAttribute('size', 'sm');
   btn.classList.add('tf-fab');
   btn.classList.add(`tf-fab--tone-${tone}`);
   btn.classList.add(`tf-fab--size-${size}`);
   btn.classList.add(`tf-fab--position-${position}`);
 
-  // Icon (mandatory).
-  const iconEl = renderIcon(iconRaw, 'Fab.icon');
-  iconEl.classList.add('tf-fab__icon');
-  btn.appendChild(iconEl);
+  // Icon
+  const iconName = (iconRaw.kind === 'named') ? iconRaw.name : null;
+  if (iconName) {
+    btn.setAttribute('icon', iconName);
+  } else {
+    const iconEl = renderIcon(iconRaw, 'Fab.icon');
+    btn.appendChild(iconEl);
+  }
 
   if (labelBind != null) {
-    // Extended FAB — wyświetla label obok ikonki. Variant `extended` CSS
-    // jest aktywowany przez obecność span'a z labelem.
+    // Extended FAB with label
     btn.classList.add('tf-fab--extended');
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-fab__label');
-    btn.appendChild(labelEl);
-    bindLabel(labelEl, labelBind, ctx);
+    bindLabelAttr(btn, labelBind, ctx);
   } else {
-    // FAB bez visual label'a — semantyka button'a wymaga accessible name.
-    // Spec §6 0x040C: addon musi dostarczyć albo `label` (BindRef) albo
-    // `Component.a11y.label` z NIEPUSTĄ wartością. Engine wpisze go
-    // później w `applyAccessibility` jako aria-label, ale tu walidujemy
-    // że INITIAL wartość jest sensowna — inaczej button jest anonymous
-    // dla screen reader'ów do czasu pierwszego patcha BindRef'a.
+    // Icon-only FAB needs accessible name via a11y.label
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError(
         'Fab without `label` field requires `Component.a11y.label` for accessible name'
@@ -233,7 +222,7 @@ function renderFab(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerActionLinkFabRenderers() {

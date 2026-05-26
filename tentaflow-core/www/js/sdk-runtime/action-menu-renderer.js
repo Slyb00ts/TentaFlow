@@ -1,13 +1,10 @@
 // =============================================================================
-// Plik: sdk-runtime/action-menu-renderer.js
-// Opis: Renderery MenuButton (0x0406) + Menu (0x0407) — Faza 6 Krok 3.3b-5.
-// MenuButton: trigger button + dropdown popup. Menu: standalone menu z
-// opcjonalnym search. Oba dzielą `MenuItem` rendering (id, label BindRef,
-// icon?, badge?, shortcut?, danger, disabled?, divider_after).
-// `badge` → throw (InlineBadge wymaga osobnego renderer'a w 3.3d).
-//
-// Spec ref: `tentaflow-sdk-spec/src/protocol/ui/actions/menus.rs` +
-// `inline.rs` (MenuItem struct).
+// File: sdk-runtime/action-menu-renderer.js
+// Description: Renderers for MenuButton (0x0406) and Menu (0x0407) using
+//              <tf-menu>, <tf-menu-item>, <tf-menu-divider> and <tf-button>
+//              web components. Menu standalone uses tf-menu directly.
+// Spec ref: tentaflow-sdk-spec/src/protocol/ui/actions/menus.rs +
+//           inline.rs (MenuItem struct).
 // =============================================================================
 
 import {
@@ -26,8 +23,22 @@ const MENU_PLACEMENTS = new Set([
   'left_start', 'left_end',
   'right_start', 'right_end',
 ]);
-// MenuItem FieldMap keys: 0=id, 1=label, 2=icon, 3=badge, 4=shortcut, 5=danger, 6=disabled, 7=divider_after
 const MENU_ITEM_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
+
+// SDK variant -> tf-button variant
+const VARIANT_MAP = {
+  primary: 'primary',
+  secondary: 'secondary',
+  tertiary: 'ghost',
+  ghost: 'ghost',
+  destructive: 'danger',
+  link: 'ghost',
+};
+
+// SDK placement -> tf-menu placement (underscores to hyphens)
+function mapPlacement(p) {
+  return p.replace(/_/g, '-');
+}
 
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
@@ -75,18 +86,13 @@ function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
 }
 
 // =============================================================================
-// Wspólny renderer MenuItem (używany przez MenuButton i Menu)
+// Shared: build <tf-menu-item> and <tf-menu-divider> elements
 // =============================================================================
 
-/// Buduje listę <li> + opcjonalnych separator'ów dla `MenuItem[]`. Klik
-/// na item dispatchuje CustomEvent `item_click` z detail.item_id na root
-/// element popup'u/listy. Lista nie posiada własnej semantyki focus —
-/// zarządza nim caller (MenuButton popup wymaga keyboard nav).
-// MenuItem: 0=id, 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge), 4=shortcut, 5=danger, 6=disabled(BindRef), 7=divider_after
-function renderMenuItems(items, ctx, listEl, options = {}) {
-  const filterPredicate = options.filterPredicate || (() => true);
-  const itemMeta = [];
+function buildMenuItems(items, ctx, menuEl) {
   const seenIds = new Set();
+  const itemMeta = [];
+
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (!Array.isArray(item)) {
@@ -107,8 +113,7 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
     }
     const badgeRaw = ctx.readField(item, 3);
     if (badgeRaw != null) {
-      // InlineBadge ma własny renderer w chunku 3.3d. Tu odrzucamy obecność.
-      // Icon/badge gracefully skipped
+      // Badge gracefully skipped
     }
     const danger = requireBool(
       ctx.readField(item, 5) ?? false,
@@ -123,103 +128,64 @@ function renderMenuItems(items, ctx, listEl, options = {}) {
       ? null
       : requireString(shortcutRaw, `MenuItem[${i}].shortcut`);
 
-    const li = document.createElement('li');
-    li.classList.add('tf-menu__item');
-    li.setAttribute('role', 'menuitem');
-    li.setAttribute('data-menu-item-id', itemId);
-    li.setAttribute('tabindex', '-1');
-    if (danger) li.classList.add('tf-menu__item--danger');
-
     const iconRaw = ctx.readField(item, 2);
-    if (iconRaw != null) {
-      const iconEl = renderIcon(iconRaw, `MenuItem[${i}].icon`);
-      iconEl.classList.add('tf-menu__item-icon');
-      li.appendChild(iconEl);
-    }
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-menu__item-label');
-    li.appendChild(labelEl);
+    const iconName = (iconRaw && iconRaw.kind === 'named') ? iconRaw.name : null;
+
+    const menuItem = document.createElement('tf-menu-item');
+    menuItem.setAttribute('action', itemId);
+    if (iconName) menuItem.setAttribute('icon', iconName);
+    if (danger) menuItem.setAttribute('danger', '');
+
+    // Reactive label
     const applyLabel = () => {
       const v = resolveBindRef(labelBind, ctx.store);
-      labelEl.textContent = v == null ? '' : String(v);
+      menuItem.innerHTML = v == null ? '' : String(v);
     };
     applyLabel();
     ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
 
-    if (shortcut != null) {
-      const sc = document.createElement('span');
-      sc.classList.add('tf-menu__item-shortcut');
-      sc.textContent = shortcut;
-      li.appendChild(sc);
-    }
-
-    // Reactive disabled przez aria-disabled + ignorowanie kliknięć.
+    // Reactive disabled
     let isDisabled = false;
     const disabledBind = ctx.readField(item, 6);
     if (disabledBind != null) {
       const applyDisabled = () => {
         isDisabled = resolveBindRef(disabledBind, ctx.store) === true;
         if (isDisabled) {
-          li.setAttribute('aria-disabled', 'true');
-          li.classList.add('tf-menu__item--disabled');
+          menuItem.setAttribute('disabled', '');
         } else {
-          li.removeAttribute('aria-disabled');
-          li.classList.remove('tf-menu__item--disabled');
+          menuItem.removeAttribute('disabled');
         }
       };
       applyDisabled();
       ctx.registerCleanup(subscribeBindRef(disabledBind, ctx.store, applyDisabled));
     }
 
-    const onClick = (e) => {
-      if (isDisabled) {
-        e.preventDefault();
-        e.stopPropagation();
-        return;
-      }
-      // stopPropagation zatrzymuje native click event przed bubble do
-      // listy — caller ma deterministyczny detail.item_id w `item_click`.
-      e.stopPropagation();
-      listEl.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('item_click', {
-          bubbles: false,
-          detail: { item_id: itemId },
-        })
-      );
-    };
-    li.addEventListener('click', onClick);
-    ctx.registerCleanup(() => li.removeEventListener('click', onClick));
-
-    itemMeta.push({ itemId, li, label: () => labelEl.textContent || '' });
-    listEl.appendChild(li);
+    menuEl.appendChild(menuItem);
+    itemMeta.push({ itemId, menuItem, label: () => menuItem.textContent || '' });
 
     if (dividerAfter && i < items.length - 1) {
-      const sep = document.createElement('li');
-      sep.classList.add('tf-menu__divider');
-      sep.setAttribute('role', 'separator');
-      listEl.appendChild(sep);
+      const divider = document.createElement('tf-menu-divider');
+      menuEl.appendChild(divider);
     }
   }
-  // filterPredicate — używane przez Menu z search dla filtrowania.
+
   return {
     refreshFilter: (query) => {
       const q = (query || '').trim().toLowerCase();
-      for (const { li, label } of itemMeta) {
+      for (const { menuItem, label } of itemMeta) {
         const text = label().toLowerCase();
         if (q.length === 0 || text.includes(q)) {
-          li.removeAttribute('hidden');
+          menuItem.removeAttribute('hidden');
         } else {
-          li.setAttribute('hidden', '');
+          menuItem.setAttribute('hidden', '');
         }
       }
-      // filterPredicate dla testów / future use.
-      filterPredicate(q);
     },
   };
 }
 
 // =============================================================================
-// MenuButton (0x0406)
+// MenuButton (0x0406) — <tf-button> trigger + <tf-menu> dropdown
 // =============================================================================
 
 export const MENU_BUTTON_TAG = 0x0406;
@@ -227,8 +193,8 @@ const MENU_BUTTON_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
 
 function renderMenuButton(component, ctx) {
   assertOnlyKnownFields(component.fields, MENU_BUTTON_FIELD_KEYS, 'MenuButton');
-  const triggerLabelBind = ctx.readField(component.fields, 0); // Option<BindRef>
-  const triggerIconRaw = ctx.readField(component.fields, 1); // Option<IconRef>
+  const triggerLabelBind = ctx.readField(component.fields, 0);
+  const triggerIconRaw = ctx.readField(component.fields, 1);
   const triggerVariant = requireEnum(
     ctx.readField(component.fields, 2),
     BUTTON_VARIANTS,
@@ -249,10 +215,6 @@ function renderMenuButton(component, ctx) {
       'MenuButton: at least one of trigger_label / trigger_icon is required'
     );
   }
-  // A11y enforcement: bez visual trigger_label, button musi mieć
-  // explicite ustawiony accessible name przez Component.a11y.label —
-  // named-icon ma aria-hidden=true, więc sam icon nie daje accessible
-  // name dla screen reader'ów (analogicznie do Fab).
   if (triggerLabelBind == null) {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError(
@@ -271,40 +233,27 @@ function renderMenuButton(component, ctx) {
   wrapper.classList.add('tf-menu-button');
   wrapper.classList.add(`tf-menu-button--placement-${placement}`);
 
-  // Trigger button.
-  const trigger = document.createElement('button');
-  trigger.setAttribute('type', 'button');
-  trigger.classList.add('tf-menu-button__trigger');
-  trigger.classList.add(`tf-button--variant-${triggerVariant}`);
-  trigger.setAttribute('aria-haspopup', 'menu');
-  trigger.setAttribute('aria-expanded', 'false');
+  // Trigger: <tf-button>
+  const trigger = document.createElement('tf-button');
+  trigger.setAttribute('variant', VARIANT_MAP[triggerVariant] || 'primary');
 
-  if (triggerIconRaw != null) {
-    const icon = renderIcon(triggerIconRaw, 'MenuButton.trigger_icon');
-    icon.classList.add('tf-menu-button__trigger-icon');
-    trigger.appendChild(icon);
-  }
+  const triggerIconName = (triggerIconRaw && triggerIconRaw.kind === 'named')
+    ? triggerIconRaw.name : null;
+  if (triggerIconName) trigger.setAttribute('icon', triggerIconName);
+
   if (triggerLabelBind != null) {
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-menu-button__trigger-label');
-    trigger.appendChild(labelEl);
-    const apply = () => {
+    const applyLabel = () => {
       const v = resolveBindRef(triggerLabelBind, ctx.store);
-      labelEl.textContent = v == null ? '' : String(v);
+      trigger.setAttribute('label', v == null ? '' : String(v));
     };
-    apply();
-    ctx.registerCleanup(subscribeBindRef(triggerLabelBind, ctx.store, apply));
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(triggerLabelBind, ctx.store, applyLabel));
   } else {
-    // Icon-only trigger — accessible name musi być na samym button-trigger
-    // (clickable element), nie na wrapper'ze. Engine `applyAccessibility`
-    // ustawi aria-label na wrapper, my dodatkowo propagujemy na trigger
-    // reaktywnie, żeby screen reader odczytał button z poprawnym labelem.
+    // Icon-only trigger: propagate a11y label
     const a11yLabel = component.a11y && component.a11y.label;
     if (a11yLabel != null) {
       const apply = () => {
         const v = resolveBindRef(a11yLabel, ctx.store);
-        // Trimujemy — whitespace-only nie daje accessible name. Pusty
-        // string albo non-string usuwa atrybut.
         if (typeof v === 'string' && v.trim().length > 0) {
           trigger.setAttribute('aria-label', v);
         } else {
@@ -317,75 +266,43 @@ function renderMenuButton(component, ctx) {
   }
   wrapper.appendChild(trigger);
 
-  // Popup (initially hidden).
-  const popupId = `tf-menu-${component.id}-popup`;
-  trigger.setAttribute('aria-controls', popupId);
-  const popup = document.createElement('ul');
-  popup.classList.add('tf-menu-button__popup', 'tf-menu');
-  popup.setAttribute('role', 'menu');
-  popup.setAttribute('id', popupId);
-  popup.setAttribute('hidden', '');
-  wrapper.appendChild(popup);
+  // Menu: <tf-menu>
+  const menu = document.createElement('tf-menu');
+  menu.setAttribute('placement', mapPlacement(placement));
+  wrapper.appendChild(menu);
 
-  renderMenuItems(items, ctx, popup);
+  buildMenuItems(items, ctx, menu);
 
-  // Toggle popup. Klik na trigger przełącza visibility; klik outside
-  // (na document) zamyka. Escape też zamyka.
-  let open = false;
-  const setOpen = (value) => {
-    open = value;
-    trigger.setAttribute('aria-expanded', value ? 'true' : 'false');
-    if (value) {
-      popup.removeAttribute('hidden');
-      wrapper.classList.add('tf-menu-button--open');
-    } else {
-      popup.setAttribute('hidden', '');
-      wrapper.classList.remove('tf-menu-button--open');
-    }
-  };
+  // Toggle menu on trigger click
   const onTriggerClick = (e) => {
     e.stopPropagation();
-    setOpen(!open);
-  };
-  const onDocClick = (e) => {
-    if (!open) return;
-    if (!wrapper.contains(e.target)) setOpen(false);
-  };
-  const onKeyDown = (e) => {
-    if (e.key === 'Escape' && open) {
-      setOpen(false);
-      trigger.focus();
+    if (menu.hasAttribute('open')) {
+      menu.close();
+    } else {
+      menu.open();
     }
   };
   trigger.addEventListener('click', onTriggerClick);
-  document.addEventListener('click', onDocClick);
-  wrapper.addEventListener('keydown', onKeyDown);
   ctx.registerCleanup(() => trigger.removeEventListener('click', onTriggerClick));
-  ctx.registerCleanup(() => document.removeEventListener('click', onDocClick));
-  ctx.registerCleanup(() => wrapper.removeEventListener('keydown', onKeyDown));
 
-  // Klik na MenuItem (item_click) zamyka popup.
-  const onItemClick = () => setOpen(false);
-  popup.addEventListener('item_click', onItemClick);
-  ctx.registerCleanup(() => popup.removeEventListener('item_click', onItemClick));
-  // Re-emit item_click na wrapper żeby Component.handlers `select`/`item_click`
-  // mogło to złapać. Engine attachuje listenery do `wrapper` (root element).
-  const onItemReemit = (e) => {
+  // Forward tf-menu-select to wrapper as item_click
+  const onSelect = (e) => {
+    menu.close();
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('item_click', {
         bubbles: false,
-        detail: e.detail,
+        detail: { item_id: e.detail && e.detail.action },
       })
     );
   };
-  popup.addEventListener('item_click', onItemReemit);
-  ctx.registerCleanup(() => popup.removeEventListener('item_click', onItemReemit));
+  menu.addEventListener('tf-menu-select', onSelect);
+  ctx.registerCleanup(() => menu.removeEventListener('tf-menu-select', onSelect));
 
   return wrapper;
 }
 
 // =============================================================================
-// Menu (0x0407) — standalone menu z opcjonalnym search
+// Menu (0x0407) — standalone <tf-menu> with optional search
 // =============================================================================
 
 export const MENU_TAG = 0x0407;
@@ -409,20 +326,19 @@ function renderMenu(component, ctx) {
 
   let searchInput = null;
   if (search) {
-    searchInput = document.createElement('input');
+    searchInput = document.createElement('tf-input');
     searchInput.setAttribute('type', 'search');
+    searchInput.setAttribute('placeholder', 'Search...');
+    searchInput.setAttribute('aria-label', 'Search menu');
     searchInput.classList.add('tf-menu-standalone__search');
-    searchInput.setAttribute('placeholder', 'Szukaj…');
-    searchInput.setAttribute('aria-label', 'Szukaj w menu');
     wrapper.appendChild(searchInput);
   }
 
-  const list = document.createElement('ul');
-  list.classList.add('tf-menu-standalone__list', 'tf-menu');
-  list.setAttribute('role', 'menu');
-  wrapper.appendChild(list);
+  const menu = document.createElement('tf-menu');
+  menu.setAttribute('open', '');
+  wrapper.appendChild(menu);
 
-  const ctrl = renderMenuItems(items, ctx, list);
+  const ctrl = buildMenuItems(items, ctx, menu);
 
   if (searchInput) {
     const onInput = () => ctrl.refreshFilter(searchInput.value);
@@ -430,24 +346,24 @@ function renderMenu(component, ctx) {
     ctx.registerCleanup(() => searchInput.removeEventListener('input', onInput));
   }
 
-  // Re-emit item_click z listy na wrapper (analogicznie do MenuButton).
-  const onItemReemit = (e) => {
+  // Forward tf-menu-select to wrapper as item_click
+  const onSelect = (e) => {
     e.stopPropagation();
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('item_click', {
         bubbles: false,
-        detail: e.detail,
+        detail: { item_id: e.detail && e.detail.action },
       })
     );
   };
-  list.addEventListener('item_click', onItemReemit);
-  ctx.registerCleanup(() => list.removeEventListener('item_click', onItemReemit));
+  menu.addEventListener('tf-menu-select', onSelect);
+  ctx.registerCleanup(() => menu.removeEventListener('tf-menu-select', onSelect));
 
   return wrapper;
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerActionMenuRenderers() {

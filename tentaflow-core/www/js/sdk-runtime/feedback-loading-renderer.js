@@ -1,12 +1,9 @@
 // =============================================================================
 // File: sdk-runtime/feedback-loading-renderer.js
-// Description: Renderers for loading feedback components: Skeleton (0x0506),
-// Spinner (0x0507), LoadingBar (0x0508) — chunk 3.3e-2.
-//
-// Skeleton shows placeholder shapes with optional shimmer animation.
-// Spinner shows animated loading indicators in four variants.
-// LoadingBar shows a thin progress bar (determinate or indeterminate).
-//
+// Description: Renderers for loading feedback components:
+//   - Skeleton  (0x0506) — placeholder shapes with shimmer (div, no tf-*)
+//   - Spinner   (0x0507) — uses <tf-spinner> with size attribute
+//   - LoadingBar(0x0508) — uses <tf-progress-bar> or div for indeterminate
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/feedback/loading.rs.
 // =============================================================================
 
@@ -23,7 +20,7 @@ import {
 import { parseDimensionToken } from './data-specialised-renderer.js';
 
 // =============================================================================
-// Skeleton (0x0506)
+// Skeleton (0x0506) — div with shimmer class (no tf-skeleton exists)
 // =============================================================================
 
 export const SKELETON_TAG = 0x0506;
@@ -106,7 +103,7 @@ function renderSkeleton(component, ctx) {
 }
 
 // =============================================================================
-// Spinner (0x0507)
+// Spinner (0x0507) — uses <tf-spinner> web component
 // =============================================================================
 
 export const SPINNER_TAG = 0x0507;
@@ -124,49 +121,22 @@ function renderSpinner(component, ctx) {
 
   if (labelBind != null) assertBindRef(labelBind, 'Spinner.label');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-spinner', `tf-spinner--size-${size}`, `tf-spinner--tone-${tone}`, `tf-spinner--${variant}`);
-  wrapper.setAttribute('role', 'status');
+  // <tf-spinner> supports size attribute (xs, sm, md, lg, xl)
+  const spinner = document.createElement('tf-spinner');
+  spinner.setAttribute('size', size);
+  spinner.classList.add(`tf-spinner--tone-${tone}`, `tf-spinner--${variant}`);
 
-  switch (variant) {
-    case 'default':
-    case 'ring': {
-      const circle = document.createElement('div');
-      circle.classList.add('tf-spinner__circle');
-      wrapper.appendChild(circle);
-      break;
-    }
-    case 'dots': {
-      for (let i = 0; i < 3; i++) {
-        const dot = document.createElement('div');
-        dot.classList.add('tf-spinner__dot');
-        wrapper.appendChild(dot);
-      }
-      break;
-    }
-    case 'bars': {
-      for (let i = 0; i < 4; i++) {
-        const bar = document.createElement('div');
-        bar.classList.add('tf-spinner__bar');
-        wrapper.appendChild(bar);
-      }
-      break;
-    }
-  }
-
+  // Reactive screen-reader label
   if (labelBind != null) {
-    const srLabel = document.createElement('span');
-    srLabel.classList.add('tf-visually-hidden');
     const applyLabel = () => {
       const v = resolveBindRef(labelBind, ctx.store);
-      srLabel.textContent = v == null ? '' : String(v);
+      spinner.setAttribute('aria-label', v == null ? 'Loading' : String(v));
     };
     applyLabel();
     ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
-    wrapper.appendChild(srLabel);
   }
 
-  return wrapper;
+  return spinner;
 }
 
 // =============================================================================
