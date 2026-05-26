@@ -1,10 +1,8 @@
 // =============================================================================
-// Plik: sdk-runtime/data-sparkline-renderer.js
-// Opis: Renderer Sparkline (0x0215) — chunk 3.3d-7. Inline mini chart z
-// prawdziwym SVG rendering: line (polyline), area (polygon z fill), bar
-// (rectangles). data_path: StatePath → Array<finite number>. Reactive
-// rebuild przy patch'u.
-//
+// File: sdk-runtime/data-sparkline-renderer.js
+// Description: Renderer Sparkline (0x0215) using <tf-sparkline> web component.
+//              Maps data_path, variant, tone to tf-sparkline properties:
+//              .points, .color, .fill, .showDots, .height.
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/charts.rs Sparkline.
 // =============================================================================
 
@@ -15,7 +13,17 @@ import {
 
 const SPARKLINE_VARIANTS = new Set(['line', 'area', 'bar']);
 const TONES = new Set(['neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted']);
-const SVG_NS = 'http://www.w3.org/2000/svg';
+
+// Map SDK tone to tf-sparkline color role names
+const TONE_TO_COLOR = {
+  neutral: 'primary',
+  primary: 'primary',
+  success: 'success',
+  warning: 'warning',
+  critical: 'danger',
+  info: 'info',
+  muted: 'primary',
+};
 
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
@@ -44,7 +52,7 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
 }
 
 // =============================================================================
-// Sparkline (0x0215)
+// Sparkline (0x0215) — uses <tf-sparkline>
 // =============================================================================
 
 export const SPARKLINE_TAG = 0x0215;
@@ -63,22 +71,21 @@ function renderSparkline(component, ctx) {
   const showMinMax = requireBool(ctx.readField(component.fields, 5), 'Sparkline.show_min_max');
 
   const wrapper = document.createElement('span');
-  wrapper.classList.add('tf-sparkline');
+  wrapper.classList.add('tf-sparkline-wrapper');
   wrapper.classList.add(`tf-sparkline--variant-${variant}`);
   wrapper.classList.add(`tf-sparkline--tone-${tone}`);
   wrapper.style.display = 'inline-flex';
   wrapper.style.alignItems = 'center';
   wrapper.style.gap = '0.5em';
 
-  const svg = document.createElementNS(SVG_NS, 'svg');
-  svg.classList.add('tf-sparkline__svg');
-  svg.setAttribute('width', String(widthPx));
-  svg.setAttribute('height', String(heightPx));
-  svg.setAttribute('viewBox', `0 0 ${widthPx} ${heightPx}`);
-  svg.setAttribute('preserveAspectRatio', 'none');
-  svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', 'Sparkline chart');
-  wrapper.appendChild(svg);
+  // <tf-sparkline> web component
+  const sparkline = document.createElement('tf-sparkline');
+  sparkline.style.width = `${widthPx}px`;
+  sparkline.color = TONE_TO_COLOR[tone] || 'primary';
+  sparkline.fill = (variant === 'area');
+  sparkline.showDots = false;
+  sparkline.height = heightPx;
+  wrapper.appendChild(sparkline);
 
   let minBadge = null;
   let maxBadge = null;
@@ -103,70 +110,23 @@ function renderSparkline(component, ctx) {
     let arr;
     try { arr = ctx.store.read(dataPath); } catch { arr = undefined; }
     if (!Array.isArray(arr)) return [];
-    // Filter finite numbers; nieliczbowe wpisy są ignorowane (renderer
-    // jest defensywny — błędne dane nie crashują UI).
     return arr.filter((n) => typeof n === 'number' && Number.isFinite(n));
   };
 
   const rebuild = () => {
-    svg.replaceChildren();
     const data = readData();
-    if (data.length === 0) {
-      if (minBadge) minBadge.textContent = '';
-      if (maxBadge) maxBadge.textContent = '';
-      return;
-    }
-    let min = data[0], max = data[0];
-    for (const n of data) { if (n < min) min = n; if (n > max) max = n; }
+    sparkline.points = data;
+
     if (showMinMax) {
-      minBadge.textContent = formatStat(min);
-      maxBadge.textContent = formatStat(max);
-    }
-    // Range protection — gdy wszystkie wartości równe, użyj range=1 żeby
-    // nie dzielić przez 0; punkt na środku SVG.
-    const range = max - min === 0 ? 1 : max - min;
-    const n = data.length;
-    if (variant === 'bar') {
-      // Bar variant: każdy słupek to <rect> wysokości proporcjonalnej do
-      // (value - min) / range; szerokość = width/n.
-      const barW = n > 0 ? widthPx / n : widthPx;
-      for (let i = 0; i < n; i++) {
-        const h = ((data[i] - min) / range) * heightPx;
-        const rect = document.createElementNS(SVG_NS, 'rect');
-        rect.setAttribute('x', String(i * barW));
-        rect.setAttribute('y', String(heightPx - h));
-        // Spec wymaga width/n bez sztucznej przerwy — wizualne odstępy są
-        // domeną CSS (opcjonalny stroke z surface bg między barami).
-        rect.setAttribute('width', String(barW));
-        rect.setAttribute('height', String(h));
-        rect.classList.add('tf-sparkline__bar');
-        svg.appendChild(rect);
+      if (data.length === 0) {
+        minBadge.textContent = '';
+        maxBadge.textContent = '';
+      } else {
+        let min = data[0], max = data[0];
+        for (const n of data) { if (n < min) min = n; if (n > max) max = n; }
+        minBadge.textContent = formatStat(min);
+        maxBadge.textContent = formatStat(max);
       }
-      return;
-    }
-    // line/area: polyline po wszystkich punktach.
-    const stepX = n > 1 ? widthPx / (n - 1) : 0;
-    const points = data.map((v, i) => {
-      const x = i * stepX;
-      const y = heightPx - ((v - min) / range) * heightPx;
-      return `${x},${y}`;
-    }).join(' ');
-    if (variant === 'area') {
-      // Area: polygon z dolnymi rogami SVG zamknięty pod krzywą.
-      const polygon = document.createElementNS(SVG_NS, 'polygon');
-      polygon.setAttribute('points', `0,${heightPx} ${points} ${widthPx},${heightPx}`);
-      polygon.classList.add('tf-sparkline__area');
-      svg.appendChild(polygon);
-      // Plus widoczna linia powyżej fill'u (lepsza czytelność).
-      const line = document.createElementNS(SVG_NS, 'polyline');
-      line.setAttribute('points', points);
-      line.classList.add('tf-sparkline__line');
-      svg.appendChild(line);
-    } else {
-      const line = document.createElementNS(SVG_NS, 'polyline');
-      line.setAttribute('points', points);
-      line.classList.add('tf-sparkline__line');
-      svg.appendChild(line);
     }
   };
   rebuild();
@@ -175,7 +135,6 @@ function renderSparkline(component, ctx) {
   return wrapper;
 }
 
-/// Format min/max badge: liczby całkowite bez kropki, ułamki z 2 miejscami.
 function formatStat(n) {
   if (!Number.isFinite(n)) return '';
   if (Number.isInteger(n)) return String(n);
@@ -183,7 +142,7 @@ function formatStat(n) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerDataSparklineRenderer() {
