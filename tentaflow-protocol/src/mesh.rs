@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: mesh.rs
-// Opis: Typy wiadomosci mesh dla komunikacji gossip, membership, CRDT sync
+// Opis: Typy wiadomosci mesh dla komunikacji gossip, membership
 //       i service discovery miedzy nodami TentaFlow.AI przez QUIC.
 // =============================================================================
 
@@ -16,43 +16,10 @@ use crate::profiling::{
 };
 
 // =============================================================================
-// Typ operacji CRDT
-// =============================================================================
-
-/// Rodzaj operacji CRDT przesylanej w synchronizacji stanu.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-pub enum CrdtOpType {
-    /// LWW-Register - ustawienie wartosci
-    SetValue(String),
-    /// OR-Set - dodanie elementu
-    AddElement(String),
-    /// OR-Set - usuniecie elementu
-    RemoveElement(String),
-}
-
-// =============================================================================
-// Operacja synchronizacji CRDT
-// =============================================================================
-
-/// Pojedyncza operacja CRDT w serializowalnej formie.
-/// Zawiera zegar logiczny (czas + hash noda) do rozwiazywania konfliktow.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct CrdtSyncOp {
-    /// Czas logiczny operacji
-    pub clock_time: u64,
-    /// Hash identyfikatora noda (czesc zegara wektorowego)
-    pub clock_node_hash: u64,
-    /// Klucz danych ktorego dotyczy operacja
-    pub key: String,
-    /// Typ operacji CRDT
-    pub op_type: CrdtOpType,
-}
-
-// =============================================================================
 // Glowny enum wiadomosci mesh
 // =============================================================================
 
-/// Wiadomosc protokolu mesh - gossip, membership, CRDT, service discovery
+/// Wiadomosc protokolu mesh - gossip, membership, service discovery
 /// i forwarding requestow miedzy nodami.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshMessage {
@@ -82,16 +49,6 @@ pub enum MeshMessage {
     /// Opuszczenie mesh przez nod
     Leave { node_id: String },
 
-    // -- CRDT sync --
-    /// Synchronizacja stanu CRDT - lista operacji do zaaplikowania
-    StateSync {
-        from: String,
-        operations: Vec<CrdtSyncOp>,
-    },
-
-    /// Zadanie synchronizacji stanu od podanego czasu
-    StateSyncRequest { from: String, since_time: u64 },
-
     // -- Forwarding --
     /// Przekazanie requestu do innego noda
     ForwardRequest {
@@ -112,13 +69,6 @@ pub enum MeshMessage {
 
     /// Pelna wymiana stanu po nawiazaniu polaczenia QUIC
     FullStateExchange(MeshFullState),
-
-    /// Przyrostowa synchronizacja CRDT (delta)
-    CrdtDeltaSync {
-        from: String,
-        operations: Vec<CrdtSyncOp>,
-        version_vector: Vec<(u64, u64)>,
-    },
 
     /// Aktualizacja listy modeli na nodzie
     ModelListUpdate {
@@ -332,8 +282,6 @@ pub struct MeshFullState {
     pub models: Vec<MeshModelInfo>,
     /// Dzialajace kontenery Docker
     pub containers: Vec<MeshContainerInfo>,
-    /// Operacje CRDT do synchronizacji
-    pub crdt_operations: Vec<CrdtSyncOp>,
     /// Wektor wersji: pary (hash_noda, czas_logiczny)
     pub version_vector: Vec<(u64, u64)>,
     /// Platforma noda: "linux", "macos", "windows", "android", "ios"
@@ -669,7 +617,6 @@ impl std::fmt::Debug for MeshCommandType {
 // =============================================================================
 
 pub const MESH_MSG_HEARTBEAT: u8 = 0x10;
-pub const MESH_MSG_CRDT_DELTA: u8 = 0x11;
 pub const MESH_MSG_FORWARD_REQ: u8 = 0x13;
 pub const MESH_MSG_MODEL_LIST: u8 = 0x15;
 pub const MESH_MSG_NODE_INFO: u8 = 0x18;
@@ -1224,43 +1171,6 @@ mod tests {
     }
 
     #[test]
-    fn test_state_sync_roundtrip() {
-        let ops = vec![
-            CrdtSyncOp {
-                clock_time: 100,
-                clock_node_hash: 0xDEAD,
-                key: "model/status".to_string(),
-                op_type: CrdtOpType::SetValue("ready".to_string()),
-            },
-            CrdtSyncOp {
-                clock_time: 101,
-                clock_node_hash: 0xBEEF,
-                key: "active_models".to_string(),
-                op_type: CrdtOpType::AddElement("llama3".to_string()),
-            },
-        ];
-
-        let msg = MeshMessage::StateSync {
-            from: "node-3".to_string(),
-            operations: ops,
-        };
-
-        let bytes = msg
-            .serialize_rkyv()
-            .expect("Serializacja state sync powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja state sync powinna sie udac");
-
-        match archived {
-            ArchivedMeshMessage::StateSync { from, operations } => {
-                assert_eq!(from.as_str(), "node-3");
-                assert_eq!(operations.len(), 2);
-            }
-            _ => panic!("Oczekiwano wariantu StateSync"),
-        }
-    }
-
-    #[test]
     fn test_forward_roundtrip() {
         let payload = vec![1u8, 2, 3, 4, 5];
         let msg = MeshMessage::ForwardRequest {
@@ -1716,12 +1626,6 @@ mod tests {
                 cpu_percent: 55.0,
                 memory_mb: 4096,
             }],
-            crdt_operations: vec![CrdtSyncOp {
-                clock_time: 200,
-                clock_node_hash: 0xCAFE,
-                key: "status".to_string(),
-                op_type: CrdtOpType::SetValue("active".to_string()),
-            }],
             version_vector: vec![(0xCAFE, 200), (0xBEEF, 150)],
             platform: "linux".to_string(),
             cpu_count: 16,
@@ -1746,7 +1650,6 @@ mod tests {
                 assert_eq!(state.models[0].max_context, 8192);
                 assert_eq!(state.containers.len(), 1);
                 assert_eq!(state.containers[0].name.as_str(), "vllm-server");
-                assert_eq!(state.crdt_operations.len(), 1);
                 assert_eq!(state.version_vector.len(), 2);
             }
             _ => panic!("Oczekiwano wariantu FullStateExchange"),

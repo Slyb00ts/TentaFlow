@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: error/mod.rs
 // Opis: Hierarchia bledow dla TentaFlow.Core — wspolna dla Router, Desktop
-//       i Mobile. Obejmuje bledy routera, sieci, gossip protocol, CRDT, peer
+//       i Mobile. Obejmuje bledy routera, sieci, gossip protocol, peer
 //       discovery oraz lokalnej inferencji.
 // =============================================================================
 
@@ -94,17 +94,6 @@ pub enum CoreError {
     /// Blad propagacji wiadomosci gossip (serializacja, dostarczenie, duplikat)
     #[error("Blad gossip protocol: {message}")]
     GossipError {
-        message: String,
-        #[source]
-        source: Option<anyhow::Error>,
-    },
-
-    // =========================================================================
-    // Bledy CRDT
-    // =========================================================================
-    /// Blad synchronizacji CRDT (merge conflict, niepoprawny stan, niezgodnosc wersji)
-    #[error("Blad CRDT sync: {message}")]
-    CrdtError {
         message: String,
         #[source]
         source: Option<anyhow::Error>,
