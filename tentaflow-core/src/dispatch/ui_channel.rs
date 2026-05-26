@@ -115,6 +115,12 @@ fn handle_panel_open(
     // Register addon→connection mapping so host functions (ui_render_cbor)
     // can find this session and register declared actions.
     let user_id_for_conn = extract_user_id_i64(ctx).unwrap_or(0);
+    tracing::info!(
+        addon = %panel_open.addon_id,
+        user_id = user_id_for_conn,
+        conn_id = ctx.connection_id,
+        "PanelOpen: registering addon connection"
+    );
     ctx.state.ui_sessions.register_addon_connection(
         &panel_open.addon_id,
         user_id_for_conn,
