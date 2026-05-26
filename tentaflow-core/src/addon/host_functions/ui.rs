@@ -130,8 +130,10 @@ pub fn ui_render_cbor(
     // Validate outbound slot/shell messages against session state.
     if let Some(registry) = crate::addon::ui_session::global_registry() {
         let user_id = caller.data().user_id.unwrap_or(0);
+        tracing::info!(addon = %addon_id, user_id, tag = tag.as_u16(), "ui_render_cbor: looking up connection");
 
         if let Some(conn_id) = registry.find_connection(&addon_id, user_id) {
+            tracing::info!(conn_id, "ui_render_cbor: found connection");
             let session_lock = registry.get_or_create(conn_id);
             let mut session = session_lock.lock();
 
