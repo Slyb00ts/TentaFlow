@@ -1770,17 +1770,6 @@ fn spawn_quic_event_handler(
                         .handle_command_response_received(&from_node_id, &data)
                         .await;
                 }
-                Ok(IrohMeshEvent::CrdtDeltaReceived { node_id, .. }) => {
-                    // Safety net — przetwarzaj CRDT delta TYLKO od trusted peerow
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false, // Zero trust — bez MeshSecurity nie przetwarzaj danych
-                    };
-                    if !is_trusted {
-                        debug!(peer_id = %node_id, "Pomijam CrdtDelta od niezaufanego peera (safety net)");
-                    }
-                    // Dalsze przetwarzanie CRDT delta (jesli bedzie potrzebne) — tu placeholder
-                }
                 Ok(IrohMeshEvent::ModelListUpdate { node_id, data }) => {
                     // ModelsSync — nadpisuje liste modeli danego peera.
                     // Format: rkyv-zakodowany `ModelsSync { models: Vec<PeerModelInfo> }`.

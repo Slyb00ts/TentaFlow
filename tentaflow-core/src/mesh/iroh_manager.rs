@@ -118,10 +118,6 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
-    CrdtDeltaReceived {
-        node_id: String,
-        data: Vec<u8>,
-    },
     PairingRequestReceived {
         peer_id: String,
         data: Vec<u8>,
@@ -1270,12 +1266,6 @@ impl IrohMeshManager {
             .await;
     }
 
-    pub async fn broadcast_crdt_delta(&self, data: Vec<u8>) {
-        let _ = self
-            .broadcast_ufp2_to_trusted(tentaflow_protocol::mesh::MESH_MSG_CRDT_DELTA, &data, None)
-            .await;
-    }
-
     pub async fn broadcast_alias_sync(&self, aliases_json: Vec<u8>) {
         let _ = self
             .broadcast_ufp2_to_trusted(
@@ -1926,10 +1916,6 @@ impl IrohMeshManagerRef {
             },
             x if x == MESH_MSG_KNOWN_PEERS => IrohMeshEvent::KnownPeersReceived {
                 from_node_id: remote_hex,
-                data: payload,
-            },
-            x if x == MESH_MSG_CRDT_DELTA => IrohMeshEvent::CrdtDeltaReceived {
-                node_id: remote_hex,
                 data: payload,
             },
             x if x == MESH_MSG_PAIRING_REQUEST => IrohMeshEvent::PairingRequestReceived {
