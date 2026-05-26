@@ -1,11 +1,9 @@
 // =============================================================================
-// Plik: sdk-runtime/action-button-group-renderer.js
-// Opis: Renderer ButtonGroup (tag 0x0403) — Faza 6 Krok 3.3b-4.
-// Grupuje kilka Button-ów wizualnie (attached=true → bez gap'a między
-// nimi, jak segmented control). Spec wymusza tag każdego dziecka =
-// 0x0401 (Button) — egzekwujemy strict.
-//
-// Spec ref: `tentaflow-sdk-spec/src/protocol/ui/actions/buttons.rs`.
+// File: sdk-runtime/action-button-group-renderer.js
+// Description: Renderer ButtonGroup (tag 0x0403). ButtonGroup remains a wrapper
+//              div (no tf-* equivalent needed) that renders child Button
+//              components via ctx.renderChild. Each child must be Button 0x0401.
+// Spec ref: tentaflow-sdk-spec/src/protocol/ui/actions/buttons.rs.
 // =============================================================================
 
 import {
@@ -67,8 +65,6 @@ function renderButtonGroup(component, ctx) {
   }
   const attached = requireBool(attachedRaw, 'ButtonGroup.attached');
 
-  // Spec §6 0x0403: each child must be a Button (tag 0x0401). Mirror
-  // Rust `ensure_ref_tag_encode/decode(Button::TAG)`.
   for (let i = 0; i < buttons.length; i++) {
     const b = buttons[i];
     if (!b || typeof b !== 'object' || b.tag !== BUTTON_TAG) {

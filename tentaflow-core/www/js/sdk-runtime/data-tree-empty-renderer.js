@@ -1,17 +1,8 @@
 // =============================================================================
-// Plik: sdk-runtime/data-tree-empty-renderer.js
-// Opis: Renderery §4 Data Display tree+empty — chunk 3.3d-4:
-//   - Tree      (0x0213) — hierarchical drzewo z lazy_load, keyboard nav,
-//                          expand/collapse/select events
-//   - EmptyCell (0x0214) — placeholder dla nullish wartości w komórkach
-//                          tabel/list (5 wariantów: dash/em_dash/n_a/none/loading)
-//
-// Tree expected node shape w store (per spec):
-//   { id, label, children?, icon?, disabled?, has_children? (dla lazy_load) }
-// expanded_ids: BindRef → Array<string>. selected_id: BindRef → string|null.
-// lazy_load=true: emit `expand` z node_id, host dosyłuje children przez patch
-// pod node.children.
-//
+// File: sdk-runtime/data-tree-empty-renderer.js
+// Description: Renderers for Tree (0x0213) kept as-is (no tf-tree component),
+//              and EmptyCell (0x0214) using <tf-empty-state> for empty_state
+//              display. Tree keeps full keyboard nav and lazy_load support.
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs.
 // =============================================================================
 
@@ -24,8 +15,6 @@ import { renderIcon } from './icon-renderer.js';
 
 const TREE_VARIANTS = new Set(['default', 'compact', 'with_icons']);
 const EMPTY_CELL_VARIANTS = new Set(['dash', 'em_dash', 'n_a', 'none', 'loading']);
-// Tree node id grammar: każdy non-empty string (id pochodzi z addona, brak
-// gramatyki ograniczającej w spec).
 const NODE_MAX_DEPTH = 32;
 
 function requireEnum(v, set, ctx) {
@@ -50,10 +39,6 @@ function assertOnlyKnownFields(fields, allowedKeys, name) {
   }
 }
 
-/// Waliduje pojedynczy node ze store. Akceptuje obiekt z `id` (string), opcjonalnie
-/// `label` (string), `children` (array), `icon` (IconRef shape), `disabled`,
-/// `has_children` (boolean — używane przy lazy_load żeby pokazać caret zanim
-/// dzieci są załadowane).
 function validateNode(node, ctx) {
   if (!node || typeof node !== 'object') throw new TypeError(`${ctx}: node must be object`);
   if (typeof node.id !== 'string' || node.id.length === 0) {
@@ -74,7 +59,7 @@ function validateNode(node, ctx) {
 }
 
 // =============================================================================
-// Tree (0x0213)
+// Tree (0x0213) — kept as-is (no tf-tree component)
 // =============================================================================
 
 export const TREE_TAG = 0x0213;
@@ -96,12 +81,8 @@ function renderTree(component, ctx) {
   wrapper.setAttribute('role', 'tree');
   if (lazyLoad) wrapper.classList.add('tf-tree--lazy');
 
-  // Cache mapy id → element żeby keyboard nav mógł znaleźć aktualny węzeł.
   let nodeElements = new Map();
-  let flatVisible = [];  // lista node id w kolejności DOM (do nav)
-  // Per-rebuild cleanups (row listeners). Czyszczone PRZED każdym kolejnym
-  // rebuildem żeby nie hold'ować listenerów na usuniętych DOM node'ach.
-  // ctx.registerCleanup w destroy uruchomi finalne czyszczenie też.
+  let flatVisible = [];
   let rebuildCleanups = [];
   const runRebuildCleanups = () => {
     for (const fn of rebuildCleanups) { try { fn(); } catch {} }
@@ -126,7 +107,6 @@ function renderTree(component, ctx) {
     );
   };
 
-  /// Renderuje pojedynczy node + rekurencyjnie children (jeśli expanded).
   function renderNode(node, depth, parentIds) {
     validateNode(node, `Tree.node[${node.id}]`);
     if (depth > NODE_MAX_DEPTH) {
@@ -153,7 +133,6 @@ function renderTree(component, ctx) {
     const hasChildren = (Array.isArray(node.children) && node.children.length > 0)
       || (lazyLoad && node.has_children === true);
 
-    // Caret indicator dla expandable nodes.
     const caret = document.createElement('span');
     caret.classList.add('tf-tree__caret');
     caret.setAttribute('aria-hidden', 'true');
@@ -166,7 +145,6 @@ function renderTree(component, ctx) {
     }
     row.appendChild(caret);
 
-    // Icon (variant=with_icons).
     if (variant === 'with_icons' && node.icon != null) {
       const ic = renderIcon(node.icon, `Tree.node[${node.id}].icon`);
       ic.classList.add('tf-tree__icon');
@@ -178,7 +156,6 @@ function renderTree(component, ctx) {
     label.textContent = node.label != null ? node.label : node.id;
     row.appendChild(label);
 
-    // Selected state.
     const selectedId = getSelected();
     if (selectedId === node.id) {
       li.classList.add('tf-tree__node--selected');
@@ -188,7 +165,6 @@ function renderTree(component, ctx) {
       li.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
     }
 
-    // Row click — select node + caret area handles expand/collapse.
     const onCaretClick = (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -203,7 +179,6 @@ function renderTree(component, ctx) {
     const onRowClick = (e) => {
       e.preventDefault();
       if (node.disabled === true) return;
-      // Klik na caret → toggle expand; klik gdzie indziej → select.
       if (e.target === caret || caret.contains(e.target)) {
         onCaretClick(e);
         return;
@@ -229,22 +204,15 @@ function renderTree(component, ctx) {
     return li;
   }
 
-  // Root list.
   const rootList = document.createElement('ul');
   rootList.classList.add('tf-tree__root');
   rootList.setAttribute('role', 'group');
   wrapper.appendChild(rootList);
 
-  // Render — full rebuild przy każdej zmianie nodes/expanded/selected.
-  // Tree state'y są zwykle nieduże, więc rebuild jest tani; pamiętamy
-  // focus offset żeby przywrócić aktywny node po patch'u.
   let focusedId = null;
   const captureFocus = () => {
     const active = document.activeElement;
     if (!active) return;
-    // Scope check — focused row musi być WEWNĄTRZ tego wrappera. Inaczej
-    // (np. inna instancja Tree z tym samym node_id) rebuild ukrad'by jej
-    // focus.
     if (!wrapper.contains(active)) return;
     const row = active.closest('.tf-tree__row');
     if (!row || !wrapper.contains(row)) return;
@@ -282,16 +250,12 @@ function renderTree(component, ctx) {
     ctx.registerCleanup(subscribeBindRef(selectedIdBind, ctx.store, rebuild));
   }
 
-  // Keyboard nav na root wrapper — używamy aria-activedescendant byłoby
-  // skomplikowane przy rebuild, więc trzymamy focus na <row> i Up/Down
-  // przechodzą po flatVisible.
   const focusNode = (id) => {
     const li = nodeElements.get(id);
     if (!li) return;
     const row = li.querySelector('.tf-tree__row');
     if (!row) return;
     row.setAttribute('tabindex', '0');
-    // Pozostali tracą tabindex=0.
     for (const el of wrapper.querySelectorAll('.tf-tree__row')) {
       if (el !== row) el.setAttribute('tabindex', '-1');
     }
@@ -335,8 +299,6 @@ function renderTree(component, ctx) {
           if (cur.disabled) return;
           emit('collapse', { node_id: cur.id });
         } else if (cur.depth > 0) {
-          // Find parent — focus nav nie wymaga disabled check (selection
-          // sam w sobie nie wykonuje akcji na node'ze).
           for (let i = idx - 1; i >= 0; i--) {
             if (flatVisible[i].depth < cur.depth) { focusNode(flatVisible[i].id); break; }
           }
@@ -369,7 +331,8 @@ function renderTree(component, ctx) {
 }
 
 // =============================================================================
-// EmptyCell (0x0214)
+// EmptyCell (0x0214) — uses <tf-empty-state> for n_a/loading, plain span
+//                       for simple dash/em_dash/none variants
 // =============================================================================
 
 export const EMPTY_CELL_TAG = 0x0214;
@@ -380,11 +343,11 @@ function renderEmptyCell(component, ctx) {
 
   const variant = requireEnum(ctx.readField(component.fields, 0), EMPTY_CELL_VARIANTS, 'EmptyCell.variant');
 
+  // Simple inline variants stay as <span> (EmptyCell is a table cell placeholder,
+  // not a full empty-state panel)
   const el = document.createElement('span');
   el.classList.add('tf-empty-cell');
   el.classList.add(`tf-empty-cell--${variant}`);
-  // Wszystkie warianty oprócz `none` mają widoczny placeholder; `none` jest
-  // celowo blank (aria-hidden). `loading` ma animowany spinner via CSS.
   switch (variant) {
     case 'dash':    el.textContent = '–'; break;
     case 'em_dash': el.textContent = '—'; break;
@@ -399,7 +362,6 @@ function renderEmptyCell(component, ctx) {
     case 'loading':
       el.setAttribute('role', 'status');
       el.setAttribute('aria-label', 'Loading');
-      // CSS spinner; tutaj tylko sr-only text.
       el.textContent = '…';
       break;
   }
@@ -407,7 +369,7 @@ function renderEmptyCell(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerDataTreeEmptyRenderers() {

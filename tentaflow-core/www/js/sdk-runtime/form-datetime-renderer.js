@@ -1,13 +1,10 @@
 // =============================================================================
-// Plik: sdk-runtime/form-datetime-renderer.js
-// Opis: Renderery datetime pickerów — chunk 3.3c-4:
-//   - DatePicker     (0x0314) — input type=date + presets + min/max + disabled_dates
-//   - DateRangePicker (0x0315) — 2x date input + range presets + max_range_days
-//   - TimePicker     (0x0316) — input type=time + step (step_minutes * 60)
-//   - DateTimePicker (0x0317) — input type=datetime-local + min/max + timezone
-//
-// Wszystkie używają natywnych HTML5 pickerów (browser zapewnia UI/keyboard/locale),
-// emit'ują `change` z reactive bind_path (jednokierunkowy read; write-back chunk 3.6).
+// File: sdk-runtime/form-datetime-renderer.js
+// Description: Renderers for datetime pickers:
+//   - DatePicker      (0x0314) — uses <tf-datepicker> with value/min/max attrs
+//   - DateRangePicker (0x0315) — two <tf-datepicker> with range constraints
+//   - TimePicker      (0x0316) — <input type="time"> (no tf-timepicker exists)
+//   - DateTimePicker  (0x0317) — <input type="datetime-local"> (no tf-* exists)
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/form/datetime.rs.
 // =============================================================================
 
@@ -22,12 +19,8 @@ const TIME_STYLES = new Set(['short', 'medium', 'long']);
 const TIME_PRECISIONS = new Set(['minute', 'second']);
 const DAY_OF_WEEK = new Set(['sunday', 'monday']);
 const DATE_PRESET_KIND = new Set(['today', 'yesterday', 'last_7_days', 'last_30_days', 'this_month', 'last_month', 'custom']);
-// ISO 8601 calendar date (YYYY-MM-DD) — restrictive validator dla min/max/disabled_dates.
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-// ISO 8601 local datetime (YYYY-MM-DDTHH:MM lub z sekundami).
 const ISO_LOCAL_DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
-// IANA timezone basic check (Region/City form). Nie waliduje pełnej listy —
-// tylko podstawowy shape.
 const TZ_RE = /^[A-Za-z_]+(\/[A-Za-z_0-9+-]+)+$|^UTC$/;
 const PRESET_KEYS = new Set([0, 1, 2]);
 const RANGE_PRESET_KEYS = new Set([0, 1, 2]);
@@ -99,17 +92,12 @@ function applyPlaceholderReactive(input, bindRef, ctx) {
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
-/// Sync `<input>.value` z store (one-way read). Pomija nadpisanie gdy input
-/// jest focusowany żeby nie burzyć user typing'u (browser native picker
-/// otwarty).
 function applyValueReactive(input, bindPath, ctx, validator) {
   const apply = () => {
     let v;
     try { v = ctx.store.read(bindPath); } catch { v = undefined; }
     const next = v == null ? '' : String(v);
     if (input.value === next) return;
-    // Jeśli walidator i wartość nie jest pusta i nie pasuje formatowi —
-    // ignorujemy zamiast wstawiać śmieci do natywnego picker'a.
     if (next !== '' && validator && !validator(next)) return;
     if (document.activeElement === input) return;
     input.value = next;
@@ -119,7 +107,7 @@ function applyValueReactive(input, bindPath, ctx, validator) {
 }
 
 // =============================================================================
-// DatePreset parsing (tagged union per inline.rs DatePresetResolve)
+// DatePreset parsing
 // =============================================================================
 
 function parseDatePresetResolve(raw, ctx) {
@@ -133,7 +121,6 @@ function parseDatePresetResolve(raw, ctx) {
     }
     return { kind: 'custom', offset_days: raw.offset_days };
   }
-  // Inne warianty mają tylko `kind`.
   for (const k of Object.keys(raw)) {
     if (k !== 'kind') throw new TypeError(`${ctx}: unexpected key '${k}' for kind=${raw.kind}`);
   }
@@ -173,7 +160,6 @@ function parseRangePreset(raw, ctx) {
     if (k === 0) id = requireString(v, `${ctx}.id`);
     else if (k === 1) label = v;
     else {
-      // RangePresetRange FieldMap [[0=from_offset_days, 1=to_offset_days]]
       if (!Array.isArray(v)) throw new TypeError(`${ctx}.range must be FieldMap`);
       const innerSeen = new Set();
       let fro, too;
@@ -199,7 +185,6 @@ function parseRangePreset(raw, ctx) {
   return { id, label, range };
 }
 
-/// Wylicza datę dla preset'u DatePresetResolve. Zwraca ISO YYYY-MM-DD.
 function resolveDatePreset(resolve) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -244,8 +229,15 @@ function resolveRangePreset(range) {
   return { from: fmt(shift(range.from_offset_days)), to: fmt(shift(range.to_offset_days)) };
 }
 
+function daysBetween(fromIso, toIso) {
+  const a = new Date(`${fromIso}T00:00:00Z`).getTime();
+  const b = new Date(`${toIso}T00:00:00Z`).getTime();
+  const ms = b - a;
+  return Math.floor(ms / 86400000) + 1;
+}
+
 // =============================================================================
-// DatePicker (0x0314)
+// DatePicker (0x0314) — uses <tf-datepicker>
 // =============================================================================
 
 export const DATE_PICKER_TAG = 0x0314;
@@ -282,29 +274,17 @@ function renderDatePicker(component, ctx) {
   })();
 
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-datepicker');
+  wrapper.classList.add('tf-datepicker-wrapper');
   wrapper.classList.add(`tf-datepicker--format-${format}`);
   wrapper.setAttribute('data-first-day-of-week', fdow);
 
-  let labelEl = null;
+  // Label
   if (labelBind != null) {
-    labelEl = document.createElement('label');
+    const labelEl = document.createElement('label');
     labelEl.classList.add('tf-datepicker__label');
     applyTextBind(labelEl, labelBind, ctx);
     wrapper.appendChild(labelEl);
-  }
-
-  const input = document.createElement('input');
-  input.setAttribute('type', 'date');
-  input.classList.add('tf-datepicker__input');
-  const inputId = `tf-datepicker-${component.id}`;
-  input.setAttribute('id', inputId);
-  if (labelEl) labelEl.setAttribute('for', inputId);
-  if (minDate) input.setAttribute('min', minDate);
-  if (maxDate) input.setAttribute('max', maxDate);
-  if (locale) input.setAttribute('lang', locale);
-
-  if (labelBind == null) {
+  } else {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError('DatePicker without `label` field requires Component.a11y.label');
     }
@@ -312,43 +292,44 @@ function renderDatePicker(component, ctx) {
     if (typeof initial !== 'string' || initial.trim().length === 0) {
       throw new TypeError('DatePicker.a11y.label must resolve to non-blank string');
     }
-    const applyAria = () => {
-      const v = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof v === 'string' && v.trim().length > 0) input.setAttribute('aria-label', v);
-      else input.removeAttribute('aria-label');
-    };
-    applyAria();
-    ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
   }
 
-  applyPlaceholderReactive(input, placeholderBind, ctx);
-  applyValueReactive(input, bindPath, ctx, (s) => ISO_DATE_RE.test(s));
-  // lastValid musi tropić każdą valid wartość — initial po reactive sync
-  // oraz wszystkie późniejsze (preset, store push), inaczej revert wraca
-  // do pustego stringu zamiast poprzedniej dobrej daty.
-  let lastValid = input.value && ISO_DATE_RE.test(input.value) ? input.value : '';
-  ctx.registerCleanup(ctx.store.subscribe(bindPath, () => {
-    if (input.value && ISO_DATE_RE.test(input.value)) lastValid = input.value;
-  }));
-  wrapper.appendChild(input);
+  // <tf-datepicker> web component
+  const picker = document.createElement('tf-datepicker');
+  if (minDate) picker.setAttribute('min', minDate);
+  if (maxDate) picker.setAttribute('max', maxDate);
+  wrapper.appendChild(picker);
 
+  // Reactive value sync from store
+  let lastValid = '';
+  const applyValue = () => {
+    let v;
+    try { v = ctx.store.read(bindPath); } catch { v = undefined; }
+    const next = v == null ? '' : String(v);
+    if (next !== '' && !ISO_DATE_RE.test(next)) return;
+    picker.value = next;
+    if (next && ISO_DATE_RE.test(next)) lastValid = next;
+  };
+  applyValue();
+  ctx.registerCleanup(ctx.store.subscribe(bindPath, applyValue));
+
+  // Presets bar
   if (presets) {
     const presetBar = document.createElement('div');
     presetBar.classList.add('tf-datepicker__presets');
     for (const p of presets) {
-      const btn = document.createElement('button');
-      btn.setAttribute('type', 'button');
-      btn.classList.add('tf-datepicker__preset');
+      const btn = document.createElement('tf-button');
+      btn.setAttribute('variant', 'ghost');
+      btn.setAttribute('size', 'sm');
       btn.setAttribute('data-preset-id', p.id);
       applyTextBind(btn, p.label, ctx);
       const onClick = (e) => {
         e.preventDefault();
         const v = resolveDatePreset(p.resolve);
-        // Walidacja zakresu min/max + disabled_dates.
         if (minDate != null && v < minDate) return;
         if (maxDate != null && v > maxDate) return;
         if (disabledSet && disabledSet.has(v)) return;
-        input.value = v;
+        picker.value = v;
         lastValid = v;
         wrapper.dispatchEvent(
           new (globalThis.CustomEvent || globalThis.Event)('change', {
@@ -364,13 +345,11 @@ function renderDatePicker(component, ctx) {
     wrapper.appendChild(presetBar);
   }
 
-  // Change event — wybór z natywnego picker'a. Waliduj disabled_dates;
-  // jeśli user wybrał disabled date, revert do poprzedniej `lastValid`
-  // (śledzony przez preset / store sync / poprzedni change).
-  const onChange = () => {
-    const v = input.value;
+  // Forward tf-datepicker change event
+  const onChange = (e) => {
+    const v = picker.value;
     if (v && disabledSet && disabledSet.has(v)) {
-      input.value = lastValid;
+      picker.value = lastValid;
       return;
     }
     lastValid = v;
@@ -381,14 +360,14 @@ function renderDatePicker(component, ctx) {
       })
     );
   };
-  input.addEventListener('change', onChange);
-  ctx.registerCleanup(() => input.removeEventListener('change', onChange));
+  picker.addEventListener('change', onChange);
+  ctx.registerCleanup(() => picker.removeEventListener('change', onChange));
 
   return wrapper;
 }
 
 // =============================================================================
-// DateRangePicker (0x0315)
+// DateRangePicker (0x0315) — two <tf-datepicker> elements
 // =============================================================================
 
 export const DATE_RANGE_PICKER_TAG = 0x0315;
@@ -436,9 +415,8 @@ function renderDateRangePicker(component, ctx) {
   wrapper.classList.add(`tf-daterange--format-${format}`);
   wrapper.setAttribute('data-first-day-of-week', fdow);
 
-  let labelEl = null;
   if (labelBind != null) {
-    labelEl = document.createElement('div');
+    const labelEl = document.createElement('div');
     labelEl.classList.add('tf-daterange__label');
     applyTextBind(labelEl, labelBind, ctx);
     wrapper.appendChild(labelEl);
@@ -447,27 +425,22 @@ function renderDateRangePicker(component, ctx) {
   const fieldsRow = document.createElement('div');
   fieldsRow.classList.add('tf-daterange__fields');
 
-  const makeInput = (id, bindPath, placeholderBind) => {
-    const inp = document.createElement('input');
-    inp.setAttribute('type', 'date');
-    inp.classList.add('tf-daterange__input');
-    inp.setAttribute('id', id);
-    if (minDate) inp.setAttribute('min', minDate);
-    if (maxDate) inp.setAttribute('max', maxDate);
-    if (locale) inp.setAttribute('lang', locale);
-    applyPlaceholderReactive(inp, placeholderBind, ctx);
-    applyValueReactive(inp, bindPath, ctx, (s) => ISO_DATE_RE.test(s));
-    return inp;
-  };
-  const fromInput = makeInput(`tf-daterange-${component.id}-from`, fromPath, placeholderFromBind);
-  const toInput = makeInput(`tf-daterange-${component.id}-to`, toPath, placeholderToBind);
+  // Two <tf-datepicker> elements for from/to
+  const fromPicker = document.createElement('tf-datepicker');
+  if (minDate) fromPicker.setAttribute('min', minDate);
+  if (maxDate) fromPicker.setAttribute('max', maxDate);
+
+  const toPicker = document.createElement('tf-datepicker');
+  if (minDate) toPicker.setAttribute('min', minDate);
+  if (maxDate) toPicker.setAttribute('max', maxDate);
+
   const dash = document.createElement('span');
   dash.classList.add('tf-daterange__dash');
   dash.setAttribute('aria-hidden', 'true');
   dash.textContent = '–';
-  fieldsRow.appendChild(fromInput);
+  fieldsRow.appendChild(fromPicker);
   fieldsRow.appendChild(dash);
-  fieldsRow.appendChild(toInput);
+  fieldsRow.appendChild(toPicker);
 
   if (labelBind == null) {
     if (component.a11y == null || component.a11y.label == null) {
@@ -480,11 +453,11 @@ function renderDateRangePicker(component, ctx) {
     const applyAria = () => {
       const v = resolveBindRef(component.a11y.label, ctx.store);
       if (typeof v === 'string' && v.trim().length > 0) {
-        fromInput.setAttribute('aria-label', `${v} (from)`);
-        toInput.setAttribute('aria-label', `${v} (to)`);
+        fromPicker.setAttribute('aria-label', `${v} (from)`);
+        toPicker.setAttribute('aria-label', `${v} (to)`);
       } else {
-        fromInput.removeAttribute('aria-label');
-        toInput.removeAttribute('aria-label');
+        fromPicker.removeAttribute('aria-label');
+        toPicker.removeAttribute('aria-label');
       }
     };
     applyAria();
@@ -493,30 +466,42 @@ function renderDateRangePicker(component, ctx) {
 
   wrapper.appendChild(fieldsRow);
 
-  // lastFrom/lastTo śledzą każdą valid wartość — initial po sync,
-  // preset + manual change.
-  let lastFrom = fromInput.value && ISO_DATE_RE.test(fromInput.value) ? fromInput.value : '';
-  let lastTo = toInput.value && ISO_DATE_RE.test(toInput.value) ? toInput.value : '';
-  ctx.registerCleanup(ctx.store.subscribe(fromPath, () => {
-    if (fromInput.value && ISO_DATE_RE.test(fromInput.value)) lastFrom = fromInput.value;
-  }));
-  ctx.registerCleanup(ctx.store.subscribe(toPath, () => {
-    if (toInput.value && ISO_DATE_RE.test(toInput.value)) lastTo = toInput.value;
-  }));
+  // Reactive value sync
+  let lastFrom = '';
+  let lastTo = '';
+  const applyFrom = () => {
+    let v;
+    try { v = ctx.store.read(fromPath); } catch { v = undefined; }
+    const next = v == null ? '' : String(v);
+    if (next !== '' && !ISO_DATE_RE.test(next)) return;
+    fromPicker.value = next;
+    if (next && ISO_DATE_RE.test(next)) lastFrom = next;
+  };
+  const applyTo = () => {
+    let v;
+    try { v = ctx.store.read(toPath); } catch { v = undefined; }
+    const next = v == null ? '' : String(v);
+    if (next !== '' && !ISO_DATE_RE.test(next)) return;
+    toPicker.value = next;
+    if (next && ISO_DATE_RE.test(next)) lastTo = next;
+  };
+  applyFrom();
+  applyTo();
+  ctx.registerCleanup(ctx.store.subscribe(fromPath, applyFrom));
+  ctx.registerCleanup(ctx.store.subscribe(toPath, applyTo));
 
   if (presets) {
     const bar = document.createElement('div');
     bar.classList.add('tf-daterange__presets');
     for (const p of presets) {
-      const btn = document.createElement('button');
-      btn.setAttribute('type', 'button');
-      btn.classList.add('tf-daterange__preset');
+      const btn = document.createElement('tf-button');
+      btn.setAttribute('variant', 'ghost');
+      btn.setAttribute('size', 'sm');
       btn.setAttribute('data-preset-id', p.id);
       applyTextBind(btn, p.label, ctx);
       const onClick = (e) => {
         e.preventDefault();
         const r = resolveRangePreset(p.range);
-        // from > to: odrzucamy preset zamiast emitować niepoprawny range.
         if (r.from > r.to) return;
         if (minDate != null && (r.from < minDate || r.to < minDate)) return;
         if (maxDate != null && (r.from > maxDate || r.to > maxDate)) return;
@@ -525,8 +510,8 @@ function renderDateRangePicker(component, ctx) {
           const span = daysBetween(r.from, r.to);
           if (span > maxRangeDays) return;
         }
-        fromInput.value = r.from;
-        toInput.value = r.to;
+        fromPicker.value = r.from;
+        toPicker.value = r.to;
         lastFrom = r.from;
         lastTo = r.to;
         wrapper.dispatchEvent(
@@ -548,22 +533,19 @@ function renderDateRangePicker(component, ctx) {
   }
 
   const validateAndEmit = (changedKind) => {
-    const f = fromInput.value;
-    const t = toInput.value;
-    // Disabled date check.
+    const f = fromPicker.value;
+    const t = toPicker.value;
     if ((f && disabledSet && disabledSet.has(f)) || (t && disabledSet && disabledSet.has(t))) {
-      fromInput.value = lastFrom; toInput.value = lastTo;
+      fromPicker.value = lastFrom; toPicker.value = lastTo;
       return;
     }
-    // from <= to enforcement.
     if (f && t && f > t) {
-      fromInput.value = lastFrom; toInput.value = lastTo;
+      fromPicker.value = lastFrom; toPicker.value = lastTo;
       return;
     }
-    // max_range_days enforcement.
     if (maxRangeDays != null && f && t) {
       if (daysBetween(f, t) > maxRangeDays) {
-        fromInput.value = lastFrom; toInput.value = lastTo;
+        fromPicker.value = lastFrom; toPicker.value = lastTo;
         return;
       }
     }
@@ -581,32 +563,22 @@ function renderDateRangePicker(component, ctx) {
   };
   const onFromChange = () => validateAndEmit('from');
   const onToChange = () => validateAndEmit('to');
-  fromInput.addEventListener('change', onFromChange);
-  toInput.addEventListener('change', onToChange);
+  fromPicker.addEventListener('change', onFromChange);
+  toPicker.addEventListener('change', onToChange);
   ctx.registerCleanup(() => {
-    fromInput.removeEventListener('change', onFromChange);
-    toInput.removeEventListener('change', onToChange);
+    fromPicker.removeEventListener('change', onFromChange);
+    toPicker.removeEventListener('change', onToChange);
   });
 
   return wrapper;
 }
 
-/// Liczba dni między dwoma ISO YYYY-MM-DD (inclusive both ends), zakładając
-/// `from <= to`. Używane do max_range_days enforcement.
-function daysBetween(fromIso, toIso) {
-  const a = new Date(`${fromIso}T00:00:00Z`).getTime();
-  const b = new Date(`${toIso}T00:00:00Z`).getTime();
-  const ms = b - a;
-  return Math.floor(ms / 86400000) + 1;
-}
-
 // =============================================================================
-// TimePicker (0x0316)
+// TimePicker (0x0316) — <input type="time"> (no tf-timepicker exists)
 // =============================================================================
 
 export const TIME_PICKER_TAG = 0x0316;
 const TIME_PICKER_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
-// ISO time HH:MM or HH:MM:SS.
 const ISO_TIME_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 
 function renderTimePicker(component, ctx) {
@@ -638,9 +610,6 @@ function renderTimePicker(component, ctx) {
   const inputId = `tf-timepicker-${component.id}`;
   input.setAttribute('id', inputId);
   if (labelEl) labelEl.setAttribute('for', inputId);
-  // step w sekundach. Dla precision=second min step 1s nawet gdy stepMinutes
-  // by sugerował coarser; spec'owy stepMinutes=1 + precision=second to
-  // step=60 sekund (czyli skok 1 min). Trzymamy się literalnego mnożenia.
   const stepSeconds = stepMinutes * 60;
   input.setAttribute('step', String(stepSeconds));
 
@@ -777,7 +746,7 @@ function renderDateTimePicker(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerFormDatetimeRenderers() {

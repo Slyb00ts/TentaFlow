@@ -1,10 +1,8 @@
 // =============================================================================
-// Plik: sdk-runtime/action-icon-button-renderer.js
-// Opis: Renderer IconButton (tag 0x0402) — Faza 6 Krok 3.3b-2.
-// IconButton to button bez label'a, sterowany przez `aria_label` (string,
-// nie BindRef — spec deklaratywnie wymaga statycznego label'a dla a11y).
-// Icon mandatoryjny (`IconRef`), variant/tone/size jak Button.
-// Spec ref: `tentaflow-sdk-spec/src/protocol/ui/actions/buttons.rs`.
+// File: sdk-runtime/action-icon-button-renderer.js
+// Description: Renderer IconButton (tag 0x0402) using <tf-button> in icon-only
+//              mode. Maps SDK variant/tone/size to tf-button attributes.
+// Spec ref: tentaflow-sdk-spec/src/protocol/ui/actions/buttons.rs.
 // =============================================================================
 
 import {
@@ -21,6 +19,18 @@ const TONES = new Set([
   'neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted',
 ]);
 const BUTTON_SIZES = new Set(['xs', 'sm', 'md', 'lg']);
+
+// SDK variant -> tf-button variant attribute
+const VARIANT_MAP = {
+  primary: 'primary',
+  secondary: 'secondary',
+  tertiary: 'ghost',
+  ghost: 'ghost',
+  destructive: 'danger',
+  link: 'ghost',
+};
+// SDK size -> tf-button size attribute
+const SIZE_MAP = { xs: 'sm', sm: 'sm', md: null, lg: null };
 
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
@@ -76,38 +86,35 @@ function renderIconButton(component, ctx) {
   }
   const ariaLabel = requireString(ariaLabelRaw, 'IconButton.aria_label');
   if (ariaLabel.trim().length === 0) {
-    // Whitespace-only nie dostarcza accessible name — odrzucamy żeby
-    // screen reader nie odczytał button'a jako anonymous.
     throw new TypeError('IconButton.aria_label must be non-blank (a11y)');
   }
   const disabledBind = ctx.readField(component.fields, 5);
   const loadingBind = ctx.readField(component.fields, 6);
 
-  const btn = document.createElement('button');
-  btn.setAttribute('type', 'button');
-  btn.classList.add('tf-icon-button');
-  btn.classList.add(`tf-icon-button--variant-${variant}`);
-  btn.classList.add(`tf-icon-button--tone-${tone}`);
-  btn.classList.add(`tf-icon-button--size-${size}`);
+  // Resolve icon name from IconRef for tf-button icon attribute
+  const iconName = (iconRaw && iconRaw.kind === 'named') ? iconRaw.name : null;
+
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', VARIANT_MAP[variant] || 'primary');
+  const mappedSize = SIZE_MAP[size];
+  if (mappedSize) btn.setAttribute('size', mappedSize);
+  if (iconName) btn.setAttribute('icon', iconName);
   btn.setAttribute('aria-label', ariaLabel);
-  // IconButton bez visual label'a — przyznaje role=button automatycznie
-  // przez <button> element. aria-label dostarcza dostępną nazwę.
 
-  // Icon (mandatory) — wstawiamy do button'a; aria-hidden=true (label
-  // przychodzi z aria-label parent button'a).
-  const iconEl = renderIcon(iconRaw, 'IconButton.icon');
-  btn.appendChild(iconEl);
+  // If icon cannot be set via attribute, render and append manually
+  if (!iconName) {
+    const iconEl = renderIcon(iconRaw, 'IconButton.icon');
+    btn.appendChild(iconEl);
+  }
 
-  // Reactive disabled/loading — pattern identyczny z Button (chunk 3.3b-1).
+  // Reactive disabled/loading
   let isDisabledLogical = false;
   let isLoadingLogical = false;
   const updateDisabledAttr = () => {
     if (isDisabledLogical || isLoadingLogical) {
       btn.setAttribute('disabled', '');
-      btn.setAttribute('aria-disabled', 'true');
     } else {
       btn.removeAttribute('disabled');
-      btn.removeAttribute('aria-disabled');
     }
   };
   if (disabledBind != null) {
@@ -122,10 +129,8 @@ function renderIconButton(component, ctx) {
     const apply = () => {
       isLoadingLogical = resolveBindRef(loadingBind, ctx.store) === true;
       if (isLoadingLogical) {
-        btn.classList.add('tf-icon-button--loading');
         btn.setAttribute('aria-busy', 'true');
       } else {
-        btn.classList.remove('tf-icon-button--loading');
         btn.removeAttribute('aria-busy');
       }
       updateDisabledAttr();

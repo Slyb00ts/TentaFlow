@@ -1,12 +1,8 @@
 // =============================================================================
-// Plik: sdk-runtime/form-radio-groups-renderer.js
-// Opis: Renderery RadioGroup (0x030D) + RadioCardGroup (0x030E) — chunk 3.3c-7.
-//
-// Oba używają `bind_path: StatePath` jako shared state dla wszystkich opcji.
-// Wybór emit'uje `change` z `{ value, kind }` SelectValue (handlers spec
-// data.rs deklaruje `change` dla obu). Reactive bind_path read-only;
-// write-back chunk 3.6.
-//
+// File: sdk-runtime/form-radio-groups-renderer.js
+// Description: Renderers for RadioGroup (0x030D) using <tf-radio-group> +
+//              <tf-radio>, and RadioCardGroup (0x030E) using <tf-radio-group>
+//              with card-styled radio children.
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/form/groups.rs.
 // =============================================================================
 
@@ -18,7 +14,7 @@ import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
-// Walidatory
+// Validators
 // =============================================================================
 
 const SELECT_VALUE_KINDS = new Set(['tstr', 'u32', 'i32', 'bool']);
@@ -158,7 +154,7 @@ function parseRadioCardOption(raw, ctx) {
     seen.add(k);
     switch (k) {
       case 0: value = parseSelectValue(v, `${ctx}.value`); break;
-      case 1: icon = v; break;  // IconRef (validation in renderIcon)
+      case 1: icon = v; break;
       case 2: title = v; break;
       case 3: if (v != null) description = v; break;
       case 4: if (v != null) badge = parseInlineBadge(v, `${ctx}.badge`); break;
@@ -181,19 +177,8 @@ function applyTextBind(element, bindRef, ctx) {
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
-/// Deterministyczna serializacja StatePath → string używana w `name=`
-/// attribute dla natywnej grupy radio'sów. Copy z form-atomic-renderer
-/// (Radio 0x030C) — radio'sy dzielące bind_path muszą mieć ten sam `name`
-/// dla natywnej eksklusywności.
-function pathToName(path) {
-  const json = JSON.stringify(path.map((s) => [s.kind, s.value]));
-  const utf8 = unescape(encodeURIComponent(json));
-  const b64 = (typeof btoa === 'function' ? btoa : (s) => Buffer.from(s, 'binary').toString('base64'))(utf8);
-  return b64.replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
-}
-
 // =============================================================================
-// RadioGroup (0x030D)
+// RadioGroup (0x030D) — uses <tf-radio-group> + <tf-radio> children
 // =============================================================================
 
 export const RADIO_GROUP_TAG = 0x030D;
@@ -211,7 +196,6 @@ function renderRadioGroup(component, ctx) {
     throw new TypeError('RadioGroup.options must be non-empty');
   }
   const options = optionsRaw.map((o, i) => parseRadioOption(o, `RadioGroup.options[${i}]`));
-  // Duplicate value detection (po canonical {kind,value} key).
   const seenVals = new Set();
   for (const opt of options) {
     const key = `${opt.value.tag}:${opt.value.value}`;
@@ -224,21 +208,20 @@ function renderRadioGroup(component, ctx) {
   const labelBind = ctx.readField(component.fields, 3);
   const density = requireEnum(ctx.readField(component.fields, 4), DENSITIES, 'RadioGroup.density');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-radio-group');
-  wrapper.classList.add(`tf-radio-group--${orientation}`);
-  wrapper.classList.add(`tf-radio-group--density-${density}`);
-  wrapper.setAttribute('role', 'radiogroup');
+  const group = document.createElement('tf-radio-group');
+  group.setAttribute('name', `tf-radio-group-${component.id}`);
+  group.classList.add(`tf-radio-group--${orientation}`);
+  group.classList.add(`tf-radio-group--density-${density}`);
 
-  let labelDomId = null;
+  // Group label
   if (labelBind != null) {
-    labelDomId = `tf-radio-group-${component.id}-label`;
     const lbl = document.createElement('div');
     lbl.classList.add('tf-radio-group__label');
-    lbl.setAttribute('id', labelDomId);
+    const lblId = `tf-radio-group-${component.id}-label`;
+    lbl.setAttribute('id', lblId);
     applyTextBind(lbl, labelBind, ctx);
-    wrapper.appendChild(lbl);
-    wrapper.setAttribute('aria-labelledby', labelDomId);
+    group.appendChild(lbl);
+    group.setAttribute('aria-labelledby', lblId);
   } else {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError('RadioGroup without label requires Component.a11y.label');
@@ -249,86 +232,71 @@ function renderRadioGroup(component, ctx) {
     }
     const applyAria = () => {
       const v = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof v === 'string' && v.trim().length > 0) wrapper.setAttribute('aria-label', v);
-      else wrapper.removeAttribute('aria-label');
+      if (typeof v === 'string' && v.trim().length > 0) group.setAttribute('aria-label', v);
+      else group.removeAttribute('aria-label');
     };
     applyAria();
     ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
   }
 
-  const listEl = document.createElement('div');
-  listEl.classList.add('tf-radio-group__list');
-  wrapper.appendChild(listEl);
-
-  const radioName = `tf-radio-group-${pathToName(bindPath)}`;
-  const radioNodes = [];
-
+  // Build <tf-radio> children
+  const radioEls = [];
   options.forEach((opt, idx) => {
-    const itemWrap = document.createElement('label');
-    itemWrap.classList.add('tf-radio-group__item');
-    if (opt.disabled) itemWrap.classList.add('tf-radio-group__item--disabled');
+    const radio = document.createElement('tf-radio');
+    radio.setAttribute('value', String(opt.value.value));
+    if (opt.disabled) radio.setAttribute('disabled', '');
 
-    const input = document.createElement('input');
-    input.setAttribute('type', 'radio');
-    input.setAttribute('name', radioName);
-    input.classList.add('tf-radio-group__input');
-    input.setAttribute('id', `tf-radio-group-${component.id}-opt-${idx}`);
-    if (opt.disabled) input.setAttribute('disabled', '');
+    // Reactive label on tf-radio
+    const applyLabel = () => {
+      const v = resolveBindRef(opt.label, ctx.store);
+      radio.setAttribute('label', v == null ? '' : String(v));
+    };
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(opt.label, ctx.store, applyLabel));
 
-    const labelText = document.createElement('span');
-    labelText.classList.add('tf-radio-group__item-label');
-    applyTextBind(labelText, opt.label, ctx);
-
-    itemWrap.appendChild(input);
-    itemWrap.appendChild(labelText);
-
-    if (opt.hint != null) {
-      const hint = document.createElement('span');
-      hint.classList.add('tf-radio-group__item-hint');
-      applyTextBind(hint, opt.hint, ctx);
-      itemWrap.appendChild(hint);
-    }
-
-    listEl.appendChild(itemWrap);
-    radioNodes.push({ input, opt, idx });
+    group.appendChild(radio);
+    radioEls.push({ radio, opt });
   });
 
-  // Reactive checked sync ze store.
+  // Reactive selection: sync tf-radio-group value from store
   const syncChecked = () => {
     let current;
     try { current = ctx.store.read(bindPath); } catch { current = undefined; }
-    for (const n of radioNodes) {
-      n.input.checked = selectValueEquals(n.opt.value, current);
+    for (const { opt } of radioEls) {
+      if (selectValueEquals(opt.value, current)) {
+        group.setAttribute('value', String(opt.value.value));
+        return;
+      }
     }
+    group.setAttribute('value', '');
   };
   syncChecked();
   ctx.registerCleanup(ctx.store.subscribe(bindPath, syncChecked));
 
-  // Per-radio change handler — emit `change` na wrapper z SelectValue.
-  for (const n of radioNodes) {
-    const onChange = (e) => {
-      // stopPropagation chroni przed bubbling'iem `change` z radio
-      // do wrappera — applyEventHandlers może mieć handler 'change' na
-      // wrapperze i bez stopPropagation otrzymałby duplikat.
-      e.stopPropagation();
-      if (n.opt.disabled) return;
-      if (!n.input.checked) return;
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('change', {
-          bubbles: false,
-          detail: { value: n.opt.value.value, kind: n.opt.value.tag },
-        })
-      );
-    };
-    n.input.addEventListener('change', onChange);
-    ctx.registerCleanup(() => n.input.removeEventListener('change', onChange));
-  }
+  // Forward tf-radio-group 'change' event with SelectValue detail
+  const onChange = (e) => {
+    e.stopPropagation();
+    const rawVal = e.detail && e.detail.value;
+    for (const { opt } of radioEls) {
+      if (String(opt.value.value) === String(rawVal)) {
+        group.dispatchEvent(
+          new (globalThis.CustomEvent || globalThis.Event)('sdk-change', {
+            bubbles: false,
+            detail: { value: opt.value.value, kind: opt.value.tag },
+          })
+        );
+        return;
+      }
+    }
+  };
+  group.addEventListener('change', onChange);
+  ctx.registerCleanup(() => group.removeEventListener('change', onChange));
 
-  return wrapper;
+  return group;
 }
 
 // =============================================================================
-// RadioCardGroup (0x030E)
+// RadioCardGroup (0x030E) — card-styled radio group
 // =============================================================================
 
 export const RADIO_CARD_GROUP_TAG = 0x030E;
@@ -364,7 +332,6 @@ function renderRadioCardGroup(component, ctx) {
   wrapper.setAttribute('role', 'radiogroup');
   wrapper.style.setProperty('--tf-radio-card-cols', String(columns));
 
-  // RadioCardGroup nie ma label field — a11y.label wymagany.
   if (component.a11y == null || component.a11y.label == null) {
     throw new TypeError('RadioCardGroup requires Component.a11y.label (no label field in spec)');
   }
@@ -380,7 +347,6 @@ function renderRadioCardGroup(component, ctx) {
   applyAria();
   ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
 
-  const radioName = `tf-radio-card-group-${pathToName(bindPath)}`;
   const cardNodes = [];
 
   options.forEach((opt, idx) => {
@@ -390,7 +356,7 @@ function renderRadioCardGroup(component, ctx) {
 
     const input = document.createElement('input');
     input.setAttribute('type', 'radio');
-    input.setAttribute('name', radioName);
+    input.setAttribute('name', `tf-radio-card-group-${component.id}`);
     input.classList.add('tf-radio-card-group__input');
     input.setAttribute('id', `tf-radio-card-group-${component.id}-opt-${idx}`);
     if (opt.disabled) input.setAttribute('disabled', '');
@@ -457,9 +423,6 @@ function renderRadioCardGroup(component, ctx) {
   return wrapper;
 }
 
-/// Minimalny render InlineBadge wewnątrz RadioCard. Pełny komponent
-/// `tf-badge` (0x020A) zostanie wpięty w grupie data-display; tutaj
-/// odtwarzamy wizualnie z inline-meta — wystarcza dla RadioCard.
 function renderInlineBadge(badge, ctx) {
   const el = document.createElement('span');
   el.classList.add('tf-inline-badge');
@@ -488,7 +451,7 @@ function renderInlineBadge(badge, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerFormRadioGroupsRenderers() {

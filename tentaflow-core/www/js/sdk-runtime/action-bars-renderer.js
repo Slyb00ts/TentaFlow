@@ -1,11 +1,11 @@
 // =============================================================================
-// Plik: sdk-runtime/action-bars-renderer.js
-// Opis: Rendererzy bar'ów akcji — Faza 6 Krok 3.3b-6:
-//   - ActionBar       (0x0408) — leading + trailing Buttons z dividerem
-//   - SegmentedControl(0x0409) — toggle z multi-option
-//   - FilterChips     (0x040A) — wybór multi/single chip'ów z liczbami
+// File: sdk-runtime/action-bars-renderer.js
+// Description: Renderers for action bars:
+//   - ActionBar       (0x0408) — leading + trailing Buttons with divider
+//   - SegmentedControl(0x0409) — uses <tf-segmented> + <option> children
+//   - FilterChips     (0x040A) — uses <tf-filter-chips> with .filters property
 //   - WizardFooter    (0x040B) — back/next/cancel/skip + extra (Buttons)
-// Spec ref: `tentaflow-sdk-spec/src/protocol/ui/actions/bars.rs`.
+// Spec ref: tentaflow-sdk-spec/src/protocol/ui/actions/bars.rs.
 // =============================================================================
 
 import {
@@ -19,13 +19,9 @@ import { BUTTON_TAG } from './action-button-renderer.js';
 const SEGMENT_SIZES = new Set(['sm', 'md', 'lg']);
 const FILTER_CHIPS_MODES = new Set(['single', 'multi']);
 
-// SegmentOption: 0=value(SelectValue), 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge)
 const SEGMENT_OPTION_KEYS = new Set([0, 1, 2, 3]);
-// FilterChipDef: 0=id, 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge), 4=count_path(StatePath)
 const FILTER_CHIP_DEF_KEYS = new Set([0, 1, 2, 3, 4]);
 const SELECT_VALUE_KEYS = new Set(['kind', 'value']);
-// Wire shape per spec `inline.rs` SelectValue::encode — kindy są `tstr`,
-// `u32`, `i32`, `bool`. NIE `uint`/`int`.
 const SELECT_VALUE_KINDS = new Set(['tstr', 'u32', 'i32', 'bool']);
 
 function requireEnum(v, set, ctx) {
@@ -95,8 +91,6 @@ function assertButtonChild(c, ctx) {
   }
 }
 
-/// Parsuje `SelectValue` (tagged union) do prymitywu JS przydatnego do
-/// porównań equality. Mirror Rust `SelectValue::{Text,UInt,Int,Bool}`.
 function parseSelectValue(sv, ctx) {
   if (!sv || typeof sv !== 'object') {
     throw new TypeError(`${ctx}: SelectValue must be object`);
@@ -126,9 +120,6 @@ function parseSelectValue(sv, ctx) {
 }
 
 function selectValueEquals(parsed, storeValue) {
-  // Porównanie heterogeniczne — addon-side store może trzymać liczbę,
-  // string lub bool. Bool i numeryczne porównywane są jako JS typeof,
-  // string jako prosta równość.
   if (parsed.tag === 'tstr')  return typeof storeValue === 'string' && storeValue === parsed.value;
   if (parsed.tag === 'bool')  return typeof storeValue === 'boolean' && storeValue === parsed.value;
   if (parsed.tag === 'u32' || parsed.tag === 'i32') {
@@ -139,7 +130,7 @@ function selectValueEquals(parsed, storeValue) {
 }
 
 // =============================================================================
-// ActionBar (0x0408)
+// ActionBar (0x0408) — div wrapper, no tf-* equivalent
 // =============================================================================
 
 export const ACTION_BAR_TAG = 0x0408;
@@ -201,7 +192,7 @@ function renderActionBar(component, ctx) {
 }
 
 // =============================================================================
-// SegmentedControl (0x0409)
+// SegmentedControl (0x0409) — uses <tf-segmented> with <option> children
 // =============================================================================
 
 export const SEGMENTED_CONTROL_TAG = 0x0409;
@@ -232,13 +223,10 @@ function renderSegmentedControl(component, ctx) {
   }
   const fullWidth = requireBool(fullWidthRaw, 'SegmentedControl.full_width');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-segmented');
-  wrapper.classList.add(`tf-segmented--size-${size}`);
-  if (fullWidth) wrapper.classList.add('tf-segmented--full-width');
-  wrapper.setAttribute('role', 'radiogroup');
+  const seg = document.createElement('tf-segmented');
+  seg.setAttribute('size', size);
+  if (fullWidth) seg.style.width = '100%';
 
-  // SegmentOption: 0=value(SelectValue), 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge)
   const optionMeta = [];
   for (let i = 0; i < options.length; i++) {
     const opt = options[i];
@@ -248,7 +236,7 @@ function renderSegmentedControl(component, ctx) {
     assertOnlyKnownFieldMapKeys(opt, SEGMENT_OPTION_KEYS, `SegmentedControl.options[${i}]`);
     const optBadge = ctx.readField(opt, 3);
     if (optBadge != null) {
-      // Icon/badge gracefully skipped
+      // Badge gracefully skipped
     }
     const optValue = ctx.readField(opt, 0);
     if (optValue == null) {
@@ -263,91 +251,77 @@ function renderSegmentedControl(component, ctx) {
       );
     }
     if (optLabel == null) {
-      // Icon-only segment: named icon ma aria-hidden=true, więc bez
-      // label'a button radio nie ma accessible name. Spec dopuszcza
-      // icon-only TYLKO gdy icon to asset z `alt`. Tu odrzucamy named
-      // icon bez label'a — addon musi dodać label albo zaspecować asset
-      // icon z `alt`.
       if (optIcon.kind === 'named') {
         throw new TypeError(
           `SegmentedControl.options[${i}]: icon-only with named icon requires label (accessible name)`
         );
       }
-      // Asset icon bez `alt` → renderIcon ustawi aria-hidden, segment też
-      // anonymous. Wymagamy alt.
       if (optIcon.kind === 'asset' && (typeof optIcon.alt !== 'string' || optIcon.alt.trim().length === 0)) {
         throw new TypeError(
           `SegmentedControl.options[${i}]: icon-only with asset icon requires non-blank alt`
         );
       }
     }
-    const btn = document.createElement('button');
-    btn.setAttribute('type', 'button');
-    btn.setAttribute('role', 'radio');
-    btn.classList.add('tf-segmented__option');
 
-    if (optIcon != null) {
-      const iconEl = renderIcon(optIcon, `SegmentedControl.options[${i}].icon`);
-      iconEl.classList.add('tf-segmented__option-icon');
-      btn.appendChild(iconEl);
-    }
+    // Build <option> child for tf-segmented
+    const optEl = document.createElement('option');
+    optEl.setAttribute('value', String(parsedValue.value));
+    seg.appendChild(optEl);
+
+    // Reactive label text on the option element
     if (optLabel != null) {
-      const labelEl = document.createElement('span');
-      labelEl.classList.add('tf-segmented__option-label');
-      btn.appendChild(labelEl);
-      const apply = () => {
+      const applyLabel = () => {
         const v = resolveBindRef(optLabel, ctx.store);
-        labelEl.textContent = v == null ? '' : String(v);
+        optEl.textContent = v == null ? '' : String(v);
       };
-      apply();
-      ctx.registerCleanup(subscribeBindRef(optLabel, ctx.store, apply));
+      applyLabel();
+      ctx.registerCleanup(subscribeBindRef(optLabel, ctx.store, applyLabel));
+    } else {
+      optEl.textContent = '';
     }
 
-    const onClick = () => {
-      // Klik dispatchuje 'change' z detail.value = wartość prymitywna.
-      // Addon obsługuje to przez handler `change` i wpisuje do store'a
-      // (chunk 3.6 wprowadzi automatic two-way write-back).
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('change', {
-          bubbles: false,
-          detail: { value: parsedValue.value, kind: parsedValue.tag },
-        })
-      );
-    };
-    btn.addEventListener('click', onClick);
-    ctx.registerCleanup(() => btn.removeEventListener('click', onClick));
-    wrapper.appendChild(btn);
-    optionMeta.push({ btn, parsedValue });
+    optionMeta.push({ parsedValue });
   }
 
-  // Reactive selection: czytamy current store value pod bind_path i
-  // zaznaczamy odpowiedni segment.
+  // Set initial value from store
   const applySelection = () => {
     let current;
-    try {
-      current = ctx.store.read(bindPath);
-    } catch {
-      current = undefined;
-    }
-    for (const { btn, parsedValue } of optionMeta) {
-      const selected = selectValueEquals(parsedValue, current);
-      btn.setAttribute('aria-checked', selected ? 'true' : 'false');
-      btn.setAttribute('tabindex', selected ? '0' : '-1');
-      if (selected) {
-        btn.classList.add('tf-segmented__option--selected');
-      } else {
-        btn.classList.remove('tf-segmented__option--selected');
+    try { current = ctx.store.read(bindPath); } catch { current = undefined; }
+    for (const { parsedValue } of optionMeta) {
+      if (selectValueEquals(parsedValue, current)) {
+        seg.setAttribute('value', String(parsedValue.value));
+        return;
       }
     }
+    seg.setAttribute('value', '');
   };
   applySelection();
   ctx.registerCleanup(ctx.store.subscribe(bindPath, applySelection));
 
-  return wrapper;
+  // Forward tf-segmented 'change' event to SDK handler with SelectValue detail
+  const onChange = (e) => {
+    const rawVal = e.detail && e.detail.value;
+    // Find matching option to get the full SelectValue kind
+    for (const { parsedValue } of optionMeta) {
+      if (String(parsedValue.value) === String(rawVal)) {
+        seg.dispatchEvent(
+          new (globalThis.CustomEvent || globalThis.Event)('sdk-change', {
+            bubbles: false,
+            detail: { value: parsedValue.value, kind: parsedValue.tag },
+          })
+        );
+        return;
+      }
+    }
+  };
+  seg.addEventListener('change', onChange);
+  ctx.registerCleanup(() => seg.removeEventListener('change', onChange));
+
+  return seg;
 }
 
 // =============================================================================
-// FilterChips (0x040A)
+// FilterChips (0x040A) — uses <tf-filter-chips> with .filters property
 // =============================================================================
 
 export const FILTER_CHIPS_TAG = 0x040A;
@@ -375,14 +349,14 @@ function renderFilterChips(component, ctx) {
   }
   const clearable = requireBool(clearableRaw, 'FilterChips.clearable');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-filter-chips');
-  wrapper.classList.add(`tf-filter-chips--mode-${mode}`);
-  wrapper.setAttribute('role', mode === 'single' ? 'radiogroup' : 'group');
+  const el = document.createElement('tf-filter-chips');
+  el.setAttribute('mode', mode);
 
-  // FilterChipDef: 0=id, 1=label(BindRef), 2=icon(IconRef), 3=badge(InlineBadge), 4=count_path(StatePath)
+  // Parse chip definitions
   const seenIds = new Set();
-  const chipMeta = [];
+  const chipDefs = [];
+  const labelBinds = [];
+  const countPaths = [];
   for (let i = 0; i < chips.length; i++) {
     const chip = chips[i];
     if (!Array.isArray(chip)) {
@@ -403,84 +377,31 @@ function renderFilterChips(component, ctx) {
     }
     const chipBadge = ctx.readField(chip, 3);
     if (chipBadge != null) {
-      // Icon/badge gracefully skipped
+      // Badge gracefully skipped
     }
+    const chipIcon = ctx.readField(chip, 2);
     const countPathRaw = ctx.readField(chip, 4);
     const countPath = countPathRaw == null
       ? null
       : requirePath(countPathRaw, `FilterChips.chips[${i}].count_path`);
 
-    const btn = document.createElement('button');
-    btn.setAttribute('type', 'button');
-    btn.setAttribute('role', mode === 'single' ? 'radio' : 'checkbox');
-    btn.classList.add('tf-filter-chips__chip');
-    btn.setAttribute('data-chip-id', chipId);
+    // Resolve initial label
+    const initialLabel = resolveBindRef(chipLabel, ctx.store);
+    const iconName = (chipIcon && chipIcon.kind === 'named') ? chipIcon.name : undefined;
 
-    const chipIcon = ctx.readField(chip, 2);
-    if (chipIcon != null) {
-      const iconEl = renderIcon(chipIcon, `FilterChips.chips[${i}].icon`);
-      iconEl.classList.add('tf-filter-chips__chip-icon');
-      btn.appendChild(iconEl);
-    }
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-filter-chips__chip-label');
-    btn.appendChild(labelEl);
-    const applyLabel = () => {
-      const v = resolveBindRef(chipLabel, ctx.store);
-      labelEl.textContent = v == null ? '' : String(v);
-    };
-    applyLabel();
-    ctx.registerCleanup(subscribeBindRef(chipLabel, ctx.store, applyLabel));
-
-    // Optional count_path — reactive number obok label'u.
-    if (countPath != null) {
-      const countEl = document.createElement('span');
-      countEl.classList.add('tf-filter-chips__chip-count');
-      btn.appendChild(countEl);
-      const applyCount = () => {
-        const v = ctx.store.read(countPath);
-        if (v == null) countEl.textContent = '';
-        else countEl.textContent = String(v);
-      };
-      applyCount();
-      ctx.registerCleanup(ctx.store.subscribe(countPath, applyCount));
-    }
-
-    const onClick = () => {
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('change', {
-          bubbles: false,
-          detail: { chip_id: chipId },
-        })
-      );
-    };
-    btn.addEventListener('click', onClick);
-    ctx.registerCleanup(() => btn.removeEventListener('click', onClick));
-    wrapper.appendChild(btn);
-    chipMeta.push({ chipId, btn });
+    chipDefs.push({
+      id: chipId,
+      label: initialLabel == null ? '' : String(initialLabel),
+      icon: iconName,
+      count: null,
+      active: false,
+    });
+    labelBinds.push(chipLabel);
+    countPaths.push(countPath);
   }
 
-  if (clearable) {
-    const clearBtn = document.createElement('button');
-    clearBtn.setAttribute('type', 'button');
-    clearBtn.classList.add('tf-filter-chips__clear');
-    clearBtn.setAttribute('aria-label', 'Wyczyść filtry');
-    clearBtn.textContent = '×';
-    const onClear = () => {
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('clear', {
-          bubbles: false,
-          detail: {},
-        })
-      );
-    };
-    clearBtn.addEventListener('click', onClear);
-    ctx.registerCleanup(() => clearBtn.removeEventListener('click', onClear));
-    wrapper.appendChild(clearBtn);
-  }
-
-  // Reactive selection — selected_ids store value powinno być array string'ów.
-  const applySelection = () => {
+  // Build and set filters
+  const rebuildFilters = () => {
     let raw;
     try { raw = ctx.store.read(selectedIdsPath); } catch { raw = undefined; }
     const selectedSet = new Set();
@@ -489,33 +410,58 @@ function renderFilterChips(component, ctx) {
         if (typeof id === 'string') selectedSet.add(id);
       }
     }
-    if (mode === 'single' && selectedSet.size > 1) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[filter-chips] mode='single' but selected_ids has ${selectedSet.size} entries`
-      );
-    }
-    for (const { chipId, btn } of chipMeta) {
-      const selected = selectedSet.has(chipId);
-      // ARIA: zarówno role=radio (single) jak i role=checkbox (multi)
-      // używają `aria-checked`. `aria-pressed` jest zarezerwowane dla
-      // role=button — łamałoby to ARIA contract na checkbox/radio.
-      btn.setAttribute('aria-checked', selected ? 'true' : 'false');
-      if (selected) {
-        btn.classList.add('tf-filter-chips__chip--selected');
-      } else {
-        btn.classList.remove('tf-filter-chips__chip--selected');
+    for (let i = 0; i < chipDefs.length; i++) {
+      chipDefs[i].active = selectedSet.has(chipDefs[i].id);
+      // Resolve current label
+      const lbl = resolveBindRef(labelBinds[i], ctx.store);
+      chipDefs[i].label = lbl == null ? '' : String(lbl);
+      // Resolve count
+      if (countPaths[i] != null) {
+        try {
+          const v = ctx.store.read(countPaths[i]);
+          chipDefs[i].count = v == null ? null : v;
+        } catch {
+          chipDefs[i].count = null;
+        }
       }
     }
+    el.filters = chipDefs.map(d => ({ ...d }));
   };
-  applySelection();
-  ctx.registerCleanup(ctx.store.subscribe(selectedIdsPath, applySelection));
+  rebuildFilters();
 
-  return wrapper;
+  // Subscribe to selection path changes
+  ctx.registerCleanup(ctx.store.subscribe(selectedIdsPath, rebuildFilters));
+  // Subscribe to label binds
+  for (let i = 0; i < labelBinds.length; i++) {
+    ctx.registerCleanup(subscribeBindRef(labelBinds[i], ctx.store, rebuildFilters));
+  }
+  // Subscribe to count paths
+  for (const cp of countPaths) {
+    if (cp != null) {
+      ctx.registerCleanup(ctx.store.subscribe(cp, rebuildFilters));
+    }
+  }
+
+  // Forward tf-filter-chips change event with chip_id
+  const onChange = (e) => {
+    const chipId = e.detail && e.detail.id;
+    if (chipId != null) {
+      el.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)('sdk-change', {
+          bubbles: false,
+          detail: { chip_id: chipId },
+        })
+      );
+    }
+  };
+  el.addEventListener('change', onChange);
+  ctx.registerCleanup(() => el.removeEventListener('change', onChange));
+
+  return el;
 }
 
 // =============================================================================
-// WizardFooter (0x040B)
+// WizardFooter (0x040B) — div wrapper, no tf-* equivalent
 // =============================================================================
 
 export const WIZARD_FOOTER_TAG = 0x040B;
@@ -583,7 +529,7 @@ function renderWizardFooter(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerActionBarsRenderers() {
