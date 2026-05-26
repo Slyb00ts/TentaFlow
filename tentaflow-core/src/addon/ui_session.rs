@@ -434,6 +434,23 @@ impl SessionState {
         Ok(())
     }
 
+    /// Dynamically adds new action_ids to a panel's declared set. Called when
+    /// SlotContent pushes components with new handlers not present in the
+    /// original layout.
+    pub fn extend_declared_actions(
+        &mut self,
+        addon_id: &str,
+        panel_id: &str,
+        new_actions: HashSet<String>,
+    ) {
+        if let Some(idx) = self.find_panel(addon_id, panel_id) {
+            self.open_panels[idx]
+                .ownership
+                .declared_actions
+                .extend(new_actions);
+        }
+    }
+
     /// Enforces §8.3 namespace rules. Reserved root paths (`__system`,
     /// `__user`, etc.) are writable only from local action handlers
     /// (`from_local_action = true`). Addon-initiated state patches must not
