@@ -863,9 +863,6 @@ function createPairWindow({ title, bodyHtml, submitLabel, submitAction, onSubmit
 }
 
 function openPairModal() {
-  // Modal z dwoma zakladkami:
-  //   QR — pokaz QR + hex + PIN (drugi nod skanuje albo wpisuje recznie)
-  //   ID — wpisz hex drugiego noda recznie (fallback, stare flow)
   const bodyHtml = `
     <div class="pair-tabs">
       <tf-tabs variant="underline" value="qr" id="pair-tabs-nav">
@@ -904,6 +901,10 @@ function openPairModal() {
     <div class="pair-tab-panel" data-tab="id" hidden>
       <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="512"></tf-input>
       <tf-input id="pair-node-pin" label="${escapeAttr(I18n.t('mesh.pair_node_pin_label'))}" placeholder="123456" maxlength="6" inputmode="numeric"></tf-input>
+      <tf-input id="pair-node-host" label="${escapeAttr(I18n.t('mesh.pair_node_host_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_host_hint'))}"></tf-input>
+      <tf-input id="pair-node-port" label="${escapeAttr(I18n.t('mesh.pair_node_port_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_port_hint'))}" inputmode="numeric"></tf-input>
+      <tf-input id="pair-node-relay" label="${escapeAttr(I18n.t('mesh.pair_node_relay_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_relay_hint'))}"></tf-input>
+      <tf-button variant="secondary" class="pair-scan-btn" id="pair-scan-btn" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>${escapeHtml(I18n.t('mesh.pair_scan_camera'))}</tf-button>
       <div class="pair-id-hint">${escapeHtml(I18n.t('mesh.pair_id_hint'))}</div>
       <div class="form-error" hidden></div>
     </div>
@@ -930,11 +931,10 @@ function openPairModal() {
       const pairInputRaw = (winEl.querySelector('#pair-node-id')?.value || '').trim();
       const pinInput = winEl.querySelector('#pair-node-pin');
       const manualPin = String(pinInput?.value || '').replace(/\D/g, '');
+      const manualHost = (winEl.querySelector('#pair-node-host')?.value || '').trim();
+      const manualPort = (winEl.querySelector('#pair-node-port')?.value || '').trim();
+      const manualRelayUrl = (winEl.querySelector('#pair-node-relay')?.value || '').trim();
       const errBox = winEl.querySelector('[data-tab="id"] .form-error');
-      // Adres / port / relay sa wyciagane wylacznie z URI 'tentaflow-pair://'
-      // (parseManualPairTarget) albo zostawiane puste. Mesh discovery (mDNS,
-      // DHT, relay) sam dorobi reszte — manualne wpisywanie host/port/relay
-      // zawsze prowadzilo do bledow uzytkownika i zaśmieconej DB.
       const parsed = await parseManualPairTarget(pairInputRaw);
       const idHex = parsed?.hex || '';
       const effectivePin = manualPin || parsed?.pin || '';
@@ -952,9 +952,17 @@ function openPairModal() {
         }
         return false;
       }
+      const manualAddress = buildManualPairAddress(manualHost, manualPort);
+      if (manualHost && !manualAddress) {
+        if (errBox) {
+          errBox.textContent = I18n.t('mesh.pair_invalid_socket');
+          errBox.hidden = false;
+        }
+        return false;
+      }
       if (errBox) errBox.hidden = true;
-      const remoteAddresses = uniqueStrings(parsed?.addresses || []);
-      const remoteRelayUrl = parsed?.relayUrl || '';
+      const remoteAddresses = uniqueStrings((manualAddress ? [manualAddress] : []).concat(parsed?.addresses || []));
+      const remoteRelayUrl = manualRelayUrl || parsed?.relayUrl || '';
       const remoteHostname = parsed?.host || '';
       const remotePublicKey = parsed?.publicKey || '';
       // Otwieramy progress-dialog od razu zamiast zostawiac user-a ze starym
@@ -1021,24 +1029,26 @@ async function wireUpPairTabs(winEl) {
         : I18n.t('mesh.pair') || 'Paruj';
     submitBtn.setAttribute('label', label);
   };
-  updateSubmitLabel(nav?.value || 'qr');
+  const applyTabState = (tab) => {
+    const value = tab || 'qr';
+    panels.forEach((p) => {
+      p.hidden = p.dataset.tab !== value;
+    });
+    updateSubmitLabel(value);
+  };
+  applyTabState(nav?.value || 'qr');
   if (nav) {
-    nav.addEventListener('change', () => {
-      const val = nav.value;
-      panels.forEach((p) => {
-        p.hidden = p.dataset.tab !== val;
-      });
-      updateSubmitLabel(val);
+    nav.addEventListener('change', (e) => {
+      applyTabState(e.detail?.value || nav.value || 'qr');
     });
   }
 
   // Auto-rozpakowanie `tentaflow-pair://...` URL-a wklejonego do pola
-  // Node ID: wyciagamy hex do pola id i PIN do PIN-pola. Adresy / relay /
-  // hostname zachowujemy w `parsed` z parseManualPairTarget (przekazane do
-  // submit handlera) — usunelismy widoczne pola Host/Port/Relay z formularza
-  // bo mesh discovery dorobi te pola sam.
+  // Node ID: wyciagamy hex, PIN i znane hinty transportowe do formularza.
   const idInput = winEl.querySelector('#pair-node-id');
   const pinInput = winEl.querySelector('#pair-node-pin');
+  const hostInput = winEl.querySelector('#pair-node-host');
+  const relayInput = winEl.querySelector('#pair-node-relay');
   if (idInput) {
     const unpack = async () => {
       const raw = String(idInput.value || '').trim();
@@ -1049,6 +1059,8 @@ async function wireUpPairTabs(winEl) {
         if (!parsed) return;
         idInput.value = parsed.hex;
         if (pinInput && parsed.pin && !pinInput.value) pinInput.value = parsed.pin;
+        if (relayInput && parsed.relayUrl && !relayInput.value) relayInput.value = parsed.relayUrl;
+        if (hostInput && parsed.host && !hostInput.value) hostInput.value = parsed.host;
       } catch (_) { /* ignore */ }
     };
     idInput.addEventListener('paste', () => setTimeout(unpack, 0));

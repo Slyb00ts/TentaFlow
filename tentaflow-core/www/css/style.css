@@ -1027,6 +1027,7 @@ input, textarea, select {
 /* Pairing modal z tabami QR + ID */
 .pair-tabs { margin-bottom: 16px; }
 .pair-tab-panel { padding: 4px 0; }
+.pair-tab-panel[hidden] { display: none !important; }
 .pair-tab-panel[data-tab="id"] {
   display: flex;
   flex-direction: column;
@@ -1114,6 +1115,8 @@ input, textarea, select {
   width: 100%;
   justify-content: center;
 }
+.pair-scan-btn[hidden] { display: none; }
+.pair-scan-btn .tf-btn { width: 100%; justify-content: center; }
 .pair-scan-btn:hover {
   border-color: var(--accent-1);
   background: var(--bg-card-hover);
