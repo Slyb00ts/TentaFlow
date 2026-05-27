@@ -160,13 +160,7 @@ fn process_four_node_sync_fanout_survives_restart() {
     ];
 
     for receiver in &mut receivers {
-        source.command(&format!(
-            "TRUST {} {}",
-            receiver.node_id, receiver.public_key
-        ));
-        receiver.command(&format!("TRUST {} {}", source.node_id, source.public_key));
-        source.command(&format!("CONNECT {} {}", receiver.node_id, receiver.addr));
-        receiver.command(&format!("CONNECT {} {}", source.node_id, source.addr));
+        connect_nodes(&mut source, receiver);
     }
 
     let seed_source_args = receivers
@@ -184,11 +178,7 @@ fn process_four_node_sync_fanout_survives_restart() {
     }
 
     let op_line = source.command("RECORD_FLOW");
-    let op_id = op_line
-        .split_whitespace()
-        .nth(3)
-        .expect("record flow op id")
-        .to_string();
+    let op_id = parse_record_flow_op_id(&op_line);
     for receiver in &mut receivers {
         source.command(&format!("PUSH {}", receiver.node_id));
     }
@@ -211,6 +201,79 @@ fn process_four_node_sync_fanout_survives_restart() {
         receiver.command("WAIT_FLOW");
     }
     source.command(&format!("ASSERT_NO_PENDING {}", op_id));
+}
+
+#[test]
+fn process_four_node_offline_receiver_catches_up_after_source_restart() {
+    if std::env::var_os("TENTAFLOW_PROCESS_E2E_CHILD").is_some() {
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("process e2e root");
+    let source_home = root.path().join("source");
+    let receiver_a_home = root.path().join("receiver-a");
+    let receiver_b_home = root.path().join("receiver-b");
+    let receiver_c_home = root.path().join("receiver-c");
+
+    let mut source = ChildNode::spawn("source", source_home.clone());
+    let mut receiver_a = ChildNode::spawn("receiver-a", receiver_a_home);
+    let mut receiver_b = ChildNode::spawn("receiver-b", receiver_b_home);
+    let mut receiver_c = ChildNode::spawn("receiver-c", receiver_c_home.clone());
+
+    connect_nodes(&mut source, &mut receiver_a);
+    connect_nodes(&mut source, &mut receiver_b);
+    connect_nodes(&mut source, &mut receiver_c);
+
+    let seed_source_args = [&receiver_a, &receiver_b, &receiver_c]
+        .iter()
+        .map(|receiver| format!("{} {}", receiver.node_id, receiver.public_key))
+        .collect::<Vec<_>>()
+        .join(" ");
+    source.command(&format!("SEED_SOURCE 3 {}", seed_source_args));
+    receiver_a.command("SEED_RECEIVER");
+    receiver_b.command("SEED_RECEIVER");
+    receiver_c.command("SEED_RECEIVER");
+
+    let offline_node_id = receiver_c.node_id.clone();
+    drop(receiver_c);
+
+    let op_line = source.command("RECORD_FLOW");
+    let op_id = parse_record_flow_op_id(&op_line);
+    source.command(&format!("PUSH {}", receiver_a.node_id));
+    source.command(&format!("PUSH {}", receiver_b.node_id));
+    source.command(&format!("WAIT_ACKS {} 2", op_id));
+    receiver_a.command("WAIT_FLOW");
+    receiver_b.command("WAIT_FLOW");
+
+    drop(receiver_a);
+    drop(receiver_b);
+    drop(source);
+
+    let mut source = ChildNode::spawn("source-restart", source_home);
+    let mut receiver_c = ChildNode::spawn("receiver-c-restart", receiver_c_home);
+    assert_eq!(receiver_c.node_id, offline_node_id);
+
+    connect_nodes(&mut source, &mut receiver_c);
+    source.command(&format!("PUSH {}", receiver_c.node_id));
+    source.command(&format!("WAIT_ACKS {} 3", op_id));
+    receiver_c.command("WAIT_FLOW");
+}
+
+fn connect_nodes(source: &mut ChildNode, receiver: &mut ChildNode) {
+    source.command(&format!(
+        "TRUST {} {}",
+        receiver.node_id, receiver.public_key
+    ));
+    receiver.command(&format!("TRUST {} {}", source.node_id, source.public_key));
+    source.command(&format!("CONNECT {} {}", receiver.node_id, receiver.addr));
+    receiver.command(&format!("CONNECT {} {}", source.node_id, source.addr));
+}
+
+fn parse_record_flow_op_id(line: &str) -> String {
+    line.split_whitespace()
+        .nth(3)
+        .expect("record flow op id")
+        .to_string()
 }
 
 async fn child_main() {
