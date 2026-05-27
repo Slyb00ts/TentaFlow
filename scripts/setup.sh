@@ -846,6 +846,20 @@ verify_installation() {
         ok=false
     fi
 
+    if command -v pkg-config &>/dev/null && pkg-config --exists 'glib-2.0 >= 2.56'; then
+        log_ok "glib-2.0: $(pkg-config --modversion glib-2.0)"
+    else
+        log_error "glib-2.0: NIE ZNALEZIONO przez pkg-config"
+        case "$DISTRO" in
+            arch)   log_error "  Zainstaluj: sudo pacman -S --needed glib2 pkg-config" ;;
+            debian) log_error "  Zainstaluj: sudo apt-get install -y libglib2.0-dev pkg-config" ;;
+            fedora) log_error "  Zainstaluj: sudo dnf install -y glib2-devel pkg-config" ;;
+            macos)  log_error "  Zainstaluj: brew install glib pkg-config" ;;
+        esac
+        log_error "  Sprawdz: pkg-config --modversion glib-2.0"
+        ok=false
+    fi
+
     # Chrome / Chromium — opcjonalne, wymagane tylko jesli user wdrozy
     # teams-bota w trybie native (deploy.native). Docker tryb ma chromium
     # wbudowany w obraz. Brak nie blokuje setup, tylko warning.
