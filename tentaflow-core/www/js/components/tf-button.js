@@ -9,6 +9,20 @@
 
 import { Sfx } from '/js/lib/sfx.js';
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeIconName(value) {
+  const text = String(value || '').trim();
+  return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
+}
+
 const VARIANT_CLASS = {
   primary:        'tf-btn-primary',
   secondary:      'tf-btn-secondary',
@@ -54,7 +68,7 @@ class TfButton extends HTMLElement {
     // przenosimy slot content do wnetrza <button>, zachowujac HTML
     // jesli podano atrybut "label" — ma pierwszenstwo nad slotem
     const labelAttr = this.getAttribute('label');
-    const innerHtml = labelAttr !== null ? labelAttr : this.innerHTML;
+    const innerHtml = labelAttr !== null ? escapeHtml(labelAttr) : this.innerHTML;
     this.innerHTML = '';
     const btn = document.createElement('button');
     btn.className = 'tf-btn';
@@ -75,7 +89,7 @@ class TfButton extends HTMLElement {
   }
 
   _renderContent(text) {
-    const icon = this.getAttribute('icon');
+    const icon = safeIconName(this.getAttribute('icon'));
     // Stroke + fill ustawione inline, bo symbole w spricie nie maja wlasnych
     // atrybutow (sprite() w modulach dodaje to przez klase .icon; tu emitujemy
     // SVG bez tej klasy, wiec atrybuty musza byc explicit).
@@ -114,7 +128,7 @@ class TfButton extends HTMLElement {
 
     // aktualizacja tekstu przez atrybut "label" — przerenderowanie contentu
     if (this.hasAttribute('label')) {
-      this._btn.innerHTML = this._renderContent(this.getAttribute('label'));
+      this._btn.innerHTML = this._renderContent(escapeHtml(this.getAttribute('label')));
     }
 
     const hasText = (this.textContent || '').trim().length > 0 || this._btn.textContent.trim().length > 0;

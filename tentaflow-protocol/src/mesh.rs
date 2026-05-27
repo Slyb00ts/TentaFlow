@@ -839,6 +839,42 @@ pub struct MeshPairingRequestPayload {
     pub pin: String,
 }
 
+/// Payload pierwszego kontaktu na osobnym ALPN `tentaflow-pairing/v2`.
+/// Kodowany CBOR-em, nie JSON-em. `sender_node_id` musi byc rowny iroh
+/// `remote_id`, a pierwsze 64 znaki `sender_public_key_hex` musza byc tym
+/// samym Ed25519 public key.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct PairingFirstContactRequest {
+    pub sender_node_id: String,
+    pub sender_public_key_hex: String,
+    pub sender_hostname: String,
+    pub pin: String,
+    pub sender_addresses: Vec<String>,
+    pub sender_relay_url: String,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct PairingTrustedKeyEntry {
+    pub node_id: String,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PairingFirstContactResponse {
+    Confirm {
+        receiver_public_key_hex: String,
+        receiver_hostname: String,
+        trusted_keys: Vec<PairingTrustedKeyEntry>,
+    },
+    Pending {
+        receiver_hostname: String,
+    },
+    Reject {
+        reason: String,
+    },
+}
+
 /// Wire payload dla `MESH_MSG_PAIRING_CONFIRM` — wysylany w odpowiedzi przez
 /// receivera po walidacji PIN-u przez admina.
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]

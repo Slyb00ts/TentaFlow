@@ -607,5 +607,5 @@ window.addEventListener('error', (e) => {
 
 bootstrap().catch((err) => {
   console.error('[app] bootstrap failed', err);
-  document.body.innerHTML = `<div style="padding: 2rem; color: #ef4444;">Bootstrap error: ${err.message}</div>`;
+  document.body.innerHTML = `<div style="padding: 2rem; color: #ef4444;">Bootstrap error: ${escapeHtml(err.message)}</div>`;
 });

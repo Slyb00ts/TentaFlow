@@ -27,9 +27,56 @@ function assertThrows(fn, m) {
   let t = false; try { fn(); } catch { t = true; }
   if (!t) throw new Error(m || 'expected throw');
 }
+function clickElement(el) {
+  el.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+}
 
 const PATH = (...segs) => segs.map((s) =>
   typeof s === 'number' ? { kind: 'index', value: s } : { kind: 'key', value: s });
+
+function ensureComponentStubs() {
+  if (!customElements.get('tf-button')) {
+    customElements.define('tf-button', class extends HTMLElement {});
+  }
+  if (!customElements.get('tf-input')) {
+    customElements.define('tf-input', class extends HTMLElement {});
+  }
+  if (!customElements.get('tf-menu')) {
+    customElements.define('tf-menu', class extends HTMLElement {
+      connectedCallback() {
+        this._onKey = (e) => {
+          if (e.key === 'Escape') this.close();
+        };
+        document.addEventListener('keydown', this._onKey);
+      }
+      disconnectedCallback() {
+        document.removeEventListener('keydown', this._onKey);
+      }
+      open() { this.setAttribute('open', ''); }
+      close() { this.removeAttribute('open'); }
+    });
+  }
+  if (!customElements.get('tf-menu-item')) {
+    customElements.define('tf-menu-item', class extends HTMLElement {
+      connectedCallback() {
+        this.addEventListener('click', (e) => {
+          if (this.hasAttribute('disabled')) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+          this.dispatchEvent(new CustomEvent('tf-menu-select', {
+            bubbles: true,
+            detail: { action: this.getAttribute('action') || '' },
+          }));
+        });
+      }
+    });
+  }
+  if (!customElements.get('tf-menu-divider')) {
+    customElements.define('tf-menu-divider', class extends HTMLElement {});
+  }
+}
 
 function makeStore() {
   return new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n });
@@ -52,21 +99,28 @@ function comp(tag, fields, extra = {}) {
   };
 }
 function setup() {
+  ensureComponentStubs();
   _clearComponentRendererRegistry();
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+function renderMounted(engine, component) {
+  const el = engine.render(component);
+  document.body.appendChild(el);
+  return el;
+}
 
 function item(id, label, extra = {}) {
-  return {
-    id,
-    label: { kind: 'literal', value: label },
-    danger: extra.danger ?? false,
-    divider_after: extra.divider_after ?? false,
-    ...(extra.icon != null ? { icon: extra.icon } : {}),
-    ...(extra.shortcut != null ? { shortcut: extra.shortcut } : {}),
-    ...(extra.disabled != null ? { disabled: extra.disabled } : {}),
-  };
+  const fields = [
+    [0, id],
+    [1, { kind: 'literal', value: label }],
+    [5, extra.danger ?? false],
+    [7, extra.divider_after ?? false],
+  ];
+  if (extra.icon != null) fields.push([2, extra.icon]);
+  if (extra.shortcut != null) fields.push([4, extra.shortcut]);
+  if (extra.disabled != null) fields.push([6, extra.disabled]);
+  return fields;
 }
 
 // ============================================================================
@@ -76,7 +130,7 @@ function item(id, label, extra = {}) {
 test('MenuButton renders trigger + hidden popup z aria attrs', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'Akcje' }],
       [2, 'primary'],
@@ -84,39 +138,35 @@ test('MenuButton renders trigger + hidden popup z aria attrs', () => {
       [4, 'bottom_start'],
     ])
   );
-  const trigger = el.querySelector('.tf-menu-button__trigger');
-  assertEq(trigger.tagName, 'BUTTON');
-  assertEq(trigger.getAttribute('aria-haspopup'), 'menu');
-  assertEq(trigger.getAttribute('aria-expanded'), 'false');
-  assertEq(trigger.textContent, 'Akcje');
-  const popup = el.querySelector('.tf-menu-button__popup');
-  assertEq(popup.getAttribute('role'), 'menu');
-  assert(popup.hasAttribute('hidden'));
-  assertEq(popup.querySelectorAll('.tf-menu__item').length, 2);
+  const trigger = el.querySelector('tf-button');
+  assertEq(trigger.tagName, 'TF-BUTTON');
+  assertEq(trigger.getAttribute('label'), 'Akcje');
+  const popup = el.querySelector('tf-menu');
+  assert(!popup.hasAttribute('open'));
+  assertEq(popup.querySelectorAll('tf-menu-item').length, 2);
 });
 
 test('MenuButton trigger click toggles popup visibility', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'ghost'], [3, [item('a', 'A')]], [4, 'bottom_end'],
     ])
   );
-  const trigger = el.querySelector('.tf-menu-button__trigger');
-  const popup = el.querySelector('.tf-menu-button__popup');
-  trigger.click();
-  assert(!popup.hasAttribute('hidden'));
-  assertEq(trigger.getAttribute('aria-expanded'), 'true');
-  trigger.click();
-  assert(popup.hasAttribute('hidden'));
+  const trigger = el.querySelector('tf-button');
+  const popup = el.querySelector('tf-menu');
+  clickElement(trigger);
+  assert(popup.hasAttribute('open'));
+  clickElement(trigger);
+  assert(!popup.hasAttribute('open'));
 });
 
 test('MenuButton item click dispatches item_click + closes popup', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'primary'], [3, [item('save', 'Save')]], [4, 'bottom_start'],
@@ -124,32 +174,32 @@ test('MenuButton item click dispatches item_click + closes popup', () => {
   );
   let received = null;
   el.addEventListener('item_click', (e) => { received = e.detail; });
-  const trigger = el.querySelector('.tf-menu-button__trigger');
-  trigger.click(); // open
-  const item1 = el.querySelector('.tf-menu__item');
-  item1.click();
+  const trigger = el.querySelector('tf-button');
+  clickElement(trigger); // open
+  const item1 = el.querySelector('tf-menu-item');
+  clickElement(item1);
   assertEq(received, { item_id: 'save' });
-  assert(el.querySelector('.tf-menu-button__popup').hasAttribute('hidden'));
+  assert(!el.querySelector('tf-menu').hasAttribute('open'));
 });
 
 test('MenuButton Escape key zamyka popup', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'primary'], [3, [item('a', 'A')]], [4, 'bottom_start'],
     ])
   );
-  el.querySelector('.tf-menu-button__trigger').click();
-  el.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }));
-  assert(el.querySelector('.tf-menu-button__popup').hasAttribute('hidden'));
+  clickElement(el.querySelector('tf-button'));
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape' }));
+  assert(!el.querySelector('tf-menu').hasAttribute('open'));
 });
 
 test('MenuButton item z shortcut renderuje span tf-menu__item-shortcut', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'primary'],
@@ -157,14 +207,45 @@ test('MenuButton item z shortcut renderuje span tf-menu__item-shortcut', () => {
       [4, 'bottom_start'],
     ])
   );
-  const sc = el.querySelector('.tf-menu__item-shortcut');
-  assertEq(sc.textContent, 'Ctrl+S');
+  const itemEl = el.querySelector('tf-menu-item');
+  assertEq(itemEl.getAttribute('shortcut'), 'Ctrl+S');
+});
+
+test('MenuButton item label traktuje HTML jako tekst', () => {
+  setup();
+  const engine = makeEngine();
+  const el = renderMounted(engine,
+    comp(MENU_BUTTON_TAG, [
+      [0, { kind: 'literal', value: 'X' }],
+      [2, 'primary'],
+      [3, [item('attack', '<img src=x onerror=alert(1)>')]],
+      [4, 'bottom_start'],
+    ])
+  );
+  const menuItem = el.querySelector('tf-menu-item');
+  assertEq(menuItem.textContent, '<img src=x onerror=alert(1)>');
+  assertEq(menuItem.querySelector('img'), null);
+});
+
+test('MenuButton trigger label traktuje HTML jako tekst', () => {
+  setup();
+  const engine = makeEngine();
+  const el = renderMounted(engine,
+    comp(MENU_BUTTON_TAG, [
+      [0, { kind: 'literal', value: '<img src=x onerror=alert(1)>' }],
+      [2, 'primary'],
+      [3, [item('safe', 'Safe')]],
+      [4, 'bottom_start'],
+    ])
+  );
+  const trigger = el.querySelector('tf-button');
+  assertEq(trigger.getAttribute('label'), '<img src=x onerror=alert(1)>');
 });
 
 test('MenuButton item danger=true → tf-menu__item--danger', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'primary'],
@@ -172,7 +253,7 @@ test('MenuButton item danger=true → tf-menu__item--danger', () => {
       [4, 'bottom_start'],
     ])
   );
-  assert(el.querySelector('.tf-menu__item--danger') != null);
+  assert(el.querySelector('tf-menu-item[danger]') != null);
 });
 
 test('MenuButton item disabled reactive blocks click', () => {
@@ -183,7 +264,7 @@ test('MenuButton item disabled reactive blocks click', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'primary'],
@@ -193,24 +274,24 @@ test('MenuButton item disabled reactive blocks click', () => {
   );
   let received = null;
   el.addEventListener('item_click', (e) => { received = e.detail; });
-  el.querySelector('.tf-menu-button__trigger').click();
-  const it = el.querySelector('.tf-menu__item');
-  assertEq(it.getAttribute('aria-disabled'), 'true');
-  it.click();
+  clickElement(el.querySelector('tf-button'));
+  const it = el.querySelector('tf-menu-item');
+  assertEq(it.hasAttribute('disabled'), true);
+  clickElement(it);
   assertEq(received, null);
   // Po wyłączeniu disabled item powinien działać.
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('d'), op: { kind: 'set', value: false } }],
   });
-  it.click();
+  clickElement(it);
   assertEq(received, { item_id: 'save' });
 });
 
 test('MenuButton item divider_after renderuje li role=separator', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [0, { kind: 'literal', value: 'X' }],
       [2, 'primary'],
@@ -221,7 +302,7 @@ test('MenuButton item divider_after renderuje li role=separator', () => {
       [4, 'bottom_start'],
     ])
   );
-  assert(el.querySelector('.tf-menu__divider') != null);
+  assert(el.querySelector('tf-menu-divider') != null);
 });
 
 test('MenuButton rejects bez trigger_label i bez trigger_icon (a11y)', () => {
@@ -269,13 +350,13 @@ test('MenuButton rejects icon-only trigger bez a11y.label (named icon = aria-hid
 test('MenuButton icon-only trigger z a11y.label OK', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_BUTTON_TAG, [
       [1, { kind: 'named', name: 'more' }],
       [2, 'ghost'], [3, [item('a', 'A')]], [4, 'bottom_start'],
     ], { a11y: { label: { kind: 'literal', value: 'Więcej opcji' } } })
   );
-  assertEq(el.querySelector('.tf-menu-button__trigger').getAttribute('aria-label'), 'Więcej opcji');
+  assertEq(el.querySelector('tf-button').getAttribute('aria-label'), 'Więcej opcji');
 });
 
 test('MenuButton icon-only aria-label removed when a11y.label patched to whitespace', () => {
@@ -292,7 +373,7 @@ test('MenuButton icon-only aria-label removed when a11y.label patched to whitesp
       [2, 'ghost'], [3, [item('a', 'A')]], [4, 'bottom_start'],
     ], { a11y: { label: { kind: 'bound', path: PATH('lbl') } } })
   );
-  const trigger = el.querySelector('.tf-menu-button__trigger');
+  const trigger = el.querySelector('tf-button');
   assertEq(trigger.getAttribute('aria-label'), 'OK label');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
@@ -335,21 +416,21 @@ test('MenuButton rejects placement out of whitelist', () => {
 test('Menu renders <ul role=menu> bez search', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_TAG, [
       [0, [item('a', 'Alpha'), item('b', 'Beta')]],
       [1, false],
     ])
   );
   assertEq(el.querySelector('.tf-menu-standalone__search'), null);
-  assertEq(el.querySelectorAll('.tf-menu__item').length, 2);
-  assertEq(el.querySelector('[role=menu]').getAttribute('role'), 'menu');
+  assertEq(el.querySelectorAll('tf-menu-item').length, 2);
+  assertEq(el.querySelector('tf-menu').hasAttribute('open'), true);
 });
 
 test('Menu z search=true renderuje input + filtruje items po tekście', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_TAG, [
       [0, [item('a', 'Apple'), item('b', 'Banana'), item('c', 'Cherry')]],
       [1, true],
@@ -358,9 +439,9 @@ test('Menu z search=true renderuje input + filtruje items po tekście', () => {
   const input = el.querySelector('.tf-menu-standalone__search');
   assert(input != null);
   // Wstępnie wszystkie widoczne.
-  const items = () => [...el.querySelectorAll('.tf-menu__item')]
+  const items = () => [...el.querySelectorAll('tf-menu-item')]
     .filter((li) => !li.hasAttribute('hidden'))
-    .map((li) => li.getAttribute('data-menu-item-id'));
+    .map((li) => li.getAttribute('action'));
   assertEq(items(), ['a', 'b', 'c']);
   input.value = 'an';
   input.dispatchEvent(new window.Event('input'));
@@ -374,7 +455,7 @@ test('Menu z search=true renderuje input + filtruje items po tekście', () => {
 test('Menu item click dispatches item_click na wrapper z detail.item_id', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = renderMounted(engine,
     comp(MENU_TAG, [
       [0, [item('save', 'Save')]],
       [1, false],
@@ -382,8 +463,22 @@ test('Menu item click dispatches item_click na wrapper z detail.item_id', () => 
   );
   let received = null;
   el.addEventListener('item_click', (e) => { received = e.detail; });
-  el.querySelector('.tf-menu__item').click();
+  clickElement(el.querySelector('tf-menu-item'));
   assertEq(received, { item_id: 'save' });
+});
+
+test('Menu item label traktuje HTML jako tekst', () => {
+  setup();
+  const engine = makeEngine();
+  const el = renderMounted(engine,
+    comp(MENU_TAG, [
+      [0, [item('attack', '<svg onload=alert(1)>')]],
+      [1, false],
+    ])
+  );
+  const menuItem = el.querySelector('tf-menu-item');
+  assertEq(menuItem.textContent, '<svg onload=alert(1)>');
+  assertEq(menuItem.querySelector('svg'), null);
 });
 
 test('Menu rejects missing search field', () => {

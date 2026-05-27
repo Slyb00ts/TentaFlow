@@ -114,10 +114,9 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // harnesses, integration suites) leaves the original instance in place.
     crate::flow_runtime::scheduler::FlowScheduler::init(pool.clone());
 
-    // Upgrade path for PR5: copy `trusted_nodes` rows + parse legacy
-    // `settings.trusted_contact:*` JSON entries into peer_persisted /
-    // peer_hints. Idempotent (INSERT OR IGNORE), so a second startup is a
-    // no-op once both source sets are empty.
+    // Upgrade path: copy `trusted_nodes` rows + legacy contact hint settings
+    // into peer_persisted / peer_hints. Idempotent (INSERT OR IGNORE), so a
+    // second startup is a no-op once both source sets are empty.
     match repository::migrate_settings_trusted_contacts_to_peer_hints(&pool) {
         Ok(n) if n > 0 => info!("Migrated {} trusted peer rows into peer_persisted", n),
         Ok(_) => {}
