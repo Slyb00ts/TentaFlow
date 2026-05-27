@@ -61,10 +61,10 @@ fn apply_organization(
         ActionType::Insert => tx
             .execute(
                 "INSERT INTO organizations \
-                 (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now')) \
                  ON CONFLICT(org_id) DO UPDATE SET \
-                 name = excluded.name, contact_email = excluded.contact_email, \
+                 name = excluded.name, slug = excluded.slug, contact_email = excluded.contact_email, \
                  dpo_contact = excluded.dpo_contact, retention_policy_json = excluded.retention_policy_json, \
                  status = excluded.status",
                 rusqlite::params![
