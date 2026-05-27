@@ -134,12 +134,13 @@ function buildMenuItems(items, ctx, menuEl) {
     const menuItem = document.createElement('tf-menu-item');
     menuItem.setAttribute('action', itemId);
     if (iconName) menuItem.setAttribute('icon', iconName);
+    if (shortcut) menuItem.setAttribute('shortcut', shortcut);
     if (danger) menuItem.setAttribute('danger', '');
 
     // Reactive label
     const applyLabel = () => {
       const v = resolveBindRef(labelBind, ctx.store);
-      menuItem.innerHTML = v == null ? '' : String(v);
+      menuItem.textContent = v == null ? '' : String(v);
     };
     applyLabel();
     ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));

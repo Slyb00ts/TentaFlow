@@ -16,6 +16,20 @@ const STATUS_CLASSES = new Set([
   'scope-mesh-admin', 'scope-trace', 'scope-license',
 ]);
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeIconName(value) {
+  const text = String(value || '').trim();
+  return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
+}
+
 class TfChip extends HTMLElement {
   static get observedAttributes() {
     return ['status', 'dot', 'clickable', 'active', 'icon'];
@@ -43,7 +57,7 @@ class TfChip extends HTMLElement {
   }
 
   _build() {
-    this._label = this.innerHTML;
+    this._label = this.textContent;
     this.innerHTML = '';
     const span = document.createElement('span');
     span.className = 'tf-chip';
@@ -54,7 +68,7 @@ class TfChip extends HTMLElement {
   _update() {
     const status = (this.getAttribute('status') || 'info').toLowerCase();
     const hasDot = this.hasAttribute('dot');
-    const icon = (this.getAttribute('icon') || '').trim();
+    const icon = safeIconName(this.getAttribute('icon'));
     const cls = ['tf-chip'];
     if (STATUS_CLASSES.has(status)) cls.push(status);
     else cls.push('info');
@@ -70,7 +84,7 @@ class TfChip extends HTMLElement {
         `<svg class="tf-chip-icon" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-${icon}"/></svg>`,
       );
     }
-    parts.push(this._label);
+    parts.push(escapeHtml(this._label));
     this._span.innerHTML = parts.join('');
     if (this.hasAttribute('clickable')) {
       this.setAttribute('role', 'button');

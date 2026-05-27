@@ -1574,7 +1574,7 @@ fn spawn_quic_event_handler(
                                 }
                             }
                             Err(e) => {
-                                warn!(peer_id = %peer_id, "Blad parsowania PairingConfirm JSON: {}", e);
+                                warn!(peer_id = %peer_id, "Blad parsowania PairingConfirm rkyv: {}", e);
                             }
                         }
                     }
