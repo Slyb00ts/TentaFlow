@@ -171,6 +171,8 @@ install_base() {
                 lld
                 pkg-config
                 glib2
+                gstreamer
+                gst-plugins-base-libs
                 openssl
                 vulkan-icd-loader
                 sqlite
@@ -183,7 +185,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "glib2" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -196,6 +198,8 @@ install_base() {
                 lld
                 pkg-config
                 libglib2.0-dev
+                libgstreamer1.0-dev
+                libgstreamer-plugins-base1.0-dev
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
@@ -210,7 +214,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libglib2.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -222,6 +226,8 @@ install_base() {
                 lld
                 pkg-config
                 glib2-devel
+                gstreamer1-devel
+                gstreamer1-plugins-base-devel
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
@@ -232,7 +238,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "glib2-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -249,12 +255,14 @@ install_base() {
                 llvm
                 pkg-config
                 glib
+                gstreamer
+                gst-plugins-base
                 openssl@3
                 sqlite
             )
             log_info "Instalacja: ${pkgs[*]}"
             brew install "${pkgs[@]}"
-            INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "glib" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "openssl@3" "sqlite")
             ;;
     esac
 
@@ -857,6 +865,24 @@ verify_installation() {
             macos)  log_error "  Zainstaluj: brew install glib pkg-config" ;;
         esac
         log_error "  Sprawdz: pkg-config --modversion glib-2.0"
+        ok=false
+    fi
+
+    if command -v pkg-config &>/dev/null && \
+       pkg-config --exists 'gstreamer-1.0 >= 1.14' && \
+       pkg-config --exists 'gstreamer-app-1.0 >= 1.14'; then
+        log_ok "gstreamer-1.0: $(pkg-config --modversion gstreamer-1.0)"
+        log_ok "gstreamer-app-1.0: $(pkg-config --modversion gstreamer-app-1.0)"
+    else
+        log_error "gstreamer-1.0 / gstreamer-app-1.0: NIE ZNALEZIONO przez pkg-config"
+        case "$DISTRO" in
+            arch)   log_error "  Zainstaluj: sudo pacman -S --needed gstreamer gst-plugins-base-libs pkg-config" ;;
+            debian) log_error "  Zainstaluj: sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev pkg-config" ;;
+            fedora) log_error "  Zainstaluj: sudo dnf install -y gstreamer1-devel gstreamer1-plugins-base-devel pkg-config" ;;
+            macos)  log_error "  Zainstaluj: brew install gstreamer gst-plugins-base pkg-config" ;;
+        esac
+        log_error "  Sprawdz: pkg-config --modversion gstreamer-1.0"
+        log_error "  Sprawdz: pkg-config --modversion gstreamer-app-1.0"
         ok=false
     fi
 
