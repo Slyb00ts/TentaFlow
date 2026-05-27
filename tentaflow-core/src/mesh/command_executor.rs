@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::RwLock as AsyncRwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 use crate::db::DbPool;
@@ -100,11 +100,19 @@ impl MeshCommandExecutor {
             return CommandResponse::fail(format!("Node {} nie jest zaufany", from_node_id));
         }
 
-        info!(
-            from = %from_node_id,
-            command = ?command,
-            "Wykonuje komende mesh"
-        );
+        if matches!(command, MeshCommandType::ProfilingActiveInfo(_)) {
+            debug!(
+                from = %from_node_id,
+                command = ?command,
+                "Wykonuje komende mesh"
+            );
+        } else {
+            info!(
+                from = %from_node_id,
+                command = ?command,
+                "Wykonuje komende mesh"
+            );
+        }
 
         match command {
             MeshCommandType::ProvisionCerts {

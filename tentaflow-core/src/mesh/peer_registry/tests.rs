@@ -608,7 +608,8 @@ async fn peer_registry_set_pubkey_persists_when_provided() {
     let id: NodeId = [42u8; 32];
 
     let _ = reg.upsert_discovered(id, TransportHints::default());
-    // No pubkey yet — so far, only hint ops can have flowed.
+    // No pubkey yet — no DB op should flow because peer_hints needs a
+    // peer_persisted parent row.
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -653,7 +654,13 @@ async fn peer_registry_no_persist_when_pubkey_missing() {
         "no UpsertEntry op should be emitted while pubkey is None (got {})",
         upserts.len()
     );
-    // Hints, however, may flow — peer_hints does not strictly require a parent
-    // row in this test sink (the real DB sink would FK-reject; that is fine
-    // because the next set_pubkey call re-emits both ops together).
+    let hint_upserts: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op, PersistOp::UpsertHints { .. }))
+        .collect();
+    assert!(
+        hint_upserts.is_empty(),
+        "no UpsertHints op should be emitted while pubkey is None (got {})",
+        hint_upserts.len()
+    );
 }
