@@ -39,9 +39,16 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         CoreSyncResourceKind::GroupMember => apply_group_member(&tx, operation)?,
         CoreSyncResourceKind::Role => apply_role(&tx, operation)?,
         CoreSyncResourceKind::OrgMembership => apply_org_membership(&tx, operation)?,
+        CoreSyncResourceKind::SyncNode => apply_sync_node(&tx, operation)?,
+        CoreSyncResourceKind::UserIdentityKey => apply_user_identity_key(&tx, operation)?,
+        CoreSyncResourceKind::NodeUserAssignment => apply_node_user_assignment(&tx, operation)?,
+        CoreSyncResourceKind::SyncUserOrgProfile => apply_sync_user_org_profile(&tx, operation)?,
         CoreSyncResourceKind::Flow => apply_flow(&tx, operation)?,
         CoreSyncResourceKind::FlowVersion => apply_flow_version(&tx, operation)?,
         CoreSyncResourceKind::FlowModelBinding => apply_flow_model_binding(&tx, operation)?,
+        CoreSyncResourceKind::SyncPolicy => apply_sync_policy(&tx, operation)?,
+        CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
+        CoreSyncResourceKind::SyncExplicitShare => apply_sync_explicit_share(&tx, operation)?,
         CoreSyncResourceKind::LegacyUser => {
             return Err(SyncLedgerError::Runtime(
                 "legacy users materialization is disabled".to_string(),
@@ -307,6 +314,207 @@ fn apply_org_membership(
     }
 }
 
+fn apply_sync_node(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO sync_nodes \
+                 (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(node_id) DO UPDATE SET \
+                 public_key = excluded.public_key, public_key_type = excluded.public_key_type, \
+                 display_name = excluded.display_name, node_kind = excluded.node_kind, trust_status = excluded.trust_status, \
+                 owner_user_id = excluded.owner_user_id, sync_profile = excluded.sync_profile",
+                rusqlite::params![
+                    operation.body.resource_id,
+                    field_string(operation, "public_key")?,
+                    field_string_or(operation, "public_key_type", "ed25519")?,
+                    field_string_or(operation, "display_name", "")?,
+                    field_string_or(operation, "node_kind", "unknown")?,
+                    field_string_or(operation, "trust_status", "untrusted")?,
+                    optional_present_i64(operation, "owner_user_id")?,
+                    field_string_or(operation, "sync_profile", "standard")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE sync_nodes SET \
+                 public_key = COALESCE(?2, public_key), public_key_type = COALESCE(?3, public_key_type), \
+                 display_name = COALESCE(?4, display_name), node_kind = COALESCE(?5, node_kind), \
+                 trust_status = COALESCE(?6, trust_status), \
+                 owner_user_id = CASE WHEN ?7 THEN ?8 ELSE owner_user_id END, \
+                 sync_profile = COALESCE(?9, sync_profile) \
+                 WHERE node_id = ?1",
+                rusqlite::params![
+                    operation.body.resource_id,
+                    optional_present_string(operation, "public_key")?,
+                    optional_present_string(operation, "public_key_type")?,
+                    optional_present_string(operation, "display_name")?,
+                    optional_present_string(operation, "node_kind")?,
+                    optional_present_string(operation, "trust_status")?,
+                    nullable_update_i64(operation, "owner_user_id")?.0,
+                    nullable_update_i64(operation, "owner_user_id")?.1,
+                    optional_present_string(operation, "sync_profile")?,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM sync_nodes WHERE node_id = ?1",
+                rusqlite::params![operation.body.resource_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_user_identity_key(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO user_identity_keys (key_id, user_id, key_type, public_key, purpose, status, revoked_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(key_id) DO UPDATE SET \
+                 user_id = excluded.user_id, key_type = excluded.key_type, public_key = excluded.public_key, \
+                 purpose = excluded.purpose, status = excluded.status, revoked_at = excluded.revoked_at",
+                rusqlite::params![
+                    operation.body.resource_id,
+                    field_i64(operation, "user_id")?,
+                    field_string(operation, "key_type")?,
+                    field_string(operation, "public_key")?,
+                    field_string_or(operation, "purpose", "sync")?,
+                    field_string_or(operation, "status", "active")?,
+                    field_optional_string(operation, "revoked_at")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE user_identity_keys SET \
+                 status = COALESCE(?2, status), revoked_at = CASE WHEN ?3 THEN ?4 ELSE revoked_at END \
+                 WHERE key_id = ?1",
+                rusqlite::params![
+                    operation.body.resource_id,
+                    optional_present_string(operation, "status")?,
+                    nullable_update_string(operation, "revoked_at")?.0,
+                    nullable_update_string(operation, "revoked_at")?.1,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM user_identity_keys WHERE key_id = ?1",
+                rusqlite::params![operation.body.resource_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_node_user_assignment(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let node_id = field_string(operation, "node_id")?;
+    let user_id = field_i64(operation, "user_id")?;
+    let assignment_mode = field_string(operation, "assignment_mode")?;
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO node_user_assignments (node_id, user_id, assignment_mode, valid_until, created_by) \
+                 VALUES (?1, ?2, ?3, NULL, ?4) \
+                 ON CONFLICT(node_id, user_id, assignment_mode) DO UPDATE SET \
+                 valid_until = NULL, created_by = excluded.created_by",
+                rusqlite::params![
+                    node_id,
+                    user_id,
+                    assignment_mode,
+                    optional_present_i64(operation, "created_by")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE node_user_assignments SET valid_until = CASE WHEN ?4 THEN ?5 ELSE valid_until END \
+                 WHERE node_id = ?1 AND user_id = ?2 AND assignment_mode = ?3",
+                rusqlite::params![
+                    node_id,
+                    user_id,
+                    assignment_mode,
+                    nullable_update_string(operation, "valid_until")?.0,
+                    nullable_update_string(operation, "valid_until")?.1,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM node_user_assignments WHERE node_id = ?1 AND user_id = ?2 AND assignment_mode = ?3",
+                rusqlite::params![node_id, user_id, assignment_mode],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_sync_user_org_profile(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let org_id = field_string(operation, "org_id")?;
+    let user_id = field_i64(operation, "user_id")?;
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO sync_user_org_profiles \
+                 (org_id, user_id, department_id, manager_user_id, is_department_manager) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(org_id, user_id) DO UPDATE SET \
+                 department_id = excluded.department_id, manager_user_id = excluded.manager_user_id, \
+                 is_department_manager = excluded.is_department_manager",
+                rusqlite::params![
+                    org_id,
+                    user_id,
+                    field_optional_string(operation, "department_id")?,
+                    optional_present_i64(operation, "manager_user_id")?,
+                    field_bool_or(operation, "is_department_manager", false)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE sync_user_org_profiles SET \
+                 department_id = CASE WHEN ?3 THEN ?4 ELSE department_id END, \
+                 manager_user_id = CASE WHEN ?5 THEN ?6 ELSE manager_user_id END, \
+                 is_department_manager = COALESCE(?7, is_department_manager) \
+                 WHERE org_id = ?1 AND user_id = ?2",
+                rusqlite::params![
+                    org_id,
+                    user_id,
+                    nullable_update_string(operation, "department_id")?.0,
+                    nullable_update_string(operation, "department_id")?.1,
+                    nullable_update_i64(operation, "manager_user_id")?.0,
+                    nullable_update_i64(operation, "manager_user_id")?.1,
+                    optional_present_bool(operation, "is_department_manager")?,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM sync_user_org_profiles WHERE org_id = ?1 AND user_id = ?2",
+                rusqlite::params![org_id, user_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
 fn apply_flow(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
     let id = resource_i64(operation)?;
     match operation.body.action {
@@ -446,6 +654,197 @@ fn apply_flow_model_binding(
     }
 }
 
+fn apply_sync_policy(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO sync_policies \
+                 (policy_id, org_id, addon_id, resource_type, resource_id, mode, authority_node_id, retention_days, is_enabled) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(org_id, addon_id, resource_type, resource_id) DO UPDATE SET \
+                 policy_id = excluded.policy_id, mode = excluded.mode, authority_node_id = excluded.authority_node_id, \
+                 retention_days = excluded.retention_days, is_enabled = excluded.is_enabled",
+                rusqlite::params![
+                    operation.body.resource_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "addon_id")?,
+                    field_string_or(operation, "resource_type", "")?,
+                    field_string_or(operation, "resource_id", "")?,
+                    field_string(operation, "mode")?,
+                    field_optional_string(operation, "authority_node_id")?,
+                    optional_present_i64(operation, "retention_days")?,
+                    field_bool_or(operation, "is_enabled", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE sync_policies SET \
+                 mode = COALESCE(?2, mode), \
+                 authority_node_id = CASE WHEN ?3 THEN ?4 ELSE authority_node_id END, \
+                 retention_days = CASE WHEN ?5 THEN ?6 ELSE retention_days END, \
+                 is_enabled = COALESCE(?7, is_enabled) \
+                 WHERE policy_id = ?1",
+                rusqlite::params![
+                    operation.body.resource_id,
+                    optional_present_string(operation, "mode")?,
+                    nullable_update_string(operation, "authority_node_id")?.0,
+                    nullable_update_string(operation, "authority_node_id")?.1,
+                    nullable_update_i64(operation, "retention_days")?.0,
+                    nullable_update_i64(operation, "retention_days")?.1,
+                    optional_present_bool(operation, "is_enabled")?,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM sync_policies WHERE policy_id = ?1",
+                rusqlite::params![operation.body.resource_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_sync_resource_acl(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let org_id = field_string(operation, "org_id")?;
+    let addon_id = field_string(operation, "addon_id")?;
+    let resource_type = field_string(operation, "resource_type")?;
+    let resource_id = field_string(operation, "resource_id")?;
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO sync_resource_acl \
+                 (org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, department_id, manager_user_id, visibility_scope) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(org_id, addon_id, resource_type, resource_id) DO UPDATE SET \
+                 owner_user_id = excluded.owner_user_id, assigned_user_id = excluded.assigned_user_id, \
+                 department_id = excluded.department_id, manager_user_id = excluded.manager_user_id, visibility_scope = excluded.visibility_scope",
+                rusqlite::params![
+                    org_id,
+                    addon_id,
+                    resource_type,
+                    resource_id,
+                    optional_present_i64(operation, "owner_user_id")?,
+                    optional_present_i64(operation, "assigned_user_id")?,
+                    field_optional_string(operation, "department_id")?,
+                    optional_present_i64(operation, "manager_user_id")?,
+                    field_string_or(operation, "visibility_scope", "assigned")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE sync_resource_acl SET \
+                 owner_user_id = CASE WHEN ?5 THEN ?6 ELSE owner_user_id END, \
+                 assigned_user_id = CASE WHEN ?7 THEN ?8 ELSE assigned_user_id END, \
+                 department_id = CASE WHEN ?9 THEN ?10 ELSE department_id END, \
+                 manager_user_id = CASE WHEN ?11 THEN ?12 ELSE manager_user_id END, \
+                 visibility_scope = COALESCE(?13, visibility_scope) \
+                 WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+                rusqlite::params![
+                    org_id,
+                    addon_id,
+                    resource_type,
+                    resource_id,
+                    nullable_update_i64(operation, "owner_user_id")?.0,
+                    nullable_update_i64(operation, "owner_user_id")?.1,
+                    nullable_update_i64(operation, "assigned_user_id")?.0,
+                    nullable_update_i64(operation, "assigned_user_id")?.1,
+                    nullable_update_string(operation, "department_id")?.0,
+                    nullable_update_string(operation, "department_id")?.1,
+                    nullable_update_i64(operation, "manager_user_id")?.0,
+                    nullable_update_i64(operation, "manager_user_id")?.1,
+                    optional_present_string(operation, "visibility_scope")?,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM sync_resource_acl \
+                 WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4",
+                rusqlite::params![org_id, addon_id, resource_type, resource_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_sync_explicit_share(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let org_id = field_string(operation, "org_id")?;
+    let addon_id = field_string(operation, "addon_id")?;
+    let resource_type = field_string(operation, "resource_type")?;
+    let resource_id = field_string(operation, "resource_id")?;
+    let subject_type = field_string(operation, "subject_type")?;
+    let subject_id = field_string(operation, "subject_id")?;
+    let action = field_string(operation, "action")?;
+    match operation.body.action {
+        ActionType::Insert => tx
+            .execute(
+                "INSERT INTO sync_explicit_shares \
+                 (org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action, granted_by, revoked_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL) \
+                 ON CONFLICT(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action) DO UPDATE SET \
+                 granted_by = excluded.granted_by, granted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), revoked_at = NULL",
+                rusqlite::params![
+                    org_id,
+                    addon_id,
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                    optional_present_i64(operation, "granted_by")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Update => tx
+            .execute(
+                "UPDATE sync_explicit_shares SET revoked_at = CASE WHEN ?8 THEN ?9 ELSE revoked_at END \
+                 WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+                 AND subject_type = ?5 AND subject_id = ?6 AND action = ?7",
+                rusqlite::params![
+                    org_id,
+                    addon_id,
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                    nullable_update_string(operation, "revoked_at")?.0,
+                    nullable_update_string(operation, "revoked_at")?.1,
+                ],
+            )
+            .map_err(sql_error)
+            .and_then(require_existing(operation)),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM sync_explicit_shares \
+                 WHERE org_id = ?1 AND addon_id = ?2 AND resource_type = ?3 AND resource_id = ?4 \
+                 AND subject_type = ?5 AND subject_id = ?6 AND action = ?7",
+                rusqlite::params![
+                    org_id,
+                    addon_id,
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                ],
+            )
+            .map_err(sql_error),
+    }
+}
+
 fn require_existing(operation: &SyncOperation) -> impl FnOnce(usize) -> LedgerResult<usize> + '_ {
     |rows| {
         if rows == 0 {
@@ -516,6 +915,20 @@ fn nullable_update_string(
         None => Ok((false, None)),
         _ => Err(SyncLedgerError::Runtime(format!(
             "core operation field has invalid nullable string type: {key}"
+        ))),
+    }
+}
+
+fn nullable_update_i64(operation: &SyncOperation, key: &str) -> LedgerResult<(bool, Option<i64>)> {
+    match operation.body.changed_fields.get(key) {
+        Some(FieldValue::I64(value)) => Ok((true, Some(*value))),
+        Some(FieldValue::U64(value)) => i64::try_from(*value)
+            .map(|value| (true, Some(value)))
+            .map_err(|e| SyncLedgerError::Runtime(format!("invalid i64 field {key}: {e}"))),
+        Some(FieldValue::Null) => Ok((true, None)),
+        None => Ok((false, None)),
+        _ => Err(SyncLedgerError::Runtime(format!(
+            "core operation field has invalid nullable i64 type: {key}"
         ))),
     }
 }

@@ -16,12 +16,12 @@ use crate::config::MeshConfig;
 use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
-use crate::mesh::relay_health::{spawn_relay_health_monitor, RelayHealth};
+use crate::mesh::relay_health::{RelayHealth, spawn_relay_health_monitor};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
 use crate::net::iroh::pairing::{
-    load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
-    PairingContactHints,
+    PairingContactHints, load_trusted_contact_hints, merge_contact_hints,
+    store_trusted_contact_hints,
 };
 use crate::routing::live_metrics;
 use parking_lot::RwLock as PlRwLock;
@@ -1376,7 +1376,9 @@ fn spawn_quic_event_handler(
                                     "PairingRequest szczegoly"
                                 );
                                 if from_node_id == local_node_id {
-                                    warn!("Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)");
+                                    warn!(
+                                        "Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)"
+                                    );
                                     continue;
                                 }
                                 let pin = val.pin.as_str();
@@ -1386,7 +1388,10 @@ fn spawn_quic_event_handler(
                                 {
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
-                                    info!("PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN", from_node_id);
+                                    info!(
+                                        "PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN",
+                                        from_node_id
+                                    );
                                     // Auto-confirm jesli PIN pochodzi z naszego QR invite —
                                     // user na drugim nodzie juz zeskanowal kod i jego intent
                                     // jest jednoznaczny. Zadna dodatkowa akcja po stronie
@@ -2284,6 +2289,57 @@ fn spawn_quic_event_handler(
                         continue;
                     }
                     crate::services::frame_proxy::frame_proxy_client().handle_response(payload);
+                }
+                Ok(IrohMeshEvent::StorageProxyRequestReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            request_id = %payload.request_id,
+                            "StorageProxyRequest from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    let Some(db) = db_pool.clone() else {
+                        debug!(
+                            peer = %from_node_id,
+                            request_id = %payload.request_id,
+                            "StorageProxyRequest without DB — dropped"
+                        );
+                        continue;
+                    };
+                    let iroh = qm_events.clone();
+                    let local_node_id = local_node_id.clone();
+                    tokio::spawn(crate::services::storage_proxy::handle_request(
+                        iroh,
+                        db,
+                        local_node_id,
+                        from_node_id,
+                        payload,
+                    ));
+                }
+                Ok(IrohMeshEvent::StorageProxyResponseReceived {
+                    from_node_id,
+                    payload,
+                }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(
+                            peer = %from_node_id,
+                            "StorageProxyResponse from untrusted peer — dropped"
+                        );
+                        continue;
+                    }
+                    crate::services::storage_proxy::storage_proxy_client().handle_response(payload);
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

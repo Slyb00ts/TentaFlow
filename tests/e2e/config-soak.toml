@@ -55,10 +55,7 @@ circuit_breaker_enabled = false
 circuit_breaker_threshold = 5
 circuit_breaker_timeout_ms = 60000
 
-# Prometheus is REQUIRED for soak metric scraping (DB pool stats).
 [monitoring]
-prometheus_enabled = true
-prometheus_bind = "0.0.0.0:19099"
 health_check_enabled = true
 health_check_bind = "0.0.0.0:19889"
 health_check_path = "/health"

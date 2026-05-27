@@ -26,6 +26,7 @@ pub mod service;
 pub mod services;
 pub mod sql;
 pub mod storage;
+pub mod sync_acl;
 #[cfg(feature = "camera")]
 pub mod streaming;
 pub mod ui;
@@ -101,6 +102,38 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "storage_list", storage::storage_list)
         .map_err(|e| anyhow::anyhow!("Rejestracja storage_list: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_acl_upsert_v1",
+            sync_acl::sync_acl_upsert_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_acl_upsert_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_acl_delete_v1",
+            sync_acl::sync_acl_delete_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_acl_delete_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_share_grant_v1",
+            sync_acl::sync_share_grant_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_share_grant_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "sync_share_revoke_v1",
+            sync_acl::sync_share_revoke_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja sync_share_revoke_v1: {e}"))?;
 
     // --- HTTP API ---
     linker

@@ -15,17 +15,17 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use regex::Regex;
-use rusqlite::types::{Value as SqliteValue, ValueRef};
 use rusqlite::OptionalExtension;
-use serde_json::{json, Value as JsonValue};
+use rusqlite::types::{Value as SqliteValue, ValueRef};
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
 use crate::addon::errors::AbiError;
 use crate::addon::lifecycle::parse_manifest_toml;
-use crate::addon::storage_sql::{get_addon_pool, open_addon_db, AddonDbPool};
-use crate::db::{repository, DbPool};
+use crate::addon::storage_sql::{AddonDbPool, get_addon_pool, open_addon_db};
+use crate::db::{DbPool, repository};
 use crate::sync::ledger::OperationId;
 use crate::sync::runtime::{self as sync_runtime, SqlWriteAction, SqlWriteCapture};
 
@@ -113,7 +113,7 @@ impl StorageSqlError {
         }
     }
 
-    fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             StorageSqlError::NotDeclared => "not_declared",
             StorageSqlError::DdlBlocked => "ddl_blocked",
@@ -167,11 +167,26 @@ fn delete_regex() -> &'static Regex {
     })
 }
 
+fn select_table_regex() -> &'static Regex {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| {
+        Regex::new(r#"(?i)\bFROM\s+["`\[]?([A-Za-z_][A-Za-z0-9_]*)["`\]]?"#)
+            .expect("select table regex stale poprawny")
+    })
+}
+
 fn identifier_regex() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
     RX.get_or_init(|| {
         Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("identifier regex stale poprawny")
     })
+}
+
+pub fn resource_type_for_query(query: &str) -> Option<String> {
+    select_table_regex()
+        .captures(query.trim())
+        .and_then(|captures| captures.get(1))
+        .map(|table| table.as_str().to_string())
 }
 
 fn strip_leading_noise(q: &str) -> &str {
@@ -209,7 +224,9 @@ pub fn query_hash_short(q: &str) -> String {
     hex::encode(&digest[..8])
 }
 
-fn parse_write_action_and_table(query: &str) -> Result<(SqlWriteAction, String), StorageSqlError> {
+pub fn parse_write_action_and_table(
+    query: &str,
+) -> Result<(SqlWriteAction, String), StorageSqlError> {
     let q = strip_leading_noise(query);
     if let Some(caps) = insert_regex().captures(q) {
         return Ok((SqlWriteAction::Insert, caps[1].to_string()));

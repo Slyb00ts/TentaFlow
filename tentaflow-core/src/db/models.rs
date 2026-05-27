@@ -602,6 +602,63 @@ pub struct SyncAccessDecision {
 }
 
 /// Konfiguracja trybu synchronizacji dla addonu/typu zasobu/zasobu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPolicyMode {
+    LocalOnly,
+    ReplicatedByPermission,
+    AuthorityReadthrough,
+    AuthorityWrite,
+    Sharded,
+    Ephemeral,
+}
+
+impl SyncPolicyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::ReplicatedByPermission => "replicated_by_permission",
+            Self::AuthorityReadthrough => "authority_readthrough",
+            Self::AuthorityWrite => "authority_write",
+            Self::Sharded => "sharded",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local_only" => Some(Self::LocalOnly),
+            "replicated_by_permission" => Some(Self::ReplicatedByPermission),
+            "authority_readthrough" => Some(Self::AuthorityReadthrough),
+            "authority_write" => Some(Self::AuthorityWrite),
+            "sharded" => Some(Self::Sharded),
+            "ephemeral" => Some(Self::Ephemeral),
+            _ => None,
+        }
+    }
+
+    pub fn is_authority_backed(self) -> bool {
+        matches!(
+            self,
+            Self::AuthorityReadthrough
+                | Self::AuthorityWrite
+                | Self::ReplicatedByPermission
+                | Self::Sharded
+        )
+    }
+
+    pub fn materializes_by_permission(self) -> bool {
+        matches!(self, Self::ReplicatedByPermission | Self::Sharded)
+    }
+}
+
+impl std::fmt::Display for SyncPolicyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Konfiguracja trybu synchronizacji dla addonu/typu zasobu/zasobu.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPolicy {
     pub policy_id: String,
@@ -609,7 +666,7 @@ pub struct SyncPolicy {
     pub addon_id: String,
     pub resource_type: Option<String>,
     pub resource_id: Option<String>,
-    pub mode: String,
+    pub mode: SyncPolicyMode,
     pub authority_node_id: Option<String>,
     pub retention_days: Option<i64>,
     pub is_enabled: bool,

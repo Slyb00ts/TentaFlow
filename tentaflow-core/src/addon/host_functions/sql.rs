@@ -12,18 +12,22 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
-use super::abi_helpers::{enforce_payload_size, write_output_with_retry_semantics, PayloadKind};
+use super::abi_helpers::{PayloadKind, enforce_payload_size, write_output_with_retry_semantics};
 use super::{
-    audit_log_with_risk, check_permission, get_memory, read_guest_string, AddonState, WasmCaller,
+    AddonState, WasmCaller, audit_log_with_risk, check_permission, get_memory, read_guest_string,
 };
 use crate::addon::errors::AbiError;
 use crate::addon::storage_sql_exec::{
-    exec_for_addon, is_ddl, query_for_addon, query_hash_short, query_one_for_addon,
-    transaction_for_addon, StorageSqlError,
+    StorageSqlError, exec_for_addon, is_ddl, parse_write_action_and_table, query_for_addon,
+    query_hash_short, query_one_for_addon, resource_type_for_query, transaction_for_addon,
 };
 use crate::audit::RiskClass;
+use crate::services::storage_proxy::{
+    DEFAULT_STORAGE_PROXY_TIMEOUT, remote_sql_exec, remote_sql_query,
+};
+use tentaflow_protocol::mesh::{StorageProxyRequestKind, StorageProxyRequestPayload};
 
 // =============================================================================
 // sql_exec_v1
@@ -98,6 +102,81 @@ pub fn sql_exec_v1(
         .org_id
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+
+    let (_, table_name) = match parse_write_action_and_table(&query) {
+        Ok(parsed) => parsed,
+        Err(e) => return e.as_abi().as_i32(),
+    };
+    if let Some((authority_node_id, iroh)) =
+        central_storage_target(caller.data(), &org_id, &addon_id, &table_name, "")
+    {
+        let request = StorageProxyRequestPayload {
+            request_id: String::new(),
+            from_node_id: iroh.node_id(),
+            org_id: org_id.clone(),
+            addon_id: addon_id.clone(),
+            resource_type: table_name,
+            resource_id: String::new(),
+            actor_user_id: caller.data().user_id,
+            kind: StorageProxyRequestKind::SqlExec {
+                query: query.clone(),
+                params: params
+                    .iter()
+                    .map(crate::services::storage_proxy::json_to_wire)
+                    .collect(),
+            },
+        };
+        match run_async(remote_sql_exec(
+            iroh.as_ref(),
+            &authority_node_id,
+            request,
+            DEFAULT_STORAGE_PROXY_TIMEOUT,
+        )) {
+            Ok((rows_affected, last_insert_id)) => {
+                audit_log_with_risk(
+                    caller.data(),
+                    "sql.exec",
+                    Some("sql"),
+                    Some(&query_hash_short(&query)),
+                    RiskClass::A,
+                    None,
+                    None,
+                    "ok",
+                    Some("central_authority"),
+                );
+                let response = json!({
+                    "rows_affected": rows_affected,
+                    "last_insert_id": last_insert_id,
+                });
+                let bytes = match serde_json::to_vec(&response) {
+                    Ok(b) => b,
+                    Err(_) => return AbiError::Operation.as_i32(),
+                };
+                return write_output_with_retry_semantics(
+                    &memory,
+                    &mut caller,
+                    &bytes,
+                    out_ptr,
+                    out_cap,
+                    out_len_ptr,
+                );
+            }
+            Err(e) => {
+                audit_log_with_risk(
+                    caller.data(),
+                    "sql.exec",
+                    Some("sql"),
+                    Some(&query_hash_short(&query)),
+                    RiskClass::A,
+                    None,
+                    None,
+                    "error",
+                    Some(&e.to_string()),
+                );
+                return proxy_error_to_abi(&e).as_i32();
+            }
+        }
+    }
 
     let result = exec_for_addon(&org_id, &addon_id, &query, &params, caller.data().user_id);
     match result {
@@ -274,6 +353,75 @@ fn sql_query_inner(
         .org_id
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let resource_type = resource_type_for_query(&query).unwrap_or_default();
+    if let Some((authority_node_id, iroh)) =
+        central_storage_target(caller.data(), &org_id, &addon_id, &resource_type, "")
+    {
+        let request = StorageProxyRequestPayload {
+            request_id: String::new(),
+            from_node_id: iroh.node_id(),
+            org_id: org_id.clone(),
+            addon_id: addon_id.clone(),
+            resource_type,
+            resource_id: String::new(),
+            actor_user_id: caller.data().user_id,
+            kind: StorageProxyRequestKind::SqlQuery {
+                query: query.clone(),
+                params: params
+                    .iter()
+                    .map(crate::services::storage_proxy::json_to_wire)
+                    .collect(),
+                one,
+                limit: None,
+            },
+        };
+        match run_async(remote_sql_query(
+            iroh.as_ref(),
+            &authority_node_id,
+            request,
+            DEFAULT_STORAGE_PROXY_TIMEOUT,
+        )) {
+            Ok(response) => {
+                audit_log_with_risk(
+                    caller.data(),
+                    action,
+                    Some("sql"),
+                    Some(&query_hash_short(&query)),
+                    RiskClass::A,
+                    None,
+                    None,
+                    "ok",
+                    Some("central_authority"),
+                );
+                let bytes = match serde_json::to_vec(&response) {
+                    Ok(b) => b,
+                    Err(_) => return AbiError::Operation.as_i32(),
+                };
+                return write_output_with_retry_semantics(
+                    &memory,
+                    caller,
+                    &bytes,
+                    out_ptr,
+                    out_cap,
+                    out_len_ptr,
+                );
+            }
+            Err(e) => {
+                audit_log_with_risk(
+                    caller.data(),
+                    action,
+                    Some("sql"),
+                    Some(&query_hash_short(&query)),
+                    RiskClass::A,
+                    None,
+                    None,
+                    "error",
+                    Some(&e.to_string()),
+                );
+                return proxy_error_to_abi(&e).as_i32();
+            }
+        }
+    }
     let result = if one {
         query_one_for_addon(&org_id, &addon_id, &query, &params)
     } else {
@@ -500,6 +648,88 @@ fn parse_params_json(params_json: &str) -> Result<Vec<JsonValue>, i32> {
         serde_json::from_str(params_json).map_err(|_| AbiError::Operation.as_i32())?;
     let arr = v.as_array().ok_or_else(|| AbiError::Operation.as_i32())?;
     Ok(arr.clone())
+}
+
+pub(crate) fn central_storage_target(
+    state: &AddonState,
+    org_id: &str,
+    addon_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> Option<(
+    String,
+    std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+)> {
+    let policy = crate::db::repository::get_effective_sync_policy(
+        &state.db,
+        org_id,
+        addon_id,
+        resource_type,
+        resource_id,
+    )
+    .ok()
+    .flatten()?;
+    if !policy.is_enabled {
+        return None;
+    }
+    if !policy.mode.is_authority_backed() {
+        return None;
+    }
+    let authority_node_id = policy.authority_node_id?;
+    let router = state.router.as_ref()?;
+    let iroh = router.mesh_manager()?;
+    if authority_node_id == iroh.node_id() {
+        return None;
+    }
+    if policy.mode.materializes_by_permission()
+        && crate::db::repository::can_node_receive_sync_resource(
+            &state.db,
+            &iroh.node_id(),
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
+        )
+        .ok()
+        .map(|decision| decision.allowed)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some((authority_node_id, iroh))
+}
+
+pub(crate) fn run_async<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
+
+pub(crate) fn proxy_error_to_abi(error: &crate::services::storage_proxy::StorageProxyError) -> AbiError {
+    match error {
+        crate::services::storage_proxy::StorageProxyError::Timeout(_) => AbiError::Timeout,
+        crate::services::storage_proxy::StorageProxyError::Remote { code, .. }
+            if code == "not_declared"
+                || code == "ddl_blocked"
+                || code == "not_write_statement"
+                || code == "internal_table_blocked"
+                || code == "authority_denied" =>
+        {
+            AbiError::Permission
+        }
+        crate::services::storage_proxy::StorageProxyError::Remote { code, .. }
+            if code == "sql_syntax" =>
+        {
+            AbiError::SqlSyntax
+        }
+        crate::services::storage_proxy::StorageProxyError::Remote { code, .. }
+            if code == "sql_constraint" =>
+        {
+            AbiError::SqlConstraint
+        }
+        _ => AbiError::Operation,
+    }
 }
 
 // =============================================================================

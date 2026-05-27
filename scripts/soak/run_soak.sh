@@ -15,13 +15,11 @@
 # Output layout:
 #   $OUTPUT_DIR/logs/tentaflow.log       — full stdout/stderr
 #   $OUTPUT_DIR/metrics/snapshot.csv     — sampled metrics (1-min cadence)
-#   $OUTPUT_DIR/metrics/prom-raw.txt     — last raw Prometheus scrape
 #   $OUTPUT_DIR/summary.txt              — analyze.py result (post-run)
 #
 # Acceptance targets (per tentavision-f1a §17.9 / M3.W14):
 #   - RSS growth < 5% / 24h
 #   - FD count steady (no monotonic growth after warm-up)
-#   - DB pool: no exhaustion
 #
 # Author: tentaflow-soak
 
@@ -33,7 +31,6 @@ OUTPUT_DIR="${2:-/tmp/tentaflow-soak-$(date +%Y%m%d-%H%M%S)}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BINARY="${REPO_ROOT}/tentaflow/target/release/tentaflow"
 CONFIG="${REPO_ROOT}/tests/e2e/config-soak.toml"
-PROM_URL="${PROM_URL:-http://127.0.0.1:19099/metrics}"
 SAMPLE_INTERVAL_SEC="${SAMPLE_INTERVAL_SEC:-60}"
 
 if [[ ! -x "${BINARY}" ]]; then
@@ -71,7 +68,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Warm-up: wait until process is alive and (optionally) Prometheus responds.
+# Warm-up: wait until process is alive.
 sleep 5
 if ! kill -0 "${TF_PID}" 2>/dev/null; then
     echo "ERROR: tentaflow died during warm-up. Tail of log:" >&2
@@ -92,12 +89,12 @@ fi
 START_TS=$(date +%s)
 END_TS=$(awk -v s="${START_TS}" -v h="${DURATION_HOURS}" 'BEGIN { printf "%d", s + h * 3600 }')
 CSV="${OUTPUT_DIR}/metrics/snapshot.csv"
-echo "ts_unix,rss_kb,vsz_kb,cpu_pct,fd_count,thread_count,db_pool_in_use,db_pool_idle,uptime_sec" > "${CSV}"
+echo "ts_unix,rss_kb,vsz_kb,cpu_pct,fd_count,thread_count,uptime_sec" > "${CSV}"
 
 echo "Sampling every ${SAMPLE_INTERVAL_SEC}s until $(date -d "@${END_TS}" 2>/dev/null || date -r "${END_TS}")"
 
 sample_one() {
-    local now rss vsz cpu fd threads pool_in_use pool_idle uptime
+    local now rss vsz cpu fd threads uptime
     now=$(date +%s)
     if ! kill -0 "${TF_PID}" 2>/dev/null; then
         echo "ERROR: tentaflow died at $(date)" >&2
@@ -107,19 +104,9 @@ sample_one() {
     read -r rss vsz cpu threads < <(ps -p "${TF_PID}" -o rss=,vsz=,%cpu=,nlwp= 2>/dev/null | awk '{print $1,$2,$3,$4}')
     fd=$(ls -1 "/proc/${TF_PID}/fd" 2>/dev/null | wc -l | tr -d ' ')
     uptime=$(( now - START_TS ))
-    pool_in_use=""
-    pool_idle=""
-    if command -v curl >/dev/null 2>&1; then
-        if curl -sf --max-time 5 "${PROM_URL}" -o "${OUTPUT_DIR}/metrics/prom-raw.txt"; then
-            pool_in_use=$(grep -E '^(sqlite_pool_in_use|tentaflow_db_pool_in_use)([{ ]|$)' \
-                "${OUTPUT_DIR}/metrics/prom-raw.txt" | awk '{print $NF}' | head -n1)
-            pool_idle=$(grep -E '^(sqlite_pool_idle|tentaflow_db_pool_idle)([{ ]|$)' \
-                "${OUTPUT_DIR}/metrics/prom-raw.txt" | awk '{print $NF}' | head -n1)
-        fi
-    fi
-    printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+    printf "%s,%s,%s,%s,%s,%s,%s\n" \
         "${now}" "${rss:-}" "${vsz:-}" "${cpu:-}" "${fd:-}" "${threads:-}" \
-        "${pool_in_use:-}" "${pool_idle:-}" "${uptime}" >> "${CSV}"
+        "${uptime}" >> "${CSV}"
 }
 
 while [[ "$(date +%s)" -lt "${END_TS}" ]]; do

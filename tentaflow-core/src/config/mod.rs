@@ -45,7 +45,7 @@ pub struct NodeConfig {
     /// Load balancing (health checks, circuit breaker)
     pub load_balancing: LoadBalancingConfig,
 
-    /// Monitoring (Prometheus, health checks)
+    /// Monitoring (health checks)
     #[serde(default)]
     pub monitoring: MonitoringConfig,
 
@@ -555,14 +555,6 @@ pub enum LlmModelCategory {
 /// Konfiguracja monitoringu
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MonitoringConfig {
-    /// Czy Prometheus metrics sa wlaczone
-    #[serde(default = "default_true")]
-    pub prometheus_enabled: bool,
-
-    /// Adres dla Prometheus endpoint
-    #[serde(default = "default_prometheus_bind")]
-    pub prometheus_bind: String,
-
     /// Czy health check endpoint jest wlaczony
     #[serde(default = "default_true")]
     pub health_check_enabled: bool,
@@ -686,10 +678,6 @@ fn default_circuit_breaker_timeout() -> u64 {
 
 fn default_weight() -> u32 {
     1
-}
-
-fn default_prometheus_bind() -> String {
-    "0.0.0.0:9090".to_string()
 }
 
 fn default_health_bind() -> String {
@@ -933,8 +921,6 @@ impl Default for NodeConfig {
 impl Default for MonitoringConfig {
     fn default() -> Self {
         Self {
-            prometheus_enabled: true,
-            prometheus_bind: default_prometheus_bind(),
             health_check_enabled: true,
             health_check_bind: default_health_bind(),
             health_check_path: default_health_path(),

@@ -13,7 +13,6 @@
 # Acceptance (tentavision-f1a M3.W14):
 #   - RSS growth < 5% over the full window (warm-up sample dropped)
 #   - FD count: not monotonically increasing (max - min <= small tolerance after warm-up)
-#   - DB pool: never exhausted (in_use < observed max+1 always; we report peak)
 
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ FD_GROWTH_LIMIT = 50           # absolute slack for FD spikes vs steady-state
 WARMUP_SAMPLES = 2             # drop first N samples (process still warming caches)
 
 class Sample:
-    __slots__ = ("ts", "rss_kb", "cpu_pct", "fd", "threads", "pool_in_use", "uptime")
+    __slots__ = ("ts", "rss_kb", "cpu_pct", "fd", "threads", "uptime")
 
     def __init__(self, row: dict[str, str]) -> None:
         def _f(key: str) -> Optional[float]:
@@ -45,7 +44,6 @@ class Sample:
         self.cpu_pct = _f("cpu_pct")
         self.fd = _f("fd_count")
         self.threads = _f("thread_count")
-        self.pool_in_use = _f("db_pool_in_use")
         self.uptime = _f("uptime_sec") or 0.0
 
 
@@ -83,7 +81,6 @@ def main(argv: list[str]) -> int:
     rss_vals = [s.rss_kb for s in post_warmup if s.rss_kb is not None]
     cpu_vals = [s.cpu_pct for s in post_warmup if s.cpu_pct is not None]
     fd_vals = [s.fd for s in post_warmup if s.fd is not None]
-    pool_vals = [s.pool_in_use for s in post_warmup if s.pool_in_use is not None]
 
     duration_sec = samples[-1].ts - samples[0].ts
     duration_h = duration_sec / 3600.0
@@ -132,13 +129,6 @@ def main(argv: list[str]) -> int:
     else:
         print("FD              : no samples")
         failures.append("FD: no samples")
-
-    # DB pool
-    if pool_vals:
-        peak = max(pool_vals)
-        print(f"DB pool in_use  : peak {peak:.0f}, mean {statistics.fmean(pool_vals):.2f}")
-    else:
-        print("DB pool         : no Prometheus samples (metric absent or scrape failed)")
 
     print()
     if failures:
