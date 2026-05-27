@@ -1508,7 +1508,7 @@ CREATE INDEX idx_alias_owners_addon ON model_alias_owners(owner_type, owner_id);
 
 // F1a §6.5 — log wywolan aliasow AI. Kazdy alias_call (M1.W6) zapisuje
 // rekord z target_used, request_id, fallback_chain_position; pozwala na
-// debug fallback chain w UI M16 i metryki Prometheus per alias.
+// debug fallback chain w UI M16 i metryki per alias.
 const ALIAS_CALLS: &str = r#"
 CREATE TABLE alias_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

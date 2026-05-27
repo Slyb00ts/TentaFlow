@@ -56,10 +56,10 @@ pub enum SyncLedgerError {
     MerklePartitionMismatch { expected: String, actual: String },
     #[error("luka sekwencji w merkle summary: expected={expected}, actual={actual}")]
     MerkleSequenceGap { expected: u64, actual: u64 },
-    #[error("błąd serializacji ledgera: {0}")]
-    Codec(#[from] rmp_serde::encode::Error),
-    #[error("błąd deserializacji ledgera: {0}")]
-    Decode(#[from] rmp_serde::decode::Error),
+    #[error("błąd serializacji CBOR ledgera: {0}")]
+    Codec(String),
+    #[error("błąd deserializacji CBOR ledgera: {0}")]
+    Decode(String),
     #[error("błąd storage Fjall: {0}")]
     Fjall(#[from] fjall::Error),
     #[error("błąd runtime sync: {0}")]
@@ -510,11 +510,15 @@ pub trait SyncLedgerStore: Send + Sync {
 }
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> LedgerResult<Vec<u8>> {
-    Ok(rmp_serde::to_vec_named(value)?)
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(value, &mut bytes)
+        .map_err(|e| SyncLedgerError::Codec(e.to_string()))?;
+    Ok(bytes)
 }
 
 pub(crate) fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> LedgerResult<T> {
-    Ok(rmp_serde::from_slice(bytes)?)
+    ciborium::de::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|e| SyncLedgerError::Decode(e.to_string()))
 }
 
 pub(crate) fn hash_canonical<T: Serialize>(value: &T) -> LedgerResult<[u8; 32]> {

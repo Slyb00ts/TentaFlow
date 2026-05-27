@@ -756,7 +756,7 @@ impl SyncRuntime {
             partition_id,
             up_to_sequence: snapshot.up_to_sequence,
             snapshot_id: snapshot.snapshot_id.as_str().to_string(),
-            snapshot_bytes: rmp_serde::to_vec_named(&snapshot)?,
+            snapshot_bytes: crate::sync::ledger::encode(&snapshot)?,
             blob_bytes,
             operations_after_snapshot,
         })
@@ -815,7 +815,7 @@ impl SyncRuntime {
                 payload.from_node_id
             )));
         }
-        let snapshot: SyncSnapshot = rmp_serde::from_slice(&payload.snapshot_bytes)?;
+        let snapshot: SyncSnapshot = crate::sync::ledger::decode(&payload.snapshot_bytes)?;
         if snapshot.partition_id.as_str() != payload.partition_id
             || snapshot.up_to_sequence != payload.up_to_sequence
             || snapshot.snapshot_id.as_str() != payload.snapshot_id
@@ -1218,7 +1218,7 @@ impl SyncRuntime {
         &self,
         capture: &crate::sync::core_capture::CoreWriteCapture,
     ) -> LedgerResult<NewSyncOperation> {
-        let payload = rmp_serde::to_vec_named(capture)?;
+        let payload = crate::sync::ledger::encode(capture)?;
         let payload_hash = sha256(&payload);
         let policy_epoch = repository::get_sync_permission_epoch(&self.db, &capture.org_id)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -1275,7 +1275,7 @@ impl SyncRuntime {
     }
 
     fn build_operation(&self, capture: &SqlWriteCapture) -> LedgerResult<NewSyncOperation> {
-        let payload = rmp_serde::to_vec_named(capture)?;
+        let payload = crate::sync::ledger::encode(capture)?;
         let payload_hash = sha256(&payload);
         let policy_epoch = repository::get_sync_permission_epoch(&self.db, &capture.org_id)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -1447,7 +1447,7 @@ impl SyncRuntime {
         policy_epoch: u64,
         chunk_count: u64,
     ) -> LedgerResult<NewSyncOperation> {
-        let payload = rmp_serde::to_vec_named(capture)?;
+        let payload = crate::sync::ledger::encode(capture)?;
         let payload_hash = sha256(&payload);
         let mut changed_fields = BTreeMap::new();
         changed_fields.insert(
@@ -1569,7 +1569,7 @@ impl SyncRuntime {
     }
 
     fn build_kv_operation(&self, capture: &KvWriteCapture) -> LedgerResult<NewSyncOperation> {
-        let payload = rmp_serde::to_vec_named(capture)?;
+        let payload = crate::sync::ledger::encode(capture)?;
         let payload_hash = sha256(&payload);
         let policy_epoch = repository::get_sync_permission_epoch(&self.db, &capture.org_id)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -1636,12 +1636,12 @@ fn operation_to_wire(operation: &SyncOperation) -> LedgerResult<MeshSyncOperatio
         op_id: operation.op_id.as_bytes().to_vec(),
         partition_id: operation.body.partition_id.as_str().to_string(),
         partition_sequence: operation.body.partition_sequence,
-        operation: rmp_serde::to_vec_named(operation)?,
+        operation: crate::sync::ledger::encode(operation)?,
     })
 }
 
 fn operation_from_wire(wire: &MeshSyncOperationWire) -> LedgerResult<SyncOperation> {
-    let operation: SyncOperation = rmp_serde::from_slice(&wire.operation)?;
+    let operation: SyncOperation = crate::sync::ledger::decode(&wire.operation)?;
     let op_id = operation_id_from_wire(&wire.op_id)?;
     if operation.op_id != op_id
         || operation.body.partition_id.as_str() != wire.partition_id
@@ -3050,7 +3050,7 @@ mod tests {
                 .iter()
                 .filter(|wire| {
                     let operation: SyncOperation =
-                        rmp_serde::from_slice(&wire.operation).expect("wire operation");
+                        crate::sync::ledger::decode(&wire.operation).expect("wire operation");
                     operation.body.table_name == "blob_store_chunks"
                 })
                 .count();

@@ -10,8 +10,9 @@
 use super::{
     audit_log, check_permission, get_memory, read_guest_bytes, read_guest_string,
     write_guest_output, AddonState, WasmCaller, ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION,
-    ABI_ERR_PERMISSION, ABI_OK,
+    ABI_ERR_PERMISSION, ABI_ERR_TIMEOUT, ABI_OK,
 };
+use tentaflow_protocol::mesh::{StorageProxyRequestKind, StorageProxyRequestPayload};
 
 /// CR-009: Maksymalna dlugosc klucza storage (1024 bajtow)
 const MAX_KEY_LENGTH: usize = 1024;
@@ -79,6 +80,49 @@ pub fn storage_get(
 
     let addon_id = caller.data().addon_id.clone();
     let instance_id = caller.data().instance_id.clone();
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+
+    if let Some((authority_node_id, iroh)) =
+        central_kv_target(caller.data(), &org_id, &addon_id, &instance_id, &key)
+    {
+        let request = StorageProxyRequestPayload {
+            request_id: String::new(),
+            from_node_id: iroh.node_id(),
+            org_id,
+            addon_id: addon_id.clone(),
+            resource_type: "addon.kv".to_string(),
+            resource_id: kv_resource_id(&instance_id, &key),
+            actor_user_id: caller.data().user_id,
+            kind: StorageProxyRequestKind::KvGet {
+                instance_id: instance_id.clone(),
+                key: key.clone(),
+            },
+        };
+        return match super::sql::run_async(crate::services::storage_proxy::remote_kv_get(
+            iroh.as_ref(),
+            &authority_node_id,
+            request,
+            crate::services::storage_proxy::DEFAULT_STORAGE_PROXY_TIMEOUT,
+        )) {
+            Ok(Some(data)) => {
+                audit_log(
+                    caller.data(),
+                    "storage.get",
+                    Some("storage"),
+                    Some(&key),
+                    "ok",
+                    Some("central_authority"),
+                );
+                write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &data)
+            }
+            Ok(None) => ABI_ERR_NOT_FOUND,
+            Err(e) => storage_proxy_error_to_legacy(&e),
+        };
+    }
 
     // Pobierz z DB
     let value: Option<Vec<u8>> = {
@@ -203,6 +247,44 @@ pub fn storage_set(
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let actor_user_id = caller.data().user_id;
     let value_size = value.len() as i64;
+
+    if let Some((authority_node_id, iroh)) =
+        central_kv_target(caller.data(), &org_id, &addon_id, &instance_id, &key)
+    {
+        let request = StorageProxyRequestPayload {
+            request_id: String::new(),
+            from_node_id: iroh.node_id(),
+            org_id,
+            addon_id: addon_id.clone(),
+            resource_type: "addon.kv".to_string(),
+            resource_id: kv_resource_id(&instance_id, &key),
+            actor_user_id,
+            kind: StorageProxyRequestKind::KvSet {
+                instance_id: instance_id.clone(),
+                key: key.clone(),
+                value,
+            },
+        };
+        return match super::sql::run_async(crate::services::storage_proxy::remote_kv_set(
+            iroh.as_ref(),
+            &authority_node_id,
+            request,
+            crate::services::storage_proxy::DEFAULT_STORAGE_PROXY_TIMEOUT,
+        )) {
+            Ok(_) => {
+                audit_log(
+                    caller.data(),
+                    "storage.set",
+                    Some("storage"),
+                    Some(&key),
+                    "ok",
+                    Some("central_authority"),
+                );
+                ABI_OK
+            }
+            Err(e) => storage_proxy_error_to_legacy(&e),
+        };
+    }
 
     // Sprawdz limit storage
     let within_limit = {
@@ -393,6 +475,42 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let actor_user_id = caller.data().user_id;
+    if let Some((authority_node_id, iroh)) =
+        central_kv_target(caller.data(), &org_id, &addon_id, &instance_id, &key)
+    {
+        let request = StorageProxyRequestPayload {
+            request_id: String::new(),
+            from_node_id: iroh.node_id(),
+            org_id,
+            addon_id: addon_id.clone(),
+            resource_type: "addon.kv".to_string(),
+            resource_id: kv_resource_id(&instance_id, &key),
+            actor_user_id,
+            kind: StorageProxyRequestKind::KvDelete {
+                instance_id: instance_id.clone(),
+                key: key.clone(),
+            },
+        };
+        return match super::sql::run_async(crate::services::storage_proxy::remote_kv_delete(
+            iroh.as_ref(),
+            &authority_node_id,
+            request,
+            crate::services::storage_proxy::DEFAULT_STORAGE_PROXY_TIMEOUT,
+        )) {
+            Ok(_) => {
+                audit_log(
+                    caller.data(),
+                    "storage.delete",
+                    Some("storage"),
+                    Some(&key),
+                    "ok",
+                    Some("central_authority"),
+                );
+                ABI_OK
+            }
+            Err(e) => storage_proxy_error_to_legacy(&e),
+        };
+    }
     let capture = crate::sync::kv_capture::KvWriteCapture::new(
         org_id,
         addon_id.clone(),
@@ -529,6 +647,52 @@ pub fn storage_list(
 
     let addon_id = caller.data().addon_id.clone();
     let instance_id = caller.data().instance_id.clone();
+    let org_id = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+
+    if let Some((authority_node_id, iroh)) =
+        central_kv_list_target(caller.data(), &org_id, &addon_id)
+    {
+        let request = StorageProxyRequestPayload {
+            request_id: String::new(),
+            from_node_id: iroh.node_id(),
+            org_id,
+            addon_id: addon_id.clone(),
+            resource_type: "addon.kv".to_string(),
+            resource_id: String::new(),
+            actor_user_id: caller.data().user_id,
+            kind: StorageProxyRequestKind::KvList {
+                instance_id: instance_id.clone(),
+                prefix: prefix.clone(),
+            },
+        };
+        return match super::sql::run_async(crate::services::storage_proxy::remote_kv_list(
+            iroh.as_ref(),
+            &authority_node_id,
+            request,
+            crate::services::storage_proxy::DEFAULT_STORAGE_PROXY_TIMEOUT,
+        )) {
+            Ok(keys) => {
+                let json = match serde_json::to_vec(&keys) {
+                    Ok(j) => j,
+                    Err(_) => return ABI_ERR_OPERATION,
+                };
+                audit_log(
+                    caller.data(),
+                    "storage.list",
+                    Some("storage"),
+                    prefix.as_deref(),
+                    "ok",
+                    Some("central_authority"),
+                );
+                write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &json)
+            }
+            Err(e) => storage_proxy_error_to_legacy(&e),
+        };
+    }
 
     let keys: Vec<String> = {
         let conn = match caller.data().db.lock() {
@@ -594,6 +758,60 @@ pub fn storage_list(
     );
 
     write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &json)
+}
+
+fn central_kv_target(
+    state: &AddonState,
+    org_id: &str,
+    addon_id: &str,
+    instance_id: &str,
+    key: &str,
+) -> Option<(
+    String,
+    std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+)> {
+    super::sql::central_storage_target(
+        state,
+        org_id,
+        addon_id,
+        "addon.kv",
+        &kv_resource_id(instance_id, key),
+    )
+}
+
+fn central_kv_list_target(
+    state: &AddonState,
+    org_id: &str,
+    addon_id: &str,
+) -> Option<(
+    String,
+    std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+)> {
+    super::sql::central_storage_target(state, org_id, addon_id, "addon.kv", "")
+}
+
+fn kv_resource_id(instance_id: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(instance_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(key.as_bytes());
+    format!("{}:{}", instance_id, hex::encode(hasher.finalize()))
+}
+
+fn storage_proxy_error_to_legacy(
+    error: &crate::services::storage_proxy::StorageProxyError,
+) -> i32 {
+    match error {
+        crate::services::storage_proxy::StorageProxyError::Timeout(_) => ABI_ERR_TIMEOUT,
+        crate::services::storage_proxy::StorageProxyError::Remote { code, .. }
+            if code == "authority_denied" =>
+        {
+            ABI_ERR_PERMISSION
+        }
+        _ => ABI_ERR_OPERATION,
+    }
 }
 
 #[cfg(test)]

@@ -42,6 +42,7 @@ pub mod service_call;
 pub mod service_call_rate_limit;
 pub mod signed_urls;
 pub mod snapshot_builder;
+pub mod storage_proxy;
 pub mod stream_hub;
 pub mod streaming;
 pub mod supervisor;
