@@ -170,6 +170,7 @@ install_base() {
                 clang
                 lld
                 pkg-config
+                glib2
                 openssl
                 vulkan-icd-loader
                 sqlite
@@ -182,7 +183,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "glib2" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -194,6 +195,7 @@ install_base() {
                 clang
                 lld
                 pkg-config
+                libglib2.0-dev
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
@@ -208,7 +210,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libglib2.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -219,6 +221,7 @@ install_base() {
                 clang
                 lld
                 pkg-config
+                glib2-devel
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
@@ -229,7 +232,7 @@ install_base() {
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "glib2-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -245,12 +248,13 @@ install_base() {
                 cmake
                 llvm
                 pkg-config
+                glib
                 openssl@3
                 sqlite
             )
             log_info "Instalacja: ${pkgs[*]}"
             brew install "${pkgs[@]}"
-            INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "glib" "openssl@3" "sqlite")
             ;;
     esac
 
