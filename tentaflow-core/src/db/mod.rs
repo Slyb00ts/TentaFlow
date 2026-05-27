@@ -3,6 +3,7 @@
 // Opis: Modul bazy danych SQLite - inicjalizacja, pool, migracje.
 // =============================================================================
 
+pub mod legal_documents;
 pub mod migrations;
 pub mod models;
 pub mod repository;
@@ -71,11 +72,47 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // Uruchom migracje
     migrations::run(&conn)?;
 
+    // F2 P1.b — migrate any pre-F2 `~/.tentaflow/addons/<addon_id>/`
+    // directories into the new per-org layout
+    // `~/.tentaflow/orgs/org-default/addons/<addon_id>/`. Runs once after
+    // migrations have populated the DB column; subsequent boots find the
+    // legacy root gone and return Ok(0). Failure is logged, not fatal —
+    // an addon whose dir refuses to move will surface a config error at
+    // first runtime access, which is easier to diagnose than a boot abort.
+    if let Some(home) = dirs::home_dir() {
+        match crate::addon::lifecycle::migrate_addon_dirs_to_org_default(&home) {
+            Ok(n) if n > 0 => info!(
+                "lifecycle: migrated {} legacy addon dir(s) to per-org layout",
+                n
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "lifecycle: legacy addon dir migration partial: {} — manual cleanup may be required",
+                e
+            ),
+        }
+    }
+
+    // F1c P5 — flow_invocations rows left in `status='running'` after a
+    // crash/restart can never be finalized by a live scheduler, so reconcile
+    // them to `failed/core_restart` before the new process begins issuing
+    // invocations.
+    match crate::flow_runtime::boot::mark_orphaned_invocations(&conn) {
+        Ok(n) if n > 0 => info!("flow_runtime: reconciled {} orphaned flow_invocations", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("flow_runtime: orphan reconciliation failed: {}", e),
+    }
+
     // Seed domyslnych danych
     seed::seed_defaults(&conn)?;
 
     let pool = Arc::new(Mutex::new(conn));
     set_global_pool(pool.clone());
+
+    // F1c P5 chunk B — install the flow scheduler singleton with the same
+    // pool the rest of the runtime uses. Idempotent: a second `init` (test
+    // harnesses, integration suites) leaves the original instance in place.
+    crate::flow_runtime::scheduler::FlowScheduler::init(pool.clone());
 
     // Upgrade path for PR5: copy `trusted_nodes` rows + parse legacy
     // `settings.trusted_contact:*` JSON entries into peer_persisted /

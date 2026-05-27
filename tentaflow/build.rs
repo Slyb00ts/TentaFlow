@@ -405,9 +405,17 @@ fn build_meeting_bot() {
     }
     // Wycisz CARGO env zarazone przez parent build (RUSTFLAGS, TARGET, itd. moga
     // wymusic re-budowanie wszystkich deps z dziwnymi flagami).
-    cmd.env_remove("CARGO_TARGET_DIR")
-        .env_remove("RUSTFLAGS")
+    cmd.env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
+    // KLUCZOWE: parent ma .cargo/config.toml z `target-dir = "target_shared"`
+    // ktore stosuje sie do KAZDEGO wywolania cargo w obrebie repo (sub-cargo
+    // tez znajduje ten config przez parent traversal). Bez explicit override
+    // nested cargo build probowal zapisac do target_shared/, ale parent
+    // cargo trzymal exclusive file lock — deadlock (cargo wisi w 0% CPU).
+    // env_remove("CARGO_TARGET_DIR") nie pomaga, bo .cargo/config.toml NIE
+    // jest env var. Ustawiamy CARGO_TARGET_DIR explicit na bot's OWN target/
+    // — env var override .cargo/config.toml.
+    cmd.env("CARGO_TARGET_DIR", bot_dir.join("target"));
 
     let status = cmd.status();
     if !matches!(status, Ok(s) if s.success()) {

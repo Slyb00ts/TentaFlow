@@ -28,6 +28,24 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         migrate_sha256_passwords(&tx)?;
     }
 
+    // F2 P1.a — every admin in `users` must have an `org_memberships` row in
+    // `org-default` with `role-org-admin`, otherwise binary-WS resolves the
+    // session to `org_context=None` and every dispatch path that filters by
+    // org (cameras, recordings, frame_url, ...) rejects the call.
+    // Migration v38 backfills this for pre-existing deployments, but on a
+    // fresh DB v38 runs BEFORE this seed inserts the admin user — so the
+    // membership table stays empty. Seed therefore re-applies the same
+    // invariant after creating users. Idempotent via INSERT OR IGNORE on
+    // the (org_id, user_id) primary key.
+    tx.execute(
+        "INSERT OR IGNORE INTO org_memberships \
+            (org_id, user_id, role_id, granted_at, granted_by) \
+         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+         FROM users u WHERE u.role = 'admin'",
+        [],
+    )?;
+
     // Domyslne ustawienia
     let jwt_secret = generate_jwt_secret();
     let settings: &[(&str, &str)] = &[
@@ -179,8 +197,8 @@ fn seed_pii_rules(conn: &Connection) -> Result<()> {
 
 /// Seeduje domyslne szablony wezlow flow (paleta komponentow).
 fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
-    // (node_type, category, label, description, default_config, icon)
-    let templates: &[(&str, &str, &str, &str, &str, &str)] = &[
+    // (node_type, category, label, description, default_config, icon, params_schema)
+    let templates: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
         (
             "trigger",
             "trigger",
@@ -188,6 +206,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Punkt wejścia flow (HTTP, QUIC, webhook)",
             "{}",
             "zap",
+            "",
         ),
         (
             "llm",
@@ -196,6 +215,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Wywołanie modelu językowego",
             r#"{"model":"","prompt_id":"","system_prompt":"","temperature":0.7,"max_tokens":4096,"stream":true}"#,
             "brain",
+            r#"{"properties":{"model":{"type":"string","title":"Model / alias","description":"LLM lub alias z tym samym katalogu","dynamic_enum":{"source":"models","category":"llm"}},"system_prompt":{"type":"string","title":"System prompt","format":"textarea","placeholder":"Jesteś pomocnym asystentem…"},"temperature":{"type":"number","title":"Temperature","minimum":0,"maximum":2,"step":0.1,"default":0.7},"max_tokens":{"type":"integer","title":"Max tokens","minimum":1,"maximum":131072,"default":4096},"top_p":{"type":"number","title":"Top P","minimum":0,"maximum":1,"step":0.05}},"required":["model"],"order":["model","system_prompt","temperature","max_tokens","top_p"]}"#,
         ),
         (
             "stt",
@@ -204,6 +224,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zamiana mowy na tekst (STT)",
             r#"{"language":"pl","model":""}"#,
             "mic",
+            r#"{"properties":{"model":{"type":"string","title":"Model STT / alias","description":"Wybierz silnik STT lub alias","dynamic_enum":{"source":"models","category":"stt"}},"language":{"type":"string","title":"Język","enum":[{"value":"pl","label":"Polski"},{"value":"en","label":"English"},{"value":"de","label":"Deutsch"},{"value":"es","label":"Español"},{"value":"fr","label":"Français"},{"value":"auto","label":"Auto-detect"}],"default":"pl"},"diarization":{"type":"boolean","title":"Diaryzacja mówców","description":"Rozpoznaj kto mówi w nagraniu","default":false}},"required":["model"],"order":["model","language","diarization"]}"#,
         ),
         (
             "tts",
@@ -212,6 +233,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zamiana tekstu na mowę (TTS)",
             r#"{"language":"pl","voice":"","speed":1.0}"#,
             "volume-2",
+            r#"{"properties":{"model":{"type":"string","title":"Model TTS / alias","dynamic_enum":{"source":"models","category":"tts"}},"voice":{"type":"string","title":"Głos","placeholder":"jarvis"},"format":{"type":"string","title":"Format","enum":[{"value":"mp3","label":"MP3"},{"value":"opus","label":"Opus (low-latency)"},{"value":"wav","label":"WAV"}],"default":"opus"},"speed":{"type":"number","title":"Tempo","minimum":0.25,"maximum":4,"step":0.05,"default":1}},"required":["model"],"order":["model","voice","format","speed"]}"#,
         ),
         (
             "embeddings",
@@ -220,6 +242,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Generowanie embeddingów tekstu",
             r#"{"model":""}"#,
             "hash",
+            r#"{"properties":{"model":{"type":"string","title":"Model embeddings","dynamic_enum":{"source":"models","category":"embeddings"}},"dimensions":{"type":"integer","title":"Wymiary","minimum":1,"maximum":8192,"description":"Opcjonalnie wymuś rozmiar wektora"}},"required":["model"],"order":["model","dimensions"]}"#,
         ),
         (
             "memory",
@@ -228,6 +251,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Odczyt/zapis pamięci konwersacji",
             r#"{"mode":"query","memory_type":"conversation","max_entries":10,"inject_to_messages":false,"context_prompt_id":""}"#,
             "database",
+            r#"{"properties":{"mode":{"type":"string","title":"Tryb","enum":[{"value":"query","label":"Query (read)"},{"value":"store","label":"Store (write)"}],"default":"query"},"memory_type":{"type":"string","title":"Typ pamięci","enum":[{"value":"conversation","label":"Conversation"},{"value":"semantic","label":"Semantic"},{"value":"episodic","label":"Episodic"}],"default":"conversation"},"max_entries":{"type":"integer","title":"Maks. wpisów","minimum":1,"maximum":200,"default":10},"inject_to_messages":{"type":"boolean","title":"Wstrzyknij do messages","default":false}},"order":["mode","memory_type","max_entries","inject_to_messages"]}"#,
         ),
         (
             "pii_filter",
@@ -236,6 +260,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Usuwanie danych osobowych z tekstu",
             "{}",
             "shield",
+            "",
         ),
         (
             "tts_clean",
@@ -244,6 +269,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Czyszczenie i normalizacja tekstu dla TTS",
             "{}",
             "eraser",
+            "",
         ),
         (
             "condition",
@@ -252,6 +278,16 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Rozgałęzienie warunkowe (if/else)",
             r#"{"field":"","operator":"equals","value":""}"#,
             "git-branch",
+            r#"{"properties":{"field":{"type":"string","title":"Pole","placeholder":"payload.text"},"operator":{"type":"string","title":"Operator","enum":[{"value":"equals","label":"="},{"value":"contains","label":"contains"},{"value":"starts_with","label":"starts with"},{"value":"matches","label":"regex match"}],"default":"equals"},"value":{"type":"string","title":"Wartość"}},"required":["field","operator"],"order":["field","operator","value"]}"#,
+        ),
+        (
+            "combine",
+            "logic",
+            "Połącz",
+            "Zbiera odpowiedzi z wielu branchy i łączy w jeden tekst",
+            r#"{"separator":"\n\n"}"#,
+            "merge",
+            r#"{"properties":{"separator":{"type":"string","title":"Separator","description":"Tekst wstawiany między branche","default":"\n\n"}},"order":["separator"]}"#,
         ),
         (
             "output",
@@ -260,6 +296,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Punkt wyjścia flow",
             r#"{"format":"text"}"#,
             "send",
+            r#"{"properties":{"mode":{"type":"string","title":"Tryb","enum":[{"value":"blocking","label":"Blocking"},{"value":"stream","label":"Streaming"}],"default":"blocking"}},"order":["mode"]}"#,
         ),
         (
             "conversation_history",
@@ -268,6 +305,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Zarządzanie historią konwersacji - wstrzykuje poprzednie wiadomości do kontekstu",
             r#"{"max_messages":20}"#,
             "message-circle",
+            r#"{"properties":{"max_messages":{"type":"integer","title":"Maks. wiadomości","minimum":1,"maximum":200,"default":20},"session_id":{"type":"string","title":"Session ID (opcjonalnie)","description":"Pomiń aby użyć ctx.session_id"}},"order":["max_messages","session_id"]}"#,
         ),
         (
             "session_context",
@@ -276,6 +314,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Świadomość sesji - informuje LLM czy to początek/kontynuacja/niezrozumiała wiadomość",
             r#"{"first_prompt_id":"","continue_prompt_id":"","unclear_prompt_id":""}"#,
             "clock",
+            r#"{"properties":{"first_prompt_id":{"type":"string","title":"Prompt: pierwsza wiadomość","dynamic_enum":{"source":"prompts"}},"continue_prompt_id":{"type":"string","title":"Prompt: kontynuacja","dynamic_enum":{"source":"prompts"}},"unclear_prompt_id":{"type":"string","title":"Prompt: niezrozumiała wiadomość","dynamic_enum":{"source":"prompts"}}},"order":["first_prompt_id","continue_prompt_id","unclear_prompt_id"]}"#,
         ),
         (
             "speaker_context",
@@ -284,24 +323,44 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Identyfikacja głosu, personalizacja, obsługa nieznanego użytkownika",
             r#"{"high_threshold":0.85,"medium_threshold":0.60,"personalization_first_prompt":"","personalization_continue_prompt":"","unknown_user_prompt":"","medium_confidence_known_prompt":"","medium_confidence_unknown_prompt":"","new_voice_prompt":"","new_speaker_prompt":""}"#,
             "user",
+            r#"{"properties":{"high_threshold":{"type":"number","title":"Próg wysokiej pewności","minimum":0,"maximum":1,"step":0.05,"default":0.85},"medium_threshold":{"type":"number","title":"Próg średniej pewności","minimum":0,"maximum":1,"step":0.05,"default":0.6}},"order":["high_threshold","medium_threshold"]}"#,
         ),
     ];
 
+    // INSERT OR REPLACE — przy unique node_type aktualizujemy istniejace
+    // wpisy zeby seed'owe schemy doszly do uzytkownikow ktorzy mieli juz
+    // bazę z migracji 5. Custom adminowych template'ow nie ma (palette jest
+    // backend-owned), wiec nadpisanie jest bezpieczne.
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO flow_node_templates (node_type, category, label, description, default_config, icon) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO flow_node_templates (node_type, category, label, description, default_config, icon, params_schema) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(node_type) DO UPDATE SET \
+            category = excluded.category, \
+            label = excluded.label, \
+            description = excluded.description, \
+            default_config = excluded.default_config, \
+            icon = excluded.icon, \
+            params_schema = excluded.params_schema",
     )?;
-    for (node_type, category, label, description, default_config, icon) in templates {
+    for (node_type, category, label, description, default_config, icon, params_schema) in templates
+    {
+        let params_schema_opt: Option<&str> = if params_schema.is_empty() {
+            None
+        } else {
+            Some(params_schema)
+        };
         stmt.execute(rusqlite::params![
             node_type,
             category,
             label,
             description,
             default_config,
-            icon
+            icon,
+            params_schema_opt,
         ])?;
     }
 
-    info!("Zaladowano szablony wezlow flow (INSERT OR IGNORE)");
+    info!("Zaladowano szablony wezlow flow (upsert z params_schema)");
     Ok(())
 }
 
@@ -534,59 +593,105 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
     //
     // RAG flows usuniete razem z RAG path; nowa implementacja RAG bedzie
     // miala wlasne default flows.
+    // Wszystkie chat/agents flowy seedowane jako STREAMING (LLM -> pii_filter
+    // -> output z mode=stream, edges od LLM dalej z from_port=stream).
+    // Bez tego try_dispatch_streaming wpada na is_streaming=false ->
+    // wrap_blocking_as_stream -> single chunk z całością odpowiedzi
+    // (klient widzi calosc po EOF zamiast token-by-token).
     let flows: &[(&str, &str, &str, &str, i64)] = &[
         (
             "Standardowy pipeline LLM",
-            "Prosty pipeline LLM z filtrem PII na odpowiedzi.",
+            "Streaming pipeline LLM z filtrem PII na odpowiedzi.",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
             1,
         ),
         (
             "Default Chat",
-            "Najprostszy chat pipeline: trigger -> LLM -> output. Bez PII.",
+            "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
             0,
         ),
         (
             "Standardowy pipeline TTS",
             "Prosty pipeline syntezy mowy: czyszczenie tekstu i TTS.",
             "tts",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"c1","type":"tts_clean","position":{"x":200,"y":0},"config":{}},{"id":"s1","type":"tts","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"c1"},{"from_node":"c1","to_node":"s1"},{"from_node":"s1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"c1","type":"tts_clean","position":{"x":200,"y":0},"config":{}},{"id":"s1","type":"tts","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"c1","from_port":"text","data_type":"text"},{"from_node":"c1","to_node":"s1"},{"from_node":"s1","to_node":"o1","to_port":"audio","data_type":"audio"}]}"#,
             1,
         ),
         (
             "Audio Chat",
-            "Voice conversation: STT (z diarization) -> LLM -> output. Wlaczany dla audio_input.",
+            "Voice conversation streaming: STT (z diarization) -> LLM -> pii_filter -> output(stream). Wlaczany dla audio_input.",
             "chat",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"s1"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":200,"y":0},"config":{"diarization":true}},{"id":"l1","type":"llm","position":{"x":400,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":600,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":800,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"s1","from_port":"audio","data_type":"audio"},{"from_node":"s1","to_node":"l1"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
             0,
         ),
         (
             "teams-flow",
-            "Domyslny flow dla teams-bot: trigger -> llm -> pii_filter -> output.",
+            "Streaming flow dla teams-bot: trigger -> llm -> pii_filter -> output(stream).",
             "agents",
-            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from_node":"t1","to_node":"l1"},{"from_node":"l1","to_node":"p1"},{"from_node":"p1","to_node":"o1"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
             0,
         ),
     ];
 
-    let mut stmt = conn.prepare(
+    // Migracja seedów. Dwie generacje legacy do nadpisania:
+    // 1) Stary blocking seed sprzed Krok 6/7 — flow_json bez `from_port":"stream"`.
+    // 2) Streaming seed sprzed wprowadzenia 6 typed input portow w output —
+    //    flow_json z `from_port":"stream"` ale bez `to_port":"text"` lub
+    //    `to_port":"audio"` (czyli edge'y konczace w output uzywaja default
+    //    `to_port="in"` ktory juz nie istnieje w output adapter).
+    // Custom flows (admin zmienil JSON i ma `to_port":"text"`/`audio`) zostaja
+    // nietkniete. Brak rekordu → INSERT.
+    let mut update_stmt = conn.prepare(
+        "UPDATE flows SET description = ?2, service_type = ?3, flow_json = ?4, \
+         is_default = ?5, status = 'active' \
+         WHERE name = ?1 AND ( \
+             flow_json NOT LIKE '%\"from_port\":\"stream\"%' \
+             OR ( \
+                 flow_json NOT LIKE '%\"to_port\":\"text\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"audio\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"image\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"video\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"embedding\"%' \
+                 AND flow_json NOT LIKE '%\"to_port\":\"other\"%' \
+             ) \
+         )",
+    )?;
+    let mut insert_stmt = conn.prepare(
         "INSERT INTO flows (name, description, service_type, flow_json, status, is_default) \
          SELECT ?1, ?2, ?3, ?4, 'active', ?5 \
          WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?1)",
     )?;
 
     for (name, description, service_type, flow_json, is_default) in flows {
-        let affected = stmt.execute(rusqlite::params![
+        // Streaming-aware seedy (chat + agents) — UPDATE legacy blocking
+        // wariantu, INSERT jeśli rekord nie istnieje. TTS pozostaje
+        // blocking, więc UPDATE nic nie zmieni (LIKE nie matchuje), INSERT
+        // wstawi przy fresh DB.
+        let migrated = update_stmt.execute(rusqlite::params![
             name,
             description,
             service_type,
             flow_json,
             is_default
         ])?;
-        if affected > 0 {
+        if migrated > 0 {
+            tracing::info!(
+                "seed: zmigrowano flow '{}' z blocking na streaming variant",
+                name
+            );
+            continue;
+        }
+        let inserted = insert_stmt.execute(rusqlite::params![
+            name,
+            description,
+            service_type,
+            flow_json,
+            is_default
+        ])?;
+        if inserted > 0 {
             debug!("Utworzono domyslny flow: {}", name);
         }
     }
@@ -742,14 +847,21 @@ mod tests {
         assert_eq!(st, "tts");
         assert_eq!(def, 1);
 
-        let (st, def) = assert_dag("Default Chat", &["trigger", "llm", "output"], 2);
+        let (st, def) = assert_dag(
+            "Default Chat",
+            &["trigger", "llm", "pii_filter", "output"],
+            3,
+        );
         assert_eq!(st, "chat");
-        assert_eq!(def, 0, "Default Chat nie jest default w db (Standardowy pipeline LLM jest)");
+        assert_eq!(
+            def, 0,
+            "Default Chat nie jest default w db (Standardowy pipeline LLM jest)"
+        );
 
         let (st, def) = assert_dag(
             "Audio Chat",
-            &["trigger", "stt", "llm", "output"],
-            3,
+            &["trigger", "stt", "llm", "pii_filter", "output"],
+            4,
         );
         assert_eq!(st, "chat");
         assert_eq!(def, 0, "Audio Chat jest opt-in (wymaga audio_input)");
@@ -808,58 +920,33 @@ mod tests {
     /// blokowaloby zapis flow przez walidacje dispatch/handlers.rs.
     #[test]
     fn seeded_flows_pass_adapter_validation() {
-        use crate::config::RouterConfig;
-        use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
-        use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
-        use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
-        use crate::flow_engine::adapters::llm::LlmNodeAdapter;
-        use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
-        use crate::flow_engine::adapters::output::OutputNodeAdapter;
-        use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
-        use crate::flow_engine::adapters::session_context::SessionContextAdapter;
-        use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
-        use crate::flow_engine::adapters::stt::SttNodeAdapter;
-        use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
-        use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-        use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
-        use crate::flow_engine::adapters::AdapterRegistry;
+        use crate::flow_engine::node_adapter::AdapterRegistry;
+        use crate::flow_engine::node_adapters::{
+            ConditionNodeAdapter, ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter,
+            LlmNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter,
+            SessionContextNodeAdapter, SpeakerContextNodeAdapter, SttNodeAdapter,
+            TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
+        };
         use crate::flow_engine::types::FlowDefinition;
-        use crate::flow_engine::validation::validate_flow;
-        use crate::services::runtime::quic_handle::ServiceManager;
+        use crate::flow_engine::validation::validate;
         use std::sync::Arc;
 
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let config = Arc::new(RouterConfig::default());
-        let sm = Arc::new(
-            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
-        );
 
         let mut registry = AdapterRegistry::new();
-        // R2a: w teście walidacji adapter LLM dostaje pusty executor slot —
-        // adapter wywoluje legacy mini-router gdy slot jest None, co
-        // pasuje do scenariusza testu (sprawdzamy tylko walidacje
-        // flow_json + adapter port metadata, nie dispatch).
-        let executor_slot: crate::flow_engine::dispatcher::ExecutorSlot =
-            std::sync::Arc::new(parking_lot::RwLock::new(None));
-        let stt_runtime_slot: crate::flow_engine::dispatcher::SttRuntimeSlot =
-            std::sync::Arc::new(parking_lot::RwLock::new(None));
-        registry.register(LlmNodeAdapter::new(
-            sm.clone(),
-            config.clone(),
-            executor_slot,
-        ));
-        registry.register(SttNodeAdapter::new(stt_runtime_slot));
-        registry.register(TtsNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(EmbeddingsNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(MemoryNodeAdapter::new(sm.clone(), config.clone()));
-        registry.register(ConversationHistoryAdapter::new(sm.clone(), config.clone()));
-        registry.register(SessionContextAdapter::new(sm.clone(), config.clone()));
-        registry.register(SpeakerContextAdapter::new(sm, config));
-        registry.register(TriggerNodeAdapter::new());
-        registry.register(OutputNodeAdapter::new());
-        registry.register(ConditionNodeAdapter::new());
-        registry.register(PiiFilterNodeAdapter::new(pool.clone()));
-        registry.register(TtsCleanNodeAdapter::new(pool.clone()));
+        registry.register(Arc::new(TriggerNodeAdapter::new()));
+        registry.register(Arc::new(OutputNodeAdapter::new()));
+        registry.register(Arc::new(ConditionNodeAdapter::new()));
+        registry.register(Arc::new(PiiFilterNodeAdapter::new()));
+        registry.register(Arc::new(TtsCleanNodeAdapter::new()));
+        registry.register(Arc::new(SttNodeAdapter::new()));
+        registry.register(Arc::new(TtsNodeAdapter::new()));
+        registry.register(Arc::new(EmbeddingsNodeAdapter::new()));
+        registry.register(Arc::new(MemoryNodeAdapter::new()));
+        registry.register(Arc::new(ConversationHistoryNodeAdapter::new()));
+        registry.register(Arc::new(SessionContextNodeAdapter::new()));
+        registry.register(Arc::new(SpeakerContextNodeAdapter::new()));
+        registry.register_llm(Arc::new(LlmNodeAdapter::new()));
 
         let flow_jsons: Vec<(String, String)> = {
             let conn = pool.lock().unwrap();
@@ -876,8 +963,12 @@ mod tests {
         for (name, json) in &flow_jsons {
             let parsed: FlowDefinition = serde_json::from_str(json)
                 .unwrap_or_else(|e| panic!("flow '{}': nie parsuje: {}", name, e));
-            validate_flow(&parsed, &registry)
-                .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
+            validate(
+                &parsed,
+                &registry,
+                crate::flow_engine::validation::ValidationSource::UserDefined,
+            )
+            .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
         }
     }
 }

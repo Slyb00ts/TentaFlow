@@ -15,7 +15,7 @@ use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody, SessionAut
 use super::recorder;
 use super::resume_token::{self, ResumeError};
 use super::subscription::{
-    push_chunk, push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
+    StreamHandlerMeta, Subscription, push_chunk, push_chunk_async, push_end, push_end_async,
 };
 use super::{HandlerContext, SessionAuthKind};
 
@@ -71,6 +71,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             presence_penalty: None,
             stop: None,
             stream: true,
+            stream_options: None,
             user: None,
             response_format: None,
             tools: None,
@@ -103,6 +104,13 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
         let mut stream = route_result.response;
         let mut completion_tokens: u32 = 0;
+        // State machine: backend (vLLM/parser) wydziela chain-of-thought do
+        // `delta.reasoning_content`, content do `delta.content`. Frontend
+        // (chat.js) parsuje `<think>...</think>` jako collapsed block, więc
+        // bridge musi opakować reasoning w te tagi. Otwieramy `<think>` na
+        // pierwszym reasoning chunku, zamykamy `</think>` przy przejściu
+        // na content lub na finish (gdyby reasoning był ostatni).
+        let mut in_thinking = false;
         while let Some(chunk_res) = stream.next().await {
             let chunk = match chunk_res {
                 Ok(c) => c,
@@ -118,25 +126,62 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 }
             };
             if let Some(choice) = chunk.choices.first() {
-                if let Some(content) = choice.delta.content.as_ref() {
-                    if !content.is_empty() {
-                        // Async send — czeka na slot gdy channel pelny zeby nie
-                        // gubic tokenow przy szybko generujacym modelu (200+ tok/s).
-                        if push_chunk_async(
-                            &sub,
-                            MessageBody::ChatStreamChunkBody(ChatStreamChunk {
-                                delta: content.clone(),
-                            }),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
-                        completion_tokens = completion_tokens.saturating_add(1);
+                let reasoning = choice
+                    .delta
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|s| !s.is_empty());
+                let content = choice.delta.content.as_deref().filter(|s| !s.is_empty());
+
+                if let Some(r) = reasoning {
+                    let payload = if in_thinking {
+                        r.to_string()
+                    } else {
+                        in_thinking = true;
+                        format!("<think>{}", r)
+                    };
+                    if push_chunk_async(
+                        &sub,
+                        MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
+                    completion_tokens = completion_tokens.saturating_add(1);
+                }
+
+                if let Some(c) = content {
+                    let payload = if in_thinking {
+                        in_thinking = false;
+                        format!("</think>{}", c)
+                    } else {
+                        c.to_string()
+                    };
+                    if push_chunk_async(
+                        &sub,
+                        MessageBody::ChatStreamChunkBody(ChatStreamChunk { delta: payload }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    completion_tokens = completion_tokens.saturating_add(1);
                 }
             }
+        }
+        // Cleanup: gdy reasoning był ostatni (brak content po nim), domknij
+        // tag żeby front miał poprawny `<think>...</think>` parować.
+        if in_thinking {
+            let _ = push_chunk_async(
+                &sub,
+                MessageBody::ChatStreamChunkBody(ChatStreamChunk {
+                    delta: "</think>".to_string(),
+                }),
+            )
+            .await;
         }
 
         let _ = push_end_async(
@@ -669,10 +714,10 @@ inventory::submit! {
 
 #[cfg(test)]
 mod tests {
-    use super::super::subscription::{
-        find_stream_handler, stream_handler_count, SubscriptionEvent,
-    };
     use super::super::SessionAuthKind;
+    use super::super::subscription::{
+        SubscriptionEvent, find_stream_handler, stream_handler_count,
+    };
 
     #[test]
     fn chat_stream_handler_registered() {
@@ -689,9 +734,9 @@ mod tests {
 
     #[tokio::test]
     async fn p0_cross_user_resume_attack_rejected() {
+        use super::super::HandlerContext;
         use super::super::resume_token;
         use super::super::subscription::{SubscriptionEvent, SubscriptionRegistry};
-        use super::super::HandlerContext;
         use std::sync::Arc;
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -716,8 +761,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 99,
+            connection_id: 0,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 
@@ -738,8 +785,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_resume_handler_rejects_invalid_token() {
-        use super::super::subscription::SubscriptionRegistry;
         use super::super::HandlerContext;
+        use super::super::subscription::SubscriptionRegistry;
         use std::sync::Arc;
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -756,8 +803,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: Some(Arc::new(b"test-secret".to_vec())),
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 
@@ -778,9 +827,9 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_resume_handler_accepts_valid_token() {
+        use super::super::HandlerContext;
         use super::super::resume_token;
         use super::super::subscription::SubscriptionRegistry;
-        use super::super::HandlerContext;
         use std::sync::Arc;
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -800,8 +849,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 2,
+            connection_id: 0,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 
@@ -828,8 +879,8 @@ mod tests {
         // jeden chunk [routing error] i End. Test weryfikuje ze (a) request
         // w ogole jest parsowany, (b) End jest emitowany, (c) nie wystepuje
         // panika. Pelny test produkcji z backendem jest w api/openai/server.rs.
-        use super::super::subscription::SubscriptionRegistry;
         use super::super::HandlerContext;
+        use super::super::subscription::SubscriptionRegistry;
         use tentaflow_protocol::{ChatMessage, ChatStreamRequest, MessageBody, SessionAuth};
 
         let reg = SubscriptionRegistry::new();
@@ -851,8 +902,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
 

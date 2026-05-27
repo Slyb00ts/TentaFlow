@@ -18,7 +18,7 @@ use tentaflow_protocol::{
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::dispatch::{
     self, addon_perm_broadcast, audit_broadcast, meeting_live_broadcast, resume_token,
@@ -34,6 +34,10 @@ type SharedSink<S> = Arc<AsyncMutex<SplitSink<WebSocketStream<S>, Message>>>;
 /// Limit rozmiaru pojedynczego binary frame (bajty). Wiecej = close 1009 (message too big).
 /// Konserwatywnie 1 MiB — typowe requesty sa <1 KiB, deploy manifests mieszcza sie w 64 KiB.
 const MAX_FRAME_SIZE: usize = 1_048_576;
+
+/// Monotonic counter for unique per-connection identifiers. Used as key in the
+/// UI SessionRegistry so panel lifecycle state is scoped per WS socket.
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Mapuje SQLite i64 user_id do 16-bajtowego SessionAuth user_id.
 /// Format zeby odroznic od stub `[0u8; 16]` (system user / nieuwierzytelniony):
@@ -78,6 +82,8 @@ pub async fn handle_ws_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+
     let session = match user_id {
         Some(id) => SessionAuth::UserSession {
             user_id: user_id_to_bytes(id),
@@ -210,6 +216,35 @@ pub async fn handle_ws_connection<S>(
                     next_seq(&seq_meet),
                     tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
                     &Mb::MeetingLiveEventBody(event),
+                    EnvelopeFlags::empty(),
+                )
+                .await;
+            }
+        });
+    }
+
+    // Spawnuj task pushujacy UI CBOR messages (addon→frontend) jako unsolicited
+    // UiChannelCbor frames. Filtr: source_user musi odpowiadac user_id polaczenia.
+    if let Some(uid) = user_id {
+        let sink_ui = Arc::clone(&sink);
+        let seq_ui = Arc::clone(&next_server_sequence);
+        let mut ui_rx = crate::dispatch::ui_cbor_broadcast::subscribe();
+        tokio::spawn(async move {
+            loop {
+                let push = match ui_rx.recv().await {
+                    Ok(p) => p,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if push.user_id != uid {
+                    continue;
+                }
+                let _ = send_body(
+                    &sink_ui,
+                    0,
+                    next_seq(&seq_ui),
+                    tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+                    &Mb::UiChannelCbor(push.cbor.to_vec()),
                     EnvelopeFlags::empty(),
                 )
                 .await;
@@ -360,11 +395,59 @@ pub async fn handle_ws_connection<S>(
                     }
                 }
 
+                // F2 P1.b — resolve the per-request OrgContext once per
+                // message. Failure leaves `org_context = None` so handlers
+                // that opt into org-scoping can decline cleanly while
+                // legacy handlers (no org-aware code path) keep running.
+                // Resolution attaches the user's default org for binary
+                // WS in P1.b; X-Org-Id / subprotocol pinning lands with
+                // the org-switcher UI in P1.c. The session's 16-byte
+                // user_id carries the i64 user id in its trailing 8 bytes
+                // (see auth_login marker `0xFF`); we reuse that encoding
+                // as the stringified key into `org_memberships`.
+                let org_context = match &session {
+                    SessionAuth::UserSession { user_id, .. } => {
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&user_id[8..]);
+                        let uid = u64::from_le_bytes(buf) as i64;
+                        let user_id_str = uid.to_string();
+                        match crate::services::rbac::resolve_org_context(
+                            &app_state.db,
+                            &user_id_str,
+                            None,
+                        ) {
+                            Ok(ctx) => Some(ctx),
+                            // NoMembership is an expected steady-state for a
+                            // user who has not yet been added to any org — log
+                            // at warn (informative for the operator, not
+                            // alarming). Every other variant indicates either
+                            // a DB problem or a malformed header that the
+                            // operator does need to see at `error`.
+                            Err(crate::services::rbac::OrgContextError::NoMembership(uid)) => {
+                                warn!(
+                                    "binary-WS: user '{}' has no org membership — org_context=None",
+                                    uid
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                error!(
+                                    "binary-WS: org_context resolution failed (user_id={}): {}",
+                                    user_id_str, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
                 let ctx = HandlerContext {
                     session: session.clone(),
                     correlation_id: envelope.correlation_id,
+                    connection_id,
                     resume_secret: Some(resume_secret.clone()),
                     state: app_state.clone(),
+                    org_context,
                 };
 
                 let variant_name = dispatch::variant_name_of(&body);
@@ -522,6 +605,8 @@ pub async fn handle_ws_connection<S>(
             "binary-WS: cleanup subskrypcji przy disconnect"
         );
     }
+
+    app_state.ui_sessions.remove(connection_id);
 
     debug!("binary-WS: polaczenie zamkniete");
 }

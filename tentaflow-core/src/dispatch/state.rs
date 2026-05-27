@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::addon::ui_session::SessionRegistry;
 use crate::config::RouterConfig;
 use crate::crypto::{SecretsCipher, SettingsCipher};
 use crate::db::DbPool;
@@ -16,10 +17,10 @@ use crate::license::StaticLicenseChecker;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;
-use crate::services::runtime::quic_handle::ServiceManager;
 use crate::services::handles_cache::LiveHandlesCache;
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;
+use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Wszystkie shared resources serwera. Handlery uzywaja przez `ctx.state`.
 pub struct AppState {
@@ -34,6 +35,9 @@ pub struct AppState {
     pub local_node_id: Arc<str>,
     pub mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     pub permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    /// AddonManager — udostępnia ui_panels cache dla Apps menu.
+    /// None w testach które nie ładują WASM.
+    pub addon_manager: Option<Arc<crate::addon::AddonManager>>,
     pub license: Arc<dyn LicenseChecker>,
     pub meeting_manager: Arc<crate::meeting::MeetingManager>,
     /// Active VNC tunnels for same-node websockify bridging. Keyed by server-
@@ -59,6 +63,8 @@ pub struct AppState {
     /// by `(node_id, service_id)`. Populated by the supervisor (krok N7.2);
     /// consumed by routing call sites (krok N7.3). Empty in N7.1.
     pub live_handles: Arc<LiveHandlesCache>,
+    /// Per-WS-connection UI panel session state (Faza 6 Krok 4).
+    pub ui_sessions: Arc<SessionRegistry>,
 }
 
 impl AppState {
@@ -100,6 +106,7 @@ impl AppState {
             local_node_id: Arc::from("test-node"),
             mesh_security: None,
             permission_checker: None,
+            addon_manager: None,
             license: Arc::new(StaticLicenseChecker::free()),
             meeting_manager,
             vnc_tunnels: Arc::new(dashmap::DashMap::new()),
@@ -107,6 +114,11 @@ impl AppState {
             port_allocator: None,
             mesh_services_registry: Arc::new(MeshServicesRegistry::new()),
             live_handles,
+            ui_sessions: {
+                let reg = Arc::new(SessionRegistry::new());
+                crate::addon::ui_session::init_global_registry(reg.clone());
+                reg
+            },
         })
     }
 }

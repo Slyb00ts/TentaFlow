@@ -12,8 +12,8 @@ use tentaflow_protocol::mesh::{
 /// Returns `true` for frames that may be accepted from peers that are NOT yet
 /// trusted. Currently only the three pairing handshake frames qualify.
 ///
-/// Every other mesh frame (heartbeat, hello, node_info, models, containers,
-/// commands, key rotation, trusted-keys sync, trust revoked, ...) MUST come
+/// Every other mesh frame (heartbeat, hello, node_info, models,
+/// commands, trusted-keys sync, trust revoked, ...) MUST come
 /// from a peer that is already in the trusted set; otherwise it must be
 /// dropped before any application-level state is touched.
 #[inline]
@@ -65,16 +65,6 @@ mod tests {
     }
 
     #[test]
-    fn key_rotation_is_post_trust() {
-        assert!(!is_pre_trust_frame(MESH_MSG_KEY_ROTATION));
-    }
-
-    #[test]
-    fn key_rotation_response_is_post_trust() {
-        assert!(!is_pre_trust_frame(MESH_MSG_KEY_ROTATION_RESPONSE));
-    }
-
-    #[test]
     fn trusted_keys_sync_is_post_trust() {
         assert!(!is_pre_trust_frame(MESH_MSG_TRUSTED_KEYS_SYNC));
     }
@@ -95,13 +85,23 @@ mod tests {
     }
 
     #[test]
-    fn crdt_delta_is_post_trust() {
-        assert!(!is_pre_trust_frame(MESH_MSG_CRDT_DELTA));
-    }
-
-    #[test]
     fn unknown_discriminant_is_post_trust() {
         assert!(!is_pre_trust_frame(0xFF));
         assert!(!is_pre_trust_frame(0x00));
+    }
+
+    #[test]
+    fn test_frame_proxy_request_is_not_pre_trust() {
+        // F1b P3.C — a frame proxy request must only be honored from a
+        // trust-paired peer; otherwise any untrusted node on the network
+        // could pull arbitrary frame_url-targeted frames out of us.
+        assert!(!is_pre_trust_frame(MESH_MSG_FRAME_PROXY_REQUEST));
+    }
+
+    #[test]
+    fn test_frame_proxy_response_is_not_pre_trust() {
+        // F1b P3.C — responses too: accepting a forged response pre-trust
+        // would let an attacker inject frame bytes into our pending-map.
+        assert!(!is_pre_trust_frame(MESH_MSG_FRAME_PROXY_RESPONSE));
     }
 }

@@ -75,8 +75,1567 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "flow_json_rename_edge_fields",
             MigrationStep::Sql(FLOW_JSON_RENAME_EDGE_FIELDS),
         ),
+        (
+            5,
+            "services_progress_message",
+            MigrationStep::Sql(SERVICES_PROGRESS_MESSAGE),
+        ),
+        (
+            6,
+            "flow_node_templates_params_schema",
+            MigrationStep::Sql(FLOW_NODE_TEMPLATES_PARAMS_SCHEMA),
+        ),
+        (
+            7,
+            "audit_log_risk_class",
+            MigrationStep::Sql(AUDIT_LOG_RISK_CLASS),
+        ),
+        (
+            8,
+            "model_alias_owners",
+            MigrationStep::Sql(MODEL_ALIAS_OWNERS),
+        ),
+        (9, "alias_calls", MigrationStep::Sql(ALIAS_CALLS)),
+        (
+            10,
+            "model_alias_changes",
+            MigrationStep::Sql(MODEL_ALIAS_CHANGES),
+        ),
+        (
+            11,
+            "addon_migrations_applied",
+            MigrationStep::Sql(ADDON_MIGRATIONS_APPLIED),
+        ),
+        (12, "frame_pickup_log", MigrationStep::Sql(FRAME_PICKUP_LOG)),
+        (
+            13,
+            "teams_bot_aliases_ownership_backfill",
+            MigrationStep::Sql(TEAMS_BOT_ALIASES_OWNERSHIP_BACKFILL),
+        ),
+        (
+            14,
+            "rename_alias_manage_to_read",
+            MigrationStep::Sql(RENAME_ALIAS_MANAGE_TO_READ),
+        ),
+        (
+            15,
+            "model_alias_visibility",
+            MigrationStep::Sql(MODEL_ALIAS_VISIBILITY),
+        ),
+        (
+            16,
+            "model_alias_consumers",
+            MigrationStep::Sql(MODEL_ALIAS_CONSUMERS),
+        ),
+        (17, "model_visibility", MigrationStep::Sql(MODEL_VISIBILITY)),
+        (18, "model_consumers", MigrationStep::Sql(MODEL_CONSUMERS)),
+        (19, "addon_uses_alias", MigrationStep::Sql(ADDON_USES_ALIAS)),
+        (20, "addon_uses_model", MigrationStep::Sql(ADDON_USES_MODEL)),
+        (21, "cameras_table", MigrationStep::Sql(CAMERAS_TABLE)),
+        (22, "recordings_table", MigrationStep::Sql(RECORDINGS_TABLE)),
+        (
+            23,
+            "cameras_vendor_check_rtsp_onvif",
+            MigrationStep::Sql(CAMERAS_VENDOR_CHECK_RTSP_ONVIF),
+        ),
+        (
+            24,
+            "frame_pickup_log_source_node_id",
+            MigrationStep::Rust(frame_pickup_log_add_source_node_id),
+        ),
+        (
+            25,
+            "audit_log_merkle_chain",
+            MigrationStep::Rust(audit_log_add_merkle_chain_columns),
+        ),
+        (
+            26,
+            "trusted_publishers",
+            MigrationStep::Sql(TRUSTED_PUBLISHERS),
+        ),
+        (
+            27,
+            "addon_vector_namespaces",
+            MigrationStep::Sql(ADDON_VECTOR_NAMESPACES),
+        ),
+        (28, "policy_claims", MigrationStep::Sql(POLICY_CLAIMS)),
+        (29, "flow_invocations", MigrationStep::Sql(FLOW_INVOCATIONS)),
+        (
+            30,
+            "cameras_onvif_metadata",
+            MigrationStep::Rust(cameras_add_onvif_metadata_columns),
+        ),
+        (
+            31,
+            "flow_invocations_actor_user_id",
+            MigrationStep::Rust(flow_invocations_add_actor_user_id),
+        ),
+        (
+            32,
+            "multi_tenant_rbac_org_isolation",
+            MigrationStep::Rust(setup_multi_tenant),
+        ),
+        (
+            33,
+            "model_aliases_strategy_round_robin",
+            MigrationStep::Rust(model_aliases_strategy_round_robin),
+        ),
+        (34, "gate_check_cache", MigrationStep::Sql(GATE_CHECK_CACHE)),
+        (
+            35,
+            "cameras_metadata_supported",
+            MigrationStep::Rust(cameras_add_metadata_supported_column),
+        ),
+        (
+            36,
+            "roles_add_camera_metadata",
+            MigrationStep::Rust(roles_add_camera_metadata_permission),
+        ),
+        (
+            37,
+            "legal_documents",
+            MigrationStep::Rust(create_legal_documents_table),
+        ),
+        (
+            38,
+            "backfill_admin_org_memberships",
+            MigrationStep::Rust(backfill_admin_org_memberships),
+        ),
+        (39, "scheduled_jobs", MigrationStep::Sql(SCHEDULED_JOBS)),
+        (
+            40,
+            "platform_locales",
+            MigrationStep::Sql(PLATFORM_LOCALES_SCHEMA),
+        ),
+        (41, "role_catalog", MigrationStep::Sql(ROLE_CATALOG_SCHEMA)),
+        (
+            42,
+            "sync_identity_registry",
+            MigrationStep::Sql(SYNC_IDENTITY_REGISTRY),
+        ),
+        (
+            43,
+            "sync_permission_engine",
+            MigrationStep::Sql(SYNC_PERMISSION_ENGINE),
+        ),
+        (44, "sync_policy", MigrationStep::Sql(SYNC_POLICY)),
+        (
+            45,
+            "core_sync_captures",
+            MigrationStep::Sql(CORE_SYNC_CAPTURES),
+        ),
+        (
+            46,
+            "kv_sync_captures",
+            MigrationStep::Sql(KV_SYNC_CAPTURES),
+        ),
+        (
+            47,
+            "blob_sync_captures",
+            MigrationStep::Sql(BLOB_SYNC_CAPTURES),
+        ),
     ]
 }
+
+// F2 P1.a follow-up — v32 (setup_multi_tenant) created the org_memberships
+// table but did not seed entries for pre-existing admin users. As a result
+// every legacy admin login resolves to `org_context=None` and every
+// dispatch path requiring OrgContext (cameras, recordings, frame_url, ...)
+// rejects the call. This step backfills every admin user from both legacy
+// `users` (F1a auth) and `user_accounts` (F2 user mgmt) into `org-default`
+// with role `role-org-admin`. Idempotent via `NOT EXISTS` guards.
+fn backfill_admin_org_memberships(conn: &Connection) -> Result<()> {
+    // Source 1: legacy `users` table (F1a). `role='admin'` is the only path
+    // by which someone can mint a JWT pre-F2.
+    conn.execute(
+        "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+         FROM users u \
+         WHERE u.role = 'admin' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM org_memberships m WHERE m.user_id = CAST(u.id AS TEXT) \
+           )",
+        [],
+    )?;
+
+    // Source 2: `user_accounts` table (F2 user mgmt). is_admin OR role='admin'.
+    // Guarded by table-existence probe — F1a installs that never ran user
+    // mgmt migrations skip this step cleanly.
+    let user_accounts_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_accounts'",
+        [],
+        |r| r.get(0),
+    )?;
+    if user_accounts_exists > 0 {
+        conn.execute(
+            "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+             SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
+             FROM user_accounts u \
+             WHERE (u.is_admin = 1 OR u.role = 'admin') \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM org_memberships m WHERE m.user_id = CAST(u.id AS TEXT) \
+               )",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+// F2 P8.a — RODO/GDPR document registry. Stores PDF artifacts generated per
+// organization (short / standard / full variant). The `legal.read` and
+// `legal.write` permission keys are already part of the v32 roles preseed
+// (`org_admin`, `dpo`: read+write; `org_operator`, `org_viewer`: read only),
+// so this migration adds storage only and does not touch `roles.permissions_json`.
+//
+// Row identity:
+//   * `id`                       UUIDv4 minted by the repo (CHECK on shape)
+//   * `org_id`                   tenant scope; ON DELETE RESTRICT — compliance
+//                                retention forbids cascading on org delete
+//                                (orgs are soft-deleted at the application layer)
+//   * `variant`                  one of short|standard|full (CHECK)
+//   * `generated_at`             unix epoch milliseconds
+//   * `generated_by_user_id`     composite FK to org_memberships(org_id,user_id),
+//                                ON DELETE RESTRICT — losing a membership must
+//                                not erase the audit trail of generated documents
+//   * `content_hash`             blake3 hex of the PDF bytes (64 lowercase hex, CHECK)
+//   * `pdf_path`                 absolute path on disk
+//   * `signed_url_ref`           HMAC ref published to the recording_url tier
+//                                (NULL until the URL is minted)
+//   * `revoked_at`               soft-delete timestamp; NULL = active
+//
+// The composite index supports the dominant query: list-by-org with newest
+// rows first.
+fn create_legal_documents_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS legal_documents (
+            id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(id) = 36 AND id LIKE '________-____-____-____-____________'),
+            org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE RESTRICT,
+            variant TEXT NOT NULL CHECK (variant IN ('short','standard','full')),
+            generated_at INTEGER NOT NULL,
+            generated_by_user_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL
+                CHECK (length(content_hash) = 64 AND content_hash GLOB '[0-9a-f]*'),
+            pdf_path TEXT NOT NULL,
+            signed_url_ref TEXT NULL,
+            revoked_at INTEGER NULL,
+            FOREIGN KEY (org_id, generated_by_user_id)
+                REFERENCES org_memberships(org_id, user_id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_legal_documents_org_id_generated_at
+            ON legal_documents(org_id, generated_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+// F2 P6.b — grant `camera.metadata` to operators so they can subscribe to
+// ONVIF analytics streams. Admin already received this permission as part of
+// the v32 seed; operator did not. Viewer is intentionally left alone — the
+// subscription host fn mutates supervisor state (refcount + spawn pull task)
+// and is therefore not a pure read operation.
+//
+// Idempotent: re-reads the permissions JSON, only appends when the entry is
+// missing. Safe to run on a fresh DB (`org_operator` already exists from v32)
+// and on an old DB where an admin manually edited the row.
+fn roles_add_camera_metadata_permission(conn: &Connection) -> Result<()> {
+    const TARGET_ROLES: &[&str] = &["org_admin", "org_operator"];
+    const NEW_PERM: &str = "camera.metadata";
+
+    for role_name in TARGET_ROLES {
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT role_id, permissions_json FROM roles WHERE name = ?1",
+                rusqlite::params![role_name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        let Some((role_id, perms_json)) = row else {
+            // Role missing — possible on test DBs that skipped v32 seeding. A
+            // missing role is harmless here; the role will be created with the
+            // correct permission set when v32 runs.
+            continue;
+        };
+        let mut perms: Vec<String> = match serde_json::from_str(&perms_json) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupt JSON should not abort the whole migration — log and
+                // skip so a single bad row does not block startup.
+                tracing::warn!(
+                    "roles_add_camera_metadata: role '{role_name}' has non-JSON permissions; skipping"
+                );
+                continue;
+            }
+        };
+        if perms.iter().any(|p| p == NEW_PERM) {
+            continue;
+        }
+        perms.push(NEW_PERM.to_string());
+        let updated = serde_json::to_string(&perms).unwrap_or(perms_json);
+        conn.execute(
+            "UPDATE roles SET permissions_json = ?1 WHERE role_id = ?2",
+            rusqlite::params![updated, role_id],
+        )?;
+    }
+    Ok(())
+}
+
+// F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table
+// gains a boolean flag indicating whether the device exposes a metadata
+// configuration that produces analytics events. Filled by the wizard when
+// `GetMetadataConfigurations` returns a non-empty list; consumed by the
+// upcoming event-pull supervisor to decide whether to subscribe.
+fn cameras_add_metadata_supported_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(cameras)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "metadata_supported" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN metadata_supported INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+// F2 P3 — reserved persistence table for gate_check decisions. The F2
+// runtime keeps the cache purely in-memory (`services::policy::cache`); F3
+// will gate-flip a feature flag that wires reads/writes through this table
+// so cache state survives restarts. Shipping the schema now means the F3
+// switch is a code change, not a migration.
+const GATE_CHECK_CACHE: &str = r#"
+CREATE TABLE IF NOT EXISTS gate_check_cache (
+    claim_id TEXT NOT NULL,
+    ctx_hash TEXT NOT NULL,
+    result TEXT NOT NULL,
+    cached_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (claim_id, ctx_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_gate_cache_expires ON gate_check_cache(expires_at);
+"#;
+
+// v42 — Identity Registry dla Sync Ledger. `sync_nodes` opisuje techniczna
+// tozsamosc node/device, `user_identity_keys` przechowuje kryptograficzne
+// klucze uzytkownika, a `node_user_assignments` mapuje kto moze uzywac danego
+// noda. `trusted_nodes` zostaje aktywnym store mesh trust; nowa tabela dostaje
+// backfill jako warstwa administracyjna pod permissions/sync policy.
+const SYNC_IDENTITY_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_nodes (
+    node_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    public_key_type TEXT NOT NULL DEFAULT 'ed25519'
+        CHECK(public_key_type IN ('ed25519','secp256k1')),
+    display_name TEXT NOT NULL DEFAULT '',
+    node_kind TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(node_kind IN ('unknown','phone','tablet','laptop','desktop','server','shared','authority')),
+    trust_status TEXT NOT NULL DEFAULT 'untrusted'
+        CHECK(trust_status IN ('untrusted','pending','trusted','revoked')),
+    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    sync_profile TEXT NOT NULL DEFAULT 'standard'
+        CHECK(sync_profile IN ('standard','limited','authority','storage_only','ephemeral')),
+    last_seen_at TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_owner ON sync_nodes(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_trust ON sync_nodes(trust_status);
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_kind ON sync_nodes(node_kind);
+
+CREATE TRIGGER IF NOT EXISTS sync_nodes_updated_at
+AFTER UPDATE ON sync_nodes
+FOR EACH ROW
+BEGIN
+    UPDATE sync_nodes
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE node_id = NEW.node_id;
+END;
+
+CREATE TABLE IF NOT EXISTS user_identity_keys (
+    key_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    key_type TEXT NOT NULL CHECK(key_type IN ('ed25519','secp256k1')),
+    public_key TEXT NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'sync'
+        CHECK(purpose IN ('auth','sync','admin','recovery')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','revoked')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    revoked_at TEXT NULL,
+    UNIQUE(user_id, key_type, public_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_identity_keys_user ON user_identity_keys(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_user_identity_keys_public ON user_identity_keys(key_type, public_key);
+
+CREATE TABLE IF NOT EXISTS node_user_assignments (
+    node_id TEXT NOT NULL REFERENCES sync_nodes(node_id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    assignment_mode TEXT NOT NULL
+        CHECK(assignment_mode IN ('primary','allowed','shared_session','authority_operator')),
+    valid_from TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    valid_until TEXT NULL,
+    created_by INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY(node_id, user_id, assignment_mode)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_user_assignments_user ON node_user_assignments(user_id, valid_until);
+CREATE INDEX IF NOT EXISTS idx_node_user_assignments_node ON node_user_assignments(node_id, valid_until);
+
+INSERT OR IGNORE INTO sync_nodes (node_id, public_key, display_name, trust_status, created_at, updated_at)
+SELECT node_id,
+       public_key,
+       COALESCE(NULLIF(hostname, ''), node_id),
+       CASE WHEN is_active = 1 THEN 'trusted' ELSE 'untrusted' END,
+       approved_at,
+       approved_at
+FROM trusted_nodes;
+"#;
+
+// v43 — fundament Permission Engine dla Sync Ledger. Tabele trzymaja
+// minimalny, domenowo-neutralny opis zasobu i relacje dostepu, na ktorych
+// pozniej opieraja sie polityki per addon oraz filtr outbox.
+const SYNC_PERMISSION_ENGINE: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_user_org_profiles (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    department_id TEXT NULL,
+    manager_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    is_department_manager INTEGER NOT NULL DEFAULT 0 CHECK(is_department_manager IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY(org_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_user_org_profiles_department
+    ON sync_user_org_profiles(org_id, department_id);
+CREATE INDEX IF NOT EXISTS idx_sync_user_org_profiles_manager
+    ON sync_user_org_profiles(org_id, manager_user_id);
+
+CREATE TRIGGER IF NOT EXISTS sync_user_org_profiles_updated_at
+AFTER UPDATE ON sync_user_org_profiles
+FOR EACH ROW
+BEGIN
+    UPDATE sync_user_org_profiles
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE org_id = NEW.org_id AND user_id = NEW.user_id;
+END;
+
+CREATE TABLE IF NOT EXISTS sync_resource_acl (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    owner_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    assigned_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    department_id TEXT NULL,
+    manager_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    visibility_scope TEXT NOT NULL DEFAULT 'assigned'
+        CHECK(visibility_scope IN ('private','own','assigned','department','manager_subtree','explicit_share','all')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY(org_id, addon_id, resource_type, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_owner
+    ON sync_resource_acl(org_id, owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_assigned
+    ON sync_resource_acl(org_id, assigned_user_id);
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_department
+    ON sync_resource_acl(org_id, department_id);
+CREATE INDEX IF NOT EXISTS idx_sync_resource_acl_manager
+    ON sync_resource_acl(org_id, manager_user_id);
+
+CREATE TRIGGER IF NOT EXISTS sync_resource_acl_updated_at
+AFTER UPDATE ON sync_resource_acl
+FOR EACH ROW
+BEGIN
+    UPDATE sync_resource_acl
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE org_id = NEW.org_id
+      AND addon_id = NEW.addon_id
+      AND resource_type = NEW.resource_type
+      AND resource_id = NEW.resource_id;
+END;
+
+CREATE TABLE IF NOT EXISTS sync_explicit_shares (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('user','node')),
+    subject_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('read','write','sync_receive','admin')),
+    granted_by INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    granted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    revoked_at TEXT NULL,
+    PRIMARY KEY(org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_explicit_shares_subject
+    ON sync_explicit_shares(org_id, subject_type, subject_id, action, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_sync_explicit_shares_resource
+    ON sync_explicit_shares(org_id, addon_id, resource_type, resource_id, revoked_at);
+"#;
+
+// v44 — Sync Policy. Polityka jest konfigurowana przez TentaFlow, nie przez
+// addon. Najbardziej szczegolny wpis wygrywa: resource > resource_type > addon.
+const SYNC_POLICY: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_policies (
+    policy_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL DEFAULT '',
+    resource_id TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL
+        CHECK(mode IN ('local_only','replicated_by_permission','authority_readthrough','authority_write','sharded','ephemeral')),
+    authority_node_id TEXT NULL REFERENCES sync_nodes(node_id) ON DELETE SET NULL,
+    retention_days INTEGER NULL CHECK(retention_days IS NULL OR retention_days >= 0),
+    is_enabled INTEGER NOT NULL DEFAULT 1 CHECK(is_enabled IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK (
+        (mode IN ('authority_readthrough','authority_write') AND authority_node_id IS NOT NULL)
+        OR (mode NOT IN ('authority_readthrough','authority_write'))
+    ),
+    CHECK (
+        (resource_id = '')
+        OR (resource_type <> '')
+    ),
+    UNIQUE(org_id, addon_id, resource_type, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_policies_lookup
+    ON sync_policies(org_id, addon_id, resource_type, resource_id, is_enabled);
+CREATE INDEX IF NOT EXISTS idx_sync_policies_authority
+    ON sync_policies(authority_node_id, is_enabled);
+
+CREATE TRIGGER IF NOT EXISTS sync_policies_updated_at
+AFTER UPDATE ON sync_policies
+FOR EACH ROW
+BEGIN
+    UPDATE sync_policies
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    WHERE policy_id = NEW.policy_id;
+END;
+"#;
+
+const CORE_SYNC_CAPTURES: &str = r#"
+CREATE TABLE IF NOT EXISTS __tentaflow_core_sync_captures (
+    capture_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    table_name TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    primary_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
+    changed_fields_blob BLOB NOT NULL,
+    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+    operation_id TEXT NULL,
+    error_message TEXT NULL,
+    created_at_ms INTEGER NOT NULL,
+    ledgered_at_ms INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_core_sync_captures_status
+    ON __tentaflow_core_sync_captures(status, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_core_sync_captures_resource
+    ON __tentaflow_core_sync_captures(org_id, resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_core_sync_captures_operation
+    ON __tentaflow_core_sync_captures(operation_id);
+"#;
+
+const KV_SYNC_CAPTURES: &str = r#"
+CREATE TABLE IF NOT EXISTS __tentaflow_kv_sync_captures (
+    capture_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    addon_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('set','delete')),
+    storage_value BLOB NULL,
+    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+    operation_id TEXT NULL,
+    error_message TEXT NULL,
+    created_at_ms INTEGER NOT NULL,
+    ledgered_at_ms INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kv_sync_captures_status
+    ON __tentaflow_kv_sync_captures(status, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_kv_sync_captures_resource
+    ON __tentaflow_kv_sync_captures(org_id, addon_id, instance_id, storage_key);
+CREATE INDEX IF NOT EXISTS idx_kv_sync_captures_operation
+    ON __tentaflow_kv_sync_captures(operation_id);
+"#;
+
+const BLOB_SYNC_CAPTURES: &str = r#"
+CREATE TABLE IF NOT EXISTS __tentaflow_blob_sync_captures (
+    capture_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    blob_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    file_path TEXT NOT NULL,
+    actor_user_id INTEGER NULL REFERENCES user_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+    operation_id TEXT NULL,
+    error_message TEXT NULL,
+    created_at_ms INTEGER NOT NULL,
+    ledgered_at_ms INTEGER NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_status
+    ON __tentaflow_blob_sync_captures(status, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_sha
+    ON __tentaflow_blob_sync_captures(org_id, sha256);
+CREATE INDEX IF NOT EXISTS idx_blob_sync_captures_operation
+    ON __tentaflow_blob_sync_captures(operation_id);
+"#;
+
+// F2 P2.a — formalise the legal value set for `model_aliases.strategy`.
+// The initial schema declared the column without a CHECK constraint, so
+// `round_robin` was already accepted by the storage layer (and the runtime
+// `Strategy::from_db` parser maps the literal to `Strategy::RoundRobin`).
+// This migration pins the contract: only `first_available` and `round_robin`
+// are valid going forward. Any future strategy must edit both this CHECK
+// and `services::catalog::Strategy::from_db`.
+//
+// SQLite cannot ALTER a CHECK constraint in place; we rebuild the table
+// using the canonical pattern (CREATE new + INSERT SELECT + DROP old +
+// RENAME + recreate index). Idempotent at three levels:
+//   * If the live `model_aliases` already has a CHECK that accepts both
+//     values (re-run after success), the rebuild repeats but produces an
+//     equivalent schema — wasted work, never incorrect.
+//   * `model_aliases_new` is dropped at the start so a half-run from a
+//     previous attempt cannot collide on the staging table name.
+//   * `DROP TABLE IF EXISTS` on the post-rename leftover keeps a partial
+//     rerun (process killed between RENAME and index creation) recoverable.
+fn model_aliases_strategy_round_robin(conn: &Connection) -> Result<()> {
+    // Drop any leftover staging table from a previous interrupted run.
+    conn.execute_batch("DROP TABLE IF EXISTS model_aliases_new;")?;
+
+    // Create the rebuilt table with an explicit CHECK constraint. Column
+    // order, types and defaults mirror the v1 schema (line 1174) so the
+    // INSERT SELECT below is a straight column-for-column copy.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE model_aliases_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT UNIQUE NOT NULL,
+            target_model TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            fallback_targets TEXT DEFAULT NULL,
+            strategy TEXT DEFAULT 'first_available'
+                CHECK(strategy IN ('first_available','round_robin'))
+        );
+        INSERT INTO model_aliases_new (id, alias, target_model, is_active, fallback_targets, strategy)
+            SELECT id, alias, target_model, is_active, fallback_targets,
+                   COALESCE(strategy, 'first_available')
+              FROM model_aliases;
+        DROP TABLE model_aliases;
+        ALTER TABLE model_aliases_new RENAME TO model_aliases;
+        CREATE INDEX IF NOT EXISTS idx_model_aliases_alias ON model_aliases(alias);
+        "#,
+    )?;
+    Ok(())
+}
+
+// F2 P1.a — multi-tenant foundation. Creates the three control tables
+// (organizations, roles, org_memberships), seeds the `org-default` row + the
+// five standard roles, then PRAGMA-guards eight existing tables to grow a
+// nullable `org_id` column and backfills every pre-existing row to
+// `org-default`. Idempotent at every step:
+//   * CREATE TABLE / CREATE INDEX use IF NOT EXISTS.
+//   * Seeds use INSERT OR IGNORE so a second run leaves the rows untouched.
+//   * ADD COLUMN is gated by a PRAGMA table_info probe.
+//   * Backfill UPDATE only touches rows where org_id IS NULL — a second run
+//     finds zero such rows and is a no-op.
+// Backfill is small enough (single SQLite UPDATE per table) to run inline;
+// no batching is required because the migration runs inside the per-version
+// transaction opened by `db::migrations::run`.
+fn setup_multi_tenant(conn: &Connection) -> Result<()> {
+    // Step 1: control tables.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS organizations (
+            org_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
+            contact_email TEXT NULL,
+            dpo_contact TEXT NULL,
+            retention_policy_json TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active','suspended','deleted')),
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_organizations_status ON organizations(status);
+        CREATE INDEX IF NOT EXISTS idx_organizations_slug ON organizations(slug);
+
+        CREATE TABLE IF NOT EXISTS roles (
+            role_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            permissions_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS org_memberships (
+            org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL,
+            role_id TEXT NOT NULL REFERENCES roles(role_id),
+            granted_at TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            PRIMARY KEY (org_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_org_memberships_user ON org_memberships(user_id);
+        CREATE INDEX IF NOT EXISTS idx_org_memberships_role ON org_memberships(role_id);
+        "#,
+    )?;
+
+    // Step 2: seed `org-default`. INSERT OR IGNORE keeps the migration
+    // idempotent across re-runs and across operators who created the row by
+    // hand before re-applying the migration.
+    conn.execute(
+        "INSERT OR IGNORE INTO organizations \
+            (org_id, name, slug, contact_email, dpo_contact, retention_policy_json, status, created_at) \
+         VALUES ('org-default', 'Default Organization', 'default', NULL, NULL, NULL, 'active', \
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        [],
+    )?;
+
+    // Step 3: seed five preseed roles. Permission keys chosen to align with
+    // the host-fn permission checks already in flight across the codebase
+    // (camera.*, service.*, sql.*, vector.*, policy.*, gate.check, flow.invoke,
+    // legal.*) plus the new RBAC-specific keys (org.*, user.*, addon.*,
+    // rbac.elevate).
+    let role_seeds: &[(&str, &str, &[&str])] = &[
+        (
+            "role-org-admin",
+            "org_admin",
+            &[
+                "org.read",
+                "org.write",
+                "org.admin",
+                "user.read",
+                "user.write",
+                "user.assign_role",
+                "addon.install",
+                "addon.upgrade",
+                "addon.uninstall",
+                "camera.read",
+                "camera.write",
+                "camera.discover",
+                "camera.metadata",
+                "service.read",
+                "service.call",
+                "sql.read",
+                "sql.write",
+                "vector.read",
+                "vector.write",
+                "policy.read",
+                "policy.write",
+                "gate.check",
+                "flow.invoke",
+                "legal.read",
+                "legal.write",
+                "rbac.elevate",
+            ],
+        ),
+        (
+            "role-org-operator",
+            "org_operator",
+            &[
+                "org.read",
+                "camera.read",
+                "camera.write",
+                "camera.discover",
+                "service.read",
+                "service.call",
+                "sql.read",
+                "vector.read",
+                "policy.read",
+                "gate.check",
+                "flow.invoke",
+                "legal.read",
+            ],
+        ),
+        (
+            "role-org-viewer",
+            "org_viewer",
+            &[
+                "org.read",
+                "camera.read",
+                "service.read",
+                "sql.read",
+                "vector.read",
+                "policy.read",
+                "legal.read",
+            ],
+        ),
+        (
+            "role-dpo",
+            "dpo",
+            &[
+                "org.read",
+                "policy.read",
+                "policy.write",
+                "gate.check",
+                "legal.read",
+                "legal.write",
+                "rbac.elevate",
+            ],
+        ),
+        (
+            "role-supervisor",
+            "supervisor",
+            &["org.read", "policy.read", "gate.check", "rbac.elevate"],
+        ),
+    ];
+    for (role_id, name, perms) in role_seeds {
+        let perms_json = serialize_perms_json(perms);
+        conn.execute(
+            "INSERT OR IGNORE INTO roles (role_id, name, permissions_json, created_at) \
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            rusqlite::params![role_id, name, perms_json],
+        )?;
+    }
+
+    // Step 4 + 5 + 6: per-table ADD COLUMN (PRAGMA-guarded) + backfill +
+    // index. The eight target tables hold every row that must scope to a
+    // tenant from F2 onward. `addon_installations` lives under the name
+    // `addons` in this schema (sole canonical addon registry — there is no
+    // separate `addon_installations` table); we use the real name to avoid
+    // creating a phantom column on a non-existent table.
+    let tables: &[&str] = &[
+        "users",
+        "addons",
+        "policy_claims",
+        "cameras",
+        "recordings",
+        "addon_vector_namespaces",
+        "audit_log",
+        "frame_pickup_log",
+    ];
+    for table in tables {
+        add_org_id_column_if_missing(conn, table)?;
+        let sql_backfill = format!(
+            "UPDATE {} SET org_id = 'org-default' WHERE org_id IS NULL",
+            table
+        );
+        conn.execute(&sql_backfill, [])?;
+        let sql_index = format!(
+            "CREATE INDEX IF NOT EXISTS idx_{tbl}_org_id ON {tbl}(org_id)",
+            tbl = table
+        );
+        conn.execute_batch(&sql_index)?;
+    }
+
+    Ok(())
+}
+
+// PRAGMA-guarded `ALTER TABLE <tbl> ADD COLUMN org_id TEXT NULL`. Idempotent:
+// a second run finds the column already present and skips. The column is
+// intentionally NULLABLE so the backfill UPDATE that follows is the single
+// source of truth for the default-org assignment (an `NOT NULL DEFAULT
+// 'org-default'` would silently mask a partial-fail backfill).
+fn add_org_id_column_if_missing(conn: &Connection, table: &str) -> Result<()> {
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&pragma_sql)?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "org_id" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_col {
+        let alter_sql = format!("ALTER TABLE {} ADD COLUMN org_id TEXT NULL", table);
+        conn.execute_batch(&alter_sql)?;
+    }
+    Ok(())
+}
+
+// Serialize a permission list to canonical JSON without pulling in
+// serde_json's value tree. Permission keys never contain `"` or `\` (they
+// are dot-delimited ASCII identifiers, validated implicitly by the host-fn
+// permission checks elsewhere in the codebase), so a hand-rolled writer is
+// safe and avoids the serde_json dependency at the migrations layer.
+fn serialize_perms_json(perms: &[&str]) -> String {
+    let mut out = String::from("[");
+    for (i, p) in perms.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(p);
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+// F1c P7 — per-user audit attribution. Existing rows pre-dating this migration
+// stay with NULL (system / unknown actor); WASM-driven flow invokes from this
+// point forward carry `state.user_id` so DoD-9 / DoD-10 reports can join the
+// row back to a concrete operator account. NULL remains valid for boot
+// recovery, scheduled tasks, and mesh-originated invocations.
+//
+// SQLite has no `ADD COLUMN IF NOT EXISTS`. We probe PRAGMA table_info first
+// so a partial reopen does not redo the ALTER.
+fn flow_invocations_add_actor_user_id(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(flow_invocations)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "actor_user_id" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE flow_invocations ADD COLUMN actor_user_id INTEGER NULL \
+                 REFERENCES users(id);",
+        )?;
+    }
+    Ok(())
+}
+
+// F1c P6 — persist the ONVIF device-service URL and the profile token chosen
+// at `camera_add_v1` time so the credentials-rotation path can re-derive the
+// RTSP URI without forcing the operator to re-run discovery. Both columns
+// are nullable: rows added under `vendor='rtsp'` (or pre-P6 ONVIF rows added
+// by hand) keep NULL.
+//
+// SQLite has no `ADD COLUMN IF NOT EXISTS`. We read PRAGMA table_info first
+// and skip the ALTER when the column already exists so the migration is
+// idempotent across partial-run reopens.
+fn cameras_add_onvif_metadata_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(cameras)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_url = false;
+    let mut has_token = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "onvif_url" {
+            has_url = true;
+        } else if name == "onvif_profile_token" {
+            has_token = true;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_url {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN onvif_url TEXT NULL;")?;
+    }
+    if !has_token {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN onvif_profile_token TEXT NULL;")?;
+    }
+    Ok(())
+}
+
+// F1c P5 — runtime tracking of in-flight and historical flow invocations
+// issued via flow_invoke_v1.
+const FLOW_INVOCATIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS flow_invocations (
+    id TEXT PRIMARY KEY,
+    addon_id TEXT NOT NULL,
+    flow_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    result_toml TEXT,
+    operators_completed INTEGER NOT NULL DEFAULT 0,
+    operators_total INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flow_invocations_addon ON flow_invocations(addon_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_invocations_running ON flow_invocations(status) WHERE status='running';
+"#;
+
+// F1c P4 — policy/claims engine tables. `policy_claims` records DPIA / FRIA
+// approvals or legal grants issued by an administrator (via CLI). Each claim
+// can be scoped globally (addon NULL) or narrowed to a specific addon and
+// optionally a single namespace / alias id. Claims expire automatically
+// (`valid_until`) and can be revoked at any time (`revoked_at` set non-NULL).
+// `policy_claim_signatures` carries the multi-signer requirement — at least
+// one signer per required role (typically DPO + supervisor) is enforced by
+// the engine when verifying. `signature_b64` is optional: NULL means manual
+// admin acknowledgment recorded via CLI; populated means a cryptographic
+// Ed25519 signature exists alongside the manual approval (verified
+// opportunistically — manual ack is the contract today, the signature is a
+// future-proofed audit anchor).
+const POLICY_CLAIMS: &str = r#"
+CREATE TABLE IF NOT EXISTS policy_claims (
+    claim_id TEXT PRIMARY KEY,
+    claim_type TEXT NOT NULL,
+    label TEXT NOT NULL,
+    subject TEXT NULL,
+    scope TEXT NULL,
+    document_uri TEXT NULL,
+    scope_addon_id TEXT NULL,
+    scope_namespace TEXT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    revoked_at TEXT NULL,
+    revoked_reason TEXT NULL,
+    issued_by_user TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_claims_type ON policy_claims(claim_type);
+CREATE INDEX IF NOT EXISTS idx_policy_claims_scope ON policy_claims(scope_addon_id, scope_namespace);
+
+CREATE TABLE IF NOT EXISTS policy_claim_signatures (
+    claim_id TEXT NOT NULL REFERENCES policy_claims(claim_id) ON DELETE CASCADE,
+    signer_role TEXT NOT NULL,
+    signer_user TEXT NOT NULL,
+    signed_at TEXT NOT NULL,
+    signature_b64 TEXT NULL,
+    PRIMARY KEY (claim_id, signer_role, signer_user)
+);
+CREATE INDEX IF NOT EXISTS idx_policy_claim_sig_claim ON policy_claim_signatures(claim_id);
+"#;
+
+// F1c P3 — per-addon per-namespace HNSW vector index registry. The on-disk
+// HNSW file lives at `file_path` (`<HOME>/.tentaflow/addons/<addon_id>/vectors/
+// <namespace>.usearch`); this table mirrors the (addon_id, namespace) pair to
+// the on-disk file plus the index geometry (`dim`, `metric`) so the namespace
+// can be reopened after process restart without consulting the manifest.
+// `count` is a best-effort cache updated on each upsert/delete — the
+// authoritative size lives inside usearch.
+const ADDON_VECTOR_NAMESPACES: &str = r#"
+CREATE TABLE IF NOT EXISTS addon_vector_namespaces (
+    addon_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    dim INTEGER NOT NULL CHECK(dim >= 1 AND dim <= 4096),
+    metric TEXT NOT NULL CHECK(metric IN ('cosine', 'euclidean', 'dot')),
+    count INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (addon_id, namespace)
+);
+CREATE INDEX IF NOT EXISTS idx_addon_vector_ns_addon ON addon_vector_namespaces(addon_id);
+"#;
+
+// F1c P2 — admin-managed allowlist of Ed25519 public keys that may sign
+// addon UI bundles. `key_b64` is the canonical 44-char base64 form (32 raw
+// bytes). The table is intentionally NOT seeded: an empty trust store means
+// no externally-published UI addon installs until an operator explicitly
+// runs `tentaflow-cli addon trust-key`. `added_by_user` is reserved for the
+// future RBAC subject (F1c P7); NULL for keys added pre-RBAC or via CLI
+// without an authenticated session.
+const TRUSTED_PUBLISHERS: &str = r#"
+CREATE TABLE IF NOT EXISTS trusted_publishers (
+    key_b64 TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    added_by_user TEXT NULL,
+    contact TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trusted_publishers_label ON trusted_publishers(label);
+"#;
+
+// F1b P4 — Merkle hash chain for `audit_log` (DoD-15). Adds two BLOB columns:
+//   - `prev_hash` (32 B) — copy of the previous row's `hash`, or NULL when
+//     the chain has not started yet (pre-P4 legacy rows).
+//   - `hash` (32 B) — `SHA256(canonical(row) || prev_hash)`.
+//
+// Existing F1a / pre-P4 rows keep NULL in both columns — `audit/verify.rs`
+// counts them as `legacy_unchained` so a verify-after-upgrade run does not
+// flag the entire pre-upgrade history as tampered. Every new row written
+// through `audit_log_with_risk` after this migration MUST populate both
+// columns.
+//
+// Idempotent via PRAGMA table_info — re-running the migration on a DB that
+// already has the columns (e.g. partial earlier run that committed the
+// _migrations row separately) is a no-op.
+fn audit_log_add_merkle_chain_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(audit_log)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_prev_hash = false;
+    let mut has_hash = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "prev_hash" {
+            has_prev_hash = true;
+        } else if name == "hash" {
+            has_hash = true;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !has_prev_hash {
+        conn.execute_batch("ALTER TABLE audit_log ADD COLUMN prev_hash BLOB NULL;")?;
+    }
+    if !has_hash {
+        conn.execute_batch("ALTER TABLE audit_log ADD COLUMN hash BLOB NULL;")?;
+    }
+    Ok(())
+}
+
+// F1b P3.C-2 — add a nullable `source_node_id` column to `frame_pickup_log`
+// so the pickup handler can record which peer's HMAC key validated the
+// token (NULL when the token verified locally). The audit query
+// "from which node was this frame fetched?" needs the column even though
+// SQLite has no easy `ADD COLUMN IF NOT EXISTS` — we read PRAGMA
+// table_info first and skip the ALTER when the column already exists so
+// the migration is idempotent if a partial earlier run committed the
+// _migrations row separately from the ALTER (or if an operator added
+// the column out of band).
+fn frame_pickup_log_add_source_node_id(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(frame_pickup_log)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_col = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "source_node_id" {
+            has_col = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    if !has_col {
+        conn.execute_batch("ALTER TABLE frame_pickup_log ADD COLUMN source_node_id TEXT NULL;")?;
+    }
+    Ok(())
+}
+
+// F1a M1.W8 — TentaVision recording manager registry. One row per artifact
+// (snapshot PNG or segment MP4) saved by an addon via `recording_save_*_v1`
+// host functions. `ref` is the public addon-facing identifier
+// (`snap_<uuid>` / `clip_<uuid>`). `file_path` is the absolute on-disk
+// location under `~/.tentaflow/recordings/<camera_id>/{snapshots,segments}/`.
+// `hash_sha256` is content hash for integrity / dedup, `retention_class` is
+// copied from `cameras.retention_class` at save time (audit chain). F1a does
+// no automatic purge — `purged_at` is set by `recording_purge_v1`.
+const RECORDINGS_TABLE: &str = r#"
+CREATE TABLE recordings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('snapshot','segment')),
+    owner_addon_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    duration_ms INTEGER NULL,
+    width INTEGER NULL,
+    height INTEGER NULL,
+    pixel_format TEXT NULL,
+    hash_sha256 TEXT NOT NULL,
+    retention_class TEXT NOT NULL CHECK(retention_class IN ('A','B','C','Unclassified')),
+    created_at INTEGER NOT NULL,
+    purged_at INTEGER NULL
+);
+CREATE UNIQUE INDEX idx_recordings_ref_active ON recordings(ref) WHERE purged_at IS NULL;
+CREATE INDEX idx_recordings_owner ON recordings(owner_addon_id, purged_at);
+CREATE INDEX idx_recordings_camera ON recordings(camera_id, purged_at);
+"#;
+
+// F1a M1.W6 — TentaVision camera ingest registry. One row per camera owned
+// by an addon. F1a only supports `fake_file` vendor (mp4 loop via GStreamer
+// filesrc). `credentials_encrypted` carries opaque AES-GCM blob for vendors
+// that need auth (unused for fake_file). `fps_actual` + `last_frame_at`
+// expose health snapshot without a separate timeseries table.
+const CAMERAS_TABLE: &str = r#"
+CREATE TABLE cameras (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL
+);
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+"#;
+
+// F1b P1.A — extend `cameras.vendor` CHECK to allow `rtsp` and `onvif` next to
+// the existing `fake_file`. SQLite cannot ALTER a CHECK constraint in-place,
+// so we rebuild the table: create `cameras_new` with the new CHECK, copy rows
+// 1:1, drop the old table, rename, recreate indexes. Foreign keys are turned
+// off during the rebuild (SQLite requirement for safe table swap) and
+// re-enabled at the end. `DROP TABLE IF EXISTS cameras_new` guards against a
+// partial earlier run leaving the scratch table behind.
+const CAMERAS_VENDOR_CHECK_RTSP_ONVIF: &str = r#"
+PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS cameras_new;
+
+CREATE TABLE cameras_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file', 'rtsp', 'onvif')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL
+);
+
+INSERT INTO cameras_new (
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at
+)
+SELECT
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at
+FROM cameras;
+
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+
+PRAGMA foreign_keys = ON;
+"#;
+
+// F1a §6.6 v0.6.0 — readonly aliases per Chunk C decision. Permission was
+// renamed from `alias.manage` (rollback removed CRUD ABI) to `alias.read`.
+// Idempotent UPDATEs touch only rows whose string column literally stores
+// `alias.manage`; `addon_declared_permissions.permission_type` uses the
+// same string semantics as the other catalogs (manifest [[permission]].id).
+const RENAME_ALIAS_MANAGE_TO_READ: &str = r#"
+UPDATE addon_permissions
+   SET permission_id = 'alias.read'
+ WHERE permission_id = 'alias.manage';
+UPDATE addon_permission_defaults
+   SET permission_id = 'alias.read'
+ WHERE permission_id = 'alias.manage';
+UPDATE addon_permission_catalog
+   SET permission_id = 'alias.read'
+ WHERE permission_id = 'alias.manage';
+UPDATE addon_declared_permissions
+   SET permission_type = 'alias.read'
+ WHERE permission_type = 'alias.manage';
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — per-alias visibility scope.
+// Three levels: `private` (only owner addon may resolve), `restricted`
+// (whitelist in `model_alias_consumers`), `public` (any addon may resolve).
+// PK = alias_id (1:1 with model_aliases). Default `private` from manifest
+// is set explicitly at install time; this CHECK has no DEFAULT so writes
+// must declare visibility.
+const MODEL_ALIAS_VISIBILITY: &str = r#"
+CREATE TABLE model_alias_visibility (
+    alias_id INTEGER PRIMARY KEY REFERENCES model_aliases(id) ON DELETE CASCADE,
+    visibility TEXT NOT NULL CHECK(visibility IN ('private','restricted','public')),
+    updated_at INTEGER NOT NULL,
+    updated_by_user_id INTEGER NULL
+);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — explicit consumer whitelist for `restricted`
+// aliases. Owner declares `allowed_consumers = [...]` in manifest; install
+// writes one row per consumer with `granted_by_user_id = NULL` (auto from
+// manifest). Admin can later add/remove rows via M16b. PK guarantees one
+// row per (alias, consumer) pair.
+const MODEL_ALIAS_CONSUMERS: &str = r#"
+CREATE TABLE model_alias_consumers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL REFERENCES model_aliases(id) ON DELETE CASCADE,
+    consumer_addon_id TEXT NOT NULL,
+    granted_by_user_id INTEGER NULL,
+    granted_at INTEGER NOT NULL,
+    revoked_at INTEGER NULL,
+    UNIQUE(alias_id, consumer_addon_id)
+);
+CREATE INDEX idx_alias_consumers_lookup ON model_alias_consumers(consumer_addon_id, alias_id);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — per-model visibility. Two levels only
+// (`restricted` default, `public`). `model_id` is a free-form TEXT key —
+// no FK because there is no `models` table in v0.6.0; the registry of
+// "known model ids" lives in services + manual config. `restricted` is
+// the default at the SQL layer so unknown models cannot be reached by
+// addons without explicit grant.
+const MODEL_VISIBILITY: &str = r#"
+CREATE TABLE model_visibility (
+    model_id TEXT PRIMARY KEY,
+    visibility TEXT NOT NULL CHECK(visibility IN ('restricted','public')) DEFAULT 'restricted',
+    updated_at INTEGER NOT NULL,
+    updated_by_user_id INTEGER NULL
+);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — model consumer whitelist (symmetric to
+// `model_alias_consumers`). `model_id` TEXT free-form (no FK).
+const MODEL_CONSUMERS: &str = r#"
+CREATE TABLE model_consumers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    consumer_addon_id TEXT NOT NULL,
+    granted_by_user_id INTEGER NULL,
+    granted_at INTEGER NOT NULL,
+    revoked_at INTEGER NULL,
+    UNIQUE(model_id, consumer_addon_id)
+);
+CREATE INDEX idx_model_consumers_lookup ON model_consumers(consumer_addon_id, model_id);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — consumer-side declaration `[[uses_alias]]`.
+// `alias_target_name` stores the alias name (not id) because a consumer
+// can declare its intent to use an alias BEFORE that alias' owner addon
+// is installed; the row then stays `pending` until reconciliation runs
+// at owner install time. Index `(alias_target_name, grant_status)` is
+// hit by reconcile lookups; `(addon_id, grant_status)` by the resolver
+// permission gate.
+const ADDON_USES_ALIAS: &str = r#"
+CREATE TABLE addon_uses_alias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    addon_id TEXT NOT NULL,
+    alias_target_name TEXT NOT NULL,
+    required INTEGER NOT NULL CHECK(required IN (0,1)),
+    reason TEXT NOT NULL,
+    grant_status TEXT NOT NULL CHECK(grant_status IN ('pending','granted','denied','auto_granted')),
+    grant_decided_at INTEGER NULL,
+    grant_decided_by_user_id INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(addon_id, alias_target_name)
+);
+CREATE INDEX idx_addon_uses_alias_target ON addon_uses_alias(alias_target_name, grant_status);
+CREATE INDEX idx_addon_uses_alias_addon ON addon_uses_alias(addon_id, grant_status);
+"#;
+
+// F1a §6.6 v0.6.0 Chunk C — consumer-side declaration `[[uses_model]]`.
+// Same pending/reconcile pattern as `addon_uses_alias` but keyed on the
+// free-form `model_id` string. `model_visibility` defaults to
+// `restricted`, so unknown-model declarations stay `pending` until an
+// admin explicitly grants (no auto-grant by absence of policy).
+const ADDON_USES_MODEL: &str = r#"
+CREATE TABLE addon_uses_model (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    addon_id TEXT NOT NULL,
+    model_target_name TEXT NOT NULL,
+    required INTEGER NOT NULL CHECK(required IN (0,1)),
+    reason TEXT NOT NULL,
+    grant_status TEXT NOT NULL CHECK(grant_status IN ('pending','granted','denied','auto_granted')),
+    grant_decided_at INTEGER NULL,
+    grant_decided_by_user_id INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(addon_id, model_target_name)
+);
+CREATE INDEX idx_addon_uses_model_target ON addon_uses_model(model_target_name, grant_status);
+CREATE INDEX idx_addon_uses_model_addon ON addon_uses_model(addon_id, grant_status);
+"#;
+
+// After M1.W5: teams-bot declares aliases via [[alias]] manifest section.
+// Hard-coded TEAMS_BOT_ALIASES const and activate/deactivate helpers were
+// removed from addon/mod.rs. This migration backfills owner records for
+// existing teams-bot aliases on already-deployed databases so the new
+// owner-aware code path treats them correctly (start/stop activate/
+// deactivate, uninstall preserves owner row for audit trail).
+const TEAMS_BOT_ALIASES_OWNERSHIP_BACKFILL: &str = r#"
+INSERT OR IGNORE INTO model_alias_owners (alias_id, owner_type, owner_id, created_at)
+SELECT id, 'addon', 'teams-bot', datetime('now')
+FROM model_aliases
+WHERE alias IN ('teams-stt', 'teams-tts', 'teams-summary', 'teams-vision-face', 'teams-vision-emotion');
+"#;
+
+// F1a §6.5 — tabela powiazania aliasu z wlascicielem (addon lub manual).
+// Pozwala odroznic aliasy stworzone automatycznie przez install addonu od
+// tych wpisanych recznie przez admina (M1.W5 zacznie ja zasilac).
+const MODEL_ALIAS_OWNERS: &str = r#"
+CREATE TABLE model_alias_owners (
+    alias_id INTEGER PRIMARY KEY REFERENCES model_aliases(id) ON DELETE CASCADE,
+    owner_type TEXT NOT NULL CHECK(owner_type IN ('addon', 'manual')),
+    owner_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_alias_owners_addon ON model_alias_owners(owner_type, owner_id);
+"#;
+
+// F1a §6.5 — log wywolan aliasow AI. Kazdy alias_call (M1.W6) zapisuje
+// rekord z target_used, request_id, fallback_chain_position; pozwala na
+// debug fallback chain w UI M16 i metryki per alias.
+const ALIAS_CALLS: &str = r#"
+CREATE TABLE alias_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL REFERENCES model_aliases(id) ON DELETE CASCADE,
+    alias_name TEXT NOT NULL,
+    method TEXT,
+    target_used TEXT NOT NULL,
+    target_node_id TEXT,
+    service_id TEXT,
+    caller_addon_id TEXT,
+    caller_user_id INTEGER,
+    request_id TEXT,
+    duration_ms INTEGER,
+    payload_bytes INTEGER,
+    response_bytes INTEGER,
+    fallback_used INTEGER DEFAULT 0,
+    fallback_chain_position INTEGER,
+    result TEXT NOT NULL CHECK(result IN ('ok','error','no_target','timeout','permission_denied','gate_denied')),
+    error_code TEXT,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX idx_alias_calls_alias_ts ON alias_calls(alias_id, ts);
+CREATE INDEX idx_alias_calls_addon_ts ON alias_calls(caller_addon_id, ts);
+CREATE INDEX idx_alias_calls_request_id ON alias_calls(request_id);
+CREATE INDEX idx_alias_calls_fallback ON alias_calls(alias_id, fallback_used) WHERE fallback_used=1;
+"#;
+
+// F1a §6.5 — historia zmian aliasu (before/after snapshot, change_type,
+// reason). UI M16 (alias detail panel) pokazuje audit trail; admin moze
+// rollback przez wstawienie nowego rekordu z before_snapshot.
+// Brak FK na model_aliases — alias mogl byc juz usuniety, ale historia
+// musi pozostac (compliance F1a §6.2.Y).
+const MODEL_ALIAS_CHANGES: &str = r#"
+CREATE TABLE model_alias_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL,
+    alias_name TEXT NOT NULL,
+    changed_by_user_id INTEGER,
+    changed_by_addon_id TEXT,
+    before_snapshot TEXT,
+    after_snapshot TEXT,
+    change_type TEXT NOT NULL CHECK(change_type IN
+        ('create','target_change','fallback_change','strategy_change',
+         'activate','deactivate','delete','suggested_default_change')),
+    reason TEXT,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX idx_alias_changes_alias ON model_alias_changes(alias_id);
+CREATE INDEX idx_alias_changes_user_ts ON model_alias_changes(changed_by_user_id, ts);
+"#;
+
+// F1a §6.5 — wykonanie migracji per-addon SQL storage. PRIMARY KEY
+// (addon_id, migration_name) zapewnia idempotencje. Hash chroni przed
+// "podmiana" tresci migracji po jej aplikacji.
+const ADDON_MIGRATIONS_APPLIED: &str = r#"
+CREATE TABLE addon_migrations_applied (
+    addon_id TEXT NOT NULL,
+    migration_name TEXT NOT NULL,
+    migration_hash TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+    applied_in_addon_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('success', 'failed', 'partial')),
+    error_message TEXT,
+    duration_ms INTEGER,
+    PRIMARY KEY (addon_id, migration_name)
+);
+CREATE INDEX idx_addon_migrations_status ON addon_migrations_applied(addon_id, status);
+"#;
+
+// F1a §6.5 — log pickupow surowych ramek (frame_ref) przez serwisy AI.
+// Token zawarty w frame_ref ma TTL; rdzen weryfikuje go przy pickupie
+// i loguje wynik (ok / token_invalid / token_expired / frame_purged /
+// unauthorized). UI compliance M22 pokazuje time-to-pickup.
+const FRAME_PICKUP_LOG: &str = r#"
+CREATE TABLE frame_pickup_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_frame_ref TEXT NOT NULL,
+    service_id TEXT NOT NULL,
+    caller_addon_id TEXT,
+    request_id TEXT NOT NULL,
+    picked_up_at INTEGER NOT NULL,
+    result TEXT NOT NULL CHECK(result IN ('ok','token_invalid','token_expired','frame_purged','unauthorized'))
+);
+CREATE INDEX idx_frame_pickup_ref ON frame_pickup_log(raw_frame_ref);
+CREATE INDEX idx_frame_pickup_request ON frame_pickup_log(request_id);
+CREATE INDEX idx_frame_pickup_service_ts ON frame_pickup_log(service_id, picked_up_at);
+"#;
+
+// Rozszerzenie audit_log o pola wymagane przez F1a §6.2.Y:
+// - risk_class — klasyfikacja RODO (A/B/C/unclassified); wpisy klasy B/C maja
+//   indeks partial dla szybkich kwerend zgodnosciowych.
+// - related_claim_id — powiazanie wpisu z claim (gate evaluation, F2).
+// - request_id — korelacja wielu wpisow w obrebie jednego wywolania service_call
+//   lub spans flow execution.
+// SQLite nie wspiera CHECK przy ALTER TABLE — walidacja po stronie Rust w
+// audit/mod.rs (RiskClass enum).
+const AUDIT_LOG_RISK_CLASS: &str = r#"
+ALTER TABLE audit_log ADD COLUMN risk_class TEXT NOT NULL DEFAULT 'unclassified';
+ALTER TABLE audit_log ADD COLUMN related_claim_id TEXT;
+ALTER TABLE audit_log ADD COLUMN request_id TEXT;
+CREATE INDEX idx_audit_risk_class ON audit_log(risk_class) WHERE risk_class IN ('B','C');
+CREATE INDEX idx_audit_claim ON audit_log(related_claim_id) WHERE related_claim_id IS NOT NULL;
+CREATE INDEX idx_audit_request_id ON audit_log(request_id);
+"#;
+
+// params_schema: JSON-Schema-like opis pol konfiguracyjnych per node type.
+// GUI flow builder rendere dynamic form z tej deklaracji (typ string z enum
+// → select, number z range → slider, boolean → toggle, format=textarea →
+// textarea, type=model_picker z `category` → dynamic dropdown z
+// model_registry filtrowane po category). Bez tej kolumny config tab w
+// builderze byl pusty bo wczytywal `template.params_schema` ktore byl
+// undefined.
+const FLOW_NODE_TEMPLATES_PARAMS_SCHEMA: &str = r#"
+ALTER TABLE flow_node_templates ADD COLUMN params_schema TEXT;
+"#;
+
+// progress_message: krotki status text aktualizowany przez supervisor /
+// detached deploy task podczas Starting (np. "warming up — alive 30s,
+// waiting for /v1/models"). GUI snapshot pokazuje obok statusu, zeby
+// user widzial PROGRES startu serwisu (vLLM cold start ~3 min, klient
+// inaczej widzi tylko "Starting" przez kilka minut bez feedbacku).
+//
+// Health_last_err zostaje DEDYKOWANE dla bledow zdrowia (failed probe).
+// Progress_message jest informacyjne, NULL gdy nic do powiedzenia.
+const SERVICES_PROGRESS_MESSAGE: &str = r#"
+ALTER TABLE services ADD COLUMN progress_message TEXT;
+"#;
 
 // Rename edge fieldow w flow_json: `from`/`to` -> `from_node`/`to_node`.
 // GUI canvas (flows-builder/canvas.js) oczekuje `from_node`/`to_node`, seed
@@ -309,24 +1868,6 @@ CREATE TABLE registries (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX idx_registries_name ON registries(name);
-
-CREATE TABLE crdt_operations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    clock_time INTEGER NOT NULL,
-    clock_node_hash INTEGER NOT NULL,
-    op_type TEXT NOT NULL,
-    op_key TEXT NOT NULL,
-    op_data TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX idx_crdt_ops_time ON crdt_operations(clock_time);
-CREATE INDEX idx_crdt_ops_key ON crdt_operations(op_key);
-
-CREATE TABLE crdt_version_vector (
-    node_hash INTEGER PRIMARY KEY,
-    last_time INTEGER NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 
 CREATE TABLE user_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -966,6 +2507,9 @@ CREATE TABLE services (
     config_json TEXT NOT NULL DEFAULT '{}',
     health_last_ok TIMESTAMP,
     health_last_err TEXT,
+    -- progress_message dodawany przez migration 5 (services_progress_message).
+    -- Nie dodajemy tu zeby ALTER TABLE w migracji nie zwalil "duplicate column"
+    -- na fresh DB.
     restart_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -1044,4 +2588,201 @@ INSERT INTO settings(key, value) VALUES
     ('mesh.advertise_hide_cgnat', '0'),
     ('mesh.advertise_prefer_same_subnet', '1'),
     ('mesh.iroh_relay_url', 'https://relay.nextapp.pl');
+"#;
+
+const SCHEDULED_JOBS: &str = r#"
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    target_type TEXT NOT NULL,
+    target_addon_id TEXT NOT NULL DEFAULT '',
+    target_action_id TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    schedule_kind TEXT NOT NULL,
+    schedule_expr TEXT NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    next_run_at TEXT,
+    max_runtime_seconds INTEGER NOT NULL DEFAULT 1800,
+    retry_policy_json TEXT NOT NULL DEFAULT '{"max_attempts":1,"backoff_seconds":60}',
+    concurrency_policy TEXT NOT NULL DEFAULT 'skip',
+    created_by_user_id INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+    ON scheduled_jobs(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_target
+    ON scheduled_jobs(target_type, target_addon_id, target_action_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_runs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    result_json TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job
+    ON scheduled_runs(job_id, scheduled_for DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status
+    ON scheduled_runs(status);
+"#;
+
+// v40 — `platform_locales`: katalog jezykow interfejsu per organizacja.
+// Tabela trzyma kody ISO 639-1 dostepne dla danej organizacji oraz wskazuje
+// jezyk domyslny. Dane sluza warstwie aplikacyjnej do walidacji kompletnosci
+// tlumaczen w `role_catalog.name_translations` i pozniej w innych tabelach
+// platformy (stanowiska, etykiety addonow). SQLite nie wymusza obecnosci
+// kluczy JSON dla wszystkich locale — kontrolka jest po stronie Rust
+// (services/role_catalog), tu seedujemy startowy zestaw pl + en.
+//
+// Czesciowy unikalny indeks `idx_platform_locales_one_default_per_org`
+// gwarantuje ze w danej organizacji jest dokladnie jeden jezyk z
+// `is_default = 1` — bez tego UI mialby ambiwalentny fallback.
+const PLATFORM_LOCALES_SCHEMA: &str = r#"
+CREATE TABLE platform_locales (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+  code          TEXT NOT NULL,
+  display_name  TEXT NOT NULL,
+  is_default    INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+  is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  UNIQUE (org_id, code)
+);
+
+CREATE INDEX idx_platform_locales_org ON platform_locales(org_id);
+CREATE UNIQUE INDEX idx_platform_locales_one_default_per_org
+  ON platform_locales(org_id) WHERE is_default = 1;
+
+INSERT INTO platform_locales (id, org_id, code, display_name, is_default, is_active)
+VALUES
+  (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+   'org-default', 'pl', 'Polski', 1, 1),
+  (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+   'org-default', 'en', 'English', 0, 1);
+"#;
+
+// v41 — `role_catalog`: globalny, administrowalny katalog rol funkcjonalnych
+// w organizacji. Rola opisuje *funkcje* osoby (np. handlowiec, PM techniczny,
+// architekt) niezaleznie od stanowiska w drzewie organizacyjnym. Stanowiska
+// i tabele typu `responsible_persons` w CRM bedaca referencja do wpisu z tego
+// katalogu.
+//
+// `name_translations` i `description_translations` trzymane jako JSON
+// (`{"pl":"...","en":"..."}`) — SQLite nie ma JSONB, walidujemy `json_valid`,
+// pelna walidacja kompletnosci kluczy wzgledem `platform_locales` zyje w
+// `services/role_catalog/repo.rs`. Seed zapewnia komplet pl + en dla wszystkich
+// 14 rol z dokumentu `00-platform-roles-catalog.md`.
+//
+// `default_visibility_scope` dziedziczy sie do reguly P2 (permissions) jako
+// startowa propozycja — admin moze zmienic w UI bez modyfikacji katalogu.
+// `is_manager` jest uzywane przez O1 do layoutu drzewa stanowisk; nie wplywa
+// bezposrednio na uprawnienia (te zyja w P2 jako reguly `flag:is_manager`).
+const ROLE_CATALOG_SCHEMA: &str = r#"
+CREATE TABLE role_catalog (
+  id                          TEXT PRIMARY KEY,
+  org_id                      TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+  slug                        TEXT NOT NULL CHECK (slug GLOB '[a-z][a-z0-9_]*' AND length(slug) <= 50),
+  kind                        TEXT NOT NULL CHECK (kind IN ('sales','technical','management','external','other')),
+  name_translations           TEXT NOT NULL DEFAULT '{}',
+  description_translations    TEXT NOT NULL DEFAULT '{}',
+  icon                        TEXT,
+  color_hint                  TEXT,
+  is_manager                  INTEGER NOT NULL DEFAULT 0 CHECK (is_manager IN (0,1)),
+  default_visibility_scope    TEXT NOT NULL DEFAULT 'assigned'
+    CHECK (default_visibility_scope IN ('assigned','own','section','department','all')),
+  is_active                   INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+  created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  updated_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  created_by                  TEXT,
+  UNIQUE (org_id, slug),
+  CHECK (json_valid(name_translations)),
+  CHECK (json_valid(description_translations))
+);
+
+CREATE INDEX idx_role_catalog_org_active ON role_catalog(org_id, is_active);
+CREATE INDEX idx_role_catalog_org_kind   ON role_catalog(org_id, kind);
+
+CREATE TRIGGER role_catalog_updated_at
+AFTER UPDATE ON role_catalog
+FOR EACH ROW
+BEGIN
+  UPDATE role_catalog SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = NEW.id;
+END;
+
+INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description_translations, icon, is_manager, default_visibility_scope) VALUES
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','handlowiec_l1','sales',
+ json_object('pl','Handlowiec L1','en','Sales Rep L1'),
+ json_object('pl','Junior — podstawowa rola sprzedazowa, prowadzi wlasne dealy','en','Junior — entry-level sales role, owns their own deals'),
+ 'i-briefcase', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','handlowiec_l2','sales',
+ json_object('pl','Handlowiec L2','en','Sales Rep L2'),
+ json_object('pl','Mid — samodzielnie prowadzi dealy oraz wspiera juniorow','en','Mid-level — runs deals independently and supports juniors'),
+ 'i-briefcase', 0, 'own'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','sales_lead','sales',
+ json_object('pl','Lider sprzedazy','en','Sales Lead'),
+ json_object('pl','Kierownik sekcji sprzedazowej, prowadzi zespol handlowcow','en','Manages a sales section and a team of sales reps'),
+ 'i-users', 1, 'section'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','pm_technical','technical',
+ json_object('pl','PM techniczny','en','Technical PM'),
+ json_object('pl','Project Manager po stronie technicznej dealu/projektu','en','Project Manager on the technical side of a deal or project'),
+ 'i-clipboard', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','architect_senior','technical',
+ json_object('pl','Architekt senior','en','Senior Architect'),
+ json_object('pl','Architekt rozwiazan, odpowiada za design techniczny','en','Solutions architect responsible for technical design'),
+ 'i-cube', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','consultant_technical','technical',
+ json_object('pl','Konsultant techniczny','en','Technical Consultant'),
+ json_object('pl','Konsultant doradzajacy klientowi w obszarze technicznym','en','Consultant advising the client on technical matters'),
+ 'i-headset', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','developer','technical',
+ json_object('pl','Programista','en','Developer'),
+ json_object('pl','Programista realizujacy implementacje na projekcie','en','Developer implementing project work'),
+ 'i-code', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','qa','technical',
+ json_object('pl','Tester QA','en','QA Engineer'),
+ json_object('pl','Odpowiada za testy i jakosc dostarczanych rozwiazan','en','Responsible for testing and quality of delivered solutions'),
+ 'i-bug', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','section_director','management',
+ json_object('pl','Dyrektor sekcji','en','Section Director'),
+ json_object('pl','Dyrektor odpowiedzialny za sekcje organizacyjna','en','Director responsible for an organizational section'),
+ 'i-building', 1, 'section'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','sales_director','management',
+ json_object('pl','Dyrektor sprzedazy','en','Sales Director'),
+ json_object('pl','Dyrektor pionu sprzedazy, nadzoruje wiele sekcji','en','Sales department director, oversees multiple sections'),
+ 'i-chart', 1, 'department'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','ceo','management',
+ json_object('pl','Prezes','en','CEO'),
+ json_object('pl','Prezes zarzadu, najwyzszy poziom decyzyjny','en','Chief Executive Officer, top decision-making level'),
+ 'i-crown', 1, 'all'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','decision_maker','external',
+ json_object('pl','Decydent klienta','en','Client Decision Maker'),
+ json_object('pl','Osoba po stronie klienta podejmujaca decyzje zakupowe','en','Person on the client side making purchasing decisions'),
+ 'i-user-check', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','influencer','external',
+ json_object('pl','Influencer po stronie klienta','en','Client Influencer'),
+ json_object('pl','Osoba wplywajaca na decyzje klienta, bez bezposredniej decyzyjnosci','en','Person influencing client decisions without direct authority'),
+ 'i-user', 0, 'assigned'),
+(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6))),
+ 'org-default','power_user_sponsor','external',
+ json_object('pl','Sponsor wewnetrzny u klienta','en','Internal Sponsor at Client'),
+ json_object('pl','Kluczowy uzytkownik i sponsor wdrozenia po stronie klienta','en','Key user and rollout sponsor on the client side'),
+ 'i-user-cog', 0, 'assigned');
 "#;

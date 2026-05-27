@@ -144,7 +144,6 @@ pub enum CancellationStatus {
     AlreadyCompleted,
 }
 
-
 // ============================================================================
 // UNIFIED MODEL PROTOCOL - Universal Format dla wszystkich modeli
 // ============================================================================
@@ -3076,6 +3075,145 @@ pub struct RegistryAuth {
 
 // ingest_tests usuniete razem z RAG/Ingest path (RAG total eradication).
 // Nowa implementacja RAG bedzie miala wlasne testy serializacji.
+
+// ============================================================================
+// Role catalog DTO — backed by services::role_catalog (migracje v40+v41).
+// Translacje sa transportowane jako Vec<(String, String)> bo rkyv 0.8 nie
+// posiada natywnego wsparcia dla BTreeMap; dispatcher API zamienia je na
+// BTreeMap<String, String> przy wejsciu do warstwy repo.
+// ============================================================================
+
+/// Wpis katalogu rol — wariant skrocony uzywany w listach.
+/// `kind` przyjmuje wartosci: `sales`, `technical`, `management`, `external`, `other`.
+/// `default_visibility_scope` przyjmuje wartosci: `assigned`, `own`, `section`,
+/// `department`, `all`. Walidacja po stronie repo (`services/role_catalog`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RoleCatalogSummary {
+    pub id: String,
+    pub slug: String,
+    pub kind: String,
+    /// Pary `(kod_locale, tlumaczenie)`. Kolejnosc jest zachowywana przez rkyv.
+    pub name_translations: Vec<(String, String)>,
+    pub icon: Option<String>,
+    pub color_hint: Option<String>,
+    pub is_manager: bool,
+    pub default_visibility_scope: String,
+    pub is_active: bool,
+}
+
+/// Pelen wpis katalogu rol — widok szczegolowy i edytor.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RoleCatalogDetail {
+    pub id: String,
+    pub org_id: String,
+    pub slug: String,
+    pub kind: String,
+    pub name_translations: Vec<(String, String)>,
+    pub description_translations: Vec<(String, String)>,
+    pub icon: Option<String>,
+    pub color_hint: Option<String>,
+    pub is_manager: bool,
+    pub default_visibility_scope: String,
+    pub is_active: bool,
+    /// RFC3339 timestamp utworzenia rzedu w SQLite.
+    pub created_at: String,
+    /// RFC3339 timestamp ostatniej modyfikacji.
+    pub updated_at: String,
+    pub created_by: Option<String>,
+}
+
+/// Wpis tabeli `platform_locales` — dla UI editor'a, zeby wiedzial jakie
+/// jezyki sa aktywne (kazda rola musi miec tlumaczenie dla kazdego aktywnego
+/// locale, walidacja po stronie repo).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PlatformLocaleSummary {
+    pub code: String,
+    pub display_name: String,
+    pub is_default: bool,
+}
+
+/// Filtry listy rol katalogu. `None` w polu = brak filtra dla tego pola.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoleCatalogListFilter {
+    /// Filtr po `kind` (np. tylko `sales`). `None` = wszystkie kindy.
+    pub kind: Option<String>,
+    /// Filtr aktywnosci. `None` = wszystkie (admin moze chciec zarchiwizowane).
+    pub is_active: Option<bool>,
+    /// Wyszukiwanie podstawowe po slug/translation (LIKE w repo).
+    pub search: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// Request stworzenia roli w katalogu.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RoleCatalogCreateRequest {
+    pub slug: String,
+    pub kind: String,
+    pub name_translations: Vec<(String, String)>,
+    pub description_translations: Vec<(String, String)>,
+    pub icon: Option<String>,
+    pub color_hint: Option<String>,
+    pub is_manager: bool,
+    pub default_visibility_scope: String,
+}
+
+/// Patch update'u roli. Semantyka pol Option:
+/// * `None` na poziomie patcha = nie ruszaj tego pola.
+/// * `Some(value)` dla pol skalarnych = ustaw nowa wartosc.
+/// * Dla `icon` / `color_hint` (`Option<Option<String>>`):
+///   - `None` = nie ruszaj,
+///   - `Some(None)` = wyzeruj (SET NULL),
+///   - `Some(Some(v))` = ustaw konkretna wartosc.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoleCatalogUpdateRequest {
+    pub id: String,
+    pub kind: Option<String>,
+    pub name_translations: Option<Vec<(String, String)>>,
+    pub description_translations: Option<Vec<(String, String)>>,
+    pub icon: Option<Option<String>>,
+    pub color_hint: Option<Option<String>>,
+    pub is_manager: Option<bool>,
+    pub default_visibility_scope: Option<String>,
+}
+
+/// Wszystkie RPC katalogu rol biznesowych w jednym slocie `MessageBody`.
+/// Wzorzec „1 slot per feature" — req/res sparowane wewnatrz inner enum,
+/// zeby trzymac globalny limit 256 wariantow rkyv 0.8 pod kontrola.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum RoleCatalogPayload {
+    /// Klient -> serwer: lista rol z filtrami (R-LIST).
+    ListRequest(RoleCatalogListFilter),
+    /// Serwer -> klient: odpowiedz z lista skroconych wpisow.
+    ListResponse { roles: Vec<RoleCatalogSummary> },
+
+    /// Klient -> serwer: pobranie pojedynczej roli po identyfikatorze (R-ONE).
+    GetRequest { id: String },
+    /// Klient -> serwer: pobranie pojedynczej roli po slugu (R-ONE alt).
+    GetBySlugRequest { slug: String },
+    /// Serwer -> klient: szczegoly roli (`None` gdy nie znaleziono).
+    GetResponse { role: Option<RoleCatalogDetail> },
+
+    /// Klient -> serwer: pobranie aktywnych locale platformy dla edytora UI.
+    ListLocalesRequest,
+    /// Serwer -> klient: lista locale (kod + display + flaga default).
+    ListLocalesResponse { locales: Vec<PlatformLocaleSummary> },
+
+    /// Klient -> serwer: utworzenie nowej roli (W-CREATE, admin only).
+    CreateRequest(RoleCatalogCreateRequest),
+    /// Serwer -> klient: utworzony wpis (pelne szczegoly z id/created_at).
+    CreateResponse(RoleCatalogDetail),
+
+    /// Klient -> serwer: patch update istniejacej roli (W-UPDATE, admin only).
+    UpdateRequest(RoleCatalogUpdateRequest),
+    /// Serwer -> klient: zaktualizowany wpis po zapisie.
+    UpdateResponse(RoleCatalogDetail),
+
+    /// Klient -> serwer: dezaktywacja roli (soft-delete, admin only).
+    DeactivateRequest { id: String },
+    /// Serwer -> klient: ack dezaktywacji.
+    DeactivateResponse { deactivated: bool },
+}
 
 #[cfg(test)]
 mod meeting_event_tests {

@@ -21,7 +21,7 @@ pub use relay::{load_relay_url, RELAY_URL_SETTING_KEY};
 pub use relay_server::{spawn_relay_server, RelayServerConfig};
 
 /// ALPN dla komunikacji mesh node-to-node. Rkyv `MessageBody` z kind discrim
-/// 0x10-0x18 (heartbeat, CRDT, gossip, forwarding).
+/// 0x10-0x18 (heartbeat, gossip, forwarding).
 pub const ALPN_MESH: &[u8] = b"tentaflow-mesh/v1";
 
 /// ALPN dla pairing handshake (PIN + Ed25519 proof). Rkyv discrim 0x20-0x22.

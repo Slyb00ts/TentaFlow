@@ -16,14 +16,14 @@ use rusqlite::Transaction;
 #[cfg(feature = "docker")]
 use std::path::PathBuf;
 
-use super::{
-    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy, LogSink,
-    PreparedDeploy,
-};
 #[cfg(feature = "docker")]
 use super::{
     build_endpoint_url, category_tag, models_from_manifest, resolve_display_name,
     smart_health_probe, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+};
+use super::{
+    build_new_service, transport_hint, DeployError, DeployResult, DeployStrategy, LogSink,
+    PreparedDeploy,
 };
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -40,6 +40,8 @@ pub struct DockerDeploy {
     log_sink: Option<LogSink>,
     #[cfg_attr(not(feature = "docker"), allow(dead_code))]
     container_id: std::sync::Mutex<Option<String>>,
+    /// Port z DB przy respawn — patrz `PythonBundleDeploy::preserved_port`.
+    preserved_port: Option<u16>,
 }
 
 impl DockerDeploy {
@@ -49,12 +51,23 @@ impl DockerDeploy {
         ports: Arc<PortAllocator>,
         log_sink: Option<LogSink>,
     ) -> Self {
+        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+    }
+
+    pub fn new_with_port(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
+        preserved_port: Option<u16>,
+    ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
             log_sink,
             container_id: std::sync::Mutex::new(None),
+            preserved_port,
         }
     }
 
@@ -352,18 +365,26 @@ impl DeployStrategy for DockerDeploy {
         let internal_port = self.manifest.engine.default_port;
         let mut allocated = Vec::new();
 
-        // Allocate ports.
+        // Allocate ports. Respawn istniejacego serwisu zachowuje port z DB
+        // (preserved_port). Dla SidecarQuic preserved_port to host_http;
+        // sidecar_quic_port jest zawsze swiezy bo nie trzymamy go w DB
+        // jako stable identifier (rzadko exposed do klientow).
         let (host_http, sidecar_quic) = if transport == Transport::SidecarQuic {
-            let pair = self
+            let http = self
                 .ports
-                .acquire_many(2)
+                .acquire_or_specific(self.preserved_port)
                 .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
-            allocated.extend_from_slice(&pair);
-            (pair[0], Some(pair[1]))
+            let quic = self
+                .ports
+                .acquire()
+                .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
+            allocated.push(http);
+            allocated.push(quic);
+            (http, Some(quic))
         } else {
             let p = self
                 .ports
-                .acquire()
+                .acquire_or_specific(self.preserved_port)
                 .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
             allocated.push(p);
             (p, None)
@@ -478,6 +499,11 @@ impl DeployStrategy for DockerDeploy {
             ],
             status_report_interval: std::time::Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
+            // Brak hard timeoutu — docker container exit (CUDA OOM,
+            // OOMKilled przez kernel cgroups itp.) flag'uje jako
+            // Failed natychmiast. Bez timeoutu zeby duze modele
+            // (70B+, multi-GB HF download) mogly sie ladowac dluzej.
+            max_wait: None,
         };
         let docker_for_probe = docker.clone();
         let name_for_probe = container_name.clone();
@@ -637,6 +663,7 @@ mod tests {
                 requires_model: None,
                 gpu_supported: None,
                 default_port: 8000,
+                dgx_spark: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
                 service_surfaces: None,

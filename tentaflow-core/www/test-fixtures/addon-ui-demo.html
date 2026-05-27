@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<!--
+  File: test-fixtures/addon-ui-demo.html
+  Description: Standalone demo page for the F1c-P1 iframe harness. Loads the
+               mock addon bundle into a tf-addon-ui-frame and exposes a small
+               control row to flip permission grants on the fly so the EPERM
+               path can be exercised without rebuilding the binary.
+-->
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <title>Addon UI host — demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0c0f15; color: #e6e8ec; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    label { font-size: 12px; color: #b6bcc7; }
+    select, button { background: #1c2030; color: #e6e8ec; border: 1px solid #2a2f3a; padding: 6px 10px; border-radius: 6px; }
+    button { cursor: pointer; }
+    #mount { width: 100%; max-width: 720px; height: 420px; }
+    #log { margin-top: 12px; font-size: 11px; color: #8b93a3; max-height: 200px; overflow: auto; }
+    #log div { padding: 2px 0; border-bottom: 1px dashed #2a2f3a; }
+  </style>
+</head>
+<body>
+  <h1>F1c-P1 — Addon UI iframe harness demo</h1>
+  <div class="controls">
+    <label>Permissions:
+      <select id="perm-preset">
+        <option value="alias.read,camera.read,vector.read">all</option>
+        <option value="alias.read">alias.read only</option>
+        <option value="">(none — every action → EPERM)</option>
+      </select>
+    </label>
+    <button id="btn-remount">Mount / remount</button>
+    <button id="btn-unmount">Unmount</button>
+  </div>
+  <div id="mount"></div>
+  <div id="log"></div>
+
+  <script type="module">
+    import '/js/components/tf-addon-ui-frame/tf-addon-ui-frame.js';
+    import { addonUiHost } from '/js/addon-ui-host.js';
+
+    const mount = document.getElementById('mount');
+    const log = document.getElementById('log');
+    let handle = null;
+
+    function logLine(text) {
+      const row = document.createElement('div');
+      row.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+      log.prepend(row);
+    }
+
+    window.addEventListener('tf-addon-toast', (e) => {
+      logLine(`toast [${e.detail.level}] ${e.detail.message}`);
+    });
+
+    async function remount() {
+      if (handle) handle.unmount();
+      const perms = document.getElementById('perm-preset').value
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      const bundleHtml = await fetch('/test-fixtures/addon-ui-mock/dashboard.html').then((r) => r.text());
+      handle = addonUiHost.mount({
+        addonId: 'tentavision',
+        componentId: 'dashboard',
+        permissions: perms,
+        containerEl: mount,
+        bundleHtml,
+      });
+      logLine(`mounted with perms=[${perms.join(', ')}]`);
+    }
+
+    document.getElementById('btn-remount').addEventListener('click', remount);
+    document.getElementById('btn-unmount').addEventListener('click', () => {
+      if (handle) { handle.unmount(); handle = null; logLine('unmounted'); }
+    });
+
+    remount();
+  </script>
+</body>
+</html>

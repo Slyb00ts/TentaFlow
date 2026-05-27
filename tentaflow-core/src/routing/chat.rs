@@ -5,17 +5,13 @@
 //       QUIC LLM routing, protocol-native completion.
 // =============================================================================
 
-use crate::api::openai::types::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent, Usage,
-};
+use crate::api::openai::types::{ChatCompletionRequest, ChatCompletionResponse};
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
-use crate::flow_engine::types::FlowExecutionResult;
-use crate::routing::router::{
-    RequestMetrics, Router, VoiceInfo,
-};
+use crate::flow_engine::envelope::FlowExecutionOutcome;
+use crate::routing::router::Router;
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 impl Router {
     /// Single entry point for non-streaming chat completion.
@@ -25,17 +21,18 @@ impl Router {
     /// for internal callers (addons, reverse mesh, translate) that bypass
     /// ACL by design.
     ///
-    /// Dispatch order:
+    /// Dispatch (stage 3d Universal Flow Gateway):
     /// 1. Model-level ACL when a user is attached.
-    /// 2. Flow engine with user-aware context — return on match.
-    /// 3. Audio bootstrap (legacy STT injection) and direct backend dispatch.
+    /// 2. FlowDispatcher::try_dispatch — user-defined flow (gdy admin
+    ///    skonfigurował) albo synthetic ad-hoc flow `trigger → llm(model)
+    ///    → output` (auto-fallback). Każdy chat request przechodzi przez
+    ///    flow_engine; backend dispatch idzie przez LlmDispatcherImpl →
+    ///    executor.execute_chat.
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
-        let mut metrics = RequestMetrics::new();
-
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
                 if !crate::auth::acl::check_access_safe(
@@ -48,9 +45,9 @@ impl Router {
                     tracing::warn!(
                         user_id = u.user_id,
                         model = %request.model,
-                        "ACL denied model access"
+                        "ACL denied chat model"
                     );
-                    return Err(crate::error::CoreError::AllBackendsUnavailable {
+                    return Err(crate::error::CoreError::ModelNotFound {
                         model_name: request.model.clone(),
                     }
                     .into());
@@ -86,7 +83,7 @@ impl Router {
                 .into());
             }
         }
-        let target_accepts_audio = if request.audio_input.is_some() {
+        let _target_accepts_audio = if request.audio_input.is_some() {
             let snap = self.catalog_snapshot();
             if !catalog_target_accepts_audio(&snap, &request.model) {
                 tracing::warn!(
@@ -112,15 +109,24 @@ impl Router {
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let ctx = crate::routing::build_flow_context_for_user(&request, false, user.clone());
+            let blobs = dispatcher.blobs();
+            let (initial, meta) =
+                crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
+                    .await?;
 
-            match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
-                Ok(Some(result)) => {
-                    let mut response = flow_result_to_chat_response(result, &request.model);
-                    // Codex H1 round 2: flow path tez musi przejsc przez
-                    // response_middleware — wczesniej tylko direct executor
-                    // sciezka aplikowala clean_text, flow zwracal bezposrednio.
-                    self.apply_response_middleware(&mut response)?;
+            match dispatcher
+                .try_dispatch(&request.model, "chat", initial, meta)
+                .await
+            {
+                Ok(outcome) => {
+                    let usage = crate::routing::middleware::TokenUsageMetadata {
+                        prompt_tokens: outcome.usage.prompt_tokens,
+                        completion_tokens: outcome.usage.completion_tokens,
+                        total_tokens: outcome.usage.total_tokens,
+                    };
+                    let finish_reason =
+                        outcome.finish_reason.as_openai_str().map(|s| s.to_string());
+                    let response = flow_outcome_to_chat_response(outcome, &request.model);
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
                             .map(|h| h.to_string_lossy().to_string())
@@ -130,126 +136,31 @@ impl Router {
                         fallbacks_tried: 0,
                         hop_count: 0,
                         latency_ms: None,
+                        usage: Some(usage),
+                        finish_reason,
                     };
                     return Ok(crate::routing::RouteResult { response, metadata });
                 }
-                Ok(None) => {}
                 Err(e) => {
-                    warn!("Flow Engine error, fallback na direct dispatch: {}", e);
+                    // Stage 3d-0b-final: typed DispatchError → CoreError.
+                    // Denied → 404, pozostałe → 500.
+                    return Err(crate::routing::dispatch_error_to_core(e, &request.model).into());
                 }
             }
         }
 
-        // R2d (D.7): chat NIE robi ukrytego STT. Po `target_accepts_audio`
-        // guard wyzej, audio_input dociera albo do audio-capable backendu w
-        // surowej formie albo request zostaje odrzucony (`audio_input_unsupported`).
-        // VoiceInfo stays None — explicit STT lezy pod /v1/audio/transcriptions
-        // albo flow z dedykowanym STT node.
-        let voice_info: Option<VoiceInfo> = None;
-
-        // Single dispatch path — `ModelRuntimeExecutor.execute_chat`.
-        // Resolver + strategy + per-instance modality filter handle
-        // Embedded / HTTP / QUIC / Mesh / Flow targets. Legacy
-        // `BackendHandle` dispatch is gone after R3b.8.
-        let _ = target_accepts_audio;
-        let t2 = std::time::Instant::now();
-        let executor_snapshot = self.executor.read().clone();
-        let route_result = match executor_snapshot {
-            Some(executor) => {
-                use crate::services::runtime::context::ExecutionContext;
-                let mut exec_ctx = ExecutionContext {
-                    user: user.clone(),
-                    ..ExecutionContext::default()
-                };
-                match executor.execute_chat(request.clone(), &mut exec_ctx).await {
-                    Ok(mut response) => {
-                        // Apply PII filter on content/reasoning — the executor
-                        // is middleware-agnostic in MVP, so the caller
-                        // gates here.
-                        self.apply_response_middleware(&mut response)?;
-                        let route_metadata = crate::routing::RouteMetadata {
-                            served_by_node: exec_ctx
-                                .route_metadata
-                                .served_by_node
-                                .unwrap_or_else(|| {
-                                    hostname::get()
-                                        .map(|h| h.to_string_lossy().to_string())
-                                        .unwrap_or_else(|_| "unknown".to_string())
-                                }),
-                            backend_type: exec_ctx
-                                .route_metadata
-                                .backend_type
-                                .unwrap_or_else(|| "executor".to_string()),
-                            strategy_used: "executor".to_string(),
-                            fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
-                            hop_count: 0,
-                            latency_ms: Some(t2.elapsed().as_secs_f64() * 1000.0),
-                        };
-                        crate::routing::RouteResult {
-                            response,
-                            metadata: route_metadata,
-                        }
-                    }
-                    Err(e) => return Err(executor_err_to_core(e, &request.model).into()),
-                }
-            }
-            None => {
-                return Err(crate::error::CoreError::InternalError {
-                    message: "router executor not wired (Router::new precondition)".to_string(),
-                    source: None,
-                }
-                .into());
-            }
-        };
-        let mut response = route_result.response;
-        let route_metadata = route_result.metadata;
-        metrics.model_name = Some(route_metadata.backend_type.clone());
-        metrics.llm_inference_ms = Some(t2.elapsed().as_millis() as u64);
-
-        if let Some(info) = voice_info {
-            response.transcribed_text = Some(info.transcribed_text);
-            response.speaker_id = info.speaker_id;
-            response.speaker_name = info.speaker_name;
-            response.speaker_confidence = info.speaker_confidence;
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Plan v1.5 wymaga że KAŻDY chat request przechodzi przez flow_engine
+        // (synthetic albo user-defined). Direct executor.execute_chat fallback
+        // wycięty.
+        Err(crate::error::CoreError::InternalError {
+            message: "flow_dispatcher not wired (DB-less router) — chat path \
+                      requires Universal Flow Gateway"
+                .to_string(),
+            source: None,
         }
-
-        info!("\n{}", metrics.format_table());
-
-        Ok(crate::routing::RouteResult {
-            response,
-            metadata: route_metadata,
-        })
+        .into())
     }
-
-    /// Codex H1 + H3 round 2: jedyny single point gdzie aplikujemy
-    /// `response_middleware.clean_text` na response. Kazda sciezka chat
-    /// (executor success, flow_engine try_dispatch result, legacy
-    /// dispatch_with_fallback) MUSI wolac to przed return zeby PII filter
-    /// nie zostal bypassowany. Lustro per-token logiki w streaming.rs
-    /// (StreamingProcessor scan + EOF flush).
-    fn apply_response_middleware(
-        &self,
-        response: &mut ChatCompletionResponse,
-    ) -> Result<()> {
-        for choice in &mut response.choices {
-            if let Some(MessageContent::Text(text)) = choice.message.content.as_mut() {
-                let cleaned = self
-                    .response_middleware
-                    .clean_text(text)
-                    .map_err(|e| anyhow::anyhow!("response_middleware.clean_text: {}", e))?;
-                *text = cleaned;
-            }
-            if let Some(reasoning) = choice.message.reasoning_content.as_mut() {
-                let cleaned = self
-                    .response_middleware
-                    .clean_text(reasoning)
-                    .map_err(|e| anyhow::anyhow!("response_middleware.clean_text: {}", e))?;
-                *reasoning = cleaned;
-            }
-        }
-        Ok(())
-    }
-
 
     pub async fn route_memory_via_quic(
         &self,
@@ -346,6 +257,7 @@ impl Router {
             top_p: None,
             n: None,
             stream: false,
+            stream_options: None,
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
@@ -361,8 +273,11 @@ impl Router {
             Ok(route_result) => {
                 let response = route_result.response;
                 let content = crate::routing::extract_response_text(&response);
-
-                let cleaned_content = self.response_middleware.clean_text(&content)?;
+                // Vision passes przez `route_chat_completion` → flow_engine,
+                // gdzie pii_filter już sprzątnął tekst. Nie filtrujemy
+                // dwa razy — w przeciwnym razie tracilibyśmy intencje
+                // syntetycznego/usera flow który wyłączył filter celowo.
+                let cleaned_content = content;
 
                 let finish_reason = response
                     .choices
@@ -486,54 +401,11 @@ pub(crate) fn catalog_target_accepts_audio(
 }
 
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
-pub(crate) fn flow_result_to_chat_response(
-    result: FlowExecutionResult,
+pub(crate) fn flow_outcome_to_chat_response(
+    outcome: FlowExecutionOutcome,
     model: &str,
 ) -> ChatCompletionResponse {
-    let json_value = converter::flow_result_to_chat_response(&result, model);
-    serde_json::from_value(json_value).unwrap_or_else(|_| {
-        let text = result
-            .output
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| result.output.to_string());
-
-        ChatCompletionResponse {
-            id: format!("flow-{}", uuid::Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model: model.to_string(),
-            choices: vec![Choice {
-                index: 0,
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: Some(MessageContent::Text(text)),
-                    reasoning_content: None,
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                finish_reason: Some("stop".to_string()),
-                logprobs: None,
-            }],
-            usage: Some(Usage {
-                prompt_tokens: result.prompt_tokens as u32,
-                completion_tokens: result.completion_tokens as u32,
-                total_tokens: result.total_tokens as u32,
-            }),
-            system_fingerprint: Some("flow-engine".to_string()),
-            transcribed_text: None,
-            speaker_id: None,
-            speaker_name: None,
-            speaker_confidence: None,
-            detected_intent: None,
-            detected_tools: None,
-        }
-    })
+    converter::flow_outcome_to_chat_response(&outcome, model)
 }
 
 #[cfg(test)]
@@ -575,14 +447,13 @@ mod audio_policy_tests {
         assert!(catalog_target_accepts_audio(&snap, "qwen-omni"));
     }
 
-    /// Text-only target rejects audio. This is the legacy bypass
-    /// the guard exists to plug — pre-fix the chat path silently
-    /// transcribed and forwarded text, dropping speaker and timing
-    /// metadata along the way.
+    /// Text-only target rejects audio. Guard egzekwuje że chat path
+    /// nie próbuje silently transkrybować audio_input dla modeli bez
+    /// audio_input capability — request musi albo iść do audio-capable
+    /// modelu, albo eksplicitnie do `/v1/audio/transcriptions`.
     #[test]
     fn text_only_target_rejects_audio() {
-        let snap =
-            snapshot_with(vec![chat_entry("bielik-11b", vec![InputModality::Text])]);
+        let snap = snapshot_with(vec![chat_entry("bielik-11b", vec![InputModality::Text])]);
         assert!(!catalog_target_accepts_audio(&snap, "bielik-11b"));
     }
 
@@ -629,10 +500,7 @@ mod audio_policy_tests {
     fn alias_audio_falls_through_to_audio_capable_fallback() {
         use crate::services::catalog::Strategy;
         let primary = chat_entry("text-llm", vec![InputModality::Text]);
-        let fallback = chat_entry(
-            "omni-llm",
-            vec![InputModality::Text, InputModality::Audio],
-        );
+        let fallback = chat_entry("omni-llm", vec![InputModality::Text, InputModality::Audio]);
         let alias = CatalogEntry {
             id: "smart-chat".into(),
             kind: CatalogEntryKind::Alias {
@@ -673,50 +541,5 @@ mod audio_policy_tests {
         };
         let snap = snapshot_with(vec![primary, fallback, alias]);
         assert!(!catalog_target_accepts_audio(&snap, "txt-only"));
-    }
-}
-
-/// Map executor errors onto typed `CoreError` variants so the OpenAI
-/// HTTP layer can serve a precise status code (404 / 400 / 503) instead
-/// of a catch-all 500. Codex R3b.8: chat/stream had been flattening
-/// every executor error to `InternalError`; mirror of `embeddings.rs`
-/// + `tts.rs` mappers so all four surfaces map errors consistently.
-pub(crate) fn executor_err_to_core(
-    err: crate::services::runtime::executor::ExecutorError,
-    model: &str,
-) -> crate::error::CoreError {
-    use crate::services::runtime::executor::ExecutorError;
-    use crate::services::runtime::resolver::ResolveError;
-    match err {
-        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
-            crate::error::CoreError::ModelNotFound { model_name: m }
-        }
-        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
-            crate::error::CoreError::InvalidRequest {
-                message: format!(
-                    "model '{}' has no candidate matching requested capabilities",
-                    requested
-                ),
-                details: None,
-            }
-        }
-        ExecutorError::Resolve(other) => crate::error::CoreError::InternalError {
-            message: format!("alias resolution: {}", other),
-            source: None,
-        },
-        ExecutorError::AllCandidatesFailed { .. }
-        | ExecutorError::TransportPendingCutover(_) => {
-            crate::error::CoreError::AllBackendsUnavailable {
-                model_name: model.to_string(),
-            }
-        }
-        ExecutorError::FlowDispatcherUnavailable
-        | ExecutorError::FlowEmptyResult { .. }
-        | ExecutorError::Internal(_)
-        | ExecutorError::SttRuntimeUnavailable
-        | ExecutorError::SttBackend(_) => crate::error::CoreError::InternalError {
-            message: format!("executor: {}", err),
-            source: None,
-        },
     }
 }

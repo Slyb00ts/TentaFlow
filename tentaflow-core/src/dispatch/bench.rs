@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::{dispatch, find, handler_count, HandlerContext};
+    use super::super::{HandlerContext, dispatch, find, handler_count};
     use std::time::Instant;
     use tentaflow_protocol::{MessageBody, SessionAuth};
 
@@ -42,8 +42,10 @@ mod tests {
                 role: None,
             },
             correlation_id: 1,
+            connection_id: 0,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            org_context: None,
         };
 
         let variants = [

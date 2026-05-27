@@ -5,7 +5,7 @@ edition = "2021"
 description = "TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobile"
 
 [features]
-default = ["inference-whisper"]
+default = ["inference-whisper", "camera"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # whisper-rs i llama-cpp-2 obie linkuja wlasna kopie ggml. Duplicate symbols
@@ -34,6 +34,11 @@ inference-mlx-kokoro = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
 rdma-probe = []
+# Camera ingest (M1.W6) — GStreamer 1.x based pipeline for RTSP/file/V4L2/MIPI
+# inputs. Optional because GStreamer pulls a large dynamic-library surface
+# (gst-plugins-base, -good, -bad). Default builds stay slim; enable
+# `--features camera` for Router/Desktop where camera ingest is needed.
+camera = ["dep:gstreamer", "dep:gstreamer-app"]
 # Jedna flaga GPU per backend — wlacza akceleracje dla LLM (llama.cpp) i STT
 # (whisper). Duplicate ggml_* symbols rozwiazane przez
 # `-Wl,--allow-multiple-definition` w `.cargo/config.toml`.
@@ -49,10 +54,26 @@ gpu-vulkan = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/vulkan", "
 # instalator setup.ps1 -Vulkan to obsluguje).
 gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/vulkan"]
 gpu-metal = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/metal", "whisper-rs/metal"]
+# Embedded vector storage (F1c P3). Opt-in because usearch ships a C++ core
+# (cxx) — cross-compile to ios/android requires extra toolchain wiring that
+# we have not validated yet. Server bin enables this explicitly; mobile and
+# desktop crates stay slim until the C++ toolchain is in place.
+vector = ["dep:usearch"]
 
 [dependencies]
 # Protocol (zawsze)
 tentaflow-protocol = { path = "../tentaflow-protocol" }
+
+# UFP/2 protocol primitives (Faza 6 Krok 4c — replacing rkyv mesh + frontend
+# wire formats with the unified CBOR envelope). Currently consumed by the
+# mesh::ufp2 submodule for heartbeat (4c2.1); further migrations land in
+# subsequent chunks.
+tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
+
+# Direct CBOR codec for the mesh::ufp2 wire bytes (encode/decode of
+# Envelope between iroh streams and sdk-spec types).
+minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
+
 
 # Proc-macro #[handler] + #[policy] + #[observed]
 tentaflow-macros = { path = "../tentaflow-macros" }
@@ -65,6 +86,7 @@ tokio = { version = "1.52.2", features = ["full"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
 async-stream = "0.3.6"
+bytes = "1.11"
 
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
@@ -76,6 +98,7 @@ rustls = { version = "0.23.40", features = ["ring"] }
 tokio-rustls = "0.26.4"
 rustls-pemfile = "2.1.3"
 tokio-util = "0.7.18"
+pin-project-lite = "0.2"
 
 # HTTP
 reqwest = { version = "0.13.3", features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
@@ -88,13 +111,21 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "1.1.2+spec-1.1.0"
 rkyv = { version = "0.8.16", features = ["unaligned"] }
+ciborium = "0.2"
 
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+fjall = "3.1.4"
+# Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
+# zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
+# konfigurowane w addon/storage_sql.rs.
+r2d2 = "0.8"
+r2d2_sqlite = "0.34.0"
 
 # Crypto
 argon2 = "0.5.3"
 sha2 = "0.10.9"
+sha1 = "0.10.6"
 hmac = "0.12.1"
 aes-gcm = "0.10.3"
 hkdf = "0.12.4"
@@ -129,15 +160,24 @@ flate2 = "1.1.9"
 tar = "0.4.45"
 tempfile = "3.27.0"
 
+# Vector storage (F1c P3 — embedded HNSW + mmap)
+# Cross-compile uwaga: usearch ma C++ core (cxx). Buduje sie na desktop
+# (linux/macos/windows) bez problemu — wymaga toolchainu cc/c++. Mobile
+# (ios/android) potrzebuje weryfikacji w F1c P3.1 (opcjonalnie fallback
+# `hnsw_rs` pure-Rust). Domyslne features wystarcza (HNSW + save/load).
+usearch = { version = "2.25", optional = true }
+
 # Synchronizacja
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
+lru = "0.12"
+blake3 = "1.5"
 arc-swap = "1.7.1"
 smallvec = "1.13"
 rustc-hash = "2.1.2"
 
 # Utils
-uuid = { version = "1.23.1", features = ["v4"] }
+uuid = { version = "1.23.1", features = ["v4", "v7"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 rand = "0.10.1"
 rand_core = "0.10"
@@ -145,12 +185,29 @@ getrandom = "0.4"
 base64 = "0.22.1"
 hex = "0.4.3"
 regex = "1.12.3"
+semver = "1.0"
 
 # Multipart form data parsing
 multer = "3.1"
 
+# Legal document rendering — Handlebars for template rendering + genpdf for
+# PDF output (F2 P8.b RODO generator). genpdf bundles a PDF layout engine on
+# top of printpdf so we get paragraphs / pagination without writing low-level
+# text positioning code. DejaVu fonts are vendored under assets/fonts/dejavu/
+# for full Polish-diacritic coverage on every platform.
+handlebars = "5"
+genpdf = "0.2"
+
 # Docker (optional)
 bollard = { version = "0.21.0", optional = true }
+
+# Camera ingest — GStreamer 1.x Rust bindings (optional, feature `camera`).
+# Version 0.23 chosen over plan's 0.21: 0.21 is from 2024 and lacks fixes
+# for GStreamer 1.24+; 0.23 targets GStreamer 1.22/1.24/1.26 which matches
+# our system (1.28). 0.25 also exists but landed too recently for stable
+# ecosystem alignment.
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }
 
 # Inference — llama.cpp (optional)
 llama-cpp-2 = { version = "0.1.146", features = ["sampler"], optional = true }
@@ -252,6 +309,31 @@ harness = false
 
 [[bench]]
 name = "audio_pipeline_clones"
+harness = false
+
+[[bench]]
+name = "streaming_pickup_perf"
+harness = false
+
+[[bench]]
+name = "recording_perf"
+harness = false
+required-features = ["camera"]
+
+[[bench]]
+name = "sql_host_perf"
+harness = false
+
+[[bench]]
+name = "migration_perf"
+harness = false
+
+[[bench]]
+name = "service_call_perf"
+harness = false
+
+[[bench]]
+name = "manifest_perf"
 harness = false
 
 [patch.crates-io]

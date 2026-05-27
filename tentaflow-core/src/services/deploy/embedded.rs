@@ -66,15 +66,14 @@ impl EmbeddedDeploy {
         // Pre-download ONNX (async, z progress do GUI) zanim załadujemy go z dysku.
         // `vision_models::*_path()` po Etapie 12d-1 jest pure stat-checkiem, więc
         // bez tego wywołania `model_path_for` zwróciłoby None.
-        let model_path =
-            crate::vision_models::ensure_for_kind(kind, self.log_sink.as_ref())
-                .await
-                .ok_or_else(|| {
-                    DeployError::Other(format!(
-                        "vision model '{}' is not available (download failed or no URL)",
-                        engine_id
-                    ))
-                })?;
+        let model_path = crate::vision_models::ensure_for_kind(kind, self.log_sink.as_ref())
+            .await
+            .ok_or_else(|| {
+                DeployError::Other(format!(
+                    "vision model '{}' is not available (download failed or no URL)",
+                    engine_id
+                ))
+            })?;
 
         let model_path_for_load = model_path.clone();
         let engine = tokio::task::spawn_blocking(move || {
@@ -161,124 +160,128 @@ impl EmbeddedDeploy {
         #[cfg(test)]
         {
             let _ = (selection, preferred_backend);
-            return Ok(Some(std::path::PathBuf::from("/tmp/tentaflow-test-model.gguf")));
+            return Ok(Some(std::path::PathBuf::from(
+                "/tmp/tentaflow-test-model.gguf",
+            )));
         }
         #[cfg(not(test))]
         {
+            let model_path = if let Some(path) = self
+                .user_config
+                .get("model_path")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                PathBuf::from(path)
+            } else {
+                if selection.repo.starts_with("http://") || selection.repo.starts_with("https://") {
+                    return Err(DeployError::Manifest(format!(
+                        "embedded LLM repo '{}' must be a HuggingFace repo id or local model_path",
+                        selection.repo
+                    )));
+                }
 
-        let model_path = if let Some(path) = self
-            .user_config
-            .get("model_path")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            PathBuf::from(path)
-        } else {
-            if selection.repo.starts_with("http://") || selection.repo.starts_with("https://") {
-                return Err(DeployError::Manifest(format!(
-                    "embedded LLM repo '{}' must be a HuggingFace repo id or local model_path",
-                    selection.repo
-                )));
-            }
+                if let Some(s) = &self.log_sink {
+                    s.phase(
+                        "download-model",
+                        &format!("[model] downloading {}", selection.repo),
+                    );
+                }
+                let store = crate::hub::model_store::ModelStore::default_for_platform();
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::channel::<crate::hub::model_store::DownloadProgress>(128);
+                let progress_sink = self.log_sink.clone();
+                let progress_task = tokio::spawn(async move {
+                    while let Some(p) = progress_rx.recv().await {
+                        if let Some(sink) = &progress_sink {
+                            sink.progress(
+                                "download-model",
+                                p.percent.round().clamp(0.0, 100.0) as u8,
+                                &format!(
+                                    "[model] {} {:.1}% ({}/{})",
+                                    p.file_name, p.percent, p.bytes_downloaded, p.bytes_total
+                                ),
+                            );
+                        }
+                    }
+                });
+                let path = store
+                    .download_model(&selection.repo, None, progress_tx)
+                    .await
+                    .map_err(|e| {
+                        DeployError::Other(format!("download model {}: {}", selection.repo, e))
+                    })?;
+                let _ = progress_task.await;
+                path
+            };
+
+            let load_path = match preferred_backend {
+                "llamacpp" if model_path.is_dir() => {
+                    find_gguf(&model_path, selection.quantization.as_deref()).ok_or_else(|| {
+                        DeployError::Other(format!(
+                            "no GGUF file found in downloaded model directory {}",
+                            model_path.display()
+                        ))
+                    })?
+                }
+                _ => model_path.clone(),
+            };
 
             if let Some(s) = &self.log_sink {
-                s.phase("download-model", &format!("[model] downloading {}", selection.repo));
+                s.phase(
+                    "load-model",
+                    &format!(
+                        "[model] loading {} from {}",
+                        selection.model_name,
+                        load_path.display()
+                    ),
+                );
             }
-            let store = crate::hub::model_store::ModelStore::default_for_platform();
-            let (progress_tx, mut progress_rx) =
-                tokio::sync::mpsc::channel::<crate::hub::model_store::DownloadProgress>(128);
-            let progress_sink = self.log_sink.clone();
-            let progress_task = tokio::spawn(async move {
-                while let Some(p) = progress_rx.recv().await {
-                    if let Some(sink) = &progress_sink {
-                        sink.progress(
-                            "download-model",
-                            p.percent.round().clamp(0.0, 100.0) as u8,
-                            &format!(
-                                "[model] {} {:.1}% ({}/{})",
-                                p.file_name, p.percent, p.bytes_downloaded, p.bytes_total
-                            ),
-                        );
-                    }
-                }
-            });
-            let path = store
-                .download_model(&selection.repo, None, progress_tx)
+
+            // Typed deploy params z manifest schema. apply_parameters_deploy
+            // produkuje `app.llamacpp` / `app.mlx` mapy (load-time tunables
+            // jak ctx_size/n_gpu_layers/threads/batch_size dla llama-cpp;
+            // request-time defaults dla mlx). DeployTarget::NativeEmbedded
+            // dla wszystkich embedded LLM/STT.
+            let (app, _req_time) = super::apply_parameters_deploy(
+                &self.manifest,
+                &self.user_config,
+                super::DeployTarget::NativeEmbedded,
+            )
+            .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+            // _req_time intentionally dropped here — `prepare()` re-runs
+            // apply_parameters_deploy gdy serializuje config_json zeby
+            // request_time_parameters byly persystowane (snapshot_builder
+            // potem czyta z config_json).
+
+            let deploy_params = crate::inference::DeployParamsSnapshot {
+                llamacpp: app.llamacpp.clone(),
+                mlx: app.mlx.clone(),
+            };
+
+            let shared = crate::inference::shared_inference_manager();
+            let mut manager = shared.write().await;
+            let info = manager
+                .load_model(&load_path, deploy_params, Some(preferred_backend))
                 .await
                 .map_err(|e| {
-                    DeployError::Other(format!("download model {}: {}", selection.repo, e))
-                })?;
-            let _ = progress_task.await;
-            path
-        };
-
-        let load_path = match preferred_backend {
-            "llamacpp" if model_path.is_dir() => {
-                find_gguf(&model_path, selection.quantization.as_deref()).ok_or_else(|| {
                     DeployError::Other(format!(
-                        "no GGUF file found in downloaded model directory {}",
-                        model_path.display()
+                        "load embedded model '{}' with backend '{}': {}",
+                        load_path.display(),
+                        preferred_backend,
+                        e
                     ))
-                })?
+                })?;
+
+            if let Some(s) = &self.log_sink {
+                s.info(&format!(
+                    "[model] loaded {} via {}",
+                    info.name, preferred_backend
+                ));
             }
-            _ => model_path.clone(),
-        };
 
-        if let Some(s) = &self.log_sink {
-            s.phase(
-                "load-model",
-                &format!(
-                    "[model] loading {} from {}",
-                    selection.model_name,
-                    load_path.display()
-                ),
-            );
-        }
-
-        // Typed deploy params z manifest schema. apply_parameters_deploy
-        // produkuje `app.llamacpp` / `app.mlx` mapy (load-time tunables
-        // jak ctx_size/n_gpu_layers/threads/batch_size dla llama-cpp;
-        // request-time defaults dla mlx). DeployTarget::NativeEmbedded
-        // dla wszystkich embedded LLM/STT.
-        let (app, _req_time) = super::apply_parameters_deploy(
-            &self.manifest,
-            &self.user_config,
-            super::DeployTarget::NativeEmbedded,
-        )
-        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
-        // _req_time intentionally dropped here — `prepare()` re-runs
-        // apply_parameters_deploy gdy serializuje config_json zeby
-        // request_time_parameters byly persystowane (snapshot_builder
-        // potem czyta z config_json).
-
-        let deploy_params = crate::inference::DeployParamsSnapshot {
-            llamacpp: app.llamacpp.clone(),
-            mlx: app.mlx.clone(),
-        };
-
-        let shared = crate::inference::shared_inference_manager();
-        let mut manager = shared.write().await;
-        let info = manager
-            .load_model(&load_path, deploy_params, Some(preferred_backend))
-            .await
-            .map_err(|e| {
-                DeployError::Other(format!(
-                    "load embedded model '{}' with backend '{}': {}",
-                    load_path.display(),
-                    preferred_backend,
-                    e
-                ))
-            })?;
-
-        if let Some(s) = &self.log_sink {
-            s.info(&format!(
-                "[model] loaded {} via {}",
-                info.name, preferred_backend
-            ));
-        }
-
-        Ok(Some(load_path))
+            Ok(Some(load_path))
         }
     }
 }
@@ -424,6 +427,7 @@ mod tests {
                 requires_model: None,
                 gpu_supported: None,
                 default_port: 0,
+                dgx_spark: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
                 service_surfaces: None,

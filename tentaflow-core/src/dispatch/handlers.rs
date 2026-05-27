@@ -121,8 +121,12 @@ fn validate_flow_json_str(ctx: &HandlerContext, flow_json: &str) -> Result<(), P
     };
     let parsed: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
         .map_err(|e| ProtocolError::bad_request(format!("invalid flow_json: {}", e)))?;
-    crate::flow_engine::validation::validate_flow(&parsed, dispatcher.registry())
-        .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
+    crate::flow_engine::validation::validate(
+        &parsed,
+        dispatcher.registry(),
+        crate::flow_engine::validation::ValidationSource::UserDefined,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
 }
 
 // =============================================================================
@@ -178,7 +182,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         _ => {
             return Err(ProtocolError::bad_request(
                 "auth_login expected AuthLoginRequestBody variant",
-            ))
+            ));
         }
     };
 
@@ -189,7 +193,10 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
     // Per-username rate limit (10/min). Per-IP wymaga remote_addr w HandlerContext —
     // follow-up. Tutaj blokujemy brute-force na konkretnego usera.
     if !crate::auth::rate_limit::LOGIN_RATE_LIMITER.check_and_record(&payload.username, 10) {
-        tracing::warn!("Rate limit logowania (binary): username={}", payload.username);
+        tracing::warn!(
+            "Rate limit logowania (binary): username={}",
+            payload.username
+        );
         return Err(ProtocolError::new(
             ProtocolErrorCode::RateLimited,
             "too many login attempts, retry in a minute",
@@ -291,7 +298,8 @@ pub fn me_preferences_get(
     let user_id_bytes = require_user_id(ctx)?;
     let user_id = user_id_to_i64(&user_id_bytes)
         .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
-    let language = repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+    let language =
+        repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
     Ok(MessageBody::MePreferencesGetResponseBody(
         tentaflow_protocol::MePreferencesGetResponse { language },
     ))
@@ -306,21 +314,22 @@ pub fn me_preferences_update(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MePreferencesUpdateRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected MePreferencesUpdateRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MePreferencesUpdateRequest",
+            ));
+        }
     };
     let user_id_bytes = require_user_id(ctx)?;
     let user_id = user_id_to_i64(&user_id_bytes)
         .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
-    if repository::set_user_preferred_language(
-        &ctx.state.db,
-        user_id,
-        payload.language.as_deref(),
-    )
-    .is_err()
+    if repository::set_user_preferred_language(&ctx.state.db, user_id, payload.language.as_deref())
+        .is_err()
     {
         return Err(ProtocolError::bad_request("unsupported language code"));
     }
-    let language = repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
+    let language =
+        repository::get_user_preferred_language(&ctx.state.db, user_id).map_err(db_err)?;
     Ok(MessageBody::MePreferencesUpdateResponseBody(
         tentaflow_protocol::MePreferencesUpdateResponse { language },
     ))
@@ -364,7 +373,7 @@ pub fn api_key_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "api_key_create expected ApiKeyCreateRequestBody variant",
-            ))
+            ));
         }
     };
 
@@ -411,7 +420,7 @@ pub fn api_key_revoke(
         _ => {
             return Err(ProtocolError::bad_request(
                 "api_key_revoke expected ApiKeyRevokeRequest variant",
-            ))
+            ));
         }
     };
 
@@ -584,7 +593,7 @@ pub fn model_install(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelInstallRequestBody",
-            ))
+            ));
         }
     };
 
@@ -774,14 +783,11 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     // published flows before writing — guards/D.19 collision detection
     // only happens here, not at the SQL layer.
     if let Some(name) = payload.published_model_name.as_deref() {
-        crate::services::catalog::guards::check_flow_publish_collision(
-            &ctx.state.db,
-            name,
-            None,
-        )
-        .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
+        crate::services::catalog::guards::check_flow_publish_collision(&ctx.state.db, name, None)
+            .map_err(|e| ProtocolError::bad_request(&e.to_string()))?;
     }
 
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let params = db::models::FlowParams {
         name: &payload.name,
         description: payload.description.as_deref(),
@@ -790,11 +796,11 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_json: &payload.graph_json,
         status: "active",
         published_model_name: payload.published_model_name.as_deref(),
+        actor_user_id: user_id,
     };
     let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
     ctx.state.router.rebuild_catalog();
 
-    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
         user_id,
@@ -863,7 +869,7 @@ pub fn flow_executions_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowExecutionsListRequest",
-            ))
+            ));
         }
     };
     let flow_id: i64 = flow_id_str
@@ -959,6 +965,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         flow_json: &new_flow_json,
         status: &new_status,
         published_model_name: new_published.as_deref(),
+        actor_user_id: user_id_opt,
     };
 
     match repository::update_flow_with_snapshot(
@@ -1005,25 +1012,29 @@ pub fn flow_node_templates_list(
     // Nodes bez zarejestrowanego adaptera dostaja puste listy, co GUI traktuje
     // jako "adapter niewspierany" i blokuje wiazania do walidacji backendu.
     let dispatcher = ctx.state.router.flow_dispatcher();
-    let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
+    let mut templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
         .map(|t| {
-            let (input_ports, output_ports) =
-                match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
-                    Some(adapter) => (
-                        adapter
-                            .supported_input_ports()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                        adapter
-                            .supported_output_ports()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                    None => (Vec::new(), Vec::new()),
-                };
+            let (input_ports, output_ports, input_port_types, output_port_types) = match dispatcher
+                .and_then(|d| d.registry().get(&t.node_type))
+            {
+                Some(adapter) => {
+                    let in_specs = adapter.input_ports();
+                    let out_specs = adapter.output_ports();
+                    let in_ports: Vec<String> = in_specs.iter().map(|p| p.name.clone()).collect();
+                    let out_ports: Vec<String> = out_specs.iter().map(|p| p.name.clone()).collect();
+                    let in_types: Vec<String> = in_specs
+                        .iter()
+                        .map(|p| p.data_type.as_wire_str().to_string())
+                        .collect();
+                    let out_types: Vec<String> = out_specs
+                        .iter()
+                        .map(|p| p.data_type.as_wire_str().to_string())
+                        .collect();
+                    (in_ports, out_ports, in_types, out_types)
+                }
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
             tentaflow_protocol::FlowNodeTemplate {
                 id: t.id,
                 node_type: t.node_type,
@@ -1034,9 +1045,51 @@ pub fn flow_node_templates_list(
                 icon: t.icon,
                 input_ports,
                 output_ports,
+                input_port_types,
+                output_port_types,
+                params_schema: t.params_schema.unwrap_or_default(),
             }
         })
         .collect();
+
+    // Dorzuc custom flow blocks z zainstalowanych addonow. GUI Flow Builder
+    // dostaje je w tej samej palecie co core templates, kluczem jest
+    // `node_type` ("addon.{addon_id}.{block}"); `id=0` bo addon blocks nie
+    // żyją w tabeli flow_node_templates.
+    if let Some(blocks) = dispatcher.and_then(|d| d.addon_flow_blocks()) {
+        for b in blocks.list_all_blocks() {
+            let input_ports: Vec<String> = b.inputs.iter().map(|p| p.name.clone()).collect();
+            let output_ports: Vec<String> = b.outputs.iter().map(|p| p.name.clone()).collect();
+            let input_port_types: Vec<String> =
+                b.inputs.iter().map(|p| p.port_type.clone()).collect();
+            let output_port_types: Vec<String> =
+                b.outputs.iter().map(|p| p.port_type.clone()).collect();
+            let params_schema = if b.config_schema.is_null() {
+                String::new()
+            } else {
+                serde_json::to_string(&b.config_schema).unwrap_or_default()
+            };
+            templates.push(tentaflow_protocol::FlowNodeTemplate {
+                id: 0,
+                node_type: b.block_type.clone(),
+                category: b.category.clone(),
+                label: b.label.clone(),
+                description: if b.description.is_empty() {
+                    None
+                } else {
+                    Some(b.description.clone())
+                },
+                default_config: "{}".to_string(),
+                icon: b.icon.clone(),
+                input_ports,
+                output_ports,
+                input_port_types,
+                output_port_types,
+                params_schema,
+            });
+        }
+    }
+
     Ok(MessageBody::FlowNodeTemplatesListResponseBody(
         tentaflow_protocol::FlowNodeTemplatesListResponse { templates },
     ))
@@ -1054,7 +1107,7 @@ pub fn flow_version_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowVersionListRequestBody",
-            ))
+            ));
         }
     };
     let flow_id: i64 = payload
@@ -1100,7 +1153,7 @@ pub fn flow_version_get(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowVersionGetRequestBody",
-            ))
+            ));
         }
     };
     let flow_id: i64 = payload
@@ -1151,7 +1204,7 @@ pub fn flow_version_restore(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected FlowVersionRestoreRequestBody",
-            ))
+            ));
         }
     };
     let flow_id: i64 = payload
@@ -1172,6 +1225,8 @@ pub fn flow_version_restore(
 
     let flow_json = version.flow_json.as_deref().unwrap_or("");
     validate_flow_json_str(ctx, flow_json)?;
+    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let created_by = user_id_opt.map(|u| u.to_string());
     // Restoring an old version keeps whatever publish name the live flow
     // currently advertises — old versions never tracked the catalog field.
     let params = db::models::FlowParams {
@@ -1182,10 +1237,8 @@ pub fn flow_version_restore(
         flow_json,
         status: version.status.as_deref().unwrap_or("draft"),
         published_model_name: existing.published_model_name.as_deref(),
+        actor_user_id: user_id_opt,
     };
-
-    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
-    let created_by = user_id_opt.map(|u| u.to_string());
 
     match repository::update_flow_with_snapshot(
         &ctx.state.db,
@@ -1309,7 +1362,7 @@ pub fn cluster_detail(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterDetailRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1376,7 +1429,7 @@ pub fn cluster_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterCreateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1440,7 +1493,7 @@ pub fn cluster_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterUpdateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1507,7 +1560,7 @@ pub fn cluster_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterDeleteRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1551,7 +1604,7 @@ pub fn cluster_add_member(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterAddMemberRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1606,7 +1659,7 @@ pub fn cluster_remove_member(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ClusterRemoveMemberRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1693,7 +1746,7 @@ pub fn mesh_pair_init(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshPairInitRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1774,7 +1827,7 @@ pub fn settings_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SettingsUpdateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1853,7 +1906,7 @@ pub fn sso_provider_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SsoProviderCreateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -1933,7 +1986,7 @@ pub fn sso_provider_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected SsoProviderDeleteRequestBody",
-            ))
+            ));
         }
     };
 
@@ -2112,9 +2165,11 @@ pub fn container_list(
     // Real Docker API integration wymaga bollard async — w sync handler
     // zwracamy zarejestrowane kontenery z Service registry (proxy).
     // Pelne portainer integration jako oddzielny stream handler w przyszlosci.
-    Ok(MessageBody::ContainerListResponse {
-        containers: Vec::new(),
-    })
+    Ok(MessageBody::ContainerBody(
+        tentaflow_protocol::ContainerPayload::ListResponse {
+            containers: Vec::new(),
+        },
+    ))
 }
 
 #[handler(variant = "ContainerStartRequest", since = (1, 0))]
@@ -2125,11 +2180,15 @@ pub fn container_start(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     match req {
-        MessageBody::ContainerStartRequest { container_id: _ } => {
+        MessageBody::ContainerBody(tentaflow_protocol::ContainerPayload::StartRequest {
+            container_id: _,
+        }) => {
             // Real Docker start wymaga async bollard — zwracamy started=true
             // jako synchroniczny ack; klient powinien obserwowac ContainerList
             // dla potwierdzenia state change.
-            Ok(MessageBody::ContainerStartResponse { started: true })
+            Ok(MessageBody::ContainerBody(
+                tentaflow_protocol::ContainerPayload::StartResponse { started: true },
+            ))
         }
         _ => Err(ProtocolError::bad_request("expected ContainerStartRequest")),
     }
@@ -2143,9 +2202,11 @@ pub fn container_stop(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     match req {
-        MessageBody::ContainerStopRequest { container_id: _ } => {
-            Ok(MessageBody::ContainerStopResponse { stopped: true })
-        }
+        MessageBody::ContainerBody(tentaflow_protocol::ContainerPayload::StopRequest {
+            container_id: _,
+        }) => Ok(MessageBody::ContainerBody(
+            tentaflow_protocol::ContainerPayload::StopResponse { stopped: true },
+        )),
         _ => Err(ProtocolError::bad_request("expected ContainerStopRequest")),
     }
 }
@@ -2279,7 +2340,7 @@ pub fn vision_infer(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected VisionBody/InferRequest",
-            ))
+            ));
         }
     };
 
@@ -2758,7 +2819,7 @@ pub async fn mesh_node_detail(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected MeshNodeDetailRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3000,10 +3061,7 @@ fn db_alias_to_proto(a: crate::db::models::DbModelAlias) -> tentaflow_protocol::
 #[handler(variant = "CatalogListRequestBody", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn catalog_list(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn catalog_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let request = match req {
         MessageBody::CatalogListRequestBody(r) => r,
         // Defensive — the proc-macro only routes the right variant here, but
@@ -3173,7 +3231,7 @@ pub fn model_alias_create(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelAliasCreateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3218,7 +3276,7 @@ pub fn model_alias_update(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelAliasUpdateRequestBody",
-            ))
+            ));
         }
     };
 
@@ -3272,12 +3330,11 @@ pub fn model_alias_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ModelAliasDeleteRequestBody",
-            ))
+            ));
         }
     };
 
-    let deleted =
-        crate::services::models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
+    let deleted = crate::services::models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
 
     if !deleted {
         return Err(ProtocolError::not_found(format!(
@@ -3317,10 +3374,9 @@ pub async fn nim_catalog_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let result =
-        crate::services::nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
-            .await
-            .map_err(|e| ProtocolError::internal(format!("nim catalog: {}", e)))?;
+    let result = crate::services::nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
+        .await
+        .map_err(|e| ProtocolError::internal(format!("nim catalog: {}", e)))?;
 
     let containers = result
         .containers
@@ -3359,7 +3415,7 @@ pub async fn service_manifest_deploy(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected DeploymentBody::ReqStart",
-            ))
+            ));
         }
     };
 
@@ -3434,7 +3490,7 @@ pub async fn service_manifest_deploy(
     );
 
     use crate::services::manifest::runtime_validate::{
-        validate_deploy_target, DeployValidationError,
+        DeployValidationError, validate_deploy_target,
     };
     validate_deploy_target(&payload.engine_id, &payload.deploy_method).map_err(
         |err| match err {
@@ -3562,18 +3618,13 @@ pub async fn service_manifest_deploy(
                         // Peers' `MeshServicesRegistry` pick the row up here
                         // instead of waiting for the 5-min anti-drift announce.
                         if let Some(qm) = quic_mesh_task {
-                            let payload =
-                                tentaflow_protocol::mesh::MeshServicesUpdatePayload {
-                                    from_node_id: local_node_id_task.clone(),
-                                    change: tentaflow_protocol::ServiceChange::Added(
-                                        info,
-                                    ),
-                                };
-                            if let Ok(bytes) =
-                                rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                            {
+                            let payload = tentaflow_protocol::mesh::MeshServicesUpdatePayload {
+                                from_node_id: local_node_id_task.clone(),
+                                change: tentaflow_protocol::ServiceChange::Added(info),
+                            };
+                            if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                                 let _ = qm
-                                    .broadcast_to_trusted(
+                                    .broadcast_ufp2_to_trusted(
                                         tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
                                         &bytes,
                                         None,
@@ -3587,8 +3638,8 @@ pub async fn service_manifest_deploy(
                         // Supervisor reconcile would also do this on its
                         // next tick, but desktop has no supervisor and we
                         // don't want a 1-second window of staleness.
-                        if let Err(e) = catalog_provider_task
-                            .rebuild(&mesh_services_registry_task, &db_clone)
+                        if let Err(e) =
+                            catalog_provider_task.rebuild(&mesh_services_registry_task, &db_clone)
                         {
                             tracing::warn!(error = %e, "post-deploy catalog rebuild failed");
                         }
@@ -3676,9 +3727,9 @@ pub async fn deploy_vllm_recommend(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     use crate::deploy::vram_calculator::{
-        analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
-        fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
-        parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
+        AutoFitOutcome, AutoFitRequest, analyze_gpu_compatibility, auto_fit_config,
+        build_vllm_args_string, estimate_vllm_vram, fetch_hf_config,
+        max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
     };
 
     let payload = match req {
@@ -3686,7 +3737,7 @@ pub async fn deploy_vllm_recommend(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected DeployVllmRecommendRequest",
-            ))
+            ));
         }
     };
 
@@ -3694,9 +3745,7 @@ pub async fn deploy_vllm_recommend(
         return Err(ProtocolError::bad_request("model wymagany"));
     }
     if payload.gpus.is_empty() {
-        return Err(ProtocolError::bad_request(
-            "co najmniej jeden GPU wymagany",
-        ));
+        return Err(ProtocolError::bad_request("co najmniej jeden GPU wymagany"));
     }
 
     let client = reqwest::Client::builder()
@@ -3877,7 +3926,7 @@ pub async fn engine_recommend(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected EngineRecommendRequest",
-            ))
+            ));
         }
     };
 
@@ -3888,14 +3937,13 @@ pub async fn engine_recommend(
 
     let mut parameters: Vec<tentaflow_protocol::KeyValue> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    let push = |params: &mut Vec<tentaflow_protocol::KeyValue>,
-                key: &str,
-                value: serde_json::Value| {
-        params.push(tentaflow_protocol::KeyValue {
-            key: key.to_string(),
-            value_json: value.to_string(),
-        });
-    };
+    let push =
+        |params: &mut Vec<tentaflow_protocol::KeyValue>, key: &str, value: serde_json::Value| {
+            params.push(tentaflow_protocol::KeyValue {
+                key: key.to_string(),
+                value_json: value.to_string(),
+            });
+        };
 
     match engine_id {
         "vllm" | "vllm-metal" | "sglang" | "tensorrt-llm" => {
@@ -3911,7 +3959,7 @@ pub async fn engine_recommend(
                 ));
             }
             use crate::deploy::vram_calculator::{
-                auto_fit_config, fetch_hf_config, parse_hf_config_with_override, AutoFitRequest,
+                AutoFitRequest, auto_fit_config, fetch_hf_config, parse_hf_config_with_override,
             };
 
             let client = reqwest::Client::builder()
@@ -3926,9 +3974,8 @@ pub async fn engine_recommend(
                             "Nie udalo sie pobrac config.json z HF: {e}"
                         ))
                     })?;
-            let spec =
-                parse_hf_config_with_override(&config_json, &payload.model_repo, None)
-                    .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
+            let spec = parse_hf_config_with_override(&config_json, &payload.model_repo, None)
+                .map_err(|e| ProtocolError::bad_request(format!("Parse HF config: {e}")))?;
 
             let gpu_count = payload.gpus.len() as u32;
             let gpu_memory_gb = payload
@@ -3960,39 +4007,96 @@ pub async fn engine_recommend(
             // manifestu dorzucaja te klucze do env / API options przy deploy.
             match engine_id {
                 "vllm" | "vllm-metal" => {
-                    push(&mut parameters, "gpu_memory_utilization",
-                        serde_json::json!(cfg.gpu_memory_utilization));
-                    push(&mut parameters, "max_model_len", serde_json::json!(cfg.max_model_len));
-                    push(&mut parameters, "max_num_seqs", serde_json::json!(cfg.max_num_seqs));
-                    push(&mut parameters, "max_num_batched_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)));
-                    push(&mut parameters, "tensor_parallel_size",
-                        serde_json::json!(cfg.tensor_parallel));
-                    push(&mut parameters, "pipeline_parallel_size",
-                        serde_json::json!(cfg.pipeline_parallel));
-                    push(&mut parameters, "kv_cache_dtype",
-                        serde_json::json!(cfg.kv_cache_dtype));
+                    push(
+                        &mut parameters,
+                        "gpu_memory_utilization",
+                        serde_json::json!(cfg.gpu_memory_utilization),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_model_len",
+                        serde_json::json!(cfg.max_model_len),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_num_seqs",
+                        serde_json::json!(cfg.max_num_seqs),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_num_batched_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)),
+                    );
+                    push(
+                        &mut parameters,
+                        "tensor_parallel_size",
+                        serde_json::json!(cfg.tensor_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "pipeline_parallel_size",
+                        serde_json::json!(cfg.pipeline_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "kv_cache_dtype",
+                        serde_json::json!(cfg.kv_cache_dtype),
+                    );
                     push(&mut parameters, "dtype", serde_json::json!("auto"));
-                    push(&mut parameters, "enable_chunked_prefill", serde_json::json!(true));
+                    push(
+                        &mut parameters,
+                        "enable_chunked_prefill",
+                        serde_json::json!(true),
+                    );
                 }
                 "sglang" => {
-                    push(&mut parameters, "tp", serde_json::json!(cfg.tensor_parallel));
-                    push(&mut parameters, "mem_fraction",
-                        serde_json::json!(cfg.gpu_memory_utilization));
-                    push(&mut parameters, "max_total_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)));
-                    push(&mut parameters, "max_batch_size",
-                        serde_json::json!(cfg.max_num_seqs));
+                    push(
+                        &mut parameters,
+                        "tp",
+                        serde_json::json!(cfg.tensor_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "mem_fraction",
+                        serde_json::json!(cfg.gpu_memory_utilization),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_total_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_batch_size",
+                        serde_json::json!(cfg.max_num_seqs),
+                    );
                 }
                 "tensorrt-llm" => {
-                    push(&mut parameters, "tp", serde_json::json!(cfg.tensor_parallel));
-                    push(&mut parameters, "max_batch_size",
-                        serde_json::json!(cfg.max_num_seqs));
-                    push(&mut parameters, "max_seq_len", serde_json::json!(cfg.max_model_len));
-                    push(&mut parameters, "free_gpu_memory_fraction",
-                        serde_json::json!(cfg.gpu_memory_utilization));
-                    push(&mut parameters, "max_num_tokens",
-                        serde_json::json!(cfg.max_model_len.max(8192)));
+                    push(
+                        &mut parameters,
+                        "tp",
+                        serde_json::json!(cfg.tensor_parallel),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_batch_size",
+                        serde_json::json!(cfg.max_num_seqs),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_seq_len",
+                        serde_json::json!(cfg.max_model_len),
+                    );
+                    push(
+                        &mut parameters,
+                        "free_gpu_memory_fraction",
+                        serde_json::json!(cfg.gpu_memory_utilization),
+                    );
+                    push(
+                        &mut parameters,
+                        "max_num_tokens",
+                        serde_json::json!(cfg.max_model_len.max(8192)),
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -4005,8 +4109,11 @@ pub async fn engine_recommend(
                 .unwrap_or(8);
             push(&mut parameters, "ctx_size", serde_json::json!(8192));
             push(&mut parameters, "n_gpu_layers", serde_json::json!(999));
-            push(&mut parameters, "threads",
-                serde_json::json!((cpus / 2).max(2)));
+            push(
+                &mut parameters,
+                "threads",
+                serde_json::json!((cpus / 2).max(2)),
+            );
             push(&mut parameters, "batch_size", serde_json::json!(512));
         }
         "ollama" => {
@@ -4015,8 +4122,11 @@ pub async fn engine_recommend(
                 .unwrap_or(8);
             push(&mut parameters, "context_size", serde_json::json!(8192));
             push(&mut parameters, "num_gpu", serde_json::json!(999));
-            push(&mut parameters, "num_thread",
-                serde_json::json!((cpus / 2).max(2)));
+            push(
+                &mut parameters,
+                "num_thread",
+                serde_json::json!((cpus / 2).max(2)),
+            );
             push(&mut parameters, "num_batch", serde_json::json!(512));
         }
         "whisper" | "mlx-whisper" => {
@@ -4024,12 +4134,23 @@ pub async fn engine_recommend(
                 .map(|n| n.get())
                 .unwrap_or(8);
             push(&mut parameters, "default_beam_size", serde_json::json!(5));
-            push(&mut parameters, "n_threads",
-                serde_json::json!((cpus / 2).max(2)));
+            push(
+                &mut parameters,
+                "n_threads",
+                serde_json::json!((cpus / 2).max(2)),
+            );
         }
         "mlx" => {
-            push(&mut parameters, "default_max_tokens", serde_json::json!(2048));
-            push(&mut parameters, "default_temperature", serde_json::json!(0.7));
+            push(
+                &mut parameters,
+                "default_max_tokens",
+                serde_json::json!(2048),
+            );
+            push(
+                &mut parameters,
+                "default_temperature",
+                serde_json::json!(0.7),
+            );
             push(&mut parameters, "default_top_p", serde_json::json!(0.95));
         }
         _ => {
@@ -4270,6 +4391,173 @@ fn escape_csv(s: &str) -> String {
     }
 }
 
+#[handler(variant = "SchedulerJobsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_jobs_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobsListRequest(_)) => {}
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobsListRequestBody",
+            ));
+        }
+    }
+    let jobs = crate::scheduler::list_jobs(&ctx.state.db).map_err(db_err)?;
+    let jobs_json = serde_json::to_string(&jobs)
+        .map_err(|e| ProtocolError::internal(format!("scheduler jobs encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobsListResponse(
+            tentaflow_protocol::SchedulerJobsListResponse { jobs_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerActionsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_actions_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::ActionsListRequest(_)) => {
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerActionsListRequestBody",
+            ));
+        }
+    }
+    let actions = crate::scheduler::list_addon_actions(&ctx.state.db).map_err(db_err)?;
+    let actions_json = serde_json::to_string(&actions)
+        .map_err(|e| ProtocolError::internal(format!("scheduler actions encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::ActionsListResponse(
+            tentaflow_protocol::SchedulerActionsListResponse { actions_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerRunsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_runs_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::RunsListRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerRunsListRequestBody",
+            ));
+        }
+    };
+    let runs = crate::scheduler::list_runs(&ctx.state.db, &payload.job_id, payload.limit as i64)
+        .map_err(db_err)?;
+    let runs_json = serde_json::to_string(&runs)
+        .map_err(|e| ProtocolError::internal(format!("scheduler runs encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::RunsListResponse(
+            tentaflow_protocol::SchedulerRunsListResponse { runs_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerJobUpsertRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_job_upsert(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobUpsertRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobUpsertRequestBody",
+            ));
+        }
+    };
+    let user_id = require_user_id(ctx)
+        .ok()
+        .and_then(|b| user_id_to_i64(&b))
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let input: crate::scheduler::UpsertJobRequest = serde_json::from_str(&payload.job_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid scheduler job json: {}", e)))?;
+    let job = crate::scheduler::upsert_job(&ctx.state.db, input, user_id).map_err(db_err)?;
+    let job_json = serde_json::to_string(&job)
+        .map_err(|e| ProtocolError::internal(format!("scheduler job encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobUpsertResponse(
+            tentaflow_protocol::SchedulerJobUpsertResponse { job_json },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerJobDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn scheduler_job_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobDeleteRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobDeleteRequestBody",
+            ));
+        }
+    };
+    crate::scheduler::delete_job(&ctx.state.db, &payload.job_id).map_err(db_err)?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobDeleteResponse(
+            tentaflow_protocol::SchedulerJobDeleteResponse { ok: true },
+        ),
+    ))
+}
+
+#[handler(variant = "SchedulerJobRunNowRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn scheduler_job_run_now(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SchedulerBody(tentaflow_protocol::SchedulerPayload::JobRunNowRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SchedulerJobRunNowRequestBody",
+            ));
+        }
+    };
+    let addon_manager = ctx
+        .state
+        .addon_manager
+        .clone()
+        .ok_or_else(|| ProtocolError::internal("AddonManager unavailable"))?;
+    let user_id = require_user_id(ctx)
+        .ok()
+        .and_then(|b| user_id_to_i64(&b))
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
+    let run = crate::scheduler::run_now(&ctx.state.db, addon_manager, &payload.job_id, user_id)
+        .await
+        .map_err(db_err)?;
+    let run_json = serde_json::to_string(&run)
+        .map_err(|e| ProtocolError::internal(format!("scheduler run encode failed: {}", e)))?;
+    Ok(MessageBody::SchedulerBody(
+        tentaflow_protocol::SchedulerPayload::JobRunNowResponse(
+            tentaflow_protocol::SchedulerJobRunNowResponse { run_json },
+        ),
+    ))
+}
+
 #[handler(variant = "AuditLogListRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
@@ -4282,7 +4570,7 @@ pub fn audit_log_list(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected AuditLogListRequestBody",
-            ))
+            ));
         }
     };
 
@@ -4323,7 +4611,7 @@ pub fn audit_log_export(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected AuditLogExportRequestBody",
-            ))
+            ));
         }
     };
 
@@ -4382,7 +4670,7 @@ pub fn audit_log_cleanup(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected AuditLogCleanupRequestBody",
-            ))
+            ));
         }
     };
     if payload.keep_days < 1 {
@@ -4765,6 +5053,372 @@ register_iam_variant!(
 );
 
 // =============================================================================
+// Apps menu — multiplexed in `AddonUiBody` (256-variant rkyv limit).
+// =============================================================================
+
+#[handler(variant = "AddonUiBody", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn addon_ui_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::AddonUiPayload as P;
+    let payload = match req {
+        MessageBody::AddonUiBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonUiBody")),
+    };
+
+    // Visibility: admin_only / group-restricted addons must not appear in
+    // the launcher for unauthorized users.
+    let user_id_bytes = require_user_id(ctx)?;
+    let user_id = user_id_to_i64(&user_id_bytes)
+        .ok_or_else(|| ProtocolError::internal("nie udalo sie zdekodowac user_id z sesji"))?;
+    let is_admin = matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    );
+    let visible_to_user = |addon_id: &str| -> Result<bool, ProtocolError> {
+        if is_admin {
+            return Ok(true);
+        }
+        repository::is_addon_visible_to_user(&ctx.state.db, addon_id, user_id).map_err(db_err)
+    };
+
+    let res = match payload {
+        // ---- Apps menu ----
+        P::ReqApplicationsList => {
+            // Zrodlo prawdy: zainstalowane addony, ktore deklaruja
+            // [application] w manifescie. Czytamy manifest_json z DB,
+            // deserializujemy, filtrujemy po widocznosci dla usera.
+            let rows = crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
+            let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> = Vec::new();
+            for a in rows {
+                if !visible_to_user(&a.addon_id)? {
+                    continue;
+                }
+                // UWAGA: `manifest_json` w DB to RAW manifest.toml string
+                // (nazwa kolumny myli, patrz addon/lifecycle.rs:125).
+                // Parsujemy przez parse_manifest_toml, NIE serde_json.
+                let manifest: crate::addon::AddonManifest =
+                    match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                if let Some(app) = manifest.application {
+                    applications.push(tentaflow_protocol::AddonApplicationInfo {
+                        addon_id: a.addon_id.clone(),
+                        title: app.title,
+                        entry_panel: app.entry_panel,
+                        icon: app.icon,
+                        description: app.description,
+                        sort_order: app.sort_order,
+                        enabled: a.is_enabled,
+                    });
+                }
+            }
+            applications.sort_by(|a, b| {
+                a.sort_order
+                    .cmp(&b.sort_order)
+                    .then_with(|| a.title.cmp(&b.title))
+            });
+            P::ResApplicationsList { applications }
+        }
+
+        // Response variants should not arrive as requests.
+        P::ResApplicationsList { .. } => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::AddonUiBody(res))
+}
+
+// variant_name_of() zwraca nazwy inner payloadu, wiec rejestrujemy
+// pod kazda z 3 request nazw (analogicznie do IamBody).
+macro_rules! register_addon_ui_variant {
+    ($variant:literal, $metric:literal, $auth:expr) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: $auth,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_addon_ui_dispatch,
+            }
+        }
+    };
+}
+
+register_addon_ui_variant!(
+    "AddonApplicationsListRequest",
+    "tentaflow_ws_handler_addon_apps_list",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+
+fn sync_conflict_limit(limit: u32) -> usize {
+    if limit == 0 {
+        100
+    } else {
+        (limit as usize).min(500)
+    }
+}
+
+fn validate_sync_conflict_scope(org_id: &str, addon_id: &str) -> Result<(), ProtocolError> {
+    crate::addon::fs_sandbox::validate_addon_id(org_id)
+        .map_err(|_| ProtocolError::bad_request("invalid org_id"))?;
+    crate::addon::fs_sandbox::validate_addon_id(addon_id)
+        .map_err(|_| ProtocolError::bad_request("invalid addon_id"))?;
+    Ok(())
+}
+
+fn validate_sync_conflict_status(status: &str) -> Result<(), ProtocolError> {
+    match status {
+        "open" | "resolved" | "ignored" | "superseded" => Ok(()),
+        _ => Err(ProtocolError::bad_request("invalid conflict status")),
+    }
+}
+
+fn sync_conflict_row_to_wire(
+    row: crate::addon::storage_sql_exec::SyncConflictRow,
+) -> tentaflow_protocol::SyncConflictRow {
+    tentaflow_protocol::SyncConflictRow {
+        operation_id: row.operation_id,
+        org_id: row.org_id,
+        addon_id: row.addon_id,
+        table_name: row.table_name,
+        resource_type: row.resource_type,
+        resource_id: row.resource_id,
+        action: row.action,
+        source_node_id: row.source_node_id,
+        error_kind: row.error_kind,
+        error_message: row.error_message,
+        status: row.status,
+        created_at_ms: row.created_at_ms,
+        resolved_at_ms: row.resolved_at_ms,
+        resolution: row.resolution,
+    }
+}
+
+fn sync_conflict_resolution_to_storage(
+    resolution: &tentaflow_protocol::SyncConflictResolution,
+) -> crate::addon::storage_sql_exec::SyncConflictResolution {
+    match resolution {
+        tentaflow_protocol::SyncConflictResolution::KeepLocal => {
+            crate::addon::storage_sql_exec::SyncConflictResolution::KeepLocal
+        }
+        tentaflow_protocol::SyncConflictResolution::Ignore => {
+            crate::addon::storage_sql_exec::SyncConflictResolution::Ignore
+        }
+        tentaflow_protocol::SyncConflictResolution::AcceptRemote => {
+            crate::addon::storage_sql_exec::SyncConflictResolution::AcceptRemote
+        }
+    }
+}
+
+#[handler(variant = "SyncConflictBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sync_conflict_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::SyncConflictPayload as P;
+    let payload = match req {
+        MessageBody::SyncConflictBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected SyncConflictBody")),
+    };
+
+    let res = match payload {
+        P::ListRequest(request) => {
+            if request.addon_id.trim().is_empty() {
+                return Err(ProtocolError::bad_request("addon_id is required"));
+            }
+            let org_id = if request.org_id.trim().is_empty() {
+                "org-default"
+            } else {
+                request.org_id.as_str()
+            };
+            let status = if request.status.trim().is_empty() {
+                "open"
+            } else {
+                request.status.as_str()
+            };
+            validate_sync_conflict_scope(org_id, &request.addon_id)?;
+            validate_sync_conflict_status(status)?;
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                org_id,
+                &request.addon_id,
+                Some(status),
+                sync_conflict_limit(request.limit),
+            )
+            .map_err(|e| ProtocolError::internal(format!("sync conflict list failed: {}", e)))?
+            .into_iter()
+            .map(sync_conflict_row_to_wire)
+            .collect();
+            P::ListResponse(tentaflow_protocol::SyncConflictsListResponse { conflicts })
+        }
+        P::ResolveRequest(request) => {
+            if request.addon_id.trim().is_empty() {
+                return Err(ProtocolError::bad_request("addon_id is required"));
+            }
+            let org_id = if request.org_id.trim().is_empty() {
+                "org-default"
+            } else {
+                request.org_id.as_str()
+            };
+            validate_sync_conflict_scope(org_id, &request.addon_id)?;
+            let operation_id = crate::sync::ledger::OperationId::from_hex(&request.operation_id)
+                .map_err(|_| ProtocolError::bad_request("invalid operation_id"))?;
+            let resolution = sync_conflict_resolution_to_storage(&request.resolution);
+            let result = crate::sync::runtime::resolve_addon_sync_conflict(
+                org_id,
+                &request.addon_id,
+                operation_id,
+                resolution,
+            )
+            .map_err(|e| ProtocolError::internal(format!("sync conflict resolve failed: {}", e)))?
+            .ok_or_else(|| ProtocolError::internal("sync runtime unavailable"))?;
+            let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+            audit(
+                ctx,
+                user_id,
+                "sync.conflict.resolve",
+                Some(&request.operation_id),
+                Some(&result.resolution),
+            );
+            P::ResolveResponse(tentaflow_protocol::SyncConflictResolveResponse {
+                operation_id: result.operation_id,
+                status: result.status,
+                resolution: result.resolution,
+                rows_affected: result.rows_affected,
+            })
+        }
+        P::ListResponse(_) | P::ResolveResponse(_) => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::SyncConflictBody(res))
+}
+
+macro_rules! register_sync_conflict_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_sync_conflict_dispatch,
+            }
+        }
+    };
+}
+
+register_sync_conflict_variant!(
+    "SyncConflictsListRequest",
+    "tentaflow_ws_handler_sync_conflicts_list"
+);
+register_sync_conflict_variant!(
+    "SyncConflictResolveRequest",
+    "tentaflow_ws_handler_sync_conflict_resolve"
+);
+
+fn sync_storage_level_to_wire(
+    level: crate::sync::storage_monitor::StoragePressureLevel,
+) -> tentaflow_protocol::SyncStoragePressureLevel {
+    match level {
+        crate::sync::storage_monitor::StoragePressureLevel::Ok => {
+            tentaflow_protocol::SyncStoragePressureLevel::Ok
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Info => {
+            tentaflow_protocol::SyncStoragePressureLevel::Info
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Warning => {
+            tentaflow_protocol::SyncStoragePressureLevel::Warning
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Critical => {
+            tentaflow_protocol::SyncStoragePressureLevel::Critical
+        }
+        crate::sync::storage_monitor::StoragePressureLevel::Unknown => {
+            tentaflow_protocol::SyncStoragePressureLevel::Unknown
+        }
+    }
+}
+
+fn sync_storage_percent_to_bps(percent: Option<f64>) -> Option<u32> {
+    percent.map(|value| (value * 100.0).round().clamp(0.0, 10_000.0) as u32)
+}
+
+fn sync_storage_report_to_wire(
+    report: crate::sync::storage_monitor::StoragePressureReport,
+) -> tentaflow_protocol::SyncStorageReportResponse {
+    tentaflow_protocol::SyncStorageReportResponse {
+        root: report.root.to_string_lossy().to_string(),
+        level: sync_storage_level_to_wire(report.level),
+        total_bytes: report.total_bytes,
+        available_bytes: report.available_bytes,
+        free_percent_bps: sync_storage_percent_to_bps(report.free_percent),
+        sqlite_bytes: report.sqlite_bytes,
+        fjall_ledger_bytes: report.fjall_ledger_bytes,
+        snapshot_blob_bytes: report.snapshot_blob_bytes,
+        final_blob_bytes: report.final_blob_bytes,
+        pending_blob_chunk_bytes: report.pending_blob_chunk_bytes,
+        large_blob_block_bytes: crate::sync::storage_monitor::LARGE_BLOB_BLOCK_BYTES,
+        paths: report
+            .paths
+            .into_iter()
+            .map(|path| tentaflow_protocol::SyncStoragePathUsage {
+                label: path.label.to_string(),
+                path: path.path.to_string_lossy().to_string(),
+                bytes: path.bytes,
+            })
+            .collect(),
+    }
+}
+
+#[handler(variant = "SyncStorageBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sync_storage_dispatch(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::SyncStoragePayload as P;
+    let payload = match req {
+        MessageBody::SyncStorageBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected SyncStorageBody")),
+    };
+
+    let res = match payload {
+        P::ReportRequest(_) => {
+            let report = crate::sync::storage_monitor::current_report()
+                .map_err(|e| ProtocolError::internal(format!("sync storage report failed: {e}")))?;
+            P::ReportResponse(sync_storage_report_to_wire(report))
+        }
+        P::ReportResponse(_) => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::SyncStorageBody(res))
+}
+
+::inventory::submit! {
+    crate::dispatch::HandlerMeta {
+        variant_name: "SyncStorageReportRequest",
+        since_major: 1,
+        since_minor: 0,
+        required_auth: crate::dispatch::SessionAuthKind::Admin,
+        metric_name: "tentaflow_ws_handler_sync_storage_report",
+        dispatch_fn: __tentaflow_dispatch_sync_storage_dispatch,
+    }
+}
+
+// =============================================================================
 // Mesh & Network settings (enumeracja IPv4 NIC + bind/advertise rules)
 // =============================================================================
 
@@ -4789,11 +5443,7 @@ fn parse_bool_setting(raw: &Option<String>, default: bool) -> bool {
 }
 
 fn bool_to_setting(v: bool) -> &'static str {
-    if v {
-        "1"
-    } else {
-        "0"
-    }
+    if v { "1" } else { "0" }
 }
 
 fn load_network_config(
@@ -5088,7 +5738,7 @@ fn broadcast_service_change(ctx: &HandlerContext, change: tentaflow_protocol::Se
     };
     tokio::spawn(async move {
         let _ = qm
-            .broadcast_to_trusted(
+            .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_SERVICES_UPDATE,
                 &bytes,
                 None,
@@ -5123,7 +5773,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqList",
-            ))
+            ));
         }
     };
 
@@ -5205,7 +5855,7 @@ async fn forward_service_action(
             return (
                 false,
                 Some("mesh transport not available on this node".to_string()),
-            )
+            );
         }
     };
     if let Some(security) = ctx.state.mesh_security.as_ref() {
@@ -5251,7 +5901,7 @@ pub async fn service_delete(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqDelete",
-            ))
+            ));
         }
     };
 
@@ -5333,7 +5983,7 @@ pub async fn service_pin(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqPin",
-            ))
+            ));
         }
     };
 
@@ -5394,7 +6044,7 @@ pub async fn service_pause(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqPause",
-            ))
+            ));
         }
     };
 
@@ -5500,7 +6150,7 @@ pub async fn service_start(
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServicePayload::ReqStart",
-            ))
+            ));
         }
     };
 
@@ -5569,6 +6219,7 @@ pub async fn service_start(
         svc.deploy_method,
         &svc.config_json,
         port_allocator,
+        svc.runtime_port,
     )
     .await;
 
@@ -5640,6 +6291,333 @@ pub async fn service_start(
     ))
 }
 
+#[handler(variant = "ServiceConfigUpdateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqUpdate(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqUpdate",
+            ));
+        }
+    };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceUpdateRemote {
+            service_id: payload.service_id,
+            model_repo: payload.model_repo.clone(),
+            model_preset_id: payload.model_preset_id.clone(),
+            gpu_memory_utilization: payload.gpu_memory_utilization,
+            max_model_len: payload.max_model_len,
+            max_num_seqs: payload.max_num_seqs,
+            max_num_batched_tokens: payload.max_num_batched_tokens,
+            kv_cache_dtype: payload.kv_cache_dtype.clone(),
+            chunked_prefill: payload.chunked_prefill,
+            vllm_args_override: payload.vllm_args_override.clone(),
+            pinned: payload.pinned,
+            paused: payload.paused,
+            restart_after_save: payload.restart_after_save,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResUpdate(
+                tentaflow_protocol::ServiceUpdateResponse {
+                    success,
+                    error,
+                    restarted: payload.restart_after_save && success,
+                },
+            ),
+        ));
+    }
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+
+    // Zaktualizuj config_json: parsujemy istniejący JSON, mergujemy podane
+    // pola, serializujemy. Pozostałe pola (np. ścieżki bundle) zostają.
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&svc.config_json).unwrap_or_else(|_| serde_json::json!({}));
+    let cfg_obj = cfg
+        .as_object_mut()
+        .ok_or_else(|| ProtocolError::bad_request("service config_json is not an object"))?;
+
+    if let Some(repo) = payload.model_repo.as_ref() {
+        cfg_obj.insert("model_repo".into(), serde_json::Value::String(repo.clone()));
+        cfg_obj.insert("model_preset_id".into(), serde_json::Value::Null);
+    }
+    if let Some(preset_id) = payload.model_preset_id.as_ref() {
+        cfg_obj.insert(
+            "model_preset_id".into(),
+            serde_json::Value::String(preset_id.clone()),
+        );
+        cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
+    }
+    if let Some(util) = payload.gpu_memory_utilization {
+        if let Some(num) = serde_json::Number::from_f64(util as f64) {
+            cfg_obj.insert(
+                "gpu_memory_utilization".into(),
+                serde_json::Value::Number(num),
+            );
+        }
+    }
+    if let Some(v) = payload.max_model_len {
+        cfg_obj.insert("max_model_len".into(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = payload.max_num_seqs {
+        cfg_obj.insert("max_num_seqs".into(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = payload.max_num_batched_tokens {
+        cfg_obj.insert(
+            "max_num_batched_tokens".into(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    if let Some(dt) = payload.kv_cache_dtype.as_ref() {
+        cfg_obj.insert(
+            "kv_cache_dtype".into(),
+            serde_json::Value::String(dt.clone()),
+        );
+    }
+    if let Some(b) = payload.chunked_prefill {
+        cfg_obj.insert("chunked_prefill".into(), serde_json::Value::Bool(b));
+    }
+    if let Some(args) = payload.vllm_args_override.as_ref() {
+        cfg_obj.insert("vllm_args".into(), serde_json::Value::String(args.clone()));
+    }
+
+    let new_config_json = serde_json::to_string(&cfg)
+        .map_err(|e| ProtocolError::internal(format!("serialize config: {e}")))?;
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::update_config_json(
+            &conn,
+            payload.service_id,
+            &new_config_json,
+        )
+        .map_err(db_err)?;
+        if let Some(p) = payload.pinned {
+            crate::services_repo::services::set_pinned(&conn, payload.service_id, p)
+                .map_err(db_err)?;
+        }
+        if let Some(p) = payload.paused {
+            crate::services_repo::services::set_paused(&conn, payload.service_id, p)
+                .map_err(db_err)?;
+        }
+    }
+
+    let mut restarted = false;
+    let mut respawn_error: Option<String> = None;
+    let was_running = matches!(
+        svc.status,
+        crate::services_repo::services::ServiceStatus::Running
+            | crate::services_repo::services::ServiceStatus::Degraded
+            | crate::services_repo::services::ServiceStatus::Starting
+    );
+
+    if payload.restart_after_save && was_running {
+        // Stop running runtime — terminate(pid) + release ports.
+        if let Some(ports) = ctx.state.port_allocator.clone() {
+            if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
+                tracing::warn!(
+                    service_id = payload.service_id,
+                    "service_update: stop failed before respawn: {}",
+                    e
+                );
+            }
+            // Mark Starting + spawn detached respawn (jak supervisor).
+            {
+                let conn = ctx
+                    .state
+                    .db
+                    .lock()
+                    .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+                let _ = crate::services_repo::services::update_status(
+                    &conn,
+                    payload.service_id,
+                    crate::services_repo::services::ServiceStatus::Starting,
+                );
+            }
+            let db = ctx.state.db.clone();
+            let svc_id = payload.service_id;
+            let engine_id = svc.engine_id.clone();
+            let deploy_method = svc.deploy_method;
+            let cfg_json = new_config_json.clone();
+            let preserved_port = svc.runtime_port;
+            tokio::spawn(async move {
+                match crate::services::deploy::respawn(
+                    &engine_id,
+                    deploy_method,
+                    &cfg_json,
+                    ports,
+                    preserved_port,
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        if let Ok(conn) = db.lock() {
+                            let _ = crate::services_repo::services::update_runtime(
+                                &conn,
+                                svc_id,
+                                handle.pid,
+                                handle.port,
+                                handle.sidecar_port,
+                                handle.endpoint_url.as_deref(),
+                            );
+                            let _ = crate::services_repo::services::update_status(
+                                &conn,
+                                svc_id,
+                                crate::services_repo::services::ServiceStatus::Running,
+                            );
+                        }
+                        tracing::info!(
+                            "service_update: respawn ok service_id={} engine={}",
+                            svc_id,
+                            engine_id
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("respawn after update: {}", e);
+                        if let Ok(conn) = db.lock() {
+                            let _ = crate::services_repo::services::update_status(
+                                &conn,
+                                svc_id,
+                                crate::services_repo::services::ServiceStatus::Failed,
+                            );
+                            let _ = crate::services_repo::services::update_health(
+                                &conn,
+                                svc_id,
+                                false,
+                                Some(&msg),
+                            );
+                        }
+                        tracing::warn!(
+                            "service_update: respawn failed service_id={}: {}",
+                            svc_id,
+                            msg
+                        );
+                    }
+                }
+            });
+            restarted = true;
+        } else {
+            respawn_error = Some("port allocator not initialized".into());
+        }
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.update",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} restart={}",
+            payload.service_id, payload.restart_after_save
+        )),
+    );
+
+    push_service_updated(ctx, payload.service_id);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResUpdate(tentaflow_protocol::ServiceUpdateResponse {
+            success: respawn_error.is_none(),
+            error: respawn_error,
+            restarted,
+        }),
+    ))
+}
+
+#[handler(variant = "ServiceVramHintRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_vram_hint(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqVramHint(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqVramHint",
+            ));
+        }
+    };
+
+    // Mesh forward NIE jest zaimplementowany dla VramHint — wymagałby
+    // proxy nvidia-smi przez QUIC. Local only na razie. `node_id` ignored.
+    let exclude_pids: Vec<u32> = Vec::new(); // exclude_service_id mapping na PID
+    // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
+    // własny serwis zwykle nie liczy się jako zaskakujący duży
+    // konsument GPU bo jest dopiero startowany lub stopped.
+    let snapshot =
+        crate::services::gpu_snapshot::collect_vram_snapshot(payload.gpu_index, &exclude_pids)
+            .await;
+
+    let recommended = snapshot
+        .first()
+        .map(crate::services::gpu_snapshot::recommended_utilization);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResVramHint(
+            tentaflow_protocol::ServiceVramHintResponse {
+                gpus: snapshot,
+                recommended_utilization: recommended,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "ServiceEnginePresetsRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_engine_presets(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqEnginePresets(p)) => {
+            p.clone()
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqEnginePresets",
+            ));
+        }
+    };
+    let manifest = crate::services::manifest::registry().by_id(&payload.engine_id);
+    let Some(manifest) = manifest else {
+        return Err(ProtocolError::not_found(format!(
+            "engine '{}' not in manifest",
+            payload.engine_id
+        )));
+    };
+    let presets = manifest
+        .model_presets
+        .iter()
+        .map(|p| tentaflow_protocol::ServicePresetInfo {
+            id: p.id.clone(),
+            display_name: p.display_name.clone(),
+            repo: p.repo.clone(),
+            quantization: p.quantization.clone(),
+            recommended: p.recommended,
+        })
+        .collect();
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResEnginePresets(
+            tentaflow_protocol::ServiceEnginePresetsResponse { presets },
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod catalog_list_tests {
     //! Coverage for the snapshot→wire mapping that backs the
@@ -5654,9 +6632,7 @@ mod catalog_list_tests {
         ModelInstance, OutputModality, ServiceSurface, Strategy,
     };
     use std::sync::Arc;
-    use tentaflow_protocol::{
-        CatalogDiagnosticWire, CatalogEntryKindWire, CatalogListRequest,
-    };
+    use tentaflow_protocol::{CatalogDiagnosticWire, CatalogEntryKindWire, CatalogListRequest};
 
     fn snapshot_with(entries: Vec<CatalogEntry>) -> CatalogSnapshot {
         CatalogSnapshot {
@@ -5753,7 +6729,10 @@ mod catalog_list_tests {
 
         let flow = by_id.get("chat-pl").unwrap();
         assert_eq!(flow.owned_by, "tentaflow-flow");
-        assert!(matches!(flow.kind, CatalogEntryKindWire::Flow { flow_id: 17, .. }));
+        assert!(matches!(
+            flow.kind,
+            CatalogEntryKindWire::Flow { flow_id: 17, .. }
+        ));
 
         let alias = by_id.get("rag-llm").unwrap();
         assert_eq!(alias.owned_by, "tentaflow-alias");
@@ -5811,7 +6790,10 @@ mod catalog_list_tests {
         shadowed.diagnostic = Some(CatalogDiagnostic::RemoteShadowed {
             local_owner: "node-z".into(),
         });
-        let snap = snapshot_with(vec![shadowed.clone(), service_entry("ok", ServiceSurface::Chat)]);
+        let snap = snapshot_with(vec![
+            shadowed.clone(),
+            service_entry("ok", ServiceSurface::Chat),
+        ]);
 
         let hidden = catalog_snapshot_to_wire(
             &snap,

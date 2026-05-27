@@ -30,9 +30,8 @@ use tentaflow_protocol::profiling::{
 
 use crate::profiling::collectors::elevation::ElevationKind;
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner,
-    NameInterner, PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector,
-    SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.uncore.imc";

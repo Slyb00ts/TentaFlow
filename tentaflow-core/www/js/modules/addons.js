@@ -21,6 +21,9 @@ import { LogsTab } from '/js/modules/addons/logs.js';
 import { ToolsTab } from '/js/modules/addons/tools.js';
 import { ResourcesTab } from '/js/modules/addons/resources.js';
 import { NetworkTab } from '/js/modules/addons/network.js';
+import { BindingsTab } from '/js/modules/addons/bindings.js';
+// `openInstallWizard` reserved for the future "Install from ZIP" flow on the
+// addons list page; it is no longer triggered from the per-addon header.
 
 // --- Stan listy ------------------------------------------------------------
 let addonsList = [];
@@ -496,6 +499,7 @@ function renderDetail() {
       adminOnly: true,
       count: linkedCount > 0 ? String(linkedCount) : null,
     },
+    { id: 'bindings', icon: 'external-link', label: I18n.t('addons.tab_bindings'), adminOnly: true },
     { id: 'resources', icon: 'chip', label: I18n.t('addons.tab_resources'), adminOnly: true },
     { id: 'network', icon: 'globe', label: I18n.t('addons.tab_network'), adminOnly: true },
     { id: 'logs', icon: 'audit', label: I18n.t('addons.tab_logs'), adminOnly: true },
@@ -572,6 +576,12 @@ function renderDetailHeader(d) {
     }));
   }
 
+  // Note: previously had "Konfiguruj" button which opened the install wizard
+  // (F2-P7 6-step UI). Removed — that wizard is for fresh installs only, and
+  // for an already-installed addon it duplicated functionality covered by
+  // the per-addon tabs (Ustawienia / Uprawnienia / OAuth / Sieć / etc.).
+  // The TentaVision-specific cameras step shouldn't appear for unrelated
+  // addons either. Settings tab is the canonical configuration surface.
   const actions = isAdmin ? `
     <tf-button variant="ghost" icon="refresh" id="hdr-reload">${escapeHtml(I18n.t('addon_reload.button'))}</tf-button>
     <tf-button variant="danger" icon="trash" id="hdr-uninstall">${escapeHtml(I18n.t('addon_uninstall.button'))}</tf-button>
@@ -640,6 +650,11 @@ async function switchTab(tabId) {
     }
     await LinkedAccountsTab.mount(body, currentAddonId);
     activeTabController = LinkedAccountsTab;
+    return;
+  }
+  if (tabId === 'bindings') {
+    await BindingsTab.mount(body, currentAddonId);
+    activeTabController = BindingsTab;
     return;
   }
   if (tabId === 'resources') {

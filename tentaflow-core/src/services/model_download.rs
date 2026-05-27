@@ -59,8 +59,8 @@ pub async fn download_with_progress(
         dest.extension().and_then(|s| s.to_str()).unwrap_or("tmp")
     ));
 
-    let mut file = std::fs::File::create(&partial)
-        .with_context(|| format!("create {}", partial.display()))?;
+    let mut file =
+        std::fs::File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
 
     let mut downloaded: u64 = 0;
     let mut last_progress_bytes: u64 = 0;
@@ -82,13 +82,8 @@ pub async fn download_with_progress(
     file.flush().context("flush")?;
     drop(file);
 
-    std::fs::rename(&partial, dest).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            partial.display(),
-            dest.display()
-        )
-    })?;
+    std::fs::rename(&partial, dest)
+        .with_context(|| format!("rename {} -> {}", partial.display(), dest.display()))?;
 
     if let Some(ref cb) = progress {
         cb(downloaded, downloaded, label);

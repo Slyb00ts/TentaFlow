@@ -43,7 +43,10 @@ pub fn ensure_firewall_rules() {
     let exe_path = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("firewall_check: nie udalo sie pobrac sciezki binarki: {}", e);
+            tracing::warn!(
+                "firewall_check: nie udalo sie pobrac sciezki binarki: {}",
+                e
+            );
             return;
         }
     };
@@ -72,7 +75,8 @@ pub fn ensure_firewall_rules() {
              ale moze nie byc widoczny z LAN. Aby ustawic recznie uruchom jako Admin: \
              New-NetFirewallRule -DisplayName \"TentaFlow Inbound\" -Direction Inbound \
              -Program \"{}\" -Action Allow",
-            e, exe_path_str
+            e,
+            exe_path_str
         );
     }
 }
@@ -114,10 +118,7 @@ fn rule_exists(exe_path: &str, direction: &str) -> bool {
 /// Odpala elevated PowerShell ze skryptem dodajacym brakujace reguly.
 /// `Start-Process -Verb RunAs` w PS triggeruje UAC; jak user odmowi,
 /// powershell zwraca non-zero exit.
-fn request_elevated_rules(
-    exe_path: &str,
-    missing: &[&'static str],
-) -> std::io::Result<()> {
+fn request_elevated_rules(exe_path: &str, missing: &[&'static str]) -> std::io::Result<()> {
     let exe_escaped = exe_path.replace('\'', "''");
 
     // Sciezka skryptu robocza — w TEMP zeby uniknac problemow z permissions.
@@ -173,7 +174,10 @@ fn request_elevated_rules(
         }
         Ok(s) => Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("UAC odrzucony lub elevated PS zwrocil exit code {:?}", s.code()),
+            format!(
+                "UAC odrzucony lub elevated PS zwrocil exit code {:?}",
+                s.code()
+            ),
         )),
         Err(e) => Err(e),
     }

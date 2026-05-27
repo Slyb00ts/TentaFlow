@@ -1,0 +1,662 @@
+// =============================================================================
+// Plik: sdk-runtime/data-table-renderer.js
+// Opis: Renderer Table (0x0211) — uses <tf-table> + <tf-column> web components.
+// Columns mapped to <tf-column> children, data set via .rows property.
+// Sort, pagination, selection, bulk actions, row actions, empty state,
+// expandable rows — all SDK features preserved with reactive bindings.
+//
+// Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs Table +
+// inline.rs (TableColumn, TablePagination, TableColumnWidth).
+// =============================================================================
+
+import {
+  registerComponentRenderer,
+  lookupComponentRenderer,
+} from './component-renderer.js';
+import { resolveBindRef, subscribeBindRef, formatValue } from './bind-resolver.js';
+
+const TABLE_VARIANTS = new Set(['default', 'striped', 'borderless', 'compact']);
+const TABLE_SELECT_MODES = new Set(['none', 'single', 'multi']);
+const DENSITIES = new Set(['compact', 'default', 'comfortable']);
+const SORT_DIRECTIONS = new Set(['asc', 'desc']);
+const TEXT_ALIGNS = new Set(['start', 'center', 'end', 'justify']);
+const COLUMN_RENDERS = new Set([
+  'text', 'number', 'currency', 'percent', 'bytes',
+  'date', 'time', 'datetime', 'relative',
+  'badge', 'chip', 'tag', 'avatar', 'avatar_group', 'icon',
+  'stat', 'trend', 'progress', 'rating', 'actions', 'link', 'custom',
+]);
+const COLUMN_WIDTH_KINDS = new Set(['auto', 'min_content', 'max_content', 'px', 'fr']);
+const VALUE_FORMAT_KINDS = new Set([
+  'number', 'currency', 'percent', 'bytes', 'duration',
+  'date', 'time', 'datetime', 'relative', 'plain',
+]);
+const ID_RE = /^[a-z0-9_-]{1,64}$/;
+const TEMPLATE_ID_RE = /^[a-z0-9_-]{1,64}$/;
+const EMPTY_STATE_TAG = 0x0003;
+const BUTTON_TAG = 0x0401;
+const COLUMN_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+const PAGINATION_KEYS = new Set([0, 1, 2]);
+
+function requireEnum(v, set, ctx) {
+  if (typeof v !== 'string' || !set.has(v)) {
+    throw new TypeError(`${ctx}: expected one of ${[...set].join('/')}, got ${JSON.stringify(v)}`);
+  }
+  return v;
+}
+function requireBool(v, ctx) {
+  if (typeof v !== 'boolean') throw new TypeError(`${ctx}: expected boolean, got ${typeof v}`);
+  return v;
+}
+function requireU8(v, ctx) {
+  if (!Number.isInteger(v) || v < 0 || v > 0xFF) throw new TypeError(`${ctx}: expected u8, got ${v}`);
+  return v;
+}
+function requireU32(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFFFFFFFn) throw new TypeError(`${ctx}: expected u32`);
+    return Number(v);
+  }
+  if (!Number.isInteger(v) || v < 0 || v > 0xFFFFFFFF) {
+    throw new TypeError(`${ctx}: expected u32, got ${v}`);
+  }
+  return v;
+}
+function requireString(v, ctx) {
+  if (typeof v !== 'string') throw new TypeError(`${ctx}: expected string`);
+  return v;
+}
+function requirePath(v, ctx) {
+  if (!Array.isArray(v)) throw new TypeError(`${ctx}: expected StatePath`);
+  return v;
+}
+function assertOnlyKnownFields(fields, allowedKeys, name) {
+  for (const [k] of fields) {
+    if (!allowedKeys.has(k)) {
+      throw new TypeError(`${name}: unknown field key ${k} (allowed: ${[...allowedKeys].join(',')})`);
+    }
+  }
+}
+const VALUE_FORMAT_VARIANT_KEYS = {
+  plain:    new Set(['kind']),
+  number:   new Set(['kind', 'decimals', 'thousands_sep']),
+  currency: new Set(['kind', 'code']),
+  percent:  new Set(['kind', 'decimals']),
+  bytes:    new Set(['kind', 'base']),
+  duration: new Set(['kind', 'style']),
+  date:     new Set(['kind', 'style']),
+  time:     new Set(['kind', 'style']),
+  datetime: new Set(['kind', 'style']),
+  relative: new Set(['kind']),
+};
+function assertValueFormat(fmt, ctx, locale) {
+  if (fmt == null) return;
+  if (typeof fmt !== 'object' || Array.isArray(fmt)) {
+    throw new TypeError(`${ctx}: ValueFormat must be object`);
+  }
+  if (typeof fmt.kind !== 'string' || !VALUE_FORMAT_KINDS.has(fmt.kind)) {
+    throw new TypeError(`${ctx}: ValueFormat.kind invalid: ${fmt.kind}`);
+  }
+  const allowed = VALUE_FORMAT_VARIANT_KEYS[fmt.kind];
+  for (const k of Object.keys(fmt)) {
+    if (!allowed.has(k)) throw new TypeError(`${ctx}: unexpected key '${k}' for kind=${fmt.kind}`);
+  }
+  try { formatValue(0, fmt, locale); }
+  catch (err) {
+    throw new TypeError(`${ctx}: invalid ValueFormat — ${err && err.message ? err.message : err}`);
+  }
+}
+
+function parseColumnWidth(raw, ctx) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError(`${ctx}: TableColumnWidth must be object`);
+  }
+  if (typeof raw.kind !== 'string' || !COLUMN_WIDTH_KINDS.has(raw.kind)) {
+    throw new TypeError(`${ctx}.kind invalid: ${raw.kind}`);
+  }
+  switch (raw.kind) {
+    case 'auto':
+    case 'min_content':
+    case 'max_content': {
+      for (const k of Object.keys(raw)) if (k !== 'kind') throw new TypeError(`${ctx}: unexpected key '${k}'`);
+      return { kind: raw.kind };
+    }
+    case 'px':
+    case 'fr': {
+      for (const k of Object.keys(raw)) if (k !== 'kind' && k !== 'value') throw new TypeError(`${ctx}: unexpected key '${k}'`);
+      const max = raw.kind === 'px' ? 0xFFFFFFFF : 0xFF;
+      if (!Number.isInteger(raw.value) || raw.value < 1 || raw.value > max) {
+        throw new TypeError(`${ctx}.value must be ${raw.kind === 'px' ? 'u32 >= 1' : 'u8 >= 1'}`);
+      }
+      return { kind: raw.kind, value: raw.value };
+    }
+  }
+  throw new TypeError(`${ctx}: unreachable`);
+}
+
+function parseColumn(raw, ctx, locale) {
+  if (!Array.isArray(raw)) throw new TypeError(`${ctx}: TableColumn must be FieldMap`);
+  const seen = new Set();
+  const col = { id: null, header: null, field_path: null, width: null, render: null, format: null, align: null, sortable: null, hidden_by_default: null, sticky_left: null };
+  for (const entry of raw) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry [u8, Value]`);
+    const [k, v] = entry;
+    if (!COLUMN_KEYS.has(k)) throw new TypeError(`${ctx}: unknown TableColumn key ${k}`);
+    if (seen.has(k)) throw new TypeError(`${ctx}: duplicate key ${k}`);
+    seen.add(k);
+    switch (k) {
+      case 0: {
+        const id = requireString(v, `${ctx}.id`);
+        if (!ID_RE.test(id)) throw new TypeError(`${ctx}.id: invalid grammar`);
+        col.id = id;
+        break;
+      }
+      case 1: col.header = v; break;
+      case 2: {
+        const segs = requirePath(v, `${ctx}.field_path`);
+        for (let si = 0; si < segs.length; si++) {
+          const s = segs[si];
+          if (!s || typeof s !== 'object' || Array.isArray(s)) {
+            throw new TypeError(`${ctx}.field_path[${si}]: PathSegment must be object`);
+          }
+          if (s.kind !== 'key' && s.kind !== 'index') {
+            throw new TypeError(`${ctx}.field_path[${si}].kind must be key/index, got ${s.kind}`);
+          }
+          if (s.kind === 'key' && typeof s.value !== 'string') {
+            throw new TypeError(`${ctx}.field_path[${si}].value must be string for kind=key`);
+          }
+          if (s.kind === 'index' && !Number.isInteger(s.value)) {
+            throw new TypeError(`${ctx}.field_path[${si}].value must be integer for kind=index`);
+          }
+        }
+        col.field_path = segs;
+        break;
+      }
+      case 3: col.width = parseColumnWidth(v, `${ctx}.width`); break;
+      case 4: col.render = requireEnum(v, COLUMN_RENDERS, `${ctx}.render`); break;
+      case 5: if (v != null) { assertValueFormat(v, `${ctx}.format`, locale); col.format = v; } break;
+      case 6: if (v != null) col.align = requireEnum(v, TEXT_ALIGNS, `${ctx}.align`); break;
+      case 7: col.sortable = requireBool(v, `${ctx}.sortable`); break;
+      case 8: col.hidden_by_default = requireBool(v, `${ctx}.hidden_by_default`); break;
+      case 9: col.sticky_left = requireBool(v, `${ctx}.sticky_left`); break;
+    }
+  }
+  if (col.id == null) throw new TypeError(`${ctx}: id required`);
+  if (col.header == null) throw new TypeError(`${ctx}: header required`);
+  if (col.field_path == null) throw new TypeError(`${ctx}: field_path required`);
+  if (col.width == null) throw new TypeError(`${ctx}: width required`);
+  if (col.render == null) throw new TypeError(`${ctx}: render required`);
+  if (col.sortable == null) throw new TypeError(`${ctx}: sortable required`);
+  if (col.hidden_by_default == null) throw new TypeError(`${ctx}: hidden_by_default required`);
+  if (col.sticky_left == null) throw new TypeError(`${ctx}: sticky_left required`);
+  return col;
+}
+
+function parsePagination(raw, ctx) {
+  if (raw == null) return null;
+  if (!Array.isArray(raw)) throw new TypeError(`${ctx}: TablePagination must be FieldMap`);
+  const seen = new Set();
+  const p = { page_size: null, current_page_path: null, show_size_picker: null };
+  for (const entry of raw) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry [u8, Value]`);
+    const [k, v] = entry;
+    if (!PAGINATION_KEYS.has(k)) throw new TypeError(`${ctx}: unknown TablePagination key ${k}`);
+    if (seen.has(k)) throw new TypeError(`${ctx}: duplicate key ${k}`);
+    seen.add(k);
+    switch (k) {
+      case 0: p.page_size = requireU32(v, `${ctx}.page_size`); break;
+      case 1: p.current_page_path = requirePath(v, `${ctx}.current_page_path`); break;
+      case 2: p.show_size_picker = requireBool(v, `${ctx}.show_size_picker`); break;
+    }
+  }
+  if (p.page_size == null) throw new TypeError(`${ctx}: page_size required`);
+  if (p.page_size === 0) throw new TypeError(`${ctx}: page_size must be > 0`);
+  if (p.current_page_path == null) throw new TypeError(`${ctx}: current_page_path required`);
+  if (p.show_size_picker == null) throw new TypeError(`${ctx}: show_size_picker required`);
+  return p;
+}
+
+function assertComponentRef(c, expectedTag, ctxName) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) {
+    throw new TypeError(`${ctxName}: Component must be object`);
+  }
+  if (c.tag !== expectedTag) {
+    throw new TypeError(`${ctxName}: expected tag 0x${expectedTag.toString(16)}, got 0x${(c.tag || 0).toString(16)}`);
+  }
+  if (typeof c.id !== 'string' || c.id.length === 0) {
+    throw new TypeError(`${ctxName}.id must be non-empty string`);
+  }
+  if (!Array.isArray(c.fields)) throw new TypeError(`${ctxName}.fields must be Array`);
+}
+
+function applyTextBind(element, bindRef, ctx) {
+  const apply = () => {
+    const v = resolveBindRef(bindRef, ctx.store);
+    element.textContent = v == null ? '' : String(v);
+  };
+  apply();
+  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
+}
+
+function readRowField(row, segments) {
+  let cur = row;
+  for (const seg of segments) {
+    if (cur == null) return undefined;
+    if (typeof cur !== 'object') return undefined;
+    if (seg.kind === 'key') cur = cur[seg.value];
+    else if (seg.kind === 'index') cur = Array.isArray(cur) ? cur[seg.value] : undefined;
+    else return undefined;
+  }
+  return cur;
+}
+
+function formatCellValue(value, render, format, locale) {
+  if (value == null) return '';
+  if (format != null) {
+    try { return formatValue(value, format, locale); }
+    catch { /* fall through */ }
+  }
+  switch (render) {
+    case 'number':
+    case 'percent':
+    case 'bytes':
+      try {
+        return new Intl.NumberFormat(locale).format(typeof value === 'bigint' ? Number(value) : value);
+      } catch { return String(value); }
+    case 'currency': return String(value);
+    case 'date':
+    case 'time':
+    case 'datetime':
+      try {
+        const opts = render === 'date' ? { dateStyle: 'medium' }
+          : render === 'time' ? { timeStyle: 'medium' }
+          : { dateStyle: 'medium', timeStyle: 'short' };
+        return new Intl.DateTimeFormat(locale, opts).format(new Date(value));
+      } catch { return String(value); }
+    default: return typeof value === 'object' ? JSON.stringify(value) : String(value);
+  }
+}
+
+/// Map field_path to a simple key string for tf-column key attribute.
+/// Takes the first key segment's value as the column key.
+function fieldPathToKey(fieldPath) {
+  for (const seg of fieldPath) {
+    if (seg.kind === 'key') return seg.value;
+  }
+  return '';
+}
+
+// =============================================================================
+// Table (0x0211) — uses <tf-table> + <tf-column> web components
+// =============================================================================
+
+export const TABLE_TAG = 0x0211;
+const TABLE_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+
+function renderTable(component, ctx) {
+  assertOnlyKnownFields(component.fields, TABLE_FIELD_KEYS, 'Table');
+
+  const columnsRaw = ctx.readField(component.fields, 0);
+  const columns = columnsRaw == null ? [] : (() => {
+    if (!Array.isArray(columnsRaw)) throw new TypeError('Table.columns: expected Array<TableColumn>');
+    return columnsRaw.map((c, i) => parseColumn(c, `Table.columns[${i}]`, ctx.locale));
+  })();
+  const colIds = new Set();
+  for (const col of columns) {
+    if (colIds.has(col.id)) throw new TypeError(`Table.columns: duplicate id '${col.id}'`);
+    colIds.add(col.id);
+  }
+  const rowsPath = requirePath(ctx.readField(component.fields, 1), 'Table.rows_path');
+  const rowKeyField = requireString(ctx.readField(component.fields, 2), 'Table.row_key_field');
+  if (rowKeyField.length === 0) throw new TypeError('Table.row_key_field must be non-empty');
+  const variant = requireEnum(ctx.readField(component.fields, 3), TABLE_VARIANTS, 'Table.variant');
+  const density = requireEnum(ctx.readField(component.fields, 4), DENSITIES, 'Table.density');
+  const sortable = requireBool(ctx.readField(component.fields, 5), 'Table.sortable');
+  const sortByBind = ctx.readField(component.fields, 6);
+  const selectMode = requireEnum(ctx.readField(component.fields, 7), TABLE_SELECT_MODES, 'Table.selectable');
+  const selectedIdsBind = ctx.readField(component.fields, 8);
+  if (selectMode !== 'none' && selectedIdsBind == null) {
+    throw new TypeError('Table.selectable != none requires selected_ids BindRef');
+  }
+  const stickyHeader = requireBool(ctx.readField(component.fields, 9), 'Table.sticky_header');
+  const stickyColumns = requireU8(ctx.readField(component.fields, 10), 'Table.sticky_columns');
+  if (stickyColumns > columns.length) {
+    throw new TypeError(`Table.sticky_columns (${stickyColumns}) > columns.length (${columns.length})`);
+  }
+  const paginationRaw = ctx.readField(component.fields, 11);
+  const pagination = parsePagination(paginationRaw, 'Table.pagination');
+  const emptyStateRaw = ctx.readField(component.fields, 12);
+  if (emptyStateRaw != null) assertComponentRef(emptyStateRaw, EMPTY_STATE_TAG, 'Table.empty_state');
+  const rowActionsRaw = ctx.readField(component.fields, 13);
+  const rowActions = rowActionsRaw == null ? [] : (() => {
+    if (!Array.isArray(rowActionsRaw)) throw new TypeError('Table.row_actions: expected Array<Component>');
+    for (let i = 0; i < rowActionsRaw.length; i++) {
+      assertComponentRef(rowActionsRaw[i], BUTTON_TAG, `Table.row_actions[${i}]`);
+    }
+    return rowActionsRaw;
+  })();
+  const bulkActionsRaw = ctx.readField(component.fields, 14);
+  const bulkActions = bulkActionsRaw == null ? [] : (() => {
+    if (!Array.isArray(bulkActionsRaw)) throw new TypeError('Table.bulk_actions: expected Array<Component>');
+    for (let i = 0; i < bulkActionsRaw.length; i++) {
+      assertComponentRef(bulkActionsRaw[i], BUTTON_TAG, `Table.bulk_actions[${i}]`);
+    }
+    return bulkActionsRaw;
+  })();
+  const virtualize = requireBool(ctx.readField(component.fields, 15), 'Table.virtualize');
+  const rowExpandable = requireBool(ctx.readField(component.fields, 16), 'Table.row_expandable');
+  const expandedRowTemplateRaw = ctx.readField(component.fields, 17);
+  const expandedRowTemplateId = expandedRowTemplateRaw == null
+    ? null
+    : (() => {
+      const t = requireString(expandedRowTemplateRaw, 'Table.expanded_row_template_id');
+      if (!TEMPLATE_ID_RE.test(t)) throw new TypeError('Table.expanded_row_template_id: invalid grammar');
+      return t;
+    })();
+  if (rowExpandable && expandedRowTemplateId == null) {
+    throw new TypeError('Table.row_expandable=true requires expanded_row_template_id');
+  }
+
+  // Create <tf-table> web component
+  const tfTable = document.createElement('tf-table');
+  if (sortable) tfTable.setAttribute('sortable', '');
+  if (selectMode !== 'none') tfTable.setAttribute('selectable', '');
+
+  // Wrapper div for additional SDK features (bulk actions, pagination, empty state)
+  const wrapper = document.createElement('div');
+  wrapper.classList.add('tf-table');
+  wrapper.classList.add(`tf-table--variant-${variant}`);
+  wrapper.classList.add(`tf-table--density-${density}`);
+  if (stickyHeader) wrapper.classList.add('tf-table--sticky-header');
+  if (virtualize) wrapper.classList.add('tf-table--virtualize');
+
+  // Bulk actions toolbar
+  let bulkToolbar = null;
+  if (bulkActions.length > 0 && selectMode === 'multi') {
+    bulkToolbar = document.createElement('div');
+    bulkToolbar.classList.add('tf-table__bulk-actions');
+    bulkToolbar.setAttribute('role', 'toolbar');
+    bulkToolbar.hidden = true;
+    for (const ba of bulkActions) {
+      bulkToolbar.appendChild(ctx.renderChild(ba));
+    }
+    wrapper.appendChild(bulkToolbar);
+  }
+
+  // Create <tf-column> children for visible columns
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i];
+    if (col.hidden_by_default) continue;
+    const tfCol = document.createElement('tf-column');
+    tfCol.setAttribute('key', fieldPathToKey(col.field_path));
+    if (sortable && col.sortable) tfCol.setAttribute('sortable', '');
+    if (col.render === 'number' || col.render === 'currency' || col.render === 'percent' || col.render === 'bytes') {
+      tfCol.setAttribute('renderer', 'num');
+      tfCol.setAttribute('align', 'num');
+    } else if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
+      tfCol.setAttribute('renderer', 'chip');
+    } else {
+      tfCol.setAttribute('renderer', 'text');
+    }
+    // Reactive header label
+    applyTextBind(tfCol, col.header, ctx);
+    tfCol.setAttribute('label', tfCol.textContent || col.id);
+    tfTable.appendChild(tfCol);
+  }
+
+  wrapper.appendChild(tfTable);
+
+  // Empty state slot
+  let emptyStateEl = null;
+  if (emptyStateRaw != null) {
+    emptyStateEl = ctx.renderChild(emptyStateRaw);
+    emptyStateEl.classList.add('tf-table__empty-state');
+    emptyStateEl.hidden = true;
+    wrapper.appendChild(emptyStateEl);
+  }
+
+  // Pagination footer
+  let paginationEl = null;
+  let pageSizeRef = null;
+  if (pagination != null) {
+    paginationEl = document.createElement('nav');
+    paginationEl.classList.add('tf-table__pagination');
+    paginationEl.setAttribute('aria-label', 'Pagination');
+    pageSizeRef = pagination.page_size;
+    wrapper.appendChild(paginationEl);
+  }
+
+  // Per-rebuild cleanups
+  let rebuildCleanups = [];
+  const runRebuildCleanups = () => {
+    for (const fn of rebuildCleanups) { try { fn(); } catch {} }
+    rebuildCleanups = [];
+  };
+  ctx.registerCleanup(runRebuildCleanups);
+
+  const extractRowId = (row) => {
+    if (row == null || typeof row !== 'object') {
+      throw new TypeError(`Table.row missing row_key_field '${rowKeyField}'`);
+    }
+    const id = row[rowKeyField];
+    if (typeof id !== 'string') {
+      throw new TypeError(`Table.row.${rowKeyField} must be string, got ${typeof id}`);
+    }
+    return id;
+  };
+
+  const readAllRows = () => {
+    let rows;
+    try { rows = ctx.store.read(rowsPath); } catch { rows = undefined; }
+    return Array.isArray(rows) ? rows : [];
+  };
+
+  const getCurrentPage = () => {
+    if (pagination == null) return 1;
+    try {
+      const v = ctx.store.read(pagination.current_page_path);
+      const n = typeof v === 'bigint' ? Number(v) : Number(v);
+      return Number.isInteger(n) && n >= 1 ? n : 1;
+    } catch { return 1; }
+  };
+
+  const readVisibleRows = () => {
+    const all = readAllRows();
+    if (pagination == null) return all;
+    const page = getCurrentPage();
+    const start = (page - 1) * pageSizeRef;
+    return all.slice(start, start + pageSizeRef);
+  };
+
+  const getSelectedSet = () => {
+    if (selectedIdsBind == null) return new Set();
+    const v = resolveBindRef(selectedIdsBind, ctx.store);
+    if (selectMode === 'single') {
+      return typeof v === 'string' ? new Set([v]) : new Set();
+    }
+    return Array.isArray(v) ? new Set(v.filter((s) => typeof s === 'string')) : new Set();
+  };
+
+  // Transform SDK rows to flat objects for tf-table .rows property.
+  // tf-table reads values by column key from row objects.
+  const transformRows = (rows) => {
+    return rows.map((row) => {
+      const flat = { ...row };
+      // For nested field_paths, resolve and add as top-level key
+      for (const col of columns) {
+        if (col.hidden_by_default) continue;
+        const key = fieldPathToKey(col.field_path);
+        const rawVal = readRowField(row, col.field_path);
+        const formatted = formatCellValue(rawVal, col.render, col.format, ctx.locale);
+        if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
+          flat[key] = { label: formatted, status: 'info' };
+        } else {
+          flat[key] = formatted;
+        }
+      }
+      return flat;
+    });
+  };
+
+  const rebuild = () => {
+    runRebuildCleanups();
+    const rows = readVisibleRows();
+    if (rows.length === 0) {
+      tfTable.rows = [];
+      if (emptyStateEl) emptyStateEl.hidden = false;
+      if (paginationEl) renderPagination();
+      if (bulkToolbar) bulkToolbar.hidden = true;
+      return;
+    }
+    if (emptyStateEl) emptyStateEl.hidden = true;
+
+    // Set rows on tf-table
+    tfTable.rows = transformRows(rows);
+
+    const selectedSet = getSelectedSet();
+    if (bulkToolbar) {
+      bulkToolbar.hidden = selectedSet.size === 0;
+    }
+    if (paginationEl) renderPagination();
+  };
+
+  const renderPagination = () => {
+    if (paginationEl == null || pagination == null) return;
+    paginationEl.replaceChildren();
+    const total = readAllRows().length;
+    const pages = Math.max(1, Math.ceil(total / pageSizeRef));
+    const page = getCurrentPage();
+
+    const prev = document.createElement('button');
+    prev.setAttribute('type', 'button');
+    prev.classList.add('tf-table__page-btn');
+    prev.textContent = '‹';
+    prev.disabled = page <= 1;
+    const onPrev = () => {
+      if (page <= 1) return;
+      wrapper.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)('page_change', {
+          bubbles: false,
+          detail: { page: page - 1, page_size: pageSizeRef },
+        })
+      );
+    };
+    prev.addEventListener('click', onPrev);
+    rebuildCleanups.push(() => prev.removeEventListener('click', onPrev));
+    paginationEl.appendChild(prev);
+
+    const info = document.createElement('span');
+    info.classList.add('tf-table__page-info');
+    info.textContent = `${page} / ${pages}`;
+    paginationEl.appendChild(info);
+
+    const next = document.createElement('button');
+    next.setAttribute('type', 'button');
+    next.classList.add('tf-table__page-btn');
+    next.textContent = '›';
+    next.disabled = page >= pages;
+    const onNext = () => {
+      if (page >= pages) return;
+      wrapper.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)('page_change', {
+          bubbles: false,
+          detail: { page: page + 1, page_size: pageSizeRef },
+        })
+      );
+    };
+    next.addEventListener('click', onNext);
+    rebuildCleanups.push(() => next.removeEventListener('click', onNext));
+    paginationEl.appendChild(next);
+
+    if (pagination.show_size_picker) {
+      const sizeSel = document.createElement('select');
+      sizeSel.classList.add('tf-table__page-size');
+      sizeSel.setAttribute('aria-label', 'Page size');
+      for (const sz of [10, 25, 50, 100]) {
+        const opt = document.createElement('option');
+        opt.value = String(sz);
+        opt.textContent = `${sz} / page`;
+        if (sz === pageSizeRef) opt.selected = true;
+        sizeSel.appendChild(opt);
+      }
+      const onSize = () => {
+        const newSize = Number.parseInt(sizeSel.value, 10);
+        if (!Number.isInteger(newSize) || newSize <= 0) return;
+        wrapper.dispatchEvent(
+          new (globalThis.CustomEvent || globalThis.Event)('page_size_change', {
+            bubbles: false,
+            detail: { page_size: newSize },
+          })
+        );
+      };
+      sizeSel.addEventListener('change', onSize);
+      rebuildCleanups.push(() => sizeSel.removeEventListener('change', onSize));
+      paginationEl.appendChild(sizeSel);
+    }
+  };
+
+  // Bridge tf-table events to SDK event protocol
+  const onSort = (e) => {
+    const { key, dir } = e.detail || {};
+    if (!key) return;
+    const sortPayload = { column_id: key, direction: dir === 'desc' ? 'desc' : 'asc' };
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('sort_change', {
+        bubbles: false,
+        detail: { sort: sortPayload },
+      })
+    );
+  };
+  tfTable.addEventListener('sort', onSort);
+  ctx.registerCleanup(() => tfTable.removeEventListener('sort', onSort));
+
+  const onRowClick = (e) => {
+    const { row, index } = e.detail || {};
+    if (!row) return;
+    const rowId = row[rowKeyField] || `row-${index}`;
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('row_click', {
+        bubbles: false,
+        detail: { row_id: rowId },
+      })
+    );
+    // Handle selection for SDK protocol
+    if (selectMode !== 'none' && e.detail?.selected !== undefined) {
+      const selIds = selectMode === 'single'
+        ? (e.detail.selected ? rowId : null)
+        : (() => {
+          const cur = Array.from(getSelectedSet());
+          return e.detail.selected
+            ? [...cur.filter((i) => i !== rowId), rowId]
+            : cur.filter((i) => i !== rowId);
+        })();
+      wrapper.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
+          bubbles: false,
+          detail: { selected_ids: selIds, mode: selectMode, changed_row_id: rowId },
+        })
+      );
+    }
+  };
+  tfTable.addEventListener('row-click', onRowClick);
+  ctx.registerCleanup(() => tfTable.removeEventListener('row-click', onRowClick));
+
+  rebuild();
+  ctx.registerCleanup(ctx.store.subscribe(rowsPath, rebuild));
+  if (selectedIdsBind != null) {
+    ctx.registerCleanup(subscribeBindRef(selectedIdsBind, ctx.store, rebuild));
+  }
+  if (pagination != null) {
+    ctx.registerCleanup(ctx.store.subscribe(pagination.current_page_path, rebuild));
+  }
+
+  return wrapper;
+}
+
+// =============================================================================
+// Rejestracja
+// =============================================================================
+
+export function registerDataTableRenderer() {
+  if (!lookupComponentRenderer(TABLE_TAG)) registerComponentRenderer(TABLE_TAG, renderTable);
+}

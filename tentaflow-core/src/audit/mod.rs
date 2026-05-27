@@ -9,8 +9,87 @@ use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+pub mod chain;
+pub mod verify;
+
+// =============================================================================
+// RiskClass — klasyfikacja RODO wpisu audytowego (F1a §6.2.Y)
+// =============================================================================
+
+/// Klasa ryzyka wpisu audit log. Wartosc zapisywana do kolumny `risk_class`.
+/// `Unclassified` — domyslna gdy wywolanie nie deklaruje klasy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RiskClass {
+    /// Klasa A — operacje administracyjne i operacyjne bez danych osobowych
+    /// wysokiej kategorii.
+    A,
+    /// Klasa B — operacje na danych osobowych zwyklych (RODO art. 6).
+    B,
+    /// Klasa C — operacje na danych wrazliwych / biometrycznych / decyzje
+    /// automatyczne (RODO art. 9, art. 22).
+    C,
+    /// Nieklasyfikowane — backward compat dla wpisow sprzed F1a.
+    Unclassified,
+}
+
+impl RiskClass {
+    /// Reprezentacja DB (kolumna TEXT).
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+impl std::fmt::Display for RiskClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_db_str())
+    }
+}
+
+impl FromStr for RiskClass {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "A" => Ok(Self::A),
+            "B" => Ok(Self::B),
+            "C" => Ok(Self::C),
+            "unclassified" => Ok(Self::Unclassified),
+            _ => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod risk_class_tests {
+    use super::*;
+
+    #[test]
+    fn risk_class_roundtrip() {
+        for rc in [
+            RiskClass::A,
+            RiskClass::B,
+            RiskClass::C,
+            RiskClass::Unclassified,
+        ] {
+            assert_eq!(RiskClass::from_str(rc.as_db_str()).unwrap(), rc);
+        }
+    }
+
+    #[test]
+    fn risk_class_invalid() {
+        assert!(RiskClass::from_str("D").is_err());
+        assert!(RiskClass::from_str("").is_err());
+    }
+}
 
 // =============================================================================
 // Stale konfiguracyjne
@@ -207,10 +286,12 @@ impl AuditLogger {
             return;
         }
 
-        // W9: Przygotuj statement raz przed petla — unika parsowania SQL przy kazdym wpisie
+        // W9: Przygotuj statement raz przed petla — unika parsowania SQL przy kazdym wpisie.
+        // F1b P4: kazdy wiersz w aktywnym chain'ie musi miec policzone prev_hash/hash,
+        // wiec wstawiamy je takze tutaj (bufor `AuditLogger`).
         let mut stmt = match conn.prepare(
-            "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, risk_class, prev_hash, hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unclassified', ?9, ?10)"
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -222,8 +303,37 @@ impl AuditLogger {
 
         let mut inserted = 0u64;
         for entry in &entries {
+            let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+            let hash_input = chain::AuditRowHashInput {
+                user_id: entry.user_id,
+                addon_id: entry.addon_id.as_deref(),
+                instance_id: None,
+                action: &entry.action,
+                resource: entry.resource.as_deref(),
+                resource_type: None,
+                resource_id: None,
+                result: None,
+                error_message: None,
+                details: entry.details.as_deref(),
+                ip_address: entry.ip_address.as_deref(),
+                node_id: entry.node_id.as_deref(),
+                severity: Some("info"),
+                risk_class: "unclassified",
+                related_claim_id: None,
+                request_id: None,
+                timestamp: &timestamp,
+            };
+            let (prev_hash_blob, hash_blob) =
+                match chain::compute_chain_for_insert(&conn, &hash_input) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Blad obliczenia hash audit chain: {}", e);
+                        continue;
+                    }
+                };
+
             let result = stmt.execute(rusqlite::params![
-                entry.timestamp.to_rfc3339(),
+                timestamp,
                 entry.user_id,
                 entry.addon_id,
                 entry.action,
@@ -231,6 +341,8 @@ impl AuditLogger {
                 entry.details,
                 entry.ip_address,
                 entry.node_id,
+                prev_hash_blob,
+                hash_blob,
             ]);
 
             match result {

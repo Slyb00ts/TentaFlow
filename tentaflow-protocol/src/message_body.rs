@@ -107,6 +107,13 @@ pub struct ServiceInfo {
     pub endpoint_url: Option<String>,
     pub restart_count: u32,
     pub health_last_err: Option<String>,
+    /// Krótki user-friendly opis aktualnej fazy startu (np.
+    /// "warming up — alive 30s, waiting for /v1/models"). Aktualizowany
+    /// przez supervisor heartbeat co 5s podczas Starting. Frontend
+    /// pokazuje obok status chipa, zeby user widzial PROGRES (vLLM
+    /// cold start ~3 min). NULL gdy serwis Running albo nic do
+    /// raportowania.
+    pub progress_message: Option<String>,
     pub models: Vec<ServiceModelEntry>,
     pub created_at: String,
     pub updated_at: String,
@@ -138,7 +145,9 @@ pub struct RequestTimeParameters {
 /// Generic key-value pair dla typed parametrow propagowanych przez wire.
 /// Wartosc jako serialized JSON string (rkyv nie obsluguje natywnie
 /// `serde_json::Value`).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 #[rkyv(derive(Debug))]
 pub struct KeyValue {
     pub key: String,
@@ -226,9 +235,124 @@ pub struct ServicePauseResponse {
     pub error: Option<String>,
 }
 
+/// Edycja istniejącego serwisu (po deploy). Pola opcjonalne — backend
+/// aktualizuje tylko te które są `Some(_)`. `restart_after_save=true`
+/// wymusza stop+respawn z nowym configiem (vLLM model reload ~30–180s).
+///
+/// Typed parameters (max_model_len, max_num_seqs, kv_cache_dtype itd.)
+/// są materializowane do `services.config_json` jako manifest schema
+/// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
+/// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ServiceUpdateRequest {
+    pub service_id: i64,
+    /// See `ServiceDeleteRequest::node_id` — None = local node.
+    pub node_id: Option<String>,
+    /// HF repo — switch model bez delete+create. `model_preset_id` ma
+    /// wyższy priorytet gdy oba podane.
+    pub model_repo: Option<String>,
+    pub model_preset_id: Option<String>,
+    /// vLLM-specific parametry runtime. Backend mapuje na `config_json`
+    /// keys i dorzuca do regenerated `vllm_args` jeśli engine to vLLM.
+    pub gpu_memory_utilization: Option<f32>,
+    pub max_model_len: Option<u32>,
+    pub max_num_seqs: Option<u32>,
+    pub max_num_batched_tokens: Option<u32>,
+    pub kv_cache_dtype: Option<String>,
+    pub chunked_prefill: Option<bool>,
+    /// Power user: surowe `vllm_args`. Gdy ustawione, nadpisuje typed
+    /// pola powyżej (backend honoruje 1:1, brak walidacji).
+    pub vllm_args_override: Option<String>,
+    /// Pinned/paused flagi — pomija jeśli `None`.
+    pub pinned: Option<bool>,
+    pub paused: Option<bool>,
+    /// `true` = stop running service + respawn z nowym configiem.
+    /// `false` = tylko zapisz do DB (zmiany aktywne po następnym restarcie).
+    pub restart_after_save: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceUpdateResponse {
+    pub success: bool,
+    pub error: Option<String>,
+    /// `true` jeśli serwis został restartowany w ramach tej operacji.
+    pub restarted: bool,
+}
+
+/// Snapshot aktualnego zajęcia VRAM per GPU + lista zewnętrznych procesów.
+/// Klient wywołuje co 2s podczas modal Edit / wizard Advanced step żeby
+/// pokazać user'owi "co już używa GPU" + zalecony `gpu_memory_utilization`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceVramHintRequest {
+    /// `None` = wszystkie GPU. Zawęź do indeksu jeśli wizard już wybrał GPU.
+    pub gpu_index: Option<u32>,
+    /// `None` = local node. Mesh forward gdy wybrano peer.
+    pub node_id: Option<String>,
+    /// Service ID dla którego liczymy hint (excluded z external — własne
+    /// procesy serwisu nie liczą się jako "external"). `None` = nowy
+    /// deploy, brak wykluczeń.
+    pub exclude_service_id: Option<i64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ServiceVramHintResponse {
+    pub gpus: Vec<GpuVramSnapshot>,
+    /// Sugerowane `gpu_memory_utilization` z uwzględnieniem external
+    /// processes. Wzór: `(free_mib - desktop_reserve_mib) / total_mib`,
+    /// clamp [0.10..0.95]. Desktop reserve = 1024 MiB (bezpieczne dla
+    /// X11/Wayland compositor + headroom).
+    pub recommended_utilization: Option<f32>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GpuVramSnapshot {
+    pub gpu_index: u32,
+    pub gpu_name: String,
+    pub total_mib: u64,
+    pub free_mib: u64,
+    pub used_mib: u64,
+    pub external_processes: Vec<GpuProcessInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GpuProcessInfo {
+    pub pid: u32,
+    pub process_name: String,
+    pub used_mib: u64,
+}
+
+/// Lista presetów modelu z manifestu silnika. Edit modal wywołuje to po
+/// zmianie dropdown'a "Preset z manifestu" — backend zwraca dokładnie te
+/// `[[model_preset]]` które są zadeklarowane w `<engine>.toml` (single
+/// source of truth, build.rs generuje z TOML do `services_generated.rs`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEnginePresetsRequest {
+    pub engine_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEnginePresetsResponse {
+    pub presets: Vec<ServicePresetInfo>,
+}
+
+/// Pojedynczy preset z manifestu — frontend renderuje jako preset-card
+/// w Edit modal lub deploy wizard. `repo` to HF repository, `quantization`
+/// pochodzi z manifestu (auto/awq/gptq/nvfp4/...). Pełen VRAM estimate
+/// liczony jest osobno przez `DeployVllmRecommendRequest` po wyborze.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServicePresetInfo {
+    pub id: String,
+    pub display_name: String,
+    pub repo: String,
+    pub quantization: Option<String>,
+    pub recommended: bool,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum ServicePayload {
     ReqList(ServiceListRequest),
     ResList(ServiceListResponse),
@@ -240,6 +364,12 @@ pub enum ServicePayload {
     ResPause(ServicePauseResponse),
     ReqStart(ServiceStartRequest),
     ResStart(ServiceStartResponse),
+    ReqUpdate(ServiceUpdateRequest),
+    ResUpdate(ServiceUpdateResponse),
+    ReqVramHint(ServiceVramHintRequest),
+    ResVramHint(ServiceVramHintResponse),
+    ReqEnginePresets(ServiceEnginePresetsRequest),
+    ResEnginePresets(ServiceEnginePresetsResponse),
 }
 
 // =============================================================================
@@ -653,6 +783,192 @@ pub struct AuditLogCleanupResponse {
     pub deleted_count: u64,
 }
 
+// ----- Scheduler screen (Admin only) -----
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobsListRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobsListResponse {
+    pub jobs_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerActionsListRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerActionsListResponse {
+    pub actions_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerRunsListRequest {
+    pub job_id: String,
+    pub limit: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerRunsListResponse {
+    pub runs_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobUpsertRequest {
+    pub job_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobUpsertResponse {
+    pub job_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobDeleteRequest {
+    pub job_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobDeleteResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobRunNowRequest {
+    pub job_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerJobRunNowResponse {
+    pub run_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerPayload {
+    JobsListRequest(SchedulerJobsListRequest),
+    JobsListResponse(SchedulerJobsListResponse),
+    ActionsListRequest(SchedulerActionsListRequest),
+    ActionsListResponse(SchedulerActionsListResponse),
+    RunsListRequest(SchedulerRunsListRequest),
+    RunsListResponse(SchedulerRunsListResponse),
+    JobUpsertRequest(SchedulerJobUpsertRequest),
+    JobUpsertResponse(SchedulerJobUpsertResponse),
+    JobDeleteRequest(SchedulerJobDeleteRequest),
+    JobDeleteResponse(SchedulerJobDeleteResponse),
+    JobRunNowRequest(SchedulerJobRunNowRequest),
+    JobRunNowResponse(SchedulerJobRunNowResponse),
+}
+
+// =============================================================================
+// Sync conflict manager — admin-only conflict review and resolution.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncConflictResolution {
+    KeepLocal,
+    Ignore,
+    AcceptRemote,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictRow {
+    pub operation_id: String,
+    pub org_id: String,
+    pub addon_id: String,
+    pub table_name: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub action: String,
+    pub source_node_id: String,
+    pub error_kind: String,
+    pub error_message: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub resolved_at_ms: Option<i64>,
+    pub resolution: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictsListRequest {
+    pub org_id: String,
+    pub addon_id: String,
+    pub status: String,
+    pub limit: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictsListResponse {
+    pub conflicts: Vec<SyncConflictRow>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictResolveRequest {
+    pub org_id: String,
+    pub addon_id: String,
+    pub operation_id: String,
+    pub resolution: SyncConflictResolution,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictResolveResponse {
+    pub operation_id: String,
+    pub status: String,
+    pub resolution: String,
+    pub rows_affected: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncConflictPayload {
+    ListRequest(SyncConflictsListRequest),
+    ListResponse(SyncConflictsListResponse),
+    ResolveRequest(SyncConflictResolveRequest),
+    ResolveResponse(SyncConflictResolveResponse),
+}
+
+// =============================================================================
+// Sync storage pressure — admin-only disk and ledger storage report.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncStoragePressureLevel {
+    Ok,
+    Info,
+    Warning,
+    Critical,
+    Unknown,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncStoragePathUsage {
+    pub label: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncStorageReportRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncStorageReportResponse {
+    pub root: String,
+    pub level: SyncStoragePressureLevel,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub free_percent_bps: Option<u32>,
+    pub sqlite_bytes: u64,
+    pub fjall_ledger_bytes: u64,
+    pub snapshot_blob_bytes: u64,
+    pub final_blob_bytes: u64,
+    pub pending_blob_chunk_bytes: u64,
+    pub large_blob_block_bytes: u64,
+    pub paths: Vec<SyncStoragePathUsage>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SyncStoragePayload {
+    ReportRequest(SyncStorageReportRequest),
+    ReportResponse(SyncStorageReportResponse),
+}
+
 // =============================================================================
 // Portainer — Docker container ops (migration-map #248-#259)
 // =============================================================================
@@ -674,6 +990,29 @@ pub struct ContainerLogChunk {
     pub stream: String, // "stdout" | "stderr"
     pub line: String,
     pub ts_epoch: u64,
+}
+
+/// Wszystkie operacje Portainer/Docker spakowane w jeden slot `MessageBody`.
+/// Wzorzec „1 slot per feature" — odciaza globalny limit 256 wariantow rkyv 0.8
+/// i utrzymuje wszystkie req/res/stream-chunk pod jedna dyskryminanta.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ContainerPayload {
+    /// Klient -> serwer: lista kontenerow widzianych przez node.
+    ListRequest,
+    /// Serwer -> klient: odpowiedz z lista podsumowan.
+    ListResponse { containers: Vec<ContainerSummary> },
+    /// Klient -> serwer: start danego kontenera (admin only).
+    StartRequest { container_id: String },
+    /// Serwer -> klient: ack startu (zmiana stanu obserwowana przez ListResponse).
+    StartResponse { started: bool },
+    /// Klient -> serwer: stop danego kontenera (admin only).
+    StopRequest { container_id: String },
+    /// Serwer -> klient: ack stopa.
+    StopResponse { stopped: bool },
+    /// Klient -> serwer: otworz stream logow (R-STREAM); `follow=true` => tail.
+    LogStreamRequest { container_id: String, follow: bool },
+    /// Serwer -> klient: pojedynczy chunk logu (stdout/stderr).
+    LogChunkBody(ContainerLogChunk),
 }
 
 // =============================================================================
@@ -1412,6 +1751,21 @@ pub struct FlowNodeTemplate {
     /// Dostepne porty wyjsciowe adaptera. LLM: ["stream","full"], wiekszosc
     /// innych: ["full"]. Pusta lista = nieznany adapter.
     pub output_ports: Vec<String>,
+    /// Typ danych per port wejsciowy w tej samej kolejnosci co `input_ports`.
+    /// Wartosci jako lowercase string FlowDataType: "any" / "text" / "audio"
+    /// / "image" / "video" / "embedding" / "json". GUI uzywa do kolorowania
+    /// portu i blokowania niekompatybilnych polaczen (lustrzana walidacja R8).
+    pub input_port_types: Vec<String>,
+    /// Analogicznie do `input_port_types`, dla portow wyjsciowych.
+    pub output_port_types: Vec<String>,
+    /// JSON-Schema-like opis pol konfiguracyjnych. Pusty string = brak
+    /// schemy (config tab w builderze pokazuje "Brak parametrow"). Format:
+    /// `{"properties":{<key>:{type, title, description, default, enum?,
+    /// minimum?, maximum?, format?, dynamic_enum?}}, "required":[...],
+    /// "order":[...]}`. `dynamic_enum` (rozszerzenie tentaflow): mowi GUI
+    /// zeby wczytac liste z runtime registry zamiast statycznego enum
+    /// — `{"source":"models","category":"stt"|"tts"|"llm"|"embeddings"}`.
+    pub params_schema: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -1727,14 +2081,18 @@ pub struct NimCatalogListResponse {
 // f64 fields drop Eq; PartialEq only.
 // =============================================================================
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmGpuInfo {
     pub index: u32,
     pub name: String,
     pub memory_gb: f64,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmRecommendRequest {
     pub model: String,
     pub gpus: Vec<DeployVllmGpuInfo>,
@@ -1751,7 +2109,9 @@ pub struct DeployVllmRecommendRequest {
     pub lock_tensor_parallel: Option<bool>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmConfig {
     pub tensor_parallel: u32,
     pub pipeline_parallel: u32,
@@ -1761,7 +2121,9 @@ pub struct DeployVllmConfig {
     pub gpu_memory_utilization: f64,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmModelSpecSummary {
     pub model_type: String,
     pub architectures: Vec<String>,
@@ -1778,7 +2140,9 @@ pub struct DeployVllmModelSpecSummary {
     pub bytes_per_param: f64,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmVramEstimate {
     pub model_weights_gb: f64,
     pub kv_cache_gb: f64,
@@ -1791,7 +2155,9 @@ pub struct DeployVllmVramEstimate {
     pub warnings: Vec<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmGpuCompatibility {
     pub used_tp: u32,
     pub used_pp: u32,
@@ -1801,7 +2167,9 @@ pub struct DeployVllmGpuCompatibility {
     pub warning: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct DeployVllmRecommendResponse {
     pub model_spec: DeployVllmModelSpecSummary,
     pub vram_estimate: DeployVllmVramEstimate,
@@ -1821,7 +2189,9 @@ pub struct DeployVllmRecommendResponse {
 /// tensorrt-llm uzywaja `auto_fit_config` z mapowaniem do typed pol; inne
 /// silniki maja proste defaulty per kategoria). Zwraca typed mape
 /// `parameter.key → JSON value` ktora wizard pre-filluje do formularza.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct EngineRecommendRequest {
     pub engine_id: String,
     pub model_repo: String,
@@ -1829,7 +2199,9 @@ pub struct EngineRecommendRequest {
     pub hf_token: Option<String>,
 }
 
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct EngineRecommendResponse {
     /// JSON-serialized values per parameter key. Wizard JS deserializuje
     /// zgodnie z `parameter.kind` z manifestu.
@@ -1892,6 +2264,41 @@ pub struct AddonInfo {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AddonsListResponse {
     pub addons: Vec<AddonInfo>,
+}
+
+// =============================================================================
+// SCHEMA v14: Apps menu + UI v2 endpointy
+// =============================================================================
+
+/// Application tile shown in the launcher / "My applications". Sourced from
+/// the addon manifest `[application]` section at install time.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonApplicationInfo {
+    pub addon_id: String,
+    pub title: String,
+    /// Entry panel id shown in the launcher tile.
+    pub entry_panel: String,
+    /// Icon name from the TentaFlow icon library (mandatory in manifest).
+    pub icon: String,
+    /// Short description shown under the tile in "All applications".
+    pub description: String,
+    /// Sort order (lower = higher). Default 100 when manifest omits it.
+    pub sort_order: i32,
+    /// Whether the addon is currently enabled in `addons.is_enabled`. The
+    /// client uses this to gray out tiles for disabled addons.
+    pub enabled: bool,
+}
+
+/// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
+/// the 256-variant rkyv limit. Panel get / UI action removed in chunk 4.2 —
+/// addon UI now goes through the CBOR channel (`ui_render_cbor`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum AddonUiPayload {
+    // ---- Apps menu ----
+    ReqApplicationsList,
+    ResApplicationsList {
+        applications: Vec<AddonApplicationInfo>,
+    },
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2121,10 +2528,14 @@ pub struct AddonResourcesSetResponse {
 /// Zmergowana regula sieciowa zadeklarowana w manifescie + status pokrycia.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AddonNetworkRuleDecl {
+    pub rule_id: String,
     pub host: String,
     pub port: Option<i32>,
+    pub protocol: String,
     pub mode: String,
     pub status: String,
+    pub required: bool,
+    pub approved: bool,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -3427,28 +3838,19 @@ pub enum MessageBody {
     AuditLogCleanupRequestBody(AuditLogCleanupRequest),
     AuditLogCleanupResponseBody(AuditLogCleanupResponse),
 
+    // ----- Scheduler -----
+    SchedulerBody(SchedulerPayload),
+
+    // ----- Sync conflict manager -----
+    SyncConflictBody(SyncConflictPayload),
+
+    // ----- Sync storage pressure -----
+    SyncStorageBody(SyncStoragePayload),
+
     // ---- Portainer (R-LIST + R-STREAM dla logs) ----
-    ContainerListRequest,
-    ContainerListResponse {
-        containers: Vec<ContainerSummary>,
-    },
-    ContainerStartRequest {
-        container_id: String,
-    },
-    ContainerStartResponse {
-        started: bool,
-    },
-    ContainerStopRequest {
-        container_id: String,
-    },
-    ContainerStopResponse {
-        stopped: bool,
-    },
-    ContainerLogStreamRequest {
-        container_id: String,
-        follow: bool,
-    },
-    ContainerLogChunkBody(ContainerLogChunk),
+    // Wzorzec „1 slot per feature" — wszystkie operacje Container w jednym
+    // wariancie MessageBody. Patrz `ContainerPayload`.
+    ContainerBody(ContainerPayload),
 
     // ---- Voice profiles (R-LIST) ----
     VoiceProfileListRequest,
@@ -3622,6 +4024,9 @@ pub enum MessageBody {
     // ---- Addons: list / detail / toggle / lifecycle ----
     AddonsListRequest,
     AddonsListResponseBody(AddonsListResponse),
+    // v14: Apps menu + UI v2 — multiplex w 1 slocie zeby zmiescic sie w 256
+    // wariantach rkyv (vide IamBody/ServicePayload).
+    AddonUiBody(AddonUiPayload),
     AddonDetailRequestBody(AddonDetailRequest),
     AddonDetailResponseBody(AddonDetailResponse),
     AddonToggleRequestBody(AddonToggleRequest),
@@ -3743,6 +4148,33 @@ pub enum MessageBody {
     // Slot odzyskany przez konsolidacje PiiRuleListRequest/Response do
     // PiiRuleBody. Patrz ProfilingBody jako wzor inner-enum pack.
     VisionBody(crate::vision::VisionInferPayload),
+
+    // ---- Camera admin RPCs (F2 P7.a) ----
+    // 2 par request/response (Discover, AddOnvif) spakowane w jeden slot,
+    // analogicznie do ProfilingBody / VisionBody. Powod: rkyv 0.8 256-variant
+    // limit + dashboard wizard need (P7.b).
+    CameraAdminBody(crate::camera::CameraAdminPayload),
+
+    // ---- Legal admin RPCs (F2 P8.c) ----
+    // 3 par request/response (List, Generate, Revoke) spakowane w jeden slot,
+    // analogicznie do CameraAdminBody / ProfilingBody. Powod: rkyv 0.8
+    // 256-variant limit + dashboard RODO surface (P8.d).
+    LegalAdminBody(crate::legal::LegalAdminPayload),
+
+    // ---- Role catalog (administrowany katalog rol biznesowych, multi-tenant, i18n) ----
+    // Wzorzec „1 slot per feature" — wszystkie req/res w `RoleCatalogPayload`.
+    RoleCatalogBody(crate::types::RoleCatalogPayload),
+
+    // ---- Binary stream pub/sub (Chunk B) ----
+    // Subscribe/Frame/Close/Closed for the live streaming surface, packed
+    // into a single discriminant to stay inside the 256-variant cap.
+    StreamBody(crate::stream::StreamPayload),
+
+    // ---- UI Channel CBOR (Faza 6 Krok 4) ----
+    // Raw CBOR bytes for the addon UI binary protocol. The dispatch handler
+    // decodes the UiTag, validates ownership/permissions via SessionState,
+    // and routes to the appropriate panel lifecycle handler.
+    UiChannelCbor(Vec<u8>),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
@@ -4060,6 +4492,69 @@ mod tests {
     }
 
     #[test]
+    fn sync_conflicts_list_round_trip() {
+        let body = MessageBody::SyncConflictBody(SyncConflictPayload::ListResponse(
+            SyncConflictsListResponse {
+                conflicts: vec![SyncConflictRow {
+                    operation_id: "aa".repeat(32),
+                    org_id: "org-default".to_string(),
+                    addon_id: "contacts".to_string(),
+                    table_name: "companies".to_string(),
+                    resource_type: "company".to_string(),
+                    resource_id: "1".to_string(),
+                    action: "insert".to_string(),
+                    source_node_id: "node-b".to_string(),
+                    error_kind: "sql_constraint".to_string(),
+                    error_message: "constraint failed".to_string(),
+                    status: "open".to_string(),
+                    created_at_ms: 123,
+                    resolved_at_ms: None,
+                    resolution: None,
+                }],
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn sync_conflict_resolve_round_trip() {
+        let body = MessageBody::SyncConflictBody(SyncConflictPayload::ResolveRequest(
+            SyncConflictResolveRequest {
+                org_id: "org-default".to_string(),
+                addon_id: "contacts".to_string(),
+                operation_id: "bb".repeat(32),
+                resolution: SyncConflictResolution::AcceptRemote,
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn sync_storage_report_round_trip() {
+        let body = MessageBody::SyncStorageBody(SyncStoragePayload::ReportResponse(
+            SyncStorageReportResponse {
+                root: "/home/user/.tentaflow".to_string(),
+                level: SyncStoragePressureLevel::Warning,
+                total_bytes: Some(1000),
+                available_bytes: Some(90),
+                free_percent_bps: Some(900),
+                sqlite_bytes: 10,
+                fjall_ledger_bytes: 20,
+                snapshot_blob_bytes: 30,
+                final_blob_bytes: 40,
+                pending_blob_chunk_bytes: 50,
+                large_blob_block_bytes: 1024 * 1024,
+                paths: vec![SyncStoragePathUsage {
+                    label: "sqlite".to_string(),
+                    path: "/home/user/.tentaflow/data/router.db".to_string(),
+                    bytes: 10,
+                }],
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
     fn mesh_trust_revoked_round_trip() {
         let evt = MessageBody::MeshTrustEventBody(MeshTrustEventPayload::Revoked(
             MeshTrustRevokedEvent {
@@ -4088,8 +4583,8 @@ mod tests {
             GpuTargets, ProfileScope, ProfileSourceFlags, ProfileTarget, ProfilingPayload,
             ProfilingStartRequest,
         };
-        let body = MessageBody::ProfilingBody(ProfilingPayload::StartRequest(
-            ProfilingStartRequest {
+        let body =
+            MessageBody::ProfilingBody(ProfilingPayload::StartRequest(ProfilingStartRequest {
                 node_id: "node-x".into(),
                 scope: ProfileScope {
                     sources: ProfileSourceFlags(
@@ -4103,8 +4598,7 @@ mod tests {
                 },
                 label: "deep-profile".into(),
                 elevation_password: String::new(),
-            },
-        ));
+            }));
         assert_eq!(round_trip(body.clone()), body);
     }
 
@@ -4141,9 +4635,264 @@ mod tests {
         assert_eq!(round_trip(resp.clone()), resp);
     }
 
+    // -------------------------------------------------------------------------
+    // RoleCatalogBody — round-trip dla wszystkich wariantow RoleCatalogPayload.
+    // -------------------------------------------------------------------------
+
+    fn sample_role_summary() -> crate::types::RoleCatalogSummary {
+        crate::types::RoleCatalogSummary {
+            id: "role-1".to_string(),
+            slug: "sales-rep".to_string(),
+            kind: "sales".to_string(),
+            name_translations: vec![
+                ("pl".to_string(), "Handlowiec".to_string()),
+                ("en".to_string(), "Sales rep".to_string()),
+            ],
+            icon: Some("sales".to_string()),
+            color_hint: Some("#0ea5e9".to_string()),
+            is_manager: false,
+            default_visibility_scope: "assigned".to_string(),
+            is_active: true,
+        }
+    }
+
+    fn sample_role_detail() -> crate::types::RoleCatalogDetail {
+        crate::types::RoleCatalogDetail {
+            id: "role-1".to_string(),
+            org_id: "org-x".to_string(),
+            slug: "sales-rep".to_string(),
+            kind: "sales".to_string(),
+            name_translations: vec![
+                ("pl".to_string(), "Handlowiec".to_string()),
+                ("en".to_string(), "Sales rep".to_string()),
+            ],
+            description_translations: vec![("pl".to_string(), "Opis".to_string())],
+            icon: Some("sales".to_string()),
+            color_hint: Some("#0ea5e9".to_string()),
+            is_manager: false,
+            default_visibility_scope: "assigned".to_string(),
+            is_active: true,
+            created_at: "2026-05-19T10:00:00Z".to_string(),
+            updated_at: "2026-05-19T10:00:00Z".to_string(),
+            created_by: Some("user-42".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_role_catalog_list_request_roundtrip() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListRequest(
+            crate::types::RoleCatalogListFilter {
+                kind: Some("sales".to_string()),
+                is_active: Some(true),
+                search: Some("handl".to_string()),
+                limit: Some(50),
+                offset: Some(0),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_list_response_roundtrip() {
+        let role_a = sample_role_summary();
+        let mut role_b = sample_role_summary();
+        role_b.id = "role-2".to_string();
+        role_b.slug = "team-lead".to_string();
+        role_b.kind = "management".to_string();
+        role_b.is_manager = true;
+        role_b.default_visibility_scope = "section".to_string();
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListResponse {
+            roles: vec![role_a, role_b],
+        });
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_get_request_by_id_and_by_slug() {
+        let by_id = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetRequest {
+            id: "role-1".to_string(),
+        });
+        assert_eq!(round_trip(by_id.clone()), by_id);
+
+        let by_slug =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetBySlugRequest {
+                slug: "sales-rep".to_string(),
+            });
+        assert_eq!(round_trip(by_slug.clone()), by_slug);
+    }
+
+    #[test]
+    fn test_role_catalog_get_response_some_and_none() {
+        let some = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetResponse {
+            role: Some(sample_role_detail()),
+        });
+        assert_eq!(round_trip(some.clone()), some);
+
+        let none = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::GetResponse {
+            role: None,
+        });
+        assert_eq!(round_trip(none.clone()), none);
+    }
+
+    #[test]
+    fn test_role_catalog_list_locales_request_response() {
+        let req =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListLocalesRequest);
+        assert_eq!(round_trip(req.clone()), req);
+
+        let res =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::ListLocalesResponse {
+                locales: vec![
+                    crate::types::PlatformLocaleSummary {
+                        code: "pl".to_string(),
+                        display_name: "Polski".to_string(),
+                        is_default: true,
+                    },
+                    crate::types::PlatformLocaleSummary {
+                        code: "en".to_string(),
+                        display_name: "English".to_string(),
+                        is_default: false,
+                    },
+                ],
+            });
+        assert_eq!(round_trip(res.clone()), res);
+    }
+
+    #[test]
+    fn test_role_catalog_create_request_full_fields() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateRequest(
+            crate::types::RoleCatalogCreateRequest {
+                slug: "sales-rep".to_string(),
+                kind: "sales".to_string(),
+                name_translations: vec![
+                    ("pl".to_string(), "Handlowiec".to_string()),
+                    ("en".to_string(), "Sales rep".to_string()),
+                ],
+                description_translations: vec![("pl".to_string(), "Opis".to_string())],
+                icon: Some("sales".to_string()),
+                color_hint: Some("#0ea5e9".to_string()),
+                is_manager: false,
+                default_visibility_scope: "assigned".to_string(),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_create_response() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateResponse(
+            sample_role_detail(),
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_update_request_only_kind() {
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
+            crate::types::RoleCatalogUpdateRequest {
+                id: "role-1".to_string(),
+                kind: Some("technical".to_string()),
+                name_translations: None,
+                description_translations: None,
+                icon: None,
+                color_hint: None,
+                is_manager: None,
+                default_visibility_scope: None,
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn test_role_catalog_update_icon_set_to_null() {
+        // Some(None) = wyzeruj (SET NULL). Sprawdza ze nested Option przechodzi
+        // przez rkyv round-trip bez zmiany na None/None.
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
+            crate::types::RoleCatalogUpdateRequest {
+                id: "role-1".to_string(),
+                icon: Some(None),
+                ..Default::default()
+            },
+        ));
+        let decoded = round_trip(body.clone());
+        assert_eq!(decoded, body);
+        match decoded {
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(req)) => {
+                assert_eq!(req.icon, Some(None));
+            }
+            _ => panic!("expected RoleCatalogBody::UpdateRequest"),
+        }
+    }
+
+    #[test]
+    fn test_role_catalog_update_icon_unchanged() {
+        // None = nie ruszaj pola.
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(
+            crate::types::RoleCatalogUpdateRequest {
+                id: "role-1".to_string(),
+                icon: None,
+                ..Default::default()
+            },
+        ));
+        let decoded = round_trip(body.clone());
+        assert_eq!(decoded, body);
+        match decoded {
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::UpdateRequest(req)) => {
+                assert_eq!(req.icon, None);
+            }
+            _ => panic!("expected RoleCatalogBody::UpdateRequest"),
+        }
+    }
+
+    #[test]
+    fn test_role_catalog_deactivate_request_response() {
+        let req =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::DeactivateRequest {
+                id: "role-1".to_string(),
+            });
+        assert_eq!(round_trip(req.clone()), req);
+
+        let res =
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::DeactivateResponse {
+                deactivated: true,
+            });
+        assert_eq!(round_trip(res.clone()), res);
+    }
+
+    #[test]
+    fn test_role_catalog_translations_vec_ordering_preserved() {
+        // Kolejnosc par w Vec<(String, String)> musi byc stabilna po round-trip
+        // — zalezy od tego deterministyczne porownywanie po stronie repo i UI.
+        let translations = vec![
+            ("pl".to_string(), "A".to_string()),
+            ("en".to_string(), "B".to_string()),
+            ("de".to_string(), "C".to_string()),
+            ("fr".to_string(), "D".to_string()),
+        ];
+        let body = MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateRequest(
+            crate::types::RoleCatalogCreateRequest {
+                slug: "x".to_string(),
+                kind: "other".to_string(),
+                name_translations: translations.clone(),
+                description_translations: vec![],
+                icon: None,
+                color_hint: None,
+                is_manager: false,
+                default_visibility_scope: "own".to_string(),
+            },
+        ));
+        let decoded = round_trip(body.clone());
+        match decoded {
+            MessageBody::RoleCatalogBody(crate::types::RoleCatalogPayload::CreateRequest(req)) => {
+                assert_eq!(req.name_translations, translations);
+            }
+            _ => panic!("expected RoleCatalogBody::CreateRequest"),
+        }
+    }
+
     #[test]
     fn body_nests_inside_envelope() {
-        use crate::envelope::{message_kind, Envelope};
+        use crate::envelope::{Envelope, message_kind};
         let body = MessageBody::ModelListRequest;
         let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
             .expect("encode body")

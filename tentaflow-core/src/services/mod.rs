@@ -4,6 +4,7 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
+pub mod gpu_snapshot;
 pub mod manifest;
 pub mod model_download;
 pub mod models;
@@ -16,16 +17,215 @@ pub mod tts;
 // Unified services refactor (Phase 1 — additive, runs alongside legacy code).
 pub mod auto_detect;
 pub mod backend;
+#[cfg(feature = "camera")]
+pub mod camera_ingest;
 pub mod catalog;
 pub mod deploy;
+pub mod frame_proxy;
+pub mod frame_storage;
 pub mod handles_cache;
+pub mod key_storage;
+pub mod legal;
 pub mod lifecycle;
+pub mod mesh_keys;
 pub mod mesh_registry;
+pub mod org;
+pub mod pickup_tokens;
+pub mod policy;
 pub mod ports;
+pub mod rbac;
+pub mod recording;
 pub mod registry;
+pub mod role_catalog;
 pub mod runtime;
+pub mod service_call;
+pub mod service_call_rate_limit;
+pub mod signed_urls;
 pub mod snapshot_builder;
+pub mod storage_proxy;
+pub mod stream_hub;
+pub mod streaming;
 pub mod supervisor;
 pub mod transport;
+#[cfg(feature = "vector")]
+pub mod vector;
 
-pub use tts::{SynthesizeCallback, TTSBufferingProcessor, TTSClient, TTSConfigCompat};
+pub use tts::{TTSClient, TTSConfigCompat};
+
+// -----------------------------------------------------------------------------
+// Global singletons: shared frame storage + streaming bus
+// -----------------------------------------------------------------------------
+//
+// Camera ingest, future media producers, and Service-to-Core consumers all
+// reach these through `frame_storage()` / `streaming_bus()`. Storage capacity
+// is fixed at 1024 frames — overridable later by config when we move past F1a.
+
+use std::sync::{Arc, OnceLock};
+
+static FRAME_STORAGE: OnceLock<Arc<frame_storage::FrameStorage>> = OnceLock::new();
+static STREAMING_BUS: OnceLock<Arc<streaming::StreamingBus>> = OnceLock::new();
+static PICKUP_TOKEN_ISSUER: OnceLock<Arc<pickup_tokens::PickupTokenIssuer>> = OnceLock::new();
+static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+#[cfg(feature = "vector")]
+static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
+
+/// Returns the process-wide vector namespace manager, initializing it lazily
+/// on first call. The DB pool is bound on first init — subsequent calls
+/// ignore the argument (a single shared catalog across the process).
+#[cfg(feature = "vector")]
+pub fn vector_namespace_manager(
+    pool: &crate::db::DbPool,
+) -> &'static Arc<vector::NamespaceManager> {
+    VECTOR_NAMESPACE_MANAGER.get_or_init(|| Arc::new(vector::NamespaceManager::new(pool.clone())))
+}
+
+pub fn frame_storage() -> &'static Arc<frame_storage::FrameStorage> {
+    FRAME_STORAGE.get_or_init(|| Arc::new(frame_storage::FrameStorage::new(1024)))
+}
+
+pub fn streaming_bus() -> &'static Arc<streaming::StreamingBus> {
+    STREAMING_BUS.get_or_init(|| Arc::new(streaming::StreamingBus::new()))
+}
+
+/// Poll interval for the on-disk key watchers. 5 s is the standard
+/// compromise: fast enough that an operator running `tentaflow-cli keys
+/// rotate <name>` sees the new key engage before the next outstanding
+/// signature minted under the previous key is checked, slow enough that
+/// the cost (one `stat()` per key per 5 s) is invisible.
+const KEY_WATCHER_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Fire a best-effort mesh broadcast after an on-disk key rotation.
+///
+/// Called from the key-storage watcher callback once the new bytes have been
+/// loaded into the in-memory issuer. If the mesh pipeline never registered
+/// a `BroadcastHook` (single-node deployment) this is a no-op. Any error —
+/// rate-limit, encoding, no trusted peers — is emitted to `audit_log` and
+/// otherwise swallowed: the rotation itself has already succeeded.
+fn trigger_mesh_broadcast_on_rotate(rotated_name: &'static str) {
+    let Some(hook) = mesh_keys::broadcast_hook() else {
+        // No mesh in this process — nothing to broadcast to. Silent.
+        return;
+    };
+    let iroh = hook.iroh.clone();
+    let node_id = hook.local_node_id.clone();
+    tokio::spawn(async move {
+        let pool = mesh_keys::mesh_key_pool();
+        let outcome = pool
+            .broadcast_on_rotate(&node_id, rotated_name, &iroh)
+            .await;
+        match &outcome {
+            Ok(br) => tracing::info!(
+                target: "tentaflow::mesh_keys::broadcast",
+                name = rotated_name,
+                peer_count = br.peer_count,
+                ok_count = br.ok_count,
+                err_count = br.err_count,
+                "broadcast_on_rotate completed"
+            ),
+            Err(e) => tracing::warn!(
+                target: "tentaflow::mesh_keys::broadcast",
+                name = rotated_name,
+                error = %e,
+                "broadcast_on_rotate failed (rotation itself succeeded)"
+            ),
+        }
+        mesh_keys::emit_broadcast_audit(rotated_name, outcome.as_ref());
+    });
+}
+
+pub fn pickup_token_issuer() -> &'static Arc<pickup_tokens::PickupTokenIssuer> {
+    PICKUP_TOKEN_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(pickup_tokens::PickupTokenIssuer::new());
+        if let Ok(path) = key_storage::key_path(pickup_tokens::KEY_NAME) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                pickup_tokens::KEY_NAME,
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(pickup_tokens::KEY_NAME);
+                },
+            );
+        }
+        issuer
+    })
+}
+
+pub fn frame_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    FRAME_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::FrameUrl,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::FrameUrl.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::FrameUrl.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::FrameUrl.key_name());
+                },
+            );
+        }
+        issuer
+    })
+}
+
+pub fn recording_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    RECORDING_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::Recording,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::Recording.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::Recording.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::Recording.key_name());
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// F2 P8.c — process-wide signing key for `/legal/<doc_id>` URLs. Same
+/// disk-backed rotation contract as the recording / frame issuers: the new
+/// bytes land via `tentaflow-cli keys rotate legal_url` and the watcher
+/// promotes them into the issuer's in-memory KeyState, leaving the previous
+/// key valid as a verify-only secondary for `max_ttl + 5 s`.
+pub fn legal_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    LEGAL_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::LegalUrl,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::LegalUrl.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::LegalUrl.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::LegalUrl.key_name());
+                },
+            );
+        }
+        issuer
+    })
+}

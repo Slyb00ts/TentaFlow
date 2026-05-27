@@ -187,7 +187,16 @@ class TfTable extends HTMLElement {
       const chip = typeof value === 'object' && value
         ? value
         : { status: 'info', label: String(value ?? '') };
-      td.innerHTML = `<span class="tf-chip ${chip.status || 'info'}">${chip.dot ? '<span class="tf-chip-dot"></span>' : ''}${chip.label ?? ''}</span>`;
+      const status = String(chip.status || 'info').replace(/[^a-zA-Z0-9_-]/g, '');
+      const span = document.createElement('span');
+      span.className = `tf-chip ${status}`;
+      if (chip.dot) {
+        const dot = document.createElement('span');
+        dot.className = 'tf-chip-dot';
+        span.appendChild(dot);
+      }
+      span.appendChild(document.createTextNode(chip.label == null ? '' : String(chip.label)));
+      td.replaceChildren(span);
     } else if (col.renderer === 'html') {
       const next = value ?? '';
       // Skip jesli identyczne — eliminuje koszt parsowania HTML komorki gdy

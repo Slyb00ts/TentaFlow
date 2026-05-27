@@ -1,11 +1,11 @@
 // =============================================================================
 // Plik: routing/tts.rs
-// Opis: Synteza mowy (TTS) — synthesize_speech (blocking) oraz
-//       synthesize_speech_stream (chunkowane PCM dla niskiej latencji
-//       pierwszej probki audio).
+// Opis: Synteza mowy (TTS) — blocking `synthesize_speech`. Streaming idzie
+//       przez flow_engine `TtsDispatcher::stream_synthesize` (Etap 3c),
+//       a HTTP endpoint /v1/audio/speech/stream w api/openai/server.rs.
 // =============================================================================
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::routing::router::Router;
 
 use tracing::debug;
@@ -20,21 +20,12 @@ pub struct TtsBytes {
     pub format: String,
 }
 
-/// Domyslny rozmiar chunku PCM dla streamingu TTS — 100 ms audio
-/// (16 kHz mono i16 LE = 16_000 * 0.1 * 2 bajty = 3200 bajtow).
-/// Mniejsze chunki = nizsza pierwsza-probka latency, ale wiecej overhead'u
-/// na ramke (nagłowek length-prefix + rkyv). 100 ms to kompromis: pierwszy
-/// chunk dociera do mikrofonu w ~50 ms od momentu zakończenia syntezy,
-/// jednoczesnie pojedynczy frame ma ~3 KB, co jest tanie.
-const TTS_STREAM_CHUNK_BYTES: usize = 3_200;
-
 impl Router {
-    /// Syntezuje mowe z tekstu uzywajac QUIC TTS lub HTTP TTS.
-    ///
-    /// Flow:
-    /// 1. Probuje znalezc QUIC TTS client (preferowany - lokalne modele Sherpa)
-    /// 2. Jesli brak QUIC -> fallback do HTTP TTS (OpenAI API)
-    /// 3. Wysyla request i zwraca raw audio bytes
+    /// Syntezuje mowe z tekstu przez flow_engine (stage 3d Universal Flow
+    /// Gateway). Synthetic flow `trigger → tts(model) → output` aktywuje
+    /// się gdy admin nie skonfigurował user-defined flow; backend dispatch
+    /// (embedded sherpa, HTTP, QUIC, mesh) idzie przez TtsDispatcherImpl
+    /// → executor.execute_tts.
     ///
     /// Parametry:
     /// - `request`: TTSRequest z OpenAI API format (model, input, voice, format, speed)
@@ -61,12 +52,16 @@ impl Router {
                 }
             }
         }
-        self.synthesize_speech(request).await
+        // Propaguj user dalej — Etap 2 odblokował TTS-as-flow, więc
+        // FlowDispatcher::acl_allow musi widzieć rzeczywistego callera, a
+        // resolver/strategy w ModelRuntimeExecutor mogą gateować per-user.
+        self.synthesize_speech(request, user).await
     }
 
     pub async fn synthesize_speech(
         &self,
         request: &crate::api::openai::types::TTSRequest,
+        user: Option<crate::auth::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<TtsBytes>> {
         // Strip emoji + apply DB-driven `tts_cleaning_rules` BEFORE
         // dispatch. Without this the TTS engine has to pronounce raw
@@ -93,44 +88,52 @@ impl Router {
 
         let tts_model = cleaned_request.model.clone();
         let t = std::time::Instant::now();
-        let executor_snapshot = self.executor.read().clone();
-        if let Some(executor) = executor_snapshot {
-            use crate::services::runtime::context::ExecutionContext;
-            use crate::services::runtime::executor::ExecutorError;
 
-            let mut exec_ctx = ExecutionContext::default();
-            match executor
-                .execute_tts(cleaned_request.clone(), &mut exec_ctx)
+        // Stage 3d Universal Flow Gateway: TTS path zawsze przez
+        // FlowDispatcher. Synthetic flow `trigger → tts(model) → output`
+        // aktywuje się gdy admin nie skonfigurował user-defined flow.
+        // Direct executor.execute_tts fallback wycięty w 3d-0b-final.
+        if let Some(ref dispatcher) = self.flow_dispatcher {
+            let (initial, meta) =
+                crate::services::runtime::executor::tts_request_to_initial_envelope(
+                    &cleaned_request,
+                    user.clone(),
+                );
+            match dispatcher
+                .try_dispatch(&cleaned_request.model, "tts", initial, meta)
                 .await
             {
-                Ok(result) => {
+                Ok(outcome) => {
+                    let result = crate::services::runtime::executor::flow_outcome_to_tts_result(
+                        outcome,
+                        dispatcher.blobs(),
+                    )
+                    .await
+                    .map_err(|e| crate::error::CoreError::InternalError {
+                        message: format!("tts flow result: {e}"),
+                        source: None,
+                    })?;
                     if let Some(req_fmt) = cleaned_request.response_format.as_deref() {
-                        if req_fmt.eq_ignore_ascii_case(&result.format) == false {
+                        if !req_fmt.eq_ignore_ascii_case(&result.format) {
                             tracing::warn!(
                                 requested = %req_fmt,
                                 actual = %result.format,
                                 model = %cleaned_request.model,
-                                "TTS backend returned different format than requested — caller's Content-Type may be misleading"
+                                "TTS flow returned different format than requested"
                             );
                         }
                     }
                     let metadata = crate::routing::RouteMetadata {
-                        served_by_node: exec_ctx
-                            .route_metadata
-                            .served_by_node
-                            .unwrap_or_else(|| {
-                                hostname::get()
-                                    .map(|h| h.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| "unknown".to_string())
-                            }),
-                        backend_type: exec_ctx
-                            .route_metadata
-                            .backend_type
-                            .unwrap_or_else(|| "executor".to_string()),
-                        strategy_used: "executor".to_string(),
-                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                        served_by_node: hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string()),
+                        backend_type: "flow_engine".to_string(),
+                        strategy_used: "flow_dispatch".to_string(),
+                        fallbacks_tried: 0,
                         hop_count: 0,
                         latency_ms: Some(t.elapsed().as_secs_f64() * 1000.0),
+                        usage: None,
+                        finish_reason: None,
                     };
                     return Ok(crate::routing::RouteResult {
                         response: TtsBytes {
@@ -140,25 +143,26 @@ impl Router {
                         metadata,
                     });
                 }
-                Err(ExecutorError::TransportPendingCutover(_)) => {
-                    debug!(
-                        "executor returned TransportPendingCutover for TTS — falling back to legacy mesh dispatch"
-                    );
-                    // fall through
-                }
                 Err(e) => {
                     self.log_tts_dispatch_diagnostics(&tts_model);
-                    return Err(map_tts_executor_err(e, &tts_model).into());
+                    return Err(crate::routing::dispatch_error_to_core(e, &tts_model).into());
                 }
             }
         }
 
-        // Executor not wired (DB-less router). After R3b.8 the legacy
-        // mesh fallback is gone — without an executor we surface a typed
-        // error instead of doing duplicate dispatch.
+        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
+        // Direct executor.execute_tts fallback wycięty. Plan v1.5 wymaga
+        // że KAŻDY TTS request przechodzi przez flow_engine (synthetic
+        // albo user-defined).
+        let _ = t;
         self.log_tts_dispatch_diagnostics(&tts_model);
-        Err(CoreError::AllBackendsUnavailable {
-            model_name: tts_model,
+        Err(crate::error::CoreError::InternalError {
+            message: format!(
+                "flow_dispatcher not wired for tts model '{}' — DB-less router \
+                 nie wspiera Universal Flow Gateway",
+                tts_model
+            ),
+            source: None,
         }
         .into())
     }
@@ -171,7 +175,7 @@ impl Router {
     /// emit the same hint instead of only the mesh fallback doing so.
     fn log_tts_dispatch_diagnostics(&self, tts_model: &str) {
         let Some(ref db) = self.db else { return };
-        match crate::db::repository::resolve_model_alias(db, tts_model) {
+        match crate::db::repository::resolve_model_alias(db, tts_model, None) {
             Ok(Some(alias)) => {
                 if alias.target_model.trim().is_empty() {
                     tracing::warn!(
@@ -201,139 +205,5 @@ impl Router {
                 );
             }
         }
-    }
-
-    pub async fn synthesize_speech_stream<F>(
-        &self,
-        request: &crate::api::openai::types::TTSRequest,
-        mut chunk_sink: F,
-    ) -> Result<()>
-    where
-        F: FnMut(Vec<u8>) -> Result<()>,
-    {
-        let route_result = self.synthesize_speech(request).await?;
-        let mut audio_bytes = route_result.response.bytes;
-
-        // Strip WAV header gdy backend zignorowal `format=pcm` i zwrocil
-        // jednak RIFF/WAVE — pierwszy chunk musi byc czystym PCM, inaczej
-        // klient slyszy klikniecie/szum z naglowka.
-        if audio_bytes.len() >= 12
-            && &audio_bytes[0..4] == b"RIFF"
-            && &audio_bytes[8..12] == b"WAVE"
-        {
-            audio_bytes = strip_wav_header(&audio_bytes)?;
-        }
-
-        for chunk in audio_bytes.chunks(TTS_STREAM_CHUNK_BYTES) {
-            chunk_sink(chunk.to_vec())?;
-        }
-        Ok(())
-    }
-}
-
-/// Wyciaga raw PCM z WAV po skanowaniu chunkow `fmt `/`data` (parser
-/// tolerancyjny na opcjonalne LIST/INFO chunki). Wymaga PCM16 mono;
-/// inaczej zwraca blad — caller zostaje w blocking ścieżce.
-fn strip_wav_header(bytes: &[u8]) -> Result<Vec<u8>> {
-    let err = |msg: &str| CoreError::InternalError {
-        message: format!("WAV strip: {}", msg),
-        source: None,
-    };
-    let mut cursor = 12usize;
-    let mut data_start: Option<usize> = None;
-    while cursor + 8 <= bytes.len() {
-        let chunk_id = &bytes[cursor..cursor + 4];
-        let chunk_size = u32::from_le_bytes(
-            bytes[cursor + 4..cursor + 8]
-                .try_into()
-                .map_err(|_| err("chunk size"))?,
-        ) as usize;
-        let body = cursor + 8;
-        if chunk_id == b"data" {
-            data_start = Some(body);
-            break;
-        }
-        cursor = body + chunk_size + (chunk_size & 1);
-    }
-    let start = data_start.ok_or_else(|| err("brak data chunk"))?;
-    Ok(bytes[start..].to_vec())
-}
-
-/// Map executor errors onto typed `CoreError` variants. Mirror of
-/// `executor_err_to_core` from routing/embeddings.rs but with the
-/// `CapabilityUnsupported` variant routed to `InvalidRequest` (Codex
-/// R3b.4 L1) — a model that has no audio-output candidate is a client
-/// misconfiguration, not an internal failure.
-fn map_tts_executor_err(
-    err: crate::services::runtime::executor::ExecutorError,
-    model: &str,
-) -> CoreError {
-    use crate::services::runtime::executor::ExecutorError;
-    use crate::services::runtime::resolver::ResolveError;
-    match err {
-        ExecutorError::Resolve(ResolveError::UnknownModel(m)) => {
-            CoreError::ModelNotFound { model_name: m }
-        }
-        ExecutorError::Resolve(ResolveError::CapabilityUnsupported { requested, .. }) => {
-            CoreError::InvalidRequest {
-                message: format!(
-                    "TTS model '{}' has no candidate that emits audio output",
-                    requested
-                ),
-                details: None,
-            }
-        }
-        ExecutorError::Resolve(other) => CoreError::InternalError {
-            message: format!("TTS alias resolution: {}", other),
-            source: None,
-        },
-        ExecutorError::AllCandidatesFailed { .. } => CoreError::AllBackendsUnavailable {
-            model_name: model.to_string(),
-        },
-        ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
-            model_name: model.to_string(),
-        },
-        ExecutorError::FlowDispatcherUnavailable
-        | ExecutorError::FlowEmptyResult { .. }
-        | ExecutorError::Internal(_)
-        | ExecutorError::SttRuntimeUnavailable
-        | ExecutorError::SttBackend(_) => CoreError::InternalError {
-            message: format!("executor.execute_tts: {}", err),
-            source: None,
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_wav_header_extracts_pcm() {
-        // Minimalny WAV: RIFF + fmt(16B PCM16 mono 16k) + data(4B PCM)
-        let mut wav = Vec::new();
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&36u32.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-        wav.extend_from_slice(&16_000u32.to_le_bytes());
-        wav.extend_from_slice(&32_000u32.to_le_bytes());
-        wav.extend_from_slice(&2u16.to_le_bytes());
-        wav.extend_from_slice(&16u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&4u32.to_le_bytes());
-        wav.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-
-        let pcm = strip_wav_header(&wav).expect("strip ok");
-        assert_eq!(pcm, vec![0xAA, 0xBB, 0xCC, 0xDD]);
-    }
-
-    #[test]
-    fn chunk_bytes_constant_matches_100ms_pcm16_16k_mono() {
-        // Walidacja stalej: 16000 Hz * 0.1 s * 2 B/sample = 3200 B
-        assert_eq!(TTS_STREAM_CHUNK_BYTES, 16_000 / 10 * 2);
     }
 }

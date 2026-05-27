@@ -17,8 +17,8 @@ use rusqlite::Transaction;
 use super::{
     auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
     host_os_supported, models_from_manifest, query_cuda0_vram_mib, resolve_display_name,
-    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogSink,
-    PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
+    smart_health_probe, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
+    RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
 use crate::deploy::process_ctl;
 use crate::deploy::python_venv::{self, NativeDeployRequest};
@@ -65,6 +65,11 @@ pub struct PythonBundleDeploy {
     ports: Arc<PortAllocator>,
     log_sink: Option<LogSink>,
     running: Mutex<Option<RunningState>>,
+    /// Port zapisany w `services.runtime_port` (gdy respawn istniejącego
+    /// serwisu). `None` = świeży deploy, `acquire()` wybierze nowy z puli.
+    /// `Some(p)` = `acquire_or_specific(p)` próbuje wziąć dokładnie ten
+    /// port, fail gdy zajęty (zamiast cicho zmieniać).
+    preserved_port: Option<u16>,
 }
 
 impl PythonBundleDeploy {
@@ -74,12 +79,23 @@ impl PythonBundleDeploy {
         ports: Arc<PortAllocator>,
         log_sink: Option<LogSink>,
     ) -> Self {
+        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+    }
+
+    pub fn new_with_port(
+        manifest: ServiceManifest,
+        user_config: serde_json::Value,
+        ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
+        preserved_port: Option<u16>,
+    ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
             log_sink,
             running: Mutex::new(None),
+            preserved_port,
         }
     }
 
@@ -154,9 +170,13 @@ impl DeployStrategy for PythonBundleDeploy {
         )
         .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
 
+        // Respawn istniejącego serwisu zachowuje port z DB (`preserved_port`);
+        // świeży deploy → acquire z puli. Bez tego allocator dawał kolejny
+        // port z cursora przy każdym respawn → DB miało :5002 ale cache
+        // BackendClient :5001 (poprzednia próba) → routing 404.
         let port = self
             .ports
-            .acquire()
+            .acquire_or_specific(self.preserved_port)
             .map_err(|e| DeployError::PortAlloc(e.to_string()))?;
         let allocated_ports = vec![port];
 
@@ -189,6 +209,13 @@ impl DeployStrategy for PythonBundleDeploy {
         if let Some(model) = model_repo {
             env.insert("MODEL".into(), model);
         }
+        // VLLM_ARGS / gpu_memory_utilization sa pojeciami specyficznymi dla
+        // vllm. Inne python-bundle silniki (qwen-asr, parakeet, xtts itd.)
+        // odpalaja przez uvicorn lub wlasny entrypoint, ktore nie znaja
+        // `--gpu-memory-utilization` — bez tego guarda flaga byla appendowana
+        // do uvicorn argv przez `build_engine_args` (rozwija VLLM_ARGS env
+        // dla kazdego engine'a) i serwis padal na `No such option`.
+        let is_vllm = engine_id == "vllm";
         // Single source of truth dla --gpu-memory-utilization.
         //   - Manual mode: wizard wysyla user's value (top-level
         //     `gpu_memory_utilization` lub w `vllm_args`). Backend ją honoruje
@@ -201,34 +228,45 @@ impl DeployStrategy for PythonBundleDeploy {
         //     zeby vllm wstal niezaleznie od stanu hosta.
         // Niezaleznie od trybu, finalnie w VLLM_ARGS jest **dokladnie jedna**
         // flaga --gpu-memory-utilization — wszystkie poprzednie sa wyciete.
-        let user_explicit_ratio = env
-            .get("GPU_MEMORY_UTILIZATION")
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| {
-                self.user_config
-                    .get("gpu_memory_utilization")
-                    .and_then(|v| v.as_f64())
-            });
-        let from_vllm_args = env.get("VLLM_ARGS").and_then(|raw| {
-            let mut iter = raw.split_whitespace();
-            while let Some(tok) = iter.next() {
-                if tok == "--gpu-memory-utilization" {
-                    return iter.next().and_then(|v| v.parse::<f64>().ok());
-                }
-                if let Some(rest) = tok.strip_prefix("--gpu-memory-utilization=") {
-                    return rest.parse::<f64>().ok();
-                }
-            }
+        let user_explicit_ratio = if !is_vllm {
             None
-        });
+        } else {
+            env.get("GPU_MEMORY_UTILIZATION")
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| {
+                    self.user_config
+                        .get("gpu_memory_utilization")
+                        .and_then(|v| v.as_f64())
+                })
+        };
+        let from_vllm_args = if !is_vllm {
+            None
+        } else {
+            env.get("VLLM_ARGS").and_then(|raw| {
+                let mut iter = raw.split_whitespace();
+                while let Some(tok) = iter.next() {
+                    if tok == "--gpu-memory-utilization" {
+                        return iter.next().and_then(|v| v.parse::<f64>().ok());
+                    }
+                    if let Some(rest) = tok.strip_prefix("--gpu-memory-utilization=") {
+                        return rest.parse::<f64>().ok();
+                    }
+                }
+                None
+            })
+        };
         // Wybor finalnej wartosci:
         //   1. user explicit (osobne pole) — zawsze wygrywa, manual mode
         //   2. wartosc w vllm_args (gdy wizard manual jeszcze nie laduje
         //      do osobnego pola) — manual mode legacy
         //   3. auto-safe z aktualnego free VRAM — auto mode / no-input
-        let final_ratio: Option<f64> = user_explicit_ratio
-            .or(from_vllm_args)
-            .or_else(auto_gpu_memory_utilization);
+        let final_ratio: Option<f64> = if !is_vllm {
+            None
+        } else {
+            user_explicit_ratio
+                .or(from_vllm_args)
+                .or_else(auto_gpu_memory_utilization)
+        };
         if let Some(ratio) = final_ratio {
             // Wytnij ewentualne stare wystapienia flagi z VLLM_ARGS.
             let cleaned = match env.get("VLLM_ARGS") {
@@ -337,6 +375,14 @@ impl DeployStrategy for PythonBundleDeploy {
             ],
             status_report_interval: Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
+            // Brak hard timeoutu (None) — duze modele (70B+, 100GB load
+            // z dysku, HF download multi-GB) moga sie ladowac 10-30 min.
+            // Probe konczy sie tylko gdy proces zginie (CUDA OOM crash
+            // → ProcessExited) albo readiness URL odpowie 2xx (Ready).
+            // User widzi PROGRES przez `progress_message` heartbeat
+            // ("alive Xs, waiting for ready") i sam decyduje czy
+            // anulowac deploy w GUI gdy uzna ze cos wisi.
+            max_wait: None,
         };
         let outcome = smart_health_probe(probe_cfg, move || async move {
             // None = still alive; Some(_) = exited (we cannot recover the
@@ -455,10 +501,7 @@ mod tests {
     #[test]
     fn strip_removes_multiple_occurrences() {
         let raw = "--gpu-memory-utilization 0.9 --max-model-len 4096 --gpu-memory-utilization 0.6";
-        assert_eq!(
-            strip_gpu_memory_utilization(raw),
-            "--max-model-len 4096"
-        );
+        assert_eq!(strip_gpu_memory_utilization(raw), "--max-model-len 4096");
     }
 
     #[test]
@@ -487,6 +530,7 @@ mod tests {
                 requires_model: None,
                 gpu_supported: None,
                 default_port: 0,
+                dgx_spark: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
                 service_surfaces: None,

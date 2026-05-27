@@ -8,7 +8,7 @@ No workspace Cargo.toml — each crate builds independently. The main binary is 
 
 ```bash
 # Build main binary (from tentaflow/)
-cd tentaflow && cargo build --release
+cd tentaflow && cargo build
 
 # Build core library (from tentaflow-core/)
 cd tentaflow-core && cargo build
@@ -36,358 +36,179 @@ Feature flags on `tentaflow-core`:
 | `inference-llamacpp` | llama.cpp backend |
 | `inference-mlx` | Apple MLX (macOS only) |
 | `dashboard-api` | Axum HTTP dashboard + API |
-| `metrics-prometheus` | Prometheus metrics |
-
-The main binary enables `docker`, `dashboard-api`, `metrics-prometheus` by default. macOS additionally enables `inference-mlx`.
-
-## Tests
-
-```bash
-# All tests (from tentaflow-core/)
-cd tentaflow-core && cargo test --lib --tests
-
-# Specific module
-cargo test --lib mesh::security
-
-# Single test
-cargo test --lib mesh::security::tests::pair_two_nodes_full_flow
-
-# Skip MLX example (fails without feature flag)
-cargo test --lib    # not cargo test (which includes examples)
-```
-
-## Architecture
-
-### Crate Dependency Graph
-
-```
-tentaflow (binary: API gateway + mesh node)
-  └── tentaflow-core (shared library)
-        └── tentaflow-protocol (QUIC protocol types, rkyv zero-copy)
-
-tentaflow-desktop/{linux,macos,windows} (native desktop apps)
-  ├── tentaflow-desktop/core (shared desktop logic)
-  │     ├── tentaflow-core
-  │     └── tentaflow-ui (egui/wgpu GUI)
-  └── tentaflow-ui
-
-tentaflow-mobile (Android JNI + iOS Swift bridge)
-  ├── tentaflow-core
-  └── tentaflow-ui
-
-tentaflow-client/native (Rust FFI → .NET P/Invoke)
-  └── tentaflow-protocol
-
-tentaflow-client/dotnet (C# wrapper over native)
-
-tentaflow-models (training pipeline for Qwen 3.5-0.8B orchestrator)
-
-mlx-models (Apple MLX inference bindings)
-```
-
-### Core Modules (tentaflow-core/src/)
-
-- **mesh/** — P2P networking: mDNS discovery, QUIC transport, CRDT state sync, gossip (SWIM), node pairing (PIN + Ed25519/X25519/ChaCha20-Poly1305), key rotation epochs, trust revocation broadcast
-- **addon/** — WASM plugins: Wasmtime (desktop) / wasmi (mobile), permission system, event bus, host functions, instance pooling, rate limiting
-- **routing/** — Request routing: load balancer with circuit breaker, chat/embeddings/TTS/STT handlers, local inference, mesh forwarding
-- **services/manifest/** — Service Manifest registry: ładowanie wygenerowanego rejestru z `services_generated.rs`, walidacja semantyczna (4 reguły), katalog silników udostępniany przez `/api/services/manifest`. Patrz sekcja `## Service Manifest`.
-- **license/** — Sprawdzanie tieru licencji (Free/Pro/Enterprise), gating opcji `download` w manifestach
-- **api/** — HTTP: OpenAI-compatible `/v1/*`, Dashboard `/api/*` (JWT), WebSocket metrics
-- **flow_engine/** — DAG-based workflow execution with typed adapters
-- **inference/** — LLM backends: llama.cpp, MLX, model manager
-- **net/quic/** — QUIC client/server with TLS 1.3
-- **db/** — SQLite (rusqlite, bundled), migrations, repository pattern
-
-### Key Design Patterns
-
-**Protocol serialization**: All QUIC messages use rkyv (zero-copy binary), not JSON. Protocol types live in `tentaflow-protocol/src/`. Two ALPN protocols: `tentaflow` (client→node) and `tentaflow-mesh` (node↔node).
-
-**build.rs does two things**: (1) compiles WASM addons from `addons/` and `addons-pro/` to `wasm32-wasip1` and embeds them via `include_bytes!`, (2) embeds `www/` static files into the binary with MIME detection. Changes to `www/` require recompilation.
-Bundled addon updates at startup are driven by `bundle_hash` (computed from embedded addon payload), not only by manifest `version`, so manifest-only changes propagate to the installed DB state without a forced version bump.
-
-**Mesh security layers**: TLS 1.3 (transport) → Ed25519 identity → X25519 DH key exchange → ChaCha20-Poly1305 AEAD with epoch-based key rotation (24h interval, 7-day grace period) and replay protection (sequential nonce + sliding window).
-
-**Pairing / First Contact**:
-- Pierwszy kontakt nie idzie już przez istniejący `mesh` stream, tylko przez osobny ALPN `tentaflow-pairing/v1`.
-- `MeshPairingStartRequest` może nieść hinty transportowe (`remote_addresses`, `remote_relay_url`, `remote_hostname`) z QR albo z autodiscovery.
-- QR payload `tentaflow-pair://...` powinien zawierać co najmniej `node_id`, `pin`, oraz gdy są znane także `addr=` i `relay=`.
-- Po potwierdzonym parowaniu utrwalamy `trusted_contact:*` w `settings`, żeby reconnect po zmianie sieci mógł iść od razu przez relay/direct hints zamiast czekać na świeże discovery.
-- `MeshNodeInfo.connection` raportuje do GUI aktywną ścieżkę iroh (`p2p`/`relay`, `lan`/`wan`, adres, lista pathów), więc ekran Mesh pokazuje realny transport zamiast zgadywać po statusie.
-- Receiver zapisuje `pending_contact:*` w settings, żeby późniejsze `confirm/reject` mogły dociągnąć połączenie do inicjatora nawet bez świeżego autodiscovery.
-- `mesh` stream jest dalej używany po zestawieniu łączności do `PairingConfirm/Reject`, `NodeInfo` i `TrustedKeysSync`.
-
-**Mesh connection lifecycle (iroh)**:
-- Transport is iroh QUIC via `IrohMeshManager` (`tentaflow-core/src/mesh/iroh_manager.rs`). Relay URL: `load_relay_url` returns `Option<RelayUrl>`. `None` = iroh's built-in N0 preset (4 production relays `*.relay.n0.iroh-canary.iroh.link`). `Some(url)` = custom override from DB `settings.mesh.iroh_relay_url` or `config.toml`.
-- Discovery and auto-connect are intentionally separate concerns now: `PeerDiscovered` always feeds GUI/peer_store, but automatic mesh dialing is only for trusted peers. Discovery/known-peers/topology merge fresh addresses into `trusted_contact:*`, keep the currently working direct path first, and reconnect via hints instead of dialing every newly seen interface.
-- On simultaneous dial (A→B and B→A concurrently) iroh produces two distinct QUIC connections. `register_connection` applies a deterministic tie-break: **outgoing wins only if `self_hex < peer_hex`** (lexicographic on endpoint-id hex). Both sides converge on the same physical connection; the loser is closed with reason `"tie-break-loser"`.
-- `dial_locks: HashMap<peer_hex, Arc<Mutex<()>>>` — per-peer async mutex. All three `connect_to_peer*` variants acquire the lock before `endpoint.connect`, so at most one dial per peer is in flight. Lock is dropped on `disconnect_peer`.
-- Heartbeat: sole producer is the loop in `pipeline.rs` (broadcasts rkyv `HeartbeatMetrics` every `heartbeat_interval_ms`, default 500). The empty `run_heartbeat_loop` stub in `iroh_manager.rs` has been removed.
-- Upgrade path: `sanitize_trusted_contacts` runs at startup and strips `settings.trusted_contact:*` entries still pointing at the dead `use.iroh.network` default.
-
-**Dashboard**:
-- Frontend `www/` uses vanilla JS + custom elements `tf-*` from `tentaflow-core/www/js/components/`.
-- The Addons (WASM) view uses `tf-chip`, `tf-searchbox`, `tf-toggle`, and `tf-button`; layout and styling live in `tentaflow-core/www/css/addons.css`.
-
-### Mesh Protocol Discriminants
-
-| Byte | Message | Status |
-|------|---------|--------|
-| 0x01-0x03 | ModelRequest, IngestRequest, CancelRequest | Client→Node |
-| 0x10-0x18 | Heartbeat, CRDT, FullState, Forward, Models, Containers, Services, NodeInfo | Node↔Node |
-| 0x20-0x22 | PairingRequest/Confirm/Reject | Pairing flow |
-| 0x23 | TrustRevoked | Revocation broadcast |
-| 0x24 | TrustedKeysSync | Post-pairing key sync |
-| 0x25 | KeyRotation | Epoch key rotation |
-| 0x30-0x33 | MeshCommand/Response/DeployProgress/LogChunk | Management (trusted only) |
-
-## Service Manifest
-
-Single source of truth dla wszystkich silników AI (LLM, TTS, STT, embeddings, vision, image-gen itd.). Każdy silnik = jeden plik TOML w `tentaflow-containers/<category>/_services/<engine_id>.toml`. Build.rs `tentaflow-core` waliduje manifesty przy `cargo build` i generuje:
-
-- Rust const w `$OUT_DIR/services_generated.rs` — statyczny rejestr używany przez `tentaflow-core/src/services/manifest/registry.rs`
-- JS module `tentaflow-core/www/js/generated/services-manifest.js` — importowany dynamicznie przez `www/js/modules/catalog/manifest-store.js` w GUI
-
-## Legacy Cleanup
-- `tentaflow-core/wwwroot/` zostało usunięte; jedynym aktywnym dashboardem jest `tentaflow-core/www/`.
-- Binary protocol nie wspiera już legacy `NodeListRequest` ani `NodeInfoRequest`; GUI i backend używają ścieżki `MeshNode*`.
-- Self-hosted iroh relay deployment assets live in `tentaflow-containers/tools/docker/iroh-relay/`; the old top-level `deploy/iroh-relay/` location is no longer used.
-- `deploy.docker` supports both single-container deployments via `context_path` and multi-container stack deployments via `compose_path`.
-- Manifests may set `engine.resource_kind` to `ai` or `infra`; the catalog renders infrastructure separately so supporting stacks do not appear as AI runtimes.
-
-Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `tentaflow-containers/_schema/schema.json`.
-
-### Struktura katalogu
-
-Kategorie z ≥1 plikiem `*.toml` w `_services/` pokazują się w GUI; puste są ukryte.
-
-| Katalog | Kategoria | Przykładowe silniki |
-|---------|-----------|---------------------|
-| `tentaflow-containers/llm/_services/` | Large Language Models | llama-cpp, mlx, vllm, sglang, ollama, tensorrt-llm |
-| `tentaflow-containers/stt/_services/` | Speech-to-Text | whisper, parakeet, qwen-asr |
-| `tentaflow-containers/tts/_services/` | Text-to-Speech | sherpa-onnx, xtts, voxcpm |
-| `tentaflow-containers/image-gen/_services/` | Generowanie obrazów | comfyui, stable-diffusion-cpp |
-| `tentaflow-containers/agents/_services/` | Autonomiczne agenty | teams-bot |
-
-Pozostałe katalogi (`vision`, `video-gen`, `music-gen`, `model-3d-gen`, `tools`) istnieją w drzewie, ale dopóki nie dodasz pliku TOML do ich `_services/`, GUI nie pokaże tej sekcji.
-
-### Anatomia pliku TOML
-
-```toml
-[engine]
-id = "vllm"
-category = "llm"
-name = "vLLM"
-description_pl = "..."
-description_en = "..."
-homepage = "https://github.com/vllm-project/vllm"
-license = "Apache-2.0"
-icon = "vllm"
-default_port = 8000
-api = "openai-compatible"
-version = "0.6.3"
-
-[deploy.docker]
-context_path = "llm/docker/vllm"
-platforms = ["linux", "windows"]
-
-[deploy.native]
-platforms = ["linux", "windows"]
-runtime = "python-bundle"
-bundle_path = "llm/python/vllm"
-
-# Opcjonalnie:
-# [deploy.external]
-# platforms = ["linux", "macos", "windows"]
-# detection_binary = "ollama"
-# detection_endpoint = "http://localhost:11434"
-# detection_health_path = "/api/tags"
-
-[[model_preset]]
-id = "qwen3-5-0-8b"
-display_name = "Qwen 3.5 0.8B"
-repo = "Qwen/Qwen3.5-0.8B"
-recommended = true
-```
-
-Pełny opis pól w `tentaflow-containers/_schema/SCHEMA.md`.
-
-### Tryby deploymentu
-
-Manifest ma do trzech sekcji deploy (każda renderuje przycisk w wizardzie):
-
-- **`[deploy.docker]`** — obraz Docker budowany lokalnie z `context_path`. Opcjonalny `download_image` (Pro feature, prebuilt OCI).
-- **`[deploy.native]`** — natywne uruchomienie. Pole `runtime` decyduje:
-  - `embedded` — wkompilowane w binarkę `tentaflow`. Gating opcjonalnie przez Cargo `feature_flag` (np. llama.cpp, MLX) albo przez `target_os` / stałą zależność (np. `apple-tts`, vision/* przez `tract-onnx`) — wtedy `feature_flag` pomijamy.
-  - `binary` — natywna binarka budowana skryptem `binary_path/build.sh` (np. sherpa-onnx, stable-diffusion-cpp).
-  - `python-bundle` — bundle Pythona w `bundle_path` (np. vllm, xtts, comfyui).
-- **`[deploy.external]`** — wykrycie zewnętrznego daemona w `PATH` z health-checkiem (np. ollama).
-
-### Native Python Bundles
-
-- Native `python-bundle` używa wspólnego katalogu modeli w `models/`; runner ustawia `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `TRANSFORMERS_CACHE` i `TORCH_HOME` tak, żeby Docker i native widziały te same pliki modeli.
-- Cache runtime bundli można przenieść przez `TENTAFLOW_CACHE_DIR`, co jest przydatne na hostach gdzie `/tmp` jest `tmpfs` albo mało miejsca.
-- Runner tworzy wersjonowane template w `<cache>/bundle-templates/<engine>/<template_hash>/venv` i osobne instancje w `<cache>/bundle-instances/<engine>/<instance_name>/`.
-- Przy tworzeniu instancji runner próbuje najpierw zrobić hardlink plików z template; zwykła kopia jest tylko fallbackiem. To ogranicza zużycie miejsca dla ciężkich env typu `vllm`.
-- Bundla z wrapperem HTTP (`parakeet`, `qwen-asr`, `xtts`, `voxcpm`) muszą trzymać własne `requirements.lock` obok `bundle.toml`, bo upstream repo nie gwarantują `fastapi`/`uvicorn` ani zależności wrappera.
-- Native deploy wstrzykuje `PORT` z wizarda/compose do procesu Pythona; `bundle.toml` powinien używać `${PORT:-<domyślny_port>}` zamiast sztywnej wartości.
-- `ServiceManifestDeployRequest` dla `runtime=embedded` nie może kończyć się samym rekordem `deployment`: po udanym deployu musi też utworzyć/odświeżyć wpis w tabeli `services`, żeby backend przywracał taki serwis po restarcie i żeby ekran `Services` nie był pusty po natywnym deployu `llama.cpp` / `mlx` / `whisper`.
-
-### Walidacja
-
-Build.rs sprawdza 4 reguły semantyczne przy każdym `cargo build`:
-
-1. `engine.id` pasuje do regex `^[a-z0-9][a-z0-9_-]{0,63}$` (chroni przed path-traversal).
-2. Manifest ma przynajmniej jedną sekcję deploy (`docker`, `native` lub `external`).
-3. `deploy.native.runtime` spójny z polami: `embedded` MOŻE mieć `feature_flag` (gdy gating przez Cargo feature) ale nie musi (gdy gating przez `target_os` lub stałą zależność, np. `apple-tts`, vision/* przez `tract-onnx`); `embedded` NIE MOŻE mieć `binary_path` ani `bundle_path`. `binary` ⇒ `binary_path`. `python-bundle` ⇒ `bundle_path`. Tylko jedno z trzech.
-4. Ścieżki `context_path` / `binary_path` / `bundle_path` istnieją na dysku.
-
-Globalna unikalność `engine.id` jest egzekwowana cross-file.
-
-### API endpoints
-
-| Endpoint | Opis |
-|----------|------|
-| `GET /api/services/manifest` | Cały manifest jako JSON (lista silników) |
-| `GET /api/services/manifest/:engine_id` | Pojedynczy silnik |
-| `GET /api/license/info` | Tier licencji (`{tier, allows_pro, allows_enterprise}`) |
-| `POST /api/services/deploy` | Deploy silnika (body: `engine_id`, `deploy_method` ∈ `docker`/`native`/`external`, `node_id`, `config`) |
-| `GET /api/services/deployed` | Lista uruchomionych deploymentów |
-
-Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
-
-### Jak dodać nowy silnik
-
-1. Wybierz kategorię (`llm`, `tts`, `stt`, ...) i utwórz `tentaflow-containers/<category>/_services/<engine-id>.toml` zgodnie z `_schema/SCHEMA.md`
-2. Dla `[deploy.docker]`: dodaj `<category>/docker/<engine-id>/{Dockerfile, entrypoint.sh, ...}`
-3. Dla `[deploy.native]` runtime=`binary`: dodaj `<category>/native/<engine-id>/build.sh`
-4. Dla `[deploy.native]` runtime=`python-bundle`: dodaj `<category>/python/<engine-id>/{bundle.toml, server.py}`
-5. Dla `[deploy.native]` runtime=`embedded`: tylko TOML manifest + Cargo feature w `tentaflow-core/Cargo.toml`
-6. `cargo build` w `tentaflow-core/` — walidacja + auto-generacja Rust + JS rejestru
-7. Reload GUI — kafelek silnika pojawi się dynamicznie z manifestu
-
-## Profilowanie Nsight Systems
-
-Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z GUI. Sesja jest uruchamiana lokalnie albo na zaufanym nodzie mesh przez forwarding rkyv; raport jest renderowany w przeglądarce bez zewnętrznego viewera.
-
-### Architektura
-
-- **`tentaflow-core/src/profiling/`** — runner `nsys`, parser SQLite eksportu, builder timeline, storage (FIFO 20 sesji), capability detection (`nsys --version`, cache 5s).
-- **`tentaflow-protocol/src/profiling.rs`** — typy rkyv: `NsightScope`, `ProfileReport`, oraz `NsightPayload` z 5+1 parami request/response.
-- **`tentaflow-core/src/dispatch/mesh_write_handlers.rs`** — 6 handlerów (`start`, `stop`, `sessions`, `report`, `delete`, `download`), `policy=Admin`.
-- **`tentaflow-core/src/dispatch/command_executor.rs`** — wykonanie zdalne; forwarding przez `MeshCommandType::Nsight*` (typed payloady rkyv, tylko trusted peer).
-- **`tentaflow-core/src/mesh/peer_store.rs`** — propagacja capability `nsys_available` + `nsys_version` przez `HeartbeatMetrics`.
-- **GUI**: `tentaflow-core/www/js/modules/mesh-detail-nsight.js` (modal startu, badge REC z countdown, lista sesji), `tentaflow-core/www/js/modules/profile-report.js` (6 KPI tiles, 7 zakładek `tf-tabs`: Overview / GPU Kernels / CUDA APIs / Memory / CPU Samples / NVTX / Timeline; vanilla SVG line chart per karta dla SM / Memory / Power). Routing: `Router.navigate('profile-report', { nodeId, sessionId })`. Per-card przycisk "Profile" widoczny gdy `gpu.vendor === 'Nvidia'` ORAZ `node.nsys_available`.
-
-### Tryby profilowania
-
-| `NsightScope` | Flagi `nsys profile` |
-|---------------|----------------------|
-| `Cpu` | `--sample=cpu --trace=osrt --gpu-metrics-device=none` |
-| `GpuIndex(i)` | `--sample=none --trace=cuda,cudnn,cublas,nvtx --gpu-metrics-device=<i>` |
-| `GpuAll` | `--sample=none --trace=cuda,cudnn,cublas,nvtx --gpu-metrics-device=all` |
-| `BothIndex(i)` | `--sample=cpu --trace=cuda,cudnn,cublas,osrt,nvtx --gpu-metrics-device=<i>` |
-| `BothAll` | `--sample=cpu --trace=cuda,cudnn,cublas,osrt,nvtx --gpu-metrics-device=all` |
-
-### Wymagania
-
-- `nsys` w `PATH` (CUDA Toolkit z Nsight Systems). Detekcja przez `nsys --version`, capability cache 5s.
-- DGX Spark / arm64-sbsa: brak specjalnych ścieżek — wystarczy zainstalowany Nsight Systems dla arm64.
-- Sesja działa lokalnie na nodzie posiadającym GPU; mesh forwarding jest tylko transportem żądań.
-
-### Limity
-
-- 1 aktywna sesja per nod (kolejne `start` odrzucane).
-- `duration_seconds` ∈ `0..=600` (`0` = manual stop przez `nsight.stop`).
-- `label` ≤ 128 znaków, bez znaków kontrolnych.
-- Storage FIFO: maks 20 sesji per nod; rotacja sierot starszych niż 1h bez `summary.bin`.
-
-### Storage layout
-
-```
-<TENTAFLOW_HOME>/nsight/<node_id>/<session_id>/
-├── report.nsys-rep    # surowy raport nsys
-└── summary.bin        # rkyv ProfileReport (parsed timeline + KPI)
-```
-
-`session_id` walidowane regex `^[a-f0-9]{16,32}$`. Przed `nsys export` runner robi `tokio::fs::symlink_metadata` na ścieżce wyjściowej (anty path-traversal).
-
-### Bezpieczeństwo
-
-- Shell injection: każdy argument `nsys` jest oddzielnym `String`, zero `format!()` shell concat.
-- Resource exhaustion: limity (1 sesja/nod, FIFO 20, duration ≤ 600s, label ≤ 128).
-- Permission: handlery `policy=Admin`; mesh route akceptuje wyłącznie trusted peerów.
-
-### Audit events
-
-`repository::log_audit` zapisuje:
-
-- `nsight.start` — przy starcie sesji (lokalnej lub zdalnej).
-- `nsight.stop` — przy ręcznym lub automatycznym (timeout) zakończeniu.
-
-## Chat pipeline po cleanup
-
-Router chat obsługuje dokładnie dwie ścieżki:
-
-1. **Flow-engine driven** — jeśli request model ma przypisany flow w `flow_model_bindings`
-   (albo jest domyślny flow dla `service_type="chat"`), request idzie przez `FlowDispatcher`
-   → `execute_flow` (blocking) albo `execute_streaming_flow` (dla SSE). Adaptery wykonują
-   pipeline krok po kroku. Streaming: tylko `llm` adapter eksponuje port `stream` (QUIC
-   `send_request_stream` lub HTTP `chat_completion_stream`); pozostałe node types pracują
-   w full/blocking mode.
-
-2. **Bare passthrough** — jeśli żaden flow nie pasuje, chat.rs/streaming.rs wywołuje
-   bezpośrednio backend LLM (QUIC/HTTP/local inference) bez żadnego pre/post-processingu
-   request'a.
-
-Usunięte moduły (były częścią starego "jarvis" pipeline'u):
-- `routing/memory_integration.rs` — wstrzykiwanie memory context, conversation cache,
-  voice-based personalization. Funkcjonalność można odtworzyć przez user-defined flow
-  z node'ami `conversation_history` + `memory` + `speaker_context`.
-- `memory_analyzer/` — LLM-based decision "czy odpytać memory engine". Obecnie: flow
-  user-defined albo brak.
-- `intent_analyzer/` — LLM-based klasyfikacja intencji + speaker enrollment trigger.
-  Obecnie: flow user-defined albo enrollment manualny przez dashboard.
-- 19 hardcoded prompt stałych w `prompt_registry/mod.rs` + 3 pliki `.txt` → prompty
-  dodawane przez dashboard (CRUD) i/lub seed pod konkretne use-case (obecnie jeden:
-  `transcription_summarization` w 5 językach).
-
-### Zarejestrowane node types i porty
-
-FlowDispatcher (`tentaflow-core/src/flow_engine/dispatcher.rs`) rejestruje adaptery dla
-wszystkich node types używanych w seedowanych flows. Walidacja flow_json przy save
-(`validate_flow_json_str` w `dispatch/handlers.rs`) odrzuca flows odwołujące się do
-niezarejestrowanych typów lub nieistniejących portów — więc każdy typ obecny w seed
-musi mieć adapter.
-
-| Node type | Adapter | supported_output_ports | Źródło |
-|-----------|---------|------------------------|--------|
-| `trigger` | `TriggerNodeAdapter` | `["full"]` | `adapters/trigger.rs` |
-| `output` | `OutputNodeAdapter` | `["full"]` | `adapters/output.rs` |
-| `condition` | `ConditionNodeAdapter` | `["full"]` | `adapters/condition.rs` |
-| `pii_filter` | `PiiFilterNodeAdapter` | `["full"]` | `adapters/pii_filter.rs` (reguły z `pii_rules`) |
-| `tts_clean` | `TtsCleanNodeAdapter` | `["full"]` | `adapters/tts_clean.rs` (reguły z `tts_cleaning_rules`) |
-| `llm` | `LlmNodeAdapter` | `["stream", "full"]` | `adapters/llm.rs` — real streaming |
-| `stt`, `tts`, `embeddings`, `memory`, `conversation_history`, `session_context`, `speaker_context` | odpowiednie `*NodeAdapter` | `["full"]` | `adapters/*.rs` |
-
-> Path RAG zostal w calosci usuniety; nowa implementacja RAG bedzie zaprojektowana od zera.
-
-Logika `trigger`/`output`/`condition`/`pii_filter`/`tts_clean` żyje w modułach adapterów
-jako `pub fn build_*` / `apply_*` — executor_async woła je dla szybkiej ścieżki
-wewnętrznej; adaptery wywołują te same funkcje. Zero duplikacji.
-
-`FlowEdge.from_port` i `to_port` (default `"full"` / `"in"`) określają który port
-node'a jest podpięty. Walidacja sprawdza że `from_port` ∈ `supported_output_ports` i
-`to_port` ∈ `supported_input_ports` po obu stronach edge'a.
-
-Seedowane flows (`db/seed.rs`): `Standardowy pipeline LLM`, `Standardowy pipeline TTS`,
-`teams-flow`. Test `seeded_flows_pass_adapter_validation` egzekwuje że każdy z nich
-parsuje i przechodzi walidację przy świeżej bazie.
-
-Test reference: `cargo test --lib seeded_flows_pass_adapter_validation`.
 
 ## Configuration
 
-`config.toml` at project root. Key sections: `[server]`, `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default ports: HTTPS/QUIC on 8090, Prometheus on 9090.
+`config.toml` at project root. Key sections: `[server]`, `[server.mtls]`, `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default ports: HTTPS/QUIC on 8090, Prometheus on 9090.
+
+`[server.mtls]` (optional) — Service-to-Core mTLS pinning for `/core/frame/pickup`:
+
+```toml
+[server.mtls]
+pickup_required = false              # default off (F1a/F1b compat)
+client_cert_fingerprints = []        # SHA-256 hex of allowed client leaf certs
+```
+
+Production must flip `pickup_required = true` and list at least one fingerprint.
+
+## Transport architecture (2-tier)
+
+TentaFlow runs two transport tiers and every change must respect this split:
+
+### Tier 1: Binary primary (default)
+
+WebTransport `/wt/api` + WebSocket `/ws/api` fallback, binary `MessageBody` protocol.
+- Frontend ↔ Core: all admin UI, all data fetching
+- Addons ↔ Core (via wasmtime): host functions ABI via addon-sdk wrappers
+- Services in mesh ↔ Core: QUIC tunnel (mesh control plane)
+- Sub-second response, low overhead, full request/response binary serialization
+
+## Admin Scheduler
+
+Scheduler administracyjny działa w `tentaflow-core/src/scheduler/` i trzyma
+stan w SQLite (`scheduled_jobs`, `scheduled_runs`). Uruchamia wyłącznie funkcje
+addonów przez `AddonManager::call_tool`, a dashboard komunikuje się z nim przez
+binary protocol (`SchedulerBody(SchedulerPayload)`), nie przez REST.
+
+Ekran admina jest w `www/js/modules/scheduler.js` i jest podpięty do menu tylko
+dla administratorów. Obsługiwane tryby harmonogramu: `once` (RFC3339),
+`interval` (`30m`, `1h`, `1d`) oraz prosty dzienny `cron` w formacie
+`minute hour * * *`. Scheduler startuje raz procesowo z dashboard/unified server
+i jest odporny na restart przez wyliczanie `next_run_at` z trwałej bazy.
+Zapis joba waliduje, że wskazany addon jest zainstalowany, włączony i ma
+deklarowane narzędzie w manifeście. UI jest uniwersalne: admin najpierw wybiera
+addon, potem jedną z funkcji zadeklarowanych przez ten addon, a payload JSON jest
+generowany z parametrów narzędzia. Przed wykonaniem joba scheduler uruchamia
+instancję addonu, jeśli wybrany addon nie ma aktywnej instancji WASM; samo
+wywołanie nadal idzie przez standardowe sprawdzenie uprawnień `call_tool`.
+
+## Eureka MF Addon
+
+Bundled addon `tentaflow-core/addons/eureka/` indeksuje publiczne informacje z
+`https://eureka.mf.gov.pl/api/public/v1/informacje/{id}` do własnego SQLite.
+Nie używa żadnego endpointu REST TentaFlow: LLM wywołuje narzędzia addonu przez
+standardowy mechanizm addon tools, a przyszłe uruchomienia cykliczne powinny iść
+przez admin scheduler.
+Manifest addonu deklaruje wymagany cel zewnętrzny przez `[[network_rule]]`:
+`tcp://eureka.mf.gov.pl:443`. Host function `http.request` działa fail-closed:
+samo uprawnienie `http.request` nie pozwala na ruch wychodzący bez zgodnej i
+zatwierdzonej reguły w `addon_network_rules`. Deklaracje manifestu nie są
+zatwierdzane automatycznie przy instalacji, także gdy `required=true`; admin
+zatwierdza je w zakładce Network addona, a UI zapisuje realne pole `approved`
+używane przez host functions.
+
+Narzędzia: `search` (lokalne wyszukiwanie po SQLite), `get_entry` (pobranie lub
+odświeżenie pojedynczego wpisu), `sync_new` (dzienny skan nowych ID), `full_dump`
+(wznawialny zrzut zakresu ID w batchach), `retry_failed` (ponowienie wpisów ze
+statusem `error`), `recent` (najnowsze lokalne wpisy) oraz `stats`. Checkpointy
+są w tabeli `eureka_sync_state`, wpisy w `eureka_entries`, a status każdego
+sprawdzonego identyfikatora w `eureka_fetch_status`.
+
+### Tier 2: HTTP REST secondary
+
+Reserved for external integrations that cannot use the binary protocol:
+
+1. `POST /core/frame/pickup` — Service-to-Core for backend service integrations
+   (yolo, whisper inference). Authentication: HMAC `X-Pickup-Token` (one-shot,
+   30 s TTL). Production REQUIRES mTLS client cert pinning (`[server.mtls]`).
+2. `GET /recordings/<ref>?token=&exp=&ref=` — Browser-friendly signed URL for
+   addon-issued recording downloads (PNG snapshots, MP4 segments). HMAC,
+   multi-use, 60–3600 s TTL.
+3. `GET /frames/<ref>?token=&exp=&ref=` — Same pattern, frame_url for raw RGB24
+   bytes from frame_storage LRU. HMAC, multi-use, 60–600 s TTL.
+
+### Security boundary
+
+Both tiers share:
+- HMAC SHA-256 token verification (constant-time via `subtle::ConstantTimeEq`)
+- Audit log per outcome (`audit_log` + `frame_pickup_log`)
+- Rate limit per IP + global (token bucket, 429 + `Retry-After`)
+- Path traversal containment (canonicalize + `base_dir.starts_with` check)
+- Security response headers: `Cross-Origin-Resource-Policy: same-site`,
+  `Referrer-Policy: no-referrer`, `Cache-Control: private, no-store`,
+  `X-Content-Type-Options: nosniff`, `Strict-Transport-Security: max-age=63072000;
+  includeSubDomains` (HSTS applied unconditionally to every response).
+
+Production TLS profile (enforced in `api::unified_server`):
+- TLS 1.3 only (legacy clients explicitly unsupported in F1b)
+- AEAD cipher suites only (no CBC, no RC4 — implied by TLS 1.3 lockout)
+- HSTS header on every response (200, 401, 403, 404, 429 — no exception)
+
+### Cluster constraint
+
+HMAC signing keys (PickupToken + frame_url + recording_url + cameras AES-GCM)
+and the pickup mTLS allowlist are process-local OR file-based per node.
+
+Single-node (F1b P3.A): HMAC keys persist on disk at
+`<tentaflow_home>/keys/{pickup_token,frame_url,recording_url}.key` (mode
+0600 on Unix). Restart no longer invalidates outstanding URLs or pickup
+tokens. Rotation: `tentaflow-cli keys rotate <name>` — running issuers
+keep the previous key as a verify-only secondary for `max_ttl + 5 s` so a
+rotation does not invalidate tokens already in flight.
+
+Cross-node frame pickup (F1b P3.C — done): when a pickup token mesh-verifies
+against a peer's HMAC key, the verifying node fetches the frame bytes from
+the issuing peer over the mesh stream (`MESH_MSG_FRAME_PROXY_REQUEST = 0x45`
+/ `MESH_MSG_FRAME_PROXY_RESPONSE = 0x46`, 5 s timeout) and serves them to
+the calling service. B-side replay protection lives in
+`PickupTokenIssuer::mesh_inflight_consume`. `frame_pickup_log` gains a
+nullable `source_node_id` column (DB v24) — local pickups leave it NULL,
+cross-node pickups record the peer's NodeId. 503 responses always carry
+`Retry-After: 5`.
+
+Multi-node (F1b P3.B): each peer mirrors its three HMAC issuer keys to
+every trust-paired peer over the existing mTLS mesh stream
+(`MESH_MSG_HMAC_KEYS_SYNC = 0x44`,
+`tentaflow_protocol::mesh::HmacKeysSyncPayload`). Tokens minted on node A
+verify on node B for the lifetime of the trust pairing. State is held in
+`services::mesh_keys::MeshKeyPool` (in-memory only, never persisted to
+disk — a revoked peer cannot leave stale verifiers behind). Disconnect /
+trust-revoke drops the peer's pool entries; reconnect re-advertises.
+One-shot pickup-token semantics are owned by the issuing node — mesh
+fallback verifies HMAC + expiry but does not enforce one-shot on the
+verifying side (the 30 s pickup TTL keeps the replay window tight). An
+explicit broadcast-on-rotate hop (push new keys without waiting for the
+next `PeerConnected`) is deferred; today rotation propagates lazily on
+the next connect cycle. Unlike `TrustedKeysSync`, the HMAC advertise is
+**not** gated by the 30 s `last_sync_sent` cooldown — every trusted
+`PeerConnected` re-advertises so a rotated key reaches peers on the
+first reconnect.
+
+### service_call rate limit (F1b P5)
+
+`service_call_v1` (host fn `service_request`) is rate-limited per addon:
+burst 100, sustain ~16.67 req/s (1000 req/min). Implementation in
+`src/services/service_call_rate_limit.rs`; limiter is a process-wide
+singleton sharing the `TokenBucket` primitive from `src/util/token_bucket.rs`
+with `api::rate_limit`. Denials return `AbiError::QuotaExceeded` (11) and
+emit at most one collapsed `audit_log` row per addon per 60 s window
+(`risk_class='C'`, `result='denied'`, `details.denied_count` carries the
+in-window total) — prevents an addon DoS from turning into an audit-log DoS.
+
+### Logging warning
+
+NEVER enable hyper access logging (`RUST_LOG=hyper=debug`) in production without
+a query-string scrubber. URLs `/recordings/<ref>?token=<hmac>` would log the
+HMAC token wire in plain text via Hyper's request line.
+
+### Default development command
+
+```bash
+cargo build --features dashboard-api
+```
+
+`camera` lives in `tentaflow-core`'s default features (GStreamer is mandatory
+for the video-surveillance pipeline), so it no longer needs an explicit flag.
+`dashboard-api` is still opt-in because some headless deployments skip the
+HTTP/dashboard stack.
+
+### Production deploy checklist
+
+- [ ] TLS 1.3 enforced (default since E2; do not weaken)
+- [ ] HSTS header observed in all responses (verify with `curl -k -I https://.../`)
+- [ ] `[server.mtls] pickup_required = true` with at least one fingerprint
+- [ ] HMAC token soak test passed (no 429 storms, no token leakage in logs)
+- [ ] `RUST_LOG` scoped to crate-level (no `hyper=debug`)
 
 ## Conventions
 
@@ -433,9 +254,6 @@ These rules apply to humans AND to every AI agent working on this repo. No excep
 - Inline comments only when the code's intent is not obvious from names — e.g. a workaround for a known bug, a non-obvious invariant, a performance trick. Do not narrate what the next line does.
 - Forbidden: meta-comments like `// CRITICAL:`, `// OPT-001`, `// Fixed in this PR`, `// Changed from X to Y`, `// OWASP-xxx`. Git blame carries history; comments carry intent.
 
-### 7. No cosmetic edits outside the task
-- Do not reorder imports, rewrap lines, fix unrelated whitespace, or rename unrelated symbols while making a feature change. Those belong in a separate formatting commit if at all.
-
 ### 8. Always use project web components — never roll your own UI primitive
 
 Project components live under `tentaflow-core/www/js/components/` — currently: `tf-button`, `tf-chip`, `tf-input`, `tf-menu`, `tf-searchbox`, `tf-select`, `tf-table`, `tf-tabs`, `tf-toggle`, `tf-window`.
@@ -448,22 +266,6 @@ Project components live under `tentaflow-core/www/js/components/` — currently:
 - Code review rejects any diff that renders a custom tab strip, custom toggle, custom select dropdown, custom modal, etc., when a `tf-*` component exists. "Slight visual difference" is not justification — change the component's CSS variant.
 
 **Why:** one-off UI primitives drift in look, accessibility, animation timing, and keyboard behavior. Users notice inconsistency. Components centralize the fixes.
-
-### 9. No CSV — always JSON for serialized lists
-
-**NEVER** persist or serialize a list-shaped value as CSV (`"a,b,c"`). Use JSON arrays (`["a","b","c"]`) — every layer (DB column, GUI form payload, wire protocol, config file).
-
-**Why:** A real bug we hit: `model_aliases.fallback_targets` was written as CSV by the GUI (`services.js`) and parsed as JSON by the Rust catalog provider via `serde_json::from_str(...).unwrap_or_default()`. Every CSV row silently parsed to an empty list — DB-backed alias fallbacks were invisible to the catalog despite the GUI showing them. CSV gets you ad-hoc parsers per layer, comma collisions in real values, and silent `unwrap_or_default` failures that mask the drift.
-
-**Rules:**
-- New list field → JSON array on every layer. `serde_json` in Rust, `JSON.parse` / `JSON.stringify` in JS.
-- Code review rejects `.split(',')` and `.join(',')` on list-shaped fields. The ONLY allowed `split(',')` is parsing third-party text formats produced by tools we don't own (`vm_stat`, `iostat`, `/proc/net/dev`). Anything in our own storage / wire / GUI is JSON.
-- Existing CSV fields are migration debt: when you touch one, migrate it to JSON in the same commit (writer + reader + DB migration if needed).
-- **Migrations don't get to interpret CSV either.** Legacy CSV in our storage is wiped to NULL with a loud warn. Admins reconstruct the data manually. A CSV-tolerant repair path becomes a permanent CSV interpreter the moment someone forgets to remove it.
-
-### Enforcement
-- Code review (human or `code-reviewer` agent) rejects any diff violating these rules.
-- If an agent reports "I added a stub because X" or "I kept the old function for compat" — that is a reject condition; the work goes back for a real implementation.
 
 ## gstack
 

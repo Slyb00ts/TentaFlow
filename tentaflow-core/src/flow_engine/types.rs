@@ -1,11 +1,76 @@
 // =============================================================================
 // Plik: flow_engine/types.rs
-// Opis: Typy danych dla DAG flow - wezly, krawedzie, kontekst wykonania
-//       i wynik przetwarzania.
+// Opis: Typy DAG flow — node, edge, definition. Runtime types (envelope,
+//       outcome, trace) żyją w `flow_engine/envelope.rs`. Stage 1d wycięło
+//       legacy FlowContext / FlowExecutionResult / FlowStepLog — nowy stack
+//       używa `FlowEnvelope` + `FlowExecutionOutcome` + `TraceStep`.
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+/// Typ danych płynących edge'em flow. Etap 2 używa go jako deklaracji (nie
+/// konwertera) — walidacja R8 sprawdza zgodność producenta, konsumenta i
+/// edge'a. `Any` jest przejściowym fallback'em dla legacy flow_json + portów
+/// które nie wiedzą jaki typ przepuszczają (passthrough adaptery: trigger,
+/// output, condition, conversation_history, session_context, speaker_context).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowDataType {
+    #[default]
+    Any,
+    Text,
+    Audio,
+    Image,
+    Video,
+    Embedding,
+    Json,
+    /// Generyczny plik / dokument (PDF, DOCX, XLSX, ZIP itp.) — wszystko co
+    /// nie jest natywnym media type (audio/image/video) ani structured data
+    /// (text/json/embedding). Adaptery konsumujace `Other` musza patrzec na
+    /// `FlowValue::Other.mime` zeby zdecydowac co z tym zrobic.
+    Other,
+}
+
+impl FlowDataType {
+    /// Stable lowercase tag uzywany w wire (rkyv) i GUI rendering. Spojny z
+    /// `serde(rename_all = "snake_case")` zeby JSON i string surface daly ten
+    /// sam tag.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            FlowDataType::Any => "any",
+            FlowDataType::Text => "text",
+            FlowDataType::Audio => "audio",
+            FlowDataType::Image => "image",
+            FlowDataType::Video => "video",
+            FlowDataType::Embedding => "embedding",
+            FlowDataType::Json => "json",
+            FlowDataType::Other => "other",
+        }
+    }
+
+    /// `Any` na której kolwiek stronie = wildcard (compatible z każdym
+    /// konkretnym typem). Inaczej wymaga dokładnego match'a.
+    pub fn compatible_with(self, other: FlowDataType) -> bool {
+        matches!(self, FlowDataType::Any) || matches!(other, FlowDataType::Any) || self == other
+    }
+
+    /// Mapowanie z `FlowValue` na typ. `Empty` → `None` (brak payloadu ≠
+    /// wildcard) — caller decyduje czy to legalne (np. trigger może
+    /// wystartować flow bez payloadu).
+    pub fn from_value(v: &crate::flow_engine::envelope::FlowValue) -> Option<Self> {
+        use crate::flow_engine::envelope::FlowValue;
+        match v {
+            FlowValue::Empty => None,
+            FlowValue::Text(_) => Some(FlowDataType::Text),
+            FlowValue::Json(_) => Some(FlowDataType::Json),
+            FlowValue::Audio { .. } => Some(FlowDataType::Audio),
+            FlowValue::Image { .. } => Some(FlowDataType::Image),
+            FlowValue::Video { .. } => Some(FlowDataType::Video),
+            FlowValue::Embedding(_) => Some(FlowDataType::Embedding),
+            FlowValue::Other { .. } => Some(FlowDataType::Other),
+        }
+    }
+}
 
 /// Wezel w grafie flow DAG
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,10 +135,8 @@ pub struct FlowEdge {
     #[serde(default)]
     pub condition: Option<String>,
 
-    /// Port wyjsciowy zrodlowego node'a. Default "full" dla backward compat —
-    /// stream-aware adaptery (LLM, TTS) eksponuja tez port "stream".
-    /// skip_serializing_if chroni stare flow_json — edges bez jawnych portow
-    /// round-trippuja byte-identycznie.
+    /// Port wyjsciowy zrodlowego node'a. Default "full" — stream-aware
+    /// adaptery (LLM) eksponuja tez port "stream".
     #[serde(
         default = "default_port_full",
         skip_serializing_if = "is_default_port_full"
@@ -86,6 +149,17 @@ pub struct FlowEdge {
         skip_serializing_if = "is_default_port_in"
     )]
     pub to_port: String,
+
+    /// Deklarowany typ danych płynących edge'em (Etap 2). Default `Any` żeby
+    /// legacy flow_json round-trippowało byte-identycznie. Walidacja R8
+    /// sprawdza zgodność z `producent.output_port_type` i
+    /// `konsument.input_port_type`.
+    #[serde(default, skip_serializing_if = "is_default_data_type")]
+    pub data_type: FlowDataType,
+}
+
+fn is_default_data_type(t: &FlowDataType) -> bool {
+    matches!(t, FlowDataType::Any)
 }
 
 fn default_port_full() -> String {
@@ -109,75 +183,6 @@ fn is_default_port_in(s: &str) -> bool {
 pub struct FlowDefinition {
     pub nodes: Vec<FlowNode>,
     pub edges: Vec<FlowEdge>,
-}
-
-/// Kontekst wykonania flow - gromadzi dane miedzy wezlami
-#[derive(Debug, Clone, Default)]
-pub struct FlowContext {
-    pub request_id: String,
-    pub model: String,
-    pub input: String,
-    pub variables: HashMap<String, serde_json::Value>,
-    pub node_results: HashMap<String, serde_json::Value>,
-    pub execution_log: Vec<FlowStepLog>,
-    /// Oryginalne messages z ChatCompletionRequest
-    pub messages: Vec<serde_json::Value>,
-    /// Audio bytes dla STT
-    pub audio_input: Option<Vec<u8>>,
-    /// Czy request jest streaming
-    pub stream: bool,
-    /// Pelny oryginalny request (JSON)
-    pub original_request: Option<serde_json::Value>,
-    /// Typ serwisu (chat, rag, stt, tts, embeddings)
-    pub service_type: String,
-    /// ID sesji rozmowy (dla conversation_history, speaker_context)
-    pub session_id: Option<String>,
-    /// ID rozpoznanej osoby (speaker_context)
-    pub person_id: Option<String>,
-    /// Pewnosc rozpoznania glosu (0.0 - 1.0)
-    pub speaker_confidence: f32,
-    /// Imie rozpoznanego mowcy
-    pub speaker_name: Option<String>,
-    /// Kontynuuj flow nawet gdy wezel zwroci blad (domyslnie false)
-    pub continue_on_error: bool,
-    /// User context — sluzy ACL gateowi w try_dispatch przed uruchomieniem
-    /// flow oraz w wezlach LLM/embedding gdy wywoluja routing dla user-a.
-    pub user_id: Option<i64>,
-    pub user_role: Option<String>,
-}
-
-impl FlowContext {
-    pub fn new(request_id: String, model: String, input: String) -> Self {
-        Self {
-            request_id,
-            model,
-            input,
-            ..Default::default()
-        }
-    }
-}
-
-/// Log pojedynczego kroku wykonania flow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FlowStepLog {
-    pub node_id: String,
-    pub node_type: String,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub status: String,
-    pub output_preview: Option<String>,
-}
-
-/// Wynik wykonania calego flow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FlowExecutionResult {
-    pub status: String,
-    pub output: serde_json::Value,
-    pub execution_log: Vec<FlowStepLog>,
-    pub total_latency_ms: i64,
-    pub total_tokens: i64,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
 }
 
 #[cfg(test)]
@@ -211,35 +216,10 @@ mod tests {
             condition: None,
             from_port: "full".into(),
             to_port: "in".into(),
+            data_type: FlowDataType::Any,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(!s.contains("from_port"), "got: {s}");
         assert!(!s.contains("to_port"), "got: {s}");
-    }
-
-    #[test]
-    fn edge_non_default_ports_serialize() {
-        let edge = FlowEdge {
-            id: None,
-            from: "a".into(),
-            to: "b".into(),
-            label: None,
-            condition: None,
-            from_port: "stream".into(),
-            to_port: "in".into(),
-        };
-        let s = serde_json::to_string(&edge).unwrap();
-        assert!(s.contains("\"from_port\":\"stream\""));
-        assert!(!s.contains("to_port"));
-    }
-
-    #[test]
-    fn from_port_no_longer_aliased_to_condition() {
-        // Chroni przed regresja buga: alias "from_port" -> condition mapowal
-        // z powrotem stream ports na condition. Teraz from_port to real port.
-        let json = r#"{"from":"a","to":"b","from_port":"stream"}"#;
-        let edge: FlowEdge = serde_json::from_str(json).unwrap();
-        assert!(edge.condition.is_none());
-        assert_eq!(edge.from_port, "stream");
     }
 }

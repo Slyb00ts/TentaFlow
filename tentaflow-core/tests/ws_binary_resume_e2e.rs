@@ -42,8 +42,10 @@ async fn streaming_handler_emits_chunks_and_end() {
             role: None,
         },
         correlation_id: 100,
+        connection_id: 0,
         resume_secret: Some(Arc::new(b"e2e-secret".to_vec())),
         state: tentaflow_core::dispatch::state::AppState::for_test(),
+        org_context: None,
     };
 
     (h.handler_fn)(req, ctx, sub);
@@ -86,8 +88,10 @@ async fn resume_token_round_trip_through_subscribe_resume_handler() {
             role: None,
         },
         correlation_id: 200,
+        connection_id: 0,
         resume_secret: Some(secret.clone()),
         state: tentaflow_core::dispatch::state::AppState::for_test(),
+        org_context: None,
     };
 
     (h.handler_fn)(req, ctx, sub);
@@ -126,8 +130,10 @@ async fn invalid_resume_token_results_in_negative_ack() {
             role: None,
         },
         correlation_id: 300,
+        connection_id: 0,
         resume_secret: Some(secret),
         state: tentaflow_core::dispatch::state::AppState::for_test(),
+        org_context: None,
     };
 
     (h.handler_fn)(req, ctx, sub);
@@ -151,8 +157,10 @@ async fn dispatch_metrics_record_chat_stream_calls() {
     let ctx = HandlerContext {
         session: SessionAuth::Anonymous,
         correlation_id: 1,
+        connection_id: 0,
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
+        org_context: None,
     };
     let _ = dispatch::dispatch(
         &MessageBody::MetaHeartbeat {
@@ -182,8 +190,10 @@ async fn recorder_round_trip_with_dispatch() {
             role: None,
         },
         correlation_id: 999,
+        connection_id: 0,
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
+        org_context: None,
     };
     let _ = dispatch::dispatch(&MessageBody::ModelListRequest, &ctx);
 

@@ -6,6 +6,8 @@ description = "TentaFlow — API Gateway i mesh node"
 build = "build.rs"
 
 [features]
+dashboard-api = ["tentaflow-core/dashboard-api"]
+camera = ["tentaflow-core/camera"]
 rdma-probe = ["tentaflow-core/rdma-probe"]
 gpu-cuda = ["tentaflow-core/gpu-cuda"]
 gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
@@ -13,7 +15,7 @@ gpu-rocm = ["tentaflow-core/gpu-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
 
 [dependencies]
-tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa"] }
+tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "inference-diarization", "inference-sherpa", "vector", "camera"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"

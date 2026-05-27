@@ -39,6 +39,7 @@ import UsersScreen from '/js/modules/users.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
 import AddonsScreen from '/js/modules/addons.js';
+import AddonAppScreen from '/js/modules/addon-app.js';
 import MyAccountsScreen from '/js/modules/my-accounts.js';
 import AppsHomeScreen from '/js/modules/apps-home.js';
 import ProfileScreen from '/js/modules/profile.js';
@@ -52,6 +53,9 @@ import ProfileReportView from '/js/modules/profile-report.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
+import LegalScreen from '/js/modules/legal/index.js';
+import SchedulerScreen from '/js/modules/scheduler.js';
+import RolesCatalogScreen from '/js/modules/roles_catalog.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -114,6 +118,7 @@ const ADMIN_NAV = [
     icon: 'flow',
     items: [
       { id: 'flows', labelKey: 'nav.flows', icon: 'flow' },
+      { id: 'scheduler', labelKey: 'nav.scheduler', icon: 'clock' },
       { id: 'rules', labelKey: 'nav.rules', icon: 'rules' },
     ],
   },
@@ -130,7 +135,9 @@ const ADMIN_NAV = [
     items: [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
+      { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
+      { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
   },
@@ -348,6 +355,80 @@ async function renderApp() {
     byId('lang-select')?.addEventListener('change', async (e) => {
       await I18n.setLanguage(e.target.value);
     });
+
+    // Async: dorzuc addon application tiles do sidebar pod sekcja Apps.
+    // Bez tego addon z [application] manifestu pojawial sie tylko w
+    // `apps-home` grid, ale nie w lewym menu.
+    injectAddonAppsIntoSidebar();
+  }
+
+  async function injectAddonAppsIntoSidebar() {
+    let apps;
+    try {
+      apps = await ApiBinary.list('addonApplicationsListRequest', {
+        arrayKey: 'applications',
+      });
+    } catch (e) {
+      console.warn('[app] addonApplicationsListRequest fail:', e?.message ?? e);
+      return;
+    }
+    if (!Array.isArray(apps) || apps.length === 0) return;
+
+    // Stabilny porzadek na dole sekcji Apps: sort_order ASC, potem title ASC.
+    const sorted = apps.slice().sort((a, b) => {
+      const sa = Number(a.sortOrder ?? a.sort_order ?? 0);
+      const sb = Number(b.sortOrder ?? b.sort_order ?? 0);
+      if (sa !== sb) return sa - sb;
+      const ta = String(a.title ?? a.addonId ?? a.addon_id ?? '').toLowerCase();
+      const tb = String(b.title ?? b.addonId ?? b.addon_id ?? '').toLowerCase();
+      return ta.localeCompare(tb);
+    });
+
+    // Znajdz sekcje Apps po headingu (i18n key nav.section_apps).
+    const appsHeading = I18n.t('nav.section_apps');
+    const sections = document.querySelectorAll('.sidebar .nav-section');
+    let appsSection = null;
+    sections.forEach((s) => {
+      const h = s.querySelector('.heading');
+      if (h && h.textContent.trim().endsWith(appsHeading)) {
+        appsSection = s;
+      }
+    });
+    if (!appsSection) return;
+
+    for (const app of sorted) {
+      const addonId = String(app.addonId ?? app.addon_id ?? '');
+      const panelId = String(app.entryPanel ?? app.entry_panel ?? '');
+      const title = String(app.title ?? addonId);
+      const enabled = app.enabled !== false;
+      const iconId = resolveAddonIcon(app.icon);
+      if (!addonId || !panelId) continue;
+
+      const item = document.createElement('div');
+      item.className = 'nav-item addon-app-nav-item';
+      item.dataset.addonId = addonId;
+      item.dataset.panelId = panelId;
+      item.dataset.view = `addon-app:${addonId}`;
+      const disabledBadge = enabled
+        ? ''
+        : `<span class="badge soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
+      item.innerHTML =
+        `<svg class="icon"><use href="#i-${iconId}"/></svg>` +
+        `<span>${escapeHtml(title)}</span>${disabledBadge}`;
+      if (!enabled) {
+        item.classList.add('disabled');
+        item.setAttribute('aria-disabled', 'true');
+      }
+      item.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        if (!enabled) return;
+        document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
+        item.classList.add('active');
+        Router.navigate('addon-app', { addonId, panelId });
+        closeDrawer();
+      });
+      appsSection.appendChild(item);
+    }
   }
 
   function openDrawer() {
@@ -410,13 +491,18 @@ async function renderApp() {
   Router.register('prompts', PromptsScreen);
   Router.register('flows', FlowsScreen);
   Router.register('flow-builder', FlowBuilderScreen);
+  Router.register('scheduler', SchedulerScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
   Router.register('users', UsersScreen);
+  Router.register('roles-catalog', RolesCatalogScreen);
   Router.register('rules', RulesScreen);
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
+  Router.register('legal', LegalScreen);
   Router.register('addons', AddonsScreen);
+  // Drill-down: Router.navigate('addon-app', { addonId, panelId }) z apps-home.
+  Router.register('addon-app', AddonAppScreen);
   Router.register('my-accounts', MyAccountsScreen);
   Router.register('apps-home', AppsHomeScreen);
   Router.register('profile', ProfileScreen);
@@ -484,6 +570,35 @@ async function refreshNavCounts() {
   if (clusters !== null) setCount('clusters', len(clusters));
   if (addons !== null) setCount('addons', len(addons));
   if (users !== null) setCount('users', len(users));
+}
+
+// Whitelista ikon w sprite (zob. www/index.html <symbol id="i-...">). Addon
+// moze podac dowolny string w manifescie [application.icon]; jezeli nie pasuje
+// — uzywamy generycznego "apps".
+const ADDON_ICON_WHITELIST = new Set([
+  'alert', 'apps', 'arrow', 'arrow-out', 'audit', 'ban', 'bar-chart', 'bolt',
+  'brain', 'branch', 'catalog', 'chart-line', 'chat', 'check', 'chevron-down',
+  'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
+  'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',
+  'dashboard', 'database', 'desktop', 'docker', 'download', 'edit',
+  'external-link', 'eye', 'file-text', 'filter', 'flow', 'folder', 'globe',
+  'globe-grid', 'gpu', 'grid-rows', 'grip', 'home', 'home-simple', 'host',
+  'iface-lan', 'iface-loop', 'iface-tb', 'iface-virt', 'iface-vpn',
+  'iface-wifi', 'image', 'info', 'key', 'line-chart', 'list', 'lock', 'logout',
+  'management', 'max', 'meeting', 'message', 'mic', 'min', 'model', 'models',
+  'network', 'network-svg', 'os', 'paperclip', 'pause', 'pi', 'pin', 'play',
+  'plus', 'prompt', 'puzzle', 'question', 'rag-db', 'ram', 'record',
+  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'search', 'send',
+  'services', 'settings', 'share', 'shield', 'sparkle', 'speaker',
+  'speaker-alt', 'star', 'stop', 'transform', 'trash', 'trend', 'unlock',
+  'user', 'users', 'volume', 'workflow-app', 'x', 'zap',
+]);
+
+function resolveAddonIcon(raw) {
+  const trimmed = String(raw ?? '').trim();
+  const stripped = trimmed.startsWith('i-') ? trimmed.slice(2) : trimmed;
+  if (stripped && ADDON_ICON_WHITELIST.has(stripped)) return stripped;
+  return 'apps';
 }
 
 window.addEventListener('error', (e) => {
