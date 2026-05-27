@@ -115,7 +115,10 @@ pub fn init(db: DbPool, signer: Arc<MeshSecurity>) -> LedgerResult<Arc<SyncRunti
         local_node_id,
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
-    Ok(runtime)
+    Ok(SYNC_RUNTIME
+        .get()
+        .expect("sync runtime must be initialized")
+        .clone())
 }
 
 pub fn record_sql_capture(
@@ -191,6 +194,13 @@ pub fn handle_ack_payload(source_node_id: &str, payload: MeshSyncAckPayload) -> 
         return Ok(());
     };
     runtime.handle_ack_payload(source_node_id, payload)
+}
+
+pub fn acknowledged_outbox_count(operation_id: OperationId) -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.acknowledged_outbox_count(operation_id).map(Some)
 }
 
 pub fn handle_pull_payload(
@@ -352,6 +362,15 @@ impl SyncRuntime {
             op_id,
             queued_targets,
         })
+    }
+
+    fn acknowledged_outbox_count(&self, operation_id: OperationId) -> LedgerResult<usize> {
+        Ok(self
+            .ledger
+            .list_outbox_for_operation(operation_id)?
+            .into_iter()
+            .filter(|entry| entry.acknowledged)
+            .count())
     }
 
     fn build_repair_pull_payloads_for_peer(
@@ -1104,8 +1123,12 @@ impl SyncRuntime {
             resolution,
         )
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
-        if result.status == "resolved" {
-            self.ledger.mark_inbox_applied(source, operation_id)?;
+        if result.status == "resolved" || result.status == "ignored" {
+            match self.ledger.mark_inbox_applied(source, operation_id) {
+                Ok(()) => {}
+                Err(SyncLedgerError::InboxEntryNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(result)
     }
@@ -3374,6 +3397,78 @@ mod tests {
     }
 
     #[test]
+    fn conflict_keep_local_marks_inbox_applied_without_overwrite() {
+        with_tmp_home(|| {
+            let source = make_runtime(43);
+            let receiver = make_runtime(44);
+            let addon_id = "sync-runtime-conflict-keep-local";
+            seed_authority_target(
+                &source.runtime.db,
+                addon_id,
+                &receiver.runtime.local_node_id,
+            );
+            seed_authority_target(
+                &receiver.runtime.db,
+                addon_id,
+                &receiver.runtime.local_node_id,
+            );
+            open_contacts_table(addon_id);
+            {
+                let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                    .expect("open addon db");
+                let conn = pool.get().expect("conn");
+                conn.execute("INSERT INTO contacts (id, name) VALUES (1, 'Local')", [])
+                    .expect("insert local");
+            }
+
+            let result = source
+                .runtime
+                .record_sql_capture(capture(addon_id, "person-1", "Remote"))
+                .expect("record");
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("push")
+                .expect("pending push");
+            receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+
+            let resolved = receiver
+                .runtime
+                .resolve_addon_sync_conflict(
+                    "org-default",
+                    addon_id,
+                    result.op_id,
+                    SyncConflictResolution::KeepLocal,
+                )
+                .expect("resolve");
+
+            assert_eq!(resolved.status, "ignored");
+            let entry = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(
+                    PeerId::new(source.runtime.local_node_id.clone()).expect("peer"),
+                    result.op_id,
+                )
+                .expect("inbox");
+            assert!(entry.applied);
+            assert!(!entry.conflicted);
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db");
+            let conn = pool.get().expect("conn");
+            let name: String = conn
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .expect("name");
+            assert_eq!(name, "Local");
+        });
+    }
+
+    #[test]
     fn missing_sequence_queues_repair_pull_from_gap() {
         with_tmp_home(|| {
             let source = make_runtime(21);
@@ -3775,6 +3870,206 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_node_mesh_full_restart_persists_fanout_and_acks() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source_db_path = tmp.path().join("source.db");
+        let source_ledger_path = tmp.path().join("source-ledger");
+        let receiver_paths = [
+            (
+                tmp.path().join("receiver-a.db"),
+                tmp.path().join("receiver-a-ledger"),
+            ),
+            (
+                tmp.path().join("receiver-b.db"),
+                tmp.path().join("receiver-b-ledger"),
+            ),
+            (
+                tmp.path().join("receiver-c.db"),
+                tmp.path().join("receiver-c-ledger"),
+            ),
+        ];
+        let capture_op_id;
+        let receiver_node_ids;
+
+        {
+            let source = make_runtime_from_paths(&source_db_path, &source_ledger_path, 111);
+            let receiver_a =
+                make_runtime_from_paths(&receiver_paths[0].0, &receiver_paths[0].1, 112);
+            let receiver_b =
+                make_runtime_from_paths(&receiver_paths[1].0, &receiver_paths[1].1, 113);
+            let receiver_c =
+                make_runtime_from_paths(&receiver_paths[2].0, &receiver_paths[2].1, 114);
+            let receivers = [&receiver_a, &receiver_b, &receiver_c];
+            let mut receiver_user_ids = Vec::new();
+
+            for (idx, receiver) in receivers.iter().enumerate() {
+                let user_id = repository::create_user_account(
+                    &source.db,
+                    &format!("restart-fanout-user-{idx}"),
+                    "hash",
+                    &format!("Restart Fanout User {idx}"),
+                    &format!("restart-fanout-{idx}@example.test"),
+                )
+                .expect("restart fanout user");
+                repository::upsert_sync_node_identity(
+                    &source.db,
+                    &receiver.local_node_id,
+                    &receiver.signer.security.public_key_hex(),
+                    "ed25519",
+                    &format!("Restart Fanout Node {idx}"),
+                    "laptop",
+                    "trusted",
+                    Some(user_id),
+                    "standard",
+                )
+                .expect("restart fanout node");
+                repository::assign_node_to_user(
+                    &source.db,
+                    &receiver.local_node_id,
+                    user_id,
+                    "primary",
+                    None,
+                )
+                .expect("restart fanout assignment");
+                receiver_user_ids.push(user_id);
+                seed_core_authority_target(&receiver.db, "core.flow", &receiver.local_node_id);
+                trust_each_other(&source, receiver);
+            }
+            repository::upsert_sync_policy(
+                &source.db,
+                "policy-core-flow-full-restart-fanout",
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                Some("core.flow"),
+                None,
+                "replicated_by_permission",
+                None,
+                None,
+                true,
+            )
+            .expect("restart fanout policy");
+            repository::upsert_sync_resource_acl(
+                &source.db,
+                "org-default",
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                "core.flow",
+                "11101",
+                receiver_user_ids.first().copied(),
+                receiver_user_ids.first().copied(),
+                None,
+                None,
+                "all",
+            )
+            .expect("restart fanout acl");
+
+            let capture = source
+                .record_core_capture(complete_core_flow_capture(
+                    "11101",
+                    "Full Restart Fanout Flow",
+                ))
+                .expect("record restart fanout flow");
+            assert_eq!(capture.queued_targets, 3);
+            for receiver in receivers {
+                let outbox = source
+                    .ledger
+                    .get_outbox_entry(
+                        SyncTarget::new(receiver.local_node_id.clone()).expect("target"),
+                        capture.op_id,
+                    )
+                    .expect("persisted fanout outbox before restart");
+                assert!(!outbox.acknowledged);
+            }
+            capture_op_id = capture.op_id;
+            receiver_node_ids = [
+                receiver_a.local_node_id.clone(),
+                receiver_b.local_node_id.clone(),
+                receiver_c.local_node_id.clone(),
+            ];
+        }
+
+        {
+            let source = make_runtime_from_paths(&source_db_path, &source_ledger_path, 111);
+            let receiver_a =
+                make_runtime_from_paths(&receiver_paths[0].0, &receiver_paths[0].1, 112);
+            let receiver_b =
+                make_runtime_from_paths(&receiver_paths[1].0, &receiver_paths[1].1, 113);
+            let receiver_c =
+                make_runtime_from_paths(&receiver_paths[2].0, &receiver_paths[2].1, 114);
+            let receivers = [&receiver_a, &receiver_b, &receiver_c];
+            for receiver in receivers {
+                trust_each_other(&source, receiver);
+            }
+
+            let source_mesh = make_mesh_manager(&source).await;
+            let receiver_meshes = vec![
+                make_mesh_manager(&receiver_a).await,
+                make_mesh_manager(&receiver_b).await,
+                make_mesh_manager(&receiver_c).await,
+            ];
+            let _source_task = source_mesh.start();
+            for receiver_mesh in &receiver_meshes {
+                let _receiver_task = receiver_mesh.start();
+            }
+            let mut source_events = source_mesh.subscribe();
+            let mut receiver_events = receiver_meshes
+                .iter()
+                .map(|receiver_mesh| receiver_mesh.subscribe())
+                .collect::<Vec<_>>();
+
+            for receiver_mesh in &receiver_meshes {
+                connect_mesh_managers(&source_mesh, receiver_mesh).await;
+            }
+
+            for idx in 0..receivers.len() {
+                let receiver = receivers[idx];
+                let push = source
+                    .build_push_payload_for_target(&receiver.local_node_id, 16)
+                    .expect("build restart fanout push")
+                    .expect("restart fanout push");
+                send_push_and_ack_over_mesh(
+                    &source,
+                    receiver,
+                    &source_mesh,
+                    &receiver_meshes[idx],
+                    &mut source_events,
+                    &mut receiver_events[idx],
+                    push,
+                )
+                .await;
+            }
+
+            source_mesh.shutdown().await;
+            for receiver_mesh in receiver_meshes {
+                receiver_mesh.shutdown().await;
+            }
+        }
+
+        let source = make_runtime_from_paths(&source_db_path, &source_ledger_path, 111);
+        let receiver_a = make_runtime_from_paths(&receiver_paths[0].0, &receiver_paths[0].1, 112);
+        let receiver_b = make_runtime_from_paths(&receiver_paths[1].0, &receiver_paths[1].1, 113);
+        let receiver_c = make_runtime_from_paths(&receiver_paths[2].0, &receiver_paths[2].1, 114);
+        let receivers = [&receiver_a, &receiver_b, &receiver_c];
+
+        for (idx, receiver) in receivers.iter().enumerate() {
+            assert_eq!(receiver.local_node_id, receiver_node_ids[idx]);
+            let flow = repository::get_flow(&receiver.db, 11101)
+                .expect("get persisted restart fanout flow")
+                .expect("persisted restart fanout flow");
+            let outbox = source
+                .ledger
+                .get_outbox_entry(
+                    SyncTarget::new(receiver.local_node_id.clone()).expect("target"),
+                    capture_op_id,
+                )
+                .expect("persisted fanout outbox after restart");
+            assert_eq!(flow.name, "Full Restart Fanout Flow");
+            assert!(outbox.acknowledged);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn multi_node_mesh_offline_outbox_survives_source_runtime_restart() {
         let _guard = test_home_guard();
         let tmp = tempfile::tempdir().expect("home");
@@ -3786,11 +4081,7 @@ mod tests {
 
         let (source_node_id, capture) = {
             let source = make_runtime_from_paths(&source_db_path, &source_ledger_path, 91);
-            seed_core_authority_target(
-                &source.db,
-                "core.flow",
-                &receiver.runtime.local_node_id,
-            );
+            seed_core_authority_target(&source.db, "core.flow", &receiver.runtime.local_node_id);
             let capture = source
                 .record_core_capture(complete_core_flow_capture("91", "Restart Durable Flow"))
                 .expect("record durable flow");
@@ -5117,11 +5408,7 @@ mod tests {
         let receiver_db = tmp.path().join("receiver.db");
         let receiver_ledger = tmp.path().join("receiver-ledger");
         let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 92);
-        seed_core_authority_target(
-            &source.runtime.db,
-            "core.flow",
-            &receiver.local_node_id,
-        );
+        seed_core_authority_target(&source.runtime.db, "core.flow", &receiver.local_node_id);
         seed_core_authority_target(&receiver.db, "core.flow", &receiver.local_node_id);
 
         let result = source
@@ -5146,7 +5433,9 @@ mod tests {
             .expect("ack after restart");
         let conn = receiver.db.lock().expect("db");
         let name: String = conn
-            .query_row("SELECT name FROM flows WHERE id = 9101", [], |row| row.get(0))
+            .query_row("SELECT name FROM flows WHERE id = 9101", [], |row| {
+                row.get(0)
+            })
             .expect("flow");
         drop(conn);
         let outbox = source
@@ -5172,11 +5461,7 @@ mod tests {
         let receiver_db = tmp.path().join("receiver.db");
         let receiver_ledger = tmp.path().join("receiver-ledger");
         let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 94);
-        seed_core_authority_target(
-            &source.runtime.db,
-            "core.blob",
-            &receiver.local_node_id,
-        );
+        seed_core_authority_target(&source.runtime.db, "core.blob", &receiver.local_node_id);
         seed_core_authority_target(&receiver.db, "core.blob", &receiver.local_node_id);
 
         let mut bytes = Vec::with_capacity(BLOB_SYNC_CHUNK_SIZE * 2 + 23);
@@ -5247,8 +5532,16 @@ mod tests {
         let source = make_runtime(95);
         let receiver = make_runtime(96);
         let addon_id = unique_addon_id("mesh-conflict");
-        seed_authority_target(&source.runtime.db, &addon_id, &receiver.runtime.local_node_id);
-        seed_authority_target(&receiver.runtime.db, &addon_id, &receiver.runtime.local_node_id);
+        seed_authority_target(
+            &source.runtime.db,
+            &addon_id,
+            &receiver.runtime.local_node_id,
+        );
+        seed_authority_target(
+            &receiver.runtime.db,
+            &addon_id,
+            &receiver.runtime.local_node_id,
+        );
         trust_each_other(&source.runtime, &receiver.runtime);
         open_contacts_table(&addon_id);
         let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
@@ -5289,7 +5582,9 @@ mod tests {
         let name: String = pool
             .get()
             .expect("conn")
-            .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get(0))
+            .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                row.get(0)
+            })
             .expect("local row");
         let outbox = source
             .runtime
@@ -5306,6 +5601,133 @@ mod tests {
         assert_eq!(name, "Local");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].resource_id, "person-conflict");
+        assert!(outbox.acknowledged);
+    }
+
+    #[test]
+    fn addon_conflict_survives_receiver_restart_and_accepts_remote() {
+        let _guard = test_home_guard();
+        let tmp = tempfile::tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("TENTAFLOW_HOME", tmp.path());
+        let source = make_runtime(115);
+        let receiver_db = tmp.path().join("receiver.db");
+        let receiver_ledger = tmp.path().join("receiver-ledger");
+        let addon_id = unique_addon_id("restart-conflict");
+        let result = {
+            let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 116);
+            seed_authority_target(&source.runtime.db, &addon_id, &receiver.local_node_id);
+            seed_authority_target(&receiver.db, &addon_id, &receiver.local_node_id);
+            open_contacts_table(&addon_id);
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+                .expect("open addon db");
+            pool.get()
+                .expect("conn")
+                .execute("INSERT INTO contacts (id, name) VALUES (1, 'Local')", [])
+                .expect("seed local");
+            let result = source
+                .runtime
+                .record_sql_capture(capture(&addon_id, "person-restart-conflict", "Remote"))
+                .expect("record conflict capture");
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.local_node_id, 16)
+                .expect("build push")
+                .expect("push");
+            let ack = receiver
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+            source
+                .runtime
+                .handle_ack_payload(&receiver.local_node_id, ack)
+                .expect("ack");
+
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                "org-default",
+                &addon_id,
+                Some("open"),
+                10,
+            )
+            .expect("conflicts before restart");
+            let name: String = pool
+                .get()
+                .expect("conn")
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .expect("local row");
+            let entry = receiver
+                .ledger
+                .get_inbox_entry(
+                    PeerId::new(source.runtime.local_node_id.clone()).expect("peer"),
+                    result.op_id,
+                )
+                .expect("inbox before restart");
+
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].resource_id, "person-restart-conflict");
+            assert_eq!(name, "Local");
+            assert!(!entry.applied);
+            assert!(entry.conflicted);
+            result
+        };
+
+        let receiver = make_runtime_from_paths(&receiver_db, &receiver_ledger, 116);
+        let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+            "org-default",
+            &addon_id,
+            Some("open"),
+            10,
+        )
+        .expect("conflicts after restart");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].operation_id, result.op_id.to_hex());
+
+        let resolved = receiver
+            .resolve_addon_sync_conflict(
+                "org-default",
+                &addon_id,
+                result.op_id,
+                SyncConflictResolution::AcceptRemote,
+            )
+            .expect("resolve after restart");
+        let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+            "org-default",
+            &addon_id,
+            Some("open"),
+            10,
+        )
+        .expect("conflicts resolved");
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+            .expect("open addon db");
+        let name: String = pool
+            .get()
+            .expect("conn")
+            .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("remote row");
+        let entry = receiver
+            .ledger
+            .get_inbox_entry(
+                PeerId::new(source.runtime.local_node_id.clone()).expect("peer"),
+                result.op_id,
+            )
+            .expect("inbox after resolve");
+        let outbox = source
+            .runtime
+            .ledger
+            .get_outbox_entry(
+                SyncTarget::new(receiver.local_node_id.clone()).expect("target"),
+                result.op_id,
+            )
+            .expect("source outbox");
+
+        assert_eq!(resolved.status, "resolved");
+        assert_eq!(resolved.resolution, "accept_remote");
+        assert_eq!(conflicts.len(), 0);
+        assert_eq!(name, "Remote");
+        assert!(entry.applied);
+        assert!(!entry.conflicted);
         assert!(outbox.acknowledged);
     }
 
@@ -5399,8 +5821,16 @@ mod tests {
             .record_core_capture(complete_core_flow_capture("9701", "Partial fanout flow"))
             .expect("record flow");
         for (receiver, receiver_mesh, receiver_events) in [
-            (&receiver_a.runtime, &receiver_a_mesh, &mut receiver_a_events),
-            (&receiver_b.runtime, &receiver_b_mesh, &mut receiver_b_events),
+            (
+                &receiver_a.runtime,
+                &receiver_a_mesh,
+                &mut receiver_a_events,
+            ),
+            (
+                &receiver_b.runtime,
+                &receiver_b_mesh,
+                &mut receiver_b_events,
+            ),
         ] {
             let push = source
                 .runtime
@@ -5447,7 +5877,9 @@ mod tests {
         .await;
         let conn = receiver_c.runtime.db.lock().expect("db");
         let name: String = conn
-            .query_row("SELECT name FROM flows WHERE id = 9701", [], |row| row.get(0))
+            .query_row("SELECT name FROM flows WHERE id = 9701", [], |row| {
+                row.get(0)
+            })
             .expect("flow on c");
         drop(conn);
         let c_outbox = source
@@ -5496,16 +5928,31 @@ mod tests {
         use crate::sync::core_registry::CoreSyncResourceKind as K;
 
         let mut role = BTreeMap::new();
-        role.insert("name".to_string(), FieldValue::String("Sync Role".to_string()));
-        role.insert("permissions_json".to_string(), FieldValue::String("[]".to_string()));
+        role.insert(
+            "name".to_string(),
+            FieldValue::String("Sync Role".to_string()),
+        );
+        role.insert(
+            "permissions_json".to_string(),
+            FieldValue::String("[]".to_string()),
+        );
         source
             .runtime
             .record_core_capture(core_capture_for(K::Role, "sync-role", role))
             .expect("record role");
         let mut user = BTreeMap::new();
-        user.insert("username".to_string(), FieldValue::String("sync-user".to_string()));
-        user.insert("display_name".to_string(), FieldValue::String("Sync User".to_string()));
-        user.insert("email".to_string(), FieldValue::String("sync@example.test".to_string()));
+        user.insert(
+            "username".to_string(),
+            FieldValue::String("sync-user".to_string()),
+        );
+        user.insert(
+            "display_name".to_string(),
+            FieldValue::String("Sync User".to_string()),
+        );
+        user.insert(
+            "email".to_string(),
+            FieldValue::String("sync@example.test".to_string()),
+        );
         user.insert("is_active".to_string(), FieldValue::Bool(true));
         user.insert("is_admin".to_string(), FieldValue::Bool(false));
         user.insert("role".to_string(), FieldValue::String("user".to_string()));
@@ -5514,8 +5961,14 @@ mod tests {
             .record_core_capture(core_capture_for(K::UserAccount, "10101", user))
             .expect("record user");
         let mut group = BTreeMap::new();
-        group.insert("name".to_string(), FieldValue::String("Sync Group".to_string()));
-        group.insert("description".to_string(), FieldValue::String("Synchronized".to_string()));
+        group.insert(
+            "name".to_string(),
+            FieldValue::String("Sync Group".to_string()),
+        );
+        group.insert(
+            "description".to_string(),
+            FieldValue::String("Synchronized".to_string()),
+        );
         source
             .runtime
             .record_core_capture(core_capture_for(K::UserGroup, "10102", group))
@@ -5525,16 +5978,36 @@ mod tests {
         group_member.insert("user_id".to_string(), FieldValue::I64(10101));
         source
             .runtime
-            .record_core_capture(core_capture_for(K::GroupMember, "10102:10101", group_member))
+            .record_core_capture(core_capture_for(
+                K::GroupMember,
+                "10102:10101",
+                group_member,
+            ))
             .expect("record group member");
         let mut membership = BTreeMap::new();
-        membership.insert("org_id".to_string(), FieldValue::String("org-default".to_string()));
-        membership.insert("user_id".to_string(), FieldValue::String("10101".to_string()));
-        membership.insert("role_id".to_string(), FieldValue::String("sync-role".to_string()));
-        membership.insert("granted_by".to_string(), FieldValue::String("sync-test".to_string()));
+        membership.insert(
+            "org_id".to_string(),
+            FieldValue::String("org-default".to_string()),
+        );
+        membership.insert(
+            "user_id".to_string(),
+            FieldValue::String("10101".to_string()),
+        );
+        membership.insert(
+            "role_id".to_string(),
+            FieldValue::String("sync-role".to_string()),
+        );
+        membership.insert(
+            "granted_by".to_string(),
+            FieldValue::String("sync-test".to_string()),
+        );
         source
             .runtime
-            .record_core_capture(core_capture_for(K::OrgMembership, "org-default:10101", membership))
+            .record_core_capture(core_capture_for(
+                K::OrgMembership,
+                "org-default:10101",
+                membership,
+            ))
             .expect("record membership");
         source
             .runtime
@@ -5542,7 +6015,10 @@ mod tests {
             .expect("record flow");
         let mut binding = BTreeMap::new();
         binding.insert("flow_id".to_string(), FieldValue::I64(10103));
-        binding.insert("model_pattern".to_string(), FieldValue::String("sync-model".to_string()));
+        binding.insert(
+            "model_pattern".to_string(),
+            FieldValue::String("sync-model".to_string()),
+        );
         binding.insert("priority".to_string(), FieldValue::I64(10));
         source
             .runtime
@@ -5569,7 +6045,11 @@ mod tests {
         group_member_retry.insert("user_id".to_string(), FieldValue::I64(10101));
         source
             .runtime
-            .record_core_capture(core_capture_for(K::GroupMember, "10102:10101:retry", group_member_retry))
+            .record_core_capture(core_capture_for(
+                K::GroupMember,
+                "10102:10101:retry",
+                group_member_retry,
+            ))
             .expect("record group member retry");
         let push = source
             .runtime
@@ -5588,19 +6068,35 @@ mod tests {
         .await;
         let conn = receiver.runtime.db.lock().expect("db");
         let username: String = conn
-            .query_row("SELECT username FROM user_accounts WHERE id = 10101", [], |row| row.get(0))
+            .query_row(
+                "SELECT username FROM user_accounts WHERE id = 10101",
+                [],
+                |row| row.get(0),
+            )
             .expect("user");
         let group_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM group_members WHERE group_id = 10102 AND user_id = 10101", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM group_members WHERE group_id = 10102 AND user_id = 10101",
+                [],
+                |row| row.get(0),
+            )
             .expect("group member");
         let role_name: String = conn
-            .query_row("SELECT name FROM roles WHERE role_id = 'sync-role'", [], |row| row.get(0))
+            .query_row(
+                "SELECT name FROM roles WHERE role_id = 'sync-role'",
+                [],
+                |row| row.get(0),
+            )
             .expect("role");
         let membership_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM org_memberships WHERE org_id = 'org-default' AND user_id = '10101'", [], |row| row.get(0))
             .expect("membership");
         let binding_pattern: String = conn
-            .query_row("SELECT model_pattern FROM flow_model_bindings WHERE id = 10104", [], |row| row.get(0))
+            .query_row(
+                "SELECT model_pattern FROM flow_model_bindings WHERE id = 10104",
+                [],
+                |row| row.get(0),
+            )
             .expect("binding");
         drop(conn);
 
